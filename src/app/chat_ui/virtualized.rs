@@ -35,22 +35,28 @@ pub(super) struct Row<'a> {
     pub aliases: Vec<Id>,
     pub anchor: bool,
     pub logical: Option<LogicalRange>,
+    rebuild: Option<Box<dyn Fn() -> Element<'a, Message> + 'a>>,
     build: Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>,
     content: Option<Element<'a, Message>>,
 }
 impl<'a> Row<'a> {
-    pub fn new(
+    pub fn once(
         key: u64,
         revision: u64,
         estimate: f32,
         id: Option<Id>,
         build: impl FnOnce() -> Element<'a, Message> + 'a,
     ) -> Self {
-        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, logical: None, build: Some(Box::new(build)), content: None }
+        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, logical: None, rebuild: None, build: Some(Box::new(build)), content: None }
+    }
+    pub fn new(key: u64, revision: u64, estimate: f32, id: Option<Id>,
+        build: impl Fn() -> Element<'a, Message> + 'a) -> Self {
+        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false,
+            logical: None, rebuild: Some(Box::new(build)), build: None, content: None }
     }
     fn element(&mut self) -> &mut Element<'a, Message> {
         if self.content.is_none() {
-            self.content = Some(self.build.take().expect("a row is built once")());
+            self.content = Some(match &self.rebuild { Some(build) => build(), None => self.build.take().expect("a static row is built once")() });
         }
         self.content.as_mut().unwrap()
     }
@@ -195,6 +201,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 nodes.push(node);
                 tree.children.push(child);
                 state.mounted.push((index, key));
+            }
+            // Reusable descriptors retain logical sources, never visited
+            // widget elements or styled fragments once their tree is evicted.
+            for key in previous.keys() {
+                if let Some(index) = state.positions.get(key) {
+                    let row = &mut self.rows[*index];
+                    if row.rebuild.is_some() { row.content = None; }
+                }
             }
             if !changed { break; }
         }
@@ -398,6 +412,41 @@ mod tests {
         assert!(logical_bounds(&state, bounds, 42, 201).is_none());
         assert!(logical_bounds(&state, bounds, 43, 50).is_none());
         assert!(state.mounted.is_empty(), "no offscreen row was instantiated");
+    }
+
+    #[test]
+    fn evicted_reusable_rows_release_element_owners_and_can_mount_again() {
+        struct Lease(Arc<()>);
+        impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Lease {
+            fn size(&self) -> Size<Length> { Size::new(Length::Fill, Length::Fixed(20.0)) }
+            fn layout(&mut self, _: &mut Tree, _: &cosmic::Renderer, limits: &layout::Limits) -> layout::Node {
+                layout::Node::new(Size::new(limits.max().width, 20.0))
+            }
+            fn draw(&self, _: &Tree, _: &mut cosmic::Renderer, _: &cosmic::Theme,
+                _: &renderer::Style, _: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {}
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let owners = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let window = Rc::new(Cell::new(Some(Viewport { top: 0.0, height: 600.0, bottom: false })));
+        let mut element = column((0..10000).map(|index| {
+            let owners = owners.clone();
+            Row::new(index, 0, 20.0, None, move || {
+                let owner = Arc::new(());
+                owners.borrow_mut().push(Arc::downgrade(&owner));
+                Element::new(Lease(owner))
+            })
+        }).collect(), window.clone());
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY));
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let first = owners.borrow().clone();
+        assert!(first.iter().all(|owner| owner.upgrade().is_some()));
+        window.set(Some(Viewport { top: 100000.0, height: 600.0, bottom: false }));
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(first.iter().all(|owner| owner.upgrade().is_none()), "eviction must drop Element as well as Tree");
+        window.set(Some(Viewport { top: 0.0, height: 600.0, bottom: false }));
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(owners.borrow().iter().filter(|owner| owner.upgrade().is_some()).count() <= 92);
     }
 
     #[test]

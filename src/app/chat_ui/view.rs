@@ -92,10 +92,15 @@ impl<'a> VirtualRows<'a> {
     fn new(gap: f32) -> Self { Self { children: vec![], gap, trailing_footer: 0.0 } }
     fn push(&mut self, row: Element<'a, Message>) -> usize { self.message(row, 0.0) }
     fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
-        self.lazy(0, 0, 80.0, vec![], self.gap, footer, move || row)
+        self.append(virtualized::Row::once(0, 0, 80.0, None, move || row), self.gap, footer)
     }
     fn lazy(&mut self, key: u64, revision: u64, estimate: f32, aliases: Vec<iced::advanced::widget::Id>,
-        gap: f32, footer: f32, build: impl FnOnce() -> Element<'a, Message> + 'a) -> usize {
+        gap: f32, footer: f32, build: impl Fn() -> Element<'a, Message> + 'a) -> usize {
+        let mut row = virtualized::Row::new(key, revision, estimate, None, build);
+        row.aliases = aliases;
+        self.append(row, gap, footer)
+    }
+    fn append(&mut self, mut row: virtualized::Row<'a>, gap: f32, footer: f32) -> usize {
         if !self.children.is_empty() {
             let gap = (gap - self.trailing_footer).max(0.0);
             if gap > 0.0 {
@@ -105,9 +110,7 @@ impl<'a> VirtualRows<'a> {
             }
         }
         let index = self.children.len();
-        let mut row = virtualized::Row::new(if key == 0 { index as u64 } else { key },
-            revision, estimate, None, build);
-        row.aliases = aliases;
+        if row.key == 0 { row.key = index as u64; }
         self.children.push(row);
         self.trailing_footer = footer;
         index
@@ -3348,7 +3351,7 @@ impl Runtime {
                         // mounted row creates their widget tree and geometry.
                         let row = step(item, cached);
                         let id = item.id.clone();
-                        let mut row = virtualized::Row::new(key, revision, 56.0 + step::GAP_XS,
+                        let mut row = virtualized::Row::once(key, revision, 56.0 + step::GAP_XS,
                             Some(scroll::item_id(&id)), move || {
                                 widget::container(scroll::item(&id, row))
                                     .padding(iced::Padding::ZERO.bottom(step::GAP_XS)).into()
