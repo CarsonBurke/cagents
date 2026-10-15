@@ -76,12 +76,18 @@ impl LineMap {
 }
 
 #[derive(Debug, Clone)]
-pub struct Version { pub text: String, pub content_hash: blake3::Hash, pub source: std::path::PathBuf, pub markdown: bool, pub mapping: LineMap }
+pub struct Version { pub text: String, pub content_hash: blake3::Hash, pub source: std::path::PathBuf, pub markdown: bool, pub mapping: LineMap, pub restoration: Option<std::sync::Arc<crate::editor::FileRestoration>> }
 pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result<Version, String> {
-    match crate::editor::load_file(worktree, path, tone) {
+    load_with_restoration(worktree, path, before, tone, false)
+}
+
+pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: PdfTone, capture: bool) -> Result<Version, String> {
+    let root = Root::open(worktree).map_err(|error| error.to_string())?;
+    match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile { source, content: FileContent::Editable { text, content_hash, markdown } }) => {
             let mapping = LineMap::between(before, &text);
-            Ok(Version { text, content_hash, source, markdown, mapping })
+            let restoration = capture.then(|| crate::editor::capture_restoration_at(&root, &source, content_hash)).transpose().map_err(|error| error.to_string())?;
+            Ok(Version { text, content_hash, source, markdown, mapping, restoration })
         }
         Ok(_) => Err("The file on disk is no longer editable text. Your buffer has been kept.".into()),
         Err(error) => Err(error.to_string()),

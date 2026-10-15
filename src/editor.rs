@@ -12,7 +12,7 @@ use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
 pub use presence::FileRestoration;
-pub(crate) use presence::{PresenceSave, save_document_file};
+pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, capture_restoration_at};
 
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
@@ -389,8 +389,13 @@ pub fn load_file(
     relative_path: &Path,
     tone: PdfTone,
 ) -> Result<LoadedFile, FileIoError> {
-    validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
+    load_file_at(&root, relative_path, tone)
+}
+
+pub(crate) fn load_file_at(root: &Root, relative_path: &Path, tone: PdfTone) -> Result<LoadedFile, FileIoError> {
+    validate_repo_path(relative_path)?;
+    let worktree = root.path();
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a
     // target that turns out to name nothing usable is reported against the
@@ -1080,7 +1085,12 @@ pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<Sav
     validate_repo_path(path)?;
     let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     let root = worktree_root(worktree)?;
-    let (parent, name) = fs_safety::open_parent_beneath(&root, path).map_err(resolve_error)?;
+    save_missing_file_at(&root, path, text)
+}
+
+pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
+    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
     let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
     let result = (|| {
         file.write_all(text.as_bytes()).map_err(io_error)?;

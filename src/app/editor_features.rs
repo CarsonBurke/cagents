@@ -702,7 +702,7 @@ impl Cagents {
     }
 
     pub(super) fn maybe_format_before_save(&mut self, card: CardId) -> Option<Task<Message>> {
-        if !self.format_on_save_enabled(card) { return None; }
+        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if !runtime.desired_file_present()) || !self.format_on_save_enabled(card) { return None; }
         if self.editor_features.requests.values().any(|operation| operation.card == card && operation.save_after)
             || self.editor_features.preparing.values().any(|operation| operation.card == card && operation.save_after) { return Some(Task::none()); }
         Some(self.update_editor_features(Action::Format { card, selection: false, save_after: true }))
@@ -870,7 +870,7 @@ impl Cagents {
     }
 
     fn editor_operation(&self, card: CardId, kind: LspEditKind) -> Option<Operation> {
-        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source()) { return None; }
+        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() || !runtime.desired_file_present()) { return None; }
         let doc = self.lsp_document(card)?;
         Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }

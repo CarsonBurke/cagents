@@ -3855,6 +3855,16 @@ impl RepositoryRuntime {
         if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
         let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
         let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
+        if !document.present || !document.saved_present {
+            let Some(restoration) = version.restoration else { document.error = Some("The reloaded file's Undo metadata is unavailable. Your buffer has been kept.".into()); return Task::none(); };
+            let Some(id) = document.next_presence_id.checked_add(1) else { document.error = Some("The editor's file identity counter is exhausted.".into()); return Task::none(); };
+            document.next_presence_id = id;
+            document.saved_presence_id = id;
+            document.deletion_mode = Some(restoration.git_mode());
+            document.restorations.insert(id, restoration);
+            document.captured_presence_ids.insert(id);
+        }
+        document.saved_present = true;
         document.history.seal();
         document.saved_history_revision = document.history.reserve_revision();
         document.saved_text = version.text;
@@ -5073,7 +5083,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else { return None; };
         Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
             text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
-            writable: !self.is_saving() && !self.is_read_only_source(),
+            writable: document.present && !self.is_saving() && !self.is_read_only_source(),
         }))
     }
 
@@ -5083,7 +5093,7 @@ impl RepositoryRuntime {
         if self.is_read_only_source() { return Err("Dependency sources are read-only".into()); }
         self.flush_lsp_change();
         let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
-        if document.active_save.is_some() || document.workspace_edit.is_some()
+        if !document.present || document.active_save.is_some() || document.workspace_edit.is_some()
             || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
             return Err("An edited buffer changed after the preview was prepared".into());
         }
@@ -5647,7 +5657,7 @@ impl RepositoryRuntime {
         let syntax_theme = self.syntax_theme;
         let ignore_whitespace = self.diff_ignore_whitespace;
         let font = self.editor_font;
-        let present = [self.diff_model().is_none_or(|model| model.present[0]), true];
+        let present = [self.diff_model().is_none_or(|model| model.present[0]), document.present];
         let source_head = self
             .diff_model()
             .and_then(|model| model.source_head.clone());
@@ -5854,7 +5864,7 @@ impl RepositoryRuntime {
         self.editor_focus_target(card)?;
         self.lsp_document()?;
         self.cursor_position()?;
-        if self.is_saving() || (feature != EditorLanguageFeature::Signature && self.is_read_only_source()) { return None; }
+        if self.is_saving() || (feature != EditorLanguageFeature::Signature && (self.is_read_only_source() || !self.desired_file_present())) { return None; }
         let action = match feature {
             EditorLanguageFeature::Rename => EditorLspAction::Rename,
             EditorLanguageFeature::FormatDocument => EditorLspAction::Format { selection: false },
@@ -6383,6 +6393,7 @@ impl RepositoryRuntime {
                     document.history.revision(),
                     document.content.text_snapshot(),
                     PresenceSave {
+                        external_missing_recreate: document.recreate_missing,
                         expected_present: document.saved_present,
                         desired_present: document.present,
                         expected_mode: document.deletion_mode,
@@ -6423,7 +6434,6 @@ impl RepositoryRuntime {
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
         }
-        let recreate = matches!(&self.document, DocumentState::Editable(document) if document.recreate_missing);
         let worktree = identity.worktree.clone();
         let saved_text = text.clone();
         cosmic::task::future(async move {
@@ -6536,15 +6546,31 @@ impl RepositoryRuntime {
                 if self.disk_stamp == Some(stamp) { self.disk_poll = None; document.external_check_pending = false; return Task::none(); }
                 let Some(stamp) = stamp else {
                     self.disk_poll = None; self.disk_stamp = Some(None);
+                    if !document.saved_present {
+                        document.external_check_pending = false;
+                        if document.external_version.is_some() || document.external_deleted {
+                            document.external_version = None; document.external_deleted = false;
+                            document.conflict = false; document.error = None; self.disk_comparison = None;
+                        }
+                        return Task::none();
+                    }
                     document.external_deleted = true; document.external_version = None; document.conflict = true;
                     document.error = Some("File deleted or renamed on disk. Your buffer has been kept.".into());
                     return Task::none();
                 };
+                let capture = !document.present || !document.saved_present;
+                document.prune_restorations();
+                if capture && document.restorations.len() + usize::from(document.external_version.as_ref().is_some_and(|version| version.restoration.is_some())) >= 64 {
+                    self.disk_poll = None;
+                    document.conflict = true;
+                    document.error = Some("The file has too many retained deletion snapshots to reload safely. Your buffer and Undo history have been kept.".into());
+                    return Task::none();
+                }
                 document.external_check_pending = true;
                 let baseline = document.disk_hash; let before = document.saved_text.clone();
                 let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::editor_reload::load(&worktree, &path, &before, tone)).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    let result = tokio::task::spawn_blocking(move || crate::editor_reload::load_with_restoration(&worktree, &path, &before, tone, capture)).await.map_err(|error| error.to_string()).and_then(|result| result);
                     RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result }
                 })
             }
@@ -6559,7 +6585,9 @@ impl RepositoryRuntime {
                     Err(error) => { document.conflict = true; document.error = Some(error); self.disk_stamp = Some(Some(stamp)); return Task::none(); }
                 };
                 self.disk_stamp = Some(Some(stamp));
-                match crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) {
+                let decision = if !document.saved_present { crate::editor_reload::Decision::Conflict }
+                    else { crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) };
+                match decision {
                     crate::editor_reload::Decision::Unchanged => {
                         if document.external_version.is_some() || document.external_deleted {
                             document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.disk_comparison = None;
@@ -6591,12 +6619,31 @@ impl RepositoryRuntime {
                 let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
                 if document.active_save.is_some() { return Task::none(); }
                 if let Some(version) = document.external_version.take() {
+                    if !document.present || !document.saved_present {
+                        let Some(restoration) = version.restoration.clone() else { document.external_version = Some(version); document.error = Some("The external file's Undo metadata is unavailable. Your buffer has been kept.".into()); return Task::none(); };
+                        let Some(id) = document.next_presence_id.checked_add(1) else { document.external_version = Some(version); document.error = Some("The editor's file identity counter is exhausted.".into()); return Task::none(); };
+                        document.next_presence_id = id;
+                        document.saved_presence_id = id;
+                        document.deletion_mode = Some(restoration.git_mode());
+                        document.restorations.insert(id, restoration);
+                        document.captured_presence_ids.insert(id);
+                    }
+                    document.saved_present = true;
+                    document.recreate_missing = false;
                     document.history.seal();
                     document.saved_history_revision = document.history.reserve_revision();
                     document.disk_hash = version.content_hash; document.saved_text = version.text;
                     document.saved_snapshot = text_editor::Content::<cosmic::Renderer>::with_text(&document.saved_text).text_snapshot();
                     document.refresh_dirty();
-                } else if document.external_deleted { document.recreate_missing = true; document.dirty = true; }
+                } else if document.external_deleted {
+                    document.history.seal();
+                    document.saved_history_revision = document.history.reserve_revision();
+                    document.saved_present = false;
+                    document.saved_text.clear(); document.disk_hash = blake3::hash(b"");
+                    document.saved_snapshot = text_editor::Content::<cosmic::Renderer>::with_text("").text_snapshot();
+                    document.recreate_missing = true;
+                    document.refresh_dirty();
+                }
                 else { return self.request_save(card, true); }
                 document.conflict = false; document.error = None;
                 self.disk_comparison = None;
@@ -7460,6 +7507,12 @@ impl RepositoryRuntime {
                 if self.is_saving() { return Task::none(); }
                 if let DocumentState::Editable(document) = &mut self.document
                     && let Some(version) = document.external_version.take() { return self.reload_disk_version(card, version); }
+                if matches!(&self.document, DocumentState::Editable(document) if document.conflict && !document.external_deleted) {
+                    // Retry a failed safe observation without replacing the
+                    // retained buffer/history through an ordinary file open.
+                    self.disk_stamp = None;
+                    return self.refresh_open_document(card);
+                }
                 if self.is_saving() {
                     return Task::none();
                 }
@@ -8824,7 +8877,8 @@ impl RepositoryRuntime {
             return;
         }
         if let DocumentState::Editable(document) = &mut self.document
-            && !document.dirty && document.active_save.is_none() && document.durability_warning.is_none() {
+            && !document.dirty && document.active_save.is_none() && document.durability_warning.is_none()
+            && document.saved_present && document.history.retained_presence_ids().next().is_none() {
             self.undo_lru.insert(document.path.clone(), crate::editor_navigation::SavedUndo {
                 source: document.source.clone(), disk_hash: document.disk_hash,
                 history: std::mem::take(&mut document.history), cursor: document.content.cursor(),
@@ -13715,6 +13769,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cross_presence_reload_keeps_both_metadata_lineages_through_undo_save_redo() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap(); let root = directory.path(); let path = Path::new("source.rs");
+        std::fs::write(root.join(path), "old").unwrap();
+        std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let SaveOutcome::Absent { restoration, .. } = crate::editor::save_document_file(root, path, "", blake3::hash(b"old"), false, PresenceSave {
+            expected_present: true, desired_present: false, external_missing_recreate: false,
+            expected_mode: Some(0o100755), restoration: None,
+        }).unwrap() else { panic!("removed old lineage"); };
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "");
+        runtime.descriptor.worktree = root.into();
+        runtime.set_auto_save(false);
+        let DocumentState::Editable(document) = &mut runtime.document else { panic!() };
+        document.present = false; document.saved_present = false;
+        document.presence_id = 2; document.saved_presence_id = 2; document.next_presence_id = 2;
+        document.deletion_mode = Some(0o100755);
+        document.restorations.insert(2, restoration.clone()); document.captured_presence_ids.insert(2);
+        let identity = runtime.current_identity(card, path.into());
+        runtime.disk_poll = Some((1, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskMetadata { identity: identity.clone(), ticket: 1, result: Ok(None) }));
+        assert!(!runtime.is_dirty());
+        assert!(matches!(&runtime.document, DocumentState::Editable(document) if !document.external_deleted && document.error.is_none()));
+        std::fs::write(root.join(path), "external third\n").unwrap();
+        std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o640)).unwrap();
+        let stamp = crate::editor_reload::stamp(root, path, path).unwrap();
+        runtime.disk_poll = Some((2, Instant::now()));
+        let task = runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(stamp) });
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(&runtime.document, DocumentState::Editable(document) if document.conflict && document.external_version.as_ref().is_some_and(|version| version.restoration.is_some())));
+        drop(runtime.update(RepositoryAction::Reload { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("external third\n"));
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &runtime.document else { panic!() };
+        assert_eq!(document.presence_id, 3); assert_eq!(document.restorations.len(), 2);
+        assert!(Arc::ptr_eq(document.restorations.get(&2).unwrap(), &restoration));
+        // A later chmod must not replace the metadata that the Reload previewed.
+        std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert!(!runtime.desired_file_present());
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(!root.join(path).exists()); assert!(!runtime.saved_file_present());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "external third\n");
+        assert_eq!(std::fs::metadata(root.join(path)).unwrap().mode() & 0o777, 0o640);
+        assert!(!runtime.is_dirty());
+        runtime.retain_viewports();
+        assert!(runtime.undo_lru.take(path, path, blake3::hash(b"external third\n")).is_none(), "text-only LRU must not detach live metadata lineage from its Undo");
+        assert!(runtime.can_step_editor_history(false));
+    }
+
+    #[tokio::test]
+    async fn external_deletion_save_again_is_create_only_and_keeps_later_edits_dirty() {
+        let directory = tempfile::tempdir().unwrap(); let root = directory.path(); let path = Path::new("source.rs");
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "original");
+        runtime.descriptor.worktree = root.into(); runtime.set_auto_save(false);
+        let identity = runtime.current_identity(card, path.into()); runtime.disk_poll = Some((1, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 1, result: Ok(None) }));
+        let task = runtime.update(RepositoryAction::KeepMine { card });
+        assert!(matches!(&runtime.document, DocumentState::Editable(document) if !document.saved_present && document.active_save.is_some()));
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('!')) }));
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "original");
+        assert!(runtime.is_dirty());
+        assert!(runtime.editor_text().unwrap().contains('!'));
+        // A new missing observation admits another explicit Save Again, whose
+        // no-replace writer must preserve a newer third-party recreation.
+        std::fs::remove_file(root.join(path)).unwrap();
+        runtime.disk_stamp = None;
+        let identity = runtime.current_identity(card, path.into()); runtime.disk_poll = Some((2, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(None) }));
+        let task = runtime.update(RepositoryAction::KeepMine { card });
+        std::fs::write(root.join(path), "newer owner").unwrap();
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "newer owner");
+        assert!(runtime.save_error().is_some());
+    }
+
     #[test]
     fn server_target_coordinates_convert_utf16_after_loading_and_refuse_split_surrogates() {
         let card = CardId::new();
@@ -15630,7 +15763,7 @@ mod tests {
         runtime.disk_poll = Some((1, Instant::now()));
         drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
             text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
-            mapping: crate::editor_reload::LineMap::between(before, after),
+            mapping: crate::editor_reload::LineMap::between(before, after), restoration: None,
         }) }));
     }
 
