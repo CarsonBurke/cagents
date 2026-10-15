@@ -148,7 +148,8 @@ use crate::{
 /// Version 80 composes explicit terminal history byte budgets with provider
 /// outcomes and retained diagnostic output. Use matched executables.
 /// Version 81 attaches stable history anchors to selection, find and viewport.
-pub const PROTOCOL_VERSION: u16 = 81;
+/// Version 82 appends exact resident worker UUIDs for pinned terminal attachments.
+pub const PROTOCOL_VERSION: u16 = 82;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

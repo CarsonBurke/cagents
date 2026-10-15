@@ -31,7 +31,7 @@ pub use ipc::TerminalSpawnOptions;
 
 pub use daemon_start::{HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for};
 #[cfg(any(feature = "ui", feature = "host"))]
-pub use hosted::HostedTerminalHandle;
+pub use hosted::{HostedTerminalBinding, HostedTerminalHandle};
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition,
     RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, Underline,
