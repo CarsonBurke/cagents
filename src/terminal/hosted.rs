@@ -4336,7 +4336,7 @@ mod tests {
             if successor { actual.execution_instance = uuid::Uuid::new_v4(); }
             // A broadcast may precede Attached; it cannot inherit authority
             // from the already seeded original descriptor on mismatch.
-            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Event { terminal_id: source.id, sequence: 1, event: WireTerminalEvent::TitleChanged("before-bound-attach".into()) } }).unwrap();
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Event { terminal_id: source.id, sequence: 1, event: super::super::ipc::WireTerminalEvent::TitleChanged { title: "before-bound-attach".into() } } }).unwrap();
             write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(attach.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Attached { terminal: actual } } }).unwrap();
             let result = handle.wait_until_attached(Duration::from_secs(2));
             assert_eq!(result.is_ok(), !successor);
