@@ -634,6 +634,44 @@ impl ShortcutDraft {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn palette_highlighted_labels_use_native_ellipsis_and_reflow_after_resize() {
+        use iced::advanced::text::{self, Paragraph as _};
+        use iced::{Font, Pixels, Size};
+        type Paragraph = <cosmic::Renderer as text::Renderer>::Paragraph;
+        fn config<T>(content: T, width: f32) -> text::Text<T, Font> {
+            text::Text {
+                content,
+                bounds: Size::new(width, 18.0),
+                size: Pixels(13.0),
+                line_height: text::LineHeight::Absolute(Pixels(18.0)),
+                font: Font::MONOSPACE,
+                align_x: text::Alignment::Left,
+                align_y: iced::alignment::Vertical::Top,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::None,
+                ellipsize: text::Ellipsize::End(text::EllipsizeHeightLimit::Lines(1)),
+            }
+        }
+        let label = "Refactor this very long workspace label without wrapping or clipping the match";
+        let spans: Vec<text::Span<'_, (), Font>> = vec![
+            text::Span::new("Refactor").color(iced::Color::from_rgb(0.9, 0.2, 0.2)),
+            text::Span::new(&label[8..]),
+        ];
+        for width in [64.0, 180.0] {
+            let plain = Paragraph::with_text(config(label, width));
+            let mut highlighted = Paragraph::with_spans(config(spans.as_slice(), width));
+            assert!(highlighted.min_bounds().width <= width + 0.5, "rich labels must apply the ellipsis strategy, not only clip their source: {:?}", highlighted.min_bounds());
+            assert!(highlighted.min_bounds().height <= 18.5);
+            assert!((highlighted.min_bounds().width - plain.min_bounds().width).abs() <= 0.5);
+            highlighted.resize(Size::new(32.0, 18.0));
+            assert!(highlighted.min_bounds().width <= 32.5);
+            highlighted.resize(Size::new(1200.0, 18.0));
+            assert!(highlighted.min_bounds().width > width, "resizing restores previously ellipsized text");
+            assert!(highlighted.min_bounds().height <= 18.5);
+        }
+    }
+
     use super::*;
 
     /// Run a real scroll operation against the retained native widget tree.
