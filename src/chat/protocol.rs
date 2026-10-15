@@ -353,7 +353,10 @@ pub trait Adapter: Send {
     /// Exact policy coverage for a new conversation that may automatically
     /// receive an unaccepted request. A UI settings projection is insufficient.
     /// Only an adapter with a fresh provider settings response may attest it.
-    fn account_continuation_policy(&self, _snapshot: &crate::chat::Snapshot) -> Result<crate::chat::PermissionSettings, String> {
+    fn account_continuation_policy(
+        &self,
+        _snapshot: &crate::chat::Snapshot,
+    ) -> Result<crate::chat::PermissionSettings, String> {
         Err("This provider cannot confirm its complete current permission policy for Automatic continuation; continue separately with explicit controls".into())
     }
     /// Pending setting acknowledgments must settle before account metadata can

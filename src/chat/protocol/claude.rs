@@ -1677,8 +1677,14 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn account_continuation_policy(&self, snapshot: &chat::Snapshot) -> Result<chat::PermissionSettings, String> {
-        let policy = self.permissions.as_ref().ok_or("Refresh Claude permission settings before Automatic continuation")?;
+    fn account_continuation_policy(
+        &self,
+        snapshot: &chat::Snapshot,
+    ) -> Result<chat::PermissionSettings, String> {
+        let policy = self
+            .permissions
+            .as_ref()
+            .ok_or("Refresh Claude permission settings before Automatic continuation")?;
         policy.continuation_settings(snapshot)
     }
 
@@ -10206,24 +10212,75 @@ mod account_continuation_capture_tests {
             "sources":[{"source":"flagSettings","settings":{"permissions":{"deny":["Read(.env)"]},"autoMode":{"environment":[]}}}]})
     }
 
-    fn start(directory: &std::path::Path, label: &str, policy: Value, busy: bool) -> (chat::runtime::LocalHandle, PathBuf) {
-        start_with_speed(directory,label,policy,busy,Some(chat::FastMode::default()))
+    fn start(
+        directory: &std::path::Path,
+        label: &str,
+        policy: Value,
+        busy: bool,
+    ) -> (chat::runtime::LocalHandle, PathBuf) {
+        start_with_speed(
+            directory,
+            label,
+            policy,
+            busy,
+            Some(chat::FastMode::default()),
+        )
     }
-    fn start_with_speed(directory: &std::path::Path, label: &str, policy: Value, busy: bool, speed:Option<chat::FastMode>) -> (chat::runtime::LocalHandle, PathBuf) {
-        let models:Vec<Model> = ["launch-model", "current-model"].into_iter().map(|id| Model {
-            id:id.into(),label:id.into(),reasoning:vec!["low".into(),"high".into()],
-        }).collect();
-        let adapter = Claude {ready:true,busy,models:models.clone(),selected:Some("launch-model".into()),reasoning:Some("low".into()),
-            fast_mode:speed.clone(),..Default::default()};
+    fn start_with_speed(
+        directory: &std::path::Path,
+        label: &str,
+        policy: Value,
+        busy: bool,
+        speed: Option<chat::FastMode>,
+    ) -> (chat::runtime::LocalHandle, PathBuf) {
+        let models: Vec<Model> = ["launch-model", "current-model"]
+            .into_iter()
+            .map(|id| Model {
+                id: id.into(),
+                label: id.into(),
+                reasoning: vec!["low".into(), "high".into()],
+            })
+            .collect();
+        let adapter = Claude {
+            ready: true,
+            busy,
+            models: models.clone(),
+            selected: Some("launch-model".into()),
+            reasoning: Some("low".into()),
+            fast_mode: speed.clone(),
+            ..Default::default()
+        };
         let capabilities = adapter.capabilities();
-        let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
-            Event::Capabilities(capabilities),Event::Models {models,selected:Some("launch-model".into()),reasoning:Some("low".into())},
-            Event::PermissionMode(Some("plan".into()))],..Default::default()};
-        if let Some(speed)=speed { initial.events.push(Event::FastMode(speed)); }
-        start_actor(directory,label,policy,adapter,initial)
+        let mut initial = Step {
+            events: vec![
+                Event::Ready(true),
+                Event::Status {
+                    busy,
+                    detail: String::new(),
+                },
+                Event::Capabilities(capabilities),
+                Event::Models {
+                    models,
+                    selected: Some("launch-model".into()),
+                    reasoning: Some("low".into()),
+                },
+                Event::PermissionMode(Some("plan".into())),
+            ],
+            ..Default::default()
+        };
+        if let Some(speed) = speed {
+            initial.events.push(Event::FastMode(speed));
+        }
+        start_actor(directory, label, policy, adapter, initial)
     }
 
-    fn start_actor(directory:&std::path::Path,label:&str,policy:Value,adapter:Claude,mut initial:Step)->(chat::runtime::LocalHandle,PathBuf) {
+    fn start_actor(
+        directory: &std::path::Path,
+        label: &str,
+        policy: Value,
+        adapter: Claude,
+        mut initial: Step,
+    ) -> (chat::runtime::LocalHandle, PathBuf) {
         let log = directory.join(format!("{label}-wire.jsonl"));
         let recipe = crate::model::LaunchRecipe {
             program: "/usr/bin/python3".into(),
@@ -10246,7 +10303,15 @@ for line in sys.stdin:
         };
         let spec = ProcessSpec::from(&recipe);
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-        let handle = chat::runtime::LocalHandle::start(spec,Box::new(adapter),initial,store,None,|_|{}).unwrap();
+        let handle = chat::runtime::LocalHandle::start(
+            spec,
+            Box::new(adapter),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
         (handle, log)
     }
 
@@ -10254,75 +10319,150 @@ for line in sys.stdin:
     fn live_continuation_capture_reads_actual_current_controls_without_prompt_or_close() {
         let directory = tempfile::tempdir().unwrap();
         let (handle, log) = start(directory.path(), "known", policy(), false);
-        handle.command(Command::SetModel {model:"current-model".into(),reasoning:Some("high".into())}).unwrap();
+        handle
+            .command(Command::SetModel {
+                model: "current-model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
         let before = std::fs::read_to_string(&log).unwrap();
-        let options = handle.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(options.controls().model.as_deref(),Some("current-model"));
-        assert_eq!(options.controls().reasoning.as_deref(),Some("high"));
-        assert_eq!(options.controls().permission_mode.as_deref(),Some("plan"));
-        assert_eq!(options.controls().fast_mode,Some(false));
-        assert_eq!(options.controls().permissions.as_ref().unwrap().rules[0].rule,"Read(.env)");
+        let options = handle
+            .capture_continuation_options(Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.controls().model.as_deref(), Some("current-model"));
+        assert_eq!(options.controls().reasoning.as_deref(), Some("high"));
+        assert_eq!(options.controls().permission_mode.as_deref(), Some("plan"));
+        assert_eq!(options.controls().fast_mode, Some(false));
+        assert_eq!(
+            options.controls().permissions.as_ref().unwrap().rules[0].rule,
+            "Read(.env)"
+        );
         let after = std::fs::read_to_string(log).unwrap();
-        let read:Vec<Value> = after[before.len()..].lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(read.len(),1,"capture sends only its fresh getter");
-        assert_eq!(read[0]["request"]["subtype"],"get_settings");
-        assert!(!handle.is_completed(),"metadata capture retains the original live actor");
+        let read: Vec<Value> = after[before.len()..]
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(read.len(), 1, "capture sends only its fresh getter");
+        assert_eq!(read[0]["request"]["subtype"], "get_settings");
+        assert!(
+            !handle.is_completed(),
+            "metadata capture retains the original live actor"
+        );
         handle.close().unwrap();
     }
 
     #[test]
     fn live_continuation_refuses_unattested_effort_absence_from_initialize_metadata() {
-        let directory=tempfile::tempdir().unwrap();
-        for (label,model) in [("missing-catalog",json!({"value":"launch-model"})),("empty-catalog",json!({"value":"launch-model","supportedEffortLevels":[]}))] {
-            let mut adapter=Claude::default();
-            let initialize=adapter.initialize().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for (label, model) in [
+            ("missing-catalog", json!({"value":"launch-model"})),
+            (
+                "empty-catalog",
+                json!({"value":"launch-model","supportedEffortLevels":[]}),
+            ),
+        ] {
+            let mut adapter = Claude::default();
+            let initialize = adapter.initialize().unwrap();
             let initial=adapter.receive(json!({"type":"control_response","response":{"subtype":"success",
                 "request_id":initialize.writes[0]["request_id"],"response":{"models":[model],"model":"launch-model","current_permission_mode":"plan","fast_mode_state":"off"}}})).unwrap();
-            adapter.command_ack(); adapter.control_replies();
-            let (handle,_)=start_actor(directory.path(),label,policy(),adapter,initial);
-            let snapshot=handle.snapshot(None).unwrap();
-            assert!(snapshot.models[0].reasoning.is_empty()); assert!(snapshot.reasoning.is_none());
-            assert!(handle.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err().contains("not confirmed all"));
-            assert!(!handle.is_completed()); handle.close().unwrap();
+            adapter.command_ack();
+            adapter.control_replies();
+            let (handle, _) = start_actor(directory.path(), label, policy(), adapter, initial);
+            let snapshot = handle.snapshot(None).unwrap();
+            assert!(snapshot.models[0].reasoning.is_empty());
+            assert!(snapshot.reasoning.is_none());
+            assert!(
+                handle
+                    .capture_continuation_options(Instant::now() + Duration::from_secs(5))
+                    .unwrap_err()
+                    .contains("not confirmed all")
+            );
+            assert!(!handle.is_completed());
+            handle.close().unwrap();
         }
     }
 
     #[test]
     fn live_continuation_distinguishes_unknown_speed_from_confirmed_nonchangeable_off() {
-        let directory=tempfile::tempdir().unwrap();
-        let (missing, _)=start_with_speed(directory.path(),"missing-speed",policy(),false,None);
+        let directory = tempfile::tempdir().unwrap();
+        let (missing, _) =
+            start_with_speed(directory.path(), "missing-speed", policy(), false, None);
         assert!(!missing.snapshot(None).unwrap().capabilities.fast_mode);
         assert!(missing.snapshot(None).unwrap().fast_mode.is_none());
-        assert!(missing.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err().contains("not confirmed all"));
-        assert!(!missing.is_completed()); missing.close().unwrap();
-        let (disabled, _)=start_with_speed(directory.path(),"disabled-speed",policy(),false,Some(chat::FastMode {
-            state:chat::FastModeState::Off,disabled_reason:Some("org_disabled".into()),
-        }));
+        assert!(
+            missing
+                .capture_continuation_options(Instant::now() + Duration::from_secs(5))
+                .unwrap_err()
+                .contains("not confirmed all")
+        );
+        assert!(!missing.is_completed());
+        missing.close().unwrap();
+        let (disabled, _) = start_with_speed(
+            directory.path(),
+            "disabled-speed",
+            policy(),
+            false,
+            Some(chat::FastMode {
+                state: chat::FastModeState::Off,
+                disabled_reason: Some("org_disabled".into()),
+            }),
+        );
         assert!(!disabled.snapshot(None).unwrap().capabilities.fast_mode);
-        assert_eq!(disabled.snapshot(None).unwrap().fast_mode,Some(chat::FastMode {state:chat::FastModeState::Off,disabled_reason:Some("org_disabled".into())}));
-        let captured=disabled.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(captured.controls().fast_mode,Some(false));
-        assert!(!disabled.is_completed()); disabled.close().unwrap();
+        assert_eq!(
+            disabled.snapshot(None).unwrap().fast_mode,
+            Some(chat::FastMode {
+                state: chat::FastModeState::Off,
+                disabled_reason: Some("org_disabled".into())
+            })
+        );
+        let captured = disabled
+            .capture_continuation_options(Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.controls().fast_mode, Some(false));
+        assert!(!disabled.is_completed());
+        disabled.close().unwrap();
     }
 
     #[test]
     fn live_continuation_capture_refuses_busy_unknown_policy_and_expired_budget() {
         let directory = tempfile::tempdir().unwrap();
-        let (busy, log) = start(directory.path(),"busy",policy(),true);
-        assert!(busy.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().is_none());
-        assert!(!log.exists(),"proved busy must not issue even the getter");
+        let (busy, log) = start(directory.path(), "busy", policy(), true);
+        assert!(
+            busy.capture_continuation_options(Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!log.exists(), "proved busy must not issue even the getter");
         assert!(!busy.is_completed());
         busy.close().unwrap();
         let mut unsupported = policy();
-        unsupported["sources"][0]["settings"]["permissions"]["additionalDirectories"] = json!(["/other-root"]);
-        let (unknown, log) = start(directory.path(),"unsupported",unsupported,false);
-        let error = unknown.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err();
+        unsupported["sources"][0]["settings"]["permissions"]["additionalDirectories"] =
+            json!(["/other-root"]);
+        let (unknown, log) = start(directory.path(), "unsupported", unsupported, false);
+        let error = unknown
+            .capture_continuation_options(Instant::now() + Duration::from_secs(5))
+            .unwrap_err();
         assert!(error.contains("cannot be transferred"));
-        let frames:Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(frames.len(),1); assert_eq!(frames[0]["request"]["subtype"],"get_settings");
-        assert!(!unknown.is_completed()); unknown.close().unwrap();
-        let (expired, log) = start(directory.path(),"expired",policy(),false);
-        assert!(expired.capture_continuation_options(Instant::now()-Duration::from_millis(1)).unwrap_err().contains("budget expired"));
-        assert!(!log.exists()); assert!(!expired.is_completed()); expired.close().unwrap();
+        let frames: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["request"]["subtype"], "get_settings");
+        assert!(!unknown.is_completed());
+        unknown.close().unwrap();
+        let (expired, log) = start(directory.path(), "expired", policy(), false);
+        assert!(
+            expired
+                .capture_continuation_options(Instant::now() - Duration::from_millis(1))
+                .unwrap_err()
+                .contains("budget expired")
+        );
+        assert!(!log.exists());
+        assert!(!expired.is_completed());
+        expired.close().unwrap();
     }
 }
