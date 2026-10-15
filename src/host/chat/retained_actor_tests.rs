@@ -126,3 +126,139 @@ for line in sys.stdin:
 "#).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+/// This boundary kills a separate host owner process with SIGKILL. Unlike a
+/// lease-rotation-only fixture, no destructor or old proxy can help recovery.
+#[test]
+fn slow_turn_survives_sigkill_of_the_host_owner_process() {
+    const EXACT: &str = "host::chat::retained_actor_tests::slow_turn_survives_sigkill_of_the_host_owner_process";
+    const ROLE: &str = "CAGENTS_RETAINED_HOST_PROCESS_ROLE";
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Receipt {
+        identity: chat::runtime::ActorIdentity,
+        agent: crate::model::AgentId,
+        run: crate::model::RunId,
+        session: TerminalId,
+    }
+    fn child(root: &Path, role: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", EXACT, "--nocapture"]).env_clear()
+            .env(ROLE, role).env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root).env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run")).env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config")).env("XDG_CACHE_HOME", root.join("cache"))
+            .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()));
+        command
+    }
+    if std::env::var_os(ROLE).is_none() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in ["home/.claude", "run", "data", "config", "cache", "bin", "project"] { fs::create_dir_all(root.join(path)).unwrap(); }
+        install_provider(&root.join("bin/claude"));
+        // Cleanup uses a separate private host lease; the parallel test runner
+        // never changes its own HOME/runtime or acquires the production lease.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = child(&self.0, "cleanup").output(); }
+        }
+        let _cleanup = Cleanup(root.to_owned());
+        struct SourceOwner(std::process::Child);
+        impl Drop for SourceOwner {
+            fn drop(&mut self) {
+                if self.0.try_wait().is_ok_and(|status| status.is_none()) { let _ = self.0.kill(); }
+                let _ = self.0.wait();
+            }
+        }
+        let mut owner = SourceOwner(child(root, "source")
+            .stdout(fs::File::create(root.join("source.stdout")).unwrap())
+            .stderr(fs::File::create(root.join("source.stderr")).unwrap()).spawn().unwrap());
+        let owner_identity = crate::daemon::holder_registry::Process::read(owner.0.id() as i32).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !root.join("owner-receipt.json").exists() {
+            assert!(owner.0.try_wait().unwrap().is_none(), "source host failed: {}", fs::read_to_string(root.join("source.stderr")).unwrap_or_default());
+            assert!(Instant::now() < deadline, "source host never published its exact owner receipt");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(owner_identity.is_current());
+        owner.0.kill().unwrap();
+        assert_eq!(owner.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!owner_identity.is_current(), "the old host owner must actually be gone");
+        wait_until(|| root.join("provider-done").exists(), "provider did not finish while no host owner existed");
+        let output = child(root, "successor").output().unwrap();
+        assert!(output.status.success(), "successor failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let role = std::env::var(ROLE).unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = HostSessionProof { host_session_id: HostSessionId::new("sigkill-host-fixture"), boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: HostIncarnation::new(&role) };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    if role == "cleanup" {
+        // Only exact holder records inside this fixture's private namespace.
+        let directory = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        if let Ok(records) = crate::daemon::holder_registry::discover(&directory, &proof.boot_id, crate::daemon::holder_registry::Kind::Native) {
+            for record in records {
+                if let Ok(inspection) = Handle::inspect_remote(&record, proof.clone())
+                    && let Ok(handle) = Handle::adopt_remote(&record, inspection.source, proof.clone(), |_| {})
+                    && handle.close().is_ok() && handle.finish_retained_close().is_ok() { continue; }
+                // On a failing assertion there may be uncommitted outcomes;
+                // never misreport that as semantic retirement. Kill only the
+                // exact fixture-created process incarnations for test hygiene.
+                for process in [&record.root, &record.holder] { if process.is_current() { unsafe { libc::kill(process.pid, libc::SIGKILL); } } }
+            }
+        }
+        return;
+    }
+    let path = root.join("registry.sqlite3");
+    let mut registry = super::super::model::Registry::at(&path).unwrap();
+    let accepted = if role == "source" {
+        registry.apply(&ModelEdit::OpenProject { repository: root.join("project"), name: "Killed host fixture".into(), kind: ProjectKind::Folder }).unwrap();
+        Some(registry.submit_agent(&Origin::User, &Submit { name: None, destination: Destination::New(Spec { provider: Provider::Claude, account: Some(crate::account::Account::system(Provider::Claude).id()), target: ExecutionTarget { repository: root.join("project"), directory: root.join("project"), placement: None }, surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None }), prompt: "One exact killed-host turn".into(), idempotency_key: "one-killed-host-turn".into() }, 1).unwrap())
+    } else { None };
+    let mut state = HostState::new(proof);
+    state.install_model(registry);
+    let host = Arc::new(HostLock::new(state));
+    let _notifications = super::super::notifications::Broker::start(&host, crate::notifications::Application::Cagents).unwrap();
+    host.lock().unwrap().notifications = Some(_notifications.handle());
+    if let Some(accepted) = accepted {
+        let session = chat::fresh_session(Provider::Claude, TerminalId::new(), root.join("project"), &crate::account::Account::system(Provider::Claude)).unwrap();
+        let id = session.id;
+        start_execution(&host, 0, session, Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap())).unwrap();
+        let (source, handle) = { let state = host.lock().unwrap(); (state.chats[&id].session.clone(), state.chats[&id].handle.clone()) };
+        super::super::agent_execution::registry(&host).unwrap().lock().unwrap().bind_agent(accepted.agent.id, None, crate::agent_execution::HostedSession::Chat(source)).unwrap();
+        handle.command_for_run(accepted.run.id, chat::Command::Prompt { text: "One exact killed-host turn".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
+        wait_until(|| fs::read_to_string(root.join("produced")).unwrap_or_default().lines().count() >= 3, "provider never began");
+        let receipt = Receipt { identity: handle.actor_identity().unwrap(), agent: accepted.agent.id, run: accepted.run.id, session: id };
+        let temporary = root.join("owner-receipt.pending");
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary).unwrap();
+        serde_json::to_writer(&file, &receipt).unwrap();
+        file.sync_all().unwrap();
+        fs::rename(temporary, root.join("owner-receipt.json")).unwrap();
+        loop { thread::park(); }
+    }
+    let receipt: Receipt = serde_json::from_slice(&fs::read(root.join("owner-receipt.json")).unwrap()).unwrap();
+    assert!(receipt.identity.record.root.is_current(), "the original provider must survive the host SIGKILL");
+    restore_orphaned_native(&host, &[]).unwrap();
+    let handle = host.lock().unwrap().chats[&receipt.session].handle.clone();
+    assert_eq!(handle.actor_identity(), Some(receipt.identity.clone()));
+    let registry = super::super::agent_execution::registry(&host).unwrap();
+    let retained = retained_actor::retained_runs(&host);
+    registry.lock().unwrap().interrupt_unproven_agent_runs_except(2, &retained).unwrap();
+    wait_until(|| registry.lock().unwrap().agent_run(receipt.run).unwrap().state == State::Succeeded, "exact retained result never committed");
+    let run = registry.lock().unwrap().agent_run(receipt.run).unwrap();
+    handle.set_visible(true);
+    wait_until(|| handle.snapshot(None).is_some_and(|snapshot| snapshot.items.len() >= 40), "transcript did not hydrate after host SIGKILL");
+    let snapshot = handle.snapshot(None).unwrap();
+    let text = snapshot.items.iter().filter_map(|item| match &item.content { chat::ItemContent::Text { text, thinking: false, .. } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
+    for index in 0..40 {
+        let marker = format!("FRAME_{index:03}|");
+        assert_eq!(run.result.text.matches(&marker).count(), 1);
+        assert_eq!(text.matches(&marker).count(), 1);
+    }
+    assert_eq!(fs::read_to_string(root.join("prompts")).unwrap().lines().count(), 1);
+    super::super::agent_execution::close(&host, &Authority::default(), receipt.agent).unwrap();
+    wait_until(|| !receipt.identity.record.holder.is_current() && !receipt.identity.record.root.is_current(), "explicit close did not retire exact native owners");
+}
