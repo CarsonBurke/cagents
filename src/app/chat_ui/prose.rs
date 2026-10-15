@@ -241,9 +241,12 @@ pub(super) fn view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        cached,
+        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        revision: cached.revision,
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        path: vec![0],
         dark: cosmic::theme::is_dark(),
-        find,
+        find: find.map(Arc::from),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -260,9 +263,12 @@ pub(super) fn content_view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        cached,
+        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        revision: cached.revision,
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
         dark: cosmic::theme::is_dark(),
-        find,
+        find: find.map(Arc::from),
     }
     .items(content.items(), settings)
 }
@@ -275,7 +281,10 @@ pub(super) fn items_for_test(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        cached,
+        blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
+        revision: cached.revision,
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        path: vec![0],
         dark: true,
         find: None,
     }
@@ -285,28 +294,57 @@ pub(super) fn items_for_test(
     )
 }
 
-struct Renderer<'c> {
-    find: Option<&'c str>,
+#[derive(Clone)]
+struct Renderer {
+    item: Arc<str>,
+    path: Vec<u32>,
+    find: Option<Arc<str>>,
     target: Target,
-    cached: &'c CachedItem,
+    blocks: Arc<HashMap<u64, Arc<[Span<'static, String>]>>>,
+    revision: u64,
     dark: bool,
 }
 
-impl Renderer<'_> {
+impl Renderer {
+    fn child(&self, index: u32) -> Self {
+        let mut path = self.path.clone(); path.push(index);
+        Self { item: self.item.clone(), path, find: self.find.clone(), target: self.target,
+            blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
+    }
+    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
+        selectable_prose::Logical { identity: selection::logical_identity(&self.item, &self.path), start }
+    }
     fn items(
         &self,
         items: &[markdown::Item],
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        widget::column::with_children(
-            items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| self.item(item, index, settings))
-                .collect::<Vec<_>>(),
-        )
-        .spacing(settings.spacing.0)
-        .into()
+        if items.len() <= 4 {
+            return widget::column::with_children(items.iter().enumerate()
+                .map(|(index, item)| self.child(index as u32).item(item, index, settings)).collect::<Vec<_>>())
+                .spacing(settings.spacing.0).into();
+        }
+        let rows = items.iter().enumerate().map(|(index, item)| {
+            use std::hash::{Hash, Hasher};
+            let renderer = self.child(index as u32);
+            let key = selection::logical_identity(&renderer.item, &renderer.path);
+            let mut revision = std::hash::DefaultHasher::new();
+            (self.revision, settings.text_size.0.to_bits(), settings.style.font, &self.find, self.dark).hash(&mut revision);
+            let revision = revision.finish();
+            let estimate = match item {
+                markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) =>
+                    (text.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0) * settings.text_size.0 * 1.3,
+                markdown::Item::CodeBlock { code, .. } => (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32) * settings.code_size.0 * 1.3 + 48.0,
+                _ => 80.0,
+            } + if index == 0 { 0.0 } else { settings.spacing.0 };
+            let item = item.clone();
+            let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                retained::kept(revision, move || widget::container(renderer.item(&item, index, settings))
+                    .padding(iced::Padding::ZERO.top(if index == 0 { 0.0 } else { settings.spacing.0 })).into())
+            });
+            row.anchor = true; row
+        }).collect();
+        virtualized::column(rows, Default::default())
     }
 
     fn item(
@@ -318,9 +356,9 @@ impl Renderer<'_> {
         use markdown::Item;
         match item {
             Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find)
+                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)))
             }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find),
+            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0))),
             Item::CodeBlock { language, code, .. } => {
                 self.code_block(settings, language.as_deref(), code)
             }
@@ -337,21 +375,23 @@ impl Renderer<'_> {
                 let mut rows = Vec::new();
                 let alt = alt.spans(settings.style);
                 if !alt.is_empty() {
-                    rows.push(selectable_prose::text(
+                    rows.push(leaf_text(
                         alt,
                         settings.text_size,
                         iced::Font::default(),
                         self.target,
-                        self.find,
+                        self.find.as_deref(),
+                        Some(self.child(0).logical(Arc::from(""), 0)),
                     ));
                 }
                 if !title.is_empty() {
-                    rows.push(selectable_prose::text(
+                    rows.push(leaf_text(
                         vec![Span::new(title.clone())].into(),
                         design::TEXT_CAPTION.into(),
                         iced::Font::default(),
                         self.target,
-                        self.find,
+                        self.find.as_deref(),
+                        Some(self.child(1).logical(Arc::from(""), 0)),
                     ));
                 }
                 rows.push(
@@ -425,7 +465,7 @@ impl Renderer<'_> {
                 }
                 iced::widget::row![
                     marker,
-                    selection::wrap(self.items(items, nested), selection::Kind::ListItem(prefix))
+                    selection::wrap(self.child(index as u32).items(items, nested), selection::Kind::ListItem(prefix))
                 ]
                 .spacing(settings.spacing.0)
                 .into()
@@ -450,7 +490,7 @@ impl Renderer<'_> {
             columns.iter().enumerate().map(|(index, column)| {
                 table::column(
                     selection::wrap(
-                        self.items(&column.header, settings),
+                        self.child(0).child(index as u32).items(&column.header, settings),
                         selection::Kind::Cell {
                             row: 0,
                             column: index,
@@ -458,7 +498,7 @@ impl Renderer<'_> {
                     ),
                     move |row: usize| {
                         let content: Element<'static, Message> = match rows[row].cells.get(index) {
-                            Some(cells) => self.items(cells, settings),
+                            Some(cells) => self.child(row as u32 + 1).child(index as u32).items(cells, settings),
                             None => iced::widget::text("").into(),
                         };
                         selection::wrap(
@@ -500,17 +540,17 @@ impl Renderer<'_> {
         language: Option<&str>,
         code: &str,
     ) -> Element<'static, Message> {
-        let spans = self
-            .cached
-            .block(language, code)
-            .map(|block| block.spans(self.dark).clone())
-            .unwrap_or_else(|| vec![Span::new(code.to_owned())].into());
-        let text = selectable_prose::text(
+        let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT).then(|| self.blocks.get(&fence_key(language.unwrap_or_default(), code))).flatten()
+            .cloned()
+            .unwrap_or_else(|| if code.len() > 2048 { Arc::from([]) } else { vec![Span::new(code.to_owned())].into() });
+        let text = code_text(
+            Arc::from(code),
             spans,
             settings.code_size,
             CodeBlock::FONT,
             self.target,
-            self.find,
+            self.find.as_deref(),
+            Some(self.logical(Arc::from(""), 0)),
         );
         step::code_frame(
             widget::scrollable(
@@ -538,9 +578,10 @@ fn heading(
     index: usize,
     target: Target,
     find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(selectable_prose::text(
+    widget::container(leaf_text(
         text.spans(heading_style(settings, level)),
         match level {
             HeadingLevel::H1 => settings.h1_size,
@@ -553,6 +594,7 @@ fn heading(
         settings.style.font,
         target,
         find,
+        logical,
     ))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
@@ -582,19 +624,120 @@ fn heading_style(settings: markdown::Settings, level: markdown::HeadingLevel) ->
     }
 }
 
+fn leaf_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced::Font,
+    target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>) -> Element<'static, Message> {
+    if let Some(logical) = logical { selectable_prose::logical_text(spans, size, font, target, find, logical) }
+    else { selectable_prose::text(spans, size, font, target, find) }
+}
+
+/// Read-only code shares one source, and only styles/shapes bounded mounted
+/// ranges. The logical block keeps source newlines intact for selection/copy.
+pub(super) fn code_text(
+    text: Arc<str>, spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
+    font: iced::Font, target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>,
+) -> Element<'static, Message> {
+    if text.len() <= 2048 {
+        let spans = if spans.is_empty() { vec![Span::new(text.to_string())].into() } else { spans };
+        return leaf_text(spans, size, font, target, find, logical);
+    }
+    let mut starts = Vec::with_capacity(spans.len() + 1);
+    starts.push(0usize);
+    for span in spans.iter() { starts.push(starts.last().copied().unwrap() + span.text.len()); }
+    let starts: Arc<[usize]> = starts.into();
+    let find: Option<Arc<str>> = find.map(Arc::from);
+    let rows = chunk_ranges(&text).into_iter().map(|range| {
+        use std::hash::{Hash, Hasher};
+        let mut key = std::hash::DefaultHasher::new();
+        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
+        let key = key.finish();
+        let mut revision = std::hash::DefaultHasher::new();
+        (&text[range.clone()], &find, font, size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
+        let revision = revision.finish();
+        let estimate = ((range.len() as f32 * size.0 * 0.6 / design::READABLE_MEASURE).ceil().max(1.0)
+            + text[range.clone()].matches('\n').count() as f32) * size.0 * 1.3;
+        let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
+        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
+        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+            retained::kept(revision, move || {
+                let spans = if spans.is_empty() { vec![Span::new(text[range.clone()].to_owned())].into() }
+                    else { sliced_spans(&spans, &starts, range.clone()) };
+                leaf_text(spans, size, font, target, find.as_deref(), logical.clone())
+            })
+        });
+        row.anchor = true; row
+    }).collect();
+    virtualized::column(rows, Default::default())
+}
+
+fn sliced_spans(spans: &[Span<'static, String>], starts: &[usize], range: std::ops::Range<usize>) -> Arc<[Span<'static, String>]> {
+    let first = starts.partition_point(|start| *start <= range.start).saturating_sub(1);
+    spans.iter().enumerate().skip(first).take_while(|(index, _)| starts[*index] < range.end)
+        .filter_map(|(index, span)| {
+            let start = range.start.saturating_sub(starts[index]);
+            let end = range.end.saturating_sub(starts[index]).min(span.text.len());
+            (start < end).then(|| Span { text: span.text[start..end].to_owned().into(), size: span.size,
+                line_height: span.line_height, font: span.font, color: span.color, link: span.link.clone(),
+                highlight: span.highlight, padding: span.padding, underline: span.underline, strikethrough: span.strikethrough })
+        }).collect()
+}
+
+/// A bounded visual chunk. Copy and selection keep the original logical
+/// paragraph, so splitting here introduces no whitespace into clipboard text.
+pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    const BYTES: usize = 2048;
+    const LINES: usize = 40;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + BYTES).min(text.len());
+        while !text.is_char_boundary(end) { end -= 1; }
+        if let Some((line, _)) = text[start..end].match_indices('\n').nth(LINES - 1) { end = start + line + 1; }
+        // Prefer a source whitespace boundary near the cap. A giant token is
+        // still bounded and wraps with the same glyph fallback as short prose.
+        if end < text.len() && let Some((at, ch)) = text[start..end].char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
+            let boundary = start + at + ch.len_utf8();
+            if boundary >= start + BYTES / 2 { end = boundary; }
+        }
+        ranges.push(start..end); start = end;
+    }
+    ranges
+}
+
 fn paragraph(
     settings: markdown::Settings,
     text: &markdown::Text,
     target: Target,
     find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
-    selectable_prose::text(
-        text.spans(settings.style),
-        settings.text_size,
-        settings.style.font,
-        target,
-        find,
-    )
+    if text.len() <= 2048 {
+        return leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical);
+    }
+    let plain = text.plain();
+    let text = Arc::new(text.clone());
+    let find: Option<Arc<str>> = find.map(Arc::from);
+    let rows = chunk_ranges(&plain).into_iter().map(|range| {
+        use std::hash::{Hash, Hasher};
+        let mut key = std::hash::DefaultHasher::new();
+        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
+        let key = key.finish();
+        let mut revision = std::hash::DefaultHasher::new();
+        (&plain[range.clone()], &find, settings.style.font, settings.text_size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
+        let revision = revision.finish();
+        let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0)
+            + plain[range.clone()].matches('\n').count() as f32) * settings.text_size.0 * 1.3;
+        let text = text.clone(); let find = find.clone();
+        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
+        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+            retained::kept(revision, move || {
+                leaf_text(text.spans_range(settings.style, range.clone()), settings.text_size, settings.style.font,
+                    target, find.as_deref(), logical.clone())
+            })
+        });
+        row.anchor = true;
+        row
+    }).collect();
+    virtualized::column(rows, Default::default())
 }
 
 /// A table column's alignment as the layout takes it.

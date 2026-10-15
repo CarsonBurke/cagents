@@ -7,7 +7,7 @@ use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
 use base64::Engine as _;
-use cosmic::widget::{markdown, text_editor};
+use cosmic::widget::text_editor;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -23,6 +23,7 @@ mod fold;
 mod hover;
 mod images;
 mod layout;
+mod markdown;
 mod markdown_source;
 mod monospace;
 mod permissions;
@@ -36,6 +37,7 @@ mod thumbnails;
 mod tool_text;
 mod turn;
 mod view;
+mod virtualized;
 
 pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
@@ -1226,6 +1228,9 @@ impl CachedItem {
         for_each_fence(
             self.markdown.items().iter().chain(coordinated),
             &mut |language, code| {
+                // Above the syntax budget, raw bounded visible chunks are
+                // prepared by prose. Do not hash/copy the full growing fence.
+                if code.len() > Self::HIGHLIGHT_LIMIT { return; }
                 let key = fence_key(language.unwrap_or_default(), code);
                 last = Some(key);
                 if blocks.contains_key(&key) {
@@ -1277,6 +1282,7 @@ impl CachedItem {
     /// The fence whose info string is `language` and whose text is `code`,
     /// where the cache holds it.
     fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
+        if code.len() > Self::HIGHLIGHT_LIMIT { return None; }
         self.blocks
             .get(&fence_key(language.unwrap_or_default(), code))
     }
@@ -1566,6 +1572,8 @@ pub(super) struct Runtime {
     /// the walk goes past the newest message.
     history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
+    selection_bookmarks: std::cell::RefCell<HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>>,
+    selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -2122,6 +2130,8 @@ impl Runtime {
             history: Vec::new(),
             history_cursor: None,
             history_stash: None,
+            selection_bookmarks: Default::default(),
+            selection_document: Default::default(),
             scroll: view::Scroll::default(),
             subagent_scroll: HashMap::new(),
             page_request: None,

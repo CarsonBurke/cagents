@@ -1,6 +1,7 @@
 //! Owned selectable rich text: selection uses the same shaped paragraph as prose.
 use super::*;
 use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
+use iced::advanced::Renderer as _;
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
@@ -15,6 +16,8 @@ static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 pub(super) struct State {
     pub(super) identity: u64,
+    pub(super) logical: Option<Logical>,
+    pub(super) logical_active: bool,
     a11y_id: iced::advanced::widget::Id,
     pub(super) plain: Arc<str>,
     pub(super) target: Option<Target>,
@@ -24,10 +27,12 @@ pub(super) struct State {
     /// How the spans were last laid out, which is what they are shaped as
     /// when something asks where a point falls among them.
     shape: Option<Shape>,
-    /// The spans shaped for hit testing, the first time a pointer needs them.
-    /// The child draws from a paragraph of its own, so a block that is only
-    /// read - a streaming one above all - is shaped once rather than twice.
+    /// One shaped paragraph shared by painting, links and selection hits.
+    /// Selection/find backgrounds are painted from glyph positions and never
+    /// change the paragraph's spans or trigger reshaping.
     paragraph: std::cell::OnceCell<ParagraphBuffer>,
+    #[cfg(test)]
+    paragraph_builds: std::cell::Cell<usize>,
     pub(super) anchor: usize,
     pub(super) end: usize,
     dragging: bool,
@@ -39,6 +44,8 @@ impl Default for State {
         Self {
             a11y_id: iced::advanced::widget::Id::unique(),
             identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
+            logical: None,
+            logical_active: false,
             plain: Arc::from(""),
             target: None,
             managed: false,
@@ -46,6 +53,8 @@ impl Default for State {
             spans: None,
             shape: None,
             paragraph: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            paragraph_builds: std::cell::Cell::new(0),
             anchor: 0,
             end: 0,
             dragging: false,
@@ -73,7 +82,7 @@ impl Shape {
             align_x: Default::default(),
             align_y: iced::alignment::Vertical::Top,
             shaping: iced::widget::text::Shaping::Advanced,
-            wrapping: Wrapping::default(),
+            wrapping: Wrapping::WordOrGlyph,
             ellipsize: Default::default(),
         }
     }
@@ -84,6 +93,8 @@ impl State {
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
+                    #[cfg(test)]
+                    self.paragraph_builds.set(self.paragraph_builds.get() + 1);
                     ParagraphBuffer::with_spans(shape.text(spans.as_ref()))
                 }
                 _ => ParagraphBuffer::default(),
@@ -110,6 +121,17 @@ impl State {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct Logical {
+    pub identity: u64,
+    pub start: usize,
+}
+
+pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
+    font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, Some(logical))
+}
+
 pub(super) fn text(
     spans: Arc<[Span<'static, String>]>,
     size: iced::Pixels,
@@ -117,6 +139,10 @@ pub(super) fn text(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, None)
+}
+fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
+    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
@@ -130,8 +156,8 @@ pub(super) fn text(
         size,
         font,
         target,
+        logical,
         matches: highlights.ranges,
-        child: widget::text("").into(),
     });
     if truncated {
         widget::column::with_children(vec![
@@ -162,16 +188,17 @@ pub(super) fn plain(
 }
 
 struct Selectable {
+    logical: Option<Logical>,
     matches: Vec<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
     plain: Arc<str>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
-    child: Element<'static, Message>,
 }
 
 impl Selectable {
+    #[cfg(test)]
     fn selected_spans(&self, state: &State) -> Arc<[Span<'static, String>]> {
         let start = state.anchor.min(state.end);
         let end = state.anchor.max(state.end);
@@ -230,6 +257,43 @@ impl Selectable {
     }
 }
 
+/// Paint byte-range backgrounds against the existing shaped glyph runs. This
+/// is independent of syntax span count and never reshapes selected text.
+fn paint_ranges(renderer: &mut cosmic::Renderer, paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>], translation: iced::Vector, color: iced::Color) {
+    if ranges.is_empty() { return; }
+    let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
+    let mut offset = 0;
+    for line in &paragraph.buffer().lines {
+        starts.push(offset);
+        offset += line.text().len() + line.ending().as_str().len();
+    }
+    for run in paragraph.buffer().layout_runs() {
+        let prefix = starts[run.line_i];
+        let mut bounds: Option<(f32, f32)> = None;
+        let mut flush = |bounds: &mut Option<(f32, f32)>| {
+            if let Some((left, right)) = bounds.take() {
+                renderer.fill_quad(renderer::Quad {
+                    bounds: Rectangle::new(Point::new(left, run.line_top) + translation,
+                        Size::new(right - left, run.line_height)), ..Default::default()
+                }, color);
+            }
+        };
+        for glyph in run.glyphs {
+            let start = prefix + glyph.start;
+            let end = prefix + glyph.end;
+            let found = ranges.partition_point(|range| range.end <= start);
+            if ranges.get(found).is_some_and(|range| range.start < end) {
+                let left = glyph.x.min(glyph.x + glyph.w);
+                let right = glyph.x.max(glyph.x + glyph.w);
+                if let Some((lo, hi)) = bounds.as_mut() { *lo = lo.min(left); *hi = hi.max(right); }
+                else { bounds = Some((left, right)); }
+            } else { flush(&mut bounds); }
+        }
+        flush(&mut bounds);
+    }
+}
+
 fn hit(paragraph: &ParagraphBuffer, plain: &str, position: Point) -> usize {
     if position.y < 0.0 {
         return 0;
@@ -280,9 +344,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn state(&self) -> tree::State {
         tree::State::new(State::default())
     }
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.child)]
-    }
+    fn children(&self) -> Vec<Tree> { vec![] }
     fn diff(&mut self, _tree: &mut Tree) {}
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
@@ -290,12 +352,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn layout(
         &mut self,
         tree: &mut Tree,
-        renderer: &cosmic::Renderer,
+        _renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         state.dirty = false;
         state.target = Some(self.target);
+        state.logical = self.logical.clone();
         if state
             .spans
             .as_ref()
@@ -333,14 +396,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        self.child = iced::widget::rich_text(self.selected_spans(state))
-            .size(self.size)
-            .font(self.font)
-            .into();
-        tree.children[0].diff(&mut self.child);
-        self.child
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
+        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, state.paragraph().min_bounds()))
     }
     fn operate(
         &mut self,
@@ -362,15 +418,41 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.child.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            defaults,
-            layout,
-            cursor,
-            viewport,
-        );
+        if layout.bounds().intersection(viewport).is_none() { return; }
+        let state = tree.state.downcast_ref::<State>();
+        let paragraph = state.paragraph();
+        let translation = layout.position() - Point::ORIGIN;
+        // Preserve inline code surfaces, emphasis, links and strike-throughs
+        // without allocating a second rich-text widget or shaped buffer.
+        for (index, span) in self.spans.iter().enumerate() {
+            if span.highlight.is_none() && !span.underline && !span.strikethrough { continue; }
+            for bounds in paragraph.span_bounds(index) {
+                if let Some(highlight) = span.highlight {
+                    renderer.fill_quad(renderer::Quad {
+                        bounds: Rectangle::new(bounds.position() - iced::Vector::new(span.padding.left, span.padding.top),
+                            bounds.size() + Size::new(span.padding.x(), span.padding.y())) + translation,
+                        border: highlight.border, ..Default::default()
+                    }, highlight.background);
+                }
+                let size = span.size.unwrap_or(self.size);
+                let line_height = span.line_height.unwrap_or_default().to_absolute(size).0;
+                let baseline = size.0 + (line_height - size.0) / 2.0;
+                for (draw, shift) in [(span.underline, size.0 * 0.08), (span.strikethrough, size.0 / 2.0)] {
+                    if draw {
+                        renderer.fill_quad(renderer::Quad {
+                            bounds: Rectangle::new(bounds.position() + translation + iced::Vector::new(0.0, baseline - shift),
+                                Size::new(bounds.width, 1.0)), ..Default::default()
+                        }, span.color.unwrap_or(defaults.text_color));
+                    }
+                }
+            }
+        }
+        paint_ranges(renderer, paragraph, &self.matches, translation, design::accent_wash(theme));
+        let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
+        if !selection.is_empty() {
+            paint_ranges(renderer, paragraph, &[selection], translation, design::accent_color(theme));
+        }
+        renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
     fn update(
         &mut self,
@@ -530,6 +612,7 @@ mod tests {
     fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
+            logical: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
             matches: vec![],
@@ -539,8 +622,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
-        };
+            };
         let state = State {
             spans: Some(spans),
             shape: Some(Shape {
@@ -568,6 +650,31 @@ mod tests {
     }
 
     #[test]
+    fn selection_reuses_the_paragraph_used_for_drawing_and_hit_testing() {
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = text(vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
+            design::TEXT_PROSE.into(), iced::Font::default(),
+            Target { card: CardId::new(), generation: 0 }, Some("prose"));
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        let buffer = state.paragraph().buffer() as *const _ as usize;
+        assert_eq!(state.paragraph_builds.get(), 1);
+        assert!(tree.children.is_empty(), "no second rich-text paragraph tree");
+        for end in [1, 20, 100, 300] {
+            let state = tree.state.downcast_mut::<State>();
+            state.anchor = 0;
+            state.end = end;
+            element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let state = tree.state.downcast_ref::<State>();
+            assert_eq!(state.paragraph_builds.get(), 1, "selection does not construct another paragraph");
+            assert_eq!(buffer, state.paragraph().buffer() as *const _ as usize,
+                "selection changes paint bounds instead of reshaping spans");
+        }
+    }
+
+    #[test]
     fn a_streamed_shrink_invalidates_selection_before_keyboard_copy() {
         let mut state = State {
             anchor: 3,
@@ -587,6 +694,7 @@ mod tests {
         ]
         .into();
         let selectable = Selectable {
+            logical: None,
             plain: "before αβ linked".into(),
             spans,
             matches: vec![],
@@ -596,8 +704,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
-        };
+            };
         let state = State {
             anchor: "before ".len(),
             end: "before αβ".len(),
@@ -630,6 +737,7 @@ mod tests {
     #[test]
     fn unicode_find_highlights_original_text_across_syntax_spans() {
         let selectable = Selectable {
+            logical: None,
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
             matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
@@ -639,8 +747,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
-        };
+            };
         assert_eq!(
             selectable
                 .selected_spans(&State::default())
@@ -655,6 +762,7 @@ mod tests {
     #[test]
     fn find_marks_only_the_matching_text() {
         let selectable = Selectable {
+            logical: None,
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
             matches: vec![4..10],
@@ -664,8 +772,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
-        };
+            };
         let spans = selectable.selected_spans(&State::default());
         assert_eq!(
             spans

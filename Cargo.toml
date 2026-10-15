@@ -66,6 +66,7 @@ ui = [
     "dep:libcosmic",
     "dep:lsp-types",
     "dep:mermaid-rs-renderer",
+    "dep:pulldown-cmark",
     "dep:notify",
     "dep:resvg",
     "dep:roxmltree",
@@ -184,6 +185,7 @@ portable-pty = { version = "0.9", features = ["serde_support"], optional = true 
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
+pulldown-cmark = { version = "0.12", optional = true }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }

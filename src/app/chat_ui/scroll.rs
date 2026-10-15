@@ -72,10 +72,16 @@ pub(super) fn steps_id(id: &str) -> Id {
 struct ItemBounds<'a> {
     ids: std::collections::HashMap<Id, Vec<&'a str>>,
     rows: std::collections::HashMap<&'a str, Rectangle>,
+    wanted: HashSet<u64>,
+    virtual_rows: Vec<(String, Rectangle)>,
 }
 impl Operation for ItemBounds<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         visit(self);
+    }
+    fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        self.virtual_rows.extend(virtualized::anchor_points(state, bounds, &self.wanted).into_iter()
+            .map(|(key, bounds)| (format!("virtual-chunk-{key:016x}"), bounds)));
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
         if let Some(id) = id.and_then(|id| self.ids.get(id)) {
@@ -165,12 +171,12 @@ impl Context {
         let next_rows: std::collections::HashMap<_, _> = rows.iter().copied().collect();
         // Preserve the first visible surviving exchange, not the transcript's
         // total height: a page may arrive while the live answer also grows.
-        let visible = self.rows.iter().filter(|row| {
+        let visible = || self.rows.iter().filter(|row| {
             row.bounds.y + row.bounds.height > top && row.bounds.y < top + previous.viewport.height
         });
-        let overlap = visible
-            .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds)))
-            .next()
+        let overlap = visible().filter(|row| row.id.starts_with("virtual-chunk-"))
+            .filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds))).next()
+            .or_else(|| visible().filter_map(|row| next_rows.get(row.id.as_str()).map(|bounds| (row, bounds))).next())
             .or_else(|| {
                 // Front eviction can remove every visible exchange. Keep the
                 // nearest surviving boundary instead of jumping to live output.
@@ -546,7 +552,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut top,
             );
         }
-        let node = self.content.as_widget_mut().layout(child, renderer, limits);
+        let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
+        for _ in 0..4 {
         let next = Geometry {
             viewport: node.size(),
             content: node.children()[0].size(),
@@ -561,25 +568,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .map(|child| (*id, child.bounds()))
             })
             .collect();
-        if !self.items.is_empty() {
-            let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
-            for (id, item) in &self.items {
-                ids.entry(id.clone()).or_default().push(item);
-            }
-            let mut measured = ItemBounds {
-                ids,
-                rows: Default::default(),
-            };
-            self.content.as_widget_mut().operate(
-                child,
-                Layout::new(&node),
-                renderer,
-                &mut measured,
-            );
-            // Item bounds take precedence over coarser direct-child anchors.
-            rows.extend(measured.rows);
-            rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
-        }
+        let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
+        for (id, item) in &self.items { ids.entry(id.clone()).or_default().push(item); }
+        let wanted = anchor.active.into_iter().flat_map(|index| anchor.contexts[index].rows.iter())
+            .filter_map(|row| row.id.strip_prefix("virtual-chunk-").and_then(|key| u64::from_str_radix(key, 16).ok())).collect();
+        let mut measured = ItemBounds { ids, rows: Default::default(), wanted, virtual_rows: vec![] };
+        self.content.as_widget_mut().operate(child, Layout::new(&node), renderer, &mut measured);
+        rows.extend(measured.rows);
+        rows.extend(measured.virtual_rows.iter().map(|(key, bounds)| (key.as_str(), *bounds)));
+        rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
         if let Some(offset) =
             anchor.layout_following(self.subagent, &rows, next, top.0, self.follow_end)
         {
@@ -589,6 +586,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut SetBottom(offset),
             );
+        }
+        let mut virtual_viewport = virtualized::UpdateViewport::default();
+        self.content.as_widget_mut().operate(child, Layout::new(&node), renderer, &mut virtual_viewport);
+        if !virtual_viewport.changed { break; }
+        node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
     }
@@ -666,6 +668,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             shell,
             viewport,
         );
+        let mut virtual_viewport = virtualized::UpdateViewport::default();
+        self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, &mut virtual_viewport);
+        if virtual_viewport.changed { shell.invalidate_layout(); }
         if self.target.is_none() {
             return;
         }
