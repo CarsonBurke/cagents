@@ -98,6 +98,17 @@ fn guard(db: &Connection, owner: uuid::Uuid) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn reset_guard(db: &Connection, owner: uuid::Uuid) -> Result<(), String> {
+    raw::guard_owner(db, owner)?;
+    let version: i64 = db.query_row("SELECT version FROM child_tool_schema WHERE singleton=1", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    if version != VERSION { return Err("Delegated tool schema changed; Reset was refused".into()); }
+    Ok(())
+}
+pub(super) fn reset_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -> Result<(), String> {
+    reset_guard(tx, owner)?;
+    tx.execute_batch("DELETE FROM child_tools;DELETE FROM child_tool_revoked;UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|error| error.to_string())
+}
+
 fn persisted_revoked(db: &Connection, agent: &str, id: &str) -> Result<bool, String> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",
         params![agent, id], |row| row.get(0)).map_err(|error| error.to_string())

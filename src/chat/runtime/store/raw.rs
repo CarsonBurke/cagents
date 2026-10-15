@@ -67,13 +67,11 @@ pub(super) fn initialize_with(
                 "Original tool source schema is unsupported; no source data was changed".into(),
             );
         }
-        // Reopening the database fences an older handle before it can write
-        // through a stale schema/revocation view.
-        tx.execute(
-            "UPDATE raw_source_schema SET nonce=?1 WHERE singleton=1",
-            [nonce.to_string()],
-        )
-        .map_err(err)?;
+    }
+    // A pending Reset must refuse initialization before owner publication.
+    super::reset::initialize_in(&tx)?;
+    if exists {
+        tx.execute("UPDATE raw_source_schema SET nonce=?1 WHERE singleton=1", [nonce.to_string()]).map_err(err)?;
     }
     let blocked = tx
         .query_row(
@@ -115,6 +113,13 @@ pub(super) fn initialize_with(
         blocked,
     })
 }
+pub(super) fn reset_in(tx: &Transaction<'_>, owner: uuid::Uuid) -> Result<State, String> {
+    guard_owner(tx, owner)?;
+    let nonce = uuid::Uuid::new_v4();
+    tx.execute_batch("DELETE FROM raw_tool_chunks;DELETE FROM raw_tool_sources;DELETE FROM raw_tool_revoked;").map_err(err)?;
+    tx.execute("UPDATE raw_source_schema SET nonce=?1,bytes=0,keys=0,chunks=0,disabled=NULL WHERE singleton=1", [nonce.to_string()]).map_err(err)?;
+    Ok(State { nonce, open: HashMap::new(), open_bytes: 0, blocked: None })
+}
 fn err(error: impl ToString) -> String {
     error.to_string()
 }
@@ -136,6 +141,10 @@ fn valid_key(key: &SourceKey) -> bool {
             .is_none_or(|id| !id.is_empty() && id.len() <= KEY_BYTES)
 }
 pub(super) fn guard(db: &Connection, nonce: uuid::Uuid) -> Result<(), String> {
+    guard_owner(db, nonce)?;
+    super::reset::guard(db)
+}
+pub(super) fn guard_owner(db: &Connection, nonce: uuid::Uuid) -> Result<(), String> {
     let (version, current): (i64, String) = db
         .query_row(
             "SELECT version,nonce FROM raw_source_schema WHERE singleton=1",
@@ -229,7 +238,7 @@ pub(super) fn revoked(db: &Connection, source: &SourceKey) -> Result<bool, Strin
 }
 impl Store {
     pub(super) fn raw_guard(&self) -> Result<(), String> {
-        guard(&self.db, self.raw_sources.nonce)
+        self.source_guard()
     }
     fn raw_refused(&mut self, message: String) -> Result<Option<String>, String> {
         let first = self.raw_sources.blocked.is_none();
@@ -619,10 +628,6 @@ impl Store {
                 self.raw_remove(ids, true)?;
                 Ok(None)
             }
-            Event::Reset { .. } => {
-                self.raw_reset()?;
-                Ok(None)
-            }
             Event::Item(item)
                 if !matches!(
                     &item.content,
@@ -732,26 +737,6 @@ impl Store {
                 self.raw_sources.open_bytes = self.raw_sources.open_bytes.saturating_sub(length);
             }
         }
-        Ok(())
-    }
-    fn raw_reset(&mut self) -> Result<(), String> {
-        self.pending_input = None;
-        self.pending_text = None;
-        let nonce = uuid::Uuid::new_v4();
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(err)?;
-        guard(&tx, self.raw_sources.nonce)?;
-        tx.execute_batch("DELETE FROM raw_tool_chunks;DELETE FROM raw_tool_sources;DELETE FROM raw_tool_revoked;").map_err(err)?;
-        tx.execute("UPDATE raw_source_schema SET nonce=?1,bytes=0,keys=0,chunks=0,disabled=NULL WHERE singleton=1",[nonce.to_string()]).map_err(err)?;
-        tx.commit().map_err(err)?;
-        self.raw_sources = State {
-            nonce,
-            open: HashMap::new(),
-            open_bytes: 0,
-            blocked: None,
-        };
         Ok(())
     }
     pub(super) fn raw_event_revoked(&self, event: &Event) -> Result<bool, String> {
@@ -1238,10 +1223,7 @@ mod tests {
                 })
                 .is_err()
         );
-        assert_eq!(
-            store.raw_source_page(query("private")),
-            Err(SourceError::NotFound)
-        );
+        assert!(store.raw_source_page(query("private")).is_err());
         store
             .db
             .execute_batch("DROP TRIGGER refuse_raw_reset")

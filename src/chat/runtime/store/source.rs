@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) const SCHEMA: &str = "CREATE TABLE source_epochs(id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE, epoch INTEGER NOT NULL);
 CREATE TABLE child_sources(agent TEXT NOT NULL,id TEXT NOT NULL,epoch INTEGER NOT NULL,len INTEGER NOT NULL,supported INTEGER NOT NULL,metadata BLOB NOT NULL,PRIMARY KEY(agent,id));
 CREATE TABLE child_source_chunks(agent TEXT NOT NULL,id TEXT NOT NULL,position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(agent,id,position),FOREIGN KEY(agent,id) REFERENCES child_sources(agent,id) ON DELETE CASCADE);";
+pub(super) fn reset_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -> Result<(), String> {
+    raw::guard_owner(tx, owner)?;
+    tx.execute_batch("DELETE FROM child_sources;DELETE FROM source_epochs;").map_err(|error| error.to_string())
+}
 pub(super) struct PendingChildSource {
     agent: String,
     id: String,
@@ -65,6 +69,8 @@ impl Store {
         &mut self,
         state: &mut crate::chat::Snapshot,
     ) -> Result<(), String> {
+        self.source_guard()?;
+        state.source_incarnation = Some(self.source_incarnation);
         use crate::chat::cache::{SourceKey, SourcePart};
         let cached: std::collections::HashMap<_, _> = state
             .source_parts
@@ -175,6 +181,7 @@ impl Store {
         Ok(())
     }
     pub(crate) fn source_page(&mut self, query: SourceQuery) -> Result<SourcePage, SourceError> {
+        self.source_guard().map_err(storage)?;
         if !(4..=PAGE_BYTES).contains(&query.limit)
             || query.source.source_id.len() > METADATA_LIMIT
             || query
@@ -189,6 +196,8 @@ impl Store {
         }
         self.flush_child_source().map_err(storage)?;
         self.flush_text().map_err(storage)?;
+        let _read = self.db.unchecked_transaction().map_err(storage)?;
+        self.source_guard().map_err(storage)?;
         let (epoch, length, metadata) = if let Some(agent) = &query.source.agent_id {
             let (epoch, length, bytes): (u64, usize, Vec<u8>) = self
                 .db

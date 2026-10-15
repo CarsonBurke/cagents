@@ -28,6 +28,11 @@ CREATE TABLE file_patch_chunks(source TEXT NOT NULL,item_id TEXT NOT NULL,file_i
  position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(source,item_id,file_index,position),
  FOREIGN KEY(source,item_id,file_index) REFERENCES file_edits(source,item_id,file_index) ON DELETE CASCADE);";
 
+pub(super) fn reset_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -> Result<(), String> {
+    super::raw::guard_owner(tx, owner)?;
+    tx.execute_batch("DELETE FROM file_edits;DELETE FROM file_totals;DELETE FROM file_paths;").map_err(|error| error.to_string())
+}
+
 fn source_key(source: &FileChangeSource) -> String {
     match source {
         FileChangeSource::Conversation => String::new(),
@@ -440,24 +445,8 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn files_reset(&mut self) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM file_edits", [])
-            .map_err(|e| e.to_string())?;
-        self.db
-            .execute("DELETE FROM file_totals", [])
-            .map_err(|e| e.to_string())?;
-        self.file_revision = self.file_revision.saturating_add(1);
-        self.child_files_seen = false;
-        self.file_index_incomplete = false;
-        self.db
-            .execute("DELETE FROM file_paths", [])
-            .map_err(|e| e.to_string())?;
-        self.file_keys = 0;
-        self.applied_files = 0;
-        Ok(())
-    }
     pub(crate) fn publish_files(&mut self, state: &mut Snapshot) -> Result<(), String> {
+        self.source_guard()?;
         if state.file_changes.revision != self.file_revision
             || state.file_changes.coverage.has_unloaded_history != self.provider_earlier
             || state.file_changes.coverage.has_incomplete_delegated_history != self.child_files_seen
@@ -574,6 +563,8 @@ impl Store {
         &self,
         command: &Command,
     ) -> Result<Option<crate::chat::FileChangeReply>, String> {
+        let _read = self.db.unchecked_transaction().map_err(|error| error.to_string())?;
+        self.source_guard()?;
         let requested_key = match command {
             Command::LoadFileChanges { after, .. } => after.as_ref(),
             Command::LoadFileChangePatches { key, .. } => Some(key),

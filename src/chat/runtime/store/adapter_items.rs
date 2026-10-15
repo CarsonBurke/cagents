@@ -18,6 +18,7 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation != self.generation {
             return Err("Original tool source was revoked by a conversation reset".into());
         }
+        store.source_guard()?;
         store.adapter_item(key)
     }
     fn validate_key(&self, key: &CanonicalItemKey) -> Result<(), String> {
@@ -30,7 +31,7 @@ impl CanonicalItemReader for Reader {
             return Err("Original tool source was revoked by reset".into());
         }
         let _read = store.db.unchecked_transaction().map_err(|error| error.to_string())?;
-        store.raw_guard()?;
+        store.source_guard()?;
         if key.agent_id.is_some() {
             return store.validate_child_adapter_key(key);
         }
@@ -55,6 +56,7 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation != self.generation {
             return Err("Original tool source was revoked by reset".into());
         }
+        store.source_guard()?;
         store.raw_original(&crate::chat::cache::SourceKey {
             agent_id: key.agent_id.clone(),
             source_id: key.item_id.clone(),
@@ -114,6 +116,7 @@ impl Store {
         Ok(result)
     }
     pub(super) fn adapter_item(&mut self, key: &CanonicalItemKey) -> Result<Option<Item>, String> {
+        self.source_guard()?;
         self.flush_input()?;
         self.flush_text()?;
         self.raw_guard()?;

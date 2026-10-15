@@ -5,6 +5,7 @@ mod child_tools;
 mod file_changes;
 pub(super) use adapter_items::reader as adapter_item_reader;
 mod raw;
+mod reset;
 mod source;
 
 use super::observed_at;
@@ -60,6 +61,8 @@ pub(crate) struct Store {
     db: Connection,
     /// A reset revokes every previously issued canonical source reader.
     canonical_generation: uuid::Uuid,
+    /// A refused Reset keeps this Store unavailable until an atomic retry succeeds.
+    reset_pending: bool,
     raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
@@ -169,6 +172,7 @@ impl Store {
             Ok(Self {
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
+                reset_pending: false,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -692,11 +696,10 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
-        if matches!(&event, Event::Reset { .. }) {
-            // Revoke before the first destructive operation, including a
-            // failing child/index cleanup. Old readers must never revive.
-            self.canonical_generation = uuid::Uuid::new_v4();
+        if let Event::Reset { reason } = event {
+            return self.reset_all(reason);
         }
+        self.source_guard()?;
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -898,25 +901,6 @@ impl Store {
                 }
                 transaction.commit().map_err(|e| e.to_string())?;
                 self.dirty = true;
-            }
-            Event::Reset { reason } => {
-                self.source_changed()?;
-                self.files_reset()?;
-                self.db
-                    .execute("DELETE FROM items", [])
-                    .map_err(|e| e.to_string())?;
-                self.end = None;
-                self.first = None;
-                self.newest = None;
-                self.forward = None;
-                self.paging = false;
-                self.provider_earlier = false;
-                self.cached_earlier = false;
-                self.pending_earlier = None;
-                self.latest_boundary = None;
-                self.dirty = true;
-                out.push(Event::Reset { reason });
-                return Ok(out);
             }
             Event::HistoryLoading(false) => {
                 // A failed provider request must not leave its cursor waiting
@@ -1260,6 +1244,7 @@ impl Store {
         &mut self,
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
+        self.source_guard()?;
         let _ = self.flush_text()?;
         let _ = self.flush_input()?;
         let old: std::collections::HashMap<_, _> = previous

@@ -928,6 +928,7 @@ impl Handle {
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        store.publish_source_authority(&mut state);
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
         }
@@ -982,6 +983,7 @@ impl Handle {
     ) -> Option<crate::terminal_ipc::ServerResponse> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        store.publish_source_authority(&mut state);
         if after == Some(state.generation) && !store.dirty {
             return None;
         }
