@@ -450,9 +450,15 @@ fn recoverable_discard_executable_runs_while_original_cleanup_is_retained() {
     assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
     executor.armed.store(true, Ordering::SeqCst);
     let outcome = service.undo_discard(&discarded.recovery, &cancel).unwrap();
+    let MutationOutcome::PartiallyApplied { paths, failures } = outcome else {
+        panic!("restored bytes plus pending cleanup must be reported precisely: {outcome:?}");
+    };
+    assert_eq!(paths, vec![path("tracked.sh")]);
+    assert_eq!(failures.len(), 1);
     assert!(
-        matches!(outcome, MutationOutcome::Applied { .. }),
-        "{outcome:?}"
+        failures[0]
+            .to_string()
+            .contains("cleanup or durability is unconfirmed")
     );
     let authority = discarded
         .recovery
