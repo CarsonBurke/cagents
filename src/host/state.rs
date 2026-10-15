@@ -347,6 +347,18 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    #[cfg(test)]
+    pub(super) fn has_pending_terminal_spawn_for_test(&self) -> bool {
+        !self.spawning.is_empty()
+    }
+    #[cfg(test)]
+    pub(super) fn observe_terminal_worker_for_test(&mut self, id: TerminalId, instance: uuid::Uuid) {
+        self.published_terminal_workers.observe(id, instance);
+    }
+    #[cfg(test)]
+    pub(super) fn latest_terminal_worker_for_test(&self, id: TerminalId) -> Option<uuid::Uuid> {
+        self.published_terminal_workers.latest(id)
+    }
     /// Keep a bounded history after workers/actors retire. Live and pending
     /// owners retain their one exact receipt independently of history eviction.
     pub(super) fn remember_terminal_handoff(
