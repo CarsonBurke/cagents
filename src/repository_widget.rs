@@ -17,7 +17,7 @@ mod diff_actions;
 pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
-pub use diff_mutations::Request as DiffMutationRequest;
+pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -45,8 +45,9 @@ use crate::{
         load_repository_diff_with_options_and_font,
     },
     editor::{
-        FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
-        SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
+        FileContent, FileIoError, FileRestoration, LinkRefusal, LoadedFile, OversizeKind,
+        PresenceSave, ReadOnlyReason, SaveDurability, SaveOutcome, load_file, save_document_file,
+        save_file, validate_repo_path,
     },
     editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
@@ -996,6 +997,15 @@ struct EditorDocument {
     saved_history_revision: u64,
     saved_snapshot: text_editor::TextSnapshot,
     disk_hash: blake3::Hash,
+    /// Desired and last published existence; empty text never proves absence.
+    present: bool,
+    saved_present: bool,
+    deletion_mode: Option<u32>,
+    presence_id: u64,
+    saved_presence_id: u64,
+    next_presence_id: u64,
+    restorations: std::collections::BTreeMap<u64, Arc<FileRestoration>>,
+    captured_presence_ids: std::collections::BTreeSet<u64>,
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
     /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
@@ -1054,6 +1064,8 @@ struct SaveTicket {
     history_revision: u64,
     snapshot_source: text_editor::TextSnapshot,
     snapshot: String,
+    present: bool,
+    presence_id: u64,
 }
 
 impl EditorDocument {
@@ -1083,6 +1095,14 @@ impl EditorDocument {
             saved_text: text,
             saved_history_revision: 0,
             disk_hash,
+            present: true,
+            saved_present: true,
+            deletion_mode: None,
+            presence_id: 0,
+            saved_presence_id: 0,
+            next_presence_id: 0,
+            restorations: std::collections::BTreeMap::new(),
+            captured_presence_ids: std::collections::BTreeSet::new(),
             markdown,
             // Source editing does not consume the preview AST. Parse only
             // when preview is first mounted, alongside its text snapshot.
@@ -1169,9 +1189,45 @@ impl EditorDocument {
         }
     }
 
+    fn prune_restorations(&mut self) {
+        let mut retained: std::collections::BTreeSet<_> =
+            self.history.retained_presence_ids().collect();
+        retained.extend([self.presence_id, self.saved_presence_id]);
+        if let Some(active) = &self.active_save {
+            retained.insert(active.presence_id);
+        }
+        self.restorations.retain(|id, _| retained.contains(id));
+        self.captured_presence_ids
+            .retain(|id| retained.contains(id));
+    }
+
+    fn present_lineage(&self, id: u64) -> u64 {
+        // An unsaved removal has not changed disk metadata. Cancelling it by
+        // Undo or typing may keep the still-present baseline; a submitted
+        // removal must retain its captured ticket's lineage until it lands.
+        if !self.captured_presence_ids.contains(&id)
+            && self.saved_present
+            && !self
+                .active_save
+                .as_ref()
+                .is_some_and(|ticket| !ticket.present && ticket.presence_id == id)
+        {
+            self.saved_presence_id
+        } else {
+            id
+        }
+    }
+
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
+        if !self.present && !self.content.is_empty() {
+            let before = self.presence_id;
+            self.presence_id = self.present_lineage(before);
+            self.present = true;
+            self.history
+                .record_latest_presence_identity((false, before), (true, self.presence_id));
+        }
         self.refresh_dirty();
         self.markdown_stale = true;
         if self.conflict_editing {
@@ -1191,8 +1247,10 @@ impl EditorDocument {
     }
 
     fn refresh_dirty(&mut self) {
-        self.dirty = self.history.revision() != self.saved_history_revision;
-        if self.dirty && self.content.text_snapshot().same_text(&self.saved_snapshot) {
+        let presence_changed = self.present != self.saved_present
+            || self.presence_id != self.saved_presence_id;
+        self.dirty = presence_changed || self.history.revision() != self.saved_history_revision;
+        if !presence_changed && self.dirty && self.content.text_snapshot().same_text(&self.saved_snapshot) {
             // Signature inequality is constant-time on ordinary edits. Only
             // a possible return to the saved bytes pays for exact equality.
             self.history.adopt_revision(self.saved_history_revision);
@@ -1206,6 +1264,14 @@ impl EditorDocument {
     /// Each entry describes one replacement in the order it was applied; an
     /// entry is `None` where the replacement had no protocol range.
     fn step_history(&mut self, redo: bool) -> Option<Vec<Option<LspTextEdit>>> {
+        let presence = self.history.replay_presence_identity(redo);
+        if presence.is_some_and(|(expected, _)| {
+            expected.0 != self.present || !expected.0 && expected.1 != self.presence_id
+        }) {
+            self.history.clear();
+            self.error = Some("The file existence changed outside this Undo transaction.".into());
+            return None;
+        }
         let mut buffer = ProtocolTracked {
             content: &mut self.content,
             edits: Vec::new(),
@@ -1218,12 +1284,21 @@ impl EditorDocument {
         let edits = buffer.edits;
         match replay {
             Replay::Empty => return None,
-            Replay::Applied => {}
+            Replay::Applied => {
+                if let Some((_, (present, id))) = presence {
+                    self.present = present;
+                    self.presence_id = if present {
+                        self.present_lineage(id)
+                    } else {
+                        id
+                    };
+                }
+            }
             Replay::Diverged => {
                 tracing::warn!("editor history no longer matched its buffer and was cleared");
             }
         }
-        if !edits.is_empty() {
+        if !edits.is_empty() || presence.is_some() {
             self.text_changed();
         }
         Some(edits)
@@ -1260,11 +1335,15 @@ impl EditorDocument {
             if replaced && content_matches(&self.content, &self.saved_text) {
                 edits = replayed;
                 self.content.set_cursor(cursor);
-                self.history.record_group(
+                self.history.record_group_with_presence_identities(
                     vec![change],
                     cursor,
                     self.content.cursor(),
                     Instant::now(),
+                    Some((
+                        (self.present, self.presence_id),
+                        (self.saved_present, self.saved_presence_id),
+                    )),
                 );
             } else {
                 tracing::warn!(
@@ -1275,6 +1354,22 @@ impl EditorDocument {
                 edits.push(None);
             }
         }
+        if edits.is_empty()
+            && (self.present != self.saved_present || self.presence_id != self.saved_presence_id)
+        {
+            self.history.record_group_with_presence_identities(
+                vec![],
+                cursor,
+                self.content.cursor(),
+                Instant::now(),
+                Some((
+                    (self.present, self.presence_id),
+                    (self.saved_present, self.saved_presence_id),
+                )),
+            );
+        }
+        self.present = self.saved_present;
+        self.presence_id = self.saved_presence_id;
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.markdown_stale = true;
@@ -1318,10 +1413,11 @@ impl EditorDocument {
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
-        self.dirty = text != self.saved_text;
-        if !self.dirty {
-            self.history.adopt_revision(self.saved_history_revision);
-        }
+        if !text.is_empty() { self.present = true; }
+        self.dirty = self.present != self.saved_present
+            || self.presence_id != self.saved_presence_id
+            || text != self.saved_text;
+        if !self.dirty { self.history.adopt_revision(self.saved_history_revision); }
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -2195,6 +2291,7 @@ pub struct RepositoryRuntime {
     standalone: bool,
     external_editors: crate::sidebar::SidebarEditors,
     keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
+    git_mutation_unavailable_reason: Option<Arc<str>>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2428,6 +2525,7 @@ impl RepositoryRuntime {
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
+            git_mutation_unavailable_reason: None,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2535,6 +2633,12 @@ impl RepositoryRuntime {
 
     pub fn set_keyboard_shortcuts(&mut self, shortcuts: Arc<crate::settings::KeyboardShortcuts>) {
         self.keyboard_shortcuts = shortcuts;
+    }
+
+    /// A host may offer portable reads/editing without a strong Git writer.
+    /// This does not restrict native file editing, saving, or its Undo history.
+    pub fn set_git_mutation_unavailable_reason(&mut self, reason: Option<Arc<str>>) {
+        self.git_mutation_unavailable_reason = reason;
     }
 
     /// History remains attached to the live native buffer while its working
@@ -3060,6 +3164,8 @@ impl RepositoryRuntime {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("B\n")
                 .text_snapshot(),
             snapshot: "B\n".into(),
+            present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
         let completion = RepositoryAction::SaveFinished {
@@ -4587,7 +4693,8 @@ impl RepositoryRuntime {
     ) -> Option<crate::repository::PathSelection> {
         use crate::repository::{PathSelection, RepoPath};
         let file = self.subject_file()?;
-        if self.mutation_refresh_pending
+        if self.git_mutation_unavailable_reason.is_some()
+            || self.mutation_refresh_pending
             || self.blocks_navigation()
             || !(if stage { file.unstaged } else { file.staged })
         {
@@ -5697,7 +5804,35 @@ impl RepositoryRuntime {
         })
     }
 
+    /// Formatters and workspace edits must not recreate an intentionally absent file.
+    pub fn desired_file_present(&self) -> bool {
+        !matches!(&self.document, DocumentState::Editable(document) if !document.present)
+    }
+    /// Reload/watch reconciliation can distinguish an owned deletion from an
+    /// external deletion without closing the document and its Undo history.
+    pub fn saved_file_present(&self) -> bool {
+        !matches!(&self.document, DocumentState::Editable(document) if !document.saved_present)
+    }
+
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
+        // Explicit Save after a completed removal means create the open file
+        // again. Debounced autosave never manufactures that user intent.
+        if let DocumentState::Editable(document) = &mut self.document
+            && !document.present
+            && !document.saved_present
+            && document.active_save.is_none()
+        {
+            let cursor = document.content.cursor();
+            document.history.record_group_with_presence_identities(
+                vec![],
+                cursor,
+                cursor,
+                Instant::now(),
+                Some(((false, document.presence_id), (true, document.presence_id))),
+            );
+            document.present = true;
+            document.text_changed();
+        }
         self.request_save_inner(card, overwrite, true)
     }
 
@@ -5707,24 +5842,57 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source) =
-            match &self.document {
-                DocumentState::Editable(document)
-                    if (document.dirty || document.durability_warning.is_some())
-                        && document.active_save.is_none() =>
-                {
-                    (
-                        document.path.clone(),
-                        document.source.clone(),
-                        document.content.text(),
-                        document.disk_hash,
-                        document.revision,
-                        document.history.revision(),
-                        document.content.text_snapshot(),
-                    )
-                }
-                _ => return Task::none(),
-            };
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.prune_restorations();
+            if document.active_save.is_none()
+                && document.present
+                && document.presence_id != document.saved_presence_id
+                && document.presence_id != 0
+                && !document.restorations.contains_key(&document.presence_id)
+            {
+                document.error = Some(
+                    "The Undo restoration metadata is unavailable. Reload before saving.".into(),
+                );
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
+                return Task::none();
+            }
+            if !document.present
+                && !document.restorations.contains_key(&document.presence_id)
+                && document.restorations.len() >= 64
+            {
+                document.error = Some("The file has too many retained deletion snapshots. Close and reopen this editor to release old Undo metadata before saving the removal.".into());
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
+                return Task::none();
+            }
+        }
+        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source, presence) = match &self.document {
+            DocumentState::Editable(document)
+                if (document.dirty || document.durability_warning.is_some())
+                    && document.active_save.is_none() =>
+            {
+                (
+                    document.path.clone(),
+                    document.source.clone(),
+                    document.content.text(),
+                    document.disk_hash,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.text_snapshot(),
+                    PresenceSave {
+                        expected_present: document.saved_present,
+                        desired_present: document.present,
+                        expected_mode: document.deletion_mode,
+                        restoration: (!document.saved_present
+                            || document.presence_id != document.saved_presence_id)
+                            .then(|| document.restorations.get(&document.presence_id).cloned())
+                            .flatten(),
+                    },
+                )
+            }
+            _ => return Task::none(),
+        };
         // The ticket is about the selected row, which is what a result is
         // matched against; the bytes go where they were read from.
         let identity = self.current_identity(card, path);
@@ -5736,6 +5904,11 @@ impl RepositoryRuntime {
             history_revision,
             snapshot_source,
             snapshot: text.clone(),
+            present: presence.desired_present,
+            presence_id: match &self.document {
+                DocumentState::Editable(document) => document.presence_id,
+                _ => unreachable!(),
+            },
         };
         if let DocumentState::Editable(document) = &mut self.document {
             document.history.seal();
@@ -5752,7 +5925,14 @@ impl RepositoryRuntime {
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &destination, &text, disk_hash, overwrite)
+                save_document_file(
+                    &worktree,
+                    &destination,
+                    &text,
+                    disk_hash,
+                    overwrite,
+                    presence,
+                )
             })
             .await
             .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
@@ -6442,16 +6622,21 @@ impl RepositoryRuntime {
                 }
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
-                    let ticket = document.active_save.take().expect("matched save ticket");
+                    let active = document
+                        .active_save
+                        .take()
+                        .expect("active save was matched above");
                     match result {
                         Ok(SaveOutcome::Saved {
                             content_hash,
                             durability,
                         }) => {
                             document.saved_text = saved_text;
+                            document.saved_present = active.present;
+                            document.saved_presence_id = active.presence_id;
                             document.disk_hash = content_hash;
-                            document.saved_history_revision = ticket.history_revision;
-                            document.saved_snapshot = ticket.snapshot_source;
+                            document.saved_history_revision = active.history_revision;
+                            document.saved_snapshot = active.snapshot_source;
                             document.refresh_dirty();
                             document.conflict = false;
                             document.error = None;
@@ -6459,6 +6644,32 @@ impl RepositoryRuntime {
                                 SaveDurability::Durable => None,
                                 SaveDurability::Unconfirmed { error } => Some(format!(
                                     "The file was replaced on disk, but its durability could not be confirmed: {error}. Reload from disk or retry the save before leaving."
+                                )),
+                            };
+                            saved = true;
+                        }
+                        Ok(SaveOutcome::Absent {
+                            restoration,
+                            durability,
+                        }) => {
+                            document.saved_text = saved_text;
+                            document.saved_present = false;
+                            document.saved_presence_id = active.presence_id;
+                            document.disk_hash = blake3::hash(b"");
+                            document.captured_presence_ids.insert(active.presence_id);
+                            document
+                                .restorations
+                                .entry(active.presence_id)
+                                .or_insert(restoration);
+                            document.saved_history_revision = active.history_revision;
+                            document.saved_snapshot = active.snapshot_source;
+                            document.refresh_dirty();
+                            document.conflict = false;
+                            document.error = None;
+                            document.durability_warning = match durability {
+                                SaveDurability::Durable => None,
+                                SaveDurability::Unconfirmed { error } => Some(format!(
+                                    "The file was removed, but directory durability could not be confirmed: {error}"
                                 )),
                             };
                             saved = true;
@@ -6482,6 +6693,11 @@ impl RepositoryRuntime {
                 if self.save_error().is_some() {
                     self.source_surface = SourceSurface::Editor;
                     self.markdown_mode = MarkdownMode::Edit;
+                }
+                if saved
+                    && matches!(&self.document, DocumentState::Editable(document) if !document.saved_present)
+                {
+                    return self.refresh_after_mutation(identity.card);
                 }
                 if saved {
                     // Only here: not when the write was submitted, not on a
@@ -15120,6 +15336,8 @@ mod tests {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
                 .text_snapshot(),
             snapshot: "submitted\n".into(),
+            present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -15335,6 +15553,8 @@ mod tests {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("newest\n")
                 .text_snapshot(),
             snapshot: "newest\n".into(),
+            present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -15391,6 +15611,8 @@ mod tests {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
                 .text_snapshot(),
             snapshot: "submitted\n".into(),
+            present: true,
+            presence_id: 0,
         });
         document.dirty = false;
         let view = RepositoryView {
@@ -15453,6 +15675,8 @@ mod tests {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
                 .text_snapshot(),
             snapshot: "submitted\n".into(),
+            present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -15735,6 +15959,8 @@ mod tests {
             snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n")
                 .text_snapshot(),
             snapshot: "after\n".into(),
+            present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -16069,6 +16295,8 @@ mod tests {
                 snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n")
                     .text_snapshot(),
                 snapshot: "after\n".into(),
+                present: true,
+                presence_id: 0,
             });
             runtime.document = DocumentState::Editable(document);
 

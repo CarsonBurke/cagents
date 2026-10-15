@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod authority;
+pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
@@ -53,6 +55,12 @@ pub use crate::process::{
 
 #[path = "repository_stash.rs"]
 mod stash_mutations;
+
+#[path = "repository_recovery.rs"]
+mod recovery;
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt,
+};
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
@@ -3815,6 +3823,7 @@ pub enum RepositoryError {
 pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
+    authority: Option<WorktreeAuthority>,
 }
 
 impl RepositoryService<SystemProcessExecutor> {
@@ -3828,6 +3837,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Self {
             git: git.into(),
             executor,
+            authority: None,
         }
     }
 
@@ -4392,7 +4402,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cache.invalidate(true);
             cache.options = Some(options);
         }
-        let git_dir = local_git_dir(worktree);
+        let git_dir = if let Some(authority) = &self.authority {
+            authority.validate()?;
+            Some(authority.private_metadata_path())
+        } else { local_git_dir(worktree) };
         if !cache.fsmonitor_checked {
             let mut command = self.git_read(
                 worktree,
@@ -4582,7 +4595,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
-        let directory = self.git_dir(worktree, cancellation)?;
+        let directory = self.git_dir_for_io(worktree, cancellation)?;
         Ok(Self::operation_state_from_git_dir(&directory))
     }
 
@@ -5767,8 +5780,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if !paths.iter().any(|path| conflicted.contains(path)) {
             return Ok(None);
         }
-        let root = fs_safety::Root::open(&request.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let root = self.captured_worktree_root(&request.worktree)?;
         let version = |metadata: &fs::Metadata| {
             (
                 metadata.dev(),
@@ -5998,14 +6010,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
-    /// Restores tracked paths from the index and deletes untracked files.
+    /// Saves tracked contents in Git, restores the index version, and moves
+    /// untracked entries to the system Trash.
     ///
-    /// This destroys work that exists nowhere else, so it refuses to run
-    /// without the caller's confirmation and never removes a directory.
+    /// Confirmation is required. Selected directories are refused; directories
+    /// emptied by removed files are pruned below the worktree root.
     pub fn discard(
         &self,
         request: &DiscardRequest,
         cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recoverable(request, cancellation)
+            .map(|result| result.outcome)
+    }
+
+    fn discard_mutation(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
     ) -> Result<MutationOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
@@ -6031,6 +6056,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
 
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
         let mut applied = Vec::new();
         if !tracked.is_empty() {
             let command =
@@ -6080,7 +6112,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
-            let root = match fs_safety::Root::open(&request.worktree) {
+            let root = match captured_root.try_clone() {
                 Ok(root) => root,
                 Err(error) => {
                     return discard_failures(
@@ -6089,6 +6121,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
+            if let Err(reason) = recovery::verify_recovery_root(captured_root) {
+                return discard_failures(&untracked, reason);
+            }
             // A refused directory does not prevent independent selected files
             // being attempted. Cancellation or loss of the index lock ends the
             // remaining batch, whose paths are still known untouched.
@@ -6111,8 +6146,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     });
                     continue;
                 }
-                match delete_untracked(&root, path) {
-                    Ok(()) => applied.push(path.clone()),
+                match recovery::trash_untracked(&root, path) {
+                    Ok(receipt) => {
+                        if let Some(receipt) = receipt {
+                            if let Some(reason) = receipt.warning.as_ref() {
+                                failures.push(MutationFailure::Path {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
+                            trashed.push(receipt);
+                        }
+                        applied.push(path.clone());
+                    }
                     Err(failure) => failures.push(failure),
                 }
             }
@@ -6147,6 +6193,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let index = parse_path_line(&output.stdout, "index_path")?;
+        let index = self.captured_worktree_path(&index)?;
         GitFileLock::acquire(&index).map_err(|reason| ValidationError::Io(reason).into())
     }
 
@@ -6220,14 +6267,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let command = self.git_read(worktree, arguments);
         let output = self.run_checked(&command, cancellation)?;
-        Ok(output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(bytes_to_path)
-            // `--git-path` answers relative to the working directory it ran
-            // in, which is the worktree.
-            .any(|path| worktree.join(path).exists()))
+        for path in output.stdout.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).map(bytes_to_path) {
+            // `--git-path` is relative to Git's scoped working directory.
+            if self.captured_worktree_path(&worktree.join(path))?.exists() { return Ok(true); }
+        }
+        Ok(false)
     }
 
     /// Commits the index, reconciling the outcome against HEAD.
@@ -8052,6 +8096,13 @@ mod tests {
             command: &CommandSpec,
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "hash-object")
+            {
+                return SystemProcessExecutor.execute(command, _cancellation);
+            }
             self.commands.lock().unwrap().push(command.clone());
             self.outputs.lock().unwrap().pop().unwrap()
         }
@@ -10543,7 +10594,10 @@ mod tests {
             }
         );
         assert!(!worktree.path().join("keep/file.txt").exists());
-        assert!(worktree.path().join("keep").is_dir());
+        assert!(
+            !worktree.path().join("keep").exists(),
+            "discard prunes the newly empty parent"
+        );
     }
 
     #[cfg(unix)]
@@ -10628,13 +10682,18 @@ mod tests {
             (0..=ROUNDS).map(|_| success(b"")).collect(),
         );
         for _ in 0..ROUNDS {
+            // Recoverable discard also prunes emptied parents, so recreate
+            // this fixture directory when a previous raced round removed it.
+            let _ = fs::create_dir(&parked_directory);
             let _ = fs::write(parked_directory.join("victim.txt"), b"inside");
-            let _ = fs::write(active.join("victim.txt"), b"inside");
+            // Never seed through the raced active name: it may currently
+            // be the link to the outside fixture itself.
             let _ = service.discard(&request, &CancellationToken::new());
             assert!(
                 hostage.exists(),
                 "discard followed a swapped ancestor out of the worktree"
             );
+            assert_eq!(fs::read(&hostage).unwrap(), b"outside");
         }
 
         stop.store(true, Ordering::Relaxed);
@@ -10644,6 +10703,14 @@ mod tests {
         // prepared entries where they started. This quiescent round proves the
         // deletion the loop above was racing really happens, rather than being
         // refused every time.
+        if let Ok(metadata) = fs::symlink_metadata(&active) {
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(&active).unwrap();
+            } else {
+                fs::remove_dir_all(&active).unwrap();
+            }
+        }
+        fs::create_dir_all(&parked_directory).unwrap();
         fs::rename(&parked_directory, &active).unwrap();
         fs::write(active.join("victim.txt"), b"inside").unwrap();
         let outcome = service
@@ -12858,6 +12925,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != repository { return Err(ValidationError::InvalidWorktree(repository.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_common_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 repository,
@@ -12866,7 +12938,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "common_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }
@@ -12878,6 +12950,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_private_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
@@ -12886,7 +12963,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "git_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "git_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }

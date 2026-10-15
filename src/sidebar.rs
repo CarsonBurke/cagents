@@ -2236,6 +2236,7 @@ pub struct SourceControlModel {
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub output_expanded: bool,
+    pub undo_discard_until_unix_ms: Option<u64>,
     pub operation: Option<crate::repository::GitOperationState>,
     pub stashes: Vec<crate::repository::StashEntry>,
     pub last_fetch_unix_ms: Option<u64>,
@@ -2420,6 +2421,7 @@ impl SourceControlModel {
             mutation_unavailable_reason: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,
@@ -2581,6 +2583,7 @@ impl SourceControlModel {
             mutation_unavailable_reason: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: snapshot.operation.clone(),
             stashes: snapshot.stashes.clone(),
             last_fetch_unix_ms: snapshot.last_fetch_unix_ms,
@@ -2827,6 +2830,7 @@ impl SourceControlModel {
         }
         next.error = self.error.clone();
         next.output_expanded = self.output_expanded;
+        next.undo_discard_until_unix_ms = self.undo_discard_until_unix_ms;
         next.stashes_expanded = self.stashes_expanded;
         next.pending_stash_drop = self.pending_stash_drop.clone();
         next.pending_marker_stage = self.pending_marker_stage.clone();
@@ -4382,6 +4386,7 @@ impl SidebarState {
             | SidebarAction::ToggleStashes { .. }
             | SidebarAction::RequestStashDrop { .. }
             | SidebarAction::ConfirmStageMarkers { .. }
+            | SidebarAction::UndoDiscard { .. }
             | SidebarAction::CancelGitMutation { .. }
             | SidebarAction::ToggleGitOutput { .. }
             | SidebarAction::Stage { .. }
@@ -4710,6 +4715,9 @@ pub enum SidebarAction {
     ConfirmStageMarkers {
         key: ActiveWorktreeKey,
         confirmed: bool,
+    },
+    UndoDiscard {
+        key: ActiveWorktreeKey,
     },
     CancelGitMutation {
         key: ActiveWorktreeKey,
@@ -8622,6 +8630,25 @@ fn source_control_notices<'a>(
             }
         }
     }
+    if source.undo_discard_until_unix_ms.is_some_and(|until| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            <= u128::from(until)
+    }) {
+        notices = notices.push(
+            widget::row::with_children(vec![
+                design::caption("Changes discarded. Backups kept.").into(),
+                widget::button::text("Undo discard")
+                    .on_press(SidebarAction::UndoDiscard {
+                        key: source.key.clone(),
+                    })
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
+    }
     if let Some(operation) = &source.operation {
         notices = notices.push(design::caption(format!(
             "{} in progress{}",
@@ -11396,7 +11423,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            design::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Tracked contents are backed up in Git; new files move to the system Trash. Undo is available for one minute.").into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
@@ -12931,6 +12958,23 @@ mod row_interaction {
                             shell.capture_event();
                             return;
                         }
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(character),
+                        modifiers,
+                        ..
+                    }) if state.focused && modifiers.is_empty() && character.as_str() == " " => {
+                        shell.publish(SidebarAction::InvokeChangeRows {
+                            key: key.clone(),
+                            row: row.clone(),
+                            command: if row.area == super::ChangeArea::Staged {
+                                super::ChangeGroupCommand::Unstage
+                            } else {
+                                super::ChangeGroupCommand::Stage
+                            },
+                        });
+                        shell.capture_event();
+                        return;
                     }
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(named),
@@ -19959,22 +20003,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_running_mutation_withholds_every_further_command_against_the_same_index() {
+    fn a_running_mutation_keeps_stage_and_unstage_available_but_withholds_discard() {
         let mut source = source_control();
         source.set_mutation(Some(MutationKind::Stage));
-        let group = source
-            .group(ChangeArea::Unstaged)
-            .expect("an unstaged group exists");
-        assert!(
-            group_commands(&source, group, false)
-                .iter()
-                .all(|command| command.action.is_none())
-                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false)
-                    .iter()
-                    .all(|command| command.action.is_none()),
-            "two `git add` runs against one index corrupt each other's lock, so the second is not \
-             enabled"
-        );
+        for area in [ChangeArea::Staged, ChangeArea::Unstaged] {
+            let group = source.group(area).expect("the fixture has both areas");
+            let group_actions = group_commands(&source, group, false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .filter_map(|action| resolve_group_command(&source, &action))
+                .collect::<Vec<_>>();
+            let row_actions = row_commands(&source, area, &group.rows()[0], false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .collect::<Vec<_>>();
+            for actions in [&group_actions, &row_actions] {
+                assert!(
+                    actions.iter().any(|action| match area {
+                        ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
+                        _ => matches!(action, SidebarAction::Stage { .. }),
+                    }),
+                    "stage and unstage intentions must reach the serialized queue"
+                );
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, SidebarAction::RequestDiscard { .. })),
+                    "discard remains unavailable while a mutation runs"
+                );
+            }
+            for commands in [
+                group_commands(&source, group, true),
+                row_commands(&source, area, &group.rows()[0], true),
+            ] {
+                assert!(
+                    commands.iter().all(|command| command.action.is_none()),
+                    "an open dialog still withholds every command"
+                );
+            }
+        }
     }
 
     #[test]

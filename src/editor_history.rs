@@ -106,6 +106,8 @@ struct Transaction {
     before_revision: u64,
     after_revision: u64,
     changes: Vec<TextChange>,
+    /// File existence changes independently of text (an empty file is not absent).
+    presence: Option<((bool, u64), (bool, u64))>,
     /// The caret before the first change, restored by undo.
     before: Cursor,
     /// The caret after the last change, restored by redo.
@@ -261,6 +263,7 @@ impl History {
                 after_revision,
                 before,
                 changes: vec![change],
+                presence: None,
                 after,
                 kind,
                 last_edit: now,
@@ -282,7 +285,40 @@ impl History {
         after: Cursor,
         now: Instant,
     ) {
-        if changes.is_empty() {
+        self.record_group_with_presence(changes, before, after, now, None);
+    }
+
+    /// Records text and file existence as a single native Undo step. A pure
+    /// existence change still earns a transaction when the text is unchanged.
+    pub fn record_group_with_presence(
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<(bool, bool)>,
+    ) {
+        self.record_group_with_presence_identities(
+            changes,
+            before,
+            after,
+            now,
+            presence.map(|(before, after)| ((before, 0), (after, 0))),
+        );
+    }
+
+    /// Existence history also owns the immutable restoration lineage. Text and
+    /// metadata intentions can change independently, including empty files.
+    pub fn record_group_with_presence_identities(
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<((bool, u64), (bool, u64))>,
+    ) {
+        let presence = presence.filter(|(before, after)| before != after);
+        if changes.is_empty() && presence.is_none() {
             return;
         }
         self.drop_redo();
@@ -292,6 +328,7 @@ impl History {
                 before_revision,
                 after_revision,
                 changes,
+                presence,
                 before,
                 after,
                 kind: EditKind::Other,
@@ -299,6 +336,48 @@ impl History {
             },
             false,
         );
+    }
+
+    /// Attach existence to an edit which recreates an intentionally absent
+    /// document. Subsequent typing can still coalesce into that same gesture.
+    pub fn record_latest_presence(&mut self, before: bool, after: bool) {
+        self.record_latest_presence_identity((before, 0), (after, 0));
+    }
+
+    pub fn record_latest_presence_identity(&mut self, before: (bool, u64), after: (bool, u64)) {
+        if let Some(transaction) = self.undo.back_mut() {
+            let original = transaction.presence.map_or(before, |(before, _)| before);
+            transaction.presence = (original != after).then_some((original, after));
+        }
+    }
+
+    /// Expected and resulting existence for the next replay. Install only
+    /// after replay answers Applied.
+    pub fn replay_presence(&self, redo: bool) -> Option<(bool, bool)> {
+        self.replay_presence_identity(redo)
+            .map(|(before, after)| (before.0, after.0))
+    }
+
+    pub fn replay_presence_identity(&self, redo: bool) -> Option<((bool, u64), (bool, u64))> {
+        let presence = if redo {
+            self.redo.last()
+        } else {
+            self.undo.back()
+        }?
+        .presence?;
+        Some(if redo {
+            presence
+        } else {
+            (presence.1, presence.0)
+        })
+    }
+
+    pub fn retained_presence_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.undo
+            .iter()
+            .chain(self.redo.iter())
+            .filter_map(|transaction| transaction.presence)
+            .flat_map(|(before, after)| [before.1, after.1])
     }
 
     /// Reverts the newest step and restores the caret it started from.
@@ -915,6 +994,27 @@ mod tests {
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert_eq!(history.revision(), saved);
         assert_eq!(model.text, "saved");
+    }
+
+    #[test]
+    fn file_presence_only_revert_is_one_transaction_without_a_text_edit() {
+        let now = Instant::now();
+        let mut history = History::default();
+        let mut model = Model::new("");
+        history.record_group_with_presence(
+            vec![],
+            model.cursor,
+            model.cursor,
+            now,
+            Some((true, false)),
+        );
+        assert_eq!(history.replay_presence(false), Some((false, true)));
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
+        assert!(!history.can_undo());
+        assert_eq!(history.replay_presence(true), Some((true, false)));
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
     }
 
     #[test]

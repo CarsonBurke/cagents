@@ -45,7 +45,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .and_then(|index| index.parse::<usize>().ok())
             .ok_or("Invalid stash selector")?;
         let common = self
-            .common_dir(worktree, cancellation)
+            .common_dir_for_io(worktree, cancellation)
             .map_err(|error| error.to_string())?;
         // A repository using another ref backend must be handled by that
         // backend's transaction API. Never edit an unfamiliar storage format.
