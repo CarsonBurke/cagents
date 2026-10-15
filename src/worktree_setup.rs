@@ -16,6 +16,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStringExt,
         fs::{MetadataExt, PermissionsExt},
