@@ -5996,6 +5996,19 @@ impl Cagents {
     fn begin_chat_close_request(&mut self, card: CardId, request: closing::EndRequest) -> Task<Message> {
         if !request.current(self, card) { self.stop_pane_close_batch(request.batch); return Task::none(); }
         let batch = request.batch;
+        // Return can have created a terminal before its reply was lost. An
+        // ordinary Chat close/absence is not a disposition for that returned
+        // worker. Preserve the original End and await exact Return recovery.
+        if let Some(target) = self.chat_ui.handoff_bindings.keys().find(|target| target.card == card).copied()
+            && !matches!(self.chat_ui.phases.get(&card), Some(Phase::Returning { .. })) {
+            if self.chat_ui.end_requests.get(&target).is_some_and(|pending| pending.batch != batch) {
+                self.stop_pane_close_batch(batch);
+                return Task::none();
+            }
+            self.chat_ui.end_requests.entry(target).or_insert(request);
+            self.status = Some(TransientNotice::warning("The Return outcome is unconfirmed. Retry Return to recover its exact terminal before ending this conversation."));
+            return Task::none();
+        }
         self.remember_conversation_draft(card);
         // This capability was captured only from a fully qualified read-only
         // report and its exact canonical shared source. Ending that saved view
@@ -7338,12 +7351,22 @@ impl Cagents {
                         let operation = captured.operation;
                         let expected = captured.binding.clone();
                         self.chat_ui.handoff_bindings.insert(target, captured);
+                        let close_requested = if let Some(request) = self.chat_ui.end_requests.get(&target) {
+                            if !request.current(self, card) {
+                                let batch = request.batch;
+                                self.stop_pane_close_batch(batch);
+                                self.chat_ui.end_requests.remove(&target);
+                                self.status = Some(TransientNotice::warning("The original End scope changed. Its Return recovery intent was kept."));
+                                return Task::none();
+                            }
+                            true
+                        } else { false };
                         self.chat_ui.phases.insert(
                             target.card,
                             Phase::Returning {
                                 target,
                                 local: None,
-                                close_requested: false,
+                                close_requested,
                             },
                         );
                         return cosmic::task::future(async move {
@@ -9682,12 +9705,18 @@ impl Cagents {
                 let receipt = match result {
                     Ok(receipt) => receipt,
                     Err(error) => {
-                        let close = close_requested && request.as_ref().is_some_and(|request| request.current(self, target.card));
-                        if !close { self.stop_pane_close_batch(batch); }
-                        self.status = Some(TransientNotice::error(error));
+                        let waiting_end = close_requested && request.as_ref().is_some_and(|request| request.current(self, target.card));
+                        if waiting_end {
+                            // No generic close fallback: it cannot attest to a
+                            // terminal already started by this ambiguous Return.
+                            self.chat_ui.end_requests.insert(target, request.unwrap());
+                            self.status = Some(TransientNotice::warning(format!("Return is unconfirmed: {error}. Retry Return to recover its exact terminal; End is waiting.")));
+                        } else {
+                            self.stop_pane_close_batch(batch);
+                            self.status = Some(TransientNotice::error(error));
+                        }
                         self.reread_chat_activity(target);
-                        return if close { request.map_or_else(Task::none, |request| self.begin_chat_close_request(target.card, request)) }
-                            else { Task::none() };
+                        return Task::none();
                     }
                 };
                 let current = self.chat_return_session(target.card);
@@ -16192,6 +16221,65 @@ mod tests {
         assert_eq!(app.chat_ui.handoff_bindings[&target].binding, first.binding);
         assert!(app.terminal_starts.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn ambiguous_claude_return_keeps_end_until_the_exact_retry_receipt() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Claude, Some(PathBuf::from(FIXTURE_DIRECTORY))));
+        let card = app.workspace.focused().unwrap();
+        write(&mut app, card, "original conversation");
+        submit(&mut app, card);
+        let target = app.chat_ui.attempt(card).unwrap().target;
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, target, Ok(handle.clone()));
+        settle(&mut app, card, Ok(()));
+        let source = app.chat_return_session(card).unwrap();
+        assert_eq!(source.launch.provider, Provider::Claude);
+        assert!(!source.owns_codex_listener());
+        assert!(!matches!(source.native_continuity, chat::NativeContinuity::Durable { .. }));
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let original = app.chat_ui.handoff_bindings[&target].clone();
+        request_end_chat(&mut app, card);
+        assert!(app.chat_ui.end_requests.contains_key(&target));
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, original.operation, Err("reply lost after possible terminal start".into())))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.chat_ui.phases.is_empty(), "no provider cleanup can follow an ambiguous Return");
+        assert!(app.chat_ui.end_requests.contains_key(&target));
+        assert!(app.recently_closed.is_empty());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        // A repeated End retains the original request rather than taking the
+        // ordinary non-Durable synchronous removal fallback.
+        drop(app.begin_chat_close(card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.chat_ui.phases.is_empty());
+        handle.clear_source_binding_for_test();
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let retry = app.chat_ui.handoff_bindings[&target].clone();
+        assert_eq!(retry.binding, original.binding);
+        assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Returning { close_requested: true, .. })));
+        let proof = original.binding.source.proof.clone().unwrap();
+        let terminal = return_terminal(&original.binding.source).unwrap();
+        let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), terminal.transcript_path.clone());
+        descriptor.session = terminal;
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let receipt = crate::terminal::ipc::TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(), source: original.binding.source.clone(),
+            source_execution_instance: original.binding.execution_instance, source_binding: original.binding,
+            retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor,
+        };
+        assert_eq!(receipt.source.proof, Some(proof));
+        // Typed-result injection proves reducer ownership only. The actual
+        // descriptor-first attachment task remains unpolled in this fixture.
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, retry.operation, Ok(receipt.clone())))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Terminal(current) if *current == receipt.terminal.session));
+        assert!(app.terminal_start_in_flight(card));
+        assert!(app.chat_ui.handoff_closes.contains_key(&card));
+        assert!(!app.chat_ui.handoff_closes[&card].attached);
+        assert!(app.recently_closed.is_empty());
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
