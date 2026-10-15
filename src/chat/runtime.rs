@@ -77,6 +77,17 @@ impl AccountSwitchOptions {
     }
 }
 
+/// This is admission against the then-current source Store. It does not
+/// promise an atomic native-turn fence after the adapter starts executing.
+fn requires_source_admission(command: &Command) -> bool {
+    match command {
+        Command::Prompt { .. } | Command::StartQueued { .. } => true,
+        Command::Answer { action, .. } => !matches!(
+            action.as_str(), "deny" | "decline" | "reject" | "cancel" | "abort"
+        ),
+        _ => false,
+    }
+}
 enum ActorCommand {
     AccountNotice(String),
     AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
@@ -3615,6 +3626,30 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            if requires_source_admission(&command) {
+                // A cache-only reader can hold Store during disk I/O. Busy is
+                // a pre-effects refusal, never evidence of lost authority and
+                // never a reason to wait before the next urgent control.
+                let admission = match self.store.try_lock() {
+                    Ok(store) => store.admit_source_command().map_err(|error| (error, true)),
+                    Err(std::sync::TryLockError::WouldBlock) => Err((
+                        "Source cache is busy; this command was refused before provider effects; retry it".into(), false,
+                    )),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Err((
+                        "Source cache ownership is unavailable; this command was refused before provider effects".into(), false,
+                    )),
+                };
+                if let Err((error, publish)) = admission {
+                    // The guard's Store lock is gone before metadata refresh.
+                    // Publication cannot convert this original refusal into
+                    // accepted work or a semantic acknowledgement.
+                    if publish && let Err(publication) = self.publish_source_authority() {
+                        tracing::warn!(reason=%super::protocol::preview(publication.as_bytes(),1024),"Source refusal metadata could not be published");
+                    }
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+            }
             // Discard a previous internally-issued control's marker. Only
             // this command owns the acknowledgement sender below.
             self.adapter.command_ack();
@@ -5151,6 +5186,93 @@ mod tests {
         handle.close().unwrap();
     }
 
+    fn source_admission_fixture() -> (tempfile::TempDir, LocalHandle, crossbeam_channel::Receiver<Command>) {
+        struct WriteOnly(crossbeam_channel::Sender<Command>);
+        impl Adapter for WriteOnly {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:serde_json::Value)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                self.0.send(command.clone()).unwrap();
+                Ok(Step {writes:vec![serde_json::json!({"command":command})],..Step::default()})
+            }
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let log=directory.path().join("provider-input.jsonl");
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
+            program:"/usr/bin/python3".into(),arguments:vec!["-u".into(),"-c".into(),
+                "import sys\nwith open(sys.argv[1], 'ab', buffering=0) as output:\n for line in sys.stdin.buffer:\n  output.write(line)\n".into(),log.to_string_lossy().into_owned()],
+            working_directory:directory.path().into(),environment:Default::default()};
+        let (calls,observed)=crossbeam_channel::bounded(16);
+        let (published,authority)=crossbeam_channel::bounded(16);
+        let mut initial=Step {events:vec![Event::Ready(true)],..Step::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(WriteOnly(calls)),initial,store,None,move |update| {
+            if matches!(update,Update::SourceAuthority {..}) {let _=published.try_send(());}
+        }).unwrap();
+        authority.recv_timeout(Duration::from_secs(2)).unwrap();
+        until(&handle,|state|state.ready);
+        (directory,handle,observed)
+    }
+    fn wait_source_admission_input(directory:&std::path::Path)->serde_json::Value {
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {
+            if let Ok(bytes)=std::fs::read(directory.join("provider-input.jsonl")) {
+                if bytes.ends_with(b"\n") {return serde_json::from_slice(&bytes).unwrap();}
+            }
+            assert!(Instant::now()<deadline,"owned provider pipe did not receive the permitted control");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn source_poison_refuses_positive_work_before_write_only_adapter_effects() {
+        let (directory,handle,calls)=source_admission_fixture();
+        handle.0.store.lock().unwrap().deny_source_release_for_test();
+        for command in [
+            Command::Prompt {text:"must not reach provider".into(),attachments:Vec::new(),mode:crate::chat::PromptMode::Send},
+            Command::StartQueued {id:"queued".into()},
+            Command::Answer {request_id:"approval".into(),action:"allow".into(),answers:Vec::new()},
+            Command::Answer {request_id:"approval".into(),action:"unknown-positive".into(),answers:Vec::new()},
+        ] {
+            assert!(matches!(handle.try_command(command),Err(Rejection::Refused(_))));
+        }
+        assert!(calls.is_empty(),"positive refusal must precede adapter command/ACK state changes");
+        let denial=Command::Answer {request_id:"approval".into(),action:"deny".into(),answers:Vec::new()};
+        handle.command(denial.clone()).unwrap();
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(),denial);
+        let wire=wait_source_admission_input(directory.path());
+        assert_eq!(wire["command"],serde_json::to_value(denial).unwrap());
+        handle.close().unwrap();
+    }
+    #[test]
+    fn held_source_store_refuses_positive_admission_without_blocking_negative_control() {
+        let (directory,handle,calls)=source_admission_fixture();
+        let original=handle.source_authority();
+        let store=handle.0.store.lock().unwrap();
+        let refused=handle.enqueue_command(Command::StartQueued {id:"queued".into()}).unwrap();
+        let error=refused.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert!(error.contains("busy") && error.contains("before provider effects"));
+        assert_eq!(handle.source_authority(),original,"Store contention grants no new authority or unavailable cause");
+        assert!(handle.source_authority_unavailable().is_none());
+        let denial=Command::Answer {request_id:"approval".into(),action:"deny".into(),answers:Vec::new()};
+        let accepted=handle.enqueue_command(denial.clone()).unwrap();
+        accepted.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)).unwrap(),denial);
+        assert!(calls.is_empty());
+        let wire=wait_source_admission_input(directory.path());
+        assert_eq!(wire["command"],serde_json::to_value(denial).unwrap());
+        drop(store);
+        handle.close().unwrap();
+    }
+    #[test]
+    fn source_admission_classifier_keeps_exact_negative_and_recovery_actions() {
+        for action in ["deny","decline","reject","cancel","abort"] {
+            assert!(!requires_source_admission(&Command::Answer {request_id:"request".into(),action:action.into(),answers:Vec::new()}));
+        }
+        for command in [Command::Interrupt,Command::Refresh,Command::Slash {command:"reset".into()}] {
+            assert!(!requires_source_admission(&command));
+        }
+        assert!(requires_source_admission(&Command::Answer {request_id:"request".into(),action:"DENY".into(),answers:Vec::new()}));
+    }
     struct SourceReplacementIdle;
     impl Adapter for SourceReplacementIdle {
         fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![Event::Ready(true)], ..Default::default() }) }
