@@ -25,11 +25,12 @@ impl Runtime {
             && anchor.as_deref() == self.turns.last().map(|turn| turn.key.as_str())
             && chat::requires_sign_in(self.session.launch.provider, message)
     }
-    fn recovery_available(&self) -> bool {
+    fn auth_recovery_available(&self) -> bool {
         self.auth_error().is_some()
             && self.pending.is_none()
             && self.queued.is_none()
             && !self.snapshot.busy
+            && !self.snapshot.original_retry_pending
             && !self.attachment_chooser_pending
     }
 }
@@ -78,7 +79,7 @@ impl Cagents {
             return false;
         };
         runtime.target == target
-            && runtime.recovery_available()
+            && runtime.auth_recovery_available()
             && !self.chat_start_pending(target.card)
             && self
                 .auth_account(runtime)
@@ -137,7 +138,7 @@ pub(super) fn view<'a>(
     let known = recovery.is_some();
     let mut login_change = None;
     let label = if let Some(recovery) = recovery {
-        let enabled = enabled && runtime.recovery_available() && !recovery.signing_in;
+        let enabled = enabled && runtime.auth_recovery_available() && !recovery.signing_in;
         let resume_enabled = enabled && recovery.login_change.is_none();
         login_change = recovery.login_change;
         controls.push(

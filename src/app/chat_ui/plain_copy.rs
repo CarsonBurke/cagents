@@ -240,7 +240,7 @@ pub(super) fn begin(
             .unwrap_or_else(|_| Err("Plain-text copy took too long. Try copying Markdown.".into()));
             Reply::new(value)
         },
-        move |reply| action(Action::PlainCopyReady(target, id, reply)),
+        move |reply| cosmic::Action::App(action(Action::PlainCopyReady(target, id, reply))),
     )
 }
 

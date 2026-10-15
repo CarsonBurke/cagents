@@ -391,7 +391,7 @@ impl Cagents {
     /// Called for DeleteFiles intent even if physical deletion partly fails.
     /// Archive/Move do not call this. Registry IDs only invalidate cached UI
     /// lineage; they are never annotation read authority.
-    pub(super) fn invalidate_originals_for_account(&mut self, _id: &AccountId) {
+    pub(in crate::app) fn invalidate_originals_for_account(&mut self, _id: &AccountId) {
         // An archived/unregistered alias can share physical authority with a
         // different filing. Conservatively invalidate all small metadata and
         // still-origin-derived stashes; actual edited composers are user intent.
