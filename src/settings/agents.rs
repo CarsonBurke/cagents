@@ -321,6 +321,21 @@ mod tests {
         let explicit = crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into(), "explicit".into()]).unwrap();
         assert_eq!(explicit.program, "/bin/echo");
         assert_eq!(explicit.arguments, ["explicit"]);
+        let path = super::super::default_path().unwrap();
+        let valid_file = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "[invalid external edit").unwrap();
+        assert_eq!(crate::model::terminal_shell(), Err(crate::model::LoginShellError::PreferencesUnavailable));
+        assert!(crate::control::terminal_spawn_recipe(root.clone(), vec![]).is_err(), "fresh CLI must not silently choose another shell when preferences cannot be read");
+        let captured = LaunchRecipe::shell_with_settings(root.clone(), &settings).unwrap();
+        assert_eq!(captured.program, shell.to_string_lossy(), "running UI keeps its captured last valid shell policy");
+        assert!(crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into()]).is_ok());
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home { shell, shell_error, .. } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap() else { panic!("device identity reply"); };
+            assert!(shell.is_empty());
+            assert!(shell_error.is_some(), "remote identity remains available and records terminal policy refusal");
+        }
+        std::fs::write(&path, valid_file).unwrap();
         std::fs::remove_file(&shell).unwrap();
         #[cfg(any(feature = "ui", feature = "host"))]
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());

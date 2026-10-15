@@ -5801,7 +5801,7 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
+        let mut launch = match LaunchRecipe::shell_with_settings(working_directory.clone(), &self.settings) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
