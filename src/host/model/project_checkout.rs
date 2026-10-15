@@ -1,23 +1,4 @@
 //! Preserve discovery information that cannot be reconstructed from a separate Git directory.
-use rusqlite::Connection;
-
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    for column in ["checkout", "primary_checkout"] {
-        let present: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = ?1)",
-                [column],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !present {
-            db.execute_batch(&format!("ALTER TABLE projects ADD COLUMN {column} TEXT;"))
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -58,7 +39,8 @@ mod tests {
         let path = directory.path().join("registry.sqlite3");
         let mut registry = Registry::at(&path).unwrap();
         registry.apply(&open("/metadata/project.git")).unwrap();
-        registry.db.execute_batch("ALTER TABLE projects DROP COLUMN checkout; ALTER TABLE projects DROP COLUMN primary_checkout; PRAGMA user_version = 12;").unwrap();
+        schema::discard_selected_for_legacy_fixture(&registry.db);
+        registry.db.pragma_update(None,"user_version",12).unwrap();
         drop(registry);
         let restored = Registry::at(&path).unwrap();
         assert!(restored.model().unwrap().projects[0].checkout.is_none());

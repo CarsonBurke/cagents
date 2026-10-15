@@ -780,40 +780,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_thirteen_checkout_only_registry_gains_all_location_tables() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("registry.sqlite3");
-        let mut registry = Registry::at(&path).unwrap();
+    fn schema_thirteen_checkout_only_registry_refuses_without_repair_or_user_data_changes() {
+        let directory=tempfile::tempdir().unwrap();
+        let path=directory.path().join("registry.sqlite3");
+        let mut registry=Registry::at(&path).unwrap();
         registry.apply(&open("/metadata/project.git")).unwrap();
-        registry.db.execute("UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'", []).unwrap();
-        registry
-            .db
-            .execute_batch(
-                "DROP TABLE agent_locations; DROP TABLE session_locations; PRAGMA user_version=13;",
-            )
-            .unwrap();
+        // Build the actual checkout-only private fork from the published12
+        // layout, rather than relabel a current authority-rich registry.
+        schema::discard_selected_for_legacy_fixture(&registry.db);
+        registry.db.execute_batch("ALTER TABLE projects ADD COLUMN checkout TEXT; ALTER TABLE projects ADD COLUMN primary_checkout TEXT; UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'; PRAGMA user_version=13;").unwrap();
         drop(registry);
-        let registry = Registry::at(&path).unwrap();
-        for table in ["agent_locations", "session_locations"] {
-            let exists: bool = registry
-                .db
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "{table}");
-        }
-        let model = registry.model().unwrap();
-        assert_eq!(
-            model.projects[0].checkout.as_deref(),
-            Some(Path::new("/checkout/project"))
-        );
-        assert_eq!(
-            model.projects[0].primary_checkout.as_deref(),
-            Some(Path::new("/checkout/primary"))
-        );
+        let wal=PathBuf::from(format!("{}-wal",path.display()));
+        let before=(std::fs::read(&path).unwrap(),std::fs::read(&wal).ok());
+        assert!(Registry::at(&path).is_err(),"private13 is ambiguous and must not be silently promoted");
+        assert_eq!((std::fs::read(&path).unwrap(),std::fs::read(&wal).ok()),before);
     }
 
     #[test]
