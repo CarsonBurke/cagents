@@ -7,6 +7,7 @@
 
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+mod operation_metadata;
 
 use std::{
     borrow::Cow,
@@ -137,6 +138,22 @@ impl DirtyState {
             || self.conflicted != 0
             || self.submodule != 0
     }
+}
+
+/// Display-only observation of Git's in-progress operation markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitOperationKind { Merge, Rebase, CherryPick, Revert }
+impl GitOperationKind {
+    pub fn label(self) -> &'static str {
+        match self { Self::Merge => "Merge", Self::Rebase => "Rebase", Self::CherryPick => "Cherry-pick", Self::Revert => "Revert" }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOperationState {
+    pub kind: GitOperationKind,
+    pub incoming_ref: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -4279,6 +4296,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             OsString::from("--no-color"),
         ]);
         arguments
+    }
+
+    /// Worker-only bounded marker/draft read. This is display metadata and
+    /// provides no permission to continue, abort or otherwise mutate Git.
+    pub fn operation_state(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
+        let observation = snapshot_admin_fingerprint(worktree, cancellation)
+            .map_err(|error| ValidationError::Io(format!("Cannot observe Git operation metadata: {error}")))?;
+        let result = observation.git_dir.as_deref()
+            .map(operation_metadata::read_operation_state).transpose()?.flatten();
+        if cancellation.is_cancelled() {
+            return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
+                "Git operation metadata read cancelled", false).into());
+        }
+        Ok(result)
     }
 
     pub fn discover(
