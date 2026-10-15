@@ -754,6 +754,100 @@ mod tests {
     }
 
     #[test]
+    fn child_kind_replacement_fences_resident_and_evicted_tools_after_prose_removal() {
+        use serde_json::json;
+        use crate::chat::ToolStatus;
+        for evicted in [false, true] {
+            for streamed in [false, true] {
+                for removed in [false, true] {
+                    let store = Arc::new(Mutex::new(Store::new().unwrap()));
+                    let source = reader(&store);
+                    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let mut adapter = crate::chat::protocol::claude::fixture_adapter();
+                    adapter.bind_item_reader(Arc::new(CountReader {inner: source.clone(), reads: reads.clone()}));
+                    let key = CanonicalItemKey::new(Some("one"), "prose:0");
+                    let call = |parent: Option<&str>, carrier: &str, id: &str, owner: &str, payload: &str| {
+                        json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":parent,
+                            "message":{"id":carrier,"content":[{"type":"tool_use","id":id,
+                                "name":"Opaque","input":{"owner":owner,"payload":payload}}]}})
+                    };
+                    for (parent, owner) in [(None, "parent"), (Some("one"), "one"), (Some("two"), "two")] {
+                        let step = adapter.receive(call(parent, &format!("seed-{owner}"), "prose:0", owner, "")).unwrap();
+                        commit(&store, adapter.as_mut(), step);
+                    }
+                    reads.store(0, std::sync::atomic::Ordering::Relaxed);
+                    let replay = adapter.receive(call(Some("one"), "resident-probe", "prose:0", "one", "")).unwrap();
+                    assert!(replay.events.iter().any(|event| matches!(event, Event::SubagentItem {id,item} if id=="one" && item.id=="prose:0")));
+                    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0,
+                        "the vulnerable path must begin with an actually resident optional tool");
+                    commit(&store, adapter.as_mut(), replay);
+                    if evicted {
+                        let pressure = "x".repeat(3 * 1024 * 1024);
+                        let step = adapter.receive(call(Some("pressure"), "pressure-first", "pressure-first", "pressure", &pressure)).unwrap();
+                        commit(&store, adapter.as_mut(), step);
+                        reads.store(0, std::sync::atomic::Ordering::Relaxed);
+                        let probe = adapter.receive(call(Some("one"), "evicted-probe", "prose:0", "one", "")).unwrap();
+                        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                            "the large committed body must actually evict the original optional entry");
+                        commit(&store, adapter.as_mut(), probe);
+                        let step = adapter.receive(call(Some("pressure"), "pressure-second", "pressure-second", "pressure", &pressure)).unwrap();
+                        commit(&store, adapter.as_mut(), step);
+                    }
+                    let text = if streamed { "new prose continued" } else { "new prose" };
+                    if streamed {
+                        for (index, event) in [
+                            json!({"type":"message_start","message":{"id":"prose"}}),
+                            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"new prose"}}),
+                            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" continued"}}),
+                        ].into_iter().enumerate() {
+                            let step = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"one","event":event})).unwrap();
+                            let is_delta = step.events.iter().any(|event| matches!(event, Event::SubagentTextDelta {id,item_id,..} if id=="one" && item_id=="prose:0"));
+                            if index >= 2 { assert!(is_delta, "actual text-delta frames must update the exact replacement prose"); }
+                            commit(&store, adapter.as_mut(), step);
+                        }
+                    }
+                    // Both completed and streaming snapshots derive the SAME
+                    // exact ID as the earlier tool, through the actual decoder.
+                    let prose = adapter.receive(json!({"type":"assistant","uuid":"prose-final","parent_tool_use_id":"one",
+                        "message":{"id":"prose","content":[{"type":"text","text":text}]}})).unwrap();
+                    assert!(prose.events.iter().any(|event| matches!(event, Event::SubagentItem {id,item} if id=="one" && item.id=="prose:0" && matches!(&item.content,ItemContent::Text {text:body,..} if body==text))));
+                    commit(&store, adapter.as_mut(), prose);
+                    assert!(source.validate_key(&key).unwrap_err().contains("changed kind"));
+                    {
+                        let store = store.lock().unwrap();
+                        let (supported, length): (bool, usize) = store.db.query_row("SELECT supported,len FROM child_sources WHERE agent='one' AND id='prose:0'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+                        assert!(supported); assert_eq!(length, text.len(), "new prose remains mutable and complete");
+                    }
+                    if removed {
+                        let removal = adapter.receive(json!({"type":"assistant","uuid":"replace-prose","parent_tool_use_id":"one",
+                            "supersedes":["prose-final"],"message":{"id":"survivor","content":[{"type":"text","text":"unrelated survivor"}]}})).unwrap();
+                        assert!(removal.events.iter().any(|event| matches!(event, Event::SubagentItemsRemoved {id,ids} if id=="one" && ids.iter().any(|id|id=="prose:0"))));
+                        commit(&store, adapter.as_mut(), removal);
+                        let store = store.lock().unwrap();
+                        assert_eq!(store.db.query_row("SELECT kind FROM child_tool_revoked WHERE agent='one' AND id='prose:0'", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+                        assert_eq!(store.db.query_row("SELECT count(*) FROM child_sources WHERE agent='one' AND id='prose:0'", [], |row| row.get::<_,usize>(0)).unwrap(), 0);
+                    }
+                    reads.store(0, std::sync::atomic::Ordering::Relaxed);
+                    let late = adapter.receive(json!({"type":"user","uuid":"late-result","parent_tool_use_id":"one",
+                        "message":{"content":[{"type":"tool_result","tool_use_id":"prose:0","content":"private old tool result","is_error":false}]}})).unwrap();
+                    assert!(late.events.iter().any(|event| matches!(event, Event::Error {fatal:false,..})));
+                    assert!(!late.events.iter().any(|event| matches!(event, Event::SubagentItem {id,item} if id=="one" && item.id=="prose:0")));
+                    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0,
+                        "replacement/removal must refuse before body hydration, resident or evicted");
+                    commit(&store, adapter.as_mut(), late);
+                    assert!(source.read(&key).is_err());
+                    for (parent, owner) in [(None, "parent"), (Some("two"), "two")] {
+                        let original = source.read(&CanonicalItemKey::new(parent,"prose:0")).unwrap().unwrap();
+                        assert!(matches!(original.content, ItemContent::Tool {input,status:ToolStatus::Running,..}
+                            if serde_json::from_str::<serde_json::Value>(&input).unwrap()["owner"]==owner));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn delegated_owner_and_body_reads_share_one_snapshot_during_exact_owner_replacement() {
         struct Swap { path: PathBuf, fired: bool, error: Option<String> }
         unsafe extern "C" fn trace(_: u32, context: *mut std::ffi::c_void, _: *mut std::ffi::c_void, sql: *mut std::ffi::c_void) -> i32 {

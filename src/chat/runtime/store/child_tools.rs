@@ -3,9 +3,14 @@
 use super::*;
 use crate::chat::protocol::CanonicalItemKey;
 
-const SCHEMA: &str = "CREATE TABLE child_tools(agent TEXT NOT NULL,id TEXT NOT NULL,metadata BLOB NOT NULL,len0 INTEGER NOT NULL,len1 INTEGER NOT NULL,spans BLOB NOT NULL,cost INTEGER NOT NULL,PRIMARY KEY(agent,id));
+const LEGACY_SCHEMA: &str = "CREATE TABLE child_tools(agent TEXT NOT NULL,id TEXT NOT NULL,metadata BLOB NOT NULL,len0 INTEGER NOT NULL,len1 INTEGER NOT NULL,spans BLOB NOT NULL,cost INTEGER NOT NULL,PRIMARY KEY(agent,id));
 CREATE TABLE child_tool_chunks(agent TEXT NOT NULL,id TEXT NOT NULL,field INTEGER NOT NULL,position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(agent,id,field,position),FOREIGN KEY(agent,id) REFERENCES child_tools(agent,id) ON DELETE CASCADE);
 CREATE TABLE child_tool_revoked(agent TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(agent,id));
+CREATE TABLE child_tool_budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL,items INTEGER NOT NULL,chunks INTEGER NOT NULL);
+INSERT INTO child_tool_budget VALUES(1,0,0,0);";
+const SCHEMA: &str = "CREATE TABLE child_tools(agent TEXT NOT NULL,id TEXT NOT NULL,metadata BLOB NOT NULL,len0 INTEGER NOT NULL,len1 INTEGER NOT NULL,spans BLOB NOT NULL,cost INTEGER NOT NULL,PRIMARY KEY(agent,id));
+CREATE TABLE child_tool_chunks(agent TEXT NOT NULL,id TEXT NOT NULL,field INTEGER NOT NULL,position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(agent,id,field,position),FOREIGN KEY(agent,id) REFERENCES child_tools(agent,id) ON DELETE CASCADE);
+CREATE TABLE child_tool_revoked(agent TEXT NOT NULL,id TEXT NOT NULL,kind INTEGER NOT NULL DEFAULT 0 CHECK(kind IN (0,1)),PRIMARY KEY(agent,id));
 CREATE TABLE child_tool_budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL,items INTEGER NOT NULL,chunks INTEGER NOT NULL);
 INSERT INTO child_tool_budget VALUES(1,0,0,0);";
 const ITEM_BYTES: usize = 64 * 1024 * 1024;
@@ -18,8 +23,8 @@ const SOURCE_ERROR: &str = "The subagent's complete original tool record is unav
 const BUDGET_ERROR: &str = "This conversation reached its complete subagent tool history limit. Existing history was kept; exact late updates are unavailable";
 
 // This namespace is independent of raw_source_schema and window/Registry DB
-// versions. Only its explicit legacy/fresh version zero may migrate to one.
-const VERSION: i64 = 1;
+// versions. Known legacy zero/one migrate explicitly to typed markers at two.
+const VERSION: i64 = 2;
 const VERSION_SCHEMA: &str = "CREATE TABLE child_tool_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL)";
 
 #[cfg(test)]
@@ -39,8 +44,18 @@ pub(super) fn initialize_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -
         [], |row| row.get(0),
     ).map_err(|error| error.to_string())?;
     if versioned {
-        guard(tx, owner)?;
-        validate_layout(tx, true)?;
+        let version: i64 = tx.query_row("SELECT version FROM child_tool_schema WHERE singleton=1", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        match version {
+            VERSION => validate_layout(tx, true, true)?,
+            1 => {
+                validate_layout(tx, true, false)?;
+                migrate_marker_kind(tx)?;
+                tx.execute("UPDATE child_tool_schema SET version=?1 WHERE singleton=1", [VERSION])
+                    .map_err(|error| error.to_string())?;
+            },
+            _ => return Err("Delegated tool schema is unsupported; its source data was retained".into()),
+        }
     } else {
         let present: usize = tx.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('child_tools','child_tool_chunks','child_tool_revoked','child_tool_budget')",
@@ -49,13 +64,14 @@ pub(super) fn initialize_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -
         match present {
             0 => {
                 tx.execute_batch(SCHEMA).map_err(|error| error.to_string())?;
-                validate_layout(tx, false)?;
+                validate_layout(tx, false, true)?;
             },
-            4 => validate_layout(tx, false)?,
+            4 => {
+                validate_layout(tx, false, false)?;
+                migrate_marker_kind(tx)?;
+            },
             _ => return Err("Delegated tool schema is incomplete; its source data was retained".into()),
         }
-        // A legacy layout is accepted only byte-for-byte modulo SQL spacing,
-        // never through CREATE IF NOT EXISTS or an inferred future version.
         tx.execute_batch(VERSION_SCHEMA).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO child_tool_schema VALUES(1,?1)", [VERSION])
             .map_err(|error| error.to_string())?;
@@ -63,7 +79,12 @@ pub(super) fn initialize_in(tx: &rusqlite::Transaction<'_>, owner: uuid::Uuid) -
     Ok(())
 }
 
-fn validate_layout(db: &Connection, versioned: bool) -> Result<(), String> {
+fn migrate_marker_kind(db: &Connection) -> Result<(), String> {
+    db.execute_batch("ALTER TABLE child_tool_revoked ADD COLUMN kind INTEGER NOT NULL DEFAULT 0 CHECK(kind IN (0,1))")
+        .map_err(|error| error.to_string())
+}
+
+fn validate_layout(db: &Connection, versioned: bool, typed_marker: bool) -> Result<(), String> {
     let tables: usize = db.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'child_tool*'",
         [], |row| row.get(0),
@@ -74,7 +95,7 @@ fn validate_layout(db: &Connection, versioned: bool) -> Result<(), String> {
     fn normalized(sql: &str) -> String {
         sql.chars().filter(|ch| !ch.is_ascii_whitespace()).flat_map(char::to_lowercase).collect()
     }
-    for expected in SCHEMA.split(';').map(str::trim).chain(versioned.then_some(VERSION_SCHEMA)).filter(|sql| sql.starts_with("CREATE TABLE ")) {
+    for expected in (if typed_marker { SCHEMA } else { LEGACY_SCHEMA }).split(';').map(str::trim).chain(versioned.then_some(VERSION_SCHEMA)).filter(|sql| sql.starts_with("CREATE TABLE ")) {
         let name = expected.strip_prefix("CREATE TABLE ").and_then(|sql| sql.split('(').next())
             .ok_or("Delegated tool migration manifest is invalid")?;
         let actual: Option<String> = db.query_row(
@@ -130,33 +151,15 @@ impl Store {
         first.then(|| reason.into())
     }
 
+    /// A kind replacement invalidates the old tool source and optional cache.
+    /// Its distinct marker permits ongoing prose but not ambiguous tool replay.
     fn remove_child_tool(&mut self, agent: &str, id: &str) -> Result<(), String> {
-        let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        guard(&tx, self.raw_sources.nonce)?;
-        let cost: Option<usize> = tx
-            .query_row(
-                "SELECT cost FROM child_tools WHERE agent=?1 AND id=?2",
-                params![agent, id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if let Some(cost) = cost {
-            let chunks: usize = tx
-                .query_row(
-                    "SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",
-                    params![agent, id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM child_tools WHERE agent=?1 AND id=?2",
-                params![agent, id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1,items=items-1,chunks=chunks-?2 WHERE singleton=1",params![cost,chunks]).map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())
+        // Prose token deltas must not repeatedly acquire a writer after the
+        // old tool has already become a retained replacement marker.
+        let exists: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tools WHERE agent=?1 AND id=?2)",
+            params![agent,id], |row| row.get(0)).map_err(|error| error.to_string())?;
+        if !exists { return Ok(()); }
+        self.revoke_child_tool_kind(agent, id, 1)
     }
 
     fn child_tool_revoked(&self, agent: &str, id: &str) -> Result<bool, String> {
@@ -173,58 +176,55 @@ impl Store {
     }
 
     pub(super) fn revoked_child_tool_event(&self, event: &Event) -> Result<bool, String> {
-        let key = match event {
-            Event::SubagentItem { id, item } => Some((id, &item.id)),
+        let (key, prose) = match event {
+            Event::SubagentItem { id, item } => (Some((id, &item.id)), matches!(&item.content, ItemContent::Text { .. })),
             Event::SubagentInputDelta { id, item_id, .. }
-            | Event::SubagentOutputDelta { id, item_id, .. }
-            | Event::SubagentTextDelta { id, item_id, .. } => Some((id, item_id)),
-            _ => None,
+            | Event::SubagentOutputDelta { id, item_id, .. } => (Some((id, item_id)), false),
+            Event::SubagentTextDelta { id, item_id, .. } => (Some((id, item_id)), true),
+            _ => (None, false),
         };
-        match key {
-            Some((agent, id)) => self.child_tool_revoked(agent, id),
-            None => Ok(false),
+        let Some((agent, id)) = key else { return Ok(false); };
+        if !self.child_tools_have_revocations { return Ok(false); }
+        if prose {
+            self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2 AND kind=0)",
+                params![agent,id], |row| row.get(0)).map_err(|error| error.to_string())
+        } else {
+            self.child_tool_revoked(agent, id)
         }
     }
 
     fn revoke_child_tool(&mut self, agent: &str, id: &str) -> Result<(), String> {
+        self.revoke_child_tool_kind(agent, id, 0)
+    }
+
+    fn revoke_child_tool_kind(&mut self, agent: &str, id: &str, kind: i64) -> Result<(), String> {
         let tx = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         guard(&tx, self.raw_sources.nonce)?;
-        let cost: Option<usize> = tx
-            .query_row(
-                "SELECT cost FROM child_tools WHERE agent=?1 AND id=?2",
-                params![agent, id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if let Some(cost) = cost {
-            let chunks: usize = tx
-                .query_row(
-                    "SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",
-                    params![agent, id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM child_tools WHERE agent=?1 AND id=?2",
-                params![agent, id],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
-                "INSERT OR IGNORE INTO child_tool_revoked VALUES(?1,?2)",
-                params![agent, id],
-            )
-            .map_err(|e| e.to_string())?;
-            // Keep only the bounded key until Reset. Late adapter updates may
-            // not re-create a body the provider explicitly removed.
-            tx.execute(
-                "UPDATE child_tool_budget SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",
-                params![cost, agent.len() + id.len() + 64, chunks],
-            )
-            .map_err(|e| e.to_string())?;
+        let cost: Option<usize> = tx.query_row(
+            "SELECT cost FROM child_tools WHERE agent=?1 AND id=?2", params![agent,id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        let marked = persisted_revoked(&tx, agent, id)?;
+        if cost.is_some() && marked {
+            return Err("Delegated tool has conflicting live and revoked source records".into());
         }
-        tx.commit().map_err(|e| e.to_string())?;
-        self.child_tools_have_revocations |= cost.is_some();
+        if let Some(cost) = cost {
+            let chunks: usize = tx.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",
+                params![agent,id], |row| row.get(0)).map_err(|error| error.to_string())?;
+            tx.execute("DELETE FROM child_tools WHERE agent=?1 AND id=?2", params![agent,id])
+                .map_err(|error| error.to_string())?;
+            // The existing bounded item slot now owns only this key marker.
+            tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",
+                params![cost,agent.len()+id.len()+64,chunks]).map_err(|error| error.to_string())?;
+        }
+        if cost.is_some() || marked {
+            // Explicit removal dominates replacement, including after the
+            // prose row disappeared. No new key is allocated by this update.
+            tx.execute("INSERT INTO child_tool_revoked(agent,id,kind) VALUES(?1,?2,?3)
+                ON CONFLICT(agent,id) DO UPDATE SET kind=min(child_tool_revoked.kind,excluded.kind)",
+                params![agent,id,kind]).map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        self.child_tools_have_revocations |= cost.is_some() || marked;
         Ok(())
     }
 
@@ -335,9 +335,10 @@ impl Store {
         if agent.len() > KEY_BYTES || id.len() > KEY_BYTES {
             return Ok(self.child_source_refused(BUDGET_ERROR));
         }
-        if self.child_tool_revoked(agent, id)? {
+        if matches!(&original.content, ItemContent::Tool { .. } | ItemContent::Command { .. } | ItemContent::Changes { .. })
+            && self.child_tool_revoked(agent, id)? {
             return Ok(Some(
-                "Delegated tool source was removed; a late update cannot recreate its private body"
+                "Delegated tool source was removed or changed kind; a late update cannot recreate its private body"
                     .into(),
             ));
         }
@@ -689,13 +690,16 @@ impl Store {
         }
         // Read the persisted tombstone even when this process did not write it.
         // The caller's snapshot also pins Store owner/schema/reset authority.
-        let revoked: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",
-            params![agent, key.item_id],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if revoked {
-            return Err("Delegated tool source was explicitly removed".into());
+        let revoked: Option<i64> = self.db.query_row(
+            "SELECT kind FROM child_tool_revoked WHERE agent=?1 AND id=?2",
+            params![agent, key.item_id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some(kind) = revoked {
+            return Err(match kind {
+                0 => "Delegated tool source was explicitly removed",
+                1 => "Delegated source changed kind; its old tool cannot be replayed without a reset or verified new identity",
+                _ => "Delegated tool source has an unsupported revocation marker",
+            }.into());
         }
         let (bytes, items, chunks): (i64, i64, i64) = self.db.query_row(
             "SELECT bytes,items,chunks FROM child_tool_budget WHERE singleton=1",
@@ -987,19 +991,19 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         let owner = raw::initialize(&mut db).unwrap().nonce;
         // Supported legacy version zero retains its exact canonical records.
-        db.execute_batch(SCHEMA).unwrap();
-        db.execute("INSERT INTO child_tool_revoked VALUES('child','retired')", []).unwrap();
+        db.execute_batch(LEGACY_SCHEMA).unwrap();
+        db.execute("INSERT INTO child_tool_revoked(agent,id) VALUES('child','retired')", []).unwrap();
         initialize(&mut db, owner).unwrap();
         assert_eq!(db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), VERSION);
         assert_eq!(db.query_row("SELECT count(*) FROM child_tool_revoked", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
         let before = db.total_changes();
         initialize(&mut db, owner).unwrap();
         assert_eq!(db.total_changes(), before, "current namespace must not restamp or rewrite");
-        db.execute("UPDATE child_tool_schema SET version=2", []).unwrap();
+        db.execute("UPDATE child_tool_schema SET version=?1", [VERSION + 1]).unwrap();
         let before = db.total_changes();
         assert!(initialize(&mut db, owner).is_err());
         assert_eq!(db.total_changes(), before);
-        assert_eq!(db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), VERSION + 1);
         for incompatible in [
             "CREATE TABLE child_tools(unrecognized TEXT)",
             "CREATE TABLE child_tools(unrecognized TEXT); CREATE TABLE child_tool_chunks(x); CREATE TABLE child_tool_revoked(x); CREATE TABLE child_tool_budget(x)",
@@ -1015,14 +1019,48 @@ mod tests {
     }
 
     #[test]
+    fn version_one_markers_migrate_as_explicit_removals() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let owner = raw::initialize(&mut db).unwrap().nonce;
+        db.execute_batch(LEGACY_SCHEMA).unwrap();
+        db.execute_batch(VERSION_SCHEMA).unwrap();
+        db.execute("INSERT INTO child_tool_schema VALUES(1,1)", []).unwrap();
+        db.execute("INSERT INTO child_tool_revoked VALUES('child','removed')", []).unwrap();
+        initialize(&mut db, owner).unwrap();
+        assert_eq!(db.query_row("SELECT kind FROM child_tool_revoked", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_,i64>(0)).unwrap(), VERSION);
+        validate_layout(&db, true, true).unwrap();
+    }
+
+    #[test]
+    fn failed_version_one_upgrade_rolls_back_marker_column_and_raw_owner() {
+        let mut db = Connection::open_in_memory().unwrap();
+        raw::initialize(&mut db).unwrap();
+        db.execute_batch(LEGACY_SCHEMA).unwrap();
+        db.execute_batch(VERSION_SCHEMA).unwrap();
+        db.execute("INSERT INTO child_tool_schema VALUES(1,1)", []).unwrap();
+        db.execute("INSERT INTO child_tool_revoked VALUES('child','removed')", []).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_child_version BEFORE UPDATE ON child_tool_schema
+            BEGIN SELECT RAISE(FAIL, 'fixture child schema stamp failure'); END;").unwrap();
+        let owner: String = db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get(0)).unwrap();
+        let failure = raw::initialize_with(&mut db, initialize_in).err().expect("migration must fail after adding the column");
+        assert!(failure.contains("fixture child schema stamp failure"));
+        assert_eq!(db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get::<_,String>(0)).unwrap(), owner);
+        assert_eq!(db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT count(*) FROM pragma_table_info('child_tool_revoked') WHERE name='kind'", [], |row| row.get::<_,usize>(0)).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT count(*) FROM child_tool_revoked WHERE agent='child' AND id='removed'", [], |row| row.get::<_,usize>(0)).unwrap(), 1);
+        validate_layout(&db, true, false).unwrap();
+    }
+
+    #[test]
     fn joined_namespace_refusal_rolls_back_raw_owner_and_child_schema_together() {
         let mut store = Store::new().unwrap();
         put(&mut store, "child", tool("known", "original", "body"));
-        store.db.execute("UPDATE child_tool_schema SET version=2", []).unwrap();
+        store.db.execute("UPDATE child_tool_schema SET version=?1", [VERSION + 1]).unwrap();
         let nonce: String = store.db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get(0)).unwrap();
         assert!(raw::initialize_with(&mut store.db, initialize_in).is_err());
         assert_eq!(store.db.query_row("SELECT nonce FROM raw_source_schema", [], |row| row.get::<_, String>(0)).unwrap(), nonce);
-        assert_eq!(store.db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(store.db.query_row("SELECT version FROM child_tool_schema", [], |row| row.get::<_, i64>(0)).unwrap(), VERSION + 1);
         assert_eq!(store.db.query_row("SELECT count(*) FROM child_tools WHERE id='known'", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
         let mut db = Connection::open_in_memory().unwrap();
         let result = raw::initialize_with(&mut db, |tx, owner| {
@@ -1040,7 +1078,7 @@ mod tests {
                 let mut store = Store::new().unwrap();
                 put(&mut store, "child", tool("known", "input", "output"));
                 if future_schema {
-                    store.db.execute("UPDATE child_tool_schema SET version=2", []).unwrap();
+                    store.db.execute("UPDATE child_tool_schema SET version=?1", [VERSION + 1]).unwrap();
                 } else {
                     // A legitimate reopen rotates the raw owner, revoking this
                     // handle even when all child table shapes remain unchanged.
@@ -1109,7 +1147,7 @@ mod tests {
         store.validate_child_adapter_key(&key).unwrap();
         assert!(store.child_adapter_item(&key).is_err());
         assert!(!store.child_tools_have_revocations);
-        store.db.execute("INSERT INTO child_tool_revoked VALUES('one','tool')", []).unwrap();
+        store.db.execute("INSERT INTO child_tool_revoked(agent,id) VALUES('one','tool')", []).unwrap();
         assert!(store.validate_child_adapter_key(&key).unwrap_err().contains("explicitly removed"));
         store.db.execute("DELETE FROM child_tool_revoked", []).unwrap();
         for column in ["bytes", "items", "chunks"] {
@@ -1477,8 +1515,11 @@ mod tests {
             ..tool("same", "", "")
         };
         put(&mut store, "two", prose);
-        assert!(read(&mut store, "two", "same").is_none());
-        put(&mut store, "two", tool("same", "tool again", ""));
+        let replaced = CanonicalItemKey::new(Some("two"), "same");
+        assert!(store.child_adapter_item(&replaced).unwrap_err().contains("changed kind"));
+        let late = store.apply(Event::SubagentItem {id: "two".into(), item: tool("same", "ambiguous replay", "")}).unwrap();
+        assert!(late.iter().any(|event| matches!(event, Event::Error {fatal:false,..})));
+        assert!(!late.iter().any(|event| matches!(event, Event::SubagentItem { .. })));
         store
             .apply(Event::SubagentTextDelta {
                 id: "two".into(),
@@ -1488,7 +1529,18 @@ mod tests {
                 delta: "new kind".into(),
             })
             .unwrap();
-        assert!(read(&mut store, "two", "same").is_none());
+        assert!(store.child_adapter_item(&replaced).is_err());
+        assert_eq!(store.db.query_row("SELECT kind FROM child_tool_revoked WHERE agent='two' AND id='same'", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
+        // Repeating the completed prose snapshot is legitimate, while its old
+        // optional tool must remain permanently unavailable through this epoch.
+        let prose = Item {id: "same".into(), content: ItemContent::Text {
+            text: "new completed prose".into(), thinking: false, phase: Phase::Final,
+        }, ..tool("same", "", "")};
+        let events = store.apply(Event::SubagentItem {id: "two".into(), item: prose}).unwrap();
+        assert!(!events.iter().any(|event| matches!(event, Event::Error { .. })));
+        // Removing just the text rows cannot make the old optional tool valid.
+        store.db.execute("DELETE FROM child_sources WHERE agent='two' AND id='same'", []).unwrap();
+        assert!(store.validate_child_adapter_key(&replaced).unwrap_err().contains("changed kind"));
         put(&mut store, "one", tool("again", "source", ""));
         store
             .apply(Event::SubagentInputDelta {
@@ -1513,6 +1565,9 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(store.validate_child_adapter_key(&replaced).is_ok());
+        put(&mut store, "two", tool("same", "new epoch issued source", ""));
+        assert!(matches!(read(&mut store,"two","same").unwrap().content, ItemContent::Tool {input,..} if input=="new epoch issued source"));
     }
 
     #[test]
