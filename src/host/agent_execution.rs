@@ -1710,3 +1710,9 @@ fn console(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::host) use ownership::before_reconciliation_transition;
+
+#[cfg(test)]
+pub(in crate::host) use ownership::after_reconciliation_eligibility;

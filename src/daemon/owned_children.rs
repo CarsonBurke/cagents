@@ -251,3 +251,56 @@ pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<Rea
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+
+/// Test-owned signal authority, captured before lifecycle/failure scheduling.
+/// A recorded PID/start alone never authorizes a later numeric signal. This
+/// pin establishes identity from capture onward, not historical child reaping.
+#[cfg(all(test, feature = "host"))]
+pub(crate) struct FixtureProcessPin {
+    file: std::fs::File,
+    expected: super::holder_registry::Process,
+}
+#[cfg(all(test, feature = "host"))]
+impl FixtureProcessPin {
+    pub(crate) fn capture(expected: &super::holder_registry::Process) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open returns a new owned descriptor, or -1. Opening
+        // comes BEFORE rereading the expected incarnation, so PID reuse across
+        // capture cannot authorize a different kernel process.
+        let descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, expected.pid, 0)};
+        if descriptor < 0 {return Err(io::Error::last_os_error());}
+        // SAFETY: successful pidfd_open returned a unique owned descriptor.
+        let file = unsafe {std::fs::File::from_raw_fd(descriptor as i32)};
+        let current = super::holder_registry::Process::read(expected.pid)?;
+        if current != *expected {return Err(io::Error::other("fixture process incarnation changed before pin capture"));}
+        Ok(Self {file, expected:expected.clone()})
+    }
+    pub(crate) fn process(&self) -> &super::holder_registry::Process { &self.expected }
+    pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: this retained pidfd names only the positively verified
+        // original incarnation. ESRCH is absence, never a numeric fallback.
+        let result = unsafe {libc::syscall(libc::SYS_pidfd_send_signal, self.file.as_raw_fd(), signal,
+            std::ptr::null::<libc::siginfo_t>(), 0)};
+        if result < 0 {return Err(io::Error::last_os_error());}
+        Ok(())
+    }
+}
+#[cfg(all(test, feature = "host"))]
+mod fixture_pin_tests {
+    use super::*;
+    #[test]
+    fn process_pin_refuses_mismatched_start_and_retains_cloexec_identity() {
+        use std::os::fd::AsRawFd;
+        let current = super::super::holder_registry::Process::read(std::process::id() as i32).unwrap();
+        let mut wrong = current.clone(); wrong.start = wrong.start.wrapping_add(1);
+        assert!(FixtureProcessPin::capture(&wrong).is_err());
+        let pin = FixtureProcessPin::capture(&current).unwrap();
+        assert_eq!(pin.process(), &current);
+        // Null signal checks this owned self-pin without affecting a process.
+        pin.signal(0).unwrap();
+        let flags = unsafe {libc::fcntl(pin.file.as_raw_fd(), libc::F_GETFD)};
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+    }
+}

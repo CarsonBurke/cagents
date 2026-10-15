@@ -75,10 +75,66 @@ fn same_terminal_identity(
     expected == *after
 }
 
+/// The old JSON form is the exact original live source. A Locate receipt
+/// additionally retains the strict historical end separately from its current
+/// planned relaunch directory. None is explicitly presentation-only history:
+/// locating an old descriptor never invents a worker-generation proof.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum TerminalSource {
+    Issued(crate::model::TerminalSession),
+    Located {
+        historical_end: crate::model::TerminalSession,
+        source: Option<crate::model::TerminalSession>,
+    },
+}
+
+struct RecordedTerminalEnd {
+    source: TerminalSource,
+    ended: crate::model::TerminalSession,
+}
+
+impl RecordedTerminalEnd {
+    fn original_source(&self) -> Option<&crate::model::TerminalSession> {
+        match &self.source {
+            TerminalSource::Issued(source) => Some(source),
+            TerminalSource::Located { source, .. } => source.as_ref(),
+        }
+    }
+
+    fn matches_end(&self, current: &crate::model::TerminalSession) -> bool {
+        use crate::model::TerminalContinuity;
+        let historical = match &self.source {
+            TerminalSource::Issued(_) => &self.ended,
+            TerminalSource::Located { historical_end, .. } => historical_end,
+        };
+        if current != &self.ended || !ended_terminal(historical)
+            || !same_terminal_identity(historical, current)
+            || self.original_source().is_some_and(|source| {
+                !same_terminal_identity(source, historical)
+                    || !source.continuity.live_proof().is_some_and(|proof| proof.is_complete())
+            })
+        {
+            return false;
+        }
+        match (&historical.continuity, &current.continuity) {
+            (TerminalContinuity::RelaunchAvailable { recipe: old, last_exit: old_exit },
+                TerminalContinuity::RelaunchAvailable { recipe: current, last_exit }) => {
+                let mut projected = old.clone();
+                projected.working_directory = current.working_directory.clone();
+                projected == *current && old_exit == last_exit
+            }
+            (TerminalContinuity::Exited { last_exit: old },
+                TerminalContinuity::Exited { last_exit }) => old == last_exit,
+            _ => false,
+        }
+    }
+}
+
 fn terminal_source(
     db: &Connection,
     id: crate::model::CardId,
-) -> Result<Option<(crate::model::TerminalSession, crate::model::TerminalSession)>, String> {
+) -> Result<Option<RecordedTerminalEnd>, String> {
     let raw: Option<(String, String)> = db
         .query_row(
             "SELECT source,ended FROM shared_view_terminal_sources WHERE pane=?1",
@@ -88,30 +144,65 @@ fn terminal_source(
         .optional()
         .map_err(|error| error.to_string())?;
     raw.map(|(source, ended)| {
-        Ok((
-            serde_json::from_str(&source).map_err(|error| error.to_string())?,
-            serde_json::from_str(&ended).map_err(|error| error.to_string())?,
-        ))
+        Ok(RecordedTerminalEnd {
+            source: serde_json::from_str(&source).map_err(|error| error.to_string())?,
+            ended: serde_json::from_str(&ended).map_err(|error| error.to_string())?,
+        })
     })
     .transpose()
 }
-fn write_terminal_source(
+
+fn write_terminal_record(
     db: &Connection,
     id: crate::model::CardId,
-    source: &crate::model::TerminalSession,
-    ended: &crate::model::TerminalSession,
+    record: &RecordedTerminalEnd,
 ) -> Result<(), String> {
     db.execute(
         "INSERT INTO shared_view_terminal_sources(pane,source,ended) VALUES(?1,?2,?3)
         ON CONFLICT(pane) DO UPDATE SET source=excluded.source,ended=excluded.ended",
         params![
             id.to_string(),
-            serde_json::to_string(source).map_err(|error| error.to_string())?,
-            serde_json::to_string(ended).map_err(|error| error.to_string())?
+            serde_json::to_string(&record.source).map_err(|error| error.to_string())?,
+            serde_json::to_string(&record.ended).map_err(|error| error.to_string())?
         ],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn relocate_terminal_end(
+    db: &Connection,
+    before: &crate::workspace_model::views::Pane,
+    after: &crate::workspace_model::views::Pane,
+) -> Result<(), String> {
+    use crate::model::CardKind;
+    let (CardKind::Terminal(previous), CardKind::Terminal(current)) = (&before.kind, &after.kind)
+        else { return Ok(()); };
+    if previous == current { return Ok(()); }
+    let record = terminal_source(db, before.id)?;
+    let source = match record {
+        Some(record) => {
+            if !record.matches_end(previous) {
+                return Err("Cannot locate the ended terminal: its current descriptor has no exact retained historical basis".into());
+            }
+            match record.source {
+                TerminalSource::Issued(source) => TerminalSource::Located {
+                    historical_end: previous.clone(), source: Some(source),
+                },
+                located @ TerminalSource::Located { .. } => located,
+            }
+        }
+        None if ended_terminal(previous) => TerminalSource::Located {
+            historical_end: previous.clone(), source: None,
+        },
+        // A restart candidate without an observed exit is not proof of an end.
+        None => return Ok(()),
+    };
+    let record = RecordedTerminalEnd { source, ended: current.clone() };
+    if !record.matches_end(current) {
+        return Err("Locate may change only the planned relaunch directory of this exact historical end".into());
+    }
+    write_terminal_record(db, before.id, &record)
 }
 
 fn update_terminal_source(
@@ -128,18 +219,19 @@ fn update_terminal_source(
     if before == Some(claimed_before) {
         if let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
         {
-            if same_terminal_identity(before, after) && ended_terminal(after) {
-                if before
-                    .continuity
-                    .live_proof()
+            if same_terminal_identity(before, after) {
+                if ended_terminal(after) && before.continuity.live_proof()
                     .is_some_and(|proof| proof.is_complete())
                 {
-                    return write_terminal_source(db, id, before, after);
+                    return write_terminal_record(db, id, &RecordedTerminalEnd {
+                        source: TerminalSource::Issued(before.clone()), ended: after.clone(),
+                    });
                 }
                 if before.continuity == after.continuity {
-                    if let Some((source, ended)) = terminal_source(db, id)? {
-                        if ended == *before {
-                            return write_terminal_source(db, id, &source, after);
+                    if let Some(mut record) = terminal_source(db, id)? {
+                        if record.matches_end(before) {
+                            record.ended = after.clone();
+                            return write_terminal_record(db, id, &record);
                         }
                     }
                 }
@@ -363,7 +455,11 @@ pub(super) fn relocate(
             continue;
         }
         let previous = key(&view.scope)?;
+        let before = view.panes.clone();
         relocation.view(&mut view);
+        for (before, after) in before.iter().zip(&view.panes) {
+            relocate_terminal_end(db, before, after)?;
+        }
         view.revision = view
             .revision
             .checked_add(1)
@@ -431,22 +527,24 @@ fn agent_retirement_view(
             })
             .chain(agent.console.iter())
             .collect::<Vec<_>>();
-        if !ended_terminal(ended)
-            || !original
-                .iter()
-                .any(|source| source.id == ended.id && source.launch == ended.launch)
-        {
+        if !original.iter().any(|source| source.id == ended.id && source.launch == ended.launch) {
             false
-        } else if let Some((source, recorded_ended)) = terminal_source(db, id)? {
-            if &recorded_ended != ended {
+        } else if let Some(record) = terminal_source(db, id)? {
+            if !record.matches_end(ended) {
                 return Err("Cannot safely retire the ended managed terminal pane: its current descriptor has no exact retained generation proof".into());
             }
+            let source = record.original_source().ok_or("Cannot safely retire the ended managed terminal pane: historical generation proof is unavailable; Locate retained only its presentation")?;
             original.iter().any(|retained| {
                 HostedSession::Terminal((**retained).clone())
                     .same_process(&HostedSession::Terminal(source.clone()))
             })
-        } else {
+        } else if matches!(ended.continuity,
+            crate::model::TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }
+            | crate::model::TerminalContinuity::Exited { .. })
+        {
             return Err("Cannot safely retire the ended managed terminal pane: historical generation proof is unavailable; the pane was retained and no retirement was guessed".into());
+        } else {
+            false
         }
     } else {
         false

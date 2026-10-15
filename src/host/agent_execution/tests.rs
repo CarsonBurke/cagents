@@ -1584,45 +1584,25 @@ fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflic
     let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
     let id = agent.session.as_ref().unwrap().id();
     let handle = host.lock().unwrap().chats[&id].handle.clone();
-    let owner = handle
-        .actor_identity()
-        .expect("fixture uses genuine retained actor facade");
-    struct Cleanup {
-        handle: chat::runtime::Handle,
-        owner: crate::daemon::holder_registry::Record,
-        pair: Option<crate::daemon::holder_registry::Record>,
-        backend: Option<crate::daemon::holder_registry::Process>,
-    }
+    let owner = handle.actor_identity().expect("fixture uses genuine retained actor facade");
+    use crate::daemon::owned_children::FixtureProcessPin;
+    struct Cleanup {handle: chat::runtime::Handle,
+        owner_pins: Vec<FixtureProcessPin>, pair: Vec<FixtureProcessPin>, backend: Option<FixtureProcessPin>}
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = self.handle.close_for_resume();
             let _ = self.handle.finish_retained_close();
             // Panic cleanup is restricted to this fixture's captured process
             // incarnations. It never discovers or signals unrelated sessions.
-            if let Some(process) = &self.backend
-                && process.is_current()
-            {
-                unsafe {
-                    libc::kill(process.pid, libc::SIGKILL);
-                }
-            }
-            for record in std::iter::once(&self.owner).chain(self.pair.iter()) {
-                for process in [&record.root, &record.holder] {
-                    if process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
-                    }
-                }
+            if let Some(process) = &self.backend {let _ = process.signal(libc::SIGKILL);}
+            for process in self.owner_pins.iter().chain(self.pair.iter()) {
+                let _ = process.signal(libc::SIGKILL);
             }
         }
     }
-    let mut cleanup = Cleanup {
-        handle: handle.clone(),
-        owner: owner.record.clone(),
-        pair: None,
-        backend: handle.provider_process(),
-    };
+    let mut cleanup = Cleanup {handle:handle.clone(),
+        owner_pins: vec![FixtureProcessPin::capture(&owner.record.root).unwrap(), FixtureProcessPin::capture(&owner.record.holder).unwrap()],
+        pair:vec![], backend:handle.provider_process().as_ref().map(FixtureProcessPin::capture).transpose().unwrap()};
     assert!(owner.record.root.is_current());
     let recipe = crate::model::LaunchRecipe {
         program: "/bin/cat".into(),
@@ -1641,19 +1621,10 @@ fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflic
         &host,
         0,
         crate::terminal_ipc::TerminalDescriptor::relaunchable(id, recipe.clone(), None).session,
-        Default::default(),
-        None,
-        true,
-    )
-    .unwrap();
-    let pair = console
-        .holder_identity()
-        .expect("real holder-backed terminal fixture")
-        .clone();
-    cleanup.pair = Some(pair.clone());
-    let mut paired = crate::chat::runtime::Handle::inspect_remote(&owner.record, proof.clone())
-        .unwrap()
-        .source;
+        Default::default(), None, true).unwrap();
+    let pair = console.holder_identity().expect("real holder-backed terminal fixture").clone();
+    cleanup.pair = vec![FixtureProcessPin::capture(&pair.root).unwrap(), FixtureProcessPin::capture(&pair.holder).unwrap()];
+    let mut paired = crate::chat::runtime::Handle::inspect_remote(&owner.record, proof.clone()).unwrap().source;
     paired.terminal = Some(descriptor.session.clone());
     handle
         .update_native_source(paired.clone(), Some(recipe), Some(pair.clone()))
@@ -1724,9 +1695,9 @@ fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflic
     // A real backend dies and restarts inside the SAME authenticated helper,
     // logical actor UUID and host Record. Old consent must preserve this new
     // incarnation, even though all those former identity fields still match.
-    unsafe {
-        libc::kill(original_backend.pid, libc::SIGKILL);
-    }
+    let original_pin = cleanup.backend.as_ref().expect("backend pinned at initial authority capture");
+    assert_eq!(original_pin.process(), &original_backend);
+    original_pin.signal(libc::SIGKILL).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         handle.refresh_retained_state().unwrap();
@@ -1769,7 +1740,7 @@ fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflic
     ));
     handle.refresh_retained_state().unwrap();
     let successor_backend = handle.provider_process().unwrap();
-    cleanup.backend = Some(successor_backend.clone());
+    cleanup.backend = Some(FixtureProcessPin::capture(&successor_backend).unwrap());
     assert_ne!(successor_backend, original_backend);
     assert!(successor_backend.is_current());
     assert_eq!(handle.actor_identity().unwrap().record, owner.record);
@@ -4791,3 +4762,6 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
 }
 // Owning native-holder/Codex presentation-close acceptance contracts.
 include!("presentation_acceptance_tests.rs");
+
+// Actual retained backend lifecycle/receipt scheduling contracts.
+include!("retained_close_race_tests.rs");

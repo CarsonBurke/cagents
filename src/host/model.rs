@@ -29,7 +29,8 @@ mod automation_membership;
 mod agent_locations;
 mod session_locations;
 pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
-pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
+pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
+mod automation_extensions_schema;
 mod automation_proposals;
 mod automation_reports;
 mod automations;
@@ -47,7 +48,7 @@ mod relocation;
 mod terminal_owners;
 mod views;
 
-pub(super) const SCHEMA_VERSION: u32 = 17;
+pub(super) const SCHEMA_VERSION: u32 = 19;
 
 /// Read-only source inspection entry point. Does not open/migrate a Registry.
 pub(crate) fn inspect_archive_report_in(
@@ -58,7 +59,7 @@ pub(crate) fn inspect_archive_report_in(
     let version: u32 = db
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| "The report registry version is unreadable")?;
-    if !(15..=SCHEMA_VERSION).contains(&version) {
+    if !(19..=SCHEMA_VERSION).contains(&version) {
         return Err("The report registry has no supported presentation authority".into());
     }
     automation_reports::report_in(db, reference, session)
@@ -101,7 +102,14 @@ impl Registry {
         Self::at_with_migration(path, migrate)
     }
 
-    fn at_with_migration(path: &Path, migration: impl FnOnce(&Connection) -> Result<(), String>) -> Result<Self, String> {
+    fn at_with_migration(path: &Path, migration: impl FnOnce(&Connection, Connection) -> Result<(), String>) -> Result<Self, String> {
+        Self::at_with_admission_hook(path, migration, || Ok(()))
+    }
+
+    fn at_with_admission_hook(path: &Path,
+        migration: impl FnOnce(&Connection, Connection) -> Result<(), String>,
+        after_inspection: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             create_private_directory(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -114,8 +122,13 @@ impl Registry {
         let inspection = Connection::open_with_flags(path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ).map_err(|error| error.to_string())?;
+        // Pin the admitted physical SQLite image with a genuine read
+        // transaction. In rollback-journal mode its SHARED lock prevents a
+        // second writer from committing or creating a hot journal between
+        // this inspection and our read-write writer reservation.
+        inspection.execute_batch("BEGIN DEFERRED").map_err(|error| error.to_string())?;
         schema::check_readonly(&inspection)?;
-        drop(inspection);
+        after_inspection()?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         // Even a rejected read-write connection can checkpoint/delete a
         // pre-existing WAL on its final close. Keep rejection side-effect free
@@ -124,7 +137,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         schema::check_readonly(&db)?;
         configure_connection(&db)?;
-        migration(&db)?;
+        migration(&db, inspection)?;
         configure(&db)?;
         db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
             .map_err(|error| error.to_string())?;
@@ -670,8 +683,8 @@ fn configure(db: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn migrate(db: &Connection) -> Result<(), String> {
-    schema::migrate(db)
+fn migrate(db: &Connection, inspection: Connection) -> Result<(), String> {
+    schema::migrate_with_admission(db, inspection, || Ok(()))
 }
 
 /// Published migration primitives run within one admitted writer transaction.

@@ -20,12 +20,25 @@ pub(crate) struct Location {
     previous_sources: Vec<[u8; 32]>,
 }
 
+/// A stopped actor proves only its retained approved directory, never a live
+/// process. Both kinds are captured by the host outside the registry writer.
+#[derive(Clone, Debug)]
+pub(crate) enum SessionDirectoryProof {
+    Live { identity: DirectoryIdentity, process: Process },
+    Completed { identity: DirectoryIdentity },
+}
+impl SessionDirectoryProof {
+    pub(crate) fn identity(&self) -> DirectoryIdentity {
+        match self { Self::Live {identity,..} | Self::Completed {identity} => *identity }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SessionMove {
     pub(crate) source: HostedSession,
     pub(crate) repository: PathBuf,
     pub(crate) candidate: PathBuf,
-    pub(crate) proof: Result<(DirectoryIdentity, Process), String>,
+    pub(crate) proof: Result<SessionDirectoryProof, String>,
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<String, String> {
@@ -243,10 +256,17 @@ pub(super) fn apply(db: &Connection, moves: &[SessionMove]) -> Result<(), String
         });
         location.repository = Some(movement.repository.clone());
         match &movement.proof {
-            Ok((identity, process)) => {
+            Ok(proof) => {
+                let identity = proof.identity();
+                if matches!(proof, SessionDirectoryProof::Completed {..})
+                    && (!matches!(movement.source, HostedSession::Chat(_))
+                        || location.approved != Some(identity))
+                {
+                    return Err("A completed provider needs its original approved directory binding; no relocation was committed".into());
+                }
                 if location
                     .approved
-                    .is_some_and(|approved| approved != *identity)
+                    .is_some_and(|approved| approved != identity)
                 {
                     return Err("The approved session directory changed during Locate; no relocation was committed".into());
                 }
@@ -255,8 +275,11 @@ pub(super) fn apply(db: &Connection, moves: &[SessionMove]) -> Result<(), String
                     return Err("The confirmed provider conversation changed during Locate; no relocation was committed".into());
                 }
                 location.source = movement.source.clone();
-                location.approved = Some(*identity);
-                location.process = Some(process.clone());
+                location.approved = Some(identity);
+                location.process = match proof {
+                    SessionDirectoryProof::Live {process,..} => Some(process.clone()),
+                    SessionDirectoryProof::Completed {..} => None,
+                };
                 location.blocked_directory = None;
                 location.refusal = None;
             }
@@ -296,7 +319,7 @@ pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result
         let Some(identity) = moves.iter().find_map(|movement| {
             source
                 .same_process(&movement.source)
-                .then(|| movement.proof.as_ref().ok().map(|(identity, _)| *identity))
+                .then(|| movement.proof.as_ref().ok().map(SessionDirectoryProof::identity))
                 .flatten()
         }) else {
             continue;
@@ -1207,7 +1230,7 @@ mod tests {
             source: source.clone(),
             repository: moved.clone(),
             candidate: moved.clone(),
-            proof: Ok((proof.identity, proof.process)),
+            proof: Ok(SessionDirectoryProof::Live {identity: proof.identity, process: proof.process}),
         };
         registry
             .apply_with_session_moves(

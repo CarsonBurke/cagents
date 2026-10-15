@@ -7,7 +7,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 /// First deliberately versioned registry checkpoint defining archive authority.
 /// The campaign owner must renumber this floor with its final migration union.
 #[cfg(feature = "host")]
-pub const ARCHIVE_REGISTRY_SCHEMA_FLOOR: u32 = 13;
+pub const ARCHIVE_REGISTRY_SCHEMA_FLOOR: u32 = 19;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchivedPaneReadiness {

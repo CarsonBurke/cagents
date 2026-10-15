@@ -3341,7 +3341,7 @@ mod tests {
         command.arg("-c");
         command.arg(r#"import os,pathlib,subprocess,sys,time
 root=pathlib.Path(sys.argv[1])
-script='import os,pathlib,signal,sys,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(600)'
+script='import os,pathlib,signal,sys,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); marker=pathlib.Path(sys.argv[1]); pending=marker.with_suffix(".pending"); pending.write_text(str(os.getpid())); pending.replace(marker); time.sleep(600)'
 child=subprocess.Popen([sys.executable,'-c',script,str(root/'child')],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
 while not (root/'child').exists(): time.sleep(.005)
 print('family-ready',flush=True)

@@ -59,6 +59,9 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
     if source.archive_report.is_some() {
         return Err("A saved automation report cannot authorize provider teardown".into());
     }
+    // A retained helper can restart a backend without changing its logical
+    // Handle or execution_instance. Serialize the entire cold close with that
+    // lifecycle transition before reconciliation, adoption or close effects.
     let transition = restart::transition_gate(host, source.id);
     let _transition = match transition.try_lock() {
         Ok(guard) => guard,
@@ -189,6 +192,11 @@ pub(super) fn close_retained_inner_then(host: &SharedHost, source: &Session, res
         state.inventory_generation += 1;
         (state.proof().clone(), pending, actor)
     };
+    #[cfg(test)]
+    if !restart && consent.is_none() {
+        let hook = RETAINED_CLOSE_AFTER_RESERVATION.lock().unwrap().take();
+        if let Some(hook) = hook { hook(); }
+    }
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
@@ -636,4 +644,13 @@ static PRESENTATION_CLOSE_BEFORE_PROVIDER: std::sync::Mutex<Option<Box<dyn FnOnc
 #[cfg(test)]
 pub(in crate::host) fn before_presentation_provider_close(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap() = Some(Box::new(hook));
+}
+
+// Test scheduling only, after the real transition/reservation and before any
+// holder adoption. The hook supplies no ownership or teardown evidence.
+#[cfg(test)]
+static RETAINED_CLOSE_AFTER_RESERVATION: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn after_retained_close_reservation(hook: impl FnOnce() + Send + 'static) {
+    *RETAINED_CLOSE_AFTER_RESERVATION.lock().unwrap() = Some(Box::new(hook));
 }

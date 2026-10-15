@@ -3193,6 +3193,24 @@ pub(super) fn close_captured(
     })
 }
 
+/// Automatic reconciliation already owns the Agent gate, then this chat's
+/// lifecycle claim across eligibility capture and cleanup. Do not release or
+/// recursively acquire that claim between the completed observation and close.
+pub(super) fn close_captured_under_transition(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    handle: &Handle,
+    execution_instance: uuid::Uuid,
+    transition: &std::sync::MutexGuard<'_, ()>,
+) -> Result<ServerResponse, ProtocolError> {
+    super::agent_execution::interactive(host, client,
+        ClientRequest::ChatClose { chat_id: source.id }, |request| {
+            process_inner_claimed(host, client, request,
+                Some((source, handle, execution_instance)), Some(transition))
+        })
+}
+
 /// Called only while this actor's transition gate is held. Full descriptors
 /// and privately retained restart aliases may identify the current actor;
 /// an arbitrary same-ID request cannot. Captured project rosters additionally
@@ -3240,9 +3258,20 @@ fn process_inner(
     request: ClientRequest,
     captured_close: Option<(&Session, &Handle, uuid::Uuid)>,
 ) -> Result<ServerResponse, ProtocolError> {
+    process_inner_claimed(host, client, request, captured_close, None)
+}
+
+fn process_inner_claimed(
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+    captured_close: Option<(&Session, &Handle, uuid::Uuid)>,
+    held_transition: Option<&std::sync::MutexGuard<'_, ()>>,
+) -> Result<ServerResponse, ProtocolError> {
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
-    let transition = match &request {
+    let transition = if held_transition.is_some() { None } else {
+    match &request {
         ClientRequest::ChatStart { session, .. }
         | ClientRequest::ChatStartSelected { session, .. }
         | ClientRequest::ChatAttach { session }
@@ -3255,7 +3284,8 @@ fn process_inner(
         | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
         _ => None,
     }
-    .map(|id| restart::transition_gate(host, id));
+    .map(|id| restart::transition_gate(host, id))
+    };
     let _transition = match transition.as_ref().map(|gate| gate.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(poison))) => Some(poison.into_inner()),
@@ -4107,6 +4137,11 @@ fn close_chat_source(
     let closed_receipt = if retained.native_continuity.retains_provider() {
         let proof = host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone();
         // Filesystem receipt discovery runs outside HostState.
+        #[cfg(test)]
+        {
+            let hook = ORDINARY_CLOSE_BEFORE_RECEIPT.lock().unwrap().take();
+            if let Some(hook) = hook { hook(); }
+        }
         chat::native_holder::closed_source(&retained, &proof)
             .map_err(unavailable)?
             .is_some()
@@ -7356,4 +7391,13 @@ done
         drop(release);
         handle.close().unwrap();
     }
+}
+
+#[cfg(test)]
+pub(super) use native_cleanup::after_retained_close_reservation;
+#[cfg(test)]
+static ORDINARY_CLOSE_BEFORE_RECEIPT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn before_ordinary_close_receipt(hook: impl FnOnce() + Send + 'static) {
+    *ORDINARY_CLOSE_BEFORE_RECEIPT.lock().unwrap() = Some(Box::new(hook));
 }
