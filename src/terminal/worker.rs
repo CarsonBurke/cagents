@@ -4,6 +4,7 @@ mod close_processes;
 #[cfg(test)]
 mod close_tests;
 pub(crate) mod holder;
+mod prompt_input;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -2858,7 +2859,11 @@ impl Worker {
         // command from inheriting an idle shell's authority.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
-            family.has_jobs() || foreground != root.process.group || !idle_shell,
+            family.has_jobs()
+                || foreground != root.process.group
+                || !idle_shell
+                || prompt_input::has_prompt_input(&self.terminal)
+                    .map_err(|error| format!("Inspect terminal prompt: {error}"))?,
             family,
         ))
     }
@@ -3386,6 +3391,14 @@ fn interactive_shell_launch(recipe: &LaunchRecipe) -> bool {
 
 fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     let mut command = CommandBuilder::new(&recipe.program);
+    if interactive_shell_launch(recipe)
+        && std::path::Path::new(&recipe.program)
+            .file_name()
+            .is_some_and(|name| name == "fish")
+    {
+        command.arg("--init-command");
+        command.arg(prompt_input::FISH_INTEGRATION);
+    }
     command.args(&recipe.arguments);
     command.cwd(&recipe.working_directory);
     scrub_inherited_markers(&mut command);

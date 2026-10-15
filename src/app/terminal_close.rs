@@ -652,13 +652,13 @@ impl Cagents {
             crate::design::title(if intent.detail.is_some() {
                 "Terminal kept open"
             } else {
-                "Close active processes?"
+                "Close terminal?"
             })
             .into(),
             crate::design::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
-                "This terminal or its paired conversation still owns running processes. Closing stops them."
+                "This terminal has running processes or an unfinished command. Closing stops its processes and discards any unsent input."
             }))
             .into(),
         ];
