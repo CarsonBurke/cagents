@@ -2955,10 +2955,18 @@ fn parse_publication_config(
 
 /// One immutable observation per path binds every occurrence in a config read.
 /// A later include candidate must not overwrite a consumed origin's version.
-fn observe_publication_path(files: &mut BTreeMap<PathBuf, Option<FileIdentity>>, path: PathBuf) -> bool {
-    files.entry(path.clone()).or_insert_with(|| {
-        fs::metadata(path).ok().map(|metadata| file_identity(&metadata))
-    }).is_some()
+fn observe_publication_path(
+    files: &mut BTreeMap<PathBuf, Option<FileIdentity>>,
+    path: PathBuf,
+) -> bool {
+    files
+        .entry(path.clone())
+        .or_insert_with(|| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata))
+        })
+        .is_some()
 }
 
 fn parse_observed_publication_config(
@@ -2976,8 +2984,14 @@ fn parse_observed_publication_config(
 > {
     let mut files = BTreeMap::new();
     let mut observe = |path: PathBuf| {
-        if path.as_os_str().is_empty() { return false; }
-        let path = if path.is_absolute() { path } else { worktree.join(path) };
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+        let path = if path.is_absolute() {
+            path
+        } else {
+            worktree.join(path)
+        };
         observe_publication_path(&mut files, path)
     };
     // A previously absent root config has no --show-origin record. Observe
@@ -6511,22 +6525,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if system_root.is_none() {
             let command = self.git_read(worktree, ["var", "GIT_CONFIG_SYSTEM"]);
             let output = self.run(&command, cancellation)?;
-            let disabled = std::env::var_os("GIT_CONFIG_SYSTEM").is_some_and(|value| value.is_empty())
-                || std::env::var("GIT_CONFIG_NOSYSTEM").ok().is_some_and(|value| {
-                    let value = value.trim().to_ascii_lowercase();
-                    matches!(value.as_str(), "true" | "yes" | "on")
-                        || value.parse::<i64>().is_ok_and(|value| value != 0)
-                });
+            let disabled = std::env::var_os("GIT_CONFIG_SYSTEM")
+                .is_some_and(|value| value.is_empty())
+                || std::env::var("GIT_CONFIG_NOSYSTEM")
+                    .ok()
+                    .is_some_and(|value| {
+                        let value = value.trim().to_ascii_lowercase();
+                        matches!(value.as_str(), "true" | "yes" | "on")
+                            || value.parse::<i64>().is_ok_and(|value| value != 0)
+                    });
             let path = if output.success {
                 let path = trim_one_line_ending(&output.stdout);
                 (!path.is_empty()).then(|| bytes_to_path(path))
-            } else { None };
-            *system_root = Some(PublicationSystemRoot { path, known: output.success || disabled });
+            } else {
+                None
+            };
+            *system_root = Some(PublicationSystemRoot {
+                path,
+                known: output.success || disabled,
+            });
         }
         let root = system_root.as_ref().unwrap();
         let system = root.path.as_deref();
         let system_known = root.known;
-        let (_, _, mut seed) = parse_observed_publication_config(worktree, b"", system, system_known)?;
+        let (_, _, mut seed) =
+            parse_observed_publication_config(worktree, b"", system, system_known)?;
         for path in admin.keys().filter(|path| {
             matches!(
                 path.file_name().and_then(OsStr::to_str),
@@ -8491,29 +8514,44 @@ mod tests {
         let mut first_absent = BTreeMap::new();
         assert!(!observe_publication_path(&mut first_absent, path.clone()));
         fs::write(&path, "[branch \"main\"]\n pushRemote = transient\n").unwrap();
-        assert!(!observe_publication_path(&mut first_absent, path.clone()),
-            "an absent candidate cannot acquire certification from a later consumed visit");
+        assert!(
+            !observe_publication_path(&mut first_absent, path.clone()),
+            "an absent candidate cannot acquire certification from a later consumed visit"
+        );
         assert_eq!(first_absent.get(&path), Some(&None));
         let mut consumed = BTreeMap::new();
         assert!(observe_publication_path(&mut consumed, path.clone()));
         let consumed_version = consumed[&path];
         fs::remove_file(&path).unwrap();
-        assert!(observe_publication_path(&mut consumed, path.clone()),
-            "a later inactive include candidate must not overwrite the origin's Some version");
+        assert!(
+            observe_publication_path(&mut consumed, path.clone()),
+            "a later inactive include candidate must not overwrite the origin's Some version"
+        );
         assert_eq!(consumed[&path], consumed_version);
-        assert_ne!(first_absent, consumed, "the complete before/after fence must reject transient origins");
+        assert_ne!(
+            first_absent, consumed,
+            "the complete before/after fence must reject transient origins"
+        );
     }
 
     #[test]
     fn disabled_system_config_is_known_absence_without_periodic_queries() {
         let root = Path::new("/publication-known-absence");
-        let (_, _, mut disabled) = parse_observed_publication_config(root, b"", None, true).unwrap();
+        let (_, _, mut disabled) =
+            parse_observed_publication_config(root, b"", None, true).unwrap();
         disabled.checked = Instant::now() - Duration::from_secs(61);
         assert!(!disabled.opaque);
-        assert!(!disabled.reconciliation_due(), "explicitly disabled system config is not an unknown installation");
-        let (_, _, mut unknown) = parse_observed_publication_config(root, b"", None, false).unwrap();
+        assert!(
+            !disabled.reconciliation_due(),
+            "explicitly disabled system config is not an unknown installation"
+        );
+        let (_, _, mut unknown) =
+            parse_observed_publication_config(root, b"", None, false).unwrap();
         unknown.checked = Instant::now() - Duration::from_secs(61);
-        assert!(unknown.reconciliation_due(), "unsupported path discovery must retain bounded reconciliation");
+        assert!(
+            unknown.reconciliation_due(),
+            "unsupported path discovery must retain bounded reconciliation"
+        );
     }
 
     #[test]
