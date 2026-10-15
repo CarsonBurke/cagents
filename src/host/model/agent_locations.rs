@@ -1,6 +1,6 @@
 //! Mutable logical placement and a verified current spelling of an agent's
 //! approved directory. Accepted specs and process descriptors remain immutable.
-use std::{fs::File, path::{Path, PathBuf}};
+use std::{fs::File, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
 use rusqlite::{Connection, OptionalExtension, params};
 use crate::{agent_execution::{Agent, DirectoryIdentity}, model::AgentId, project_recovery::Relocation};
 use super::{Registry, execution::{decode, encode}, repository_key};
@@ -66,6 +66,9 @@ pub(super) fn insert_new(db: &Connection, agent: &Agent) -> Result<(), String> {
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
+    if path == Path::new("/") {
+        return std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path);
+    }
     let root = crate::fs_safety::Root::open(Path::new("/"))?;
     let relative = path.strip_prefix("/").map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput,error))?;
     let directory = crate::fs_safety::open_beneath(&root, relative).map_err(std::io::Error::other)?;
