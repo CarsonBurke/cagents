@@ -182,7 +182,11 @@ pub(super) fn try_defer(
     )
     .map_err(refused)?;
     let gate = super::client::control_gate(host);
-    let _admission = gate.read().unwrap_or_else(|p| p.into_inner());
+    let _admission = match gate.try_read() {
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return Err(ProtocolError::new(ProtocolErrorCode::QueueFull,"Daemon lifecycle control is busy; retry when it finishes",true)),
+    };
     super::client::ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     // This preserves the exact interactive ownership/agent gate used by the

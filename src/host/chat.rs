@@ -1958,7 +1958,7 @@ pub(super) fn enqueue_deferred(
     request: ClientRequest,
 ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, ProtocolError> {
     let mut pending = None;
-    super::agent_execution::interactive(host, client, request, |request| {
+    super::agent_execution::try_interactive(host, client, request, |request| {
         let ClientRequest::ChatCommand { chat_id, command } = request else {
             return Err(error("Expected a provider control command"));
         };
