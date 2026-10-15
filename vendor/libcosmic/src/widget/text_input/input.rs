@@ -234,6 +234,8 @@ where
         let spacing = THEME.lock().unwrap().cosmic().space_xxs();
 
         let v: Cow<'a, str> = value.into();
+        // Capture the interface defaults for this newly built widget; the
+        // renderer defaults remain those selected when the window started.
         TextInput {
             id: Id::unique(),
             placeholder: placeholder.into(),
@@ -243,10 +245,10 @@ where
             is_read_only: false,
             select_on_focus: false,
             double_click_select_delimiter: None,
-            font: None,
+            font: Some(crate::font::default()),
             width: Length::Fill,
             padding: spacing.into(),
-            size: None,
+            size: Some(crate::widget::text::default_size()),
             helper_size: 10.0,
             helper_line_height: text::LineHeight::Absolute(14.0.into()),
             on_focus: None,

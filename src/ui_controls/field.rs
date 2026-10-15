@@ -195,4 +195,6 @@ pub fn editor<'a, Message: Clone + 'static>(
     content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
 ) -> TextEditor<'a, Message> {
     TextEditor::new(name, content)
+        .font(design::interface_font())
+        .size(design::interface_size())
 }
