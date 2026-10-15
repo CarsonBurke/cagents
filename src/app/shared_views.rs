@@ -674,6 +674,15 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    pub(super) fn locally_closed_card(&self, id: CardId) -> bool {
+        self.card_state(id)
+            .is_some_and(|card| matches!(card.existence, Existence::Closed { .. }))
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|runtime| runtime.card_was_closed(id))
+    }
+
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked.clear();
         // Decide which whole views can project before retiring any local alias.
@@ -682,6 +691,9 @@ impl Cagents {
         let mut adoptions = Vec::new();
         for view in views {
             for shared in &view.panes {
+                if self.locally_closed_card(shared.id) {
+                    continue;
+                }
                 let aliases = self
                     .durable
                     .cards
@@ -782,11 +794,15 @@ impl Cagents {
             // projection-local deduplication.
             self.shared_views.restoration_requests.remove(&pane.id);
         }
-        if self.session.is_none() || !self.durable.cards.iter().any(|source| {
+        let historical_claim = self
+            .session
+            .as_ref()
+            .is_some_and(|runtime| runtime.terminal_was_closed(terminal));
+        if self.session.is_none() || (!historical_claim && !self.durable.cards.iter().any(|source| {
             source.id != pane.id
                 && !source.existence.is_open()
                 && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal.id)
-        }) {
+        })) {
             return;
         }
         // Resolving the recipe's actual archived owner belongs to the ordered
@@ -814,6 +830,24 @@ impl Cagents {
         owned: &HashSet<CardId>,
         current: Vec<CardId>,
     ) -> Task<Message> {
+        // A stale shared read cannot undo this window's explicit closure,
+        // including after its heavy descriptor has retired or the UI restarted.
+        let filtered = view
+            .panes
+            .iter()
+            .any(|pane| self.locally_closed_card(pane.id))
+            .then(|| View {
+                scope: view.scope.clone(),
+                revision: view.revision,
+                panes: view
+                    .panes
+                    .iter()
+                    .filter(|pane| !self.locally_closed_card(pane.id))
+                    .cloned()
+                    .collect(),
+                retired: view.retired.clone(),
+            });
+        let view = filtered.as_ref().unwrap_or(view);
         let index = match &view.scope {
             Scope::Channel(id) => {
                 let Some(index) = self
@@ -1318,6 +1352,60 @@ mod tests {
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
+    }
+
+    #[test]
+    fn committed_local_close_survives_stale_shared_view_projection_and_restart() {
+        let (mut app, channel, _, pane) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let mut view = View::empty(channel);
+        view.panes.push(pane.clone());
+        let owned = HashSet::from([pane.id]);
+        drop(app.project_shared_view(&view, &owned));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("closed-view.sqlite3");
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-view"))
+                .unwrap();
+        app.session = Some(runtime);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        app.detach_shared_pane(pane.id);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let committed = app
+            .session
+            .as_ref()
+            .unwrap()
+            .take_committed_closures(app.durable.id);
+        assert_eq!(
+            Arc::make_mut(&mut app.durable).retire_committed_cards(&committed),
+            1
+        );
+        drop(app.project_shared_view(&view, &owned));
+        assert!(app.card_state(pane.id).is_none());
+        assert!(app.workspace.card(pane.id).is_none());
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        app.session.as_mut().unwrap().shutdown();
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-view"))
+                .unwrap();
+        app.session = Some(runtime);
+        drop(app.project_shared_view(&view, &owned));
+        assert!(app.card_state(pane.id).is_none());
+        assert!(app.workspace.card(pane.id).is_none());
     }
 
     #[test]
