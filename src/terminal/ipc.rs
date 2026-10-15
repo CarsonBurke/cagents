@@ -495,7 +495,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty scrollback page budget in bytes (allocated lazily).
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -507,7 +509,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: 16 * 1024 * 1024,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -521,7 +523,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -1864,6 +1866,16 @@ pub fn validate_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn holder_options_decode_the_legacy_scrollback_field() {
+        let mut legacy = serde_json::to_value(super::TerminalSpawnOptions::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("max_scrollback_bytes");
+        object.insert("max_scrollback".into(), serde_json::json!(10_000));
+        let options: super::TerminalSpawnOptions = serde_json::from_value(legacy).unwrap();
+        assert_eq!(options.max_scrollback_bytes, 10_000);
+    }
+
     use std::io::{Cursor, Read};
 
     use crate::model::{BootId, HostIncarnation, HostSessionId};
