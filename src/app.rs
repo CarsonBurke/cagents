@@ -7651,7 +7651,7 @@ pub struct Cagents {
     terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
-    terminal_clipboard: Option<(CardId, terminal_ui::ClipboardTarget, bool, String)>,
+    terminal_clipboard: Option<(CardId, terminal_ui::ClipboardTarget, bool, String, crate::model::OperationId)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
     navigation_cache: sidebar::NavigationCache,
@@ -20635,9 +20635,6 @@ impl Application for Cagents {
                         }
                     }
                     if is_escape_press(&event) && !captured {
-                        if let Some((card, terminal, ..)) = &self.terminal_clipboard {
-                            return self.handle_terminal_find(terminal_ui::Action::ConfirmClipboard(*card, terminal.clone(), false));
-                        }
                         if self.transient_work_close.is_some() {
                             return cosmic::task::message(Message::CancelTransientWorkClose);
                         }
@@ -21935,6 +21932,12 @@ impl Application for Cagents {
         let dialog = (|| {
         if top == modal_ui::Modal::Clone {
             return self.clone_repository_dialog();
+        }
+        if matches!(top, modal_ui::Modal::EditorFeatures(_)) {
+            return self.editor_feature_dialog();
+        }
+        if top == modal_ui::Modal::Clipboard {
+            return self.terminal_clipboard_dialog();
         }
         if top == modal_ui::Modal::ChatClose {
             return self.chat_close_dialog();
