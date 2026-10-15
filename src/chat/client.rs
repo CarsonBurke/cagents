@@ -500,6 +500,13 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let inner = Self::fixture_unbound(session, snapshot);
+        inner.offline.bind(&inner);
+        Self { inner }
+    }
+
+    #[cfg(test)]
+    fn fixture_unbound(session: Session, snapshot: Snapshot) -> Arc<Inner> {
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
             .items
@@ -554,8 +561,7 @@ impl ClientHandle {
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             });
-        inner.offline.bind(&inner);
-        Self { inner }
+        inner
     }
 
     #[cfg(test)]
@@ -563,11 +569,12 @@ impl ClientHandle {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
-        let mut handle = Self::fixture(session.clone(), snapshot);
-        let inner = Arc::get_mut(&mut handle.inner).unwrap();
+        let mut owner = Self::fixture_unbound(session.clone(), snapshot);
+        let inner = Arc::get_mut(&mut owner).unwrap();
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
-        handle
+        owner.offline.bind(&owner);
+        Self { inner: owner }
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
