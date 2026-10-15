@@ -32,7 +32,7 @@ pub enum Action {
     Composer(text_editor::Action),
     Preview,
     InsertSuggestion,
-    SuggestionLines { generation: u64, anchor: Anchor, original: String, result: Result<String, String> },
+    SuggestionLines { generation: u64, composer_revision:u64, head:String, anchor: Anchor, original: String, result: Result<String, String> },
     PreviewSuggestion { comment: String, index: usize },
     SuggestionPreview { generation: u64, head: String, comment: String, index: usize, expected_body: String, result: Result<String,String> },
     ApplySuggestion { comment: String, index: usize },
@@ -386,6 +386,7 @@ impl State {
                 | Action::AcknowledgeUnknown
         ) {
             self.discussion.composer_revision = self.discussion.composer_revision.wrapping_add(1);
+            self.discussion.suggestion_loading=false;
         }
         if matches!(
             &action,
@@ -564,12 +565,13 @@ impl State {
                     self.effects.push(Effect::OpenUrl(url));
                 }
             }
-            Action::SuggestionLines { generation, anchor, original, result } => {
-                if generation != self.generation { return ActionTask::none(); }
+            Action::SuggestionLines { generation, composer_revision, head, anchor, original, result } => {
+                if generation != self.generation || composer_revision!=self.discussion.composer_revision { return ActionTask::none(); }
                 self.discussion.suggestion_loading = false;
+                if self.context.as_ref().is_none_or(|context|context.head_oid!=head){self.notice=Some("The PR head changed. Re-anchor the draft before inserting selected lines.".into());return ActionTask::none();}
                 match result {
                     Ok(lines) => if let Some(composer) = &mut self.discussion.composer {
-                        if matches!(&composer.destination, Destination::Line(current) if *current == anchor) && composer.content.text() == original {
+                        if composer.authority.context.head_oid==head && matches!(&composer.destination, Destination::Line(current) if *current == anchor) && composer.content.text() == original {
                             let block = crate::github::suggested_changes::suggestion_block(&lines);
                             let body = if original.is_empty() { block } else { format!("{original}\n\n{block}") };
                             composer.content = text_editor::Content::with_text(&body);
@@ -634,8 +636,11 @@ impl State {
                 let Some(composer) = &self.discussion.composer else { return ActionTask::none(); };
                 let Destination::Line(anchor) = &composer.destination else { return ActionTask::none(); };
                 if anchor.side != crate::github::ReviewDiffSide::Right { self.notice = Some("Suggestions can replace lines on the current right side of the diff.".into()); return ActionTask::none(); }
+                if self.context.as_ref().is_none_or(|context|context.head_oid!=composer.authority.context.head_oid){self.notice=Some("Re-anchor the draft to the current PR head before inserting selected lines.".into());return ActionTask::none();}
                 let anchor = anchor.clone(); let original = composer.content.text();
-                let authority = composer.authority.clone(); let generation = self.generation; let api = Arc::clone(&self.api); let cancellation = self.cancellation.clone();
+                let authority = composer.authority.clone();let head=authority.context.head_oid.clone();
+                self.discussion.composer_revision=self.discussion.composer_revision.wrapping_add(1);let composer_revision=self.discussion.composer_revision;
+                let generation = self.generation; let api = Arc::clone(&self.api); let cancellation = self.cancellation.clone();
                 self.discussion.suggestion_loading = true;
                 return iced::Task::perform(async move {
                     let requested = anchor.clone();
@@ -643,7 +648,7 @@ impl State {
                         let key = PullRequestKey::new(authority.target.repository, authority.target.pull_request.number).map_err(|error| error.to_string())?;
                         api.suggestion_lines(&key, &requested.path, &authority.context.head_oid, requested.start_line, requested.line, &cancellation).map_err(|error| error.to_string())
                     }).await.unwrap_or_else(|error| Err(error.to_string()));
-                    Action::SuggestionLines { generation, anchor, original, result }
+                    Action::SuggestionLines { generation, composer_revision, head, anchor, original, result }
                 }, |action| super::Action::Discussion(action));
             }
             Action::PreviewSuggestion { comment, index } => {
@@ -1904,6 +1909,31 @@ mod tests {
             start_line: 4,
             line: 7,
         }
+    }
+
+    #[test]
+    fn stale_suggestion_lines_cannot_replace_a_new_composer_at_the_same_anchor() {
+        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
+        drop(state.update_discussion(Action::InsertSuggestion));
+        let revision=state.discussion.composer_revision;let head=state.context.as_ref().unwrap().head_oid.clone();
+        drop(state.update_discussion(Action::Cancel));drop(state.update_discussion(Action::Begin(anchor())));
+        drop(state.update_discussion(Action::InsertSuggestion));
+        assert!(state.discussion.suggestion_loading);
+        drop(state.update_discussion(Action::SuggestionLines{generation:state.generation,composer_revision:revision,head,anchor:anchor(),original:String::new(),result:Ok("old selected text".into())}));
+        assert!(state.discussion.composer.as_ref().unwrap().content.text().is_empty());
+        assert!(state.discussion.suggestion_loading,"an old receipt cannot clear a newer request");
+    }
+
+    #[test]
+    fn suggestion_lines_from_an_old_head_leave_the_draft_unchanged() {
+        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
+        drop(state.update_discussion(Action::InsertSuggestion));
+        let revision=state.discussion.composer_revision;let head=state.context.as_ref().unwrap().head_oid.clone();
+        state.context.as_mut().unwrap().head_oid="d".repeat(40);
+        drop(state.update_discussion(Action::SuggestionLines{generation:state.generation,composer_revision:revision,head,anchor:anchor(),original:String::new(),result:Ok("old selected text".into())}));
+        assert!(state.discussion.composer.as_ref().unwrap().content.text().is_empty());
+        assert!(!state.discussion.suggestion_loading);
+        assert!(state.notice.as_ref().unwrap().contains("head changed"));
     }
 
     #[test]
