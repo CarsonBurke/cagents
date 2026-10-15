@@ -196,7 +196,11 @@ mod branch_delete_tests {
     use std::{fs, path::Path, process::Command};
 
     fn git(path: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+            command.env_remove(name);
+        }
+        let output = command
             .current_dir(path)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -209,6 +213,10 @@ mod branch_delete_tests {
                 "commit.gpgsign=false",
                 "-c",
                 "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "init.templateDir=",
             ])
             .args(args)
             .output()
@@ -390,6 +398,7 @@ printf '%s\n' "$1" >> "$CAGENTS_BRANCH_RACE_ROOT/policy-phases"
                 hook
             } else {
                 let hook = path.join(".git/hooks/reference-transaction");
+                fs::create_dir_all(hook.parent().unwrap()).unwrap();
                 fs::write(&hook,"#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' \"$1\" >> \"$CAGENTS_BRANCH_RACE_ROOT/policy-phases\"\n").unwrap();
                 hook
             };
@@ -637,6 +646,7 @@ exec /usr/bin/git "$@"
             fs::write(root.join("admin-y"), admin_y.as_os_str().as_encoded_bytes()).unwrap();
             fs::write(root.join("admin-z"), admin_z.as_os_str().as_encoded_bytes()).unwrap();
             let hook = repository.join(".git/hooks/reference-transaction");
+            fs::create_dir_all(hook.parent().unwrap()).unwrap();
             fs::write(&hook, r##"#!/bin/sh
 set -eu
 /bin/cat >/dev/null
