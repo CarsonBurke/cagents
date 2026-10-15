@@ -5945,6 +5945,9 @@ mod tests {
     #[test]
     fn visible_draft_setup_probes_its_exact_account_with_statusbar_hidden() {
         let mut app = context_inspector_test_app(false);
+        // A real window supplies its viewport before panes are classified.
+        // The fixture's default zero-width viewport makes every card offscreen.
+        app.workspace.resize_viewport(1100.0);
         app.settings.show_status_bar = false;
         app.refresh_ui.focused = true;
         for provider in Account::PROVIDERS {
@@ -5981,6 +5984,8 @@ mod tests {
             },
         };
         drop(app.insert_chat_card(session, None, None));
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
         assert!(!app.settings.show_status_bar);
         let generation = app.account_ui.discovery_generation;
         drop(app.update(Message::AccountUi(Action::Located {
