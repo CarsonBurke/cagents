@@ -2964,6 +2964,7 @@ mod tests {
             ..Default::default()
         };
         let update = Presentation {
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             base_generation: 1,
             metadata: Snapshot {
@@ -3051,6 +3052,7 @@ mod tests {
             );
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let malformed = Presentation {
+                turn_outcomes_unchanged: false,
                 file_changes_unchanged: false,
                 base_generation: 2,
                 metadata: Snapshot {

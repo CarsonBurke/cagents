@@ -57,6 +57,9 @@ pub(crate) struct Store {
     file_keys: usize,
     applied_files: usize,
     pub(super) file_cwd: Option<PathBuf>,
+    pub(super) turn_session: Option<String>,
+    pub(super) visible_turn_origins: Vec<super::turn_outcomes::ScopedOrigin>,
+    pub(super) presented_turn_outcomes: Option<std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
     end: Option<Cursor>,
@@ -140,7 +143,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,native_session TEXT);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
@@ -152,6 +155,9 @@ impl Store {
                 file_keys: 0,
                 applied_files: 0,
                 file_cwd: None,
+                turn_session: None,
+                visible_turn_origins: Vec::new(),
+                presented_turn_outcomes: None,
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
@@ -356,7 +362,7 @@ impl Store {
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,native_session=excluded.native_session", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,self.turn_session]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -1031,9 +1037,9 @@ impl Store {
         let mut reused = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
             } else {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
             };
             let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
@@ -1051,6 +1057,7 @@ impl Store {
                             row.get::<_, i64>(4)? as usize,
                             row.get::<_, i64>(5)? as usize,
                             row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -1059,10 +1066,11 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut turn_origins=Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans, native_session) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
@@ -1133,6 +1141,7 @@ impl Store {
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
+                    super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),&previous.id,&id);
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1250,6 +1259,7 @@ impl Store {
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
+                super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),&item.id,&id);
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1275,6 +1285,7 @@ impl Store {
         }
         if self.forward.is_none() {
             items.reverse();
+            turn_origins.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1324,6 +1335,7 @@ impl Store {
             .collect();
         drop(old);
         previous.clear();
+        self.visible_turn_origins=turn_origins;
         self.dirty = false;
         self.paging = false;
         self.changed = Some(Default::default());
@@ -1490,6 +1502,32 @@ mod tests {
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
     #[test]
+    fn native_part_origins_keep_ingestion_scope_across_session_rotation_and_resident_reuse() {
+        let mut store=Store::new().unwrap();
+        store.turn_session=Some("confirmed-A".into());
+        let text=|id:&str,body:&str|Item {id:id.to_owned(),role:Role::User,at:None,started_at:None,
+            content:ItemContent::Text{text:body.to_owned(),thinking:false,phase:Default::default()}};
+        let mut source=text("literal:native-part:not-a-parser-contract",&"x".repeat(PART_BYTES*3));
+        let source_id=source.id.clone();
+        source.role=Role::User;
+        store.apply(Event::Item(source)).unwrap();
+        let mut previous=store.window().unwrap().items;
+        assert!(previous.len()>1);
+        assert_eq!(store.visible_turn_origins.len(),previous.len());
+        for (origin,item) in store.visible_turn_origins.iter().zip(&previous) {
+            assert_eq!(origin.session_id.as_deref(),Some("confirmed-A"));
+            assert_eq!(origin.origin.source_item_id,source_id);assert_eq!(origin.origin.item_id,item.id);
+        }
+        store.turn_session=Some("confirmed-B".into());
+        let window=store.window_reusing(&mut previous).unwrap();
+        assert_eq!(store.visible_turn_origins.len(),window.items.len());
+        assert!(store.visible_turn_origins.iter().all(|origin|origin.session_id.as_deref()==Some("confirmed-A")));
+        store.turn_session=None;store.apply(Event::Item(text("unconfirmed-item","unknown"))).unwrap();
+        store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().any(|origin|origin.origin.item_id=="unconfirmed-item"&&origin.session_id.is_none()));
+    }
+
+    #[test]
     fn output_for_an_uncacheable_identity_remains_nonfatal() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let id = "x".repeat(METADATA_LIMIT + 1);
@@ -1637,6 +1675,7 @@ mod tests {
         store.earlier().unwrap();
         let earlier = store.window_reusing(&mut latest.items).unwrap();
         let replayed = crate::chat::presentation::Presentation {
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             children: Vec::new(),
             base_generation: 1,

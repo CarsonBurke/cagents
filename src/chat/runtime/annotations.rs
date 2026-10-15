@@ -15,6 +15,7 @@ pub(super) struct Authority {
     unconfirmed_commands: Vec<String>,
     revision: u64,
     store: Option<annotations::storage::Store>,
+    turn_projection: Option<(String,Vec<super::turn_outcomes::ScopedOrigin>,std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>)>,
     notice: Option<String>,
     retry_at: Option<std::time::Instant>,
     #[cfg(test)]
@@ -29,11 +30,19 @@ impl Authority {
             unconfirmed_commands: Vec::new(),
             revision: 0,
             store: None,
+            turn_projection:None,
             notice: None,
             retry_at: None,
             #[cfg(test)]
             root: None,
         }
+    }
+    #[cfg(test)]
+    pub(super) fn for_turn_outcomes_test(scope:LaunchAccountScope,root:std::path::PathBuf,session:&str) -> Self {
+        let mut authority=Self::new(Ok(scope));
+        authority.root=Some(root);
+        assert!(authority.apply(Some(&Some(session.to_owned())),vec![],&mut vec![]).is_none());
+        authority
     }
     fn pending_store(&self) -> Result<annotations::storage::Store, String> {
         let scope = self.scope.as_ref().map_err(Clone::clone)?;
@@ -243,6 +252,28 @@ impl Authority {
     pub(super) fn session(&self) -> Option<&str> {
         self.session.as_deref()
     }
+    /// Read only this actor's confirmed physical account/session authority.
+    /// Historical transcript IDs do not inherit a later /clear session.
+    pub(super) fn turn_outcomes(
+        &mut self, expected_session: Option<&str>, origins: &[super::turn_outcomes::ScopedOrigin],
+    ) -> Result<std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>,String> {
+        let session=self.session.as_deref().filter(|session|Some(*session)==expected_session)
+            .ok_or("No matching provider-confirmed turn outcome authority")?;
+        let store=self.store.as_ref().ok_or("Qualified turn outcome storage is unavailable")?;
+        let revision=store.turn_outcome_revision()?;
+        if let Some((previous_session,previous_origins,projection))=&self.turn_projection
+            && previous_session==session && previous_origins==origins && projection.revision==revision {
+            return Ok(projection.clone());
+        }
+        let qualified:Vec<_>=origins.iter().filter(|origin|origin.session_id.as_deref()==Some(session))
+            .filter(|origin|origin.origin.source_item_id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES)
+            .map(|origin|origin.origin.clone()).collect();
+        let mut projection=store.project_turn_outcomes(&qualified)?;
+        if qualified.len()!=origins.len() { projection.complete=false; }
+        let projection=std::sync::Arc::new(projection);
+        self.turn_projection=Some((session.to_owned(),origins.to_vec(),projection.clone()));
+        Ok(projection)
+    }
     pub(super) fn revision(&self) -> u64 {
         self.revision
     }
@@ -300,6 +331,7 @@ impl Authority {
             self.session = identity.clone();
             self.latest_proven = None;
             self.store = None;
+            self.turn_projection=None;
             self.notice = None;
             self.retry_at = None;
         }

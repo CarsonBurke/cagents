@@ -15,6 +15,10 @@ pub struct Presentation {
     pub order: Vec<String>,
     pub changes: Vec<ItemChange>,
     pub children: Vec<ChildUpdate>,
+    /// True retains the exact prior Arc. False includes a real empty/unknown
+    /// replacement, which must clear stale markers after authority changes.
+    #[serde(default)]
+    pub turn_outcomes_unchanged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +200,12 @@ impl Presentation {
             }
             metadata.file_changes = previous.file_changes.clone();
         }
+        if self.turn_outcomes_unchanged {
+            if metadata.turn_outcomes.as_ref()!=&super::turn_outcomes::TurnOutcomeProjection::default() {
+                return Err("Retained turn outcomes carry replacement metadata");
+            }
+            metadata.turn_outcomes=previous.turn_outcomes.clone();
+        }
         metadata.items = apply_items(&previous.items, self.order, self.changes)?;
         let mut children = HashMap::new();
         for child in self.children {
@@ -243,6 +253,7 @@ mod tests {
         let retained_ui = installed.clone();
         let next = text("live", "hello tail");
         let update = Presentation {
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             base_generation: 1,
             metadata: Snapshot {
@@ -328,6 +339,7 @@ mod tests {
         };
         metadata.subagents[0].items.clear();
         let update = Presentation {
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             base_generation: 1,
             metadata,
@@ -382,6 +394,7 @@ mod tests {
             ..Snapshot::default()
         };
         snapshot = Presentation {
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             children: Vec::new(),
             base_generation: 4,
@@ -424,7 +437,8 @@ mod tests {
             body_mut(&mut shell.content).unwrap().clear();
             assert!(
                 Presentation {
-                    file_changes_unchanged: false,
+                    turn_outcomes_unchanged: false,
+            file_changes_unchanged: false,
                     children: Vec::new(),
                     base_generation: generation,
                     metadata: Snapshot {
@@ -460,6 +474,7 @@ mod tests {
         };
         let update = Presentation {
             base_generation: 1,
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: true,
             metadata: Snapshot {
                 generation: 2,
@@ -474,4 +489,20 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&summary, &current.file_changes));
         assert_eq!(current.file_changes.applied_files, 99);
     }
+    #[test]
+    fn unchanged_turn_projection_preserves_arc_and_real_empty_replacement_clears() {
+        use super::super::turn_outcomes::{TurnOutcomeProjection,VisibleTurnOutcome,TurnOutcome,TurnIdentity,TurnIdentityKind};
+        let projection=std::sync::Arc::new(TurnOutcomeProjection { revision:3,complete:true,records:vec![VisibleTurnOutcome {
+            outcome:TurnOutcome { identity:TurnIdentity {session_id:"session".into(),kind:TurnIdentityKind::AcceptedInput,id:"A".into()},
+                outcome:crate::agent::ActivityOutcome::Cancelled,finished_at:1234 },item_ids:vec!["actual-input".into()],
+        }] });
+        let previous=Snapshot {generation:1,turn_outcomes:projection.clone(),..Default::default()};
+        let delta=|unchanged|Presentation {base_generation:1,file_changes_unchanged:false,turn_outcomes_unchanged:unchanged,
+            metadata:Snapshot{generation:2,..Default::default()},order:vec![],changes:vec![],children:vec![]};
+        let retained=delta(true).apply(&previous).unwrap();assert!(std::sync::Arc::ptr_eq(&projection,&retained.turn_outcomes));
+        let cleared=delta(false).apply(&previous).unwrap();assert_eq!(cleared.turn_outcomes.as_ref(),&TurnOutcomeProjection::default());
+        let mut malformed=delta(true);malformed.metadata.turn_outcomes=projection;
+        assert!(malformed.apply(&previous).is_err());
+    }
+
 }

@@ -670,6 +670,7 @@ fn a_refresh_of_a_full_window_with_metadata() {
         }
         let update = chat::presentation::Presentation {
             base_generation: installed.generation,
+            turn_outcomes_unchanged: false,
             file_changes_unchanged: false,
             metadata: Snapshot {
                 generation: installed.generation + 1,

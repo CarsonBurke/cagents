@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod annotations;
+mod turn_outcomes;
 mod execution;
 mod store;
 mod websocket;
@@ -776,6 +777,13 @@ impl Handle {
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let refresh_outcomes_after_window=store.dirty;
+        if !refresh_outcomes_after_window {
+            turn_outcomes::refresh(
+            &mut self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()),
+            &store.visible_turn_origins,&mut state,
+        );
+        }
         if after.is_some_and(|generation| generation >= state.generation) && !store.dirty {
             return None;
         }
@@ -796,7 +804,14 @@ impl Handle {
                 }
             }
         }
+        if refresh_outcomes_after_window {
+        turn_outcomes::refresh(
+            &mut self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()),
+            &store.visible_turn_origins,&mut state,
+        );
+        }
         if refresh_publication {
+            store.presented_turn_outcomes=Some(state.turn_outcomes.clone());
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
                 state.file_changes.revision,
@@ -822,6 +837,13 @@ impl Handle {
     ) -> Option<crate::terminal_ipc::ServerResponse> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let refresh_outcomes_after_window=store.dirty;
+        if !refresh_outcomes_after_window {
+            turn_outcomes::refresh(
+            &mut self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()),
+            &store.visible_turn_origins,&mut state,
+        );
+        }
         if after == Some(state.generation) && !store.dirty {
             return None;
         }
@@ -846,6 +868,12 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            if refresh_outcomes_after_window {
+            turn_outcomes::refresh(
+                &mut self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()),
+                &store.visible_turn_origins,&mut state,
+            );
+            }
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -898,7 +926,11 @@ impl Handle {
                     } else {
                         None
                     };
+                    let turn_outcomes_unchanged=store.presented_turn_outcomes.as_ref()
+                        .is_some_and(|old|Arc::ptr_eq(old,&state.turn_outcomes));
+                    let retained_outcomes=turn_outcomes_unchanged.then(||std::mem::take(&mut state.turn_outcomes));
                     let metadata = state.clone();
+                    if let Some(outcomes)=retained_outcomes { state.turn_outcomes=outcomes; }
                     if let Some(files) = retained_files {
                         state.file_changes = files;
                     }
@@ -908,6 +940,7 @@ impl Handle {
                     }
                     crate::chat::presentation::Presentation {
                         file_changes_unchanged,
+                        turn_outcomes_unchanged,
                         base_generation,
                         metadata,
                         order: state.items.iter().map(|item| item.id.clone()).collect(),
@@ -915,6 +948,7 @@ impl Handle {
                         children,
                     }
                 });
+            store.presented_turn_outcomes=Some(state.turn_outcomes.clone());
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
                 state.file_changes.revision,
@@ -2408,6 +2442,8 @@ impl Actor {
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
+        let turn_session=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).session().map(str::to_owned);
+        self.store.lock().unwrap_or_else(|p|p.into_inner()).turn_session=turn_session;
         let originals = self.adapter.take_original_updates();
         if let Some(message) = self
             .annotations
@@ -4733,6 +4769,67 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn host_committed_historical_outcomes_publish_without_transcript_or_current_turn_changes() {
+        use crate::{account::scope::LaunchAccountScope,agent::{Provider,ActivityOutcome},chat::turn_outcomes::{TurnIdentity,TurnIdentityKind,TurnUpdate}};
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self)->Result<Step,String> { Ok(Step { events:vec![Event::Ready(true),Event::TurnStarted,Event::Status{busy:true,detail:"B running".into()}],..Step::default() }) }
+            fn command(&mut self,_:Command)->Result<Step,String> { Ok(Step::default()) }
+            fn receive(&mut self,_:Value)->Result<Step,String> { Ok(Step::default()) }
+        }
+        let root=super::super::annotations::storage::test_directory();
+        let home=root.path().join("home"); std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let scope=LaunchAccountScope::resolve(Provider::Claude,root.path(),|name|(name=="HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let path=root.path().join("annotations");
+        let mut durable=super::super::annotations::storage::Store::for_test(&path,&scope,"session-A").unwrap();
+        let spec=ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
+            program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().to_owned(),environment:BTreeMap::new() };
+        let mut adapter:Box<dyn Adapter>=Box::new(Quiet); let mut initial=adapter.initialize().unwrap();
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
+        until(&handle,|snapshot|snapshot.ready);
+        *handle.0.annotations.lock().unwrap()=annotations::Authority::for_turn_outcomes_test(scope.clone(),path.clone(),"session-A");
+        {
+            let mut store=handle.0.store.lock().unwrap(); store.turn_session=Some("session-A".into());
+            store.apply(Event::Item(text("input-A","first input"))).unwrap();
+            store.apply(Event::Item(text("input-B","queued next input"))).unwrap();
+            let mut state=handle.0.state.lock().unwrap();state.session_id=Some("session-A".into());state.busy=true;state.turn_generation=2;
+        }
+        let baseline=handle.snapshot(None).unwrap(); assert!(baseline.turn_outcomes.records.is_empty());
+        let identity=TurnIdentity {session_id:"session-A".into(),kind:TurnIdentityKind::AcceptedInput,id:"accepted-A".into()};
+        durable.apply_turn_update(&TurnUpdate::Bind { identity:identity.clone(),item_ids:vec!["input-A".into()] }).unwrap();
+        durable.apply_turn_update(&TurnUpdate::Finish { identity:identity.clone(),outcome:ActivityOutcome::Cancelled,finished_at:1234 }).unwrap();
+        let chat_id=crate::model::TerminalId::new();
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate{update,..})=handle.presentation(chat_id,Some(baseline.generation)) else { panic!("outcome-only host commit was hidden by unchanged transcript generation"); };
+        assert!(!update.turn_outcomes_unchanged);
+        let current=update.apply(&baseline).unwrap();
+        assert_eq!(current.turn_outcomes.records[0].outcome.identity,identity);
+        assert_eq!(current.turn_outcomes.records[0].item_ids,["input-A"]);
+        assert!(current.busy);assert_eq!(current.turn_generation,2);
+        assert!(handle.snapshot(Some(current.generation)).is_none());
+        assert!(Arc::ptr_eq(&current.turn_outcomes,&handle.snapshot(None).unwrap().turn_outcomes));
+        assert!(!durable.apply_turn_update(&TurnUpdate::Finish {identity:identity.clone(),outcome:ActivityOutcome::Cancelled,finished_at:9999}).unwrap().changed);
+        assert!(handle.presentation(chat_id,Some(current.generation)).is_none());
+        handle.0.state.lock().unwrap().generation+=1;
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate{update,..})=handle.presentation(chat_id,Some(current.generation)) else {panic!("expected metadata-only delta");};
+        assert!(update.turn_outcomes_unchanged);assert!(update.metadata.turn_outcomes.records.is_empty());
+        let retained=update.apply(&current).unwrap();assert!(Arc::ptr_eq(&retained.turn_outcomes,&current.turn_outcomes));
+        // A matching raw item ID in a different confirmed session must never
+        // requalify the old session-A window after /clear or reconnect.
+        let mut other=super::super::annotations::storage::Store::for_test(&path,&scope,"session-B").unwrap();
+        let other_identity=TurnIdentity{session_id:"session-B".into(),kind:TurnIdentityKind::AcceptedInput,id:"different-B".into()};
+        other.apply_turn_update(&TurnUpdate::Bind{identity:other_identity.clone(),item_ids:vec!["input-A".into()]}).unwrap();
+        other.apply_turn_update(&TurnUpdate::Finish{identity:other_identity,outcome:ActivityOutcome::Succeeded,finished_at:5678}).unwrap();
+        *handle.0.annotations.lock().unwrap()=annotations::Authority::for_turn_outcomes_test(scope,path,"session-B");
+        handle.0.state.lock().unwrap().session_id=Some("session-B".into());
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate{update,..})=handle.presentation(chat_id,Some(retained.generation)) else {panic!("authority change must explicitly clear outcomes");};
+        assert!(!update.turn_outcomes_unchanged);
+        let cleared=update.apply(&retained).unwrap();assert!(cleared.turn_outcomes.records.is_empty());assert!(!cleared.turn_outcomes.complete);
+        assert!(cleared.busy);assert_eq!(cleared.turn_generation,2);
+        handle.close().unwrap();
     }
 
     #[test]
