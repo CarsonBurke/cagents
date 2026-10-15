@@ -721,6 +721,9 @@ mod tests {
         std::fs::write(worktree.join(".env"), "private fixture secret").unwrap();
         let error = checked_record(&request).unwrap_err();
         assert!(error.contains("non-disposable ignored"), "{error}");
+        let prepare_refusal = PreparedRemoval::prepare(request.clone()).err()
+            .expect("the real cleanup preparation must refuse ignored user data before removal");
+        assert!(prepare_refusal.contains("non-disposable ignored"), "{prepare_refusal}");
         assert_eq!(std::fs::read_to_string(worktree.join(".env")).unwrap(), "private fixture secret");
         std::fs::remove_file(worktree.join(".env")).unwrap();
         std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
