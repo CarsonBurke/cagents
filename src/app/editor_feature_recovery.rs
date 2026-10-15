@@ -106,7 +106,7 @@ mod tests {
             }
         };
         let RepositoryAction::AutoSaveDue { ticket: old_ticket, .. } = &due else { unreachable!() }; let old_ticket = *old_ticket;
-        app.cards.insert(card, CardRuntime::Repository(runtime));
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
         let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("another publisher's exact cleanup".into(), || Ok(()));
         let failure = crate::editor_workspace_edit::PublicationFailure { message: "cleanup pending".into(), recovery: Some(authority.clone()), worktree: Some(directory.path().into()) };
         drop(app.update(Message::EditorFeatures(Action::Published { ticket: 999, result: Err(failure) })));
