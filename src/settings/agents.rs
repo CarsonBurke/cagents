@@ -420,7 +420,12 @@ mod tests {
             environment: BTreeMap::from([("PATH".into(), "tools:/usr/bin".into())]),
             ..Default::default()
         };
-        assert!(previous.validate_execution(Provider::Claude).unwrap_err().contains("absolute"));
+        assert!(
+            previous
+                .validate_execution(Provider::Claude)
+                .unwrap_err()
+                .contains("absolute")
+        );
         for path in ["", ":/usr/bin", "/usr/bin:", "/usr/bin:tools", "."] {
             let mut ambiguous = previous.clone();
             ambiguous.environment.insert("PATH".into(), path.into());
@@ -428,20 +433,40 @@ mod tests {
         }
         let mut repaired = previous.clone();
         repaired.model = Some("fixture-model".into());
-        repaired.validate_changes(&previous, Provider::Claude).unwrap();
-        repaired.environment.insert("FIXTURE_TOOL".into(), "value".into());
-        repaired.validate_changes(&previous, Provider::Claude).unwrap();
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
+        repaired
+            .environment
+            .insert("FIXTURE_TOOL".into(), "value".into());
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
         repaired.executable = Some("/bin/sh".into());
-        repaired.validate_changes(&previous, Provider::Claude).unwrap();
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
         repaired.validate_execution(Provider::Claude).unwrap();
         let pinned = repaired.clone();
-        repaired.environment.insert("PATH".into(), "relative-tools".into());
-        repaired.validate_changes(&pinned, Provider::Claude).unwrap();
+        repaired
+            .environment
+            .insert("PATH".into(), "relative-tools".into());
+        repaired
+            .validate_changes(&pinned, Provider::Claude)
+            .unwrap();
         let pinned = repaired.clone();
         repaired.executable = None;
-        assert!(repaired.validate_changes(&pinned, Provider::Claude).is_err());
-        repaired.environment.insert("PATH".into(), "/usr/bin".into());
-        repaired.validate_changes(&pinned, Provider::Claude).unwrap();
+        assert!(
+            repaired
+                .validate_changes(&pinned, Provider::Claude)
+                .is_err()
+        );
+        repaired
+            .environment
+            .insert("PATH".into(), "/usr/bin".into());
+        repaired
+            .validate_changes(&pinned, Provider::Claude)
+            .unwrap();
         repaired.validate_execution(Provider::Claude).unwrap();
 
         let missing_pin = AgentLaunchSettings {
@@ -449,9 +474,17 @@ mod tests {
             ..previous
         };
         let mut repair_environment = missing_pin.clone();
-        repair_environment.environment.insert("PATH".into(), "other-tools".into());
-        repair_environment.validate_changes(&missing_pin, Provider::Claude).unwrap();
-        assert!(repair_environment.validate_execution(Provider::Claude).is_err());
+        repair_environment
+            .environment
+            .insert("PATH".into(), "other-tools".into());
+        repair_environment
+            .validate_changes(&missing_pin, Provider::Claude)
+            .unwrap();
+        assert!(
+            repair_environment
+                .validate_execution(Provider::Claude)
+                .is_err()
+        );
     }
 
     #[cfg(any(feature = "ui", feature = "host"))]
@@ -474,25 +507,51 @@ mod tests {
         // This is the mismatch that execution policy must refuse: launching
         // a bare name sees the project CLI while discovery skips relative PATH.
         let output = std::process::Command::new(Provider::Claude.executable())
-            .current_dir(directory.path()).env_clear().env("PATH", &path).output().unwrap();
+            .current_dir(directory.path())
+            .env_clear()
+            .env("PATH", &path)
+            .output()
+            .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"project\n");
         assert_eq!(
-            crate::account::probe::find_executable(Provider::Claude.executable(), Some(std::ffi::OsStr::new(&path))).unwrap(),
+            crate::account::probe::find_executable(
+                Provider::Claude.executable(),
+                Some(std::ffi::OsStr::new(&path))
+            )
+            .unwrap(),
             host.join(Provider::Claude.executable())
         );
-        assert!(configuration.resolve_executable(Provider::Claude, Some(host.as_os_str())).is_err());
-        assert!(crate::chat::fresh_session_configured(
-            Provider::Claude,
-            crate::model::TerminalId::new(),
-            directory.path().into(),
-            &crate::account::Account::system(Provider::Claude),
-            &configuration,
-            LaunchDefaults::default(),
-        ).is_err());
-        configuration.executable = Some(tools.join(Provider::Claude.executable()).to_str().unwrap().into());
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+        assert!(
+            crate::chat::fresh_session_configured(
+                Provider::Claude,
+                crate::model::TerminalId::new(),
+                directory.path().into(),
+                &crate::account::Account::system(Provider::Claude),
+                &configuration,
+                LaunchDefaults::default(),
+            )
+            .is_err()
+        );
+        configuration.executable = Some(
+            tools
+                .join(Provider::Claude.executable())
+                .to_str()
+                .unwrap()
+                .into(),
+        );
         configuration.validate_execution(Provider::Claude).unwrap();
-        assert_eq!(configuration.resolve_executable(Provider::Claude, Some(host.as_os_str())).unwrap(), tools.join(Provider::Claude.executable()));
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            tools.join(Provider::Claude.executable())
+        );
     }
 
     #[cfg(any(feature = "ui", feature = "host"))]
@@ -506,8 +565,7 @@ mod tests {
         for (root, marker) in [(&host, "host"), (&configured, "configured")] {
             std::fs::create_dir(root).unwrap();
             let binary = root.join(Provider::Claude.executable());
-            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n"))
-                .unwrap();
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n")).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let mut configuration = AgentLaunchSettings::default();
@@ -550,16 +608,16 @@ mod tests {
                 .unwrap(),
             host_program
         );
-        configuration.executable = Some(
-            directory.path().join("missing").to_str().unwrap().into(),
-        );
+        configuration.executable = Some(directory.path().join("missing").to_str().unwrap().into());
         assert!(
             configuration
                 .resolve_executable(Provider::Claude, Some(host.as_os_str()))
                 .is_err()
         );
         configuration.executable = None;
-        configuration.environment.insert("PATH".into(), String::new());
+        configuration
+            .environment
+            .insert("PATH".into(), String::new());
         assert!(
             configuration
                 .resolve_executable(Provider::Claude, Some(host.as_os_str()))
@@ -633,32 +691,35 @@ mod tests {
                     .into_owned(),
             ),
         );
-        value.as_table_mut().unwrap().insert("agents".into(), toml::Value::Table(toml::Table::from_iter([
-            (
-                "claude".into(),
-                toml::Value::try_from(AgentLaunchSettings {
-                    executable: Some(
-                        directory
-                            .path()
-                            .join("missing-provider")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    model: Some("pinned-model".into()),
-                    permission_mode: Some("plan".into()),
-                    ..Default::default()
-                })
-                .unwrap(),
-            ),
-            (
-                "codex".into(),
-                toml::Value::try_from(AgentLaunchSettings {
-                    model: Some("keep-model".into()),
-                    ..Default::default()
-                })
-                .unwrap(),
-            ),
-        ])));
+        value.as_table_mut().unwrap().insert(
+            "agents".into(),
+            toml::Value::Table(toml::Table::from_iter([
+                (
+                    "claude".into(),
+                    toml::Value::try_from(AgentLaunchSettings {
+                        executable: Some(
+                            directory
+                                .path()
+                                .join("missing-provider")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        model: Some("pinned-model".into()),
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                (
+                    "codex".into(),
+                    toml::Value::try_from(AgentLaunchSettings {
+                        model: Some("keep-model".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            ])),
+        );
         std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
         let loaded = super::super::load(&path).unwrap();
         assert_eq!(
