@@ -242,7 +242,9 @@ impl RecoveryAuthority {
         // can resolve those same leaves without retrying this exact older Arc.
         // Old refusal markers must then observe completion as well.
         match &self.0.leaves {
-            Some(leaves) => leaves.iter().all(|leaf| leaf.0.resolved.load(Ordering::Acquire)),
+            Some(leaves) => leaves
+                .iter()
+                .all(|leaf| leaf.0.resolved.load(Ordering::Acquire)),
             None => self.0.resolved.load(Ordering::Acquire),
         }
     }

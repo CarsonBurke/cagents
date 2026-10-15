@@ -228,11 +228,16 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         let other = Root::open(&other).unwrap();
         let foreign_lease = Arc::new(Some(
-            crate::worktree_cleanup::fixture_protection(runtime.path(), other.path(), false).unwrap(),
+            crate::worktree_cleanup::fixture_protection(runtime.path(), other.path(), false)
+                .unwrap(),
         ));
-        let error = FilesystemRecoveryContext::new(&source, foreign_lease, placement.clone()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied,
-            "matching source placement must still reject a different source's actual cleanup lease");
+        let error =
+            FilesystemRecoveryContext::new(&source, foreign_lease, placement.clone()).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "matching source placement must still reject a different source's actual cleanup lease"
+        );
         assert!(FilesystemRecoveryContext::new(&other, protection, placement).is_err());
         assert!(std::fs::read_dir(source.path()).unwrap().next().is_none());
         assert!(std::fs::read_dir(other.path()).unwrap().next().is_none());

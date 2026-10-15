@@ -3,12 +3,24 @@
 //! Real Git service contracts on the isolated HOST boundary. These exercise
 //! the same public recovery API as the UI integration suite without UI imports.
 //! Test-only owned placement topology is not production issuer qualification.
-use cagents::{filesystem_recovery_context::FilesystemRecoveryContext, repository::{
-    CancellationToken, CommandSpec, DiscardRequest, MutationOutcome, PathSelection,
-    ProcessExecutor, ProcessFailure, ProcessOutput, RepoPath, RepositoryService,
-    SystemProcessExecutor, WorktreeAuthority,
-}};
-use std::{fs, os::{fd::AsRawFd, unix::fs::{MetadataExt, PermissionsExt}}, path::PathBuf, sync::Arc, time::Duration};
+use cagents::{
+    filesystem_recovery_context::FilesystemRecoveryContext,
+    repository::{
+        CancellationToken, CommandSpec, DiscardRequest, MutationOutcome, PathSelection,
+        ProcessExecutor, ProcessFailure, ProcessOutput, RepoPath, RepositoryService,
+        SystemProcessExecutor, WorktreeAuthority,
+    },
+};
+use std::{
+    fs,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 #[path = "support/recovery_context.rs"]
 mod recovery_context;
@@ -18,51 +30,109 @@ fn isolate(mut command: CommandSpec) -> CommandSpec {
     // Remove inherited redirection while preserving explicit retained scopes:
     // CommandSpec applies its controlled environment after removed_environment.
     for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"GIT_") { command = command.env_remove(key); }
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command = command.env_remove(key);
+        }
     }
-    command.arguments.splice(0..0, [
-        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-        "-c", "init.templateDir=", "-c", "commit.gpgsign=false",
-    ].map(Into::into));
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Recovery Contract").env("GIT_AUTHOR_EMAIL", "contract@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Recovery Contract").env("GIT_COMMITTER_EMAIL", "contract@example.invalid")
-        .env("GIT_AUTHOR_DATE", "1700000000 +0000").env("GIT_COMMITTER_DATE", "1700000000 +0000")
+    command.arguments.splice(
+        0..0,
+        [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "init.templateDir=",
+            "-c",
+            "commit.gpgsign=false",
+        ]
+        .map(Into::into),
+    );
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Recovery Contract")
+        .env("GIT_AUTHOR_EMAIL", "contract@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Recovery Contract")
+        .env("GIT_COMMITTER_EMAIL", "contract@example.invalid")
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
         .timeout(Duration::from_secs(30))
 }
 impl ProcessExecutor for IsolatedExecutor {
-    fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+    fn execute(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessFailure> {
         SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)
     }
 }
-struct Fixture { directory: tempfile::TempDir }
+struct Fixture {
+    directory: tempfile::TempDir,
+}
 impl Fixture {
     fn new() -> Option<Self> {
-        let fixture = Self { directory: tempfile::Builder::new().prefix("cagents-host-recovery-")
-            .permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap() };
+        let fixture = Self {
+            directory: tempfile::Builder::new()
+                .prefix("cagents-host-recovery-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap(),
+        };
         fixture.git_in_root(&["init", "-b", "main", "work"]);
         Some(fixture)
     }
-    fn work(&self) -> PathBuf { self.directory.path().join("work") }
+    fn work(&self) -> PathBuf {
+        self.directory.path().join("work")
+    }
     fn git_in_root(&self, args: &[&str]) {
-        let output = IsolatedExecutor.execute(&CommandSpec::new("git").cwd(self.directory.path()).args(args.iter().copied()), &CancellationToken::new()).unwrap();
+        let output = IsolatedExecutor
+            .execute(
+                &CommandSpec::new("git")
+                    .cwd(self.directory.path())
+                    .args(args.iter().copied()),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert!(output.success, "Git {args:?}: {output:?}");
     }
     fn git_in_work(&self, args: &[&str]) {
-        let output = IsolatedExecutor.execute(&CommandSpec::new("git").cwd(self.work()).args(args.iter().copied()), &CancellationToken::new()).unwrap();
+        let output = IsolatedExecutor
+            .execute(
+                &CommandSpec::new("git")
+                    .cwd(self.work())
+                    .args(args.iter().copied()),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert!(output.success, "Git {args:?}: {output:?}");
     }
-    fn commit(&self, message: &str) { self.git_in_work(&["commit", "-m", message]); }
-    fn write(&self, path: &str, bytes: &[u8]) { fs::write(self.work().join(path), bytes).unwrap(); }
-    fn service(&self) -> RepositoryService<IsolatedExecutor> { RepositoryService::new("git", Arc::new(IsolatedExecutor)) }
-    fn recovery_context(&self) -> FilesystemRecoveryContext { recovery_context::context(&self.work()) }
-    fn recovery_service(&self) -> RepositoryService<cagents::repository::WorktreeExecutor<IsolatedExecutor>> {
-        self.service().with_worktree_authority(WorktreeAuthority::capture(&self.work()).unwrap()).unwrap()
+    fn commit(&self, message: &str) {
+        self.git_in_work(&["commit", "-m", message]);
+    }
+    fn write(&self, path: &str, bytes: &[u8]) {
+        fs::write(self.work().join(path), bytes).unwrap();
+    }
+    fn service(&self) -> RepositoryService<IsolatedExecutor> {
+        RepositoryService::new("git", Arc::new(IsolatedExecutor))
+    }
+    fn recovery_context(&self) -> FilesystemRecoveryContext {
+        recovery_context::context(&self.work())
+    }
+    fn recovery_service(
+        &self,
+    ) -> RepositoryService<cagents::repository::WorktreeExecutor<IsolatedExecutor>> {
+        self.service()
+            .with_worktree_authority(WorktreeAuthority::capture(&self.work()).unwrap())
+            .unwrap()
             .with_recovery_context(self.recovery_context())
     }
 }
-fn path(path: &str) -> RepoPath { RepoPath::parse(path).unwrap() }
+fn path(path: &str) -> RepoPath {
+    RepoPath::parse(path).unwrap()
+}
 
 /// Root UID does not prove CAP_CHOWN. Count a different-GID positive only
 /// after the real syscall and same-FD observation both establish it.
@@ -71,9 +141,14 @@ fn try_distinct_original_group(file: &fs::File) {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     assert!((0..=65_536).contains(&count));
     let mut groups = vec![0; count as usize];
-    assert_eq!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) }, count);
-    let candidate = groups.into_iter().find(|gid| *gid != initial).or_else(||
-        (unsafe { libc::geteuid() } == 0).then_some(initial.wrapping_add(12_345)));
+    assert_eq!(
+        unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+        count
+    );
+    let candidate = groups
+        .into_iter()
+        .find(|gid| *gid != initial)
+        .or_else(|| (unsafe { libc::geteuid() } == 0).then_some(initial.wrapping_add(12_345)));
     if let Some(gid) = candidate {
         if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, gid) } == 0 {
             assert_eq!(file.metadata().unwrap().gid(), gid);
@@ -81,7 +156,9 @@ fn try_distinct_original_group(file: &fs::File) {
             return;
         }
     }
-    eprintln!("NO_RESTORABLE_SECONDARY_GID: original-GID equality still asserted; no cross-GID positive credited");
+    eprintln!(
+        "NO_RESTORABLE_SECONDARY_GID: original-GID equality still asserted; no cross-GID positive credited"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -299,4 +376,3 @@ fn recoverable_discard_restores_blob_under_restrictive_umask() {
     );
     assert!(!discarded.recovery.live_recovery.needs_resolution());
 }
-

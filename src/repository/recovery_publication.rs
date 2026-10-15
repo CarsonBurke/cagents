@@ -838,7 +838,9 @@ mod tests {
             directories: BTreeMap::new(),
             entries: vec![DiscardRecoveryEntry {
                 path: RepoPath::parse("restored").unwrap(),
-                before: SavedEntry::Symlink { target: PathBuf::from("original-target") },
+                before: SavedEntry::Symlink {
+                    target: PathBuf::from("original-target"),
+                },
                 after: SavedEntry::Absent,
                 after_version: None,
                 trash: None,
