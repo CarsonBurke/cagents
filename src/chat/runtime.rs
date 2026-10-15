@@ -3443,7 +3443,7 @@ mod tests {
         assert_eq!(snapshot.permission_denials.last().unwrap().tool_input.as_ref().unwrap().len(),64*1024);
         assert!(serde_json::to_vec(&snapshot).unwrap().len()<=STATE_LIMIT);
         handle.command(Command::Compact).unwrap();
-        assert!(!handle.snapshot().exited);
+        assert!(!handle.snapshot(None).unwrap().exited);
         handle.close().unwrap();
     }
 
