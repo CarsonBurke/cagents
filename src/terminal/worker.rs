@@ -1954,10 +1954,7 @@ impl Worker {
                 WorkerEvent::Command(Some(command)) => {
                     // A command selected together with the priority wake must
                     // cross the cancellation boundary before it can write.
-                    if self.published.interrupt_requested.load(Ordering::Acquire) {
-                        carried_command = Some(command);
-                        continue;
-                    }
+                    let Some(command) = self.command_before_interrupt(command) else { continue; };
                     // Wheel bursts otherwise queue one repaint per event. Fold
                     // adjacent viewport deltas before publishing a snapshot.
                     let command =
@@ -2226,6 +2223,15 @@ impl Worker {
 
         self.drain_effects();
         self.publish_snapshot(false);
+    }
+
+    fn command_before_interrupt(&mut self, command: Command) -> Option<Command> {
+        if self.published.interrupt_requested.load(Ordering::Acquire) {
+            // A coalesced scroll may already own the carry slot. Return the
+            // selected command to the inbox without replacing that control.
+            self.retained_commands.push_front(command);
+            None
+        } else { Some(command) }
     }
 
     /// Returns true when shutdown was requested.
@@ -5849,6 +5855,27 @@ mod tests {
             drop(commands);
             worker.run();
         }
+    }
+
+    #[test]
+    fn repeated_interrupt_retains_selected_and_coalesced_control_commands() {
+        let (mut worker, _) = capture_worker();
+        let (commands, receiver) = command_channel(4);
+        worker.commands = receiver;
+        let (reply, _) = crossbeam_channel::bounded(1);
+        commands.send(Command::CloseChecked { allow_active: false, deadline: std::time::Instant::now() + Duration::from_secs(3), reply }).unwrap();
+        let mut carried = None;
+        let _ = coalesce_scroll_command(Command::Scroll(ScrollCommand::Delta(1)), &worker.commands, &mut carried);
+        assert!(matches!(carried, Some(Command::CloseChecked { .. })));
+        worker.retained_commands.push_back(Command::Resize(TerminalSize { columns: 81, rows: 24, cell_width_px: 1, cell_height_px: 1 }));
+        let selected = worker.retained_commands.pop_front().unwrap();
+        worker.published.request_interrupt(None);
+        assert!(worker.command_before_interrupt(selected).is_none());
+        worker.interrupt_input();
+        assert!(matches!(carried, Some(Command::CloseChecked { .. })), "pending scroll control must retain ownership");
+        assert!(matches!(worker.retained_commands.pop_front(), Some(Command::Resize(_))));
+        drop(commands);
+        worker.run();
     }
 
     #[test]
