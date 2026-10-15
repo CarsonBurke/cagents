@@ -3558,19 +3558,24 @@ fn send_pty_message(
     discard_pending: &AtomicBool,
 ) -> bool {
     loop {
-        let mut cancellation = libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut cancellation, 1, 0) } < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        // Carry must deliver the already-read message even if checking a
+        // cancellation descriptor fails. Only destructive teardown permits
+        // discarding it; ordinary delivery needs no extra poll syscall.
+        if discard_pending.load(Ordering::Acquire) {
+            let mut cancellation = libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut cancellation, 1, 0) } < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
             }
-            return false;
-        }
-        if cancellation.revents != 0 && discard_pending.load(Ordering::Acquire) {
-            return false;
+            if cancellation.revents != 0 {
+                return false;
+            }
         }
         match sender.send_timeout(message, READER_SEND_POLL) {
             Ok(()) => return true,
