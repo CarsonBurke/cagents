@@ -2093,6 +2093,7 @@ impl Worker {
                     let Some(command) = self.command_before_interrupt(command) else {
                         continue;
                     };
+                    self.retain_carried_for_handoff(&command, &mut carried_command);
                     // Wheel bursts otherwise queue one repaint per event. Fold
                     // adjacent viewport deltas before publishing a snapshot.
                     let command =
@@ -2371,6 +2372,17 @@ impl Worker {
             None
         } else {
             Some(command)
+        }
+    }
+
+    fn retain_carried_for_handoff(&mut self, command: &Command, carried: &mut Option<Command>) {
+        if matches!(command, Command::CheckInputDrained(_) | Command::PrepareUpgrade(_) | Command::Carry { .. }) {
+            if let Some(command) = carried.take() {
+                // An interrupt can retain a control ahead of the command a
+                // previous scroll coalescer already selected. Include that
+                // accepted command in the handoff's drain/refusal contract.
+                self.retained_commands.push_front(command);
+            }
         }
     }
 
@@ -6291,6 +6303,40 @@ mod tests {
         worker.retained_commands.push_back(Command::Input(b"retained".to_vec()));
         assert!(worker.input_drained_for_handoff().is_err());
         worker.retained_commands.clear();
+        worker.run();
+    }
+
+    #[test]
+    fn interrupt_retained_carry_cannot_overtake_post_interrupt_coalesced_input() {
+        let (mut worker, _) = capture_worker_for(shell_session("exec cat").launch);
+        let (commands, receiver) = command_channel(4);
+        worker.commands = receiver;
+        // The scroll was selected before priority interruption was published.
+        assert!(worker.published.request_interrupt(None));
+        let generation = worker.published.input_order.lock().unwrap().generation;
+        commands.send(Command::OrderedInput { generation,
+            input: Box::new(Command::Input(b"after interrupt".to_vec())) }).unwrap();
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = directory.path().join("must-not-detach.sock");
+        commands.send(Command::Carry { socket: socket.clone(), reply }).unwrap();
+        let mut carried = None;
+        let scroll = coalesce_scroll_command(Command::Scroll(ScrollCommand::Delta(1)), &worker.commands, &mut carried);
+        assert!(matches!(scroll, Command::Scroll(_)));
+        assert!(matches!(carried, Some(Command::OrderedInput { .. })));
+        let boundary = worker.interrupt_input();
+        assert!(!is_cancelable_input_before(carried.as_ref().unwrap(), boundary));
+        let command = worker.retained_commands.pop_front().expect("retained carry control");
+        assert!(matches!(command, Command::Carry { .. }));
+        worker.retain_carried_for_handoff(&command, &mut carried);
+        assert!(!worker.handle_command(command));
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        assert!(carried.is_none());
+        assert!(matches!(worker.retained_commands.front(), Some(Command::OrderedInput { .. })));
+        assert!(!worker.carried);
+        assert!(!socket.exists());
+        worker.retained_commands.clear();
+        drop(commands);
         worker.run();
     }
 
