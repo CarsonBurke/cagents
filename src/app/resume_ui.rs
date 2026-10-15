@@ -61,6 +61,12 @@ struct Row {
     source: Source,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeDestination {
+    Channel(crate::model::ChannelId),
+    Worktree(PathBuf),
+}
+
 enum Source {
     /// A conversation cagents saved, with the launch it was saved with.
     Saved(Box<SavedConversation>),
@@ -164,6 +170,7 @@ pub enum Progress {
     Found {
         conversations: Vec<catalog::Found>,
         titles: Vec<(CardId, String)>,
+        models: Vec<(CardId, String)>,
         read: usize,
     },
 }
@@ -262,6 +269,7 @@ fn index(
         read += batch.len();
         let mut conversations = Vec::new();
         let mut titles = Vec::new();
+        let mut models = Vec::new();
         for mut found in catalog::find_all(cache, &seeds, batch, workers, cancel) {
             if let Some(name) = names.get(&found.id) {
                 found.title = name.clone();
@@ -278,10 +286,9 @@ fn index(
                 // it, and one cagents never named by its first message,
                 // unless the reader renamed it here.
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    if let Some((card, untitled)) = occupied.get_mut().take()
-                        && (found.named || found.titled && untitled)
-                    {
-                        titles.push((card, found.title));
+                    if let Some((card, untitled)) = occupied.get_mut().take() {
+                        if let Some(model) = found.model { models.push((card, model)); }
+                        if found.named || found.titled && untitled { titles.push((card, found.title)); }
                     }
                 }
             }
@@ -289,6 +296,7 @@ fn index(
         if !send(Progress::Found {
             conversations,
             titles,
+            models,
             read,
         }) {
             return;
@@ -659,9 +667,16 @@ impl Cagents {
             Progress::Found {
                 conversations,
                 titles,
+                models,
                 read,
             } => {
                 let state = &mut self.resume_ui;
+                for (card, model) in models {
+                    if let Some(row) = state.rows.iter().find(|row| row.card == card)
+                        && let Source::Saved(entry) = &row.source
+                        && let Some(key) = chat_ui::closing::draft_key(&entry.session)
+                    { Arc::make_mut(&mut self.durable).conversation_models.insert(key, model); }
+                }
                 for (card, title) in titles
                     .into_iter()
                     .filter(|(card, _)| !self.chrome_ui.user_titles.contains_key(card))
@@ -811,20 +826,81 @@ impl Cagents {
         }
         let replace = self.resume_ui.replace;
         self.close_resume();
-        self.recently_closed
-            .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
-        // The draft `/resume` was asked from gives its place to the
-        // conversation, where both belong to the same strip.
+        let destination = self.resumed_conversation_destination(entry.card, &session, &entry.title);
+        let entry = SavedConversation { session, ..entry };
+        let scope = match &destination {
+            ResumeDestination::Channel(channel) => self.select_channel(*channel),
+            ResumeDestination::Worktree(path) => self.select_worktree(path.clone(), false),
+        };
+        // Selection may refuse a missing/locked destination. Never insert in
+        // the previous strip just because selecting the intended one failed.
+        let selected = match &destination {
+            ResumeDestination::Channel(id) => self.durable.active_channel == Some(*id),
+            ResumeDestination::Worktree(path) => self.durable.active_channel.is_none()
+                && self.active_workspace.as_deref() == Some(path.as_path()),
+        };
+        if !selected { return scope; }
+        Task::batch([scope, self.commit_resumed_conversation(entry, replace)])
+    }
+
+    /// Called only once the exact destination has been selected. The async
+    /// selection lane carries this continuation until its guard is installed.
+    pub(super) fn commit_resumed_conversation(&mut self, entry: SavedConversation, replace: Option<CardId>) -> Task<Message> {
+        self.recently_closed.retain(|(card, _)| card.id != entry.card);
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
-        let insert = self.insert_chat_card(session, replace, None);
+        let insert = self.insert_chat_card(entry.session, replace, None);
         if let Some(card) = self.workspace.focused() {
+            if self.durable.active_channel.is_none()
+                && let Some(scope) = self.active_workspace.clone()
+            {
+                // A catalog cwd can be outside the current worktree when it
+                // was not known locally. Filing and executable cwd are distinct.
+                Arc::make_mut(&mut self.durable).card_scopes.insert(card, scope.clone());
+                self.worktree_owners.insert(card, scope);
+            }
             self.apply_reported_title(card, entry.title);
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
-        Task::batch([scope, insert, discard])
+        self.refresh_sidebar_channels();
+        self.refresh_sidebar_worktree_panes();
+        self.persist();
+        Task::batch([insert, discard])
+    }
+
+    fn resumed_conversation_destination(&mut self, original: CardId, session: &chat::Session, title: &str) -> ResumeDestination {
+        if let Some(id) = self.durable.channels.iter().find(|channel| channel.cards.contains(&original)).map(|channel| channel.id) {
+            return ResumeDestination::Channel(id);
+        }
+        if let Some(id) = chat_ui::closing::draft_key(session).and_then(|key| self.durable.conversation_channels.get(&key).copied())
+            && self.durable.channels.iter().any(|channel| channel.id == id)
+        { return ResumeDestination::Channel(id); }
+        let directory = session.launch.recipe.working_directory.canonicalize()
+            .unwrap_or_else(|_| session.launch.recipe.working_directory.clone());
+        // A known worktree is the precise owner, even when nested inside its
+        // repository. Do not reduce it to its parent project's channel list.
+        if let Some(root) = self.known_worktree_roots.iter().chain(self.sidebar_model.projects.iter().flat_map(|project| project.worktrees.iter().map(|worktree| &worktree.path)))
+            .filter(|root| directory.starts_with(root)).max_by_key(|root| root.components().count())
+        {
+            return ResumeDestination::Worktree(root.clone());
+        }
+        let project = self.sidebar_model.projects.iter()
+            .filter(|project| directory.starts_with(&project.repository))
+            .max_by_key(|project| project.repository.components().count()).map(|project| project.id);
+        if let Some(project) = project {
+            let id = crate::model::ChannelId::new();
+            let ordinal = self.next_provisional_ordinal();
+            Arc::make_mut(&mut self.durable).channels.push(crate::model::ProjectChannel {
+                id, project_id: project, title: title.to_owned(), title_source: crate::model::ChannelTitleSource::Prompt,
+                ordinal, shared: false, cards: Vec::new(), focused: None,
+            });
+            self.publish_channel_creation(id, project);
+            return ResumeDestination::Channel(id);
+        }
+        if let Some(path) = &self.active_workspace { return ResumeDestination::Worktree(path.clone()); }
+        if let Some(id) = self.durable.active_channel { return ResumeDestination::Channel(id); }
+        ResumeDestination::Worktree(directory)
     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
@@ -1027,6 +1103,85 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_resume_joins_recorded_project_channel_and_attention() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(project, crate::repository::RepositoryId::new(), "Recorded project".into(), directory.path().into(), Vec::new(), Vec::new()));
+        let entry = saved(directory.path());
+        drop(app.resume_saved_conversation(entry));
+        let card = app.workspace.focused().unwrap();
+        let channel = app.durable.channels.iter().find(|channel| channel.cards.contains(&card)).unwrap();
+        assert_eq!(channel.project_id, project);
+        let channel = channel.id;
+        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting }));
+        app.refresh_sidebar_channels();
+        let row = app.sidebar_model.projects.iter().find(|row| row.id == project).unwrap().channels.iter().find(|row| row.id == channel).unwrap();
+        assert_eq!(row.activity, Some(crate::agent::ActivityState::Waiting));
+        assert!(row.has_panes);
+    }
+
+    #[test]
+    fn catalog_resume_joins_exact_linked_worktree_and_waiting_attention() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let linked = directory.path().join("linked");
+        let nested = linked.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let project = ProjectId::new();
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(
+            project, crate::repository::RepositoryId::new(), "Recorded project".into(), directory.path().into(),
+            vec![crate::sidebar::SidebarWorktree::new(worktree, linked.clone(), Some("linked-branch".into()), false, false, None, None, None)], Vec::new()));
+        let entry = saved(&nested);
+        let launch = entry.session.launch.clone();
+        assert_eq!(app.resumed_conversation_destination(entry.card, &entry.session, &entry.title), ResumeDestination::Worktree(linked.clone()));
+        drop(app.resume_saved_conversation(entry));
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(app.active_workspace.as_ref(), Some(&linked));
+        assert!(app.durable.active_channel.is_none());
+        assert!(app.durable.channels.is_empty());
+        assert_eq!(app.durable.card_scopes.get(&card), Some(&linked));
+        assert!(app.sidebar_state.worktree_has_panes(project, worktree));
+        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else { panic!("native chat"); };
+        assert_eq!(resumed.launch, launch);
+        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting }));
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(crate::agent::ActivityState::Waiting));
+    }
+
+    #[test]
+    fn catalog_model_updates_saved_display_metadata_without_rewriting_issued_launch() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let entry = saved(directory.path());
+        let key = chat_ui::closing::draft_key(&entry.session).unwrap();
+        let issued = entry.session.clone();
+        app.resume_indexed(Progress::Saved { entries: vec![entry.clone()], seeds: Vec::new().into(), error: None });
+        app.resume_indexed(Progress::Found { conversations: Vec::new(), titles: Vec::new(), models: vec![(entry.card, "catalog-model".into())], read: 1 });
+        assert_eq!(app.durable.conversation_models[&key], "catalog-model");
+        let Source::Saved(saved) = &app.resume_ui.rows[0].source else { panic!("saved descriptor"); };
+        assert_eq!(saved.session, issued);
+    }
+
+    #[test]
+    fn catalog_resume_falls_back_to_the_current_worktree_without_changing_launch_cwd() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let current = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(project, crate::repository::RepositoryId::new(), "Current project".into(), current.path().into(), Vec::new(), Vec::new()));
+        app.active_workspace = Some(current.path().into());
+        let entry = saved(foreign.path());
+        let launch = entry.session.launch.clone();
+        assert_eq!(app.resumed_conversation_destination(entry.card, &entry.session, &entry.title), ResumeDestination::Worktree(current.path().into()));
+        drop(app.resume_saved_conversation(entry));
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(app.durable.card_scopes.get(&card).map(PathBuf::as_path), Some(current.path()));
+        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else { panic!("native chat"); };
+        assert_eq!(resumed.launch, launch);
+    }
 
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(
@@ -1264,6 +1419,7 @@ mod tests {
             },
         ));
         let found = |updated_at_unix_ms| catalog::Found {
+            model: None,
             seed: 0,
             path: directory.path().join("transcript.jsonl"),
             id: uuid::Uuid::new_v4().to_string(),
@@ -1279,6 +1435,7 @@ mod tests {
                 Progress::Found {
                     conversations: vec![found(updated_at_unix_ms)],
                     titles: Vec::new(),
+                models: Vec::new(),
                     read: 1,
                 },
             ));
@@ -1308,6 +1465,7 @@ mod tests {
             Progress::Found {
                 conversations: (4..4 + PAGE as i64).map(found).collect(),
                 titles: Vec::new(),
+                models: Vec::new(),
                 read: 1,
             },
         ));
@@ -1422,6 +1580,7 @@ mod tests {
             conversations,
             titles,
             read,
+            ..
         } = &progress[2]
         else {
             panic!("the newest conversations come next")

@@ -2477,6 +2477,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
+        Message::ChatClose(chat_ui::closing::Action::End(_)) => true,
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -2536,6 +2537,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
 
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
+        || matches!(message, Message::ChatClose(action) if !matches!(action, chat_ui::closing::Action::CommitHide(_)))
         || matches!(
             message,
             Message::KeyEvent { .. }
@@ -3939,6 +3941,7 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ChatClose(chat_ui::closing::Action),
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -14916,10 +14919,11 @@ impl Application for Cagents {
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id) =>
+                    =>
             {
-                self.begin_chat_close(id)
+                self.request_chat_tab_close(id)
             }
+            Message::CloseCard(id) if self.chat_has_parked_runtime(id) => self.begin_chat_close(id),
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
@@ -15968,6 +15972,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatClose(action) => self.update_chat_close(action),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -16425,6 +16430,9 @@ impl Application for Cagents {
         let top = self.top_modal()?;
         #[rustfmt::skip]
         let dialog = (|| {
+        if top == modal_ui::Modal::ChatClose {
+            return self.chat_close_dialog();
+        }
         if top == modal_ui::Modal::Approval
             && let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);

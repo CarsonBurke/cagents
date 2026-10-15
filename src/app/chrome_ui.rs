@@ -734,6 +734,7 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    EndConversation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -751,6 +752,7 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseOthers => Action::CloseOthers(id),
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
+            PaneMenuCommand::EndConversation => return Message::ChatClose(chat_ui::closing::Action::End(id)),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
             PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
             PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
@@ -2053,6 +2055,10 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
+            if self.card_state(id).is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) {
+                entries.push(widget::menu::Item::Button("Close conversation…".into(), None,
+                    PaneMenu(id, PaneMenuCommand::EndConversation)));
+            }
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
                     self.chat_switch_label(id).into(),

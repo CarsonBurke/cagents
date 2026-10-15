@@ -15,6 +15,7 @@ pub(super) enum Modal {
     Discard,
     SettingsReset,
     TerminalClose,
+    ChatClose,
     Update,
     Health,
     Recovery,
@@ -256,6 +257,7 @@ impl Cagents {
         active!(Discard, self.sidebar_state.pending_discard().is_some());
         active!(SettingsReset, self.settings_reset_confirm);
         active!(TerminalClose, self.terminal_close_dialog_visible());
+        active!(ChatClose, self.chat_ui.close_dialog.is_some());
         active!(Update, self.update_ui.confirmation.is_some());
         active!(Health, self.daemon_health_ui.confirmation);
         active!(Recovery, self.session_recovery.open());
@@ -282,6 +284,7 @@ impl Cagents {
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
     }
     pub(super) fn reconcile_modal_backing_state(&mut self) {
+        self.reconcile_chat_close_backing_state();
         if self.dirty_repository_close.as_ref().is_some_and(|close| {
             !matches!(
                 self.cards.get(&close.card),
@@ -301,9 +304,11 @@ impl Cagents {
             .map(|frame| frame.restore.clone());
         let fallback = self.modal_restore_fallback();
         let project_ui = &self.project_ui;
+        let chat_close = self.chat_ui.close_dialog.as_ref();
         let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
             match kind {
                 Modal::Project(role) => project_ui.modal_target(role).map(|target| target.request),
+                Modal::ChatClose => chat_close.map(|dialog| project_ui::ModalRequest::Counter(dialog.generation())),
                 _ => None,
             }
         });
@@ -348,6 +353,7 @@ impl Cagents {
             Modal::Discard => sidebar::discard_cancel_id(),
             Modal::SettingsReset => widget::Id::new("dialog.reset-settings.cancel"),
             Modal::TerminalClose => widget::Id::new("dialog.terminal-close.cancel"),
+            Modal::ChatClose => widget::Id::new("chat-close.cancel"),
             Modal::Update => widget::Id::new("update.cancel"),
             Modal::Health => widget::Id::new("daemon-health.cancel"),
             Modal::Recovery => widget::Id::new("session-recovery.cancel"),
@@ -374,6 +380,7 @@ impl Cagents {
                 Modal::Discard => self.update(Message::Sidebar(SidebarAction::CancelDiscard)),
                 Modal::SettingsReset => self.close_settings_reset(),
                 Modal::TerminalClose => self.cancel_terminal_close(),
+                Modal::ChatClose => self.cancel_chat_close(),
                 Modal::Update => self.update_update_ui(update_ui::Action::CancelApply),
                 #[cfg(feature = "integrated-browser")]
                 Modal::BrowserImport => self.cancel_browser_import(),
@@ -920,6 +927,7 @@ mod tests {
             (Modal::Discard, "sidebar.discard.cancel"),
             (Modal::SettingsReset, "dialog.reset-settings.cancel"),
             (Modal::TerminalClose, "dialog.terminal-close.cancel"),
+            (Modal::ChatClose, "chat-close.cancel"),
             (Modal::Update, "update.cancel"),
             (Modal::Health, "daemon-health.cancel"),
             (Modal::Recovery, "session-recovery.cancel"),
