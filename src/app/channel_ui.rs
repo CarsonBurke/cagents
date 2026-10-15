@@ -416,7 +416,7 @@ impl Cagents {
                         .map(|card| self.card_keyboard_focus(card))
                         .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
                 });
-                self.modal_focus(focus)
+                self.modal_restore_focus(focus)
             }
         }
     }

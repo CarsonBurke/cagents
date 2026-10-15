@@ -1598,7 +1598,7 @@ impl Cagents {
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
         Task::batch([
-            self.modal_focus(focus),
+            self.modal_restore_focus(focus),
             self.lifecycle_sweep(),
             self.sync_chrome(),
         ])

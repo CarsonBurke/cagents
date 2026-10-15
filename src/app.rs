@@ -11875,7 +11875,7 @@ impl Cagents {
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
-        self.modal_focus(restore_focus)
+        self.modal_restore_focus(restore_focus)
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
@@ -12581,7 +12581,7 @@ impl Cagents {
                 |card| self.card_keyboard_focus(card),
             )
         };
-        self.modal_focus(target)
+        self.modal_restore_focus(target)
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
@@ -14865,7 +14865,7 @@ impl Application for Cagents {
                     })
                 };
                 target.map_or_else(Task::none, |target| {
-                    self.modal_focus(target)
+                    self.modal_restore_focus(target)
                 })
             }
             Message::ReturnToAutomationBeforeClose => {

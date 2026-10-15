@@ -256,7 +256,7 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        self.modal_focus(target)
+        self.modal_restore_focus(target)
     }
 
     pub(super) fn adopt_session_recovery_keyboard_nav(&mut self, restore: bool) -> bool {

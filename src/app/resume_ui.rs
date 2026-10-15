@@ -538,7 +538,7 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace.focused().map_or_else(Task::none, |card| {
-                    self.modal_focus(self.card_keyboard_focus(card))
+                    self.modal_restore_focus(self.card_keyboard_focus(card))
                 })
             }
             Action::Query(query) => {

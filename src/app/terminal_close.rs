@@ -425,7 +425,7 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            self.modal_focus(
+            self.modal_restore_focus(
                 self.workspace
                     .focused()
                     .map(|card| self.card_keyboard_focus(card))
@@ -477,7 +477,7 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
-        self.modal_focus(
+        self.modal_restore_focus(
             card.map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )

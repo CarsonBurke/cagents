@@ -209,6 +209,15 @@ impl Cagents {
     pub(super) fn modal_focus(&self, target: widget::Id) -> Task<Message> {
         self.modal_stack.focus_if_present(target)
     }
+    /// Closing a feature must not restore into the workspace or reset a
+    /// surviving dialog's focused field. The stack owns those transitions.
+    pub(super) fn modal_restore_focus(&self, target: widget::Id) -> Task<Message> {
+        if self.modal_is_open() {
+            Task::none()
+        } else {
+            self.modal_focus(target)
+        }
+    }
     pub(super) fn active_modals(&self) -> Vec<Modal> {
         let mut result = Vec::new();
         macro_rules! active {

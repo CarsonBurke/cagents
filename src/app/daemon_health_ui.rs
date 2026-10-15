@@ -126,7 +126,7 @@ impl Cagents {
             .focused()
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-        self.modal_focus(target)
+        self.modal_restore_focus(target)
     }
     pub(super) fn adopt_daemon_health_keyboard_nav(&mut self, restore: bool) -> bool {
         if !self.daemon_health_ui.confirmation {
@@ -310,6 +310,36 @@ mod tests {
             repeat: false,
         }
     }
+    #[test]
+    fn completed_lower_restart_cannot_restore_into_a_present_workspace_widget() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.confirmation = true;
+        app.daemon_health_ui.restarting = true;
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let current = widget::Id::new("dialog.reset-settings.confirm");
+        // Deliberately operate both surfaces: presence alone does not authorize
+        // a lower feature to move focus out of the surviving modal.
+        let root = app.workspace.focused()
+            .map(|card| app.card_keyboard_focus(card))
+            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+        let field = |id| -> Element<'_, Message> {
+            widget::text_input("", "")
+                .id(id)
+                .on_input(|_| Message::DismissStatus)
+                .into()
+        };
+        let content = widget::column::with_children(vec![field(root), field(current.clone())]).into();
+        let feature = app.update_daemon_health_ui(Action::Finished(Ok(())));
+        assert!(!app.daemon_health_ui.confirmation);
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+        let completion = app.finish_modal_update(feature);
+        let task = iced::widget::operation::focus(current.clone()).map(cosmic::Action::App)
+            .chain(completion);
+        assert_eq!(super::super::tests::focused_element(content, task), Some(current));
+    }
+
     #[test]
     fn protocol_mismatch_offers_reviewed_restart_without_stopping_anything() {
         let mut app = super::super::tests::context_inspector_test_app(false);

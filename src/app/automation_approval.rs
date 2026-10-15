@@ -348,7 +348,7 @@ impl Cagents {
                         if let Some(restore) = state.restore_keyboard_nav.take() {
                             self.core.set_keyboard_nav(restore);
                         }
-                        self.modal_focus(
+                        self.modal_restore_focus(
                             self.workspace
                                 .focused()
                                 .map(|card| self.card_keyboard_focus(card))

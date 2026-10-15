@@ -607,7 +607,7 @@ impl Cagents {
                 .first()
                 .filter(|target| self.visible_sidebar_rows().contains(&target.row))
                 .map_or_else(Task::none, |target| {
-                    self.modal_focus(sidebar::selection_row_focus_id(target.row))
+                    self.modal_restore_focus(sidebar::selection_row_focus_id(target.row))
                 });
         }
         // Revalidate every target before starting any operation. A reload may
