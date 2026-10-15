@@ -15,6 +15,7 @@ pub(super) struct State {
     git_target: Option<sidebar::git_commands::GitTarget>,
     git_captured: bool,
     stash_picker: Option<Command>,
+    stash_entries: Vec<crate::repository::StashEntry>,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -257,6 +258,7 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
+                self.palette.stash_entries.clear();
                 self.palette.recording = Some(field);
                 self.palette.filtering_key = false;
                 self.palette.query = None;
@@ -272,6 +274,7 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
+                self.palette.stash_entries.clear();
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 Task::none()
@@ -364,6 +367,7 @@ impl Cagents {
                 self.palette.git_target = sidebar::git_commands::GitTarget::capture(&self.sidebar_model, &self.sidebar_state);
                 self.palette.git_captured = true;
                 self.palette.stash_picker = None;
+                self.palette.stash_entries.clear();
                 self.palette.panes_only = matches!(action, Action::OpenPanes);
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
@@ -397,6 +401,7 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
+                self.palette.stash_entries.clear();
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
@@ -484,6 +489,7 @@ impl Cagents {
         let command = self.update(message);
         self.palette.sidebar_target = None;
         if self.palette.query.is_none() {
+            self.palette.stash_entries.clear();
             self.palette.git_target = None;
             self.palette.git_captured = false;
         }
@@ -721,8 +727,9 @@ impl Cagents {
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
         if let Some(command) = self.palette.stash_picker {
             let Some(target) = self.palette.git_target.as_ref() else { return Vec::new(); };
+            if !target.available(&self.sidebar_model, &self.sidebar_state, Command::GitRefresh) { return Vec::new(); }
             let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
-            let mut entries: Vec<_> = target.stashes(&self.sidebar_model, &self.sidebar_state).iter().filter_map(|entry| {
+            let mut entries: Vec<_> = self.palette.stash_entries.iter().filter_map(|entry| {
                 let label = format!("{} · {}", entry.reference, entry.message);
                 match_score(&label, query).map(|score| (score, label, Message::Palette(Action::RunGitStash(target.clone(), command, entry.clone()))))
             }).collect();
@@ -916,6 +923,10 @@ impl Cagents {
             .into_iter()
             .enumerate()
             .flat_map(|(index, (label, chord, message))| {
+                let enabled = match &message {
+                    Message::Palette(Action::RunGitStash(target, command, entry)) => target.stash_action(&self.sidebar_model, &self.sidebar_state, *command, entry).is_some(),
+                    _ => true,
+                };
                 let next_section = self.palette_section(&message);
                 let heading: Option<Element<'_, Message>> = if next_section.is_some() && next_section != section {
                     Some(widget::container(design::caption(next_section.unwrap())).height(SECTION_HEIGHT).align_y(Alignment::Center).padding([0,12]).into())
@@ -966,7 +977,7 @@ impl Cagents {
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
-                .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
+                .on_press_maybe(enabled.then(|| Message::Palette(Action::Run(MessageBox(Box::new(message))))))
                 .into();
                 let button = if self.palette.panes_only && pane.is_some() {
                     let card = pane.unwrap();
@@ -1280,7 +1291,9 @@ impl Cagents {
             let Some(target) = self.git_command_target() else { return Task::none(); };
             if !target.available(&self.sidebar_model, &self.sidebar_state, command) { return Task::none(); }
             if sidebar::git_commands::is_stash_picker(command) {
+                let entries = target.stashes(&self.sidebar_model, &self.sidebar_state).to_vec();
                 let task = self.update_palette(Action::Open);
+                self.palette.stash_entries = entries;
                 self.palette.git_target = Some(target);
                 self.palette.stash_picker = Some(command);
                 return task;
@@ -3089,6 +3102,29 @@ mod settings_recorder_tests {
         assert!(app.palette_entries().is_empty(), "a branch switch cannot substitute another stash source");
         drop(app.update_palette(Action::Close));
         assert!(!app.palette.git_captured);
+    }
+
+    #[test]
+    fn stash_enter_keeps_the_shown_candidate_when_a_refresh_replaces_the_same_index() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let original = crate::repository::StashEntry { reference: "stash@{0}".into(), oid: crate::repository::Oid::parse(&"a".repeat(40)).unwrap(), message: "Original".into() };
+        app.sidebar_model.source_control.as_mut().unwrap().stashes = vec![original.clone()];
+        drop(app.run_workspace_command(Command::GitPopStash, keyboard::Modifiers::empty()));
+        let shown = app.palette_entries();
+        assert!(matches!(&shown[0].2, Message::Palette(Action::RunGitStash(_, _, entry)) if entry == &original));
+        drop(shown);
+        let mut replacement = original.clone();
+        replacement.oid = crate::repository::Oid::parse(&"b".repeat(40)).unwrap();
+        replacement.message = "Replacement".into();
+        app.sidebar_model.source_control.as_mut().unwrap().stashes = vec![replacement];
+        let after_refresh = app.palette_entries();
+        assert!(matches!(&after_refresh[0].2, Message::Palette(Action::RunGitStash(_, _, entry)) if entry == &original), "the selected index still names the originally displayed candidate");
+        drop(after_refresh);
+        drop(app.update_palette(Action::Submit));
+        assert!(app.status.as_ref().unwrap().message.contains("original stash"));
+        assert!(app.source_control_mutations.is_empty(), "Enter cannot pop the replacement stash");
     }
 
     #[test]
