@@ -16121,6 +16121,12 @@ impl Application for Cagents {
                     self.focused_pane(),
                 ) {
                     Some(command) => {
+                        // A mounted nontext sidebar/inspector control has no
+                        // pane find target. Keep find in project navigation
+                        // instead of borrowing the logical pane behind it.
+                        let command = if native_region.is_some() && !native_targets_pane
+                            && command == workspace_widget::GlobalShortcut::FindInPane
+                        { workspace_widget::GlobalShortcut::FocusProjectSearch } else { command };
                         let modifiers = match event {
                             keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
                             _ => keyboard::Modifiers::empty(),

@@ -233,3 +233,44 @@ fn actual_workspace_buttons_reopen_a_pane_while_the_native_search_field_keeps_re
         assert_eq!(app.utility_card(&CardKind::Settings), app.workspace.focused());
     }
 }
+
+
+#[test]
+fn actual_nontext_sidebar_find_focuses_project_search_instead_of_the_background_editor() {
+    use iced::futures::StreamExt;
+    use keyboard::key::Code;
+    let (mut app, card) = super::tests::editing_repository_app();
+    app.sidebar_model.projects.push(sidebar::SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Keyboard fixture".into(), "/keyboard-fixture".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+    prepare(&mut app);
+    assert!(!app.sidebar_state.controls_expanded());
+    let mut renderer = super::tests::headless_renderer();
+    let (cache, messages) = native(&app, &mut renderer, Cache::new(), Some(widget::Id::new("sidebar.settings")), &[key("f", Code::KeyF, keyboard::Modifiers::CTRL, None)]);
+    let routed = messages.into_iter().find(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &widget::Id::new("sidebar.settings") && region.pane == workspace_widget::FocusedPane::Other && region.card.is_none())).expect("actual sidebar nontext owner");
+    let task = app.update(routed);
+    assert!(app.sidebar_state.controls_expanded(), "find must positively open the existing project filter");
+    let mut ui = UserInterface::build(app.view(), Size::new(1600.0, 1000.0), cache, &mut renderer);
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    executor.block_on(async {
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+                match action {
+                    iced::runtime::Action::Widget(operation) => {
+                        let mut next = Some(operation);
+                        while let Some(mut operation) = next.take() {
+                            ui.operate(&renderer, operation.as_mut());
+                            if let iced::advanced::widget::operation::Outcome::Chain(chained) = operation.finish() { next = Some(chained); }
+                        }
+                    }
+                    iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(_))) => panic!("sidebar find cannot schedule a background repository action"),
+                    _ => {}
+                }
+            }
+        }
+    });
+    executor.shutdown_background();
+    let mut messages = Vec::new();
+    let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::CTRL, None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+    assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &sidebar::search_focus_id() && region.pane == workspace_widget::FocusedPane::TextInput && region.card.is_none())), "the actual returned focus operation must land in the mounted project search field");
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { unreachable!() };
+    assert!(!runtime.find_is_open());
+}
