@@ -352,6 +352,14 @@ mod tests {
         run_tasks(&mut app, task);
         let target = app.active.unwrap();
         let target_anchor = app.capture_editor_location(target).unwrap().anchor;
+        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false }));
+        run_tasks(&mut app, back);
+        assert_eq!(app.active, Some(origin));
+        assert!(app.tab(origin).unwrap().runtime.is_dirty());
+        assert_eq!(app.capture_editor_location(origin).unwrap().anchor, anchor);
+        let forward = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: origin, forward: true }));
+        run_tasks(&mut app, forward);
+        assert_eq!(app.active, Some(target));
         // An actual unpolled Save makes the dirty origin temporarily
         // unavailable. Completion must leave the same Back entry retryable.
         let save = app.update(Message::Repository(RepositoryAction::Save { card: origin, overwrite: false }));
