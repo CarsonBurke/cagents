@@ -208,12 +208,9 @@ fn busy() -> ProtocolError {
     )
 }
 
-/// Caller holds short exclusive control admission. No slow teardown occurs here.
-pub(crate) fn reserve(
-    host: &SharedHost,
-    project: &ProjectInstance,
-    selected: &[SessionClose],
-) -> Result<Reservation, ProtocolError> {
+/// Build the same logical/protected ownership boundary for inventory and final
+/// reservation. This read grants no cleanup authority and installs no lease.
+fn prepare(host:&SharedHost,project:&ProjectInstance)->Result<ReservedProject,ProtocolError> {
     let registry = super::super::agent_execution::registry(host).map_err(error)?;
     let model = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -342,6 +339,50 @@ pub(crate) fn reserve(
             }
         }
     }
+    Ok(reserved)
+}
+
+/// Retained pre-discovery startup custody is ownership even after the public
+/// start failed and chat_spawning/discovery disappeared. Only exact privately
+/// saved foreign membership excludes it; an unrelated-looking recipe is not
+/// absence or foreign ownership proof. No cleanup/IPC/FS call holds HostState.
+fn require_no_startups(host:&SharedHost,reserved:&ReservedProject)->Result<(),ProtocolError> {
+    let pending={
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        if state.native_actor_startups.len()>128 {return Err(error("Native startup custody exceeds its bounded inventory; no project sessions were closed"));}
+        state.native_actor_startups.iter().map(|(id,startup)|(*id,startup.scope_snapshot())).collect::<Vec<_>>()
+    };
+    if pending.is_empty(){return Ok(());}
+    let registry=super::super::agent_execution::registry(host).map_err(error)?;
+    for (id,(source,_context)) in &pending {
+        let hosted=HostedSession::Chat(source.clone());
+        let explicit_own=reserved.sessions.contains(id)||reserved.panes.contains(&CardId::from_uuid(id.as_uuid()));
+        let repository=registry.lock().unwrap_or_else(|p|p.into_inner()).retained_session_repository(std::slice::from_ref(&hosted)).map_err(error)?;
+        let foreign=!explicit_own && (repository.as_ref().is_some_and(|repository|*repository!=reserved.project.repository)
+            || (repository.is_none()&&reserved.protected_sources.iter().any(|saved|saved==&hosted)));
+        if !foreign {
+            return Err(error(format!("Native startup {id} retains unresolved provider ownership in this project or an uncertain scope. Resolve that exact startup before removing the project; no project sessions were closed.")));
+        }
+    }
+    // Off-host private binding reads may overlap startup reconciliation. Do not
+    // accept a replacement entry or a newly added owner on an old snapshot.
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    if state.native_actor_startups.len()!=pending.len() || pending.iter().any(|(id,(source,context))| {
+        state.native_actor_startups.get(id).is_none_or(|current| {
+            let (current_source,current_context)=current.scope_snapshot();
+            current_source!=*source || !Arc::ptr_eq(&current_context,context)
+        })
+    }) {return Err(error("Native startup custody changed during project inventory. Retry after it settles; no project sessions were closed."));}
+    Ok(())
+}
+
+pub(super) fn require_no_startup_owners(host:&SharedHost,project:&ProjectInstance)->Result<(),ProtocolError> {
+    require_no_startups(host,&prepare(host,project)?)
+}
+
+/// Caller holds short exclusive control admission. No slow teardown occurs here.
+pub(crate) fn reserve(host:&SharedHost,project:&ProjectInstance,selected:&[SessionClose])->Result<Reservation,ProtocolError> {
+    let mut reserved=prepare(host,project)?;
     // Another Git project may own external linked roots absent from this
     // snapshot. In that case only explicit shared membership can authorize
     // teardown; a guessed path prefix must never broaden ownership.
@@ -356,6 +397,7 @@ pub(crate) fn reserve(
     reserved
         .sessions
         .extend(selected.iter().map(|selected| selected.source.id()));
+    require_no_startups(host,&reserved)?;
     // A missing installed actor is not proof that its retained provider died.
     // Fail the entire roster before the first close; leave its saved pane and
     // project reachable for explicit recovery/cleanup. Foreign pending owners
