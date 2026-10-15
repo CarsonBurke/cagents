@@ -17202,6 +17202,12 @@ impl Application for Cagents {
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
+                    let model = if self.inspector_diagnostics_card == Some(card) {
+                        match self.cards.get(&card) {
+                            Some(CardRuntime::Chat(runtime)) => inspector::with_chat_memory(model, runtime.memory_diagnostics()),
+                            _ => model,
+                        }
+                    } else { model };
                     Some(match self.lsp_context(card) {
                         Some(lsp) => inspector::with_lsp(model, card, lsp),
                         None => model,

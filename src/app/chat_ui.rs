@@ -1006,7 +1006,7 @@ struct CachedItem {
     coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
-    /// Measured exposed presentation storage. Opaque iced Markdown/parser
+    /// Approximate exposed presentation storage. Opaque Markdown/parser
     /// allocations and widget/shaping trees are intentionally not estimated.
     fn retained_bytes(&self) -> usize {
         self.source.retained_capacity()
@@ -2366,6 +2366,26 @@ impl Runtime {
     }
     /// Prepare parent grouping metadata and only the currently selected
     /// child's presentation. Hidden children keep no Markdown/highlight cache.
+    pub(super) fn memory_diagnostics(&self) -> crate::inspector::ChatMemory {
+        fn payload(item: &chat::Item) -> usize {
+            match &item.content {
+                ItemContent::Text { text, .. } => text.len(),
+                ItemContent::Command { output, .. } => output.len(),
+                ItemContent::Tool { input, output, .. } => input.len() + output.len(),
+                ItemContent::Changes { changes, .. } => changes.iter().map(|change| change.diff.len()).sum(),
+                ItemContent::Delivery { body, .. } => body.len(),
+                _ => 0,
+            }
+        }
+        crate::inspector::ChatMemory {
+            source_bytes: self.snapshot.items.iter().chain(self.snapshot.subagents.iter().flat_map(|agent| &agent.items))
+                .map(|item| payload(item)).sum(),
+            presentation_bytes: self.cache.values().map(CachedItem::retained_bytes).sum(),
+            selection_bytes: self.selection_document.borrow().as_ref().map_or(0, |(_, catalog)| catalog.retained_plain_bytes()),
+            prepared_items: self.cache.len(),
+        }
+    }
+
     fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
         let mut presentation_changed = false;
         // Each transcript has its own streaming lifecycle: a child can keep
