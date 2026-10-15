@@ -219,6 +219,23 @@ fn an_idle_shell_closes_without_confirmation_from_its_daemon_owner() {
 }
 
 #[test]
+fn an_unsent_fish_command_requires_confirmation_and_a_cleared_line_does_not() {
+    let Some(fish) = installed_fish() else { return };
+    let shell = CloseSafetyShell::shell(&fish);
+    shell.terminal.input(b"echo unfinished-command").unwrap();
+    shell.wait_for_text("unfinished-command");
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    shell.terminal.input(b"\x15").unwrap();
+    shell.wait_for("cleared prompt", || {
+        !shell.screen().contains("unfinished-command")
+    });
+    shell.assert_unconfirmed_close();
+}
+
+#[test]
 fn an_idle_fish_closes_without_confirmation_from_its_daemon_owner() {
     let Some(fish) = installed_fish() else { return };
     CloseSafetyShell::shell(&fish).assert_unconfirmed_close();
