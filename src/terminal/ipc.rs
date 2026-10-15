@@ -798,6 +798,10 @@ pub enum ServerResponse {
         next_offset: Option<u64>,
         omitted: u64,
     },
+    ChatSource {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::SourcePage, crate::chat::cache::SourceError>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

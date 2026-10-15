@@ -683,7 +683,7 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -891,6 +891,10 @@ impl Handle {
             .cloned()
             .ok_or("Retained provider output expired or is unavailable")?;
         lease.read(offset)
+    }
+    /// Read only the ingestion cache, including after the actor exits.
+    pub(crate) fn source_query(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)
     }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {

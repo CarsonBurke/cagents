@@ -2239,6 +2239,9 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
+            if let chat::Command::LoadSource { query } = command {
+                return Ok(ServerResponse::ChatSource { chat_id, result: handle.source_query(query) });
+            }
             if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
                 return Ok(match reply {
                     crate::chat::FileChangeReply::Files(summary) => {
