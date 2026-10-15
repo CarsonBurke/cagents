@@ -624,9 +624,13 @@ pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), Res
     let raw = c_component(name, &directory.path)?;
     // SAFETY: the held directory and C string outlive unlinkat; AT_REMOVEDIR
     // removes only an empty directory entry and never follows a symbolic link.
-    let status = unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
+    let status =
+        unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
     if status < 0 {
-        return Err(ResolveError::io(&directory.path.join(name), &io::Error::last_os_error()));
+        return Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
@@ -773,11 +777,16 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
 /// Reads the content/access attributes of one held file for a coherent
 /// metadata comparison. A caller must compare descriptor metadata before and
 /// after capture; a disappearing listed attribute is a concurrent change.
-pub fn content_attributes(file: &File) -> io::Result<std::collections::BTreeMap<OsString, Vec<u8>>> {
+pub fn content_attributes(
+    file: &File,
+) -> io::Result<std::collections::BTreeMap<OsString, Vec<u8>>> {
     let mut attributes = std::collections::BTreeMap::new();
     for name in attribute_names(file)? {
-        if !is_content_attribute(&name) { continue; }
-        let value = read_attribute(file, &name)?.ok_or_else(|| io::Error::other("file attributes changed while they were read"))?;
+        if !is_content_attribute(&name) {
+            continue;
+        }
+        let value = read_attribute(file, &name)?
+            .ok_or_else(|| io::Error::other("file attributes changed while they were read"))?;
         attributes.insert(OsString::from_vec(name.to_bytes().to_vec()), value);
     }
     Ok(attributes)

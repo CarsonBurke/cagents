@@ -287,8 +287,17 @@ impl History {
     /// Expected and resulting existence for the next replay. The caller must
     /// install the result only after replay answers Applied.
     pub fn replay_presence(&self, redo: bool) -> Option<(bool, bool)> {
-        let presence = if redo { self.redo.last() } else { self.undo.back() }?.presence?;
-        Some(if redo { presence } else { (presence.1, presence.0) })
+        let presence = if redo {
+            self.redo.last()
+        } else {
+            self.undo.back()
+        }?
+        .presence?;
+        Some(if redo {
+            presence
+        } else {
+            (presence.1, presence.0)
+        })
     }
 
     /// Reverts the newest step and restores the caret it started from.
@@ -860,7 +869,13 @@ mod tests {
         let now = Instant::now();
         let mut history = History::default();
         let mut model = Model::new("");
-        history.record_group_with_presence(vec![], model.cursor, model.cursor, now, Some((true, false)));
+        history.record_group_with_presence(
+            vec![],
+            model.cursor,
+            model.cursor,
+            now,
+            Some((true, false)),
+        );
         assert_eq!(history.replay_presence(false), Some((false, true)));
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert!(model.text.is_empty());

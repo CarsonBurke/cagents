@@ -74,12 +74,20 @@ impl Cagents {
             }
         };
         if let Some(revision) = buffer_revision {
-            let Some(present) = patch.working_present else { return Task::none(); };
+            let Some(present) = patch.working_present else {
+                return Task::none();
+            };
             let change = patch.buffer_change.take();
             let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&identity.card) else {
                 return Task::none();
             };
-            if let Err(error) = runtime.apply_diff_buffer_revert_with_presence(&identity, revision, change, present, patch.working_mode) {
+            if let Err(error) = runtime.apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision,
+                change,
+                present,
+                patch.working_mode,
+            ) {
                 self.status = Some(TransientNotice::warning(error));
                 return Task::none();
             }
