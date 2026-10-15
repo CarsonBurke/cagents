@@ -1748,32 +1748,8 @@ impl Runtime {
         {
             transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
-        if let Some((_, name)) = &self.pending_account_switch {
-            content.push(
-                widget::row::with_children(vec![
-                    design::caption(if transitioning {
-                        format!("Switching to {name}…")
-                    } else {
-                        format!("Switches to {name} after this turn")
-                    })
-                    .into(),
-                    crate::ui_controls::button::quiet("Cancel switch")
-                        .on_press_maybe(
-                            (!transitioning).then_some(action(Action::CancelAccountSwitch(target))),
-                        )
-                        .into(),
-                ])
-                .spacing(space::S)
-                .into(),
-            );
-        } else if !transitioning && let Some((id, name)) = &self.account_switch_fallback {
-            content.push(
-                crate::ui_controls::button::secondary(format!(
-                    "Continue on {name} as a new conversation (cache lost)"
-                ))
-                .on_press(action(Action::ContinueOnAccount(target, id.clone())))
-                .into(),
-            );
+        if let Some(control)=self.account_switch_controls(transitioning) {
+            content.push(control);
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -2852,6 +2828,41 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
         )
+    }
+
+    /// Account transition controls share the exact rendered/action surface.
+    /// A separate new conversation can coexist with any original actor work.
+    pub(super) fn account_switch_controls(&self, transitioning: bool) -> Option<Element<'_, Message>> {
+        let target=self.target;
+        if let Some((_, name)) = &self.pending_account_switch {
+            Some(
+                widget::row::with_children(vec![
+                    design::caption(if transitioning {
+                        format!("Switching to {name}…")
+                    } else {
+                        format!("Switches to {name} after this turn")
+                    })
+                    .into(),
+                    crate::ui_controls::button::quiet("Cancel switch")
+                        .on_press_maybe(
+                            (!transitioning).then_some(action(Action::CancelAccountSwitch(target))),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            )
+        } else if !transitioning && let Some((id, name)) = &self.account_switch_fallback {
+            Some(
+                crate::ui_controls::button::secondary(format!(
+                    "Continue on {name} as a new conversation (cache lost)"
+                ))
+                .on_press(action(Action::ContinueOnAccount(target, id.clone())))
+                .into(),
+            )
+        } else {
+            None
+        }
     }
 
     fn composer_actions(&self, available: bool) -> Element<'_, Message> {

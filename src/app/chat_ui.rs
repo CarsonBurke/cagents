@@ -4299,11 +4299,11 @@ impl Cagents {
             .as_ref()
             .map(|(account, _)| account)
             != Some(&id)
-            || runtime.snapshot.busy
-            || runtime.pending.is_some()
         {
             return Task::none();
         }
+        // This creates an independent conversation. Ongoing source work and
+        // unconfirmed commands keep their exact original owner and may continue.
         let mut excerpt = Vec::new();
         let mut bytes = 0;
         for item in runtime.snapshot.items.iter().rev() {
@@ -12369,7 +12369,43 @@ mod tests {
             assert!(!app.chat_ui.removed_accounts.contains(&card));
             assert!(!app.chat_start_pending(card));
             assert!(app.chat_ui.retiring.is_empty(),"a pre-effect refusal never schedules provider retirement");
-            drop(app.continue_on_account(target,alternate));
+            if busy {
+                let mut current=handle.snapshot().as_ref().clone();
+                current.busy=true;
+                handle.publish_snapshot_for_test(current);
+                let runtime=app.chat_runtime_mut(target).unwrap();
+                Arc::make_mut(&mut runtime.snapshot).busy=true;
+                runtime.pending=Some(PendingCommand {
+                    followup:false,take_back:None,id:1,draft_revision:None,request:None,
+                    first_prompt:None,model:None,sent:None,page:None,queued:None,
+                });
+            }
+            // Click the actual enabled control, then dispatch its normal app
+            // action while the original may have started another turn/control.
+            let messages={
+                use iced::advanced::{Layout,Shell,clipboard,layout,widget::Tree};
+                let renderer=crate::app::tests::headless_renderer();
+                let mut element=chat_runtime(&app,card).account_switch_controls(false).unwrap();
+                let mut tree=Tree::new(element.as_widget());
+                let viewport=iced::Rectangle::with_size(iced::Size::new(1000.0,200.0));
+                let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,viewport.size()));
+                let point=Layout::new(&node).bounds().center();
+                let mut messages=Vec::new();
+                for event in [
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+                ] {
+                    element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),
+                        iced::mouse::Cursor::Available(point),&renderer,&mut clipboard::Null,
+                        &mut Shell::new(&mut messages),&viewport);
+                }
+                messages
+            };
+            let continuation=messages.into_iter().find_map(|message|match message {
+                Message::ChatUi(Action::ContinueOnAccount(actual,id)) if actual==target && id==alternate =>Some(Action::ContinueOnAccount(actual,id)),
+                _=>None,
+            }).expect("the rendered fallback must emit an actionable continuation even while source work is pending");
+            drop(app.handle_chat_ui(continuation));
             let new_card=app.workspace.focused().unwrap();
             assert_ne!(new_card,card);
             assert_ne!(chat_runtime(&app,new_card).session.id,source.id);
@@ -12377,6 +12413,8 @@ mod tests {
             assert!(chat_runtime(&app,new_card).composer.text().contains("provider cache is unavailable"));
             assert_eq!(chat_runtime(&app,card).session,source);
             assert!(Arc::ptr_eq(chat_runtime(&app,card).handle().unwrap(),&handle));
+            assert_eq!(chat_runtime(&app,card).pending.is_some(),busy);
+            assert_eq!(chat_runtime(&app,card).snapshot.busy,busy);
         }
     }
 
