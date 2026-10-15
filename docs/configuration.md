@@ -208,7 +208,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `default_channel_pane` | string | `"native_chat"` | `"native_chat"` or `"terminal"`; the first pane in an empty channel. |
 | `diff_hide_unchanged` | boolean | `true` | Hide unchanged lines in diff views. |
 | `chat_expand_tool_groups` | boolean | `false` | Start chat tool groups expanded. |
-| `chat_content_fraction` | float | `0.5` | Fraction of pane width used for chat content. |
+| `chat_content_fraction` | float | `0.5` | Legacy preference retained for compatibility; chat uses an automatic centered reading column. |
 | `default_native_pane_fraction` | float | `0.5` | Initial width fraction of native chat and utility panes. |
 | `usage_preview_rows` | table | `{}` | Provider keys map to usage rows; an empty list hides that provider’s preview rows. |
 | `show_worktree_changes_icons` | boolean | `true` | Show dirty-worktree badges in Projects. |

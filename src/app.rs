@@ -2157,6 +2157,7 @@ struct SettingsSave {
     generation: u64,
     path: PathBuf,
     base: AppSettings,
+    base_observed_at: Option<Instant>,
     desired: AppSettings,
     view: WindowView,
     store: Option<Arc<crate::persistence::StateStore>>,
@@ -2213,9 +2214,15 @@ impl SettingsSave {
                 (Some(backup), settings::load_live_observed(&self.path))
             }
         } else {
+            // A captured edit may predate the previous queued write, but a
+            // newer observed baseline already incorporates it. Reusing the old
+            // desired snapshot in that case would turn external values into edits.
             let base = lane
                 .as_ref()
-                .filter(|saved| !saved.undo)
+                .filter(|saved| {
+                    !saved.undo
+                        && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
+                })
                 .map_or(&self.base, |saved| &saved.desired);
             let saved = settings::save_merged_observed(&self.path, base, &self.desired)
                 .map_err(|error| error.to_string())?;
@@ -2924,6 +2931,10 @@ impl SettingsField {
     const PREFERENCES: &[Self] = &[
         Self::AppTheme,
         Self::UiScale,
+        Self::InterfaceFontFamily,
+        Self::InterfaceFontSize,
+        Self::ChatFontFamily,
+        Self::ChatFontSize,
         Self::TerminalLineHeight,
         Self::TerminalPadding,
         Self::TerminalScrollSize,
@@ -3620,6 +3631,10 @@ impl SettingsDraft {
                 .set(field, previous.notifications.get(field)),
             SettingsField::AppTheme => self.app_theme = previous.app_theme.clone(),
             SettingsField::UiScale => self.ui_scale = previous.ui_scale.clone(),
+            SettingsField::InterfaceFontFamily => self.interface_font_family = previous.interface_font_family.clone(),
+            SettingsField::InterfaceFontSize => self.interface_font_size = previous.interface_font_size.clone(),
+            SettingsField::ChatFontFamily => self.chat_font_family = previous.chat_font_family.clone(),
+            SettingsField::ChatFontSize => self.chat_font_size = previous.chat_font_size.clone(),
             SettingsField::TerminalLineHeight => {
                 self.terminal_line_height = previous.terminal_line_height.clone()
             }
@@ -3866,6 +3881,11 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.review_previous_change =
                     previous.keyboard_shortcuts.review_previous_change.clone()
             }
+        }
+        if let Some(raw) = previous.numeric_display.get(&field) {
+            self.numeric_display.insert(field, raw.clone());
+        } else {
+            self.numeric_display.remove(&field);
         }
     }
 }
@@ -12756,6 +12776,7 @@ impl Cagents {
             generation: self.settings_save_generation,
             path,
             base: self.settings_base.clone(),
+            base_observed_at: self.settings_observed_at,
             desired: self.settings.clone(),
             view,
             store: self.session.as_ref().map(SessionRuntime::operation_store),
@@ -13368,6 +13389,10 @@ impl Cagents {
                 };
                 self.settings_base = loaded;
                 let previous = std::mem::replace(&mut self.settings, next);
+                let before_retry = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let retry_changed = before_retry != self.settings;
+                self.refresh_settings_feedback();
                 // An acknowledgement/own-file notification with identical values
                 // must not normalize the spelling the user is still editing.
                 if previous != self.settings {
@@ -13382,7 +13407,12 @@ impl Cagents {
                     }
                     self.settings_draft = draft;
                 }
-                self.synchronize_settings(&previous)
+                let save = if retry_changed {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
+                Task::batch([save, self.synchronize_settings(&previous)])
             }
         }
     }
@@ -20422,6 +20452,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_save_after_external_reload_keeps_later_external_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 16.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings.terminal_font_size, 16.0);
+
+        // A later write has not reached this window's watcher yet. The adopted
+        // 16-point baseline is not a local edit against the old 14-point save.
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        app.settings.show_status_bar = !external.show_status_bar;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(saved.settings.terminal_font_size, 18.0);
+        assert_eq!(saved.settings.show_status_bar, app.settings.show_status_bar);
+        drop(app.acknowledge_settings_save(saved));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert_eq!(settings::load_live(&path).unwrap(), app.settings);
+    }
+
+    #[test]
     fn settings_save_ack_applies_merged_values_and_retains_later_local_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -20777,6 +20837,64 @@ mod tests {
         assert!(app.settings_invalid.is_empty());
         assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
         assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
+    fn settings_external_shortcut_release_retries_and_persists_refused_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        let mut external = settings::load_live(&path).unwrap();
+        external.keyboard_shortcuts.command_palette.clear();
+        settings::save(&path, &external).unwrap();
+        let reload = app.reload_settings(settings::load_live_observed(&path));
+        settle_settings_task(&mut app, reload);
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert_eq!(settings::load_live(&path).unwrap().keyboard_shortcuts,
+            app.settings.keyboard_shortcuts);
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
+    fn settings_reload_preserves_only_unfinished_font_values_and_display() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let field = SettingsField::InterfaceFontSize;
+        app.settings_draft.interface_font_size = "20".into();
+        app.settings_draft.numeric_display.insert(field, "20.00".into());
+        app.settings_pending.insert(field, (1, "20".into()));
+        app.settings_draft.chat_font_family = "pending family".into();
+        app.settings_invalid.insert(SettingsField::ChatFontFamily, "test refusal".into());
+        let mut external = settings::load_live(&path).unwrap();
+        external.chat_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings_draft.interface_font_size, "20");
+        assert_eq!(app.settings_draft.numeric_display.get(&field).unwrap(), "20.00");
+        assert_eq!(app.settings_draft.chat_font_family, "pending family");
+        assert_eq!(app.settings_draft.chat_font_size, "18");
+        assert_eq!(app.settings.chat_font_size, 18.0);
+        for (field, key) in [
+            (SettingsField::InterfaceFontFamily, "interface_font_family"),
+            (SettingsField::InterfaceFontSize, "interface_font_size"),
+            (SettingsField::ChatFontFamily, "chat_font_family"),
+            (SettingsField::ChatFontSize, "chat_font_size"),
+        ] {
+            assert!(SettingsField::PREFERENCES.contains(&field));
+            assert_eq!(field.config_key(), key);
+        }
     }
 
     #[test]

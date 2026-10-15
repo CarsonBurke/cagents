@@ -1514,7 +1514,7 @@ fn shortcut_input<'a>(
     let mut children = vec![row.into()];
     if let Some(reason) = &error { children.push(design::caption(reason.clone()).class(cosmic::theme::Text::Custom(design::destructive_text)).into()); }
     let conflict = if error.is_some() { "conflicts unsaved" } else { "" };
-    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts {source} {conflict}"))
+    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(field.config_key()).keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts {source} {conflict}"))
 }
 
 #[cfg(test)]
@@ -1602,6 +1602,7 @@ mod search_tests {
             reload_error: None,
             can_undo: false,
             invalid: &invalid,
+            fonts: &app.settings_font_choices,
             accounts: vec![],
             updates: app.update_summary(),
             testing_notification: false,
@@ -1611,6 +1612,7 @@ mod search_tests {
             (SettingsCategory::General, "hover"),
             (SettingsCategory::Terminal, "dracula"),
             (SettingsCategory::Keyboard, "ctrl+t"),
+            (SettingsCategory::Keyboard, "keyboard_shortcuts.toggle_projects"),
         ] {
             let result = settings_category_controls(category, &app.settings_draft, &context)
                 .into_iter()
