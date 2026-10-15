@@ -1024,8 +1024,14 @@ impl SidebarWorktree {
     }
 
     fn status_description(&self) -> String {
-        let mut status = status_summary(self.detached, self.locked, self.dirty.as_ref(),
-            self.untracked_omitted, self.ahead, self.behind);
+        let mut status = status_summary(
+            self.detached,
+            self.locked,
+            self.dirty.as_ref(),
+            self.untracked_omitted,
+            self.ahead,
+            self.behind,
+        );
         if let Some(operation) = self.operation {
             status.push_str(&format!(", {} in progress", operation.label()));
         }
@@ -6633,7 +6639,9 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
-    if worktree.status_error.is_some() { return Icon::Warning; }
+    if worktree.status_error.is_some() {
+        return Icon::Warning;
+    }
     if worktree
         .dirty
         .as_ref()
@@ -6653,7 +6661,9 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
-    if worktree.status_error.is_some() { return BadgeTone::Warning; }
+    if worktree.status_error.is_some() {
+        return BadgeTone::Warning;
+    }
     if worktree
         .dirty
         .as_ref()
@@ -12176,17 +12186,41 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_status_marks_cached_clean_as_last_known_and_identical_success_clears_it() {
-        let mut row = SidebarWorktree::new(WorktreeId::new(), "/repo".into(), Some("main".into()),
-            false, false, Some(DirtyState::default()), None, None);
+        let mut row = SidebarWorktree::new(
+            WorktreeId::new(),
+            "/repo".into(),
+            Some("main".into()),
+            false,
+            false,
+            Some(DirtyState::default()),
+            None,
+            None,
+        );
         row.apply_status_error(Some("index unavailable"));
         assert!(matches!(worktree_change_icon(&row), Icon::Warning));
         assert!(matches!(worktree_change_tone(&row), BadgeTone::Warning));
-        assert!(row.chrome.dirty_badge.as_deref().unwrap().contains("Git status unavailable"));
+        assert!(
+            row.chrome
+                .dirty_badge
+                .as_deref()
+                .unwrap()
+                .contains("Git status unavailable")
+        );
         assert!(row.chrome.tooltip.contains("Last known: No changes"));
-        assert!(row.chrome.accessible_name.contains("Git status unavailable"));
-        assert!(row.status_description().contains("index unavailable"), "compact hover uses the same availability");
+        assert!(
+            row.chrome
+                .accessible_name
+                .contains("Git status unavailable")
+        );
+        assert!(
+            row.status_description().contains("index unavailable"),
+            "compact hover uses the same availability"
+        );
         row.apply_status(&StatusSnapshot::default());
-        assert!(row.status_error.is_none(), "even an identical successful clean read clears error provenance");
+        assert!(
+            row.status_error.is_none(),
+            "even an identical successful clean read clears error provenance"
+        );
         assert!(row.chrome.dirty_badge.is_none());
         assert!(!row.chrome.tooltip.contains("Git status unavailable"));
         assert!(row.chrome.tooltip.contains("No changes"));
@@ -12195,11 +12229,20 @@ pub(crate) mod tests {
         full.dirty.untracked = 12;
         row.apply_status(&full);
         row.apply_status_error(Some("full refresh failed"));
-        let mut tracked = StatusSnapshot { untracked_omitted: true, ..StatusSnapshot::default() };
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
         tracked.dirty.unstaged = 1;
         row.apply_status(&tracked);
-        assert!(row.status_error.is_none(), "the tracked status read itself succeeded");
-        assert!(row.untracked_omitted, "failed refresh invalidates authority to reuse the old complete untracked count");
+        assert!(
+            row.status_error.is_none(),
+            "the tracked status read itself succeeded"
+        );
+        assert!(
+            row.untracked_omitted,
+            "failed refresh invalidates authority to reuse the old complete untracked count"
+        );
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
         assert!(row.chrome.tooltip.contains("1 tracked changes"));
         row.apply_status(&full);

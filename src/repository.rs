@@ -849,8 +849,14 @@ impl SnapshotCache {
     /// Tiny display facts proven by the last successful cached read, including
     /// an unchanged read. Never use this projection as mutation authority.
     pub fn row_status(&self) -> Option<(&StatusSnapshot, Option<GitOperationKind>)> {
-        self.last_status.as_ref().map(|status| (status,
-            self.control_metadata.as_ref().and_then(|control| control.operation.as_ref().map(|operation| operation.kind))))
+        self.last_status.as_ref().map(|status| {
+            (
+                status,
+                self.control_metadata
+                    .as_ref()
+                    .and_then(|control| control.operation.as_ref().map(|operation| operation.kind)),
+            )
+        })
     }
 
     /// Ignored-folder expansion is independent of porcelain status. Observe
@@ -912,8 +918,13 @@ impl StatusSnapshot {
     /// Display counts and identity without cloning the changed-path listing.
     /// This cached projection is never sufficient for a mutation safety check.
     pub fn display_summary(&self) -> Self {
-        Self { untracked_omitted: self.untracked_omitted, head: self.head.clone(),
-            tracking: self.tracking.clone(), dirty: self.dirty.clone(), entries: Vec::new() }
+        Self {
+            untracked_omitted: self.untracked_omitted,
+            head: self.head.clone(),
+            tracking: self.tracking.clone(),
+            dirty: self.dirty.clone(),
+            entries: Vec::new(),
+        }
     }
 
     /// Entries in one area, in Git's reporting order.

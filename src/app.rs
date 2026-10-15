@@ -11280,16 +11280,25 @@ impl Cagents {
                     cache.invalidate(invalidation & 2 != 0);
                 }
                 let status_read = git_ui::next_status_read();
-                let snapshot = service.snapshot_cached(&worktree, options, &cancellation, &mut cache)
+                let snapshot = service
+                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
                     .map_err(|error| error.to_string())?;
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
                     return Err("source-control read cancelled".to_owned());
                 }
-                let (status, operation) = cache.row_status()
-                    .ok_or_else(|| "successful source-control read did not expose display status".to_owned())?;
-                let mut read = SourceControlRead { prepared: None, status: status.clone(), operation, read: status_read };
-                let Some(mut snapshot) = snapshot else { return Ok(read); };
+                let (status, operation) = cache.row_status().ok_or_else(|| {
+                    "successful source-control read did not expose display status".to_owned()
+                })?;
+                let mut read = SourceControlRead {
+                    prepared: None,
+                    status: status.clone(),
+                    operation,
+                    read: status_read,
+                };
+                let Some(mut snapshot) = snapshot else {
+                    return Ok(read);
+                };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -13943,7 +13952,8 @@ impl Application for Cagents {
                             let selecting = self.project_ui.select_on_load.as_ref()
                                 == Some(&loaded.project.repository);
                             let activation = if selecting {
-                                self.sidebar_model.project(existing_id)
+                                self.sidebar_model
+                                    .project(existing_id)
                                     .and_then(|project| self.project_activation_worktree(project))
                             } else {
                                 None
@@ -13951,7 +13961,11 @@ impl Application for Cagents {
                             if activation.is_some() {
                                 self.project_ui.select_on_load = None;
                             }
-                            let worktree = if selecting { activation } else { Some(worktree) };
+                            let worktree = if selecting {
+                                activation
+                            } else {
+                                Some(worktree)
+                            };
                             let task = if (selecting || open_cards)
                                 && let Some(worktree) = worktree
                                 && !self.refuse_in_deleting_worktree(&worktree)
@@ -14152,7 +14166,9 @@ impl Application for Cagents {
                             // Model observation and activation are independent
                             // subscriptions. Even before checkout metadata
                             // arrives, select only a navigable current row.
-                            let activation = self.sidebar_model.project(project_id)
+                            let activation = self
+                                .sidebar_model
+                                .project(project_id)
                                 .and_then(|project| self.project_activation_worktree(project));
                             if let Some(path) = activation {
                                 self.project_ui.select_on_load = None;
@@ -16769,21 +16785,37 @@ impl Application for Cagents {
                 // generation. Watcher scalar updates do not restart it under
                 // continuous writes; only row/cache facts use the shared order.
                 if let Ok(read) = &result
-                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.read)
-                    && let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                    && self.refresh_ui.git.accept_bound_status(
+                        &key,
+                        &read.status,
+                        read.operation,
+                        read.read,
+                    )
+                    && let Some(worktree) = self
+                        .sidebar_model
+                        .projects
+                        .iter_mut()
                         .find(|project| project.id == key.project_id)
-                        .and_then(|project| project.worktrees.iter_mut().find(|worktree| worktree.id == key.worktree_id))
+                        .and_then(|project| {
+                            project
+                                .worktrees
+                                .iter_mut()
+                                .find(|worktree| worktree.id == key.worktree_id)
+                        })
                 {
                     worktree.apply_status(&read.status);
                     worktree.apply_operation(read.operation);
                 }
                 if matches!(&result, Ok(read) if read.prepared.is_none()) {
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() { source.set_reloading(false); }
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
                     return Task::none();
                 }
                 let (snapshot, mut next) = match result {
                     Ok(read) => {
-                        let (snapshot, model) = *read.prepared.expect("unchanged reads returned above");
+                        let (snapshot, model) =
+                            *read.prepared.expect("unchanged reads returned above");
                         (Some(snapshot), model)
                     }
                     Err(error) => (None, SourceControlModel::failed(key, error)),
