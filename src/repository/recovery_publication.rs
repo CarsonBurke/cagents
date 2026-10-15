@@ -2,7 +2,10 @@
 //!
 //! The protected internal namespace contract belongs to DirectoryPublication.
 //! Pathname acquisition does not exclude writes through an already-open FD
-//! after the final content fence. Unknown entries are retained, never removed
+//! after the final content fence. The protected internal-name assumption lasts
+//! for the complete transaction/retry lifetime of the original held directory;
+//! its public directory entry, ancestors and reconstructed lookalikes are NOT
+//! trusted. Unknown entries are retained, never removed
 //! using a diagnostic spelling or a guessed Git temporary filename.
 use super::*;
 use crate::recovery_authority::RecoverySlot;
@@ -104,9 +107,29 @@ fn digest_file(file: &fs::File, length: u64, cancellation: &CancellationToken) -
     Ok(hash.finalize().into())
 }
 
+#[cfg(target_os = "linux")]
+fn pin_symlink(root: &fs_safety::Root, name: &Path) -> Result<fs::File, String> {
+    use std::os::fd::FromRawFd;
+    if name.components().count() != 1 || name.file_name() != Some(name.as_os_str()) {
+        return Err("Undo metadata pin requires one private leaf".into());
+    }
+    let name = std::ffi::CString::new(name.as_os_str().as_bytes()).map_err(|error|error.to_string())?;
+    // SAFETY: the Root owns its directory FD, the component has no NUL/slash,
+    // and the returned FD has exactly one File owner with CLOEXEC preserved.
+    let descriptor = unsafe { libc::openat(root.descriptor(), name.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if descriptor < 0 { return Err(io::Error::last_os_error().to_string()); }
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+#[cfg(not(target_os = "linux"))]
+fn pin_symlink(_root: &fs_safety::Root, _name: &Path) -> Result<fs::File, String> {
+    Err("Strong Undo publication requires Linux retained metadata handles".into())
+}
+
 struct Proof {
     metadata: fs::Metadata,
     file: Option<Arc<fs::File>>,
+    // O_PATH pins symlink identity too; naked dev/ino cannot survive unlink/ABA.
+    identity_pin: Arc<fs::File>,
     digest: Option<[u8;32]>,
     target: Option<PathBuf>,
 }
@@ -114,25 +137,52 @@ struct Proof {
 impl Proof {
     fn capture(holding: &mut Holding, name: &Path, cancellation: &CancellationToken) -> Result<Self, String> {
         let metadata = fs_safety::metadata_beneath(&holding.root, name).map_err(|error|error.to_string())?;
-        let (file, digest, target) = if metadata.is_file() {
+        let (file, digest, target, identity_pin) = if metadata.is_file() {
             let file = holding.open(name)?;
             if full_version(&metadata) != full_version(&file.metadata().map_err(|error|error.to_string())?) {
                 return Err("Undo entry changed while being opened".into());
             }
             let digest = digest_file(&file, metadata.len(), cancellation)?;
-            (Some(file), Some(digest), None)
+            (Some(file.clone()), Some(digest), None, file)
         } else if metadata.file_type().is_symlink() {
+            let pin = Arc::new(pin_symlink(&holding.root, name)?);
+            holding.files.push(pin.clone());
+            if full_version(&pin.metadata().map_err(|error|error.to_string())?) != full_version(&metadata) {
+                return Err("Undo symlink changed while being pinned".into());
+            }
             let target = fs_safety::read_link_beneath(&holding.root, name).map_err(|error|error.to_string())?;
-            (None, None, Some(target))
+            (None, None, Some(target), pin)
         } else { return Err("Undo entry is not a regular file or symlink".into()); };
-        let proof = Self { metadata, file, digest, target };
+        let proof = Self { metadata, file, identity_pin, digest, target };
+        proof.verify(holding, name, cancellation)?;
+        Ok(proof)
+    }
+
+    fn after_blob_mode_change(
+        holding: &Holding, name: &Path, file: Arc<fs::File>, authenticated: fs::Metadata,
+        digest: [u8;32], mode: u32, cancellation: &CancellationToken,
+        after_mode: impl FnOnce(&Arc<fs::File>) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        file.set_permissions(fs::Permissions::from_mode(mode)).map_err(|error|error.to_string())?;
+        file.sync_all().map_err(|error|error.to_string())?;
+        after_mode(&file)?;
+        let metadata = file.metadata().map_err(|error|error.to_string())?;
+        if (metadata.dev(),metadata.ino(),metadata.len(),metadata.uid(),metadata.gid(),metadata.mtime(),metadata.mtime_nsec())
+            != (authenticated.dev(),authenticated.ino(),authenticated.len(),authenticated.uid(),authenticated.gid(),authenticated.mtime(),authenticated.mtime_nsec())
+            || metadata.mode() & 0o7777 != mode & 0o7777
+        { return Err("Recovery blob changed during permission restoration".into()); }
+        // chmod changes ctime. Normalize only that known metadata transition;
+        // the original expected-object digest is NEVER replaced by fresh data.
+        let proof = Self { metadata, file: Some(file.clone()), identity_pin: file, digest: Some(digest), target: None };
         proof.verify(holding, name, cancellation)?;
         Ok(proof)
     }
 
     fn same_identity(&self, holding: &Holding, name: &Path) -> Result<(), String> {
         let named = fs_safety::metadata_beneath(&holding.root, name).map_err(|error|error.to_string())?;
-        if (named.dev(), named.ino(), named.file_type()) != (self.metadata.dev(), self.metadata.ino(), self.metadata.file_type()) {
+        let pinned = self.identity_pin.metadata().map_err(|error|error.to_string())?;
+        if (named.dev(), named.ino(), named.file_type()) != (self.metadata.dev(), self.metadata.ino(), self.metadata.file_type())
+            || (pinned.dev(), pinned.ino(), pinned.file_type()) != (self.metadata.dev(), self.metadata.ino(), self.metadata.file_type()) {
             return Err("The acquired Undo entry was replaced; its replacement was retained".into());
         }
         Ok(())
@@ -180,6 +230,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 let generated = PathBuf::from("restored-symlink");
                 fs_safety::symlink_within(&holding.root, target, generated.as_os_str()).map_err(|error|error.to_string())?;
                 let proof = Proof::capture(holding, &generated, cancellation)?;
+                if proof.target.as_ref() != Some(target) { return Err("The restored symlink no longer matches the saved target".into()); }
                 Some((generated, proof))
             }
             SavedEntry::Blob { oid, mode, bytes } => {
@@ -192,17 +243,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 let file = holding.open(generated.as_path())?;
                 let before = file.metadata().map_err(|error|error.to_string())?;
                 if !before.is_file() || before.len() != *bytes { return Err("Recovery blob has an unexpected type or size".into()); }
+                let digest = digest_file(&file, before.len(), cancellation)?;
                 let actual = self.hash_recovery_object(source, &holding.publication, &file, cancellation).map_err(|error|error.to_string())?;
                 if actual != *oid || full_version(&before) != full_version(&file.metadata().map_err(|error|error.to_string())?) {
                     return Err("Recovery blob does not match its saved object; the unknown entry was preserved".into());
                 }
                 let named = fs_safety::metadata_beneath(&holding.root, generated.as_path()).map_err(|error|error.to_string())?;
                 if full_version(&named) != full_version(&before) { return Err("Recovery temporary name changed; it was preserved".into()); }
-                file.set_permissions(fs::Permissions::from_mode(*mode)).map_err(|error|error.to_string())?;
-                if file.metadata().map_err(|error|error.to_string())?.mode() & 0o7777 != *mode & 0o7777 { return Err("Recovery file permissions could not be restored exactly".into()); }
-                file.sync_all().map_err(|error|error.to_string())?;
                 let generated = generated.as_path().to_owned();
-                let proof = Proof::capture(holding, &generated, cancellation)?;
+                let proof = Proof::after_blob_mode_change(holding, &generated, file, before, digest, *mode, cancellation, |_| Ok(()))?;
                 Some((generated, proof))
             }
             SavedEntry::Trashed => return Err("The Trash receipt is missing".into()),
@@ -275,5 +324,81 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             fs_safety::sync_directory(&holding.parent).map_err(|error|error.to_string())
         })();
         Ok(cleanup.err().map(|error| format!("Undo was applied, but cleanup or durability is unconfirmed: {error}")))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, DiscardRecovery, Holding) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            directories: BTreeMap::new(), entries: vec![], expires_unix_ms: u64::MAX,
+        };
+        let holding = Holding::create(&root, &recovery).unwrap();
+        (directory, recovery, holding)
+    }
+
+    #[test]
+    fn undo_blob_authenticated_proof_refuses_existing_fd_write_during_own_chmod_window() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("generated");
+        fs::write(holding.root.path().join(path), b"work").unwrap();
+        let file = holding.open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let modified = metadata.modified().unwrap();
+        let digest = digest_file(&file, metadata.len(), &CancellationToken::new()).unwrap();
+        // This writer already owns its FD before the permission transition;
+        // private namespace trust does not exclude its subsequent content write.
+        let writer = fs::OpenOptions::new().write(true).open(holding.root.path().join(path)).unwrap();
+        let result = Proof::after_blob_mode_change(&holding, path, file, metadata, digest, 0o640,
+            &CancellationToken::new(), |_| {
+                assert_eq!(writer.write_at(b"EVIL", 0).unwrap(), 4);
+                writer.set_times(fs::FileTimes::new().set_modified(modified)).map_err(|error|error.to_string())
+            });
+        assert!(result.is_err(), "the original authenticated digest must survive our own ctime change");
+        assert_eq!(fs::read(holding.root.path().join(path)).unwrap(), b"EVIL");
+    }
+
+    #[test]
+    fn undo_blob_authenticated_proof_never_adopts_a_fresh_named_replacement() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("generated");
+        fs::write(holding.root.path().join(path), b"work").unwrap();
+        let file = holding.open(path).unwrap();
+        let original = file.clone();
+        let metadata = file.metadata().unwrap();
+        let digest = digest_file(&file, metadata.len(), &CancellationToken::new()).unwrap();
+        let result = Proof::after_blob_mode_change(&holding, path, file, metadata, digest, 0o640,
+            &CancellationToken::new(), |_| {
+                fs::rename(holding.root.path().join(path), holding.root.path().join("original")).unwrap();
+                fs::write(holding.root.path().join(path), b"EVIL").map_err(|error|error.to_string())
+            });
+        assert!(result.is_err());
+        let mut bytes = [0;4]; original.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"work");
+        assert_eq!(fs::read(holding.root.path().join(path)).unwrap(), b"EVIL");
+    }
+
+    #[test]
+    fn undo_symlink_proof_pins_unlinked_metadata_instead_of_naked_inode_numbers() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("link");
+        fs_safety::symlink_within(&holding.root, Path::new("saved-target"), path.as_os_str()).unwrap();
+        let proof = Proof::capture(&mut holding, path, &CancellationToken::new()).unwrap();
+        assert!(proof.identity_pin.metadata().unwrap().file_type().is_symlink());
+        fs_safety::unlink_within(&holding.root, path.as_os_str()).unwrap();
+        let unlinked = proof.identity_pin.metadata().unwrap();
+        assert_eq!(unlinked.nlink(), 0);
+        assert_eq!((unlinked.dev(),unlinked.ino()), (proof.metadata.dev(),proof.metadata.ino()));
+        fs_safety::symlink_within(&holding.root, Path::new("foreign-target"), path.as_os_str()).unwrap();
+        assert!(proof.same_identity(&holding, path).is_err());
+        assert_eq!(fs_safety::read_link_beneath(&holding.root, path).unwrap(), Path::new("foreign-target"));
     }
 }
