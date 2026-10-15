@@ -2766,6 +2766,15 @@ impl Runtime {
         self.presentation_evicted = true;
     }
 
+    /// Explicit account/history deletion invalidates both the visible reader
+    /// and its private offline fallback. Ordinary archive/move never calls it.
+    pub(super) fn revoke_local_history(&mut self) {
+        if let Some(handle) = self.handle() { handle.revoke_local_history(); }
+        self.release_transcript_presentation();
+        self.history = Vec::new();
+        self.history_cursor = None;
+    }
+
     /// Evict disposable body/presentation owners while keeping the small
     /// interaction state needed by either a live or archived rehydration.
     pub(super) fn release_transcript_presentation(&mut self) {
@@ -12775,6 +12784,49 @@ mod tests {
     }
 
     #[test]
+    fn parked_hidden_eof_reveal_restores_cached_history_without_losing_draft_or_scroll() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        show_chat_snapshot_for_test(&mut app, card, Snapshot {
+            generation: 19, session_id: Some(KNOWN_THREAD.into()), ready: true,
+            items: vec![Arc::new(chat::Item { id: "parked-body".into(), role: chat::Role::Assistant,
+                content: text("History from before the connection ended"), started_at: None, at: None })],
+            ..Default::default()
+        });
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("Unsent while parked"));
+        runtime.scroll = view::Scroll::new(120.0, 800.0, 400.0);
+        let saved_scroll = runtime.scroll;
+        let handle = runtime.handle().unwrap().clone();
+        runtime.set_visible(false).unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat"); };
+        app.chat_ui.parked.insert(card, runtime);
+        // The client test separately drives real Unix socket EOF. Here its
+        // disconnected publication enters the actual parked-runtime handler.
+        handle.disconnect_for_test();
+        drop(app.handle_chat_action(Action::Wake(target, Wake::Disconnected("fixture EOF".into()))));
+        let mut runtime = app.chat_ui.parked.remove(&card).unwrap();
+        assert!(runtime.disconnected);
+        runtime.set_visible(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.resident_snapshot_with_clock().is_none() {
+            assert!(std::time::Instant::now() < deadline, "parked view did not rehydrate");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.generation, 19);
+        assert!(runtime.snapshot.transcript_bytes() > 0);
+        assert!(runtime.snapshot.read_only_reason.is_some());
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent while parked");
+        assert_eq!(runtime.scroll, saved_scroll);
+        assert!(runtime.disconnected, "cached text never grants send authority");
+        runtime.revoke_local_history();
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert!(runtime.cache.is_empty());
+    }
+
+    #[test]
     fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -12858,6 +12910,11 @@ mod tests {
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         assert!(handle.resident_snapshot_with_clock().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while parent.upgrade().is_some() || child.upgrade().is_some() {
+            assert!(std::time::Instant::now() < deadline, "offline spill must release queued raw owners");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             parent.upgrade().is_none(),
             "client, runtime and presentation must all release the parent body"
