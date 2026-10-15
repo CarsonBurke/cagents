@@ -273,6 +273,9 @@ where
     popup_at: Option<Position>,
     on_hover: Option<Box<dyn Fn(Option<Position>) -> Message + 'a>>,
     on_definition: Option<Box<dyn Fn(Position) -> Message + 'a>>,
+    on_code_action: Option<Box<dyn Fn(Position) -> Message + 'a>>,
+    code_action_lines: &'a [usize],
+    code_action_available: Option<Position>,
     find_matches: &'a [(Position, Position)],
     current_match: usize,
     placeholder: Option<text::Fragment<'a>>,
@@ -311,6 +314,9 @@ where
             popup_at: None,
             on_hover: None,
             on_definition: None,
+            on_code_action: None,
+            code_action_lines: &[],
+            code_action_available: None,
             find_matches: &[],
             current_match: 0,
             placeholder: None,
@@ -393,6 +399,38 @@ where
         self
     }
 
+    pub fn code_action_lines(mut self, lines: &'a [usize], available: Option<Position>) -> Self {
+        self.code_action_lines = lines;
+        self.code_action_available = available;
+        self
+    }
+
+    pub fn on_code_action(mut self, callback: impl Fn(Position) -> Message + 'a) -> Self {
+        self.on_code_action = Some(Box::new(callback));
+        self
+    }
+
+    fn code_action_line(&self, line: usize) -> bool {
+        self.on_code_action.is_some() && (self.code_action_available.is_some_and(|at| at.line == line) || self.code_action_lines.binary_search(&line).is_ok())
+    }
+
+    fn code_action_hit(&self, bounds: Rectangle, point: Point) -> Option<Position> {
+        if self.on_code_action.is_none() || point.x < bounds.x || point.x > bounds.x + 16.0 { return None; }
+        let text_bounds = bounds.shrink(self.text_padding());
+        if point.y < text_bounds.y || point.y > text_bounds.y + text_bounds.height { return None; }
+        let internal = self.content.0.borrow();
+        let mut previous = None;
+        for run in internal.editor.buffer().layout_runs() {
+            if previous == Some(run.line_i) { continue; }
+            previous = Some(run.line_i);
+            if self.code_action_line(run.line_i) && point.y >= text_bounds.y + run.line_top && point.y < text_bounds.y + run.line_top + run.line_height {
+                let column = self.diagnostics.iter().find(|diagnostic| diagnostic.start.line == run.line_i).map_or_else(|| self.code_action_available.filter(|at| at.line == run.line_i).map_or(0, |at| at.column), |diagnostic| diagnostic.start.column);
+                return Some(Position { line: run.line_i, column });
+            }
+        }
+        None
+    }
+
     /// Sets the [`Font`] of the [`TextEditor`].
     ///
     /// [`Font`]: text::Renderer::Font
@@ -447,6 +485,9 @@ where
             popup_at: self.popup_at,
             on_hover: self.on_hover,
             on_definition: self.on_definition,
+            on_code_action: self.on_code_action,
+            code_action_lines: self.code_action_lines,
+            code_action_available: self.code_action_available,
             find_matches: self.find_matches,
             current_match: self.current_match,
             placeholder: self.placeholder,
@@ -494,7 +535,7 @@ where
         Padding {
             left: self.padding.left
                 + self.line_digits as f32 * self.text_size.unwrap_or(Pixels(16.0)).0 * 0.7
-                + 16.0,
+                + 16.0 + if self.on_code_action.is_some() { 14.0 } else { 0.0 },
             right: self.padding.right + crate::design::SCROLLBAR_GUTTER,
             ..self.padding
         }
@@ -1999,6 +2040,13 @@ where
         if self.popup.is_none() {
             state.popup_bounds = None;
         }
+        if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
+            if let Some(at) = pointer.and_then(|point| self.code_action_hit(layout.bounds(), point)) {
+                shell.publish(self.on_code_action.as_ref().unwrap()(at));
+                shell.capture_event();
+                return;
+            }
+        }
         if self.on_hover.is_some() || self.on_definition.is_some() {
             let text_bounds = layout.bounds().shrink(self.text_padding());
             let hit = pointer
@@ -2680,7 +2728,7 @@ where
                         ),
                         Size::new(4.0, 4.0),
                     );
-                    if let Some(bounds) = bounds.intersection(&dot) {
+                    if let Some(bounds) = bounds.intersection(&dot).filter(|_| self.on_code_action.is_none()) {
                         renderer.fill_quad(
                             renderer::Quad {
                                 bounds,
@@ -2759,6 +2807,26 @@ where
                 gutter_clip,
             );
         }
+        if self.on_code_action.is_some() {
+            let color = crate::design::warning_color(&cosmic::theme::active());
+            let mut previous = None;
+            for run in internal.editor.buffer().layout_runs() {
+                if previous == Some(run.line_i) { continue; }
+                previous = Some(run.line_i);
+                if !self.code_action_line(run.line_i) { continue; }
+                let x = bounds.x + 4.0;
+                let y = text_bounds.y + run.line_top + (run.line_height - 12.0) / 2.0;
+                for (rectangle, radius) in [
+                    (Rectangle::new(Point::new(x, y), Size::new(8.0, 8.0)), 4.0),
+                    (Rectangle::new(Point::new(x + 2.0, y + 7.0), Size::new(4.0, 3.0)), 0.5),
+                    (Rectangle::new(Point::new(x + 3.0, y + 11.0), Size::new(2.0, 1.0)), 0.5),
+                ] {
+                    if let Some(bounds) = bounds.intersection(&rectangle).filter(|rectangle| rectangle.y >= text_bounds.y && rectangle.y + rectangle.height <= text_bounds.y + text_bounds.height) {
+                        renderer.fill_quad(renderer::Quad { bounds, border: Border { radius: radius.into(), ..Default::default() }, ..Default::default() }, color);
+                    }
+                }
+            }
+        }
         drop(internal);
         let geometry = self.scroll_geometry(bounds);
         if geometry.scrollable {
@@ -2796,6 +2864,7 @@ where
         {
             return mouse::Interaction::default();
         }
+        if cursor.position().is_some_and(|point| self.code_action_hit(layout.bounds(), point).is_some()) { return mouse::Interaction::Pointer; }
         let geometry = self.scroll_geometry(layout.bounds());
         let over_horizontal = geometry
             .horizontal
@@ -4496,6 +4565,37 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn code_action_lightbulb_uses_visible_native_rows_and_captures_only_its_gutter_click() {
+        #[derive(Debug, PartialEq)]
+        enum Message { CodeAction(Position), Editor }
+        let renderer = headless_renderer();
+        let content: Content = Content::with_text(&format!("first\nsecond\n{}\nlast\n", "long wrapped source ".repeat(60)));
+        let diagnostics = [Diagnostic { start: Position { line: 2, column: 3 }, end: Position { line: 2, column: 7 }, severity: crate::lsp::LspSeverity::Error }];
+        let mut editor: TextEditor<'_, highlighter::PlainText, Message> = TextEditor::new(&content)
+            .size(16.0).height(Length::Fill).wrapping(Wrapping::WordOrGlyph)
+            .diagnostics(&diagnostics).code_action_lines(&[2], None)
+            .on_code_action(Message::CodeAction).on_action(|_| Message::Editor);
+        let mut tree = widget::Tree::new(&editor as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(360.0, 220.0));
+        let node = editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+        let bounds = node.bounds();
+        let text = bounds.shrink(editor.text_padding());
+        let rows = content.0.borrow().editor.buffer().layout_runs().filter(|run| run.line_i == 2).take(2)
+            .map(|run| text.y + run.line_top + run.line_height / 2.0).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        let point = Point::new(bounds.x + 8.0, rows[0]);
+        let position = Position { line: 2, column: 3 };
+        assert_eq!(editor.code_action_hit(bounds, point), Some(position));
+        assert_eq!(editor.code_action_hit(bounds, Point::new(bounds.x + 8.0, rows[1])), None, "wrapped continuations must not repeat the action button");
+        assert_eq!(editor.code_action_hit(bounds, Point::new(text.x + 20.0, rows[0])), None);
+        let mut published = Vec::new();
+        let mut shell = Shell::new(&mut published);
+        editor.update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Layout::new(&node), mouse::Cursor::Available(point), &renderer, &mut clipboard::Null, &mut shell, &viewport);
+        assert_eq!(published, [Message::CodeAction(position)]);
+        assert_eq!(content.text(), format!("first\nsecond\n{}\nlast\n", "long wrapped source ".repeat(60)));
     }
 
     #[test]

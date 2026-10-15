@@ -324,6 +324,7 @@ pub enum EditorLspAction {
     CancelRename,
     Format { selection: bool },
     CodeActions,
+    CodeActionsAt(Option<LspPosition>),
     ChooseCodeAction(usize),
     Signature,
     Complete,
@@ -348,6 +349,9 @@ pub enum EditorLspAction {
 struct EditorLanguageState {
     rename: Option<String>,
     code_actions: Vec<crate::lsp::LspCodeAction>,
+    code_action_lines: Vec<usize>,
+    code_action_support: bool,
+    available_actions_at: Option<(u64, text_editor::Position)>,
     signature: Option<crate::lsp::LspSignatureHelp>,
     diagnostics: Vec<crate::lsp::LspDiagnostic>,
     marks: Vec<text_editor::Diagnostic>,
@@ -3066,11 +3070,20 @@ impl RepositoryRuntime {
         } else {
             vec![]
         };
+        self.language.code_action_lines = self.language.marks.iter().map(|diagnostic| diagnostic.start.line).collect();
+        self.language.code_action_lines.sort_unstable();
+        self.language.code_action_lines.dedup();
         self.language.diagnostics = diagnostics;
     }
 
     pub fn set_editor_rename(&mut self, draft: Option<String>) { self.language.rename = draft; }
-    pub fn set_editor_code_actions(&mut self, items: Vec<crate::lsp::LspCodeAction>) { self.language.code_actions = items; }
+    pub fn set_editor_code_actions(&mut self, items: Vec<crate::lsp::LspCodeAction>) {
+        self.language.available_actions_at = if items.is_empty() { None } else {
+            match &self.document { DocumentState::Editable(document) => Some((document.revision, document.content.cursor().position)), _ => None }
+        };
+        self.language.code_actions = items;
+    }
+    pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
     pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) { self.language.signature = signature; }
     pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
     pub fn rename_focus_id(card: CardId) -> widget::Id { widget::Id::new(format!("editor.rename.{card}")) }
@@ -8748,6 +8761,7 @@ fn editable_document_view<'a>(
                 &[]
             })
             .diagnostics(&runtime.language.marks)
+            .code_action_lines(&runtime.language.code_action_lines, runtime.language.available_actions_at.filter(|(revision, _)| *revision == document.revision).map(|(_, at)| at))
             .popup(
                 popup,
                 if runtime.language.completions.is_empty() {
@@ -8847,6 +8861,9 @@ fn editable_document_view<'a>(
                     })
                     .or_else(|| text_editor::default_bindings(press))
             });
+        let editor = if runtime.language.code_action_support && !runtime.is_read_only_source() {
+            editor.on_code_action(move |at| RepositoryAction::Language { card, action: EditorLspAction::CodeActionsAt(caret_position(&document.content, at)) })
+        } else { editor };
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         crate::interaction::context_menu(editor, editor_context_menu(card, document, runtime.is_read_only_source()))

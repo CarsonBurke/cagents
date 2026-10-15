@@ -10350,6 +10350,7 @@ impl Cagents {
         let status = self.lsp.open(doc, path, worktree, language, version, text);
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
+            runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions);
         }
         self.lsp_documents.insert(doc, card);
         let state = self.lsp_contexts.entry(card).or_default();
@@ -10573,7 +10574,10 @@ impl Cagents {
             LspEvent::Locations { kind, items, .. } => {
                 state.context.locations = Some((kind, items));
             }
-            LspEvent::Status { status, .. } => state.context.status = Some(status),
+            LspEvent::Status { status, .. } => {
+                state.context.status = Some(status);
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions); }
+            },
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -10819,6 +10823,12 @@ impl Cagents {
     ) -> Task<Message> {
         use repository_widget::EditorLspAction as Action;
         use editor_features::Action as Feature;
+        if let Action::CodeActionsAt(at) = &action {
+            return match at {
+                Some(at) => { let focus = self.move_lsp_caret(card, *at); let request = self.update_editor_features(Feature::CodeActions(card)); Task::batch([focus, request]) },
+                None => Task::none(),
+            };
+        }
         let feature = match &action {
             Action::Rename => Some(Feature::Rename(card)),
             Action::RenameDraft(draft) => Some(Feature::RenameDraft(card, draft.clone())),
@@ -10905,7 +10915,7 @@ impl Cagents {
                     _ => Task::none(),
                 }
             }
-            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
+            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::CodeActionsAt(_) | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
         }
     }
 
