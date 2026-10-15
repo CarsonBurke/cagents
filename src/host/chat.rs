@@ -523,7 +523,10 @@ fn changed_from(
         }
         super::agent_execution::retain_chat_identity(&host, id);
     }
-    if matches!(&update, Update::Attention(_)) {
+    if matches!(
+        &update,
+        Update::Attention(_) | Update::AttentionContext { .. }
+    ) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
         // Read outside HostState; a failed ownership read cannot safely turn
@@ -580,16 +583,23 @@ fn changed_from(
     {
         courier.wake();
     }
-    if let Update::Attention(evidence) = &update {
+    let attention = match &update {
+        Update::Attention(evidence) => Some((evidence, None)),
+        Update::AttentionContext { evidence, content } => Some((evidence, content.clone())),
+        _ => None,
+    };
+    if let Some((evidence, content)) = attention {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 id,
                 record.session.launch.provider,
                 record.session.launch.recipe.working_directory.clone(),
                 evidence.clone(),
-            ));
+            );
+            event.content = content;
+            notifications.record(event);
         }
         return;
     }
@@ -3863,31 +3873,37 @@ fn process_inner_claimed(
                 recipe,
                 last_exit: None,
             };
-            let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(host, chat_id, &continuation, terminal.clone())? {
+            let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(
+                host,
+                chat_id,
+                &continuation,
+                terminal.clone(),
+            )? {
                 Some(published) => published,
                 None => {
-                // Teardown is proved, so the terminal takes over the chat's lineage
-                // and whatever agents it started, unless another of its sessions runs.
-                if let Ok(registry) = super::agent_execution::registry(host) {
-                    registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .succeed(
-                            terminal_id,
-                            chat_id,
-                            session
-                                .terminal
-                                .as_ref()
-                                .and_then(|terminal| terminal.recovery_origin),
-                            |members| {
-                                host.lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .any_other_live(members, chat_id)
-                            },
-                        )
-                        .map_err(unavailable)?;
-                }
-                    let attempt = source_binding::mark_return_attempt(host, chat_id, &continuation)?;
+                    // Teardown is proved, so the terminal takes over the chat's lineage
+                    // and whatever agents it started, unless another of its sessions runs.
+                    if let Ok(registry) = super::agent_execution::registry(host) {
+                        registry
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .succeed(
+                                terminal_id,
+                                chat_id,
+                                session
+                                    .terminal
+                                    .as_ref()
+                                    .and_then(|terminal| terminal.recovery_origin),
+                                |members| {
+                                    host.lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .any_other_live(members, chat_id)
+                                },
+                            )
+                            .map_err(unavailable)?;
+                    }
+                    let attempt =
+                        source_binding::mark_return_attempt(host, chat_id, &continuation)?;
                     let published = super::state::spawn_terminal_view_owned_at_directory_attempt(
                         host, client, terminal,
                         crate::terminal_ipc::TerminalSpawnOptions { initially_visible: false, ..Default::default() },
@@ -3897,7 +3913,13 @@ fn process_inner_claimed(
                             unavailable("Terminal start failure belongs to another exact attempt; original custody retained")
                         } else { failure.error }
                     })?;
-                    source_binding::remember_return_worker(host, chat_id, &continuation, published.0.clone(), published.1.clone())?;
+                    source_binding::remember_return_worker(
+                        host,
+                        chat_id,
+                        &continuation,
+                        published.0.clone(),
+                        published.1.clone(),
+                    )?;
                     published
                 }
             };
@@ -4096,14 +4118,23 @@ fn close_chat_source(
         } else {
             attached(&state, client, chat_id)?.handle.clone()
         };
-        let source = state.chats.get(&chat_id).expect("captured hosted actor").session.clone();
+        let source = state
+            .chats
+            .get(&chat_id)
+            .expect("captured hosted actor")
+            .session
+            .clone();
         state.issued_chat_ids.insert(chat_id);
         (handle, source)
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-    if bound_close::close_unattempted(host, &source).map_err(unavailable)?.is_some() {
-        let snapshot = handle.snapshot(None).ok_or_else(|| unavailable(
-            "The exact original owner closed, but its final transcript is unavailable"))?;
+    if bound_close::close_unattempted(host, &source)
+        .map_err(unavailable)?
+        .is_some()
+    {
+        let snapshot = handle.snapshot(None).ok_or_else(|| {
+            unavailable("The exact original owner closed, but its final transcript is unavailable")
+        })?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     if let Some(deadline) = deadline {
@@ -4132,7 +4163,11 @@ fn close_chat_source(
         (retained, state.native_closing.contains_key(&chat_id))
     };
     let closed_receipt = if retained.native_continuity.retains_provider() {
-        let proof = host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone();
+        let proof = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone();
         // Filesystem receipt discovery runs outside HostState.
         #[cfg(test)]
         {
@@ -4708,7 +4743,10 @@ fn retire_terminal_actor(
 ) -> Result<(), ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.chats.get(&terminal_id).filter(|record| record.handle.same_actor(handle))
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| record.handle.same_actor(handle))
             .map(|record| record.session.clone())
     };
     if let Some(source) = &source {

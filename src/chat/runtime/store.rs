@@ -639,6 +639,11 @@ impl Store {
     }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
+    #[cfg(test)]
+    pub(super) fn refuse_writes_for_test(&self) {
+        self.db.pragma_update(None, "query_only", true).unwrap();
+    }
+
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
         if let Some(seal) = &self.messages {
             match &mut event {
@@ -1846,7 +1851,11 @@ mod tests {
 
     #[test]
     fn turn_outcomes_preserve_native_tool_status_and_never_rewrite_bodies() {
-        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed,crate::notifications::Kind::Succeeded] {
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+            crate::notifications::Kind::Succeeded,
+        ] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
             let input = "retained input".repeat(1000);

@@ -3,6 +3,7 @@
 //! The daemon owns delivery and the durable journal. Windows report focus and
 //! acknowledge attention; they do not each send a desktop notification.
 
+pub mod presentation;
 pub mod review;
 #[cfg(feature = "ui")]
 pub mod ui;
@@ -138,6 +139,8 @@ pub struct Event {
     #[serde(default)]
     pub destination: Option<Destination>,
     pub evidence: Evidence,
+    #[serde(default)]
+    pub content: Option<Content>,
 }
 
 impl Event {
@@ -154,10 +157,24 @@ impl Event {
             directory: Some(directory),
             destination: None,
             evidence,
+            content: None,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(content) = &self.content {
+            if content.conversation.chars().count() > 80
+                || content.preview.chars().count() > 240
+                || content
+                    .conversation
+                    .chars()
+                    .chain(content.preview.chars())
+                    .any(char::is_control)
+                || (content.request.is_some() && self.evidence.kind != Kind::Waiting)
+            {
+                return Err("Notification preview exceeds its text boundary".into());
+            }
+        }
         if self.evidence.key.len() > 1024
             || self
                 .directory
@@ -211,7 +228,8 @@ impl Event {
             destination.validate()?;
         }
         if matches!(self.target, Target::SessionInbox(_)) {
-            if self.evidence.kind != Kind::MessageReceived
+            if self.content.is_some()
+                || self.evidence.kind != Kind::MessageReceived
                 || self.source_session.is_none()
                 || self.provider.is_some()
                 || self.directory.is_some()
@@ -229,7 +247,8 @@ impl Event {
         }
         if let Target::PullRequest(request) = &self.target {
             request.validate()?;
-            if self.evidence.kind != Kind::ReviewRequested
+            if self.content.is_some()
+                || self.evidence.kind != Kind::ReviewRequested
                 || self.evidence.key != request.request
                 || self.source_session.is_some()
                 || self.provider.is_some()
@@ -285,6 +304,8 @@ pub struct Preferences {
     pub waiting: bool,
     pub while_focused: bool,
     pub review_requests: bool,
+    /// Explicit opt-in; existing configurations retain metadata-only alerts.
+    pub message_previews: bool,
 }
 
 impl Default for Preferences {
@@ -296,6 +317,7 @@ impl Default for Preferences {
             waiting: true,
             while_focused: false,
             review_requests: true,
+            message_previews: false,
         }
     }
 }
@@ -385,6 +407,7 @@ pub enum Field {
     Waiting,
     WhileFocused,
     ReviewRequests,
+    MessagePreviews,
 }
 
 impl Preferences {
@@ -396,6 +419,7 @@ impl Preferences {
             Field::Waiting => self.waiting,
             Field::WhileFocused => self.while_focused,
             Field::ReviewRequests => self.review_requests,
+            Field::MessagePreviews => self.message_previews,
         }
     }
     pub fn set(&mut self, field: Field, value: bool) {
@@ -406,6 +430,7 @@ impl Preferences {
             Field::Waiting => &mut self.waiting,
             Field::WhileFocused => &mut self.while_focused,
             Field::ReviewRequests => &mut self.review_requests,
+            Field::MessagePreviews => &mut self.message_previews,
         } = value;
     }
 }
@@ -486,9 +511,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_context_keeps_legacy_journal_records_readable() {
+        let mut event = Event::session(
+            TerminalId::new(),
+            Provider::Claude,
+            "/fixture".into(),
+            Evidence {
+                key: "accepted-turn".into(),
+                kind: Kind::Waiting,
+            },
+        );
+        let mut legacy = serde_json::to_value(&event).unwrap();
+        legacy.as_object_mut().unwrap().remove("content");
+        assert_eq!(Event::from_journal(&legacy.to_string()).unwrap(), event);
+        event.content = Some(Content {
+            conversation: "Fixture conversation".into(),
+            preview: "Question for the operator".into(),
+            request: Some(RequestType::Question),
+        });
+        let bytes = postcard::to_stdvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
+    }
+
+    #[test]
     fn inbox_attention_is_distinct_fixed_and_compatible_with_waiting_preferences() {
         let session = TerminalId::new();
         let event = Event {
+            content: None,
             target: Target::SessionInbox(crate::agent_execution::Lineage(session)),
             source_session: Some(session),
             provider: None,
@@ -529,6 +578,7 @@ mod tests {
         assert_eq!(event.target(), Target::Session(session));
         assert_eq!(event.source_session(), Some(session));
         let event = Event {
+            content: None,
             target: Target::AgentRun(RunId::new()),
             source_session: None,
             provider: None,
@@ -561,6 +611,7 @@ mod tests {
             notices: vec![Notice {
                 id,
                 event: Event {
+                    content: None,
                     target: target.clone(),
                     source_session: None,
                     provider: None,
@@ -623,6 +674,7 @@ mod tests {
     #[test]
     fn context_is_bounded_and_does_not_include_parent_paths() {
         let event = Event {
+            content: None,
             target: Target::Session(TerminalId::new()),
             source_session: None,
             provider: Some(Provider::Codex),
