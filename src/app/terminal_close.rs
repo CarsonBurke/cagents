@@ -706,6 +706,10 @@ impl Cagents {
     /// card ran must already have ended or been closed through the daemon,
     /// as a worktree's deletion retires the cards it held.
     pub(super) fn retire_offstrip_card(&mut self, card: CardId) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.status=Some(TransientNotice::warning("The editor was kept until its file recovery finishes."));
+            return Task::none();
+        }
         if self.workspace.order().any(|id| id == card)
             || self
                 .card_state(card)
@@ -751,6 +755,11 @@ impl Cagents {
         unasked: bool,
         batch: Option<uuid::Uuid>,
     ) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.stop_pane_close_batch(batch);
+            self.status=Some(TransientNotice::warning("Resolve file recovery before closing this editor."));
+            return Task::none();
+        }
         if self.terminal_start_in_flight(card)
             || (matches!(
                 self.card_state(card).map(|state| &state.kind),
@@ -1285,6 +1294,13 @@ impl Cagents {
             ));
             return None;
         }
+        if self.card_has_editor_recovery(id) {
+            self.retire_card_removal(target);
+            let _=self.workspace.cancel_close(id);
+            self.stop_pane_close_batch(origin);
+            self.status=Some(TransientNotice::warning("The editor was kept because file recovery is pending. Resolve recovery before choosing Close again."));
+            return None;
+        }
         if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()) {
             self.terminal_close_bindings.pending_removals.get_mut(&id)?
                 .waiting_for_editor_write = true;
@@ -1785,6 +1801,27 @@ mod tests {
             .bound
             .insert(card, captured.clone());
         (app, card, captured)
+    }
+
+    #[test]
+    fn actual_reserved_close_cannot_drop_new_editor_recovery_without_an_active_save() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let card=app.workspace.focused().unwrap();
+        let (runtime,_)=RepositoryRuntime::open_fixture(card,"source.rs","clean");
+        app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+        let _held=app.request_card_removal(card);
+        let target=app.pending_card_removal_target(card).expect("real typed removal reserved before recovery arrives");
+        let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("original held files".into(),||Ok(()));
+        let Some(CardRuntime::Repository(runtime))=app.cards.get_mut(&card) else {panic!()};
+        runtime.retain_editor_recovery(authority.clone(),"needs actual recovery".into());
+        assert!(!runtime.is_dirty());assert!(!runtime.is_saving());
+        drop(app.update(Message::CommitCloseTarget(target)));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id|id==card));
+        assert!(app.card_has_editor_recovery(card));assert!(!authority.is_resolved());
+        assert!(app.pending_card_removal_target(card).is_none());assert!(app.workspace.pending_close().is_none());
+        assert!(app.status.as_ref().is_some_and(|notice|notice.message.contains("recovery")));
     }
 
     #[tokio::test]
