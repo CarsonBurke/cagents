@@ -24,6 +24,7 @@ mod file_ui;
 mod editor_features;
 mod git_group_ui;
 mod git_patch_ui;
+mod git_binding;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -6683,7 +6684,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
+        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel, git_binding::Binding)>>, String>,
     },
     SourceControlGroupSelection {
         key: ActiveWorktreeKey,
@@ -7678,6 +7679,7 @@ impl QueuedGitMutation {
 
 #[derive(Debug)]
 struct SourceControlMutation {
+    binding: git_binding::Binding,
     id: uuid::Uuid,
     kind: MutationKind,
     cancellation: CancellationToken,
@@ -13422,7 +13424,8 @@ impl Cagents {
     fn release_source_control(&mut self) -> Task<Message> {
         let previous = self.sidebar_model.source_control.take();
         let cache = self.refresh_ui.source_cache.take();
-        if previous.is_none() && cache.is_none() {
+        let binding = self.refresh_ui.source_binding.take();
+        if previous.is_none() && cache.is_none() && binding.is_none() {
             return Task::none();
         }
         // Old cancelled readers retain the old binding's invalidation flag.
@@ -13448,6 +13451,7 @@ impl Cagents {
                 }
                 drop(previous);
                 drop(cache);
+                drop(binding);
             })
             .await;
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -13510,12 +13514,9 @@ impl Cagents {
         {
             self.context_tab = ContextTab::Files;
         }
-        let mut source = SourceControlModel::loading(key.clone());
-        source.set_mutation(
-            self.source_control_mutations
-                .get(&key.canonical_path)
-                .map(|mutation| mutation.kind),
-        );
+        // A newly opened actor never inherits optimistic state from an older
+        // actor merely because its pathname is equal.
+        let source = SourceControlModel::loading(key.clone());
         self.sidebar_model.source_control = Some(source);
         Task::batch([release, self.source_control_snapshot_task(key)])
     }
@@ -13542,6 +13543,7 @@ impl Cagents {
         source.mark_history_requested();
         let generation = self.history_ui.next_page_request();
         Self::source_control_history_task(
+            self.refresh_ui.source_binding.clone(),
             generation,
             source.key.clone(),
             source
@@ -14646,78 +14648,33 @@ impl Cagents {
         }
         let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
         let invalidated = self.refresh_ui.source_invalidated.clone();
+        let binding = self.refresh_ui.source_binding.get_or_insert_with(|| git_binding::Binding::new(key.clone())).clone();
+        if binding.key != key { return Task::none(); }
+        if let Some(source) = self.sidebar_model.source_control.as_mut() { source.set_command_binding_id(binding.id); }
         let model_key = key.clone();
         let reveal_demand = self.sidebar_state.files_reveal_demand().cloned();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                let mut binding = binding;
+                let was_initialized = binding.initialized;
+                binding.initialize()?;
+                if !was_initialized {
+                    *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = crate::repository::SnapshotCache::default();
+                }
+                let input = git_binding::SnapshotInput { worktree, options, cancellation, cache, invalidated, browse_files, previous_errors, expanded, model_key, reveal_demand };
                 let service = RepositoryService::system("git");
-                let mut cache = cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
-                if invalidation != 0 {
-                    cache.invalidate(invalidation & 2 != 0);
-                }
-                let Some(mut snapshot) = service
-                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
-                if cancellation.is_cancelled() {
-                    cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
-                }
-                let mut reveal_error = None;
-                let mut revealed_path = None;
-                if browse_files {
-                    let ignored = service
-                        .ignored_files_with_limit(
-                            &worktree,
-                            &snapshot.files.paths,
-                            options.status_limit,
-                            &cancellation,
-                        )
-                        .map_err(|error| {
-                            cache.invalidate(false);
-                            error.to_string()
-                        })?;
-                    snapshot.files.listing_truncated |= ignored.listing_truncated;
-                    snapshot.files.ignored = ignored.ignored;
-                    snapshot.files.ignored_directories = ignored.ignored_directories;
-                    repository_widget::expand_ignored_directories(
-                        &worktree,
-                        &mut snapshot.files,
-                        &expanded,
-                        &previous_errors,
-                        &cancellation,
-                    )
-                    .inspect_err(|_| cache.invalidate(false))?;
-                    if let Some(path) = reveal_demand.as_ref() {
-                        match crate::repository::include_revealed_path(
-                            &worktree,
-                            &mut snapshot.files,
-                            path,
-                        ) {
-                            Ok(target) => revealed_path = target,
-                            Err(error) => reveal_error = Some(error),
-                        }
+                let loaded = if let Some(authority) = binding.authority.as_ref() {
+                    input.read(&service.with_worktree_authority(authority.clone()).map_err(|error| error.to_string())?)
+                } else if !crate::repository::WorktreeAuthority::supported() {
+                    input.read(&service)
+                } else { Err("The original Git worktree binding is unavailable.".into()) }?;
+                binding.validate()?;
+                Ok(loaded.map(|(snapshot, mut model)| {
+                    if let Some(reason) = crate::repository::WorktreeAuthority::unsupported_reason() {
+                        model.set_mutation_unavailable_reason(Some(Arc::from(reason)));
                     }
-                    cache.observe_browse(&worktree, &snapshot.files);
-                }
-                let mut model =
-                    SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
-                model.revealed_path = revealed_path;
-                if let Some(error) = reveal_error {
-                    model.set_error(Some(format!(
-                        "Could not reveal the requested path: {error}"
-                    )));
-                }
-                if cancellation.is_cancelled() {
-                    cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
-                }
-                Ok(Some(Box::new((snapshot, model))))
+                    Box::new((snapshot, model, binding))
+                }))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
@@ -14731,6 +14688,7 @@ impl Cagents {
     }
 
     fn source_control_history_task(
+        binding: Option<git_binding::Binding>,
         generation: u64,
         key: ActiveWorktreeKey,
         head: Option<crate::repository::Oid>,
@@ -14752,9 +14710,9 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .filtered_history(&request, &query, &cancellation)
-                    .map_err(|error| error.to_string())
+                binding.as_ref().filter(|binding| binding.key.canonical_path == request.worktree)
+                    .ok_or_else(|| "The original Git history binding is unavailable.".to_owned())?
+                    .history(&request, &query, &cancellation)
             })
             .await
             .map_err(|error| format!("history reader join failed: {error}"))
@@ -14801,6 +14759,8 @@ impl Cagents {
         {
             return None;
         }
+        let binding = self.refresh_ui.source_binding.as_ref()
+            .filter(|binding| binding.key == *key && binding.authority.is_some())?.clone();
         let source = self.sidebar_model.source_control.as_mut()?;
         if source.busy() {
             return None;
@@ -14810,6 +14770,7 @@ impl Cagents {
         self.source_control_mutations.insert(
             key.canonical_path.clone(),
             SourceControlMutation {
+                binding,
                 id,
                 kind,
                 cancellation: CancellationToken::new(),
@@ -14838,6 +14799,7 @@ impl Cagents {
         }
         let kind = request.kind();
         if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
+            if self.refresh_ui.source_binding.as_ref().is_none_or(|binding| binding.id != active.binding.id) { return Task::none(); }
             QueuedGitMutation::append(&mut active.pending, request.clone());
             if let Some(source) = self.sidebar_model.source_control.as_mut() {
                 if let Some(selection) = request.optimistic_selection() {
@@ -14912,6 +14874,8 @@ impl Cagents {
         operation: uuid::Uuid,
         request: QueuedGitMutation,
     ) -> Task<Message> {
+        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
+            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
         let request = match request {
             QueuedGitMutation::PreparedDiff(pending) => return self.apply_prepared_diff_at_turn(key, operation, pending),
             QueuedGitMutation::Area { area, command, .. } => {
@@ -14942,7 +14906,10 @@ impl Cagents {
                         selection: selection.clone(),
                     };
                     let result = tokio::task::spawn_blocking(move || {
-                        let service = RepositoryService::system("git");
+                        let service = match binding.mutation_service() {
+                            Ok(service) => service,
+                            Err(error) => return Err(Some(error)),
+                        };
                         match service.check_stage_markers(&request, &approved, &cancellation) {
                             Ok(Some(markers)) => Ok(markers),
                             Ok(None) => Err(mutation_report(
@@ -14988,7 +14955,7 @@ impl Cagents {
                     .unwrap_or_default();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
+                        binding.mutation_service()?
                             .discard_recoverable(&request, &cancellation)
                             .map_err(|error| error.to_string())
                     })
@@ -15018,7 +14985,7 @@ impl Cagents {
                 let worktree = key.canonical_path.clone();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
+                        binding.mutation_service()?
                             .apply_patch_recoverable(
                                 &worktree,
                                 &patch,
@@ -15091,7 +15058,7 @@ impl Cagents {
         &self,
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
-        run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
+        run: impl FnOnce(&git_binding::ScopedService, &CancellationToken) -> (Option<String>, bool)
         + Send
         + 'static,
     ) -> Task<Message> {
@@ -15101,10 +15068,14 @@ impl Cagents {
             .filter(|mutation| mutation.id == operation)
             .map(|mutation| mutation.cancellation.clone())
             .unwrap_or_default();
+        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
+            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
-                run(&service, &cancellation)
+                match binding.mutation_service() {
+                    Ok(service) => run(&service, &cancellation),
+                    Err(error) => (Some(error), false),
+                }
             })
             .await;
             let (report, committed) = match joined {
@@ -18757,6 +18728,16 @@ impl Application for Cagents {
                         return Task::none();
                     }
                 }
+                if matches!(&action, SidebarAction::RequestDiscard { .. }) {
+                    self.refresh_ui.discard_binding = self.refresh_ui.source_binding.as_ref().map(|binding| binding.id);
+                }
+                if matches!(&action, SidebarAction::ConfirmDiscard { .. })
+                    && (self.refresh_ui.discard_binding.is_none() || self.refresh_ui.discard_binding != self.refresh_ui.source_binding.as_ref().map(|binding| binding.id)) {
+                    return Task::none();
+                }
+                if matches!(&action, SidebarAction::CancelDiscard | SidebarAction::ConfirmDiscard { .. }) {
+                    self.refresh_ui.discard_binding = None;
+                }
                 self.sidebar_state.apply(&action);
                 // Opening a row, by pointer or keyboard, is navigation: it
                 // ends any explicit selection and anchors a later range, but
@@ -19129,7 +19110,7 @@ impl Application for Cagents {
                             return Task::none();
                         };
                         source.search_history(query.clone());
-                        Self::source_control_history_task(self.history_ui.next_page_request(), key,
+                        Self::source_control_history_task(self.refresh_ui.source_binding.clone(), self.history_ui.next_page_request(), key,
                             Some(head), 0, query, self.history_ui.page_cancellation())
                     }
                     SidebarAction::HistoryCommand { key, oid, command, mainline, message } => {
@@ -19158,12 +19139,12 @@ impl Application for Cagents {
                             return Task::none();
                         };
                         self.sidebar_state.pin_amend_head(&key, revision, head.clone());
+                        let binding = self.refresh_ui.source_binding.clone();
                         cosmic::task::future(async move {
-                            let worktree = key.canonical_path.clone();
                             let pinned = head.clone();
                             let result = tokio::task::spawn_blocking(move || {
-                                RepositoryService::system("git").commit_message(&worktree, &pinned, &CancellationToken::default())
-                                    .map_err(|error| error.to_string())
+                                binding.as_ref().ok_or_else(|| "The original Git worktree binding is unavailable.".to_owned())?
+                                    .head_message(&pinned, &CancellationToken::default())
                             }).await.map_err(|error| format!("amend reader join failed: {error}"))
                                 .and_then(|result| result);
                             Message::SourceControlAmendMessage { key, revision, head, result }
@@ -19217,6 +19198,9 @@ impl Application for Cagents {
                     }
                     SidebarAction::UndoDiscard { key } => {
                         if !self.source_control_is_bound(&key) || self.folder_scope(&key) { return Task::none(); }
+                        if self.refresh_ui.recovery_bindings.get(&key.canonical_path).copied()
+                            != self.refresh_ui.source_binding.as_ref().map(|binding| binding.id) { return Task::none(); }
+                        self.refresh_ui.recovery_bindings.remove(&key.canonical_path);
                         let recovery = self.discard_recoveries.remove(&key.canonical_path);
                         if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.undo_discard_until_unix_ms = None; }
                         recovery.map_or_else(Task::none, |recovery| self.enqueue_git_mutation(key, QueuedGitMutation::UndoDiscard(recovery)))
@@ -19293,7 +19277,7 @@ impl Application for Cagents {
                         };
                         let query = source.history_query.clone();
                         source.mark_history_requested();
-                        Self::source_control_history_task(self.history_ui.next_page_request(), key,
+                        Self::source_control_history_task(self.refresh_ui.source_binding.clone(), self.history_ui.next_page_request(), key,
                             Some(head), page, query, self.history_ui.page_cancellation())
                     }
                     SidebarAction::ToggleControls => {
@@ -21389,6 +21373,8 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if let Ok(Some(prepared)) = &result
+                    && self.refresh_ui.source_binding.as_ref().is_none_or(|binding| binding.id != prepared.2.id) { return Task::none(); }
+                if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
                         .sidebar_model
                         .projects
@@ -21405,7 +21391,8 @@ impl Application for Cagents {
                 }
                 let (snapshot, mut next) = match result {
                     Ok(Some(prepared)) => {
-                        let (snapshot, model) = *prepared;
+                        let (snapshot, model, binding) = *prepared;
+                        self.refresh_ui.source_binding = Some(binding);
                         (Some(snapshot), model)
                     }
                     Ok(None) => unreachable!(),
@@ -21423,6 +21410,7 @@ impl Application for Cagents {
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
                 // belong to the binding, not to the page of Git output.
+                if let Some(binding) = self.refresh_ui.source_binding.as_ref() { next.set_command_binding_id(binding.id); }
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }
@@ -21437,6 +21425,7 @@ impl Application for Cagents {
                 next.undo_discard_until_unix_ms = self
                     .discard_recoveries
                     .get(&next.key.canonical_path)
+                    .filter(|_| self.refresh_ui.recovery_bindings.get(&next.key.canonical_path).copied() == self.refresh_ui.source_binding.as_ref().map(|binding| binding.id))
                     .map(|recovery| recovery.expires_unix_ms);
                 self.sidebar_model.source_control = Some(next);
                 match snapshot {
@@ -21536,6 +21525,7 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let binding = self.source_control_mutations[&key.canonical_path].binding.id;
                 let task = self.update(Message::SourceControlMutated {
                     key: key.clone(),
                     operation,
@@ -21546,7 +21536,7 @@ impl Application for Cagents {
                     .sidebar_model
                     .source_control
                     .as_mut()
-                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                    .filter(|source| source.key == key && self.refresh_ui.source_binding.as_ref().is_some_and(|current| current.id == binding))
                 {
                     let pending = source.pending_marker_stage.get_or_insert_with(Vec::new);
                     let mut seen = pending
@@ -21597,6 +21587,8 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let binding = self.source_control_mutations[&key.canonical_path].binding.id;
+                let current_binding = self.refresh_ui.source_binding.as_ref().is_some_and(|current| current.id == binding);
                 self.discard_recoveries
                     .retain(|_, recovery| recovery.can_undo());
                 let mut expires = None;
@@ -21606,12 +21598,13 @@ impl Application for Cagents {
                             expires = Some(result.recovery.expires_unix_ms);
                             if let Some(source) =
                                 self.sidebar_model.source_control.as_mut().filter(|source| {
-                                    source.key.canonical_path == key.canonical_path
+                                    current_binding && source.key == key
                                 })
                             {
                                 source.undo_discard_until_unix_ms =
                                     Some(result.recovery.expires_unix_ms);
                             }
+                            self.refresh_ui.recovery_bindings.insert(key.canonical_path.clone(), binding);
                             self.discard_recoveries
                                 .insert(key.canonical_path.clone(), Arc::new(result.recovery));
                         }
@@ -21630,7 +21623,7 @@ impl Application for Cagents {
                     .sidebar_model
                     .source_control
                     .as_mut()
-                    .filter(|source| source.key == refresh_key)
+                    .filter(|source| current_binding && source.key == refresh_key)
                 {
                     source.undo_discard_until_unix_ms = self
                         .discard_recoveries
@@ -21663,6 +21656,10 @@ impl Application for Cagents {
                 if self.exit.is_some() {
                     return Task::none();
                 }
+                // Even a failed/uncertain earlier turn invalidates a prepared
+                // patch against the previous rendered index/source snapshot.
+                mutation.binding.mutation_revision.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let current_binding = self.refresh_ui.source_binding.as_ref().is_some_and(|binding| binding.id == mutation.binding.id);
                 let failed = report.is_some();
                 if !failed
                     && let Some(rollback) = mutation.rollback.as_mut()
@@ -21674,7 +21671,7 @@ impl Application for Cagents {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
                 let mutation_refused = self.sidebar_model.source_control.as_ref()
-                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                    .filter(|source| current_binding && source.key == key)
                     .is_some_and(|source| !source.mutations_available());
                 // Roll back Git rows, never a newer host capability. On a
                 // successful final supported turn, retain only its projection:
@@ -21685,10 +21682,12 @@ impl Application for Cagents {
                         .sidebar_model
                         .source_control
                         .as_mut()
-                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                        .filter(|source| current_binding && source.key == key)
                 {
                     let current_capability = source.mutation_unavailable_reason().map(Arc::from);
+                    let binding = source.command_binding_id();
                     *source = rollback.clone();
+                    source.set_command_binding_id(binding);
                     source.set_mutation_unavailable_reason(current_capability);
                     if source.mutations_available() {
                         for pending in &mutation.pending {
@@ -21702,7 +21701,7 @@ impl Application for Cagents {
                     mutation.pending.clear();
                     self.git_mutation_unavailable(&key);
                 }
-                if committed && let Some(revision) = mutation.commit_revision {
+                if current_binding && committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
                 }
                 if let Some(next) = mutation.pending.pop_front() {
@@ -21722,7 +21721,7 @@ impl Application for Cagents {
                         .sidebar_model
                         .source_control
                         .as_mut()
-                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                        .filter(|source| current_binding && source.key == key)
                     {
                         source.set_mutation(Some(mutation.kind));
                         source.set_error(report.clone());
@@ -21733,7 +21732,7 @@ impl Application for Cagents {
                 }
                 let mut refreshes = Vec::new();
                 for (&card, runtime) in &mut self.cards {
-                    if let CardRuntime::Repository(runtime) = runtime
+                    if current_binding && let CardRuntime::Repository(runtime) = runtime
                         && runtime.descriptor.worktree == key.canonical_path
                     {
                         refreshes.push(repository_task(runtime.refresh_after_mutation(card)));
@@ -21743,7 +21742,7 @@ impl Application for Cagents {
                     .sidebar_model
                     .source_control
                     .as_mut()
-                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                    .filter(|source| current_binding && source.key == key)
                     .map(|source| {
                         source.set_mutation(None);
                         source.set_error(report.clone());

@@ -58,10 +58,15 @@ impl Cagents {
             .filter(|mutation| mutation.id == operation)
             .map(|mutation| mutation.cancellation.clone())
             .unwrap_or_default();
+        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
+            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
         cosmic::task::future(async move {
             let target = key.clone();
             tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
+                let service = match binding.mutation_service() {
+                    Ok(service) => service,
+                    Err(error) => return Message::SourceControlMutated { key: target, operation, report: Some(error), committed: false },
+                };
                 let worktree = target.canonical_path.clone();
                 let complete = |report| Message::SourceControlMutated {
                     key: target.clone(),
@@ -151,6 +156,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        let binding = self.source_control_mutations[&key.canonical_path].binding.clone();
         let (selection, report) = match result {
             Ok(selection) => (Some(selection), None),
             Err(error) => (None, Some(error)),
@@ -163,7 +169,8 @@ impl Cagents {
             report,
             committed: false,
         });
-        if !self.source_control_is_bound(&key) || self.modal_is_open() {
+        if !self.source_control_is_bound(&key) || self.modal_is_open()
+            || self.refresh_ui.source_binding.as_ref().is_none_or(|current| current.id != binding.id) {
             return release;
         }
         let Some(action) = selection

@@ -141,6 +141,15 @@ impl RepositoryRuntime {
         runtime
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_diff_fixture_at(card: CardId, worktree: &Path) -> Self {
+        let mut runtime = Self::selected_diff_fixture(card);
+        runtime.descriptor.worktree = worktree.to_owned();
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime
+    }
+
     /// Selection commands require actual selected rows. Their captured request
     /// keeps palette activation bound to the rendered source and coordinates.
     pub fn can_apply_diff_selection(&self, kind: git_patch::Kind) -> bool {

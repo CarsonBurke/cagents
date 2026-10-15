@@ -10,15 +10,22 @@ use crate::{git_patch, repository_widget::DiffMutationRequest};
 pub(super) struct Pending {
     card: CardId,
     buffer_only: bool,
+    binding_revision: Option<(crate::model::OperationId, u64)>,
     result: Arc<std::sync::OnceLock<Result<Option<Arc<repository_widget::PreparedDiffMutation>>, String>>>,
 }
 
 impl Pending {
-    fn new(card: CardId, buffer_only: bool) -> Self { Self { card, buffer_only, result: Arc::new(std::sync::OnceLock::new()) } }
+    fn new(card: CardId, buffer_only: bool) -> Self { Self { card, buffer_only, binding_revision: None, result: Arc::new(std::sync::OnceLock::new()) } }
     pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.result, &other.result) }
 }
 
 impl Cagents {
+    fn prepared_diff_binding_current(&self, pending: &Pending) -> bool {
+        pending.binding_revision.is_none_or(|(id, revision)| self.refresh_ui.source_binding.as_ref().is_some_and(|binding| {
+            binding.id == id && binding.mutation_revision.load(std::sync::atomic::Ordering::Acquire) == revision
+        }))
+    }
+
     pub(super) fn start_diff_patch(
         &mut self,
         card: CardId,
@@ -31,7 +38,9 @@ impl Cagents {
             .filter(|source| source.key.canonical_path == runtime.descriptor.worktree) else { return Task::none(); };
         let Some(capture) = runtime.capture_diff_mutation(card, kind, request.as_deref()) else { return Task::none(); };
         let key = source.key.clone();
-        let pending = Pending::new(card, capture.applies_to_buffer());
+        let mut pending = Pending::new(card, capture.applies_to_buffer());
+        pending.binding_revision = self.refresh_ui.source_binding.as_ref().filter(|binding| binding.key == key)
+            .map(|binding| (binding.id, binding.mutation_revision.load(std::sync::atomic::Ordering::Acquire)));
         // A genuine native buffer Revert never writes Git or disk and remains
         // available on hosts without strong Git mutation authority.
         let reservation = if pending.buffer_only { Task::none() }
@@ -79,7 +88,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if self.modal_is_open() { return Task::none(); }
+        if self.modal_is_open() || !self.prepared_diff_binding_current(&pending) { return Task::none(); }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&pending.card) else { return Task::none(); };
         match prepared.as_ref().clone().apply(runtime) {
             Ok(None) => self.drain_lsp_intents(pending.card),
@@ -102,8 +111,8 @@ impl Cagents {
             Ok(None) => return self.update(complete(Some("The selected range contains no applicable changed lines.".into()))),
             Err(error) => return self.update(complete(Some(error.clone()))),
         };
-        if self.modal_is_open() {
-            return self.update(complete(Some("Close the dialog and retry the selected change.".into())));
+        if self.modal_is_open() || !self.prepared_diff_binding_current(&pending) {
+            return self.update(complete(Some("The original Git source changed. Retry the selected change.".into())));
         }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&pending.card) else {
             return self.update(complete(Some("The original diff is no longer available.".into())));
@@ -126,21 +135,20 @@ impl Cagents {
 mod tests {
     use super::*;
 
-    fn fixture() -> (Cagents, CardId, ActiveWorktreeKey) {
-        let mut app = super::super::tests::context_inspector_test_app(false);
+    fn fixture() -> (tempfile::TempDir, Cagents, CardId, ActiveWorktreeKey) {
+        let temporary = tempfile::tempdir().unwrap();
+        super::super::git_binding::tests::init(temporary.path(), "changed\nkeep\n");
+        let (mut app, key) = super::super::git_binding::tests::app_for(temporary.path());
         let card = CardId::new();
-        let runtime = repository_widget::RepositoryRuntime::selected_diff_fixture(card);
-        app.sidebar_model = sidebar::tests::panel_model();
-        let source = app.sidebar_model.source_control.as_mut().unwrap();
-        source.key.canonical_path = runtime.descriptor.worktree.clone();
-        let key = source.key.clone();
+        let runtime = repository_widget::RepositoryRuntime::selected_diff_fixture_at(card, temporary.path());
         app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
-        (app, card, key)
+        (temporary, app, card, key)
     }
 
     #[test]
     fn delayed_preparation_reserves_turn_and_refuses_changed_diff_before_git() {
-        let (mut app, card, key) = fixture();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, card, key) = fixture();
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
         let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).unwrap().prepare().unwrap();
         // Admission of the actual app action reserves before its worker runs.
@@ -168,7 +176,7 @@ mod tests {
 
     #[test]
     fn unchanged_buffer_preparation_applies_once_and_keeps_one_undo() {
-        let (mut app, card, key) = fixture();
+        let (_temporary, mut app, card, key) = fixture();
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
         let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, None).unwrap().prepare().unwrap();
         assert!(prepared.applies_to_buffer());
