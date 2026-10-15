@@ -485,3 +485,9 @@ commands open a target picker and retain its exact stash object identity.
 conflict row. They accept the chosen side and stage that exact path, using the
 same operation as the row buttons; a changed worktree or selection retires the
 captured command.
+
+Native code-buffer language actions are configurable as `editor_complete`
+(`Ctrl+Space`), `go_to_definition` (`F12`), `find_references` (`Shift+F12`),
+`show_hover` and `show_diagnostics` (unbound). Clearing or remapping these
+bindings retires their original native chords. `Space` is accepted as a named
+key in configured chords and the shortcut recorder.

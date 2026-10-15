@@ -385,6 +385,11 @@ pub struct KeyboardShortcuts {
     pub git_output: Vec<String>,
     pub git_accept_ours: Vec<String>,
     pub git_accept_theirs: Vec<String>,
+    pub editor_complete: Vec<String>,
+    pub go_to_definition: Vec<String>,
+    pub find_references: Vec<String>,
+    pub show_hover: Vec<String>,
+    pub show_diagnostics: Vec<String>,
 
 
     /// Serialized action names whose configured chords pass through to terminals.
@@ -537,6 +542,11 @@ impl Default for KeyboardShortcuts {
             git_output: Vec::new(),
             git_accept_ours: Vec::new(),
             git_accept_theirs: Vec::new(),
+            editor_complete: vec!["Ctrl+Space".into()],
+            go_to_definition: vec!["F12".into()],
+            find_references: vec!["Shift+F12".into()],
+            show_hover: Vec::new(),
+            show_diagnostics: Vec::new(),
 
 
             terminal_passthrough_actions: [
@@ -570,7 +580,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 138] {
+    pub fn actions(&self) -> [&Vec<String>; 143] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -715,6 +725,11 @@ impl KeyboardShortcuts {
             &self.git_output,
             &self.git_accept_ours,
             &self.git_accept_theirs,
+            &self.editor_complete,
+            &self.go_to_definition,
+            &self.find_references,
+            &self.show_hover,
+            &self.show_diagnostics,
 
 
         ]
@@ -722,7 +737,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 138] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 143] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -862,6 +877,11 @@ impl KeyboardShortcuts {
             &mut self.git_output,
             &mut self.git_accept_ours,
             &mut self.git_accept_theirs,
+            &mut self.editor_complete,
+            &mut self.go_to_definition,
+            &mut self.find_references,
+            &mut self.show_hover,
+            &mut self.show_diagnostics,
 
         ]
     }
@@ -912,7 +932,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 138] = [
+const SHORTCUT_ACTIONS: [&str; 143] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1056,6 +1076,11 @@ const SHORTCUT_ACTIONS: [&str; 138] = [
     "git_output",
     "git_accept_ours",
     "git_accept_theirs",
+    "editor_complete",
+    "go_to_definition",
+    "find_references",
+    "show_hover",
+    "show_diagnostics",
 
 
 ];
@@ -1198,7 +1223,7 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
 /// Native code-buffer actions have a narrower scope than workspace actions.
 /// Ordinary text controls and shells keep their own editing commands.
 pub fn is_editor_command(action: &str) -> bool {
-    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all" | "next_diagnostic" | "previous_diagnostic")
+    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all" | "next_diagnostic" | "previous_diagnostic" | "editor_complete" | "go_to_definition" | "find_references" | "show_hover" | "show_diagnostics")
 }
 
 pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
@@ -1320,6 +1345,7 @@ pub enum ShortcutKey {
     ArrowUp,
     ArrowDown,
     Tab,
+    Space,
     PageUp,
     PageDown,
     Function(u8),
@@ -1362,6 +1388,8 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowDown)
             } else if token.eq_ignore_ascii_case("tab") {
                 Some(ShortcutKey::Tab)
+            } else if token.eq_ignore_ascii_case("space") {
+                Some(ShortcutKey::Space)
             } else if token.eq_ignore_ascii_case("pageup") {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
@@ -1435,6 +1463,7 @@ pub fn shortcut_search_keywords(value: &str) -> String {
                 ShortcutKey::ArrowUp => "Up".into(),
                 ShortcutKey::ArrowDown => "Down".into(),
                 ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::Space => "Space".into(),
                 ShortcutKey::PageUp => "PageUp".into(),
                 ShortcutKey::PageDown => "PageDown".into(),
                 ShortcutKey::Function(number) => format!("F{number}"),
@@ -2239,7 +2268,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 133] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 138] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2378,6 +2407,11 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 133] = [
     "git_output",
     "git_accept_ours",
     "git_accept_theirs",
+    "editor_complete",
+    "go_to_definition",
+    "find_references",
+    "show_hover",
+    "show_diagnostics",
 
 
 ];

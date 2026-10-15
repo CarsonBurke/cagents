@@ -525,10 +525,12 @@ impl Cagents {
             }
             if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
                 let name = match key {
+                    keyboard::Key::Character(value) if value == " " => Some("Space".to_owned()),
                     keyboard::Key::Character(value) if value.chars().count() == 1 => {
                         Some(value.to_uppercase())
                     }
                     keyboard::Key::Named(name) => match name {
+                        keyboard::key::Named::Space => Some("Space".into()),
                         keyboard::key::Named::ArrowLeft => Some("Left".into()),
                         keyboard::key::Named::ArrowRight => Some("Right".into()),
                         keyboard::key::Named::ArrowUp => Some("Up".into()),
@@ -1198,6 +1200,7 @@ impl Cagents {
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
+            editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
             pane_index,
             pane_count: self.workspace.order().count(),
             project_count: self.sidebar_model.projects.len(),
@@ -1293,6 +1296,12 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::editor_language_command_bit(command).is_some() {
+            return self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.editor_language_command_action(card, command),
+                _ => None,
+            }).map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        }
         if workspace_widget::git_command_bit(command).is_some() {
             let Some(target) = self.git_command_target() else { return Task::none(); };
             if !target.available(&self.sidebar_model, &self.sidebar_state, command) { return Task::none(); }
@@ -1537,6 +1546,11 @@ impl Cagents {
             | Command::GitOutput
             | Command::GitAcceptOurs
             | Command::GitAcceptTheirs
+            | Command::EditorComplete
+            | Command::GoToDefinition
+            | Command::FindReferences
+            | Command::ShowHover
+            | Command::ShowDiagnostics
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1809,6 +1823,11 @@ impl SettingsField {
             Self::ShortcutGitOutput => Some(Command::GitOutput),
             Self::ShortcutGitAcceptOurs => Some(Command::GitAcceptOurs),
             Self::ShortcutGitAcceptTheirs => Some(Command::GitAcceptTheirs),
+            Self::ShortcutEditorComplete => Some(Command::EditorComplete),
+            Self::ShortcutGoToDefinition => Some(Command::GoToDefinition),
+            Self::ShortcutFindReferences => Some(Command::FindReferences),
+            Self::ShortcutShowHover => Some(Command::ShowHover),
+            Self::ShortcutShowDiagnostics => Some(Command::ShowDiagnostics),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1985,6 +2004,11 @@ impl ShortcutDraft {
             (Command::GitOutput, self.git_output.as_str()),
             (Command::GitAcceptOurs, self.git_accept_ours.as_str()),
             (Command::GitAcceptTheirs, self.git_accept_theirs.as_str()),
+            (Command::EditorComplete, self.editor_complete.as_str()),
+            (Command::GoToDefinition, self.go_to_definition.as_str()),
+            (Command::FindReferences, self.find_references.as_str()),
+            (Command::ShowHover, self.show_hover.as_str()),
+            (Command::ShowDiagnostics, self.show_diagnostics.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),

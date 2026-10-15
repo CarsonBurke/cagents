@@ -151,6 +151,11 @@ pub enum GlobalShortcut {
     GitOutput,
     GitAcceptOurs,
     GitAcceptTheirs,
+    EditorComplete,
+    GoToDefinition,
+    FindReferences,
+    ShowHover,
+    ShowDiagnostics,
 
 
     CommandPalette,
@@ -379,6 +384,11 @@ impl GlobalShortcut {
             Self::GitOutput => "git_output",
             Self::GitAcceptOurs => "git_accept_ours",
             Self::GitAcceptTheirs => "git_accept_theirs",
+            Self::EditorComplete => "editor_complete",
+            Self::GoToDefinition => "go_to_definition",
+            Self::FindReferences => "find_references",
+            Self::ShowHover => "show_hover",
+            Self::ShowDiagnostics => "show_diagnostics",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -536,6 +546,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub editor_language_commands: u8,
     pub diff_commands: u8,
     pub review_commands: u8,
     pub can_navigate_diagnostics: bool,
@@ -615,6 +626,7 @@ impl ShortcutDescriptor {
         if let Some(bit) = diff_command_bit(self.action) {
             return context.diff_commands & bit != 0;
         }
+        if let Some(bit) = editor_language_command_bit(self.action) { return context.editor_language_commands & bit != 0; }
         if let Some(bit) = editor_command_bit(self.action) {
             return context.editor_commands & bit != 0;
         }
@@ -1298,6 +1310,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::GitOutput, label: "Show or hide Git output", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::GitAcceptOurs, label: "Accept ours and stage", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::GitAcceptTheirs, label: "Accept theirs and stage", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::EditorComplete, label: "Trigger completion", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::GoToDefinition, label: "Go to definition", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::FindReferences, label: "Find references", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::ShowHover, label: "Show hover information", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::ShowDiagnostics, label: "Show diagnostics", repeatable: false, scope: ShortcutScope::Editor },
 
 ];
 
@@ -1421,6 +1438,11 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitOutput => &shortcuts.git_output,
         GlobalShortcut::GitAcceptOurs => &shortcuts.git_accept_ours,
         GlobalShortcut::GitAcceptTheirs => &shortcuts.git_accept_theirs,
+        GlobalShortcut::EditorComplete => &shortcuts.editor_complete,
+        GlobalShortcut::GoToDefinition => &shortcuts.go_to_definition,
+        GlobalShortcut::FindReferences => &shortcuts.find_references,
+        GlobalShortcut::ShowHover => &shortcuts.show_hover,
+        GlobalShortcut::ShowDiagnostics => &shortcuts.show_diagnostics,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
@@ -1495,6 +1517,7 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
         ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
         ShortcutKey::Tab => Key::Named(Named::Tab),
+        ShortcutKey::Space => Key::Named(Named::Space),
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
         ShortcutKey::Function(number) => Key::Named(match number {
@@ -1953,6 +1976,17 @@ pub fn shortcut_descriptor_by_id(id: &str) -> Option<&'static ShortcutDescriptor
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| descriptor.id() == id)
 }
 
+pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::EditorComplete => Some(1 << 0),
+        GlobalShortcut::GoToDefinition => Some(1 << 1),
+        GlobalShortcut::FindReferences => Some(1 << 2),
+        GlobalShortcut::ShowHover => Some(1 << 3),
+        GlobalShortcut::ShowDiagnostics => Some(1 << 4),
+        _ => None,
+    }
+}
+
 pub const fn editor_command_bit(command: GlobalShortcut) -> Option<u8> {
     Some(match command {
         GlobalShortcut::EditorUndo => 1,
@@ -2009,6 +2043,7 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
+            ShortcutKey::Space => matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Space)) || matches!(key.as_ref(), keyboard::Key::Character(value) if value == " "),
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)

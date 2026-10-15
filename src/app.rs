@@ -2949,12 +2949,17 @@ pub enum SettingsField {
     ShortcutGitOutput,
     ShortcutGitAcceptOurs,
     ShortcutGitAcceptTheirs,
+    ShortcutEditorComplete,
+    ShortcutGoToDefinition,
+    ShortcutFindReferences,
+    ShortcutShowHover,
+    ShortcutShowDiagnostics,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 138] = [
+    const SHORTCUTS: [Self; 143] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3098,6 +3103,11 @@ impl SettingsField {
         Self::ShortcutGitOutput,
         Self::ShortcutGitAcceptOurs,
         Self::ShortcutGitAcceptTheirs,
+        Self::ShortcutEditorComplete,
+        Self::ShortcutGoToDefinition,
+        Self::ShortcutFindReferences,
+        Self::ShortcutShowHover,
+        Self::ShortcutShowDiagnostics,
 
     ];
 
@@ -3246,6 +3256,11 @@ impl SettingsField {
             Self::ShortcutGitOutput => "Show or hide Git output",
             Self::ShortcutGitAcceptOurs => "Accept ours and stage",
             Self::ShortcutGitAcceptTheirs => "Accept theirs and stage",
+            Self::ShortcutEditorComplete => "Trigger completion",
+            Self::ShortcutGoToDefinition => "Go to definition",
+            Self::ShortcutFindReferences => "Find references",
+            Self::ShortcutShowHover => "Show hover information",
+            Self::ShortcutShowDiagnostics => "Show diagnostics",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3448,6 +3463,11 @@ impl SettingsField {
             | Self::ShortcutGitOutput
             | Self::ShortcutGitAcceptOurs
             | Self::ShortcutGitAcceptTheirs
+            | Self::ShortcutEditorComplete
+            | Self::ShortcutGoToDefinition
+            | Self::ShortcutFindReferences
+            | Self::ShortcutShowHover
+            | Self::ShortcutShowDiagnostics
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3613,6 +3633,11 @@ struct ShortcutDraft {
     git_output: String,
     git_accept_ours: String,
     git_accept_theirs: String,
+    editor_complete: String,
+    go_to_definition: String,
+    find_references: String,
+    show_hover: String,
+    show_diagnostics: String,
 
 
     command_palette: String,
@@ -3766,6 +3791,11 @@ impl ShortcutDraft {
             git_output: settings::format_chords(&shortcuts.git_output),
             git_accept_ours: settings::format_chords(&shortcuts.git_accept_ours),
             git_accept_theirs: settings::format_chords(&shortcuts.git_accept_theirs),
+            editor_complete: settings::format_chords(&shortcuts.editor_complete),
+            go_to_definition: settings::format_chords(&shortcuts.go_to_definition),
+            find_references: settings::format_chords(&shortcuts.find_references),
+            show_hover: settings::format_chords(&shortcuts.show_hover),
+            show_diagnostics: settings::format_chords(&shortcuts.show_diagnostics),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4134,6 +4164,11 @@ impl SettingsDraft {
             SettingsField::ShortcutGitOutput => self.keyboard_shortcuts.git_output = value,
             SettingsField::ShortcutGitAcceptOurs => self.keyboard_shortcuts.git_accept_ours = value,
             SettingsField::ShortcutGitAcceptTheirs => self.keyboard_shortcuts.git_accept_theirs = value,
+            SettingsField::ShortcutEditorComplete => self.keyboard_shortcuts.editor_complete = value,
+            SettingsField::ShortcutGoToDefinition => self.keyboard_shortcuts.go_to_definition = value,
+            SettingsField::ShortcutFindReferences => self.keyboard_shortcuts.find_references = value,
+            SettingsField::ShortcutShowHover => self.keyboard_shortcuts.show_hover = value,
+            SettingsField::ShortcutShowDiagnostics => self.keyboard_shortcuts.show_diagnostics = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4495,6 +4530,11 @@ fn settings_update(
         SettingsField::ShortcutGitOutput => { next.keyboard_shortcuts.git_output = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitAcceptOurs => { next.keyboard_shortcuts.git_accept_ours = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitAcceptTheirs => { next.keyboard_shortcuts.git_accept_theirs = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorComplete => { next.keyboard_shortcuts.editor_complete = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGoToDefinition => { next.keyboard_shortcuts.go_to_definition = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutFindReferences => { next.keyboard_shortcuts.find_references = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutShowHover => { next.keyboard_shortcuts.show_hover = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutShowDiagnostics => { next.keyboard_shortcuts.show_diagnostics = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

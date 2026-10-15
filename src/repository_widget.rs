@@ -2463,6 +2463,26 @@ impl RepositoryRuntime {
             | (u8::from(!document.content.is_empty()) << 5)
     }
 
+    /// Language actions belong to the mounted editable document, whose LSP
+    /// registration and caret supply the existing request handlers' inputs.
+    pub fn editor_language_command_capabilities(&self) -> u8 {
+        if self.editable_surface_visible() && self.lsp_document.is_some() && self.cursor_position().is_some() { 31 } else { 0 }
+    }
+
+    pub fn editor_language_command_action(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let bit = crate::workspace_widget::editor_language_command_bit(command)?;
+        if self.editor_language_command_capabilities() & bit == 0 { return None; }
+        Some(RepositoryAction::Language { card, action: match command {
+            Command::EditorComplete => EditorLspAction::Complete,
+            Command::GoToDefinition => EditorLspAction::Definition(None),
+            Command::FindReferences => EditorLspAction::References,
+            Command::ShowHover => EditorLspAction::Hover(Some(self.cursor_position()?)),
+            Command::ShowDiagnostics => EditorLspAction::Diagnostics,
+            _ => return None,
+        } })
+    }
+
     /// Changes presentation without replacing the open buffer or its edit history.
     pub fn set_wrap_lines(&mut self, wrap_lines: bool) {
         self.wrap_lines = wrap_lines;
@@ -8471,7 +8491,7 @@ fn registered_editor_binding(card: CardId, runtime: &RepositoryRuntime, press: &
         return None;
     }
     if let Some(command) = crate::workspace_widget::editor_shortcut(&press.key, press.physical_key, press.modifiers, &runtime.keyboard_shortcuts) {
-        return Some(editor_command_action(card, command).map(text_editor::Binding::Custom));
+        return Some(runtime.editor_language_command_action(card, command).or_else(|| editor_command_action(card, command)).map(text_editor::Binding::Custom));
     }
     use iced::keyboard::Key;
     if text_editor::history_command(press).is_some() || (press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() && matches!(&press.key, Key::Character(key) if matches!(key.to_ascii_lowercase().as_str(), "x" | "c" | "v" | "a"))) { return Some(None); }
@@ -9716,16 +9736,6 @@ fn editable_document_view<'a>(
                 }
                 if let Some(binding) = registered_editor_binding(card, runtime, &press) { return binding; }
                 let action = match &press.key {
-                    Key::Character(character)
-                        if character.as_str() == " " && press.modifiers.command() =>
-                    {
-                        Some(EditorLspAction::Complete)
-                    }
-                    Key::Named(Named::F12) => Some(if press.modifiers.shift() {
-                        EditorLspAction::References
-                    } else {
-                        EditorLspAction::Definition(None)
-                    }),
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
                             || !runtime.language.hover.is_empty() =>
@@ -17829,6 +17839,37 @@ mod tests {
         assert!(descriptor.available(&context));
         context.focused = crate::workspace_widget::FocusedPane::TextInput;
         assert!(!descriptor.available(&context));
+    }
+
+    #[test]
+    fn registered_language_bindings_follow_remapping_and_current_document_capabilities() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        use iced::keyboard::{Key, key::{Named, Physical, NativeCode}};
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        let press = |key: Key, modifiers| iced::widget::text_editor::KeyPress {
+            modified_key: key.clone(), key, physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            modifiers, text: None, status: iced::widget::text_editor::Status::Focused { is_hovered: false },
+        };
+        assert!(matches!(registered_editor_binding(card, &runtime, &press(Key::Named(Named::F12), iced::keyboard::Modifiers::empty())), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { action: EditorLspAction::Definition(None), .. })))));
+        for key in [Key::Named(Named::Space), Key::Character(" ".into())] {
+            assert!(matches!(registered_editor_binding(card, &runtime, &press(key, iced::keyboard::Modifiers::CTRL)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { action: EditorLspAction::Complete, .. })))));
+        }
+        assert!(matches!(runtime.editor_language_command_action(card, Command::ShowHover), Some(RepositoryAction::Language { action: EditorLspAction::Hover(Some(at)), .. }) if at == runtime.cursor_position().unwrap()), "explicit hover uses the caret rather than the mouse-leave dismiss action");
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.go_to_definition = vec!["F9".into()];
+        shortcuts.find_references.clear();
+        shortcuts.editor_complete.clear();
+        runtime.set_keyboard_shortcuts(Arc::new(shortcuts));
+        assert!(registered_editor_binding(card, &runtime, &press(Key::Named(Named::F12), iced::keyboard::Modifiers::empty())).is_none());
+        assert!(registered_editor_binding(card, &runtime, &press(Key::Named(Named::F12), iced::keyboard::Modifiers::SHIFT)).is_none());
+        assert!(registered_editor_binding(card, &runtime, &press(Key::Named(Named::Space), iced::keyboard::Modifiers::CTRL)).is_none());
+        assert!(matches!(registered_editor_binding(card, &runtime, &press(Key::Named(Named::F9), iced::keyboard::Modifiers::empty())), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { action: EditorLspAction::Definition(None), .. })))));
+        runtime.set_lsp_document(None);
+        assert_eq!(runtime.editor_language_command_capabilities(), 0);
+        for command in [Command::EditorComplete, Command::GoToDefinition, Command::FindReferences, Command::ShowHover, Command::ShowDiagnostics] {
+            assert!(runtime.editor_language_command_action(card, command).is_none());
+        }
     }
 
     #[test]
