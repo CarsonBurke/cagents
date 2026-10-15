@@ -54,6 +54,18 @@ impl AdmissionFailure {
     pub fn ticket(&self) -> &AdmissionTicket { &self.ticket }
 }
 
+/// A phase-one payload retains the original owner while its message waits.
+/// This is not an Editable grant. Only consuming it can start enrollment.
+#[derive(Debug, Clone)]
+pub struct PreparedRoot { ticket: AdmissionTicket, _owner: Arc<EditedRootLease> }
+impl PreparedRoot {
+    pub fn ticket(&self) -> &AdmissionTicket { &self.ticket }
+    pub fn begin_enrollment(self) -> Result<EnrollmentWork, AdmissionFailure> {
+        // Set the in-flight fence BEFORE this payload releases its passive Arc.
+        self.ticket.begin_enrollment()
+    }
+}
+
 /// The successful async result retains both the actual lease and its custody
 /// ticket. Consumers clone this SAME lease into Source/Doc/Undo/queued workers.
 #[derive(Debug, Clone)]
@@ -110,6 +122,23 @@ impl EditedRootAdmissions {
         match first_error { Some(error) => Err(error), None => Ok(None) }
     }
 
+    /// Pure first cleanup admission after a stale/discarded result or final
+    /// passive owner drops. Prepared payloads and active pairs retain raw Arcs;
+    /// observers alone do not keep an abandoned root registered forever.
+    /// Unknown/failed cleanup is never rearmed by this ordinary sweep.
+    pub fn request_unowned_retirements(&self) {
+        for ticket in self.entries.values() {
+            let mut state = ticket.lock();
+            if !state.worker && !state.retiring
+                && matches!(state.phase, AdmissionPhase::Prepared | AdmissionPhase::Active)
+                && state.owner.as_ref().is_some_and(|owner| Arc::strong_count(owner) == 1) {
+                state.retiring = true;
+                state.retirement_armed = true;
+                state.phase = AdmissionPhase::RetirementRequested;
+            }
+        }
+    }
+
     pub fn request_all_retirements(&self) {
         for ticket in self.entries.values() { ticket.request_retirement(); }
     }
@@ -152,7 +181,7 @@ impl AdmissionTicket {
 
     /// The phase-one worker must call prepared BEFORE producing its message.
     /// UI ingress does not need delivery to preserve this original owner.
-    pub fn begin_enrollment(&self) -> Result<EnrollmentWork, AdmissionFailure> {
+    fn begin_enrollment(&self) -> Result<EnrollmentWork, AdmissionFailure> {
         let mut state = self.lock();
         if state.phase != AdmissionPhase::Prepared || state.worker || state.retiring || state.owner.is_none() {
             return Err(self.failure("Original root enrollment is unavailable; retain its admission ticket."));
@@ -236,12 +265,25 @@ pub struct PreparationWork { ticket: AdmissionTicket, finished: bool }
 impl PreparationWork {
     /// Store actual client.prepare_edited_root_owner result BEFORE any enroll
     /// RPC. Even a later panic or lost message leaves the window's SAME owner.
-    pub fn prepared(mut self, owner: Arc<EditedRootLease>) -> AdmissionTicket {
+    pub fn prepared(mut self, owner: Arc<EditedRootLease>) -> PreparedRoot {
         let mut state = self.ticket.lock();
         debug_assert!(state.owner.is_none() && state.retirement.is_none());
+        let payload = PreparedRoot { ticket: self.ticket.clone(), _owner: owner.clone() };
         state.owner = Some(owner);
         state.worker = false;
         state.phase = if state.retiring { AdmissionPhase::RetirementRequested } else { AdmissionPhase::Prepared };
+        self.finished = true;
+        drop(state);
+        payload
+    }
+    /// Normal read-only/binary/PDF completion, or reuse of an existing validated
+    /// AdmittedRoot pair. No new original owner and no RPC was prepared here.
+    pub fn finish_read_only(mut self) -> AdmissionTicket {
+        let mut state = self.ticket.lock();
+        debug_assert!(state.owner.is_none() && state.retirement.is_none());
+        state.worker = false;
+        state.phase = AdmissionPhase::Settled;
+        state.notice = None;
         self.finished = true;
         drop(state);
         self.ticket.clone()

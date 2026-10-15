@@ -88,6 +88,9 @@ impl Cagents {
     /// endpoint is not an Active lease; only the actual enrolled worker receipt
     /// permits Editable publication. Historical/preview runtimes do not call it.
     pub(super) fn configure_repository_recovery_endpoint(&mut self, runtime: &mut RepositoryRuntime) {
+        // SAME original window custody; Runtime's internal file loads reserve
+        // there before their first worker, never in a per-pane registry.
+        runtime.set_edited_root_admissions(self.edited_root_admissions.clone());
         let expected = (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY)
             .then_some(self.workspace_model.identity);
         match LocalRecoveryEndpoint::capture(expected) {
