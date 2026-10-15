@@ -8487,37 +8487,12 @@ fn find_strip<'a>(
             .width(Length::Fill)
             .into(),
     ];
-    row.push(crate::ui_controls::find_options(
-        runtime.find_options.case_sensitive,
-        runtime.find_options.regex,
-        runtime.find_options.whole_word,
-        true,
-        move |option, enabled| RepositoryAction::FindOptionsChanged {
-            card,
-            option,
-            enabled,
-        },
-    ));
-    if !runtime.shows_diff() {
-        let selection_enabled =
-            runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
-        let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some())
-            .label("Selection");
-        if selection_enabled {
-            selection = selection
-                .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
-        }
-        row.push(
-            crate::interaction::tooltip(selection, "Search the selection captured when enabled")
-                .into(),
-        );
-    }
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
     if !runtime.find_query.is_empty() {
         row.push(
-            crate::design::caption(if let Some(error) = &runtime.find_error {
-                error.clone()
+            crate::design::caption(if runtime.find_error.is_some() {
+                "Invalid expression".into()
             } else if if runtime.shows_diff() {
                 runtime.diff_find_pending()
             } else {
@@ -8560,6 +8535,36 @@ fn find_strip<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
+    let mut options = vec![crate::ui_controls::find_options(
+        runtime.find_options.case_sensitive,
+        runtime.find_options.regex,
+        runtime.find_options.whole_word,
+        true,
+        move |option, enabled| RepositoryAction::FindOptionsChanged {
+            card,
+            option,
+            enabled,
+        },
+    )];
+    if !runtime.shows_diff() {
+        let selection_enabled =
+            runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
+        let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some())
+            .label("Selection");
+        if selection_enabled {
+            selection = selection
+                .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
+        }
+        options.push(
+            crate::interaction::tooltip(selection, "Search the selection captured when enabled")
+                .into(),
+        );
+    }
+    strips.push(widget::row::with_children(options).spacing(space::S).align_y(Alignment::Center).into());
+    if let Some(error) = &runtime.find_error {
+        strips.push(widget::text::body(format!("Invalid expression: {error}")).size(12)
+            .class(cosmic::theme::Text::Custom(crate::design::destructive_text)).into());
+    }
     if runtime.replace_open && !runtime.shows_diff() {
         strips.push(
             widget::row::with_children(vec![

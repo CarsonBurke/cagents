@@ -15,7 +15,11 @@ pub fn pattern(query: &str, options: FindOptions) -> Result<regex::Regex, String
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(2 * REGEX_SIZE_LIMIT)
         .build()
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            let message = error.to_string();
+            let line = message.lines().last().unwrap_or("Invalid regular expression").trim();
+            line.strip_prefix("error: ").unwrap_or(line).chars().take(240).collect()
+        })
 }
 
 fn word(character: char) -> bool {
