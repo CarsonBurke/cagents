@@ -4920,7 +4920,7 @@ mod tests {
         };
         let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
         let renderer = crate::app::tests::headless_renderer();
-        for width in [240.0, 600.0] {
+        for width in [160.0, 240.0, 600.0] {
             let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
             let mut tree = Tree::new(element.as_widget());
             let limits =
@@ -4937,12 +4937,12 @@ mod tests {
                 "recorded time and Copy never cover the command/status"
             );
             assert!(actions.x >= 0.0 && actions.x + actions.width <= width + 0.1);
-            if width == 240.0 {
+            if width == 160.0 {
                 assert!(
                     actions.y >= header.y + header.height,
                     "narrow history dates use their own reserved line"
                 );
-            } else {
+            } else if width == 600.0 {
                 assert!(
                     actions.x >= header.x + header.width,
                     "wide rows keep actions beside the header"
