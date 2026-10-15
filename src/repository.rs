@@ -25,6 +25,7 @@ mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
 mod status_limit;
+mod operation_metadata;
 
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
@@ -4670,7 +4671,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         directory: Option<&Path>,
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
-        let mut state = directory.and_then(Self::operation_state_from_git_dir);
+        let mut state = directory.map(operation_metadata::read_operation_state).transpose()?.flatten();
         if let Some(message) = state.as_ref().and_then(|state| state.message.as_ref()) {
             let command = self
                 .git_read(worktree, ["stripspace", "--strip-comments"])
@@ -4694,54 +4695,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
         let directory = self.git_dir_for_io(worktree, cancellation)?;
-        Ok(Self::operation_state_from_git_dir(&directory))
+        operation_metadata::read_operation_state(&directory)
     }
 
+    /// Row badges need only a best-effort kind; selected-panel reads use the
+    /// checked reader and report malformed or unavailable control metadata.
     pub fn operation_state_from_git_dir(directory: &Path) -> Option<GitOperationState> {
-        let read = |path: &str| {
-            fs::read_to_string(directory.join(path))
-                .ok()
-                .map(|text| text.trim().to_owned())
-                .filter(|text| !text.is_empty())
-        };
-        let (kind, incoming_ref, message) =
-            if directory.join("rebase-merge").is_dir() || directory.join("rebase-apply").is_dir() {
-                let prefix = if directory.join("rebase-merge").is_dir() {
-                    "rebase-merge"
-                } else {
-                    "rebase-apply"
-                };
-                (
-                    GitOperationKind::Rebase,
-                    read(&format!("{prefix}/onto")),
-                    read(&format!("{prefix}/message")).or_else(|| read("MERGE_MSG")),
-                )
-            } else if directory.join("MERGE_HEAD").exists() {
-                (
-                    GitOperationKind::Merge,
-                    read("MERGE_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else if directory.join("CHERRY_PICK_HEAD").exists() {
-                (
-                    GitOperationKind::CherryPick,
-                    read("CHERRY_PICK_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else if directory.join("REVERT_HEAD").exists() {
-                (
-                    GitOperationKind::Revert,
-                    read("REVERT_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else {
-                return None;
-            };
-        Some(GitOperationState {
-            kind,
-            incoming_ref,
-            message,
-        })
+        operation_metadata::read_operation_state(directory).ok().flatten()
     }
 
     pub fn stashes(
