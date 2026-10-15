@@ -71,6 +71,14 @@ impl TerminalSurface {
         self.handle.proof()
     }
 
+    pub fn worker_binding(&self) -> Option<super::HostedTerminalBinding> {
+        self.handle.worker_binding()
+    }
+
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
+    }
+
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.handle.acknowledge_redraw(observed_generation);
     }

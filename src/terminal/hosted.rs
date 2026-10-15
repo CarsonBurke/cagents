@@ -182,6 +182,13 @@ struct RetainedFrame {
     expires: Instant,
 }
 
+/// Immutable authenticated identity of one hosted emulator/PTY owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedTerminalBinding {
+    pub source: TerminalSession,
+    pub execution_instance: uuid::Uuid,
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
@@ -217,6 +224,7 @@ struct HostedPublishedState {
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
+    worker_binding: OnceLock<HostedTerminalBinding>,
     attachment: Mutex<AttachmentState>,
     attachment_changed: Condvar,
     wake: Arc<WakeCallback>,
@@ -249,6 +257,7 @@ impl HostedPublishedState {
                 TerminalVisibility::Hidden
             })),
             proof: Mutex::new(expected_host),
+            worker_binding: OnceLock::new(),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_changed: Condvar::new(),
             wake,
@@ -656,6 +665,14 @@ impl HostedPublishedState {
             .clone()
     }
 
+    fn pin_worker(&self, terminal: &super::ipc::TerminalDescriptor) -> bool {
+        if terminal.execution_instance.is_nil() {return false;}
+        let binding=self.worker_binding.get_or_init(||HostedTerminalBinding {
+            source:terminal.session.clone(),execution_instance:terminal.execution_instance,
+        });
+        binding.execution_instance==terminal.execution_instance
+    }
+
     fn pin_proof(&self, proof: &HostSessionProof) -> bool {
         if !proof.is_complete() {
             return false;
@@ -948,6 +965,15 @@ impl HostedTerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .confirmed;
         confirmed.then(|| self.inner.published.proof()).flatten()
+    }
+
+    /// Original worker authority survives transport loss, never worker replacement.
+    pub fn worker_binding(&self) -> Option<HostedTerminalBinding> {
+        self.inner.published.worker_binding.get().cloned()
+    }
+
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.inner.published.worker_binding.get().map(|binding|binding.execution_instance)
     }
 
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
@@ -1827,6 +1853,9 @@ fn serve_connection(
                     .iter()
                     .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
                 {
+                    if !published.pin_worker(terminal) {
+                        return reject_handshake(events,published,stop,worker_changed_error());
+                    }
                     published.observe_activity(terminal.activity);
                     if published
                         .observe_agent_activity(events, terminal.agent_activity)
@@ -1864,7 +1893,14 @@ fn serve_connection(
     }
 
     if !attached {
+        // Once accepted, this handle can only reattach its original worker.
+        // Losing that worker must never replay the original spawn intent.
+        let attach_only=published.worker_binding.get().is_some();
         let (kind, request) = match intent {
+            ConnectionIntent::Spawn(_) if attach_only => (
+                PendingRequest::Attach,
+                ClientRequest::Attach {terminal_id,after_generation:published.snapshot_cursor(),after_event_sequence:published.event_sequence.load(Ordering::Acquire)},
+            ),
             ConnectionIntent::Attach => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
@@ -1904,39 +1940,7 @@ fn serve_connection(
         return ConnectionEnd::Stop;
     }
 
-    if send_request(
-        connection.writer(),
-        &proof,
-        &mut next_request_id,
-        &mut pending,
-        PendingRequest::Command("restore hosted terminal visibility"),
-        ClientRequest::SetVisibility {
-            terminal_id,
-            visibility: published.desired_visibility(),
-        },
-    )
-    .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-    let epoch = published
-        .output_observation
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .epoch;
-    if epoch != 0
-        && send_request(
-            connection.writer(),
-            &proof,
-            &mut next_request_id,
-            &mut pending,
-            PendingRequest::Command("restore terminal output observation"),
-            ClientRequest::TerminalAcknowledge { terminal_id, epoch },
-        )
-        .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
+    let mut presentation_restored=false;
 
     loop {
         published.expire_retained(Instant::now());
@@ -1944,7 +1948,44 @@ fn serve_connection(
             connection.close();
             return ConnectionEnd::Stop;
         }
-        while pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        if attached && !presentation_restored {
+        if send_request(
+            connection.writer(),
+            &proof,
+            &mut next_request_id,
+            &mut pending,
+            PendingRequest::Command("restore hosted terminal visibility"),
+            ClientRequest::SetVisibility {
+                terminal_id,
+                visibility: published.desired_visibility(),
+            },
+        )
+        .is_err()
+        {
+            return ConnectionEnd::Retry;
+        }
+        let epoch = published
+            .output_observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .epoch;
+        if epoch != 0
+            && send_request(
+                connection.writer(),
+                &proof,
+                &mut next_request_id,
+                &mut pending,
+                PendingRequest::Command("restore terminal output observation"),
+                ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+            )
+                .is_err()
+        {
+            return ConnectionEnd::Retry;
+        }
+
+            presentation_restored=true;
+        }
+        while attached && pending.len() < MAX_IN_FLIGHT_REQUESTS {
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -2012,7 +2053,7 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        let work = if attached && pending.len() < MAX_IN_FLIGHT_REQUESTS {
             wait_for_client_work(stop, commands, connection.incoming(), published)
         } else {
             wait_for_server_or_stop(stop, connection.incoming(), published)
@@ -2059,6 +2100,9 @@ fn serve_connection(
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if !published.pin_worker(&terminal) {
+                            return reject_handshake(events,published,stop,worker_changed_error());
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2082,6 +2126,9 @@ fn serve_connection(
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
+                        if !published.pin_worker(&terminal) {
+                            return reject_handshake(events,published,stop,worker_changed_error());
+                        }
                         attached = true;
                         published.observe_activity(terminal.activity);
                         if published
@@ -2316,6 +2363,11 @@ fn serve_connection(
             _ => return ConnectionEnd::Retry,
         }
     }
+}
+
+fn worker_changed_error() -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::ProofMismatch,
+        "The terminal worker changed; rediscover its current attachment before sending input",false)
 }
 
 fn send_request(
@@ -3133,7 +3185,7 @@ mod tests {
             assert_eq!(handle.proof(), None);
             assert!(handle.wait_until_attached(Duration::ZERO).is_err());
             let terminal = TerminalDescriptor {
-                execution_instance: uuid::Uuid::nil(),
+                execution_instance: session.id.as_uuid(),
                 screen_lost_after_crash: false,
                 session,
                 generation: 0,
@@ -3207,7 +3259,7 @@ mod tests {
         stream.write_all(&frame[2..]).unwrap();
         let spawn: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
         let terminal = TerminalDescriptor {
-            execution_instance: uuid::Uuid::nil(),
+            execution_instance: session.id.as_uuid(),
             screen_lost_after_crash: false,
             session,
             generation: 0,
@@ -3432,11 +3484,6 @@ mod tests {
             );
             let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(attach.request, ClientRequest::Attach { .. }));
-            let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-            assert!(matches!(
-                visibility.request,
-                ClientRequest::SetVisibility { .. }
-            ));
             if !during_attach {
                 send(
                     &mut stream,
@@ -3445,7 +3492,7 @@ mod tests {
                     ServerMessage::Response {
                         response: ServerResponse::Attached {
                             terminal: TerminalDescriptor {
-                                execution_instance: uuid::Uuid::nil(),
+                                execution_instance: session.id.as_uuid(),
                                 screen_lost_after_crash: false,
                                 session,
                                 generation: 0,
@@ -3463,12 +3510,17 @@ mod tests {
                 );
                 handle.wait_until_attached(Duration::from_secs(2)).unwrap();
             }
+            let visibility=if during_attach {None} else {
+                let request:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request,ClientRequest::SetVisibility {..}));
+                Some(request)
+            };
             send(
                 &mut stream,
                 if during_attach {
                     attach.request_id
                 } else {
-                    visibility.request_id
+                    visibility.as_ref().unwrap().request_id
                 },
                 pinned.clone(),
                 shutdown(),
@@ -3529,6 +3581,50 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn same_handle_refuses_same_daemon_same_id_successor_before_replaying_input() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket=directory.path().join("worker-pin.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let pinned=proof("worker-pin");let source=session();let id=source.id;
+        let first_instance=uuid::Uuid::new_v4();let successor=uuid::Uuid::new_v4();
+        let descriptor=|instance| {
+            let mut value=TerminalDescriptor::relaunchable(id,source.launch.clone(),None);
+            value.session=source.clone();value.execution_instance=instance;value.attached=true;value
+        };
+        let connect=|stream:&mut UnixStream,terminal| {
+            let request:ClientEnvelope=read_frame(stream).unwrap().unwrap();
+            assert!(matches!(request.request,ClientRequest::Connect {..}));
+            write_frame(stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(request.request_id),proof:pinned.clone(),
+                message:ServerMessage::Response {response:ServerResponse::Connected {proof:pinned.clone(),resumed:vec![terminal]}},}).unwrap();
+        };
+        let handle=HostedTerminalHandle::connect_at(socket.clone(),id,Some(pinned.clone()),|_|{}).unwrap();
+        let mut first=accept_connection(&listener);connect(&mut first,descriptor(first_instance));
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert_eq!(handle.worker_binding(),Some(HostedTerminalBinding {source:source.clone(),execution_instance:first_instance}));
+        let restore:ClientEnvelope=read_frame(&mut first).unwrap().unwrap();
+        assert!(matches!(restore.request,ClientRequest::SetVisibility {..}));
+        drop(first);
+        let mut second=accept_connection(&listener);
+        handle.input(b"MUST_NOT_REACH_SUCCESSOR\n".to_vec()).unwrap();
+        connect(&mut second,descriptor(successor));
+        assert_eq!(read_frame::<ClientEnvelope>(&mut second).unwrap(),None,"successor must see no replayed key, paste or presentation effect");
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while handle.input(vec![b'x'])!=Err(TerminalSendError::Closed) {assert!(Instant::now()<deadline);thread::yield_now();}
+        assert_eq!(handle.execution_instance(),Some(first_instance),"never refresh old authority from successor");
+        assert_eq!(handle.worker_binding().unwrap().source,source);
+        assert_eq!(handle.proof(),None);
+        let fresh=HostedTerminalHandle::connect_at(socket,id,Some(pinned.clone()),|_|{}).unwrap();
+        let mut third=accept_connection(&listener);connect(&mut third,descriptor(successor));
+        fresh.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert_eq!(fresh.execution_instance(),Some(successor));
+        let restore:ClientEnvelope=read_frame(&mut third).unwrap().unwrap();
+        assert!(matches!(restore.request,ClientRequest::SetVisibility {..}));
+        fresh.input(b"fresh-owner\n".to_vec()).unwrap();
+        let input:ClientEnvelope=read_frame(&mut third).unwrap().unwrap();
+        assert!(matches!(input.request,ClientRequest::Input {terminal_id,bytes} if terminal_id==id && bytes==b"fresh-owner\n"));
     }
 
     #[test]
@@ -3603,6 +3699,12 @@ mod tests {
                 attach.request,
                 ClientRequest::Attach { terminal_id: id, .. } if id == terminal_id
             ));
+            let mut terminal=TerminalDescriptor::relaunchable(terminal_id,session().launch,None);
+            terminal.execution_instance=terminal_id.as_uuid();terminal.attached=true;
+            write_frame(&mut stream,&ServerEnvelope {
+                version:PROTOCOL_VERSION,request_id:Some(attach.request_id),proof:pinned.clone(),
+                message:ServerMessage::Response {response:ServerResponse::Attached {terminal}},
+            }).unwrap();
             let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert!(matches!(
                 visibility.request,
@@ -3615,7 +3717,8 @@ mod tests {
                 ClientRequest::Input { terminal_id: id, bytes }
                     if id == terminal_id && bytes == *b"x"
             ));
-            assert_eq!(handle.proof(), None);
+            assert_eq!(handle.proof(), Some(pinned.clone()));
+            assert_eq!(handle.execution_instance(),Some(terminal_id.as_uuid()));
             drop(handle);
             break;
         }
@@ -4021,7 +4124,7 @@ mod tests {
                 response: ServerResponse::Connected {
                     proof: pinned.clone(),
                     resumed: vec![TerminalDescriptor {
-                        execution_instance: uuid::Uuid::nil(),
+                        execution_instance: session.id.as_uuid(),
                         screen_lost_after_crash: false,
                         session,
                         generation: 0,
