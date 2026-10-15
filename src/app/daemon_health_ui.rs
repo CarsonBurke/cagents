@@ -344,6 +344,7 @@ mod tests {
     fn lower_completion_cannot_enable_a_second_tab_owner_for_the_upper_dialog() {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.finish_modal_update(Task::none()));
         app.daemon_health_ui.confirmation = true;
         app.daemon_health_ui.restarting = true;
         app.daemon_health_ui.restore_keyboard_nav = Some(true);
@@ -383,6 +384,9 @@ mod tests {
                     Some(widget::Id::new(if expected { "dialog.reset-settings.confirm" } else { "dialog.reset-settings.cancel" })));
             }
         }
+        drop(app.update(Message::CancelResetSettings));
+        assert!(!app.modal_is_open());
+        assert!(app.core.keyboard_nav(), "the final pop restores the original workspace choice, not the upper dialog's suppressed restore flag");
     }
 
     #[test]

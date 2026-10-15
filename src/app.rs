@@ -12716,6 +12716,7 @@ impl Application for Cagents {
         );
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
+        let modal_stack = modal_ui::Stack::with_keyboard_nav(core.keyboard_nav());
         let settings_draft = SettingsDraft::from_settings(&settings);
         let shared_views = shared_views::State::for_workspace(&durable);
         let workspace_history = crate::tab_history::TabHistory::from_recent(
@@ -12849,7 +12850,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
-            modal_stack: Default::default(),
+            modal_stack,
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,

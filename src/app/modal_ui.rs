@@ -48,6 +48,7 @@ pub(super) struct Stack {
     frames: Vec<Frame>,
     generation: u64,
     focus_revision: Arc<std::sync::atomic::AtomicU64>,
+    workspace_keyboard_nav: Option<bool>,
     pub(super) workspace_focus: crate::interaction::FocusSnapshot,
 }
 struct Frame {
@@ -58,6 +59,12 @@ struct Frame {
     focus: crate::interaction::FocusSnapshot,
 }
 impl Stack {
+    pub(super) fn with_keyboard_nav(enabled: bool) -> Self {
+        Self { workspace_keyboard_nav: Some(enabled), ..Self::default() }
+    }
+    pub(super) fn adopt_keyboard_nav(&mut self, enabled: bool) {
+        self.workspace_keyboard_nav = Some(enabled);
+    }
     fn top(&self, active: &[Modal]) -> Option<Modal> {
         // Feature handlers are also called directly by tests and startup.
         // Newly present payloads still participate before the next update.
@@ -311,6 +318,12 @@ impl Cagents {
     }
     pub(super) fn finish_modal_update(&mut self, task: Task<Message>) -> Task<Message> {
         let active = self.active_modals();
+        // Learn the reader's choice before an opening handler suppresses it.
+        // A startup/direct-handler payload without a prior frame must not
+        // teach us an already-suppressed feature-local setting.
+        if self.modal_stack.frames.is_empty() && active.is_empty() {
+            self.modal_stack.adopt_keyboard_nav(self.core.keyboard_nav());
+        }
         let restore = self
             .modal_stack
             .frames
@@ -343,6 +356,9 @@ impl Cagents {
         if self.modal_stack.frames.is_empty()
             && let Some(restore) = restore
         {
+            if let Some(enabled) = self.modal_stack.workspace_keyboard_nav {
+                self.restore_modal_keyboard_nav(enabled);
+            }
             return Task::batch([task, self.modal_stack.focus(restore, fallback)]);
         }
         task
@@ -927,6 +943,42 @@ mod tests {
             ),
             Some(fallback)
         );
+    }
+
+    #[test]
+    fn full_unwind_preserves_both_workspace_keyboard_navigation_choices() {
+        for enabled in [false, true] {
+            let mut app = app();
+            app.core.set_keyboard_nav(enabled);
+            drop(app.finish_modal_update(Task::none()));
+            app.settings_reset_confirm = true;
+            app.settings_reset_keyboard_nav = Some(enabled);
+            app.core.set_keyboard_nav(false);
+            drop(app.finish_modal_update(Task::none()));
+            app.resume_ui.open = true;
+            drop(app.finish_modal_update(Task::none()));
+            drop(app.close_settings_reset());
+            drop(app.finish_modal_update(Task::none()));
+            assert_eq!(app.top_modal(), Some(Modal::Resume));
+            app.resume_ui.open = false;
+            drop(app.finish_modal_update(Task::none()));
+            assert_eq!(app.core.keyboard_nav(), enabled);
+        }
+    }
+
+    #[test]
+    fn direct_handler_without_a_workspace_snapshot_keeps_its_original_choice() {
+        for enabled in [false, true] {
+            let mut app = app();
+            // This fixture bypassed the update entry and already suppressed
+            // native traversal before its first registered frame existed.
+            app.settings_reset_confirm = true;
+            app.settings_reset_keyboard_nav = Some(enabled);
+            app.core.set_keyboard_nav(false);
+            drop(app.finish_modal_update(Task::none()));
+            drop(app.update(Message::CancelResetSettings));
+            assert_eq!(app.core.keyboard_nav(), enabled);
+        }
     }
 
     #[test]
