@@ -971,6 +971,7 @@ mod presentation_tests {
             "/project".into(),
             &Account::system(Provider::Claude),
             false,
+            &Default::default(),
         )
         .unwrap();
         let handle = Arc::new(ClientHandle::fixture(

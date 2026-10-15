@@ -4668,6 +4668,7 @@ mod tests {
                 start.request_id,
                 ServerResponse::ChatAttached {
                     session,
+                    account_home: None,
                     snapshot: Snapshot {
                         generation: 7,
                         ..Default::default()
@@ -4731,7 +4732,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (first, second) = futures_util::future::join(
+            let (first, second) = cosmic::iced::futures::future::join(
                 handle.original_prompt(Some("one"), Some("native-session"), 0, 256),
                 handle.original_prompt(Some("two"), Some("native-session"), 0, 256),
             )

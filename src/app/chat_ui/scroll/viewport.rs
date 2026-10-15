@@ -2,7 +2,9 @@
 //! changing the native scroll anchor or the reader's offset.
 use super::*;
 
-pub(super) fn viewport<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+pub(in crate::app::chat_ui) fn viewport<'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
     Element::new(Viewport {
         content: content.into(),
     })
