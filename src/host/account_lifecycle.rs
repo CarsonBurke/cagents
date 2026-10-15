@@ -20,7 +20,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-type Map = BTreeMap<uuid::Uuid, Reserved>;
+type Map = BTreeMap<uuid::Uuid, Arc<Reserved>>;
+#[derive(Clone)]
 pub(super) struct Reserved {
     homes: Vec<Home>,
     /// Opaque physical annotation namespaces from a selected missing account's
@@ -28,6 +29,15 @@ pub(super) struct Reserved {
     namespaces: BTreeSet<String>,
 }
 pub(super) type Reservations = Arc<Mutex<Map>>;
+
+/// Replacing one immutable scope also invalidates prepared observations with
+/// the same operation token. A newly enrolled inode must never hide behind an
+/// unchanged token-only CAS.
+fn same_basis(observed: &Map, current: &Map) -> bool {
+    observed.len() == current.len() && observed.iter().all(|(token, scope)| {
+        current.get(token).is_some_and(|current| Arc::ptr_eq(scope, current))
+    })
+}
 
 #[derive(Clone)]
 pub(super) struct Home {
@@ -183,16 +193,16 @@ fn normalize(path: &Path) -> Result<PathBuf, String> {
 /// writer. A changed basis refuses before any project close.
 pub(super) struct ProjectAdmission {
     roots: Vec<PathBuf>,
-    tokens: BTreeSet<uuid::Uuid>,
+    basis: Map,
     overlaps: bool,
     observed: Vec<Home>,
 }
 impl ProjectAdmission {
     pub(super) fn prepare(host: &SharedHost, roots: &[PathBuf]) -> Result<Self, ProtocolError> {
         let map = host.lock().unwrap_or_else(|p| p.into_inner()).account_lifecycle.clone();
-        let (tokens, mut homes) = {
+        let (basis, mut homes) = {
             let entries = map.lock().unwrap_or_else(|p| p.into_inner());
-            (entries.keys().copied().collect(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
+            (entries.clone(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
         };
         let mut overlaps = false;
         let mut observed = Vec::new();
@@ -206,7 +216,7 @@ impl ProjectAdmission {
             }
             observed.extend(homes);
         }
-        Ok(Self { roots: roots.to_vec(), tokens, overlaps, observed })
+        Ok(Self { roots: roots.to_vec(), basis, overlaps, observed })
     }
     /// The project token is already installed. Revalidate original
     /// descriptors/names off admission before teardown.
@@ -216,8 +226,8 @@ impl ProjectAdmission {
     }
     pub(super) fn check(&self, host: &SharedHost, roots: &[PathBuf]) -> Result<(), ProtocolError> {
         let map = host.lock().unwrap_or_else(|p| p.into_inner()).account_lifecycle.clone();
-        let tokens = map.lock().unwrap_or_else(|p| p.into_inner()).keys().copied().collect::<BTreeSet<_>>();
-        if roots != self.roots || tokens != self.tokens {
+        let entries = map.lock().unwrap_or_else(|p| p.into_inner());
+        if roots != self.roots || !same_basis(&self.basis, &entries) {
             return Err(refusal("Project/account reservation scope changed during admission; retry"));
         }
         if self.overlaps { return Err(refusal("An account operation is using this project's physical directory. Wait for it before removing the project.")); }
@@ -228,8 +238,9 @@ impl ProjectAdmission {
 pub(crate) struct Reservation {
     map: Reservations,
     token: uuid::Uuid,
-    homes: Vec<Home>,
+    host: std::sync::Weak<super::state::HostLock>,
     accounts: Vec<Account>,
+    create: Option<(crate::agent::Provider, uuid::Uuid)>,
     /// Only relevant registrations, not the global revision: unrelated edits
     /// must be preserved while a provider is taking time to sign out.
     registered: Vec<(
@@ -309,9 +320,9 @@ impl Reservation {
             .map(|scope| crate::account::scope::namespace_key(&scope))
             .collect::<BTreeSet<_>>();
         let token = uuid::Uuid::new_v4();
-        let (previous_tokens, mut previous_homes) = {
+        let (previous_basis, mut previous_homes) = {
             let entries = map.lock().unwrap_or_else(|p| p.into_inner());
-            (entries.keys().copied().collect::<BTreeSet<_>>(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
+            (entries.clone(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
         };
         for home in &mut previous_homes { home.refresh_ancestors().map_err(refusal)?; }
         let (project_tokens, project_roots) = super::project_removal::account_basis(host);
@@ -326,7 +337,7 @@ impl Reservation {
         }
         if project_overlap { return Err(refusal("This account directory is in a project being removed. Wait for that operation before changing the account.")); }
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
-        if previous_tokens != entries.keys().copied().collect::<BTreeSet<_>>() {
+        if !same_basis(&previous_basis, &entries) {
             return Err(refusal("Account operations changed during reservation; retry"));
         }
         if entries.len() >= 64 {
@@ -343,14 +354,15 @@ impl Reservation {
         if entries.values().any(|entry| !entry.namespaces.is_disjoint(&physical_namespaces)) {
             return Err(refusal("This physical account's historical annotations are being deleted; wait and retry"));
         }
-        entries.insert(token, Reserved { homes: homes.clone(), namespaces: BTreeSet::new() });
+        entries.insert(token, Arc::new(Reserved { homes, namespaces: BTreeSet::new() }));
         drop(entries);
         drop(writer);
         let reservation = Self {
             map,
             token,
-            homes,
+            host: Arc::downgrade(host),
             accounts: accounts.to_vec(),
+            create: None,
             registered,
         };
         // No effects have happened. Refuse any filesystem/registration change
@@ -361,11 +373,112 @@ impl Reservation {
         Ok(reservation)
     }
 
+    /// Reserve the exact future home BEFORE mkdir. The random key is only a
+    /// negative admission target; creation still requires a successful actual
+    /// nonrecursive mkdir and its original receipt, never an existing home.
+    pub(super) fn for_operation(host: &SharedHost, operation: &crate::account::remote::Operation) -> Result<Self, ProtocolError> {
+        let mut accounts = crate::account::remote::affected_accounts(operation).map_err(refusal)?;
+        let create = if let crate::account::remote::Operation::Create { provider, .. } = operation {
+            let homes = crate::account::home::Homes::installation().ok_or_else(|| refusal("Account homes unavailable"))?;
+            let key = uuid::Uuid::new_v4();
+            accounts.push(Account::managed(*provider, key, homes.path(*provider, key)));
+            Some((*provider, key))
+        } else { None };
+        let mut reservation = Self::install(host, &accounts)?;
+        if create.is_some() && reservation.current().map_err(refusal)?.homes.last().is_some_and(|home| home.pin.is_some()) {
+            return Err(refusal("The planned new home already exists; it was not adopted or changed"));
+        }
+        reservation.create = create;
+        Ok(reservation)
+    }
+
+    fn current(&self) -> Result<Arc<Reserved>, String> {
+        self.map.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).cloned()
+            .ok_or_else(|| "The account mutation reservation was released; reload accounts and retry".into())
+    }
+
+    pub(crate) fn create_home(&self, homes: &crate::account::home::Homes, provider: crate::agent::Provider,
+        system: Option<&Path>, config: crate::account::home::CodexConfig) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
+    }
+
+    fn create_home_initialized(&self, homes: &crate::account::home::Homes, provider: crate::agent::Provider,
+        system: Option<&Path>, config: crate::account::home::CodexConfig,
+        initialized: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        let (planned_provider, key) = self.create.ok_or_else(|| std::io::Error::other("Account creation has no reserved fresh home"))?;
+        let path = homes.path(provider, key);
+        if provider != planned_provider || !self.accounts.iter().any(|account| account.provider == provider && account.registry_key() == Some(key) && account.resolved_home().as_ref() == Some(&path)) {
+            return Err(std::io::Error::other("Account creation does not match its planned home"));
+        }
+        let original_system = self.accounts.iter().find(|account| account.provider == provider && account.is_system())
+            .and_then(Account::resolved_home);
+        if system != original_system.as_deref() {
+            return Err(std::io::Error::other("Account seeding does not match its reserved System home"));
+        }
+        homes.create_planned_with_config_initialized(provider, key, system, config, |created| {
+            self.enroll_created_home(created)?;
+            initialized(created)?;
+            // The initializer can pause before seeding. Revalidate every
+            // original operand again without reentering the held Store lease.
+            for home in &self.current().map_err(std::io::Error::other)?.homes {
+                home.verify().map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs before any seed under the already-held registry/lifecycle leases.
+    /// Never load the registry here. Observe original FDs/maps off the control
+    /// writer, then atomically replace this immutable roster under a brief
+    /// try-write. Busy/failure retains the fresh files and publishes no row.
+    fn enroll_created_home(&self, created: &crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()> {
+        use std::io;
+        if self.create != Some((created.provider(), created.key())) { return Err(io::Error::other("Fresh home does not match its creation reservation")); }
+        created.revalidate()?;
+        let host = self.host.upgrade().ok_or_else(|| io::Error::other("The account host is no longer available"))?;
+        let basis = self.map.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let original = basis.get(&self.token).ok_or_else(|| io::Error::other("The creation reservation was released"))?;
+        let index = self.accounts.iter().position(|account| account.provider == created.provider() && account.registry_key() == Some(created.key()))
+            .ok_or_else(|| io::Error::other("The planned home is absent from its creation reservation"))?;
+        let planned = original.homes.get(index).ok_or_else(|| io::Error::other("The planned home scope changed"))?;
+        if planned.pin.is_some() || planned.canonical != created.home() { return Err(io::Error::other("Fresh home differs from its original planned directory")); }
+        let pin = Arc::new(created.directory().try_clone()?);
+        let metadata = pin.metadata()?;
+        let actual = Home { path: planned.path.clone(), canonical: created.home().to_owned(),
+            ancestors: physical_ancestors(created.home(), Some(&pin)).map_err(io::Error::other)?,
+            identity: Some((metadata.dev(), metadata.ino())), pin: Some(pin) };
+        actual.verify().map_err(io::Error::other)?;
+        for (i, home) in original.homes.iter().enumerate() { if i != index { home.verify().map_err(io::Error::other)?; } }
+        let mut other_homes = basis.iter().filter(|(token, _)| **token != self.token)
+            .flat_map(|(_, scope)| scope.homes.iter().cloned()).collect::<Vec<_>>();
+        for home in &mut other_homes { home.refresh_ancestors().map_err(io::Error::other)?; }
+        if other_homes.iter().any(|home| actual.overlaps(home)) { return Err(io::Error::other("Another account operation overlaps the new home")); }
+        let (project_tokens, roots) = super::project_removal::account_basis(&host);
+        if roots.len() > 4096 { return Err(io::Error::other("Project/account conflict scope exceeds its bound")); }
+        let projects = roots.into_iter().map(Home::capture).collect::<Result<Vec<_>, _>>().map_err(io::Error::other)?;
+        if projects.iter().any(|project| actual.overlaps(project)) { return Err(io::Error::other("A project removal overlaps the new home")); }
+        let namespace = actual.scope(created.provider()).map(|scope| crate::account::scope::namespace_key(&scope)).ok_or_else(|| io::Error::other("New home has no physical identity"))?;
+        if basis.iter().any(|(token, scope)| *token != self.token && scope.namespaces.contains(&namespace)) { return Err(io::Error::other("The new home's namespace is reserved")); }
+        let mut updated = (**original).clone(); updated.homes[index] = actual;
+        let gate = host.lock().unwrap_or_else(|p| p.into_inner()).control_gate.clone();
+        let writer = super::client::try_scoped_control_write(&gate).map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
+        super::client::ensure_control_open(&host).map_err(|error| io::Error::other(error.message))?;
+        if super::project_removal::account_basis(&host).0 != project_tokens { return Err(io::Error::other("Project reservations changed during home enrollment; retry creation")); }
+        let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if !same_basis(&basis, &entries) { return Err(io::Error::other("Account reservations changed during home enrollment; retry creation")); }
+        entries.insert(self.token, Arc::new(updated));
+        drop(entries); drop(writer);
+        created.revalidate()?;
+        for home in &projects { home.verify().map_err(io::Error::other)?; }
+        Ok(())
+    }
+
     /// Match the exact request operand/provider/key captured by this host
     /// reservation. The original alias must still name its pinned directory;
     /// return the captured canonical operand, never resolve a new request path.
     pub(crate) fn link_home(&self, provider: crate::agent::Provider, key: uuid::Uuid, operand: &Path) -> Result<PathBuf, String> {
-        let home = self.accounts.iter().zip(&self.homes).find_map(|(account, home)| {
+        let current = self.current()?;
+        let home = self.accounts.iter().zip(&current.homes).find_map(|(account, home)| {
             (account.provider == provider && matches!(&account.home,
                 crate::account::AccountHome::Linked { key: captured, path } if *captured == key && path == operand)).then_some(home)
         }).ok_or("The linked account operand does not match its physical reservation")?;
@@ -400,7 +513,8 @@ impl Reservation {
     /// reacquire the registry flock here. Physical validation precedes that
     /// lease in commit(), while this cut closes concurrent metadata races.
     pub(crate) fn verify_registry(&self, registry: &Registry) -> Result<(), String> {
-        for home in &self.homes { home.verify()?; }
+        let current = self.current()?;
+        for home in &current.homes { home.verify()?; }
         for (key, account, pending, archived) in &self.registered {
             if registry.find(*key) != account.as_ref()
                 || registry.pending().iter().find(|value| value.key == *key) != pending.as_ref()
@@ -1105,6 +1219,101 @@ printf '%s\n' '{"type":"control_response","response":{"subtype":"success","reque
         assert!(store.load().unwrap().pending().iter().any(|pending| pending.key == key));
         assert_eq!(std::fs::read(system.join("keep")).unwrap(), b"replacement");
         assert!(original.is_dir());
+    }
+
+    #[test]
+    fn account_admission_create_reserves_future_home_and_its_actual_inode_before_seeding() {
+        let Some(root) = isolated("account_admission_create_reserves_future_home_and_its_actual_inode_before_seeding") else { return; };
+        let host = host(); let homes = crate::account::home::Homes::installation().unwrap();
+        let system = Account::system(Provider::Claude).resolved_home().unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("settings.json"), br#"{"fixture":"original-system"}"#).unwrap();
+        let foreign = root.join("foreign-home"); std::fs::create_dir(&foreign).unwrap();
+        let source = terminal(&root, BTreeMap::from([("HOME".into(), foreign.display().to_string())]));
+        let source_id = source.id;
+        request(&host, ClientRequest::Spawn { session: source, options: Default::default() }).unwrap();
+        let operation = crate::account::remote::Operation::Create { provider: Provider::Claude, copy_codex_config: false };
+        let reservation = Arc::new(Reservation::for_operation(&host, &operation).unwrap());
+        let (_, key) = reservation.create.unwrap(); let planned = homes.path(Provider::Claude, key);
+        assert!(!planned.exists());
+        let alias = root.join("new-home-alias"); std::os::unix::fs::symlink(&planned, &alias).unwrap();
+        let related = || terminal(&root, BTreeMap::from([("HOME".into(), foreign.display().to_string()), ("CLAUDE_CONFIG_DIR".into(), alias.display().to_string())]));
+        assert!(request(&host, ClientRequest::Spawn { session: related(), options: Default::default() }).is_err(), "planned direct/dangling-alias home cannot start before mkdir");
+        assert!(ensure_paths(&host, [planned.clone()]).is_err());
+        let before = ProjectAdmission::prepare(&host, std::slice::from_ref(&foreign)).unwrap();
+        before.check(&host, std::slice::from_ref(&foreign)).unwrap();
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        let worker_reservation = reservation.clone(); let worker_homes = homes.clone(); let worker_system = system.clone();
+        let worker = std::thread::spawn(move || {
+            let store = Store::installation().unwrap();
+            worker_reservation.commit(|| store.try_create_pending_reserved(&worker_reservation, &worker_homes, Provider::Claude, 1, || {
+                worker_reservation.create_home_initialized(&worker_homes, Provider::Claude, Some(&worker_system), crate::account::home::CodexConfig::Shared, |created| {
+                    assert!(!created.home().join("settings.json").exists(), "pause is before actual seed");
+                    entered.send((created.home().to_owned(), created.directory().metadata()?.ino())).unwrap();
+                    resume.recv_timeout(Duration::from_secs(15)).unwrap();
+                    Ok(())
+                })
+            }))
+        });
+        let (actual, inode) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(actual, planned); assert_eq!(std::fs::metadata(&actual).unwrap().ino(), inode);
+        assert!(!actual.join("settings.json").exists());
+        assert!(Store::installation().unwrap().try_load().is_err(), "the production store lease is held; never reenter a blocking load");
+        assert!(before.check(&host, std::slice::from_ref(&foreign)).is_err(), "same-token inode enrollment must invalidate prepared map observations");
+        let pending_source = related(); let related_id = pending_source.id;
+        assert!(request(&host, ClientRequest::Spawn { session: pending_source, options: Default::default() }).unwrap_err().message.contains("being changed"));
+        assert!(!host.lock().unwrap().terminals.contains_key(&related_id));
+        assert!(matches!(request(&host, ClientRequest::List).unwrap(), ServerResponse::Listed { .. }));
+        request(&host, ClientRequest::Input { terminal_id: source_id, bytes: b"creation-responsive\n".to_vec() }).unwrap();
+        wait_file(&root.join("pty-input"));
+        assert_eq!(std::fs::read(root.join("pty-input")).unwrap(), b"creation-responsive");
+        let unrelated = terminal(&root, BTreeMap::from([("HOME".into(), foreign.display().to_string())]));
+        let unrelated_id = unrelated.id;
+        request(&host, ClientRequest::Spawn { session: unrelated, options: Default::default() }).unwrap();
+        // Enrollment retains the actual mkdir FD, so moving P cannot turn it
+        // into a foreign alias while seeding still owns the original receipt.
+        let moved = root.join("moved-new-home"); std::fs::rename(&planned, &moved).unwrap();
+        assert!(ensure_paths(&host, [moved.clone()]).is_err());
+        std::fs::rename(&moved, &planned).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), (key, planned.clone()));
+        assert_eq!(std::fs::read(planned.join("settings.json")).unwrap(), br#"{"fixture":"original-system"}"#);
+        assert!(Store::installation().unwrap().load().unwrap().pending().iter().any(|pending| pending.key == key));
+        assert!(ensure_paths(&host, [alias.clone()]).is_err());
+        drop(reservation);
+        ensure_paths(&host, [alias]).unwrap();
+        for id in [source_id, unrelated_id] {
+            request(&host, ClientRequest::CloseTerminalChecked { terminal_id: id, allow_active: true }).unwrap();
+            request(&host, ClientRequest::Detach { terminal_id: id }).unwrap();
+        }
+    }
+
+    #[test]
+    fn account_admission_failed_creation_enrollment_retains_unseeded_home_without_publication() {
+        let Some(root) = isolated("account_admission_failed_creation_enrollment_retains_unseeded_home_without_publication") else { return; };
+        let host = host(); let homes = crate::account::home::Homes::installation().unwrap();
+        let system = Account::system(Provider::Claude).resolved_home().unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("settings.json"), b"{}").unwrap();
+        let operation = crate::account::remote::Operation::Create { provider: Provider::Claude, copy_codex_config: false };
+        let reservation = Reservation::for_operation(&host, &operation).unwrap();
+        let (_, key) = reservation.create.unwrap(); let path = homes.path(Provider::Claude, key);
+        let foreign_system = root.join("unreserved-system");
+        assert!(reservation.create_home(&homes, Provider::Claude, Some(&foreign_system), crate::account::home::CodexConfig::Shared).is_err());
+        assert!(!path.exists(), "a mismatched seed operand refuses before mkdir");
+        let store = Store::installation().unwrap();
+        let gate = host.lock().unwrap().control_gate.clone(); let reader = gate.read().unwrap();
+        let error = reservation.commit(|| store.try_create_pending_reserved(&reservation, &homes, Provider::Claude, 1, || {
+            reservation.create_home(&homes, Provider::Claude, Some(&system), crate::account::home::CodexConfig::Shared)
+        })).unwrap_err();
+        assert!(error.contains("files were retained"), "{error}");
+        assert!(path.is_dir()); assert!(std::fs::read_dir(&path).unwrap().next().is_none(), "Busy precedes seeding and links");
+        drop(reader);
+        assert!(!store.load().unwrap().pending().iter().any(|pending| pending.key == key));
+        assert!(ensure_paths(&host, [path.clone()]).is_err());
+        drop(reservation);
+        assert!(path.is_dir(), "failed initialization grants no cleanup authority");
     }
 
 }

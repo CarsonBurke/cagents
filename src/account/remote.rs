@@ -154,8 +154,8 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
             let system = Account::system(provider).resolved_home();
             let (key, home) = reservation.commit(|| store
                 .try_create_pending_reserved(reservation, &homes, provider, now, || {
-                    homes.create_with_config(
-                        provider,
+                    reservation.create_home(
+                        &homes, provider,
                         system.as_deref(),
                         if copy_codex_config {
                             CodexConfig::Copy

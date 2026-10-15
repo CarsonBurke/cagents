@@ -656,9 +656,7 @@ pub(super) fn process_request(
                 super::agent_execution::terminals::admit(host, client_id, &request)?;
                 super::project_removal::admit(host, &request)?;
             }
-            let accounts = crate::account::remote::affected_accounts(operation)
-                .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
-            super::account_lifecycle::Reservation::install(host, &accounts)?
+            super::account_lifecycle::Reservation::for_operation(host, operation)?
         };
         let reply = crate::account::remote::execute_reserved(operation.clone(), &reservation)
             .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
