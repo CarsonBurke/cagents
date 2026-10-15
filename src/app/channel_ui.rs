@@ -495,9 +495,30 @@ impl Cagents {
             .is_none_or(|state| !state.kind.is_utility())
     }
 
+    /// Publication may outlive its progress surface and the focused pane.
+    /// Check the channel being retired rather than whichever editor has focus.
+    fn channel_has_pending_editor_write(&self, id: ChannelId) -> bool {
+        self.durable.channels.iter().find(|channel| channel.id == id)
+            .is_some_and(|channel| channel.cards.iter().any(|card| {
+                matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+            }))
+    }
+
+    fn keep_channel_for_editor_write(&mut self, id: ChannelId) -> Task<Message> {
+        let reason = "Finish saving or applying edits in this channel, then retry deleting it.".to_owned();
+        self.channel_ui.deleting.remove(&id);
+        self.channel_ui.failed.insert(id, reason.clone());
+        self.status = Some(TransientNotice::warning(format!("Channel kept: {reason}")));
+        self.refresh_sidebar_channels();
+        Task::none()
+    }
+
     /// Opens a channel's delete confirmation, or deletes an empty channel at
     /// once unless `always_confirm`.
     fn begin_channel_deletion(&mut self, id: ChannelId, always_confirm: bool) -> Task<Message> {
+        if self.channel_has_pending_editor_write(id) {
+            return self.keep_channel_for_editor_write(id);
+        }
         if self.channel_ui.is_deleting(id) {
             return Task::none();
         }
@@ -550,6 +571,9 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        if self.channel_has_pending_editor_write(id) {
+            return self.keep_channel_for_editor_write(id);
+        }
         let Some(cards) = self
             .durable
             .channels
@@ -623,6 +647,11 @@ impl Cagents {
     }
 
     fn retire_channel(&mut self, id: ChannelId, passive: bool) -> Task<Message> {
+        // A publication can begin after the initial request while session
+        // teardown is in flight. Recheck before any channel or card mutation.
+        if !passive && self.channel_has_pending_editor_write(id) {
+            return self.keep_channel_for_editor_write(id);
+        }
         let Some(index) = self
             .durable
             .channels

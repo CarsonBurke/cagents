@@ -154,6 +154,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_publication_fences_target_channel_request_and_late_retirement() {
+        for late_completion in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let original = "fn old() {}\n";
+            for name in ["focused.rs", "participant.rs", "unopened.rs"] {
+                std::fs::write(root.path().join(name), original).unwrap();
+            }
+            let mut app = app();
+            let focused = buffer(&mut app, root.path(), "focused.rs", original);
+            let participant = buffer(&mut app, root.path(), "participant.rs", original);
+            let template = app.durable.cards[0].clone();
+            for card in [focused, participant] {
+                let CardRuntime::Repository(runtime) = &app.cards[&card] else { panic!("editor"); };
+                let mut state = template.clone();
+                state.id = card;
+                state.kind = CardKind::Repository(runtime.descriptor.clone());
+                Arc::make_mut(&mut app.durable).cards.push(state);
+                let index = app.workspace.cards().len();
+                app.workspace.add_card(WorkspaceCard::new(card, "editor".into(), CardWidth::Fraction(0.5)).unwrap(), index, card == focused).unwrap();
+            }
+            app.workspace.focus(focused).unwrap();
+            Arc::make_mut(&mut app.durable).focused = Some(focused);
+            let project = crate::model::ProjectId::new();
+            let target = crate::model::ChannelId::new();
+            let unrelated = crate::model::ChannelId::new();
+            for (id, cards) in [(target, vec![participant]), (unrelated, Vec::new())] {
+                Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel {
+                    id, project_id: project, title: "channel".into(), title_source: Default::default(),
+                    ordinal: 0, shared: false, focused: cards.first().copied(), cards,
+                });
+            }
+            let plan = plan(&app, root.path(), &["participant.rs", "unopened.rs"]);
+            let operation = operation(&app, participant);
+            let publishing = app.publish_editor_workspace_edit(93, operation, plan);
+            drop(app.finish_modal_update(Task::none()));
+            let hide = dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter,
+                |message| matches!(message, Message::EditorFeatures(Action::HidePublication(93))));
+            drop(app.update(hide));
+            assert!(!app.focused_repository_is_saving());
+            assert!(matches!(&app.cards[&participant], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+            // Model a teardown result that was already in flight before the
+            // publisher froze B. No daemon/session-close proof is claimed.
+            let decision = if late_completion {
+                super::super::channel_ui::Action::SessionsClosed(target, Ok(()))
+            } else {
+                super::super::channel_ui::Action::Delete(target)
+            };
+            drop(app.update(Message::ChannelUi(decision)));
+            assert!(app.durable.channels.iter().any(|channel| channel.id == target));
+            assert!(app.cards.contains_key(&participant));
+            assert!(!app.channel_ui.is_deleting(target));
+            assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("Channel kept")));
+            drop(app.update(Message::ChannelUi(super::super::channel_ui::Action::Delete(unrelated))));
+            assert!(!app.durable.channels.iter().any(|channel| channel.id == unrelated));
+            finish(&mut app, publishing).await;
+            assert_eq!(text(&app, participant), "fn renamed() {}\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), "fn renamed() {}\n");
+            assert!(app.durable.channels.iter().any(|channel| channel.id == target));
+            drop(app.update(Message::ChannelUi(super::super::channel_ui::Action::RetryFailed(target))));
+            assert!(!app.durable.channels.iter().any(|channel| channel.id == target));
+        }
+    }
+
+    #[tokio::test]
     async fn hidden_publication_keeps_real_autosave_and_save_close_intents() {
         let root = tempfile::tempdir().unwrap();
         let original = "fn old() {}\n";
