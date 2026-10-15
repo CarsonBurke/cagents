@@ -51,6 +51,11 @@ impl InputTrace {
         self.1.get().map(|region| region.pane)
     }
 
+    pub(crate) fn clear_keyboard_focus(&self) {
+        self.1.set(None);
+        self.2.borrow_mut().take();
+    }
+
     /// Exact native focused control sampled with the current keyboard region.
     pub fn keyboard_widget_id(&self) -> Option<cosmic::iced::widget::Id> {
         self.2.borrow().clone()

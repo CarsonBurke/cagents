@@ -135,6 +135,8 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
+    /// Native embedded browser content.
+    Browser,
     /// The native code editor.
     Editor,
     /// A native text field, including fields inside a pane.
@@ -156,7 +158,7 @@ pub struct ShortcutDescriptor {
 
 impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
-        matches!(self, Self::Editor | Self::Chat | Self::TextInput)
+        matches!(self, Self::Editor | Self::Chat | Self::TextInput | Self::Browser)
     }
 }
 
@@ -1044,6 +1046,7 @@ where
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .traced_by(input)
     .with_scroll_input(scroll_input)
     .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
@@ -1847,6 +1850,7 @@ struct WorkspaceSurface<'a, Message> {
     shortcuts: &'a KeyboardShortcuts,
     /// The kind of the focused card; see [`is_global_shortcut_chord`].
     focused_pane: FocusedPane,
+    input_trace: Option<InputTrace>,
     /// The strip viewport width the owner already holds, which is what the
     /// enclosing `view` laid this surface's content out against.
     ///
@@ -1876,11 +1880,17 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             content: content.into(),
             shortcuts,
             focused_pane,
+            input_trace: None,
             reported_width,
             on_resize: Box::new(on_resize),
             initial_scroll: None,
             scroll_input: None,
         }
+    }
+
+    fn traced_by(mut self, trace: &InputTrace) -> Self {
+        self.input_trace = Some(trace.clone());
+        self
     }
 
     fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
@@ -1997,19 +2007,13 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                     physical_key,
                     modifiers,
                     ..
-                }
-                | keyboard::Event::KeyReleased {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
                 },
             ) if is_global_shortcut_chord(
                 key,
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
-                self.focused_pane,
+                self.input_trace.as_ref().and_then(InputTrace::keyboard_focus).unwrap_or(self.focused_pane),
             ) =>
             {
                 shell.capture_event();

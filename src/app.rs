@@ -33,6 +33,8 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+#[cfg(test)]
+mod keyboard_focus_tests;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -4284,6 +4286,12 @@ pub enum Message {
     },
     CancelDialog,
     ShortcutTerminalPassthrough { action: String, enabled: bool },
+    RoutedKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        region: crate::input_trace::KeyboardRegion,
+        widget: Option<widget::Id>,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -6441,9 +6449,10 @@ impl Cagents {
     /// A terminal that has ended, or is closing, is read-only and forwards
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
-        let Some(card) = self.workspace.focused() else {
-            return workspace_widget::FocusedPane::Other;
-        };
+        self.input_trace.keyboard_focus().unwrap_or_else(|| self.workspace.focused().map_or(workspace_widget::FocusedPane::Other, |card| self.pane_kind(card)))
+    }
+
+    fn pane_kind(&self, card: CardId) -> workspace_widget::FocusedPane {
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
                 if ended_terminal(self.card_state(card)).is_none()
@@ -6452,6 +6461,8 @@ impl Cagents {
                 workspace_widget::FocusedPane::Terminal
             }
             Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => workspace_widget::FocusedPane::Browser,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
@@ -13204,6 +13215,27 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let message = match message {
+            Message::RoutedKeyEvent { event, captured, region, widget } => {
+                let _focus = self.input_trace.scoped_keyboard_focus(region, widget);
+                if let Some(card) = region.card
+                    && !self.workspace.order().any(|candidate| candidate == card)
+                { return Task::none(); }
+                let focus = if !self.workspace_inputs_blocked()
+                    && matches!(event, keyboard::Event::KeyPressed { .. })
+                    && let Some(card) = region.card
+                    && self.workspace.focused() != Some(card)
+                {
+                    if self.focused_repository_is_saving() { return Task::none(); }
+                    match self.workspace.focus(card) {
+                        Ok(update) => self.apply_viewport(update, false, false),
+                        Err(_) => return Task::none(),
+                    }
+                } else { Task::none() };
+                return Task::batch([focus, self.update(Message::KeyEvent { event, captured })]);
+            }
+            message => message,
+        };
         for failure in self.terminal_review_input.take_key_cleanup_failures() {
             self.notices.record(TransientNotice::warning(failure));
         }
@@ -15766,7 +15798,13 @@ impl Application for Cagents {
                 self.settings_draft.keyboard_shortcuts.terminal_passthrough_actions = actions.clone();
                 self.save_settings_task(false)
             }
+            Message::RoutedKeyEvent { .. } => unreachable!("native keyboard event normalized before dispatch"),
             Message::KeyEvent { event, captured } => {
+                let native_region = self.input_trace.keyboard_focus();
+                let native_targets_pane = native_region.is_none() || self.input_trace.keyboard_card().is_some();
+                let repository_keys = native_region.is_none() || matches!(native_region, Some(workspace_widget::FocusedPane::Editor | workspace_widget::FocusedPane::Review));
+                let native_widget = self.input_trace.keyboard_widget_id();
+                let chat_find_keys = native_region.is_none() || native_widget == self.workspace.focused().map(|card| card_control_id(card, "chat-find"));
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -15796,7 +15834,8 @@ impl Application for Cagents {
                     }
                     return Task::none();
                 }
-                if !captured
+                if repository_keys
+                    && !captured
                     && !self.workspace_inputs_blocked()
                     && workspace_widget::global_shortcut(
                         &event,
@@ -15870,7 +15909,7 @@ impl Application for Cagents {
                 if let Some(task) = self.account_key_event(&event) {
                     return task;
                 }
-                if !self.workspace_inputs_blocked()
+                if chat_find_keys && native_targets_pane && !self.workspace_inputs_blocked()
                     && let Some(task) = self.chat_find_key(&event)
                 {
                     return task;
@@ -15962,7 +16001,7 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
-                    if let Some(card) = self.focused_repository_card_with_find() {
+                    if native_targets_pane && let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
                         ));
@@ -16000,7 +16039,7 @@ impl Application for Cagents {
                 if let Some(task) = self.chat_picker_key(&event) {
                     return task;
                 }
-                if let Some(card) = self.workspace.focused()
+                if native_targets_pane && let Some(card) = self.workspace.focused()
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
@@ -16012,6 +16051,7 @@ impl Application for Cagents {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
                     }
                     if *key == keyboard::key::Named::Enter
+                        && (native_region.is_none() || native_widget == Some(terminal_ui::input_id(card)))
                         && self
                             .terminal_find
                             .get(&card)
@@ -16028,10 +16068,12 @@ impl Application for Cagents {
                     modifiers,
                     ..
                 } = &event
+                    && native_targets_pane
                     && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && let Some(card) = self.workspace.focused()
+                    && (native_region.is_none() || native_widget == Some(repository_widget::find_focus_id(card)))
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
@@ -16041,17 +16083,17 @@ impl Application for Cagents {
                     }));
                 }
                 #[cfg(feature = "integrated-browser")]
-                if !captured
+                if !captured && (native_region.is_none() || native_region == Some(workspace_widget::FocusedPane::Browser))
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
                     && let Some(message) = browser_shortcut(card, &event)
                 {
                     return cosmic::task::message(message);
                 }
-                if !captured && let Some(task) = self.chat_scroll_key(&event) {
+                if native_targets_pane && !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
                 }
-                if is_save_press(&event)
+                if repository_keys && is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {
@@ -16639,11 +16681,7 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
+            event::listen_with(|event, _status, event_window| match event {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
@@ -16663,6 +16701,12 @@ impl Application for Cagents {
                 _ => None,
             }),
         ];
+        if self.workspace_inputs_blocked() {
+            subscriptions.push(event::listen_with(|event, status, _| match event {
+                iced::Event::Keyboard(event) => Some(Message::KeyEvent { event, captured: matches!(status, event::Status::Captured) }),
+                _ => None,
+            }));
+        }
         if let Some(session) = &self.session {
             subscriptions.push(
                 Subscription::run_with(
@@ -17143,6 +17187,7 @@ impl Application for Cagents {
             let mut actions: Vec<Element<'_, Message>> = vec![
                 crate::interaction::tooltip(
                     crate::ui_controls::button::primary("New conversation")
+                        .id(widget::Id::new("empty.new-conversation"))
                         .icon(Icon::Chat)
                         .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
                             chrome_ui::NewTab::Thread,
@@ -17227,6 +17272,7 @@ impl Application for Cagents {
                                     crate::ui_controls::provider_icon(provider),
                                     format!("{} · {status} · Manage accounts", provider.label()),
                                 )
+                                .id(widget::Id::new(format!("empty.provider.{}", provider.label())))
                                 .on_press(Message::AccountUi(account_ui::Action::OpenPane));
                                 Element::from(if status == "Account available" {
                                     control.tone(design::Tone::Themed(design::success_color))
@@ -17445,7 +17491,44 @@ impl Application for Cagents {
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
         self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
+        let surface = if self.workspace_inputs_blocked() {
+            // The existing modal subscription owns keys in this tree. Do not
+            // let a previous workspace snapshot leak into its fallback route.
+            self.input_trace.clear_keyboard_focus();
+            crate::input_trace::observe(surface, &self.input_trace)
+        } else {
+            let mut regions = Vec::new();
+            for mounted in &self.workspace.projection(self.workspace.viewport_width()).mounted {
+                let card = mounted.id;
+                let kind = self.pane_kind(card);
+                let region = |pane| crate::input_trace::KeyboardRegion { pane, card: Some(card) };
+                regions.push((workspace_widget::card_widget_id(card), region(if matches!(kind, workspace_widget::FocusedPane::Chat | workspace_widget::FocusedPane::Review) { kind } else { workspace_widget::FocusedPane::Other })));
+                regions.push((self.card_header_widget_id(card), region(workspace_widget::FocusedPane::Other)));
+                if let Some(chrome) = self.card_chrome.get(&card) {
+                    regions.push((chrome.close_id.clone(), region(workspace_widget::FocusedPane::Other)));
+                    regions.push((chrome.resize_id.clone(), region(workspace_widget::FocusedPane::Other)));
+                    regions.push((chrome.browser_address_id.clone(), region(workspace_widget::FocusedPane::TextInput)));
+                }
+                if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+                    regions.push((self.card_keyboard_focus(card), region(kind)));
+                }
+                #[cfg(feature = "integrated-browser")]
+                if matches!(self.cards.get(&card), Some(CardRuntime::Browser(_))) {
+                    regions.push((self.card_keyboard_focus(card), region(workspace_widget::FocusedPane::Browser)));
+                }
+                if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
+                    regions.push((repository_widget::editor_focus_id(card), region(workspace_widget::FocusedPane::Editor)));
+                }
+                if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
+                    regions.push((card_control_id(card, "chat-composer"), region(workspace_widget::FocusedPane::Chat)));
+                }
+            }
+            for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list", "command.previous-column", "command.next-column", "chrome.notices", "empty.new-conversation", "empty.resume-conversation", "empty.new-terminal", "empty.new-browser", "empty.accounts"] {
+                regions.push((widget::Id::new(id), workspace_widget::FocusedPane::Other.into()));
+            }
+            regions.extend(crate::agent::Provider::ALL.into_iter().map(|provider| (widget::Id::new(format!("empty.provider.{}", provider.label())), workspace_widget::FocusedPane::Other.into())));
+            crate::input_trace::observe_keyboard_events(surface, &self.input_trace, regions, |event, captured, region, widget| Message::RoutedKeyEvent { event, captured, region, widget })
+        };
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
@@ -20277,7 +20360,7 @@ mod tests {
     /// A repository card whose durable state and runtime both say repository,
     /// with an unsaved buffer and a language server reporting on it - the
     /// state a user is in while editing a file.
-    fn editing_repository_app() -> (Cagents, CardId) {
+    pub(super) fn editing_repository_app() -> (Cagents, CardId) {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().expect("a focused card");
         {
