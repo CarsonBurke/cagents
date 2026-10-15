@@ -86,6 +86,7 @@ pub(crate) struct Resident {
     pub interrupt_subagents: Vec<String>,
     pub account_reports: Vec<Update>,
     next_input: u64,
+    acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
@@ -171,6 +172,7 @@ struct Remote {
     uncertain_input: Mutex<Option<InputIdentity>>,
     pending: Mutex<Vec<Pending>>,
     retiring_inputs: Mutex<Vec<InputIdentity>>,
+    recovering_inputs: AtomicBool,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     stop: AtomicBool,
     installed: AtomicBool,
@@ -279,6 +281,7 @@ impl RemoteActor {
             interrupt_subagents: Vec::new(),
             account_reports: Vec::new(),
             next_input: 1,
+            acknowledged_input_count: 0,
             continuity_loss: None,
             retained_runs: Vec::new(),
             outbox_ack: 0,
@@ -319,6 +322,7 @@ impl RemoteActor {
             uncertain_input: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             retiring_inputs: Mutex::new(Vec::new()),
+            recovering_inputs: AtomicBool::new(false),
             notify: Arc::new(|_| {}),
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(true),
@@ -647,6 +651,7 @@ impl RemoteActor {
             &registry::directory(Kind::Native)?,
             attached.identity.record.terminal,
         );
+        let recovering_inputs=attached.resident.acknowledged_input_count>0;
         let remote = Self(Arc::new(Remote {
             identity: attached.identity,
             epoch: attached.epoch,
@@ -663,6 +668,7 @@ impl RemoteActor {
             recovery_environment: attached.recovery_environment,
             pending: Mutex::new(Vec::new()),
             retiring_inputs: Mutex::new(Vec::new()),
+            recovering_inputs: AtomicBool::new(recovering_inputs),
             notify: Arc::new(notify),
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(false),
@@ -759,6 +765,7 @@ impl RemoteActor {
                             (actor.0.notify)(report);
                         }
                     }
+                    let _=actor.reconcile_acknowledged_inputs();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -899,6 +906,7 @@ impl RemoteActor {
         if self.0.stop.load(Ordering::Acquire) {
             return Err("Retained actor proxy is unavailable; no new input was admitted".into());
         }
+        if self.0.recovering_inputs.load(Ordering::Acquire) {return Err("Previous command receipts are settling after reattachment; no new command was admitted".into());}
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
         let identity;
@@ -1023,6 +1031,20 @@ impl RemoteActor {
         });
         let mut retiring=self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner());
         for identity in completed {if !retiring.contains(&identity) {retiring.push(identity);}}
+    }
+
+    fn reconcile_acknowledged_inputs(&self)->Result<(),String> {
+        if self.state().acknowledged_input_count==0 && !self.0.recovering_inputs.load(Ordering::Acquire) {return Ok(());}
+        let receipts:Vec<InputReceipt>=self.call("acknowledged_inputs",Value::Null)?;
+        if receipts.len()>64 || receipts.iter().any(|receipt|!matches!(&receipt.state,InputState::Acknowledged(_))) {return Err("Helper returned an invalid terminal receipt page".into());}
+        // Deliver any still-live local waiter before retirement. Older daemon
+        // waiters no longer exist; observing their durable terminal outcome
+        // settles metadata without reconstructing or replaying their input.
+        self.apply_receipts(&receipts);
+        let mut retiring=self.0.retiring_inputs.lock().unwrap_or_else(|p|p.into_inner());
+        for receipt in &receipts {if !retiring.contains(&receipt.identity) {retiring.push(receipt.identity.clone());}}
+        if receipts.is_empty() {self.0.recovering_inputs.store(false,Ordering::Release);}
+        Ok(())
     }
 
     fn flush_input_retirements(&self)->Result<(),String> {
@@ -1588,6 +1610,7 @@ impl Server {
             interrupt_subagents,
             account_reports,
             next_input: journal.next_input()?,
+            acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
@@ -1763,9 +1786,11 @@ impl Server {
                 }
                 value!(receipts)
             }
+            "acknowledged_inputs" => value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).acknowledged_input_page()?),
             "retire_acknowledged_inputs" => {
                 let (identities,) = decode!((Vec<InputIdentity>,));
                 self.journal.lock().unwrap_or_else(|p|p.into_inner()).retire_acknowledged_inputs(&identities)?;
+                self.changed.fetch_add(1,Ordering::Release);
                 Ok(Value::Null)
             }
             "ack_inputs" => {
@@ -1774,6 +1799,7 @@ impl Server {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .retire_inputs(through)?;
+                self.changed.fetch_add(1,Ordering::Release);
                 Ok(Value::Null)
             }
             "input" => {
@@ -2897,7 +2923,7 @@ done"#;
         assert_eq!(*actor.0.input_sequence.lock().unwrap(), 2);
     }
     #[test]
-    fn real_helper_accepts_more_than_its_receipt_capacity_without_replaying_commands() {
+    fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
         const CHILD:&str="CAGENTS_ACTOR_RECEIPT_RETIREMENT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root=tempfile::tempdir_in("/var/tmp").unwrap();
@@ -2927,11 +2953,37 @@ done"#;
   esac
 done"#;
         let mut spec=ProcessSpec::from(&source.launch.recipe);spec.arguments=vec!["-c".into(),script.into()];
-        let actor=RemoteActor::spawn(spec,source,BTreeMap::new(),|_|{}).unwrap();
+        let actor=RemoteActor::spawn(spec,source.clone(),BTreeMap::new(),|_|{}).unwrap();
         struct Owner(RemoteActor);
         impl Drop for Owner {fn drop(&mut self) {let _=self.0.close();let _=self.0.finish_close();}}
         let owner=Owner(actor);let actor=&owner.0;actor.commit_installation().unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);while !actor.state().ready {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
+        // Stop the old proxy before observing/retiring this helper receipt.
+        // Its actual actor and provider continue under the retained helper.
+        actor.preserve().unwrap();
+        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:*blake3::hash(&serde_json::to_vec(&serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap()).unwrap()).as_bytes()};
+        let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
+        let _:InputReceipt=actor.call("input",json!([identity,payload])).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);
+        loop {
+            let receipt:Option<InputReceipt>=actor.call("input_receipt",json!([identity])).unwrap();
+            if receipt.is_some_and(|receipt|matches!(receipt.state,InputState::Acknowledged(_))) {break;}
+            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
+        }
+        let orphaned:Vec<InputReceipt>=actor.call("acknowledged_inputs",Value::Null).unwrap();assert_eq!(orphaned.len(),1);
+        assert_eq!(orphaned[0].identity,identity);
+        let record=actor.identity().record;
+        drop(_lease);
+        let mut proof=source.proof.clone().unwrap();proof.host_incarnation=HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        let _replacement_lease=crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+        let replacement=RemoteActor::adopt(&record,source.clone(),proof.clone(),|_|{}).unwrap();
+        let replacement_owner=Owner(replacement);let actor=&replacement_owner.0;
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while actor.0.recovering_inputs.load(Ordering::Acquire) {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
+        let reclaimed:Vec<InputReceipt>=actor.call("acknowledged_inputs",Value::Null).unwrap();assert!(reclaimed.is_empty());
+        assert!(actor.call::<InputReceipt>("input",json!([identity,payload])).is_err(),"a retired old-proxy command cannot execute again");
+        source.proof=Some(proof);source.native_continuity=actor.state().native_continuity.clone();
+        actor.call::<()>("update_source",json!([source,Option::<crate::model::LaunchRecipe>::None,Option::<crate::terminal::holder::Record>::None])).unwrap();
         let mut total=0usize;
         while total<journal::MAX_INPUTS+33 {
             let count=32.min(journal::MAX_INPUTS+33-total);let mut replies=Vec::new();
@@ -2942,7 +2994,7 @@ done"#;
         let deadline=Instant::now()+Duration::from_secs(5);
         while !actor.0.retiring_inputs.lock().unwrap().is_empty() {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
         assert!(actor.pending_inputs().is_empty());
-        assert_eq!(*actor.0.input_sequence.lock().unwrap(),total as u64+1);
+        assert_eq!(*actor.0.input_sequence.lock().unwrap(),total as u64+2);
         assert!(!root.path().join("prompts").exists(),"receipt retirement must never enqueue a provider prompt");
         actor.close().unwrap();actor.finish_close().unwrap();
     }
