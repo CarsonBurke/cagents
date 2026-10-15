@@ -152,7 +152,15 @@ impl Cagents {
         match (expected_scope, first) {
             (None, None) => true,
             (Some(expected), Some((scope, pane))) => scope == expected && !pane.pending_terminal_start
-                && matches!(&pane.kind, CardKind::Chat(current) if terminal_close::same_chat_removal_source(issued, current)),
+                && match &pane.kind {
+                    CardKind::Chat(current) => terminal_close::same_chat_removal_source(issued, current),
+                    // A saved automation console has an explicitly persisted,
+                    // proof-checked read-only projection. This grants no live
+                    // execution authority and never accepts an arbitrary kind
+                    // conversion or a freshly looked-up terminal source.
+                    CardKind::Terminal(_) => self.canonical_automation_archive_pane(card).as_ref() == Some(pane),
+                    _ => false,
+                },
             _ => false,
         }
     }
