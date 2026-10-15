@@ -2182,12 +2182,27 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
-            if let chat::Command::LoadOriginal { user_id, expected_session, offset, limit } = command {
+            if let chat::Command::LoadOriginal {
+                user_id,
+                expected_session,
+                offset,
+                limit,
+            } = command
+            {
                 let result = crate::chat::original::validate_query(
-                    user_id.as_deref(), expected_session.as_deref(), offset, limit,
-                ).and_then(|()| handle.original_prompt(
-                    user_id.as_deref(), expected_session.as_deref(), offset, limit,
-                ));
+                    user_id.as_deref(),
+                    expected_session.as_deref(),
+                    offset,
+                    limit,
+                )
+                .and_then(|()| {
+                    handle.original_prompt(
+                        user_id.as_deref(),
+                        expected_session.as_deref(),
+                        offset,
+                        limit,
+                    )
+                });
                 return Ok(ServerResponse::ChatOriginal { chat_id, result });
             }
             if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
@@ -2374,7 +2389,11 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {

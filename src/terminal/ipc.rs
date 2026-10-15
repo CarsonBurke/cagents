@@ -786,7 +786,8 @@ pub enum ServerResponse {
     },
     ChatOriginal {
         chat_id: TerminalId,
-        result: Result<crate::chat::annotations::OriginalPage, crate::chat::annotations::OriginalError>,
+        result:
+            Result<crate::chat::annotations::OriginalPage, crate::chat::annotations::OriginalError>,
     },
 }
 

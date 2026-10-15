@@ -27,10 +27,10 @@ pub struct OriginalSettings {
 }
 impl OriginalSettings {
     pub fn is_exact(&self) -> bool {
-        !matches!(self.model, Setting::Unknown|Setting::Default)
-            && !matches!(self.reasoning, Setting::Unknown|Setting::Default)
-            && !matches!(self.fast, Setting::Unknown|Setting::Default)
-            && !matches!(self.permission, Setting::Unknown|Setting::Default)
+        !matches!(self.model, Setting::Unknown | Setting::Default)
+            && !matches!(self.reasoning, Setting::Unknown | Setting::Default)
+            && !matches!(self.fast, Setting::Unknown | Setting::Default)
+            && !matches!(self.permission, Setting::Unknown | Setting::Default)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ pub struct OriginalPrompt {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginalPage {
-    pub session_id:String,
+    pub session_id: String,
     pub original: OriginalPrompt,
     pub offset: usize,
     pub next_offset: usize,
@@ -85,7 +85,7 @@ pub(crate) enum ApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalUpdate {
     /// Adapter conversation identity at the exact live request/answer boundary.
-    pub session_id:Option<String>,
+    pub session_id: Option<String>,
     pub key: ApprovalKey,
     pub request_id: String,
     pub decision: ApprovalDecision,
@@ -93,12 +93,26 @@ pub(crate) struct ApprovalUpdate {
 
 /// Adapter proof events. These never originate from local execution Started,
 /// saved recipes, or UI snapshots.
-#[cfg(feature="host")]
+#[cfg(feature = "host")]
 pub(crate) enum OriginalUpdate {
-    Settings { command_id:String, settings:OriginalSettings },
-    Accepted { command_id:String, session_id:String, user_id:String, turn_id:String, aliases:Vec<String> },
-    Rejected { command_id:String },
+    Settings {
+        command_id: String,
+        settings: OriginalSettings,
+    },
+    Accepted {
+        command_id: String,
+        session_id: String,
+        user_id: String,
+        turn_id: String,
+        aliases: Vec<String>,
+    },
+    Rejected {
+        command_id: String,
+    },
     /// Only emitted when native ordering proves this is the current latest
     /// user, rather than a late echo or a history-page arrival.
-    Latest { session_id:String, user_id:String },
+    Latest {
+        session_id: String,
+        user_id: String,
+    },
 }

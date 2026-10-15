@@ -662,7 +662,14 @@ impl Codex {
     // never escape into the parent's ID space. Keep the original correlation
     // inside the child and allocate every wire request through the parent.
     fn child_step(&mut self, id: &str, content: Step, step: &mut Step) -> Result<(), String> {
-        if let Some(child)=self.children.get_mut(id){self.annotation_updates.extend(child.annotation_updates.drain(..).map(|mut update|{update.key.agent_id=Some(id.to_owned());update.session_id=self.thread.clone();update}));}
+        if let Some(child) = self.children.get_mut(id) {
+            self.annotation_updates
+                .extend(child.annotation_updates.drain(..).map(|mut update| {
+                    update.key.agent_id = Some(id.to_owned());
+                    update.session_id = self.thread.clone();
+                    update
+                }));
+        }
         if content.events.iter().any(|event| {
             matches!(
                 event,
@@ -1264,16 +1271,20 @@ impl Codex {
         let Some(key) = Self::approval_item_key(frame) else {
             return;
         };
-        self.annotation_updates.push(chat::annotations::ApprovalUpdate {
-            session_id:self.thread.clone(),
-            key: chat::annotations::ApprovalKey { agent_id: None, item_id:key.clone() },
-            request_id: frame["id"].to_string(),
-            decision: match status {
-                ToolStatus::AwaitingApproval => chat::annotations::ApprovalDecision::Awaiting,
-                ToolStatus::Denied => chat::annotations::ApprovalDecision::Denied,
-                _ => chat::annotations::ApprovalDecision::Allowed,
-            },
-        });
+        self.annotation_updates
+            .push(chat::annotations::ApprovalUpdate {
+                session_id: self.thread.clone(),
+                key: chat::annotations::ApprovalKey {
+                    agent_id: None,
+                    item_id: key.clone(),
+                },
+                request_id: frame["id"].to_string(),
+                decision: match status {
+                    ToolStatus::AwaitingApproval => chat::annotations::ApprovalDecision::Awaiting,
+                    ToolStatus::Denied => chat::annotations::ApprovalDecision::Denied,
+                    _ => chat::annotations::ApprovalDecision::Allowed,
+                },
+            });
         if status == ToolStatus::Running {
             self.approval_states.remove(&key);
         } else {
@@ -1340,7 +1351,12 @@ impl Codex {
         {
             let mut local = Step::default();
             child.release_approval(frame, &mut local);
-            self.annotation_updates.extend(child.annotation_updates.drain(..).map(|mut update| { update.key.agent_id=Some(child_id.to_owned());update.session_id=self.thread.clone(); update }));
+            self.annotation_updates
+                .extend(child.annotation_updates.drain(..).map(|mut update| {
+                    update.key.agent_id = Some(child_id.to_owned());
+                    update.session_id = self.thread.clone();
+                    update
+                }));
             step.events
                 .extend(chat::child_events(child_id, local.events));
             return;
@@ -1361,7 +1377,12 @@ impl Codex {
         {
             let mut local = Step::default();
             child.set_approval(frame, status, &mut local);
-            self.annotation_updates.extend(child.annotation_updates.drain(..).map(|mut update| { update.key.agent_id=Some(child_id.to_owned());update.session_id=self.thread.clone(); update }));
+            self.annotation_updates
+                .extend(child.annotation_updates.drain(..).map(|mut update| {
+                    update.key.agent_id = Some(child_id.to_owned());
+                    update.session_id = self.thread.clone();
+                    update
+                }));
             step.events
                 .extend(chat::child_events(child_id, local.events));
         } else {
@@ -1377,7 +1398,12 @@ impl Codex {
         {
             let first = step.events.len();
             child.request(frame.clone(), step)?;
-            self.annotation_updates.extend(child.annotation_updates.drain(..).map(|mut update|{update.key.agent_id=Some(child_id.to_owned());update.session_id=self.thread.clone();update}));
+            self.annotation_updates
+                .extend(child.annotation_updates.drain(..).map(|mut update| {
+                    update.key.agent_id = Some(child_id.to_owned());
+                    update.session_id = self.thread.clone();
+                    update
+                }));
             self.requests.append(&mut child.requests);
             for event in &mut step.events[first..] {
                 if let Event::Item(item) = event {
@@ -3879,9 +3905,14 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 }
 
 #[cfg(test)]
-pub(crate) fn annotation_test_adapter(with_child:bool)->Box<dyn Adapter>{
-    let mut adapter=tests::adapter();
-    if with_child{let mut child=tests::adapter();child.thread=Some("child-exact".into());child.is_child=true;adapter.children.insert("child-exact".into(),child);}
+pub(crate) fn annotation_test_adapter(with_child: bool) -> Box<dyn Adapter> {
+    let mut adapter = tests::adapter();
+    if with_child {
+        let mut child = tests::adapter();
+        child.thread = Some("child-exact".into());
+        child.is_child = true;
+        adapter.children.insert("child-exact".into(), child);
+    }
     Box::new(adapter)
 }
 #[cfg(test)]
