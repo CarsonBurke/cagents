@@ -258,7 +258,7 @@ mod tests {
                 range_length: None,
                 text: "x".into(),
             }]),
-            full: Arc::new(Snapshot::new(version,text)),
+            full: Arc::new(Snapshot::new(version, text)),
         }
     }
 
@@ -324,7 +324,7 @@ mod tests {
                 uri: Arc::clone(&uri),
                 language_id: "rust".into(),
                 version: 1,
-                text: Arc::new(Snapshot::new(1,Arc::from("opened"))),
+                text: Arc::new(Snapshot::new(1, Arc::from("opened"))),
             },
         ] {
             let (sender, _receiver) = channel();

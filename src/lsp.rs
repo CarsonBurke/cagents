@@ -33,6 +33,7 @@
 //! [`LspStatus::Unavailable`] while editing, saving and syntax highlighting
 //! keep working.
 
+use crate::repository_widget::text_editor::{Position as NativePosition, TextSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
@@ -44,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use crate::repository_widget::text_editor::{TextSnapshot,Position as NativePosition};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -253,7 +253,8 @@ pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
         // final line contains no LF, so only its scalar count is used above.
         for item in items.iter_mut() {
             let point = item.range.start == item.range.end;
-            item.range.start = shift_diagnostic_position(item.range.start, edit.range, ending, true);
+            item.range.start =
+                shift_diagnostic_position(item.range.start, edit.range, ending, true);
             item.range.end = shift_diagnostic_position(item.range.end, edit.range, ending, point);
             item.range.end = item.range.end.max(item.range.start);
         }
@@ -261,9 +262,14 @@ pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
 }
 
 fn shift_diagnostic_position(
-    at: LspPosition, old: LspRange, new_end: LspPosition, right: bool,
+    at: LspPosition,
+    old: LspRange,
+    new_end: LspPosition,
+    right: bool,
 ) -> LspPosition {
-    if at < old.start { return at; }
+    if at < old.start {
+        return at;
+    }
     if old.start == old.end && at == old.start {
         return if right { new_end } else { old.start };
     }
@@ -271,9 +277,19 @@ fn shift_diagnostic_position(
         return if right { old.start } else { new_end };
     }
     if at.line == old.end.line {
-        LspPosition::new(new_end.line, new_end.character.saturating_add(at.character.saturating_sub(old.end.character)))
+        LspPosition::new(
+            new_end.line,
+            new_end
+                .character
+                .saturating_add(at.character.saturating_sub(old.end.character)),
+        )
     } else {
-        LspPosition::new(new_end.line.saturating_add(at.line.saturating_sub(old.end.line)), at.character)
+        LspPosition::new(
+            new_end
+                .line
+                .saturating_add(at.line.saturating_sub(old.end.line)),
+            at.character,
+        )
     }
 }
 
@@ -516,64 +532,115 @@ struct Snapshot {
 
 impl Snapshot {
     fn new(version: i32, text: Arc<str>) -> Self {
-        let result = Self {version,text:OnceLock::from(text),native:None,line_starts:OnceLock::new()};
+        let result = Self {
+            version,
+            text: OnceLock::from(text),
+            native: None,
+            line_starts: OnceLock::new(),
+        };
         result.protocol_lines();
         result
     }
 
-    fn with_version(&self,version:i32)->Self {
-        Self {version,native:self.native.clone(),text:self.text.get().cloned().map(OnceLock::from).unwrap_or_default(),line_starts:self.line_starts.get().cloned().map(OnceLock::from).unwrap_or_default()}
+    fn with_version(&self, version: i32) -> Self {
+        Self {
+            version,
+            native: self.native.clone(),
+            text: self
+                .text
+                .get()
+                .cloned()
+                .map(OnceLock::from)
+                .unwrap_or_default(),
+            line_starts: self
+                .line_starts
+                .get()
+                .cloned()
+                .map(OnceLock::from)
+                .unwrap_or_default(),
+        }
     }
 
     fn from_native(version: i32, native: TextSnapshot) -> Self {
-        Self {version,text:OnceLock::new(),native:Some(native.without_cached_text()),line_starts:OnceLock::new()}
+        Self {
+            version,
+            text: OnceLock::new(),
+            native: Some(native.without_cached_text()),
+            line_starts: OnceLock::new(),
+        }
     }
 
     fn full_text(&self) -> &Arc<str> {
-        self.text.get_or_init(|| self.native.as_ref().expect("lazy snapshot has native source").text())
+        self.text.get_or_init(|| {
+            self.native
+                .as_ref()
+                .expect("lazy snapshot has native source")
+                .text()
+        })
     }
 
-    fn wire_text(&self)->String {
-        self.native.as_ref().map_or_else(||self.full_text().to_string(),TextSnapshot::to_string_uncached)
+    fn wire_text(&self) -> String {
+        self.native.as_ref().map_or_else(
+            || self.full_text().to_string(),
+            TextSnapshot::to_string_uncached,
+        )
     }
 
     fn byte_len(&self) -> usize {
-        self.native.as_ref().map_or_else(|| self.full_text().len(), TextSnapshot::len)
+        self.native
+            .as_ref()
+            .map_or_else(|| self.full_text().len(), TextSnapshot::len)
     }
 
     fn compatible_native(&self) -> Option<&TextSnapshot> {
-        self.native.as_ref().filter(|source| source.protocol_compatible_lines())
+        self.native
+            .as_ref()
+            .filter(|source| source.protocol_compatible_lines())
     }
 
     fn protocol_lines(&self) -> &[u32] {
         self.line_starts.get_or_init(|| {
             let mut lines = vec![0];
-            for (index,byte) in self.full_text().bytes().enumerate() {
-                if byte == b'\n' {lines.push(u32::try_from(index+1).unwrap_or(u32::MAX));}
+            for (index, byte) in self.full_text().bytes().enumerate() {
+                if byte == b'\n' {
+                    lines.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
+                }
             }
             lines.into()
         })
     }
 
     fn line_count(&self) -> u32 {
-        u32::try_from(self.compatible_native().map_or_else(||self.protocol_lines().len(),TextSnapshot::line_count)).unwrap_or(u32::MAX)
+        u32::try_from(
+            self.compatible_native()
+                .map_or_else(|| self.protocol_lines().len(), TextSnapshot::line_count),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     fn line_span(&self, line: u32) -> Option<Range<usize>> {
         if let Some(source) = self.compatible_native() {
             let line = usize::try_from(line).ok()?;
-            let start = source.byte_offset(NativePosition {line,column:0})?;
-            return Some(start..start+source.line(line)?.text.len());
+            let start = source.byte_offset(NativePosition { line, column: 0 })?;
+            return Some(start..start + source.line(line)?.text.len());
         }
         let lines = self.protocol_lines();
         let start = *lines.get(line as usize)? as usize;
-        let end = lines.get(line as usize+1).map_or(self.byte_len(),|next| *next as usize-1);
-        let end = if end > start && self.full_text().as_bytes().get(end-1) == Some(&b'\r') {end-1} else {end};
+        let end = lines
+            .get(line as usize + 1)
+            .map_or(self.byte_len(), |next| *next as usize - 1);
+        let end = if end > start && self.full_text().as_bytes().get(end - 1) == Some(&b'\r') {
+            end - 1
+        } else {
+            end
+        };
         Some(start..end)
     }
 
-    fn line_content(&self, line: u32) -> Option<std::borrow::Cow<'_,str>> {
-        if let Some(source) = self.compatible_native() {return Some(source.line(usize::try_from(line).ok()?)?.text);}
+    fn line_content(&self, line: u32) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(source) = self.compatible_native() {
+            return Some(source.line(usize::try_from(line).ok()?)?.text);
+        }
         let span = self.line_span(line)?;
         Some(std::borrow::Cow::Borrowed(&self.full_text()[span]))
     }
@@ -663,7 +730,9 @@ impl Snapshot {
         let span = self
             .line_span(position.line)
             .ok_or_else(|| self.out_of_range(position.line, position.character))?;
-        let content = self.line_content(position.line).ok_or_else(|| self.out_of_range(position.line,position.character))?;
+        let content = self
+            .line_content(position.line)
+            .ok_or_else(|| self.out_of_range(position.line, position.character))?;
         let mut scalars = 0u32;
         for (offset, _) in content.char_indices() {
             if scalars == position.character {
@@ -760,21 +829,39 @@ fn build_incremental(
 /// Convert only affected source lines. Unusual native line topology or a
 /// legacy source without persistent intermediate lines uses the lazy full
 /// fallback, leaving serialization at the existing debounce boundary.
-fn native_incremental(base:&Snapshot, edits:&[LspTextEdit], expected:&TextSnapshot)->Option<Vec<lsp_types::TextDocumentContentChangeEvent>> {
-    if edits.is_empty() {return None;}
+fn native_incremental(
+    base: &Snapshot,
+    edits: &[LspTextEdit],
+    expected: &TextSnapshot,
+) -> Option<Vec<lsp_types::TextDocumentContentChangeEvent>> {
+    if edits.is_empty() {
+        return None;
+    }
     let mut changes = Vec::with_capacity(edits.len());
     let mut working = base.compatible_native()?.clone();
     for edit in edits {
-        let snapshot = Snapshot::from_native(base.version,working.clone());
-        changes.push(lsp_types::TextDocumentContentChangeEvent {range:Some(snapshot.range_to_utf16(edit.range).ok()?),range_length:None,text:edit.new_text.clone()});
-        let native_position = |at:LspPosition| -> Option<NativePosition> {
+        let snapshot = Snapshot::from_native(base.version, working.clone());
+        changes.push(lsp_types::TextDocumentContentChangeEvent {
+            range: Some(snapshot.range_to_utf16(edit.range).ok()?),
+            range_length: None,
+            text: edit.new_text.clone(),
+        });
+        let native_position = |at: LspPosition| -> Option<NativePosition> {
             let line = usize::try_from(at.line).ok()?;
             let content = working.line(line)?;
             let scalar = usize::try_from(at.character).ok()?;
-            let column = if scalar == content.text.chars().count() {content.text.len()} else {content.text.char_indices().nth(scalar)?.0};
-            Some(NativePosition {line,column})
+            let column = if scalar == content.text.chars().count() {
+                content.text.len()
+            } else {
+                content.text.char_indices().nth(scalar)?.0
+            };
+            Some(NativePosition { line, column })
         };
-        working = working.replaced(native_position(edit.range.start)?,native_position(edit.range.end)?,&edit.new_text)?;
+        working = working.replaced(
+            native_position(edit.range.start)?,
+            native_position(edit.range.end)?,
+            &edit.new_text,
+        )?;
     }
     working.same_text(expected).then_some(changes)
 }
@@ -886,10 +973,23 @@ impl SnapshotStore {
         requested_version: i32,
         text: Arc<str>,
     ) -> Option<Arc<Snapshot>> {
-        self.register_source(doc,uri,session,requested_version,Arc::new(Snapshot::new(requested_version,text)))
+        self.register_source(
+            doc,
+            uri,
+            session,
+            requested_version,
+            Arc::new(Snapshot::new(requested_version, text)),
+        )
     }
 
-    fn register_source(&self,doc:LspDocumentId,uri:&Arc<Url>,session:&SessionKey,requested_version:i32,source:Arc<Snapshot>)->Option<Arc<Snapshot>> {
+    fn register_source(
+        &self,
+        doc: LspDocumentId,
+        uri: &Arc<Url>,
+        session: &SessionKey,
+        requested_version: i32,
+        source: Arc<Snapshot>,
+    ) -> Option<Arc<Snapshot>> {
         let mut inner = self.lock();
         match inner.uris.get_mut(uri) {
             Some(state) => {
@@ -935,14 +1035,23 @@ impl SnapshotStore {
         RecordOutcome::Recorded { previous, snapshot }
     }
 
-    fn record_native(&self, uri: &Arc<Url>, requested_version: i32, source: TextSnapshot) -> RecordOutcome {
+    fn record_native(
+        &self,
+        uri: &Arc<Url>,
+        requested_version: i32,
+        source: TextSnapshot,
+    ) -> RecordOutcome {
         let mut inner = self.lock();
-        let Some(state) = inner.uris.get_mut(uri) else {return RecordOutcome::UnknownUri;};
+        let Some(state) = inner.uris.get_mut(uri) else {
+            return RecordOutcome::UnknownUri;
+        };
         let previous = state.latest();
-        let Some(version) = next_version(previous.version,requested_version) else {return RecordOutcome::VersionExhausted;};
-        let snapshot = Arc::new(Snapshot::from_native(version,source));
+        let Some(version) = next_version(previous.version, requested_version) else {
+            return RecordOutcome::VersionExhausted;
+        };
+        let snapshot = Arc::new(Snapshot::from_native(version, source));
         state.push(Arc::clone(&snapshot));
-        RecordOutcome::Recorded {previous,snapshot}
+        RecordOutcome::Recorded { previous, snapshot }
     }
 
     fn latest(&self, uri: &Url) -> Option<Arc<Snapshot>> {
@@ -3900,16 +4009,46 @@ impl LspManager {
         version: i32,
         text: &str,
     ) -> LspStatus {
-        self.open_source(doc,path,worktree,language,version,Arc::new(Snapshot::new(version,Arc::from(text))))
+        self.open_source(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::new(version, Arc::from(text))),
+        )
     }
 
     /// Registers an immutable editor source without serializing it on the UI
     /// thread. The worker materializes it only when didOpen is sent.
-    pub fn open_snapshot(&mut self,doc:LspDocumentId,path:&Path,worktree:&Path,language:LspLanguage,version:i32,source:TextSnapshot)->LspStatus {
-        self.open_source(doc,path,worktree,language,version,Arc::new(Snapshot::from_native(version,source)))
+    pub fn open_snapshot(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: TextSnapshot,
+    ) -> LspStatus {
+        self.open_source(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::from_native(version, source)),
+        )
     }
 
-    fn open_source(&mut self,doc:LspDocumentId,path:&Path,worktree:&Path,language:LspLanguage,version:i32,source:Arc<Snapshot>)->LspStatus {
+    fn open_source(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: Arc<Snapshot>,
+    ) -> LspStatus {
         if self.servers.is_empty() {
             return LspStatus::Disabled;
         }
@@ -4006,10 +4145,27 @@ impl LspManager {
         text: &str,
         root: PathBuf,
     ) -> LspStatus {
-        self.open_source_at_root(doc,path,worktree,language,version,Arc::new(Snapshot::new(version,Arc::from(text))),root)
+        self.open_source_at_root(
+            doc,
+            path,
+            worktree,
+            language,
+            version,
+            Arc::new(Snapshot::new(version, Arc::from(text))),
+            root,
+        )
     }
 
-    fn open_source_at_root(&mut self,doc:LspDocumentId,path:&Path,worktree:&Path,language:LspLanguage,version:i32,source:Arc<Snapshot>,root:PathBuf)->LspStatus {
+    fn open_source_at_root(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: Arc<Snapshot>,
+        root: PathBuf,
+    ) -> LspStatus {
         if self.servers.is_empty() {
             return LspStatus::Disabled;
         }
@@ -4119,7 +4275,7 @@ impl LspManager {
     ) {
         if let Some(pending) = self.pending_opens.get_mut(&doc) {
             pending.version = version;
-            pending.text = Arc::new(Snapshot::new(version,Arc::from(full_text)));
+            pending.text = Arc::new(Snapshot::new(version, Arc::from(full_text)));
             return;
         }
         let Some(reference) = self.documents.get(&doc).cloned() else {
@@ -4173,31 +4329,59 @@ impl LspManager {
 
     /// Records a transition produced by the native recorded-edit layer.
     /// Its immutable source remains lazy for incremental synchronization.
-    pub fn change_snapshot(&mut self, doc:LspDocumentId, version:i32, edits:&[LspTextEdit], source:TextSnapshot) {
+    pub fn change_snapshot(
+        &mut self,
+        doc: LspDocumentId,
+        version: i32,
+        edits: &[LspTextEdit],
+        source: TextSnapshot,
+    ) {
         if let Some(pending) = self.pending_opens.get_mut(&doc) {
             pending.version = version;
-            pending.text = Arc::new(Snapshot::from_native(version,source));
+            pending.text = Arc::new(Snapshot::from_native(version, source));
             return;
         }
-        let Some(reference) = self.documents.get(&doc).cloned() else {return;};
-        let (previous,snapshot) = match self.snapshots.record_native(&reference.uri,version,source) {
-            RecordOutcome::Recorded {previous,snapshot} => (previous,snapshot),
-            RecordOutcome::UnknownUri => return,
-            RecordOutcome::VersionExhausted => {
-                self.events.emit_now(LspEvent::DocumentDesynced {doc,version:i32::MAX,error:LspError::VersionExhausted});return;
-            }
+        let Some(reference) = self.documents.get(&doc).cloned() else {
+            return;
         };
+        let (previous, snapshot) =
+            match self
+                .snapshots
+                .record_native(&reference.uri, version, source)
+            {
+                RecordOutcome::Recorded { previous, snapshot } => (previous, snapshot),
+                RecordOutcome::UnknownUri => return,
+                RecordOutcome::VersionExhausted => {
+                    self.events.emit_now(LspEvent::DocumentDesynced {
+                        doc,
+                        version: i32::MAX,
+                        error: LspError::VersionExhausted,
+                    });
+                    return;
+                }
+            };
         let incremental = if previous.compatible_native().is_some() && !edits.is_empty() {
             snapshot.compatible_native().and_then(|expected| {
-                let changes = native_incremental(&previous,edits,expected);
+                let changes = native_incremental(&previous, edits, expected);
                 if changes.is_none() {
-                    self.events.emit_now(LspEvent::DocumentDesynced {doc,version:snapshot.version,error:LspError::InconsistentEdits});
+                    self.events.emit_now(LspEvent::DocumentDesynced {
+                        doc,
+                        version: snapshot.version,
+                        error: LspError::InconsistentEdits,
+                    });
                 }
                 changes
             })
-        } else {None};
+        } else {
+            None
+        };
         if let Some(session) = self.sessions.get(&reference.session) {
-            let _ = session.commands.send(SessionCommand::Change {uri:Arc::clone(&reference.uri),version:snapshot.version,incremental,full:snapshot});
+            let _ = session.commands.send(SessionCommand::Change {
+                uri: Arc::clone(&reference.uri),
+                version: snapshot.version,
+                incremental,
+                full: snapshot,
+            });
         }
     }
 
@@ -4414,7 +4598,9 @@ impl LspManager {
         at: LspPosition,
     ) -> Result<LspPosition, LspError> {
         if let Some(pending) = self.pending_opens.get(&doc) {
-            return pending.text.from_utf16(lsp_types::Position::new(at.line, at.character));
+            return pending
+                .text
+                .from_utf16(lsp_types::Position::new(at.line, at.character));
         }
         let reference = self
             .documents
@@ -5533,7 +5719,8 @@ mod tests {
                     .snapshots
                     .latest(&reference.uri)
                     .unwrap()
-                    .full_text().as_ref(),
+                    .full_text()
+                    .as_ref(),
                 "edited while blocked"
             );
             assert_eq!(manager.sessions.len(), 1);
@@ -5938,7 +6125,10 @@ mod tests {
             );
             let old_ticket = manager.pending_opens[&doc].ticket;
             manager.change(doc, 2, &[], "edited during discovery");
-            assert_eq!(manager.pending_opens[&doc].text.full_text().as_ref(), "edited during discovery");
+            assert_eq!(
+                manager.pending_opens[&doc].text.full_text().as_ref(),
+                "edited during discovery"
+            );
             manager.close(doc);
             let (ticket, root) = next_matching(&events, |event| match event {
                 LspEvent::RootDiscovered { ticket, root, .. } => Some((*ticket, root.clone())),
@@ -6008,7 +6198,11 @@ mod tests {
                     manager.change(doc, version, &[], &latest);
                 }
                 old_versions.push(Arc::downgrade(
-                    manager.snapshots.latest(&reference.uri).unwrap().full_text(),
+                    manager
+                        .snapshots
+                        .latest(&reference.uri)
+                        .unwrap()
+                        .full_text(),
                 ));
             }
             assert!(
@@ -6186,27 +6380,93 @@ mod tests {
 
     #[test]
     fn diagnostic_ranges_follow_insert_delete_and_multiline_replacements() {
-        fn diagnostic(start: (u32,u32), end: (u32,u32)) -> LspDiagnostic {
-            LspDiagnostic { range: LspRange::new(LspPosition::new(start.0,start.1),LspPosition::new(end.0,end.1)), severity:LspSeverity::Error, message:"error".into(), source:None, code:None }
+        fn diagnostic(start: (u32, u32), end: (u32, u32)) -> LspDiagnostic {
+            LspDiagnostic {
+                range: LspRange::new(
+                    LspPosition::new(start.0, start.1),
+                    LspPosition::new(end.0, end.1),
+                ),
+                severity: LspSeverity::Error,
+                message: "error".into(),
+                source: None,
+                code: None,
+            }
         }
-        let mut items = vec![diagnostic((2,3),(2,8)), diagnostic((0,0),(0,2))];
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,0)),new_text:"α\r\nβ\n".into()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(4,3),LspPosition::new(4,8)));
-        assert_eq!(items[1].range, LspRange::new(LspPosition::new(0,0),LspPosition::new(0,2)));
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(3,0)),new_text:String::new()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(2,3),LspPosition::new(2,8)));
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(2,5),LspPosition::new(2,7)),new_text:"x\ny".into()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(2,3),LspPosition::new(3,2)));
+        let mut items = vec![diagnostic((2, 3), (2, 8)), diagnostic((0, 0), (0, 2))];
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                new_text: "α\r\nβ\n".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(4, 3), LspPosition::new(4, 8))
+        );
+        assert_eq!(
+            items[1].range,
+            LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 2))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(3, 0)),
+                new_text: String::new(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(2, 8))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(2, 5), LspPosition::new(2, 7)),
+                new_text: "x\ny".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(3, 2))
+        );
     }
 
     #[test]
     fn diagnostic_insert_affinity_and_complete_deletion_remain_valid() {
-        let mut item = LspDiagnostic { range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,5)),severity:LspSeverity::Error,message:"error".into(),source:None,code:None };
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,2)),new_text:"α".into()}]);
-        assert_eq!(item.range, LspRange::new(LspPosition::new(0,3),LspPosition::new(0,6)));
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,6),LspPosition::new(0,6)),new_text:"z".into()}]);
-        assert_eq!(item.range.end, LspPosition::new(0,6));
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,0),LspPosition::new(1,0)),new_text:String::new()}]);
+        let mut item = LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 5)),
+            severity: LspSeverity::Error,
+            message: "error".into(),
+            source: None,
+            code: None,
+        };
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 2)),
+                new_text: "α".into(),
+            }],
+        );
+        assert_eq!(
+            item.range,
+            LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6))
+        );
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 6), LspPosition::new(0, 6)),
+                new_text: "z".into(),
+            }],
+        );
+        assert_eq!(item.range.end, LspPosition::new(0, 6));
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(1, 0)),
+                new_text: String::new(),
+            }],
+        );
         assert_eq!(item.range, LspRange::default());
     }
 
@@ -6286,9 +6546,18 @@ mod tests {
     #[test]
     fn a_crlf_terminator_is_not_part_of_its_line() {
         let snapshot = Snapshot::new(1, Arc::from("ab\r\ncd\r\n"));
-        assert_eq!(snapshot.line_content(0), Some(std::borrow::Cow::Borrowed("ab")));
-        assert_eq!(snapshot.line_content(1), Some(std::borrow::Cow::Borrowed("cd")));
-        assert_eq!(snapshot.line_content(2), Some(std::borrow::Cow::Borrowed("")));
+        assert_eq!(
+            snapshot.line_content(0),
+            Some(std::borrow::Cow::Borrowed("ab"))
+        );
+        assert_eq!(
+            snapshot.line_content(1),
+            Some(std::borrow::Cow::Borrowed("cd"))
+        );
+        assert_eq!(
+            snapshot.line_content(2),
+            Some(std::borrow::Cow::Borrowed(""))
+        );
         assert_eq!(
             snapshot.to_utf16(LspPosition::new(0, 2)).expect("line end"),
             lsp_types::Position::new(0, 2)
@@ -6757,111 +7026,195 @@ mod tests {
         });
     }
 
-    fn native_source(text:&str)->TextSnapshot {
-        crate::repository_widget::text_editor::Content::<cosmic::Renderer>::with_text(text).text_snapshot()
+    fn native_source(text: &str) -> TextSnapshot {
+        crate::repository_widget::text_editor::Content::<cosmic::Renderer>::with_text(text)
+            .text_snapshot()
     }
 
     #[test]
     fn native_changes_during_root_discovery_remain_lazy_until_worker_open() {
         block_on(async {
-            let (_root,worktree,file) = workspace();
+            let (_root, worktree, file) = workspace();
             let (release, waiting) = tokio::sync::oneshot::channel::<()>();
             let mut manager = rust_manager().after_shutdown(async move {
                 let _ = waiting.await;
             });
-            let slot = install_fake(&mut manager,incremental_capabilities(), |_| Vec::new());
-            let events = manager.events();let doc = LspDocumentId(1);
-            let initial = native_source("before");let changed = native_source("after");
-            manager.open_snapshot(doc,&file,&worktree,rust_language(),1,initial.clone());
-            manager.change_snapshot(doc,2,&[],changed.clone());
-            assert!(!initial.is_materialized());assert!(!changed.is_materialized());
-            let (ticket,root) = next_matching(&events,|event| match event {LspEvent::RootDiscovered {doc:at,ticket,root} if *at == doc => Some((*ticket,root.clone())),_=>None}).await;
-            manager.finish_discovery(doc,ticket,root);
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            let initial = native_source("before");
+            let changed = native_source("after");
+            manager.open_snapshot(doc, &file, &worktree, rust_language(), 1, initial.clone());
+            manager.change_snapshot(doc, 2, &[], changed.clone());
+            assert!(!initial.is_materialized());
+            assert!(!changed.is_materialized());
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            manager.finish_discovery(doc, ticket, root);
             tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(slot.lock().unwrap().is_none(), "replacement must wait for the old manager to reap");
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "replacement must wait for the old manager to reap"
+            );
             assert_eq!(initial.serialization_count(), 0);
             assert_eq!(changed.serialization_count(), 0);
             release.send(()).unwrap();
-            await_ready(&events,doc).await;
+            await_ready(&events, doc).await;
             let fake = handle_of(&slot).await;
             let opened = fake.wait_for("textDocument/didOpen").await;
-            assert_eq!(opened.params["textDocument"]["text"],"after");
-            assert!(!initial.is_materialized());assert!(!changed.is_materialized());
-            assert_eq!(initial.serialization_count(),0);assert_eq!(changed.serialization_count(),1);
-            manager.shutdown();manager.wait_for_shutdown().await;
+            assert_eq!(opened.params["textDocument"]["text"], "after");
+            assert!(!initial.is_materialized());
+            assert!(!changed.is_materialized());
+            assert_eq!(initial.serialization_count(), 0);
+            assert_eq!(changed.serialization_count(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
         });
     }
 
     #[test]
     fn native_incremental_typing_never_materializes_full_text() {
         block_on(async {
-            let (_root,worktree,file) = workspace();
+            let (_root, worktree, file) = workspace();
             let mut manager = rust_manager();
-            let slot = install_fake(&mut manager,incremental_capabilities(), |_| Vec::new());
-            let events = manager.events();let doc = LspDocumentId(1);
-            manager.open_source_at_root(doc,&file,&worktree,rust_language(),1,Arc::new(Snapshot::from_native(1,native_source("a😀\nnext\n"))),worktree.clone());
-            await_ready(&events,doc).await;
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_source_at_root(
+                doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                Arc::new(Snapshot::from_native(1, native_source("a😀\nnext\n"))),
+                worktree.clone(),
+            );
+            await_ready(&events, doc).await;
             let source = native_source("a😀x\nnext\n");
-            let edit = LspTextEdit {range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,2)),new_text:"x".into()};
-            manager.change_snapshot(doc,2,&[edit],source.clone());
+            let edit = LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 2)),
+                new_text: "x".into(),
+            };
+            manager.change_snapshot(doc, 2, &[edit], source.clone());
             assert!(!source.is_materialized());
             let fake = handle_of(&slot).await;
             let change = fake.wait_for("textDocument/didChange").await;
-            assert_eq!(change.params["contentChanges"][0]["range"]["start"]["character"],3);
-            assert_eq!(change.params["contentChanges"][0]["text"],"x");
+            assert_eq!(
+                change.params["contentChanges"][0]["range"]["start"]["character"],
+                3
+            );
+            assert_eq!(change.params["contentChanges"][0]["text"], "x");
             assert!(!source.is_materialized());
             let next = native_source("a😀x\nzero\nnext\n");
-            manager.change_snapshot(doc,3,&[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,0)),new_text:"zero\n".into()}],next.clone());
-            let changes = fake.wait_for_count("textDocument/didChange",2).await;
-            assert_eq!(changes[1].params["contentChanges"][0]["text"],"zero\n");
-            assert!(!source.is_materialized());assert!(!next.is_materialized());
-            assert_eq!(source.serialization_count(),0);assert_eq!(next.serialization_count(),0);
-            manager.shutdown(); manager.wait_for_shutdown().await;
+            manager.change_snapshot(
+                doc,
+                3,
+                &[LspTextEdit {
+                    range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                    new_text: "zero\n".into(),
+                }],
+                next.clone(),
+            );
+            let changes = fake.wait_for_count("textDocument/didChange", 2).await;
+            assert_eq!(changes[1].params["contentChanges"][0]["text"], "zero\n");
+            assert!(!source.is_materialized());
+            assert!(!next.is_materialized());
+            assert_eq!(source.serialization_count(), 0);
+            assert_eq!(next.serialization_count(), 0);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
         });
     }
 
     #[test]
     fn native_full_sync_materializes_only_the_latest_debounced_source() {
         block_on(async {
-            let (_root,worktree,file) = workspace();
+            let (_root, worktree, file) = workspace();
             let mut manager = rust_manager();
-            let slot = install_fake(&mut manager,full_sync_capabilities(), |_| Vec::new());
-            let events = manager.events();let doc = LspDocumentId(1);
-            manager.open_source_at_root(doc,&file,&worktree,rust_language(),1,Arc::new(Snapshot::from_native(1,native_source("a"))),worktree.clone());await_ready(&events,doc).await;
+            let slot = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_source_at_root(
+                doc,
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                Arc::new(Snapshot::from_native(1, native_source("a"))),
+                worktree.clone(),
+            );
+            await_ready(&events, doc).await;
             let mut sources = Vec::new();
             for version in 2..8 {
                 let source = native_source(&"a".repeat(version as usize));
-                manager.change_snapshot(doc,version,&[],source.clone());
-                assert!(!source.is_materialized());sources.push(source);
+                manager.change_snapshot(doc, version, &[], source.clone());
+                assert!(!source.is_materialized());
+                sources.push(source);
             }
             let fake = handle_of(&slot).await;
             let change = fake.wait_for("textDocument/didChange").await;
-            assert_eq!(change.params["contentChanges"][0]["text"],"aaaaaaa");
-            assert_eq!(fake.entries("textDocument/didChange").len(),1);
-            assert_eq!(sources.last().unwrap().serialization_count(),1);
+            assert_eq!(change.params["contentChanges"][0]["text"], "aaaaaaa");
+            assert_eq!(fake.entries("textDocument/didChange").len(), 1);
+            assert_eq!(sources.last().unwrap().serialization_count(), 1);
             assert!(sources.iter().all(|source| !source.is_materialized()));
-            assert!(sources[..sources.len()-1].iter().all(|source| source.serialization_count()==0));
-            manager.shutdown(); manager.wait_for_shutdown().await;
+            assert!(
+                sources[..sources.len() - 1]
+                    .iter()
+                    .all(|source| source.serialization_count() == 0)
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
         });
     }
 
     #[test]
     fn native_incremental_ranges_are_verified_against_the_immutable_result() {
-        let base = Snapshot::from_native(1,native_source("before"));
+        let base = Snapshot::from_native(1, native_source("before"));
         let expected = native_source("incorrect");
-        assert!(native_incremental(&base,&[LspTextEdit {range:LspRange::new(LspPosition::new(0,0),LspPosition::new(0,6)),new_text:"after".into()}],&expected).is_none());
+        assert!(
+            native_incremental(
+                &base,
+                &[LspTextEdit {
+                    range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 6)),
+                    new_text: "after".into()
+                }],
+                &expected
+            )
+            .is_none()
+        );
         assert!(!expected.is_materialized());
         assert!(!base.native.unwrap().is_materialized());
     }
 
     #[test]
     fn native_group_ranges_use_persistent_intermediate_lines() {
-        let base = Snapshot::from_native(1,native_source("a😀\nlast"));
-        let changes = native_incremental(&base,&[
-            LspTextEdit {range:LspRange::new(LspPosition::new(0,0),LspPosition::new(0,0)),new_text:"first\n".into()},
-            LspTextEdit {range:LspRange::new(LspPosition::new(1,2),LspPosition::new(1,2)),new_text:"x".into()},
-        ],&native_source("first\na😀x\nlast")).unwrap();
-        assert_eq!(changes[1].range.unwrap().start,lsp_types::Position::new(1,3));
+        let base = Snapshot::from_native(1, native_source("a😀\nlast"));
+        let changes = native_incremental(
+            &base,
+            &[
+                LspTextEdit {
+                    range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                    new_text: "first\n".into(),
+                },
+                LspTextEdit {
+                    range: LspRange::new(LspPosition::new(1, 2), LspPosition::new(1, 2)),
+                    new_text: "x".into(),
+                },
+            ],
+            &native_source("first\na😀x\nlast"),
+        )
+        .unwrap();
+        assert_eq!(
+            changes[1].range.unwrap().start,
+            lsp_types::Position::new(1, 3)
+        );
         assert!(!base.native.unwrap().is_materialized());
     }
 
@@ -7453,7 +7806,8 @@ mod tests {
                     .snapshots
                     .latest(&uri)
                     .expect("the snapshot survives the crash")
-                    .full_text().as_ref(),
+                    .full_text()
+                    .as_ref(),
                 "abcd\n"
             );
 
@@ -7676,10 +8030,17 @@ mod tests {
             await_ready(&events, doc).await;
             let fake = handle_of(&slot).await;
             fake.wait_for("textDocument/didOpen").await;
-            assert_eq!(fake.entries("initialize")[0].params["initializationOptions"], options);
+            assert_eq!(
+                fake.entries("initialize")[0].params["initializationOptions"],
+                options
+            );
             let methods = fake.methods();
-            assert!(methods.iter().position(|method| method == "initialize")
-                < methods.iter().position(|method| method == "textDocument/didOpen"));
+            assert!(
+                methods.iter().position(|method| method == "initialize")
+                    < methods
+                        .iter()
+                        .position(|method| method == "textDocument/didOpen")
+            );
             manager.begin_shutdown().await;
         });
     }
@@ -7728,7 +8089,8 @@ mod tests {
                     .snapshots
                     .latest(&Url::from_file_path(&file).expect("uri"))
                     .expect("snapshot")
-                    .full_text().as_ref(),
+                    .full_text()
+                    .as_ref(),
                 "abcd\n",
                 "editing continues without a server"
             );

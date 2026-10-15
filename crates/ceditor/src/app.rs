@@ -1963,8 +1963,24 @@ impl Editor {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
                         let status = match text {
-                            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,&absolute_path,&worktree,language,version,&text),
-                            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,&absolute_path,&worktree,language,version,source),
+                            repository_widget::LspChangeText::Text(text) => self.lsp.open(
+                                doc,
+                                &absolute_path,
+                                &worktree,
+                                language,
+                                version,
+                                &text,
+                            ),
+                            repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.open_snapshot(
+                                    doc,
+                                    &absolute_path,
+                                    &worktree,
+                                    language,
+                                    version,
+                                    source,
+                                )
+                            }
                         };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
@@ -1977,15 +1993,22 @@ impl Editor {
                 LspIntent::Change { version, text } => {
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         match text {
-                            cagents::repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
-                            cagents::repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                            cagents::repository_widget::LspChangeText::Text(text) => {
+                                self.lsp.change(doc, version, &edits, &text)
+                            }
+                            cagents::repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.change_snapshot(doc, version, &edits, source)
+                            }
                         }
                     }
-                    let synchronized_version = self.tab(id).and_then(|tab| tab.runtime.lsp_document()).and_then(|doc| self.lsp.document_version(doc));
+                    let synchronized_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics,&edits);
+                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
                         tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
                     }
                 }
@@ -3604,9 +3627,10 @@ impl Application for Editor {
                         self.settings.editor_find_options = options;
                         self.settings.editor_replace_preserve_case = preserve;
                         for tab in &mut self.tabs {
-                            tasks.push(repository_task(tab.runtime.update_find_preferences(
-                                tab.id, options, preserve,
-                            )));
+                            tasks.push(repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            ));
                         }
                         tasks.push(self.save_settings());
                     }
@@ -4102,9 +4126,16 @@ impl Application for Editor {
                     }
                     let options = self.settings.editor_find_options;
                     let preserve = self.settings.editor_replace_preserve_case;
-                    let find_tasks = self.tabs.iter_mut().map(|tab| {
-                        repository_task(tab.runtime.update_find_preferences(tab.id, options, preserve))
-                    }).collect::<Vec<_>>();
+                    let find_tasks = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let shortcuts =
                         self.capture_preference(PreferenceWrite::Shortcuts(self.shortcuts.clone()));
                     Task::batch([
@@ -4394,7 +4425,9 @@ impl Application for Editor {
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, version, .. } if current_version == Some(version) => {
+                                LspEvent::Diagnostics { items, version, .. }
+                                    if current_version == Some(version) =>
+                                {
                                     tab.set_diagnostics(items, Some(version));
                                 }
                                 LspEvent::Completion { items, .. } => tab.completions = items,
@@ -6626,49 +6659,99 @@ mod tests {
             source: None,
             code: None,
         };
-        let publish = |version, line| Message::Lsp(generation, Some(LspEvent::Diagnostics {
-            doc,
-            version,
-            items: vec![diagnostic(line)],
-        }));
-        let next = || Message::Repository(RepositoryAction::Language {
-            card: id,
-            action: EditorLspAction::Diagnostic(true),
-        });
+        let publish = |version, line| {
+            Message::Lsp(
+                generation,
+                Some(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![diagnostic(line)],
+                }),
+            )
+        };
+        let next = || {
+            Message::Repository(RepositoryAction::Language {
+                card: id,
+                action: EditorLspAction::Diagnostic(true),
+            })
+        };
         drop(app.update(publish(1, 2)));
-        assert!(app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(2, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(2, 0))
+        );
 
-        app.tab_mut(id).unwrap().runtime.move_cursor_to(LspPosition::new(0, 0));
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
-            card: id,
-            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
-                Arc::new("// before\n".into()),
-            )),
-        })));
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .move_cursor_to(LspPosition::new(0, 0));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("// before\n".into()),
+                )),
+            })),
+        );
         assert_eq!(app.lsp.document_version(doc), Some(2));
-        assert_eq!(app.tab(id).unwrap().diagnostics[0].range.start, LspPosition::new(3, 0));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(3, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(3, 0))
+        );
 
         drop(app.update(publish(1, 0)));
-        assert_eq!(app.tab(id).unwrap().diagnostics[0].range.start, LspPosition::new(3, 0));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
         drop(app.update(publish(2, 1)));
         drop(app.update(next()));
-        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), Some(LspPosition::new(1, 0)));
-        drop(app.update(Message::Lsp(generation, Some(LspEvent::DocumentDesynced {
-            doc,
-            version: 2,
-            error: LspError::InconsistentEdits,
-        }))));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(1, 0))
+        );
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::DocumentDesynced {
+                doc,
+                version: 2,
+                error: LspError::InconsistentEdits,
+            }),
+        )));
         assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        assert!(!app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         drop(app.update(publish(2, 1)));
-        assert!(app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
         app.close_document(id);
         assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        assert!(!app.tab(id).unwrap().runtime.diagnostic_navigation_available());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
     }
 
     #[test]
@@ -6708,15 +6791,20 @@ mod tests {
         let second = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
         load_selected(&mut app, second);
         for id in [first, second] {
-            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
-                (app.settings.editor_find_options, true));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (app.settings.editor_find_options, true)
+            );
         }
         let task = app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
-            card: first, option: FindOption::Regex, enabled: true,
+            card: first,
+            option: FindOption::Regex,
+            enabled: true,
         }));
         run_tasks(&mut app, task);
         let task = app.update(Message::Repository(RepositoryAction::PreserveCaseChanged {
-            card: first, enabled: false,
+            card: first,
+            enabled: false,
         }));
         run_tasks(&mut app, task);
         let persisted = settings::load(&app.settings_path).unwrap();
@@ -6726,28 +6814,40 @@ mod tests {
         let third = add(&mut app, root.to_str().unwrap(), Some("c.rs"));
         load_selected(&mut app, third);
         for id in [first, second, third] {
-            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
-                (persisted.editor_find_options, false));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (persisted.editor_find_options, false)
+            );
         }
         let mut reopened = configured(&directory);
         reopened.settings_writable = true;
         reopened.settings = persisted;
         let fourth = add(&mut reopened, root.to_str().unwrap(), Some("d.rs"));
         load_selected(&mut reopened, fourth);
-        assert_eq!(reopened.tab(fourth).unwrap().runtime.find_preferences(),
-            (app.settings.editor_find_options, false));
+        assert_eq!(
+            reopened.tab(fourth).unwrap().runtime.find_preferences(),
+            (app.settings.editor_find_options, false)
+        );
         app.settings_open = true;
         drop(app.update(Message::ResetSettings));
         let task = app.update(Message::ResetSettings);
         run_tasks(&mut app, task);
         let defaults = AppSettings::default();
         for id in [first, second, third] {
-            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
-                (defaults.editor_find_options, defaults.editor_replace_preserve_case));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (
+                    defaults.editor_find_options,
+                    defaults.editor_replace_preserve_case
+                )
+            );
         }
         let reset = settings::load(&app.settings_path).unwrap();
         assert_eq!(reset.editor_find_options, defaults.editor_find_options);
-        assert_eq!(reset.editor_replace_preserve_case, defaults.editor_replace_preserve_case);
+        assert_eq!(
+            reset.editor_replace_preserve_case,
+            defaults.editor_replace_preserve_case
+        );
     }
 
     #[test]

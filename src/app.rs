@@ -10289,8 +10289,12 @@ impl Cagents {
                     // completion range or a hover span that predates a
                     // keystroke describes characters the buffer no longer has.
                     match text {
-                        repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
-                        repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                        repository_widget::LspChangeText::Text(text) => {
+                            self.lsp.change(doc, version, &edits, &text)
+                        }
+                        repository_widget::LspChangeText::Snapshot(source) => {
+                            self.lsp.change_snapshot(doc, version, &edits, source)
+                        }
                     }
                     let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
@@ -10362,8 +10366,13 @@ impl Cagents {
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = match text {
-            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,path,worktree,language,version,text),
-            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,path,worktree,language,version,source.clone()),
+            repository_widget::LspChangeText::Text(text) => {
+                self.lsp.open(doc, path, worktree, language, version, text)
+            }
+            repository_widget::LspChangeText::Snapshot(source) => {
+                self.lsp
+                    .open_snapshot(doc, path, worktree, language, version, source.clone())
+            }
         };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
@@ -12578,11 +12587,13 @@ impl Cagents {
             for (card, runtime) in &mut self.cards {
                 let task = match runtime {
                     CardRuntime::Repository(runtime) => runtime.update_find_preferences(
-                        *card, self.settings.editor_find_options,
+                        *card,
+                        self.settings.editor_find_options,
                         self.settings.editor_replace_preserve_case,
                     ),
                     CardRuntime::PullRequests(pane) => pane.runtime.update_find_preferences(
-                        *card, self.settings.editor_find_options,
+                        *card,
+                        self.settings.editor_find_options,
                         self.settings.editor_replace_preserve_case,
                     ),
                     _ => Task::none(),
@@ -14095,9 +14106,9 @@ impl Application for Cagents {
                                 CardRuntime::Repository(runtime) => {
                                     runtime.update_find_preferences(*target, options, preserve)
                                 }
-                                CardRuntime::PullRequests(pane) => {
-                                    pane.runtime.update_find_preferences(*target, options, preserve)
-                                }
+                                CardRuntime::PullRequests(pane) => pane
+                                    .runtime
+                                    .update_find_preferences(*target, options, preserve),
                                 _ => Task::none(),
                             };
                             tasks.push(repository_task(task));

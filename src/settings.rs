@@ -1778,7 +1778,8 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
             serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
         }) {
             return Err(SettingsError::LanguageServer(format!(
-                "language server {} initialization_options exceed 1 MiB", server.id
+                "language server {} initialization_options exceed 1 MiB",
+                server.id
             )));
         }
         let id = server.id.as_str();
@@ -2873,7 +2874,10 @@ mod tests {
         settings.language_servers[0].initialization_options = Some(options.clone());
         let text = toml::to_string(&settings).unwrap();
         let decoded: AppSettings = toml::from_str(&text).unwrap();
-        assert_eq!(decoded.language_servers[0].initialization_options, Some(options));
+        assert_eq!(
+            decoded.language_servers[0].initialization_options,
+            Some(options)
+        );
         assert!(decoded.validate().is_ok());
         settings.language_servers[0].initialization_options =
             Some(serde_json::json!({"oversized": "x".repeat(1024 * 1024)}));
