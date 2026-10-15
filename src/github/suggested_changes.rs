@@ -18,12 +18,15 @@ pub fn suggestions(body: &str) -> Vec<Suggestion> {
         let trimmed = line.trim_start_matches(' ');
         if line.len()-trimmed.len()>3 || trimmed.starts_with('\t') { continue; }
         let trimmed=trimmed.trim_end();
-        let fence = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+        let marker=trimmed.as_bytes().first().copied().unwrap_or_default();
+        if !matches!(marker,b'`'|b'~'){continue;}
+        let fence = trimmed.bytes().take_while(|byte| *byte == marker).count();
         if fence < 3 { continue; }
+        if marker==b'~'{for line in lines.by_ref(){if closing_fence(line,fence,marker){break;}}continue;}
         let Some(header) = trimmed[fence..].strip_prefix("suggestion") else {
             // Skip ordinary fenced code so embedded suggestion-looking text
             // cannot turn a quoted example into an actionable replacement.
-            for line in lines.by_ref() { if closing_fence(line,fence) { break; } }
+            for line in lines.by_ref() { if closing_fence(line,fence,marker) { break; } }
             continue;
         };
         let offsets = if header.is_empty() { Some((0, 0, false)) } else {
@@ -33,7 +36,7 @@ pub fn suggestions(body: &str) -> Vec<Suggestion> {
         };
         let mut replacement=Vec::new(); let mut complete=false;
         for line in lines.by_ref() {
-            if closing_fence(line,fence) { complete=true; break; }
+            if closing_fence(line,fence,marker) { complete=true; break; }
             replacement.push(line);
         }
         if let Some((before,after,explicit_range))=offsets && complete { result.push(Suggestion{replacement:replacement.join("\n"),before,after,explicit_range}); }
@@ -41,11 +44,11 @@ pub fn suggestions(body: &str) -> Vec<Suggestion> {
     result
 }
 
-fn closing_fence(line: &str, minimum: usize) -> bool {
+fn closing_fence(line: &str, minimum: usize, marker:u8) -> bool {
     let trimmed=line.trim_start_matches(' ');
     if line.len()-trimmed.len()>3 || trimmed.starts_with('\t') {return false;}
     let trimmed=trimmed.trim_end();
-    trimmed.len()>=minimum && trimmed.bytes().all(|byte|byte==b'`')
+    trimmed.len()>=minimum && trimmed.bytes().all(|byte|byte==marker)
 }
 
 pub fn suggestion_block(lines: &str) -> String {
@@ -55,7 +58,7 @@ pub fn suggestion_block(lines: &str) -> String {
 }
 
 pub fn suggestion_range(thread: &PullRequestReviewThread, suggestion: &Suggestion) -> Option<(u64,u64)> {
-    if thread.outdated || thread.side != ReviewDiffSide::Right { return None; }
+    if thread.outdated || thread.side != ReviewDiffSide::Right || thread.start_side==Some(ReviewDiffSide::Left) { return None; }
     let line=thread.line?;
     let (start,end)=if suggestion.explicit_range {(line.checked_sub(suggestion.before)?,line.checked_add(suggestion.after)?)}else{(thread.start_line.unwrap_or(line),line)};
     (start>0 && start<=end).then_some((start,end))
@@ -123,7 +126,11 @@ impl<E:ProcessExecutor> GitHubService<E>{
 #[cfg(test)]mod tests{use super::*;
 use crate::repository::Oid;
 #[test]fn suggestion_fences_and_offsets_are_explicit(){assert_eq!(suggestions("```rust\nx\n```\n```suggestion:-1+2\nnew\n```"),vec![Suggestion{replacement:"new".into(),before:1,after:2,explicit_range:true}]);assert!(suggestions("```suggestion\nunfinished").is_empty());assert!(suggestions("```suggestion:-99999+2\nx\n```").is_empty());assert!(suggestions("    ```suggestion\n    example\n    ```").is_empty());}
-#[test]fn inserted_suggestions_preserve_embedded_fences(){let source="before\n```rust\nx\n```\nafter";let block=suggestion_block(source);assert!(block.starts_with("````suggestion"));assert_eq!(suggestions(&block)[0].replacement,source);assert!(suggestions("````text\n```suggestion\nnot a suggestion\n```\n````").is_empty());}
+#[test]fn inserted_suggestions_preserve_embedded_fences(){let source="before\n```rust\nx\n```\nafter";let block=suggestion_block(source);assert!(block.starts_with("````suggestion"));assert_eq!(suggestions(&block)[0].replacement,source);assert!(suggestions("````text\n```suggestion\nnot a suggestion\n```\n````").is_empty());assert!(suggestions("~~~text\n```suggestion\nnot a suggestion\n```\n~~~").is_empty());}
+#[test]fn ranges_never_apply_across_diff_sides(){
+let mut thread:PullRequestReviewThread=serde_json::from_value(serde_json::json!({"id":"thread","path":"file.rs","line":5,"startLine":3,"diffSide":"RIGHT","startDiffSide":"LEFT","isOutdated":false,"isResolved":false,"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}})).unwrap();
+let suggestion=Suggestion{replacement:"new".into(),before:0,after:0,explicit_range:false};assert_eq!(suggestion_range(&thread,&suggestion),None);thread.start_side=Some(ReviewDiffSide::Right);assert_eq!(suggestion_range(&thread,&suggestion),Some((3,5)));
+}
 #[test]fn replacements_preserve_context_line_endings_and_eof(){assert_eq!(replace_lines("a\nb\nc\n",2,2,"x\ny").unwrap(),"a\nx\ny\nc\n");assert_eq!(replace_lines("a\r\nb\r\n",2,2,"x").unwrap(),"a\r\nx\r\n");assert_eq!(replace_lines("a\nb",2,2,"x").unwrap(),"a\nx");assert_eq!(replace_lines("a\nb\nc\n",2,2,"").unwrap(),"a\nc\n");assert!(replace_lines("a\n",0,1,"x").is_err());}
 }
 
