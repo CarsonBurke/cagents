@@ -1109,7 +1109,11 @@ pub(super) fn code_text(
                     }
                 }
                 if display.is_empty() {
-                    return widget::Space::new().height(size.0 * 1.3).into();
+                    // Empty physical lines still own a logical caret position,
+                    // including the final newline. A Space cannot participate
+                    // in pointer selection or copy across that source boundary.
+                    return leaf_text(vec![Span::new(String::new())].into(), size, font,
+                        target, find.as_deref(), logical);
                 }
                 code_line(
                     text.clone(),
