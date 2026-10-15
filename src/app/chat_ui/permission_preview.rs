@@ -152,10 +152,12 @@ impl Monitor {
                             .values()
                             .flat_map(|(launch, _)| config_paths(launch))
                             .collect::<HashSet<_>>();
+                        let previous = candidates.lock()
+                            .unwrap_or_else(|error| error.into_inner()).clone();
                         let mut failed = register_config_paths(
-                            &lexical, &candidates, &mut watcher, &mut registered,
+                            &lexical, &candidates, &mut watcher, &mut registered, false,
                         );
-                        let mut stable = false;
+                        let mut stable_paths = None;
                         for _ in 0..3 {
                             let physical = lexical.iter().map(|path| {
                                 (path.clone(), canonicalize(path).ok())
@@ -164,15 +166,23 @@ impl Monitor {
                                 .chain(physical.values().flatten().cloned())
                                 .collect::<HashSet<_>>();
                             failed |= register_config_paths(
-                                &paths, &candidates, &mut watcher, &mut registered,
+                                &paths, &candidates, &mut watcher, &mut registered, false,
                             );
                             let validated = lexical.iter().map(|path| {
                                 (path.clone(), canonicalize(path).ok())
                             }).collect::<HashMap<_, _>>();
                             if physical == validated {
-                                stable = true;
+                                stable_paths = Some(paths);
                                 break;
                             }
+                        }
+                        let stable = stable_paths.is_some();
+                        if let Some(paths) = stable_paths {
+                            // Keep old physical watches and candidates until
+                            // the complete replacement mapping is validated.
+                            failed |= register_config_paths(
+                                &paths, &candidates, &mut watcher, &mut registered, true,
+                            );
                         }
                         failed |= !stable;
                         watch_changed =
@@ -181,6 +191,10 @@ impl Monitor {
                             // Do not publish policy read through a changing
                             // alias. A real event or the focused fallback will
                             // retry; retain the last successfully read policy.
+                            let retained = previous.into_iter().chain(lexical).collect();
+                            register_config_paths(
+                                &retained, &candidates, &mut watcher, &mut registered, true,
+                            );
                             worker_dirty.store(true, Ordering::Release);
                             for (&target, (launch, _)) in &next {
                                 if replies.publish(Reply {
@@ -331,8 +345,16 @@ fn register_config_paths(
     candidates: &Mutex<HashSet<PathBuf>>,
     watcher: &mut Option<notify::RecommendedWatcher>,
     registered: &mut HashSet<PathBuf>,
+    prune: bool,
 ) -> bool {
-    *candidates.lock().unwrap_or_else(|error| error.into_inner()) = paths.clone();
+    {
+        let mut candidates = candidates.lock().unwrap_or_else(|error| error.into_inner());
+        if prune {
+            candidates.clone_from(paths);
+        } else {
+            candidates.extend(paths.iter().cloned());
+        }
+    }
     let directories = paths.iter()
         .flat_map(|path| path.ancestors().skip(1))
         .filter(|path| path.is_dir())
@@ -349,10 +371,12 @@ fn register_config_paths(
             failed = true;
         }
     }
-    for path in registered.difference(&directories) {
-        let _ = watcher.unwatch(path);
+    if prune {
+        for path in registered.difference(&directories) {
+            let _ = watcher.unwatch(path);
+        }
+        registered.retain(|path| directories.contains(path));
     }
-    registered.retain(|path| directories.contains(path));
     failed
 }
 
@@ -730,5 +754,57 @@ mod tests {
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
         std::fs::write(second.join("config.toml"), "changed target").unwrap();
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("changed target"));
+    }
+
+    #[test]
+    fn adding_another_draft_preserves_existing_physical_config_watch() {
+        use std::os::unix::fs::symlink;
+        let account = tempfile::tempdir().unwrap();
+        let physical = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let source = physical.path().join("config.toml");
+        std::fs::write(&source, "first").unwrap();
+        std::fs::write(other.path().join("config.toml"), "other").unwrap();
+        symlink(&source, account.path().join("config.toml")).unwrap();
+        let inject = Arc::new(AtomicBool::new(false));
+        let worker_inject = inject.clone();
+        let monitor = Monitor::with_resolver_and_canonicalize(
+            |launch| {
+                let home = launch.recipe.environment.get("CODEX_HOME")?;
+                std::fs::read_to_string(Path::new(home).join("config.toml")).ok()
+            },
+            true,
+            move |path| {
+                if worker_inject.swap(false, Ordering::AcqRel) {
+                    // The unchanged draft must retain its existing physical
+                    // watch while another draft's mapping is being prepared.
+                    std::fs::write(&source, "changed while adding draft").unwrap();
+                }
+                path.canonicalize()
+            },
+        );
+        let first_target = Target { card: CardId::new(), generation: 1 };
+        let second_target = Target { card: CardId::new(), generation: 1 };
+        let mut first_launch = launch();
+        first_launch.recipe.working_directory = account.path().into();
+        first_launch.recipe.environment.insert(
+            "CODEX_HOME".into(), account.path().to_string_lossy().into_owned(),
+        );
+        let mut second_launch = first_launch.clone();
+        second_launch.recipe.environment.insert(
+            "CODEX_HOME".into(), other.path().to_string_lossy().into_owned(),
+        );
+        monitor.sync(std::iter::once((first_target, &first_launch)));
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("first"));
+        inject.store(true, Ordering::Release);
+        monitor.sync([(first_target, &first_launch), (second_target, &second_launch)].into_iter());
+        for _ in 0..3 {
+            let reply = monitor.next_for_test();
+            if reply.target == first_target {
+                assert_eq!(reply.mode.as_deref(), Some("changed while adding draft"));
+                return;
+            }
+        }
+        panic!("unchanged draft did not observe its physical config edit");
     }
 }
