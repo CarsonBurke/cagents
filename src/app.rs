@@ -3504,6 +3504,7 @@ impl SettingsField {
             Self::Notifications(Field::Waiting) => "Waiting for you",
             Self::Notifications(Field::ReviewRequests) => "Review requests",
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
+            Self::Notifications(Field::MessagePreviews) => "Message previews",
             Self::AppTheme => "App theme",
             Self::InterfaceFontFamily => "Interface font family",
             Self::InterfaceFontSize => "Interface font size",
