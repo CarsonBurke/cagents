@@ -14,7 +14,7 @@ pub enum AutomationCommand {
         request_id: Uuid,
         #[arg(long)]
         definition: PathBuf,
-        /// Wait for the user's decision so the requesting tool call resumes.
+        /// Wait for the decision. Exit: 0 approved, 3 timeout, 4 declined.
         #[arg(long)]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -178,16 +178,17 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             if Instant::now() >= deadline {
                 break;
             }
-            reply = client
-                .automation_until(
-                    authority.clone(),
-                    Request::Proposal { id },
-                    deadline.min(Instant::now() + IO_TIMEOUT),
-                )
-                .map_err(protocol_error)?;
+            match poll_proposal(&mut client, authority.clone(), id, deadline)? {
+                Some(current) => reply = current,
+                None => break,
+            }
         }
     }
-    let (data, human) = match reply {
+    let outcome = match (&reply, wait) {
+        (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
+        _ => None,
+    };
+    let (mut data, human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
                 crate::automations::ProposalState::Pending => format!(
@@ -276,11 +277,39 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Cancellation requested; inspect the run for its confirmed outcome.".into(),
         ),
     };
+    if let Some(outcome) = outcome {
+        data["outcome"] = json!(outcome);
+    }
     Ok(CommandOutput {
         command: name,
         data,
         human,
     })
+}
+
+fn poll_proposal(
+    client: &mut ControlClient,
+    authority: crate::agent_execution::Authority,
+    id: Uuid,
+    deadline: Instant,
+) -> Result<Option<Response>, AppError> {
+    match client.automation_until(
+        authority,
+        Request::Proposal { id },
+        deadline.min(Instant::now() + IO_TIMEOUT),
+    ) {
+        Ok(reply) => Ok(Some(reply)),
+        Err(error) if is_timeout_error(&error) && Instant::now() >= deadline => Ok(None),
+        Err(error) => Err(protocol_error(error)),
+    }
+}
+
+fn proposal_outcome(state: &crate::automations::ProposalState) -> WaitOutcome {
+    match state {
+        crate::automations::ProposalState::Pending => WaitOutcome::TimedOut,
+        crate::automations::ProposalState::Declined => WaitOutcome::Failed,
+        crate::automations::ProposalState::Approved { .. } => WaitOutcome::Succeeded,
+    }
 }
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
@@ -408,6 +437,81 @@ fn read_definition(path: &Path) -> Result<Definition, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_pending_proposal_poll_preserves_pending_timeout_outcome() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("proposal-wait"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        let id = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            let connected: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connected.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(request.request, ClientRequest::Automation { operation: Request::Proposal { id: received }, .. } if received == id)
+            );
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(
+            poll_proposal(
+                &mut client,
+                Authority::default(),
+                id,
+                Instant::now() + Duration::from_millis(25)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let outcome = proposal_outcome(&crate::automations::ProposalState::Pending);
+        assert_eq!(outcome.exit_code(), 3);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proposal_wait_uses_the_shared_exit_contract() {
+        use crate::automations::ProposalState;
+        for (state, code) in [
+            (ProposalState::Pending, 3),
+            (ProposalState::Declined, 4),
+            (
+                ProposalState::Approved {
+                    automation: Uuid::new_v4(),
+                    execution_revision: 1,
+                },
+                0,
+            ),
+        ] {
+            assert_eq!(
+                CommandOutput {
+                    command: "automation.propose",
+                    data: json!({"outcome": proposal_outcome(&state)}),
+                    human: String::new(),
+                }
+                .exit_code(),
+                ExitCode::from(code)
+            );
+        }
+    }
 
     fn parse(arguments: &[&str]) -> Result<AutomationCommand, clap::Error> {
         match Cli::try_parse_from(arguments)?.command {
