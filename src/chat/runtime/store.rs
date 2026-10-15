@@ -58,6 +58,7 @@ pub(crate) struct Store {
     applied_files: usize,
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) turn_session: Option<String>,
+    history_origins: std::collections::HashMap<String,Option<super::turn_outcomes::HistoryProof>>,
     pub(super) visible_turn_origins: Vec<super::turn_outcomes::ScopedOrigin>,
     pub(super) presented_turn_outcomes: Option<std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
@@ -82,6 +83,12 @@ pub(crate) struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
 impl Store {
+    /// Sidecars describe only source items in this exact provider step. They
+    /// are never a license to qualify a preexisting unknown row later.
+    pub(super) fn stage_history_origins(&mut self, events:&[Event]) {
+        self.history_origins=super::turn_outcomes::history_origins(events);
+    }
+    pub(super) fn clear_history_origins(&mut self) { self.history_origins.clear(); }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {
@@ -143,7 +150,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,native_session TEXT);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,native_session TEXT,history_account BLOB);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
@@ -156,6 +163,7 @@ impl Store {
                 applied_files: 0,
                 file_cwd: None,
                 turn_session: None,
+                history_origins:Default::default(),
                 visible_turn_origins: Vec::new(),
                 presented_turn_outcomes: None,
                 presented_file_changes: None,
@@ -359,10 +367,13 @@ impl Store {
         } else {
             body0.len() as i64
         };
+        let history_proof=if older { self.history_origins.get(&item.id).and_then(|proof|proof.as_ref()) } else {None};
+        let native_session=if older {history_proof.map(|proof|&proof.session_id)} else {self.turn_session.as_ref()};
+        let history_account=history_proof.map(|proof|postcard::to_stdvec(&proof.account)).transpose().map_err(|error|error.to_string())?;
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,native_session=excluded.native_session", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,self.turn_session]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,native_session=CASE WHEN items.native_session=excluded.native_session AND items.history_account IS excluded.history_account THEN items.native_session ELSE NULL END,history_account=CASE WHEN items.native_session=excluded.native_session AND items.history_account IS excluded.history_account THEN items.history_account ELSE NULL END", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,native_session,history_account]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -664,6 +675,7 @@ impl Store {
             out.push(nonfatal(warning));
         }
         match event {
+            Event::HistoryOrigins { .. } => {}
             Event::OutputDelta { id, offset, delta } => {
                 let cached: Option<(Vec<u8>, usize, usize)> = self
                     .db
@@ -1037,9 +1049,9 @@ impl Store {
         let mut reused = std::collections::HashSet::new();
         let records = {
             let query = if self.forward.is_some() {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session,history_account,length(history_account) FROM items WHERE ordinal>=?1 ORDER BY ordinal ASC LIMIT 129"
             } else {
-                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
+                "SELECT id,ordinal,metadata,len0,len1,len2,spans,native_session,history_account,length(history_account) FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129"
             };
             let mut statement = self.db.prepare(query).map_err(|e| e.to_string())?;
             let rows = statement
@@ -1049,6 +1061,7 @@ impl Store {
                         .or(self.end)
                         .map_or(i64::MAX, |cursor| cursor.0)],
                     |row| {
+                        if row.get::<_,Option<usize>>(9)?.is_some_and(|bytes|bytes>4608) {return Err(rusqlite::Error::InvalidQuery);}
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
@@ -1058,6 +1071,7 @@ impl Store {
                             row.get::<_, i64>(5)? as usize,
                             row.get::<_, Vec<u8>>(6)?,
                             row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<Vec<u8>>>(8)?,
                         ))
                     },
                 )
@@ -1070,7 +1084,8 @@ impl Store {
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1, len2, spans, native_session) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2, spans, native_session, history_account) in records {
+            let history_account:Option<crate::chat::turn_outcomes::HistoryAccountOrigin>=history_account.map(|bytes|postcard::from_bytes(&bytes)).transpose().map_err(|error|error.to_string())?;
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
@@ -1141,7 +1156,7 @@ impl Store {
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
-                    super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),&previous.id,&id);
+                    super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),history_account.as_ref(),&previous.id,&id);
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1259,7 +1274,7 @@ impl Store {
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
-                super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),&item.id,&id);
+                super::turn_outcomes::push_origin(&mut turn_origins,native_session.as_deref(),history_account.as_ref(),&item.id,&id);
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1522,7 +1537,14 @@ mod tests {
         let window=store.window_reusing(&mut previous).unwrap();
         assert_eq!(store.visible_turn_origins.len(),window.items.len());
         assert!(store.visible_turn_origins.iter().all(|origin|origin.session_id.as_deref()==Some("confirmed-A")));
+        store.apply(Event::Item(text(&source_id,"a rewritten carrier under a different session"))).unwrap();
+        store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().find(|origin|origin.origin.source_item_id==source_id).unwrap().session_id.is_none());
         store.turn_session=None;store.apply(Event::Item(text("unconfirmed-item","unknown"))).unwrap();
+        store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().any(|origin|origin.origin.item_id=="unconfirmed-item"&&origin.session_id.is_none()));
+        store.turn_session=Some("confirmed-B".into());
+        store.apply(Event::Item(text("unconfirmed-item","later rewrite must not promote unknown origin"))).unwrap();
         store.window().unwrap();
         assert!(store.visible_turn_origins.iter().any(|origin|origin.origin.item_id=="unconfirmed-item"&&origin.session_id.is_none()));
     }

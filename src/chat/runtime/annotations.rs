@@ -15,6 +15,7 @@ pub(super) struct Authority {
     unconfirmed_commands: Vec<String>,
     revision: u64,
     store: Option<annotations::storage::Store>,
+    turn_history_store: Option<(crate::chat::turn_outcomes::HistoryAccountOrigin,String,annotations::storage::Store)>,
     turn_projection: Option<(String,Vec<super::turn_outcomes::ScopedOrigin>,std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>)>,
     notice: Option<String>,
     retry_at: Option<std::time::Instant>,
@@ -30,6 +31,7 @@ impl Authority {
             unconfirmed_commands: Vec::new(),
             revision: 0,
             store: None,
+            turn_history_store:None,
             turn_projection:None,
             notice: None,
             retry_at: None,
@@ -43,6 +45,11 @@ impl Authority {
         authority.root=Some(root);
         assert!(authority.apply(Some(&Some(session.to_owned())),vec![],&mut vec![]).is_none());
         authority
+    }
+    #[cfg(test)]
+    pub(super) fn for_history_outcomes_test(root:std::path::PathBuf) -> Self {
+        let mut authority=Self::new(Err("Read-only history has no authenticated provider launch scope".into()));
+        authority.root=Some(root);authority
     }
     fn pending_store(&self) -> Result<annotations::storage::Store, String> {
         let scope = self.scope.as_ref().map_err(Clone::clone)?;
@@ -257,15 +264,46 @@ impl Authority {
     pub(super) fn turn_outcomes(
         &mut self, expected_session: Option<&str>, origins: &[super::turn_outcomes::ScopedOrigin],
     ) -> Result<std::sync::Arc<crate::chat::turn_outcomes::TurnOutcomeProjection>,String> {
-        let session=self.session.as_deref().filter(|session|Some(*session)==expected_session)
-            .ok_or("No matching provider-confirmed turn outcome authority")?;
-        let store=self.store.as_ref().ok_or("Qualified turn outcome storage is unavailable")?;
+        let session=expected_session.ok_or("No displayed conversation identity")?;
+        if self.session.as_deref().is_some_and(|confirmed|confirmed!=session) {
+            return Err("Provider-confirmed turn outcome authority changed".into());
+        }
+        let captured=self.scope.as_ref().ok().cloned();
+        let mut source_account:Option<crate::chat::turn_outcomes::HistoryAccountOrigin>=None;
+        for origin in origins.iter().filter(|origin|origin.session_id.as_deref()==Some(session)) {
+            let Some(account)=origin.account.as_ref() else {continue;};
+            if captured.as_ref().is_some_and(|scope|super::turn_outcomes::account_origin(scope)!=*account) {continue;}
+            if source_account.as_ref().is_some_and(|previous|previous!=account) {
+                return Err("History window crosses physical account authorities".into());
+            }
+            source_account=Some(account.clone());
+        }
+        let live=self.session.as_deref()==Some(session) && captured.is_some();
+        let selected=if let Some(scope)=captured.as_ref() {super::turn_outcomes::account_origin(scope)}
+            else {source_account.clone().ok_or("No validated physical history source")?};
+        let store=if live {
+            self.store.as_ref().ok_or("Qualified turn outcome storage is unavailable")?
+        } else {
+            if source_account.as_ref()!=Some(&selected) {return Err("No matching explicit history source identity".into());}
+            let scope=super::turn_outcomes::physical_scope(&selected)?;
+            if self.turn_history_store.as_ref().is_none_or(|(account,previous,_)|account!=&selected||previous!=session) {
+                #[cfg(test)]
+                let opened=if let Some(root)=&self.root {
+                    annotations::storage::Store::for_test(root,&scope,session)
+                } else {annotations::storage::Store::installation(&scope,session)};
+                #[cfg(not(test))]
+                let opened=annotations::storage::Store::installation(&scope,session);
+                self.turn_history_store=Some((selected.clone(),session.to_owned(),opened?));
+            }
+            &self.turn_history_store.as_ref().expect("opened history projection store").2
+        };
         let revision=store.turn_outcome_revision()?;
         if let Some((previous_session,previous_origins,projection))=&self.turn_projection
             && previous_session==session && previous_origins==origins && projection.revision==revision {
             return Ok(projection.clone());
         }
         let qualified:Vec<_>=origins.iter().filter(|origin|origin.session_id.as_deref()==Some(session))
+            .filter(|origin|match origin.account.as_ref() {Some(account)=>account==&selected,None=>live})
             .filter(|origin|origin.origin.source_item_id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES)
             .map(|origin|origin.origin.clone()).collect();
         let mut projection=store.project_turn_outcomes(&qualified)?;
@@ -332,6 +370,7 @@ impl Authority {
             self.latest_proven = None;
             self.store = None;
             self.turn_projection=None;
+            self.turn_history_store=None;
             self.notice = None;
             self.retry_at = None;
         }

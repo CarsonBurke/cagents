@@ -1315,6 +1315,7 @@ fn preflight_inner(
     store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
+    store.stage_history_origins(&initial.events);
     for event in initial.events.drain(..) {
         if let Event::Error {
             message,
@@ -1333,6 +1334,7 @@ fn preflight_inner(
     if count.0 > 4 * STATE_LIMIT {
         return Err("Provider initial presentation exceeds IPC capacity".into());
     }
+    store.clear_history_origins();
     initial.events = metadata;
     Ok(store)
 }
@@ -2443,7 +2445,11 @@ impl Actor {
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
         let turn_session=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).session().map(str::to_owned);
-        self.store.lock().unwrap_or_else(|p|p.into_inner()).turn_session=turn_session;
+        {
+            let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
+            store.turn_session=turn_session;
+            store.stage_history_origins(&step.events);
+        }
         let originals = self.adapter.take_original_updates();
         if let Some(message) = self
             .annotations
@@ -2492,6 +2498,7 @@ impl Actor {
         });
         let mut execution_events = Vec::new();
         for event in step.events {
+            if matches!(&event,Event::HistoryOrigins{..}) {continue;}
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
                     let update = self.execution.start(run, key)?;
@@ -2540,6 +2547,7 @@ impl Actor {
                 return Err(message);
             }
         }
+        self.store.lock().unwrap_or_else(|p|p.into_inner()).clear_history_origins();
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         if let Some(confirmed) = confirmed {
@@ -2606,9 +2614,11 @@ impl Actor {
         // Owned edit summaries have their own item/byte budgets; they do not
         // count toward the provider's request/model identity budget.
         let file_changes = std::mem::take(&mut state.file_changes);
+        let turn_outcomes = std::mem::take(&mut state.turn_outcomes);
         let mut counter = ByteCounter(0);
         let _ = serde_json::to_writer(&mut counter, &*state);
         state.file_changes = file_changes;
+        state.turn_outcomes = turn_outcomes;
         state.items = items;
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
@@ -2805,7 +2815,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.turn_started_at = observed_at();
             state.finished_at = None;
         }
-        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
+        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } | Event::HistoryOrigins { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -4769,6 +4779,52 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn actual_claude_read_only_initialize_preflight_and_handle_restore_only_proved_history_outcomes() {
+        use std::io::Write;
+        use crate::{agent::{Provider,ActivityOutcome},chat::{Launch,turn_outcomes::{TurnIdentity,TurnIdentityKind,TurnUpdate}},account::scope::LaunchAccountScope};
+        let root=super::super::annotations::storage::test_directory();
+        let cwd=root.path().join("removed-project");std::fs::create_dir(&cwd).unwrap();
+        let config=root.path().join("native-config");
+        let project:String=cwd.to_str().unwrap().chars().map(|c|if c.is_ascii_alphanumeric(){c}else{'-'}).collect();
+        let directory=config.join("projects").join(project);std::fs::create_dir_all(&directory).unwrap();
+        let session="00000000-0000-4000-8000-000000000001";
+        let mut file=std::fs::File::create(directory.join(format!("{session}.jsonl"))).unwrap();
+        writeln!(file,"{}",json!({"type":"user","uuid":"known-source","sessionId":session,"message":{"role":"user","content":"known exact history"}})).unwrap();
+        writeln!(file,"{}",json!({"type":"user","uuid":"unknown-source","parentUuid":"known-source","message":{"role":"user","content":"missing session proof"}})).unwrap();
+        drop(file);std::fs::remove_dir(&cwd).unwrap();
+        let launch=Launch {provider:Provider::Claude,session_id:Some(session.into()),recipe:crate::model::LaunchRecipe {
+            program:"claude".into(),arguments:vec![],working_directory:cwd,
+            environment:BTreeMap::from([("CLAUDE_CONFIG_DIR".into(),config.to_string_lossy().into_owned())]),unset_environment:Default::default(),
+        }};
+        let scope=LaunchAccountScope::resolve(Provider::Claude,root.path(),|name|(name=="CLAUDE_CONFIG_DIR").then(||config.as_os_str().to_owned())).unwrap();
+        let annotations_path=root.path().join("annotations");
+        let (spec,mut adapter)=crate::chat::protocol::claude::create(&launch).unwrap();
+        assert!(matches!(spec.transport,TransportSpec::History));
+        let mut initial=adapter.initialize().unwrap();assert!(initial.writes.is_empty());
+        assert!(initial.events.iter().all(|event|!matches!(event,Event::Session{..})),"history source proof must not confirm a live session");
+        let initial_items:Vec<_>=initial.events.iter().filter_map(|event|match event {Event::History{items,..}=>Some(items.as_slice()),_=>None}).flatten().collect();
+        let alias=|body:&str|initial_items.iter().find(|item|matches!(&item.content,ItemContent::Text{text,..}if text==body)).unwrap().id.clone();
+        let known=alias("known exact history");let unknown=alias("missing session proof");
+        let mut durable=super::super::annotations::storage::Store::for_test(&annotations_path,&scope,session).unwrap();
+        for (id,item) in [("accepted-known",known.clone()),("accepted-unknown",unknown.clone())] {
+            let identity=TurnIdentity{session_id:session.into(),kind:TurnIdentityKind::AcceptedInput,id:id.into()};
+            durable.apply_turn_update(&TurnUpdate::Bind{identity:identity.clone(),item_ids:vec![item]}).unwrap();
+            durable.apply_turn_update(&TurnUpdate::Finish{identity,outcome:ActivityOutcome::Cancelled,finished_at:1234}).unwrap();
+        }
+        let store=preflight(&spec,&mut initial).unwrap();
+        assert!(initial.events.iter().all(|event|!matches!(event,Event::HistoryOrigins{..})),"preflight consumes bounded source sidecars");
+        let handle=Handle::start(spec,adapter,initial,store,launch.session_id.clone(),|_|{}).unwrap();
+        *handle.0.annotations.lock().unwrap()=annotations::Authority::for_history_outcomes_test(annotations_path);
+        let snapshot=until(&handle,|snapshot|snapshot.exited);
+        assert!(snapshot.read_only_reason.is_some());assert!(!snapshot.ready);
+        assert_eq!(snapshot.turn_outcomes.records.len(),1);
+        assert_eq!(snapshot.turn_outcomes.records[0].item_ids,[known]);
+        assert!(!snapshot.turn_outcomes.complete,"a missing source session remains explicitly unqualified");
+        assert!(handle.original_prompt(Some(&unknown),Some(session),0,1024).is_err(),"history metadata cannot enable original-command authority");
+        handle.close().unwrap();
     }
 
     #[test]

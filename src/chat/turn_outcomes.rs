@@ -25,7 +25,7 @@ impl HistoryAccountOrigin {
     pub fn validate(&self)->Result<(),String> {
         use std::os::unix::ffi::OsStrExt;
         if !matches!(self.provider,crate::agent::Provider::Claude|crate::agent::Provider::Codex)
-            || !self.canonical_home.is_absolute() || self.canonical_home.as_os_str().as_bytes().len()>4096
+            || !self.canonical_home.is_absolute() || self.canonical_home.to_str().is_none() || self.canonical_home.as_os_str().as_bytes().len()>4096
             || self.canonical_home.components().any(|part|matches!(part,std::path::Component::ParentDir|std::path::Component::CurDir)) {
             return Err("Invalid native history physical account origin".into());
         }
