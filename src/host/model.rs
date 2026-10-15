@@ -706,6 +706,8 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 15 {
         native_actor::migrate(db)?;
     }
+    // Parent integration must allocate the cumulative schema checkpoint.
+    views::migrate_terminal_sources(db)?;
     Ok(())
 }
 

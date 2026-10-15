@@ -776,6 +776,15 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
     Ok(())
 }
 
+/// Reads only the managed presentation. No registry means ordinary interactive
+/// conversations still close without the optional managed-agent subsystem.
+pub(super) fn preflight_retirement(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    let Ok(registry) = registry(host) else { return Ok(()); };
+    let result = registry.lock().unwrap_or_else(|p| p.into_inner())
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
+    result
+}
+
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -793,11 +802,16 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .agent(id)?;
-    if agent.origin != origin {
-        return Err("This caller does not own the agent".into());
-    }
+        .preflight_agent_close(&origin, id)?;
     if agent.closed {
+        // Older daemons closed the worker without retiring its shared pane.
+        // Repeating close repairs only that retained presentation; it does not
+        // start or contact a provider, and keeps the completed run history.
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_agent(&origin, id)?;
+        announce(host, &registry);
         return Ok(agent);
     }
     let pending = registry
@@ -948,6 +962,26 @@ pub(super) fn process(
             Ok(Reply::Listed(summaries))
         }
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
+        Operation::InspectPresentationRepair(id) => {
+            let origin = origin(host, &authority)?;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let target = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .inspect_presentation_repair(&origin, id)?;
+            Ok(Reply::PresentationRepair(target))
+        }
+        Operation::ConfirmPresentationRepair { observed } => {
+            let origin = origin(host, &authority)?;
+            let id = observed.agent.id;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let removed = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .confirm_presentation_repair(&origin, &observed)?;
+            if removed { announce(host, &registry); }
+            Ok(Reply::PresentationRemoved { agent: id, removed })
+        }
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
