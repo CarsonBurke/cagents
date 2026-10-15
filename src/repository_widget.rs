@@ -618,8 +618,7 @@ pub enum RepositoryAction {
     },
     /// Mounts the find bar over the open buffer and hands it the keyboard.
     ///
-    /// Find is a strip, not a modal: it holds the editor in search mode so
-    /// the buffer cannot be typed into behind it, and nothing else.
+    /// Find keeps the buffer editable; clicks return keyboard focus to it.
     OpenFind {
         card: CardId,
     },
@@ -630,6 +629,9 @@ pub enum RepositoryAction {
         card: CardId,
         query: String,
     },
+    FindOptionsChanged { card: CardId, option: crate::ui_controls::FindOption, enabled: bool },
+    FindSelectionChanged { card: CardId, enabled: bool },
+    PreserveCaseChanged { card: CardId, enabled: bool },
     FindNext {
         card: CardId,
     },
@@ -720,6 +722,9 @@ impl RepositoryAction {
             | Self::OpenFind { card }
             | Self::CloseFind { card }
             | Self::FindQueryChanged { card, .. }
+            | Self::FindOptionsChanged { card, .. }
+            | Self::FindSelectionChanged { card, .. }
+            | Self::PreserveCaseChanged { card, .. }
             | Self::FindNext { card }
             | Self::FindPrevious { card }
             | Self::FindInputFocus { card, .. }
@@ -1827,8 +1832,18 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
     }
 }
 
+type FindScope = ((usize, usize), (usize, usize));
+
+fn scoped_matches(matches: &mut Vec<(text_editor::Position, text_editor::Position)>, scope: Option<FindScope>) {
+    if let Some((first, last)) = scope {
+        matches.retain(|(start, end)| (start.line, start.column) >= first && (end.line, end.column) <= last);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct FindKey {
+    options: crate::editor_search::FindOptions,
+    selection: Option<FindScope>,
     generation: u64,
     revision: u64,
     query: String,
@@ -1902,6 +1917,11 @@ pub struct RepositoryRuntime {
     find_open: bool,
     /// The find bar's query exactly as the user typed it.
     find_query: String,
+    find_options: crate::editor_search::FindOptions,
+    find_selection: Option<FindScope>,
+    find_selection_candidate: Option<FindScope>,
+    find_select_on_finish: bool,
+    replace_preserve_case: bool,
     /// Which occurrence of [`RepositoryRuntime::find_query`] is selected, and
     /// how many there are.
     ///
@@ -2095,6 +2115,11 @@ impl RepositoryRuntime {
             editor_font_size: 14.0,
             find_open: false,
             find_query: String::new(),
+            find_options: crate::editor_search::FindOptions::default(),
+            find_selection: None,
+            find_selection_candidate: None,
+            find_select_on_finish: false,
+            replace_preserve_case: false,
             find_index: 0,
             find_total: 0,
             find_input_focused: false,
@@ -3070,10 +3095,28 @@ impl RepositoryRuntime {
         });
         true
     }
-    /// Marks the editor as search-owned: document edits are ignored while the
-    /// native viewport continues to accept scrolling actions.
+    /// Keep the search focus policy while allowing normal buffer editing.
     pub fn set_search_mode(&mut self, enabled: bool) {
         self.search_mode = enabled;
+    }
+
+    pub fn set_find_preferences(&mut self, options: crate::editor_search::FindOptions, preserve_case: bool) {
+        self.find_options = options;
+        self.replace_preserve_case = preserve_case;
+        self.refresh_find_matches();
+    }
+
+    pub fn find_preferences(&self) -> (crate::editor_search::FindOptions, bool) {
+        (self.find_options, self.replace_preserve_case)
+    }
+
+    fn current_selection_scope(&self) -> Option<FindScope> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let cursor = document.content.cursor();
+        let anchor = cursor.selection?;
+        let first = (anchor.line, anchor.column);
+        let last = (cursor.position.line, cursor.position.column);
+        (first != last).then(|| (first.min(last), first.max(last)))
     }
 
     /// Selects one case-insensitive occurrence in the open buffer and returns
@@ -3083,6 +3126,8 @@ impl RepositoryRuntime {
             return None;
         };
         let key = FindKey {
+            options: crate::editor_search::FindOptions::default(),
+            selection: None,
             generation: self.generation,
             revision: document.revision,
             query: query.to_owned(),
@@ -3198,12 +3243,14 @@ impl RepositoryRuntime {
         if !self.editable_surface_visible() {
             return Task::none();
         }
+        if self.find_open { return iced::widget::operation::focus(find_focus_id(card)); }
         if let Some(selection) = self.selected_text()
             && !selection.trim().is_empty()
             && !selection.contains('\n')
         {
             self.find_query = selection;
         }
+        self.find_selection_candidate = self.current_selection_scope();
         self.find_open = true;
         self.set_search_mode(true);
         if let DocumentState::Editable(document) = &self.document {
@@ -3232,12 +3279,7 @@ impl RepositoryRuntime {
         self.focus_editor(card)
     }
 
-    /// Drops the find strip and the search-mode hold that came with it.
-    ///
-    /// Every exit from find goes through here. `search_mode` refuses every
-    /// editor action that is not a scroll, so a strip that closes without
-    /// releasing it leaves a buffer that silently swallows the user's
-    /// keystrokes and looks, from the outside, simply broken.
+    /// Drops the strip and its transient match/selection state.
     fn clear_find(&mut self) {
         self.find_open = false;
         self.find_query.clear();
@@ -3249,6 +3291,9 @@ impl RepositoryRuntime {
         self.find_snapshot = None;
         self.find_origin = None;
         self.find_error = None;
+        self.find_selection = None;
+        self.find_selection_candidate = None;
+        self.find_select_on_finish = false;
         if let Some(active) = &self.find_active {
             active.cancellation.cancel();
         }
@@ -3263,6 +3308,7 @@ impl RepositoryRuntime {
             // Keep the requested occurrence while a revision is re-searched;
             // an empty pending result is not a completed zero-match search.
             self.find_index = occurrence;
+            self.find_select_on_finish = true;
             return;
         }
         let total = self.select_cached_match(occurrence);
@@ -3285,6 +3331,8 @@ impl RepositoryRuntime {
             return None;
         };
         self.find_open.then(|| FindKey {
+            options: self.find_options,
+            selection: self.find_selection,
             generation: self.generation,
             revision: document.revision,
             query: self.find_query.clone(),
@@ -3311,13 +3359,16 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return;
         };
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
         if wanted.query.is_empty()
             || (document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
         {
-            self.find_matches = document.content.find_matches(&wanted.query);
+            match document.content.find_matches_with(&wanted.query, wanted.options) {
+                Ok(mut matches) => {
+                    scoped_matches(&mut matches, wanted.selection);
+                    self.find_matches = matches;
+                }
+                Err(error) => self.find_error = Some(error),
+            }
             self.find_cache = Some(wanted);
         }
     }
@@ -3360,10 +3411,12 @@ impl RepositoryRuntime {
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                snapshot.find_matches(&key.query, || cancellation.is_cancelled())
+                snapshot.find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
+                    .map(|result| result.map(|mut matches| { scoped_matches(&mut matches, key.selection); matches }))
             })
             .await
-            .map_err(|error| format!("Find worker failed: {error}"));
+            .map_err(|error| format!("Find worker failed: {error}"))
+            .and_then(std::convert::identity);
             RepositoryAction::FindLoaded {
                 card,
                 ticket,
@@ -3400,7 +3453,12 @@ impl RepositoryRuntime {
             self.find_index
         };
         self.find_origin = None;
-        self.select_find_match(occurrence);
+        if std::mem::take(&mut self.find_select_on_finish) {
+            self.select_find_match(occurrence);
+        } else {
+            self.find_total = self.find_matches.len();
+            self.find_index = self.find_index.min(self.find_total.saturating_sub(1));
+        }
     }
 
     /// Renews the cached count after something changed the buffer under an
@@ -3412,7 +3470,12 @@ impl RepositoryRuntime {
         if !self.find_open {
             return;
         }
-        self.select_find_match(self.find_index);
+        self.find_select_on_finish = false;
+        self.prepare_find_matches();
+        self.find_total = self.find_matches.len();
+        if self.find_cache.as_ref() == self.wanted_find().as_ref() {
+            self.find_index = self.find_index.min(self.find_total.saturating_sub(1));
+        }
     }
 
     /// Steps to the next or previous occurrence.
@@ -3983,9 +4046,8 @@ impl RepositoryRuntime {
 
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
-        // The same gates as typing: a history step is an edit, and find
-        // holds the buffer read-only while it is open.
-        if self.search_mode || self.source_surface != SourceSurface::Editor {
+        // A history step edits the mounted source buffer, including while Find is open.
+        if self.source_surface != SourceSurface::Editor {
             return Task::none();
         }
         let DocumentState::Editable(document) = &mut self.document else {
@@ -5226,9 +5288,6 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { card, action } => {
-                if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
-                    return Task::none();
-                }
                 // No buffer is mounted outside Edit, so an action arriving
                 // from any other surface is a stale message about a surface
                 // that has already been replaced.
@@ -5238,6 +5297,7 @@ impl RepositoryRuntime {
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
+                let moved = !matches!(action, text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. });
                 let applied = match &mut self.document {
                     DocumentState::Editable(document) => document.apply(action),
                     _ => Applied::Unchanged,
@@ -5251,7 +5311,10 @@ impl RepositoryRuntime {
                         self.push_lsp_change(edit);
                         self.markdown_task(card)
                     }
-                    Applied::Unchanged => Task::none(),
+                    Applied::Unchanged => {
+                        if self.find_open && moved { self.find_selection_candidate = self.current_selection_scope(); }
+                        Task::none()
+                    },
                 }
             }
             RepositoryAction::Language { action, .. } => {
@@ -5855,7 +5918,25 @@ impl RepositoryRuntime {
                 // A new query knows nothing of where the last one had got
                 // to, so it starts at its own first occurrence.
                 self.find_index = 0;
-                self.refresh_find_matches();
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::FindOptionsChanged { option, enabled, .. } => {
+                match option {
+                    crate::ui_controls::FindOption::CaseSensitive => self.find_options.case_sensitive = enabled,
+                    crate::ui_controls::FindOption::Regex => self.find_options.regex = enabled,
+                    crate::ui_controls::FindOption::WholeWord => self.find_options.whole_word = enabled,
+                }
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::FindSelectionChanged { enabled, .. } => {
+                self.find_selection = enabled.then(|| self.find_selection_candidate.or_else(|| self.current_selection_scope())).flatten();
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::PreserveCaseChanged { enabled, .. } => {
+                self.replace_preserve_case = enabled;
                 Task::none()
             }
             RepositoryAction::FindNext { .. } => {
@@ -5883,7 +5964,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ReplaceMatch { card, all } => {
-                if self.is_saving() {
+                if self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
                     return Task::none();
                 }
                 let DocumentState::Editable(document) = &mut self.document else {
@@ -5894,10 +5975,10 @@ impl RepositoryRuntime {
                 }
                 if all {
                     let snapshot = document.content.search_snapshot();
-                    let Some(text) =
-                        snapshot.replace_matches(&self.find_matches, &self.replace_query)
-                    else {
-                        return Task::none();
+                    let text = match snapshot.replace_matches_with(&self.find_matches, &self.find_query,
+                        &self.replace_query, self.find_options, self.replace_preserve_case) {
+                        Ok(text) => text,
+                        Err(error) => { self.find_error = Some(error); return Task::none(); }
                     };
                     document.content.perform(text_editor::Action::SelectAll);
                     document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
@@ -5905,13 +5986,19 @@ impl RepositoryRuntime {
                     )));
                 } else {
                     let (start, end) = self.find_matches[self.find_index];
+                    let replacement = document.content.with_line(start.line, |line, _| {
+                        crate::editor_search::replacement(line, start.column, end.column, &self.find_query,
+                            &self.replace_query, self.find_options, self.replace_preserve_case)
+                    });
+                    let replacement = match replacement {
+                        Some(Ok(replacement)) => replacement,
+                        _ => { self.find_error = Some("The selected match changed; search again.".into()); return Task::none(); }
+                    };
                     document.content.move_to(text_editor::Cursor {
                         position: end,
                         selection: Some(start),
                     });
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(self.replace_query.clone()),
-                    )));
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(replacement))));
                 }
                 self.push_lsp_change(None);
                 self.markdown_task(card)
@@ -7950,6 +8037,13 @@ fn find_strip<'a>(
             .width(Length::Fill)
             .into(),
     ];
+    row.push(crate::ui_controls::find_options(runtime.find_options.case_sensitive, runtime.find_options.regex,
+        runtime.find_options.whole_word, true,
+        move |option, enabled| RepositoryAction::FindOptionsChanged { card, option, enabled }));
+    let selection_enabled = runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
+    let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
+    if selection_enabled { selection = selection.on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled }); }
+    row.push(crate::interaction::tooltip(selection, "Search the selection captured when enabled").into());
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
     if !runtime.find_query.is_empty() {
@@ -8001,6 +8095,11 @@ fn find_strip<'a>(
                     .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
                     .width(Length::Fill)
                     .into(),
+                {
+                    let mut preserve = crate::ui_controls::field::checkbox(runtime.replace_preserve_case).label("Preserve case");
+                    if !runtime.find_options.regex { preserve = preserve.on_toggle(move |enabled| RepositoryAction::PreserveCaseChanged { card, enabled }); }
+                    crate::interaction::tooltip(preserve, "Keep each matched word's upper, lower or title case (plain text)").into()
+                },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
                         (matched && !runtime.is_saving())
@@ -16115,7 +16214,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_waits_while_find_holds_the_buffer() {
+    fn undo_and_redo_work_while_find_stays_open() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
         drop(runtime.update(RepositoryAction::EditorAction {
@@ -16124,10 +16223,11 @@ mod tests {
         }));
         drop(runtime.update(RepositoryAction::OpenFind { card }));
         drop(runtime.update(RepositoryAction::Undo { card }));
-        assert_eq!(buffer_text(&runtime), "zalpha\n");
-        drop(runtime.update(RepositoryAction::CloseFind { card }));
-        drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "alpha\n");
+        assert!(runtime.find_is_open());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "zalpha\n");
+        assert!(runtime.find_is_open());
     }
 
     #[test]
@@ -17872,7 +17972,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_find_releases_the_buffer_it_was_holding_read_only() {
+    fn find_stays_editable_and_closing_it_preserves_the_caret() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
@@ -17887,8 +17987,8 @@ mod tests {
         };
         assert_eq!(
             document.content.text(),
-            "alpha\n",
-            "find holds the buffer read-only while it is open"
+            "zalpha\n",
+            "find leaves the buffer editable while it is open"
         );
 
         drop(runtime.update(RepositoryAction::CloseFind { card }));
@@ -17902,9 +18002,8 @@ mod tests {
         };
         assert_eq!(
             document.content.text(),
-            "zalpha\n",
-            "a closed find bar that left search mode on would swallow every keystroke that \
-             followed it"
+            "zzalpha\n",
+            "closing find preserves the caret after edits"
         );
     }
 
@@ -17942,6 +18041,78 @@ mod tests {
         eprintln!(
             "100k matches complete Replace All: {replace_elapsed:?}; undo: {undo_elapsed:?}; redo: {redo_elapsed:?} (unoptimized test profile, excludes layout)"
         );
+    }
+
+    #[test]
+    fn find_edits_refresh_counts_without_moving_the_editing_caret() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        assert_eq!(runtime.find_total, 2);
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: None });
+        }
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        assert_eq!(buffer_text(&runtime), "alpha alphax");
+        // Literal search still matches a prefix until whole-word is enabled.
+        assert_eq!(runtime.find_total, 2);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 12)));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        assert_eq!(runtime.find_total, 1);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.find_total, 2);
+        assert!(runtime.find_is_open());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.find_total, 1);
+    }
+
+    #[test]
+    fn find_options_scope_and_invalid_patterns_are_applied_to_current_revision() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: Some(text_editor::Position { line: 0, column: 0 }) });
+        }
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        assert_eq!(runtime.find_total, 4);
+        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: true }));
+        assert_eq!(runtime.find_total, 2);
+        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::CaseSensitive, enabled: true }));
+        assert_eq!(runtime.find_total, 1);
+        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: false }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        assert_eq!(runtime.find_total, 2);
+        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "[".into() }));
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_error.is_some());
+    }
+
+    #[test]
+    fn regex_capture_replace_all_and_preserve_case_are_each_one_undo_step() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "call1 call2");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: r"call(\d)".into() }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "item$1".into() }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(buffer_text(&runtime), "item1 item2");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "call1 call2");
+        assert!(runtime.find_is_open());
+
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "word".into() }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "value".into() }));
+        drop(runtime.update(RepositoryAction::PreserveCaseChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(buffer_text(&runtime), "value Value VALUE value");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "word Word WORD wOrd");
     }
 
     #[test]
