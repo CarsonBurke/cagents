@@ -23,6 +23,37 @@ fn unique<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, Option<V>>, key: K, v
     }
 }
 
+/// The indexed equivalent of automation12856's canonical archive-console
+/// presentation predicate. This only admits a cached menu candidate: the click
+/// still uses the authoritative canonical helper and original source token.
+fn archive_console_matches_binding(
+    agent: crate::model::AgentId,
+    card: CardId,
+    saved: &crate::chat::Session,
+    current: &crate::model::TerminalSession,
+) -> bool {
+    if agent.as_uuid() != card.as_uuid() { return false; }
+    let Some(proof) = saved.proof.as_ref().filter(|proof| proof.is_complete()) else { return false; };
+    let Some(original) = saved.terminal.as_ref() else { return false; };
+    if original.id != saved.id
+        || original.launch.arguments != ["agent".to_owned(), "console".to_owned(), agent.to_string()]
+        || original.continuity.live_proof().as_ref() != Some(proof) { return false; }
+    let mut original = original.clone();
+    if matches!(current.continuity,
+        crate::model::TerminalContinuity::Exited { .. }
+        | crate::model::TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }) {
+        original.continuity = current.continuity.clone();
+    }
+    original == *current
+}
+fn resource(kind: &CardKind) -> Option<(u8, crate::model::TerminalId)> {
+    match kind {
+        CardKind::Chat(session) => Some((0, session.id)),
+        CardKind::Terminal(session) => Some((1, session.id)),
+        _ => None,
+    }
+}
+
 impl Cagents {
     /// Index filing once, then capture each actual open durable Chat exactly
     /// once. workspace.order intentionally does not participate: Hide removes
@@ -39,12 +70,16 @@ impl Cagents {
             unique(&mut repositories, channel.id, channel.repository.as_path());
         }
         let mut views = HashMap::new();
+        let mut resources: HashMap<_, usize> = HashMap::new();
         for view in &self.workspace_model.views {
             let repository = match &view.scope {
                 Scope::Channel(id) => repositories.get(id).copied().flatten(),
                 Scope::Worktree { repository, .. } => Some(repository.as_path()),
             };
-            for pane in &view.panes { unique(&mut views, pane.id, (view.scope.clone(), repository, pane)); }
+            for pane in &view.panes {
+                if let Some(key) = resource(&pane.kind) { *resources.entry(key).or_default() += 1; }
+                unique(&mut views, pane.id, (view.scope.clone(), repository, pane));
+            }
         }
         let mut cards = HashMap::new();
         for card in &self.durable.cards { unique(&mut cards, card.id, card); }
@@ -58,8 +93,13 @@ impl Cagents {
             };
             let (shared_scope, shared_repository, shared_worktree) = match views.get(&card.id) {
                 Some(Some((scope, Some(repository), pane))) if !pane.pending_terminal_start
-                    && matches!(&pane.kind, CardKind::Chat(current) if terminal_close::same_chat_removal_source(issued, current)) =>
-                        (Some(scope.clone()), Some((*repository).to_path_buf()), pane.scope.clone()),
+                    && match &pane.kind {
+                        CardKind::Chat(current) => terminal_close::same_chat_removal_source(issued, current),
+                        CardKind::Terminal(current) => resource(&pane.kind).is_some_and(|key| resources.get(&key) == Some(&1))
+                            && self.durable.automation_archives.get(&card.id).copied().is_some_and(|agent|
+                                archive_console_matches_binding(agent, card.id, issued, current)),
+                        _ => false,
+                    } => (Some(scope.clone()), Some((*repository).to_path_buf()), pane.scope.clone()),
                 Some(_) => return None,
                 None => (None, None, None),
             };
@@ -297,5 +337,36 @@ mod shared_capture_tests {
         app.workspace_model.views[0].panes[0].kind = issued.kind;
         app.workspace_model.views[0].panes[0].pending_terminal_start = true;
         assert!(app.capture_conversation_end_targets().is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod archive_candidate_tests {
+    use super::*;
+    #[test]
+    fn sidebar_end_archive_candidate_requires_original_canonical_console_recipe_and_complete_proof() {
+        let agent = crate::model::AgentId::new();
+        let card = CardId::from_uuid(agent.as_uuid());
+        let proof = crate::model::HostSessionProof { host_session_id: crate::model::HostSessionId::new("archive-owner"),
+            boot_id: crate::model::BootId::new("archive-boot"), host_incarnation: crate::model::HostIncarnation::new("archive-host") };
+        let id = crate::model::TerminalId::new();
+        let console = crate::model::TerminalSession { id, owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            launch: crate::model::LaunchRecipe { program: "cagents".into(), arguments: vec!["agent".into(), "console".into(), agent.to_string()],
+                working_directory: "/original".into(), environment: Default::default(), unset_environment: Default::default() },
+            transcript_path: None, resume_hint: None, continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() } };
+        let mut saved = crate::chat::Session { id, launch: crate::chat::Launch { provider: crate::agent::Provider::Codex,
+            recipe: console.launch.clone(), session_id: Some("exact-archived-thread".into()) }, proof: Some(proof), terminal: Some(console.clone()),
+            owned_codex_listener: None, native_continuity: Default::default() };
+        assert!(archive_console_matches_binding(agent, card, &saved, &console));
+        let mut ended = console.clone(); ended.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1234 } };
+        assert!(archive_console_matches_binding(agent, card, &saved, &ended));
+        assert!(!archive_console_matches_binding(crate::model::AgentId::new(), card, &saved, &ended));
+        ended.launch.working_directory = "/replaced".into();
+        assert!(!archive_console_matches_binding(agent, card, &saved, &ended));
+        saved.proof = None;
+        assert!(!archive_console_matches_binding(agent, card, &saved, &console));
     }
 }
