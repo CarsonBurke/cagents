@@ -709,6 +709,9 @@ pub struct SidebarWorktree {
     pub dirty: Option<DirtyState>,
     pub untracked_omitted: bool,
     pub listing_truncated: bool,
+    // Independent from the tracked listing's cap: a -uno prefix may retain
+    // an earlier complete untracked count across subsequent tracked reads.
+    untracked_complete: bool,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -731,6 +734,7 @@ impl SidebarWorktree {
         ahead: Option<u64>,
         behind: Option<u64>,
     ) -> Self {
+        let untracked_complete = dirty.is_some();
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
         let status = status_summary(detached, locked, dirty.as_ref(), false, false, ahead, behind);
@@ -769,6 +773,7 @@ impl SidebarWorktree {
             dirty,
             untracked_omitted: false,
             listing_truncated: false,
+            untracked_complete,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -814,6 +819,7 @@ impl SidebarWorktree {
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
         row.listing_truncated = status.is_some_and(|status| status.listing_truncated);
+        row.untracked_complete = status.is_some_and(|status| !status.untracked_omitted && !status.listing_truncated);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -851,12 +857,14 @@ impl SidebarWorktree {
         // count. Only a previously complete count may be reused: a capped
         // full listing has no authority over untracked paths it omitted.
         let mut dirty = status.dirty.clone();
-        let untracked_omitted = status.untracked_omitted
-            && (self.dirty.is_none() || self.untracked_omitted || self.listing_truncated);
-        if status.untracked_omitted && !untracked_omitted {
+        let reuse_untracked = status.untracked_omitted && self.untracked_complete;
+        let untracked_complete = reuse_untracked || !status.untracked_omitted && !status.listing_truncated;
+        let untracked_omitted = status.untracked_omitted && !reuse_untracked;
+        if reuse_untracked {
             dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
         }
         if self.untracked_omitted == untracked_omitted
+            && self.untracked_complete == untracked_complete
             && self.listing_truncated == status.listing_truncated
             && self.dirty.as_ref() == Some(&dirty)
             && self.ahead == ahead
@@ -866,6 +874,7 @@ impl SidebarWorktree {
         }
         self.dirty = Some(dirty);
         self.untracked_omitted = untracked_omitted;
+        self.untracked_complete = untracked_complete;
         self.listing_truncated = status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
@@ -11976,6 +11985,25 @@ pub(crate) mod tests {
         assert!(!row.untracked_omitted);
         assert!(row.listing_truncated);
         assert!(row.chrome.tooltip.contains("15+ changes"));
+
+        // Truncating only tracked paths did not invalidate the earlier full
+        // untracked count. A third -uno read must retain its provenance.
+        let mut tracked = StatusSnapshot { untracked_omitted: true, ..StatusSnapshot::default() };
+        tracked.dirty.unstaged = 1;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(!row.untracked_omitted && !row.listing_truncated);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("13 changes"));
+
+        // Conversely, a later capped full read replaces the old provenance:
+        // its partial untracked count cannot become complete after -uno.
+        let mut capped_full = StatusSnapshot { listing_truncated: true, ..StatusSnapshot::default() };
+        capped_full.dirty.untracked = 4;
+        row.apply_status(&capped_full);
+        row.apply_status(&tracked);
+        assert!(row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("1 tracked changes"));
     }
 
     #[test]
