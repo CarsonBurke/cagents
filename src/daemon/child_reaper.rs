@@ -631,9 +631,15 @@ mod tests {
                 pidfd: unsafe { File::from_raw_fd(fd) },
             }
         }
+        fn take_with_pidfd(&mut self, pidfd: io::Result<File>) -> io::Result<(Child, File)> {
+            // Descriptor duplication may fail. Keep the original Child in its
+            // cleanup owner until every fallible preparation step succeeds.
+            let pidfd = pidfd?;
+            Ok((self.child.take().unwrap(), pidfd))
+        }
         fn handoff(&mut self, reservation: Reservation) {
-            let child = self.child.take().unwrap();
-            match reservation.retain(child, self.pidfd.try_clone().unwrap()) {
+            let (child, pidfd) = self.take_with_pidfd(self.pidfd.try_clone()).unwrap();
+            match reservation.retain(child, pidfd) {
                 Ok(()) => {}
                 Err((error, child, pidfd, reservation)) => {
                     self.child = Some(child);
@@ -673,6 +679,29 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    #[test]
+    fn failed_descriptor_preparation_keeps_the_original_child_in_its_cleanup_owner() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let pid = owned.child.as_ref().unwrap().id();
+        let error = owned
+            .take_with_pidfd(Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(owned.child.as_ref().unwrap().id(), pid);
+        assert!(owned.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert_eq!(reaper.free(), 0);
+        assert!(reaper.service.state.lock().unwrap().entries[0].is_none());
+
+        // The original owner and its existing credit remain usable after the
+        // preparation failure; the exact original wait must release the slot.
+        owned.handoff(reservation);
+        owned.signal(libc::SIGKILL);
+        reaper.await_free(1);
+        assert!(!reaper.service.has_outstanding_ownership());
     }
 
     #[test]
@@ -745,12 +774,8 @@ mod tests {
             "the final-cleanup queue must not hide this original child"
         );
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, pidfd, reservation) = reservation
-            .retain(
-                owned.child.take().unwrap(),
-                owned.pidfd.try_clone().unwrap(),
-            )
-            .unwrap_err();
+        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
+        let (error, child, pidfd, reservation) = reservation.retain(child, pidfd).unwrap_err();
         owned.child = Some(child);
         assert!(error.to_string().contains("injected"));
         assert!(
@@ -819,9 +844,8 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let mut unrelated = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap();
+        let (child, wrong) = owned.take_with_pidfd(unrelated.pidfd.try_clone()).unwrap();
         let pid = child.id();
-        let wrong = unrelated.pidfd.try_clone().unwrap();
         let fd = wrong.as_raw_fd();
         let (error, child, returned, reservation) = reservation.retain(child, wrong).unwrap_err();
         owned.child = Some(child);
@@ -849,9 +873,8 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let ticket = reservation.ticket;
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap();
+        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
         let pid = child.id();
-        let pidfd = owned.pidfd.try_clone().unwrap();
         let fd = pidfd.as_raw_fd();
         reaper.service.fail_wake.store(true, Ordering::Release);
         let (error, child, returned, reservation) = reservation.retain(child, pidfd).unwrap_err();
@@ -881,12 +904,10 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap();
+        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
         let pid = child.id();
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, pidfd, reservation) = reservation
-            .retain(child, owned.pidfd.try_clone().unwrap())
-            .unwrap_err();
+        let (error, child, pidfd, reservation) = reservation.retain(child, pidfd).unwrap_err();
         reservation.preserve_suspended(child, Some(pidfd), &error.to_string());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
@@ -932,13 +953,9 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap();
+        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
         reservation.quarantine();
-        reservation.preserve_suspended(
-            child,
-            Some(owned.pidfd.try_clone().unwrap()),
-            "fixture transfer failure",
-        );
+        reservation.preserve_suspended(child, Some(pidfd), "fixture transfer failure");
         reaper.service.fail_wake.store(true, Ordering::Release);
         assert!(reaper.service.retry_preserved().is_err());
         assert!(
@@ -976,11 +993,8 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         missing_reservation.preserve_suspended(missing.child.take().unwrap(), None, "missing fd");
         reaper.service.reserve().unwrap_err();
-        reservation.preserve_suspended(
-            wrong.child.take().unwrap(),
-            Some(unrelated.pidfd.try_clone().unwrap()),
-            "wrong fd",
-        );
+        let (child, pidfd) = wrong.take_with_pidfd(unrelated.pidfd.try_clone()).unwrap();
+        reservation.preserve_suspended(child, Some(pidfd), "wrong fd");
         assert_eq!(
             reaper.service.retry_preserved().unwrap(),
             RetryReport {
@@ -1016,11 +1030,8 @@ mod tests {
         let mut reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        reservation.preserve_suspended(
-            owned.child.take().unwrap(),
-            Some(owned.pidfd.try_clone().unwrap()),
-            "fixture failure",
-        );
+        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
+        reservation.preserve_suspended(child, Some(pidfd), "fixture failure");
         reaper.service.state.lock().unwrap().stopping = true;
         reaper.service.wake().unwrap();
         reaper.worker.take().unwrap().join().unwrap();
