@@ -70,7 +70,7 @@ fn respond(request: ClientRequest, populated: bool, registrations: &mut usize) -
         ClientRequest::ReadWorkspaceModel => {
             let mut model = WorkspaceModel::default();
             if populated {
-                model.projects.push(ModelProject { repository: "/work/repo/.git".into(), checkout:Some("/work/repo".into()), name: "Fixture project".into(), kind: ProjectKind::Git, ordinal: 1 });
+                model.projects.push(ModelProject { repository: "/work/repo/.git".into(), checkout:Some("/work/repo".into()), primary_checkout:Some("/work/repo".into()), name: "Fixture project".into(), kind: ProjectKind::Git, ordinal: 1 });
                 model.channels.push(ModelChannel { id: ID.parse().unwrap(), repository: "/work/repo/.git".into(), title: "Fixture channel".into(), title_source: Default::default(), ordinal: 1 });
             }
             ServerResponse::WorkspaceModel { model }
