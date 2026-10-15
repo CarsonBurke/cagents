@@ -1173,6 +1173,9 @@ impl Cagents {
         );
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
+        if self.remember_sidebar_project_order() {
+            self.persist();
+        }
         self.sidebar_model.data_state = SidebarDataState::Ready;
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
@@ -1231,6 +1234,30 @@ impl Cagents {
                             .is_ok_and(|canonical| canonical == repository)
             })
             .map(|project| project.id)
+    }
+
+    /// Append first-seen projects in the order already presented to the user.
+    /// Existing ranks, including a user's custom order, remain unchanged.
+    pub(super) fn remember_sidebar_project_order(&mut self) -> bool {
+        let mut known = self
+            .durable
+            .project_order
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let missing = self
+            .sidebar_model
+            .projects
+            .iter()
+            .filter_map(|project| known.insert(project.id).then_some(project.id))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return false;
+        }
+        Arc::make_mut(&mut self.durable)
+            .project_order
+            .extend(missing);
+        true
     }
 
     /// Keeps the durable channels in the registry's ascending rank order.
@@ -2592,6 +2619,65 @@ mod tests {
         assert_eq!(project.kind, ProjectKind::Folder);
         assert!(project.worktrees.is_empty());
         assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
+    fn adopted_projects_append_to_durable_order_and_restore_after_shuffled_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let original = app
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        Arc::make_mut(&mut app.durable).project_order = original.clone();
+        let mut expected = original;
+        for (index, name) in ["zeta", "alpha", "middle"].into_iter().enumerate() {
+            let repository = directory.path().join(name);
+            std::fs::create_dir(&repository).unwrap();
+            let shared = ModelProject {
+                repository: repository.canonicalize().unwrap(),
+                name: name.into(),
+                kind: ProjectKind::Folder,
+                ordinal: (index + 1) as u32,
+            };
+            app.workspace_model.projects.push(shared.clone());
+            let Adoption::Opening(task) = app.adopt_shared_project(&shared) else {
+                panic!("new shared folder must be read");
+            };
+            let message = first_message(task).expect("actual repository load completion");
+            drop(app.update(message));
+            let id = app
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.repository == shared.repository)
+                .unwrap()
+                .id;
+            expected.push(id);
+            assert_eq!(app.durable.project_order, expected);
+        }
+        let mut restored = app.sidebar_model.clone();
+        restored.projects.reverse();
+        restored.apply_project_order(&app.durable.project_order);
+        assert_eq!(
+            restored
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let before = app.durable.clone();
+        assert!(
+            !app.remember_sidebar_project_order(),
+            "a refresh must not append duplicates"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &app.durable),
+            "unchanged order does not clone the workspace"
+        );
     }
 
     #[test]

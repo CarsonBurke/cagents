@@ -14,6 +14,8 @@ struct AutomaticAttempt {
 
 #[derive(Debug, Default)]
 pub struct State {
+    pub(super) activation: Option<super::project_activation::PendingActivation>,
+    pub(super) pending_loads: HashMap<PathBuf, ProjectId>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,

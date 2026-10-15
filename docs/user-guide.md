@@ -27,6 +27,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   remove and reopen the project to enable Git features; existing open folder
   projects keep their identity and channels. `cagents project open PATH` and
   `cagents channel spawn --repository PATH` accept the same folders.
+- `cagents project list` lists shared projects by creation rank, newest first.
+  Each window keeps its own saved sidebar order, including projects you drag
+  into a custom position.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
   selected worktree or channel. A **pane** is one independently focused surface;
@@ -62,12 +65,19 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
   or name.
-- Worktree labels prefer the matching pull request title and fall back to a
-  readable branch basename; tooltips and search keep the full branch name.
+- Worktree labels show literal branch names, including prefixes and punctuation
+  such as `feature/auth-fix`. Detached worktrees use their directory name.
+  Matching pull request titles remain available in tooltips and search.
   Rows show matching pull requests and their CI status. Unread updates stay
   emphasized until acknowledged. **Waiting for input** stays visible until the
   agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
+- Collapse Projects to a compact rail with stable project initials and colors.
+  Waiting and unread badges remain visible. Hover for the project name and
+  status; keyboard-focused controls expose the same information to assistive
+  technology.
+- Project search ranks exact and prefix matches before looser matches. Long
+  highlighted labels end in an ellipsis, leaving room for the row's status.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
   after 300 milliseconds.
 - Deleting a worktree warns about uncommitted files and unsaved editor changes.
