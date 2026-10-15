@@ -1,4 +1,6 @@
+mod cleanup;
 mod presentation;
+mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -647,6 +649,46 @@ impl HostState {
                 ));
             }
         }
+    }
+
+    pub(super) fn announce_worktrees_changed(&self, repository: &std::path::Path) {
+        for client in &self.model_watchers {
+            if let Some(delivery) = self.clients.get(client) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::WorktreesChanged {
+                        repository: repository.to_path_buf(),
+                    },
+                ));
+            }
+        }
+    }
+
+    pub(super) fn worktree_live_sessions(&self, path: &std::path::Path) -> Vec<TerminalId> {
+        let mut sessions = BTreeSet::new();
+        for (id, record) in &self.terminals {
+            if !record.handle.is_completed() && record.current_directory().starts_with(path) {
+                sessions.insert(*id);
+            }
+        }
+        for (id, record) in &self.chats {
+            if record.handle.owns_work()
+                && record
+                    .session
+                    .launch
+                    .recipe
+                    .working_directory
+                    .starts_with(path)
+            {
+                sessions.insert(*id);
+            }
+        }
+        for (id, session) in &self.chat_spawning {
+            if session.launch.recipe.working_directory.starts_with(path) {
+                sessions.insert(*id);
+            }
+        }
+        sessions.into_iter().collect()
     }
 
     /// Tells every observing client except `creator` that a terminal now
@@ -1372,74 +1414,6 @@ impl HostState {
         let mut replay: Vec<_> = title.chain(cwd).chain(events).collect();
         replay.sort_by_key(|(sequence, _)| *sequence);
         Ok(replay)
-    }
-
-    /// Called with exclusive control admission and window-launch fences held.
-    /// Existing processes can change cwd without asking the daemon, so automatic
-    /// cleanup waits for global process quiescence, not a cached cwd match.
-    pub(super) fn allow_automatic_worktree_cleanup(
-        &mut self,
-        client: ClientId,
-        windows: &[crate::instance::VerifiedWindow],
-    ) -> Result<(), String> {
-        let verified = |id: &ClientId| {
-            self.client_pids
-                .get(id)
-                .is_some_and(|pid| windows.iter().any(|window| window.pid() == *pid))
-        };
-        if !verified(&client) || self.model_watchers.iter().any(|id| !verified(id)) {
-            return Err("A window has not established directory protection".into());
-        }
-        if self.shutting_down
-            || self.upgrade.is_some()
-            || self.inventory_count() != 0
-            || !self.browser_logins_spawning.is_empty()
-            || !self.execution_startups.is_empty()
-            || !self.chat_bindings.is_empty()
-            || !self.chat_handoffs.is_empty()
-            || !self.native_closing.is_empty()
-            || !self.native_adoption_failures.is_empty()
-        {
-            return Err("Hosted process ownership has not settled".into());
-        }
-        let registry = self
-            .model
-            .as_ref()
-            .ok_or("The session registry is unavailable")?;
-        if !registry.cleanup_execution_is_quiescent()?
-            || !registry.active_automation_firings()?.is_empty()
-        {
-            return Err("Accepted or uncertain background work has not settled".into());
-        }
-        if let Some(store) = &self.upgrade_evidence
-            && store.load()?.is_some_and(|checkpoint| {
-                !checkpoint.terminals.is_empty()
-                    || !checkpoint.carried.is_empty()
-                    || !checkpoint.chats.is_empty()
-            })
-        {
-            return Err("Retained upgrade ownership has not settled".into());
-        }
-        // Recovery discovery is intentionally tolerant of unrelated records;
-        // cleanup instead preserves every remaining record it cannot disprove.
-        let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
-        for kind in [
-            crate::daemon::holder_registry::Kind::Terminal,
-            crate::daemon::holder_registry::Kind::Native,
-        ] {
-            let directory = crate::daemon::holder_registry::directory(kind)?;
-            crate::daemon::holder_registry::discover(&directory, &boot, kind)?;
-            for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
-                let path = entry.map_err(|error| error.to_string())?.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "json")
-                {
-                    return Err("Detached or uncertain holder ownership remains".into());
-                }
-            }
-        }
-        Ok(())
     }
 
     fn inventory_count(&mut self) -> u64 {
@@ -2715,6 +2689,7 @@ fn restore_upgrade_from(
     let mut adopted = Vec::new();
     let mut unattached = Vec::new();
     let mut reattached = Vec::new();
+    let mut interrupted_setups = false;
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
@@ -2742,6 +2717,9 @@ fn restore_upgrade_from(
                 !checkpoint.preserve_carried,
             ) {
                 adopted.push(terminal.source.id);
+            } else if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+                interrupted_setups = true;
+                setup_restore::retain_pane(host, &terminal.source, &terminal.source.launch);
             } else if checkpoint.preserve_carried {
                 return Err(format!(
                     "Terminal {} could not be authenticated for continued ownership; no recipe restart was authorized. Its checkpoint was retained for explicit recovery",
@@ -2794,6 +2772,11 @@ fn restore_upgrade_from(
         for terminal in &checkpoint.terminals {
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
+            }
+            if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+                interrupted_setups = true;
+                setup_restore::retain_pane(host, &terminal.source, &terminal.recipe);
+                continue;
             }
             // An unattached conversation's paired view would reconnect to its
             // retained server as a new, unowned client. Keep it as evidence.
@@ -2876,7 +2859,13 @@ fn restore_upgrade_from(
             store.path.display()
         ));
     }
-    store.remove()?;
+    if interrupted_setups {
+        let evidence = store.archive_interrupted_setup()?;
+        tracing::warn!(evidence = %evidence.display(),
+            "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
+    } else {
+        store.remove()?;
+    }
     publish();
     if !unattached.is_empty() {
         tracing::warn!(
@@ -3107,6 +3096,11 @@ fn adopt_carried_terminal(
         tracing::warn!(terminal = %id, %error, "confirmed continuation requires its original holder; recipe restart is refused");
         return false;
     }
+    if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+        tracing::warn!(terminal = %id, %error,
+            "worktree setup lost its authenticated holder; its command was not replayed");
+        return false;
+    }
     let recipe = match crate::upgrade::checkpoint_recipe(&terminal.source, &terminal.relaunches) {
         Ok(recipe) => recipe,
         Err(unsafe_recipe) => {
@@ -3315,6 +3309,28 @@ pub(super) fn spawn_pending_terminal(
     terminal_id: TerminalId,
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_pending_terminal_with_review(shared, client_id, pane, terminal_id, options, None)
+}
+
+pub(super) fn spawn_reviewed_worktree_setup(
+    shared: &SharedHost,
+    client_id: ClientId,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+    run_id: crate::model::OperationId,
+    options: TerminalSpawnOptions,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_pending_terminal_with_review(shared, client_id, pane, terminal_id, options, Some(run_id))
+}
+
+fn spawn_pending_terminal_with_review(
+    shared: &SharedHost,
+    client_id: ClientId,
+    pane: crate::model::CardId,
+    terminal_id: TerminalId,
+    options: TerminalSpawnOptions,
+    reviewed_setup_run: Option<crate::model::OperationId>,
+) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
         let state = shared.lock().unwrap_or_else(|p| p.into_inner());
         pending_terminal_session(&state, pane, terminal_id, false)?
@@ -3329,6 +3345,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        reviewed_setup_run,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3390,6 +3407,7 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3415,8 +3433,156 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        None,
     )
     .map(|(descriptor, _)| descriptor)
+}
+
+/// Run outside HostLock: an explicit run must still name the original checkout
+/// generation immediately before publication and child creation. Retained
+/// recipes without generation evidence never grant fresh execution authority.
+pub(super) fn verify_worktree_setup_generation(
+    recipe: &crate::model::LaunchRecipe,
+) -> Result<(), ProtocolError> {
+    let invalid =
+        |detail: String| ProtocolError::new(ProtocolErrorCode::InvalidRequest, detail, false);
+    let creation=recipe.environment.get("CAGENTS_WORKTREE_SETUP_CREATION_ID")
+        .ok_or_else(||invalid("This saved setup has no creation-generation evidence; review its worktree before resuming".into()))?
+        .parse::<crate::model::OperationId>().map_err(|error|invalid(format!("Invalid setup creation identity: {error}")))?;
+    let service = crate::repository::RepositoryService::system("git");
+    let admin = service
+        .git_dir(
+            &recipe.working_directory,
+            &crate::repository::CancellationToken::new(),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    if !crate::repository::worktree_setup_marker_matches(&admin, creation)
+        .map_err(|error| invalid(error.to_string()))?
+    {
+        return Err(invalid("This checkout was replaced or its original creation identity is unavailable; no setup was started".into()));
+    }
+    Ok(())
+}
+
+/// Hold the creator's SQLite writer reservation through actual child startup.
+/// Every metadata CAS uses that same SQLite writer, so a superseding resume or
+/// skip cannot authorize an older pending pane after this check.
+fn worktree_setup_run_guard(
+    recipe: &crate::model::LaunchRecipe,
+) -> Result<(crate::persistence::WorktreeOperationGuard, fs::File), ProtocolError> {
+    let invalid =
+        |detail: String| ProtocolError::new(ProtocolErrorCode::InvalidRequest, detail, false);
+    let creation = recipe
+        .environment
+        .get("CAGENTS_WORKTREE_SETUP_CREATION_ID")
+        .ok_or_else(|| invalid("Setup has no creation identity".into()))?
+        .parse::<crate::model::OperationId>()
+        .map_err(|error| invalid(error.to_string()))?;
+    let run = recipe
+        .environment
+        .get("CAGENTS_WORKTREE_SETUP_ID")
+        .ok_or_else(|| invalid("Setup has no run identity".into()))?
+        .parse::<crate::model::OperationId>()
+        .map_err(|error| invalid(error.to_string()))?;
+    let owners = || -> Result<Vec<std::path::PathBuf>, ProtocolError> {
+        let mut paths =
+            crate::instance::window_database_paths().map_err(|error| invalid(error.to_string()))?;
+        let directories = crate::instance::project_dirs()
+            .ok_or_else(|| invalid("Data directory is unavailable".into()))?;
+        paths.push(directories.data_dir().join("worktree-operations.sqlite3"));
+        paths.sort();
+        paths.dedup();
+        let mut owners = Vec::new();
+        for path in paths {
+            if !path
+                .try_exists()
+                .map_err(|error| invalid(error.to_string()))?
+            {
+                continue;
+            }
+            if crate::persistence::read_worktree_operation_at(&path, creation)
+                .map_err(|error| invalid(error.to_string()))?
+                .is_some()
+            {
+                owners.push(path);
+            }
+        }
+        if owners.len() != 1 {
+            return Err(invalid(
+                "No unique current setup creation journal is available; review this worktree again"
+                    .into(),
+            ));
+        }
+        Ok(owners)
+    };
+    let initial = owners()?;
+    let row = crate::persistence::read_worktree_operation_at(&initial[0], creation)
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| invalid("Setup creation disappeared".into()))?;
+    let service = crate::repository::RepositoryService::system("git");
+    let execution_lease = service
+        .worktree_setup_execution_lease(&row)
+        .map_err(|error| invalid(error.to_string()))?;
+    let owners = owners()?;
+    let cancel = crate::repository::CancellationToken::new();
+    let common = service
+        .common_dir(&recipe.working_directory, &cancel)
+        .map_err(|error| invalid(error.to_string()))?;
+    let admin = service
+        .git_dir(&recipe.working_directory, &cancel)
+        .map_err(|error| invalid(error.to_string()))?;
+    let records = service
+        .list_worktrees(&recipe.working_directory, &cancel)
+        .map_err(|error| invalid(error.to_string()))?;
+    let guard = crate::persistence::lock_worktree_operation_at(&owners[0], creation)
+        .map_err(|error| invalid(error.to_string()))?;
+    let report = service
+        .worktree_setup_creation_from_row(&guard.operation)
+        .map_err(|error| invalid(error.to_string()))?;
+    let request = report
+        .request
+        .as_ref()
+        .ok_or_else(|| invalid("Setup creation has no request".into()))?;
+    let intent = request
+        .setup_intent
+        .as_ref()
+        .ok_or_else(|| invalid("Setup creation has no retained intent".into()))?;
+    if intent.run_id != Some(run)
+        || intent.skip
+        || !intent.copy_done
+        || !intent
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.requires_trust())
+        || request.destination != recipe.working_directory
+    {
+        return Err(invalid("This setup run was superseded, skipped or is not prepared; review its current intent before starting".into()));
+    }
+    let saved_common =
+        serde_json::from_value::<std::path::PathBuf>(guard.operation.payload["common_dir"].clone())
+            .map_err(|error| invalid(error.to_string()))?;
+    let saved_admin =
+        serde_json::from_value::<std::path::PathBuf>(guard.operation.payload["admin_dir"].clone())
+            .map_err(|error| invalid(error.to_string()))?;
+    if common != saved_common
+        || admin != saved_admin
+        || !records.iter().any(|record| {
+            record.path == request.destination
+                && record.branch.as_deref() == Some(request.branch.full_ref().as_str())
+        })
+    {
+        return Err(invalid(
+            "The setup creation no longer owns this checkout registration".into(),
+        ));
+    }
+    if !crate::repository::worktree_setup_marker_matches(&admin, creation)
+        .map_err(|error| invalid(error.to_string()))?
+    {
+        return Err(invalid(
+            "The checkout generation changed before setup execution".into(),
+        ));
+    }
+    Ok((guard, execution_lease))
 }
 
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
@@ -3431,6 +3597,7 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    reviewed_setup_run: Option<crate::model::OperationId>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3457,6 +3624,32 @@ fn start_terminal_view_owned(
             if accepted.launch != session.launch {
                 return Err(not_found(terminal_id));
             }
+        }
+        let setup = session
+            .launch
+            .environment
+            .get("CAGENTS_WORKTREE_SETUP")
+            .is_some_and(|value| value == "1");
+        let reviewed = reviewed_setup_run.is_some_and(|run_id| {
+            session
+                .launch
+                .environment
+                .get("CAGENTS_WORKTREE_SETUP_ID")
+                .is_some_and(|value| value == &run_id.to_string())
+        });
+        if reviewed_setup_run.is_some() && !setup {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The reserved pane is not a worktree setup recipe",
+                false,
+            ));
+        }
+        if setup && adoption.is_none() && !reviewed {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Worktree setup was interrupted; review and explicitly resume it instead of replaying its saved recipe",
+                false,
+            ));
         }
         state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
@@ -3571,8 +3764,29 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
+    let setup_run_guard =
+        if adoption.is_none() && crate::upgrade::is_worktree_setup_recipe(&session.launch) {
+            match worktree_setup_run_guard(&session.launch) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .cancel_spawn(terminal_id);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+    let (setup_run_guard, setup_execution_lease) = setup_run_guard
+        .map_or((None, None), |(database, lease)| {
+            (Some(database), Some(lease))
+        });
+    let setup_execution_lease = setup_execution_lease.map(Arc::new);
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
+        setup_execution_lease: setup_execution_lease.clone(),
         agent_authority,
         columns: options.columns,
         rows: options.rows,
@@ -3591,6 +3805,7 @@ fn start_terminal_view_owned(
     }) {
         Ok(handle) => handle,
         Err(error) => {
+            drop(setup_run_guard);
             shared
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3602,6 +3817,10 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    drop(setup_run_guard);
+    // The verified holder handshake transferred the same flock description.
+    // Its lifetime now fences execution independently of daemon callbacks.
+    drop(setup_execution_lease);
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -4119,6 +4338,137 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, TerminalEvent::Completed { .. }))
         );
+    }
+
+    #[test]
+    fn saved_setup_recipes_require_reviewed_start_and_do_not_replay_on_restore() {
+        if std::env::var_os("CAGENTS_SETUP_HOST_POLICY_TEST").is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","host::state::tests::saved_setup_recipes_require_reviewed_start_and_do_not_replay_on_restore","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",fixture.path()).env("XDG_RUNTIME_DIR",fixture.path()).env("XDG_DATA_HOME",fixture.path().join("data")).env("XDG_CONFIG_HOME",fixture.path().join("config"))
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("CAGENTS_SETUP_HOST_POLICY_TEST","1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated host setup policy failed: {output:?}"
+            );
+            return;
+        }
+
+        use crate::workspace_model::views::{Pane, Scope};
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let repository = directory.path().to_owned();
+        let run_id = crate::model::OperationId::new();
+        let creation_id = crate::model::OperationId::new();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            repository.join(".git/cagents-setup-creation"),
+            format!("{creation_id}\n"),
+        )
+        .unwrap();
+        let launch = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf once >> setup-count".into()],
+            working_directory: repository.clone(),
+            environment: BTreeMap::from([
+                ("CAGENTS_WORKTREE_SETUP".into(), "1".into()),
+                ("CAGENTS_WORKTREE_SETUP_ID".into(), run_id.to_string()),
+                (
+                    "CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),
+                    creation_id.to_string(),
+                ),
+            ]),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: launch.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: launch,
+                last_exit: None,
+            },
+        };
+        let pane = Pane {
+            id: crate::model::CardId::new(),
+            title: "Worktree setup".into(),
+            user_title: None,
+            pending_terminal_start: true,
+            width_fraction: 1.0,
+            scope: Some(repository.clone()),
+            kind: crate::model::CardKind::Terminal(session.clone()),
+        };
+        let make_host = |name: &str| {
+            let mut registry =
+                super::super::model::Registry::at(&directory.path().join(name)).unwrap();
+            registry
+                .apply(&ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: "setup".into(),
+                    kind: Default::default(),
+                })
+                .unwrap();
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: Scope::Worktree {
+                        repository: repository.clone(),
+                        path: repository.clone(),
+                    },
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            let mut state = test_host();
+            state.install_model(registry);
+            state.register_client(1);
+            Arc::new(HostLock::new(state))
+        };
+        let host = make_host("first.sqlite3");
+        let options = TerminalSpawnOptions::default();
+        assert!(spawn_pending_terminal(&host, 1, pane.id, session.id, options.clone()).is_err());
+        assert!(spawn_terminal(&host, 1, session.clone(), options.clone()).is_err());
+        assert!(
+            spawn_reviewed_worktree_setup(
+                &host,
+                1,
+                pane.id,
+                session.id,
+                crate::model::OperationId::new(),
+                options.clone()
+            )
+            .is_err()
+        );
+        assert!(!directory.path().join("setup-count").exists());
+        assert!(
+            spawn_reviewed_worktree_setup(&host, 1, pane.id, session.id, run_id, options.clone())
+                .is_err(),
+            "a manually retained marker and pane cannot replace the current authorizing journal"
+        );
+        assert!(!directory.path().join("setup-count").exists());
+        // Reopen the saved pre-launch pane after a simulated daemon loss.
+        // Its marker and pending bit are evidence, not replay permission.
+        let restored = make_host("restored.sqlite3");
+        assert!(
+            spawn_pending_terminal(&restored, 1, pane.id, session.id, options.clone()).is_err()
+        );
+        assert!(spawn_terminal(&restored, 1, session.clone(), options.clone()).is_err());
+        fs::remove_file(repository.join(".git/cagents-setup-creation")).unwrap();
+        assert!(
+            spawn_reviewed_worktree_setup(&restored, 1, pane.id, session.id, run_id, options)
+                .is_err(),
+            "even explicit stale callbacks must refuse missing generation evidence"
+        );
+        assert!(!directory.path().join("setup-count").exists());
     }
 
     #[test]

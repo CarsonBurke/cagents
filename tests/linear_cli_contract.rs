@@ -344,3 +344,75 @@ fn uncertain_relation_deletion_identifies_relation_without_mistaking_it_for_issu
     assert!(error["details"]["writeContext"]["issueId"].is_null());
     assert!(error["message"].as_str().unwrap().contains(TEAM_ID));
 }
+
+#[test]
+fn stored_key_authenticates_without_shell_environment_and_environment_overrides_it() {
+    let f = Fixture::new();
+    let helper = f.path().join("bin/secret-tool");
+    fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINEAR_FIXTURE/keyring-argv\"\nprintf '%s\\n' 'fixture-keyring-secret'\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        f.request()
+            .contains("Authorization: fixture-keyring-secret")
+    );
+    let keyring_args = fs::read_to_string(f.path().join("keyring-argv")).unwrap();
+    assert!(keyring_args.contains("com.carson.cagents.linear"));
+    assert!(keyring_args.contains("default"));
+    assert!(!keyring_args.contains("fixture-keyring-secret"));
+    fs::remove_file(f.path().join("keyring-argv")).unwrap();
+    f.success(&["linear", "issue", "ENG-12"]);
+    assert!(f.request().contains(&format!("Authorization: {KEY}")));
+    assert!(
+        !f.path().join("keyring-argv").exists(),
+        "environment override avoids the keyring entirely"
+    );
+}
+
+#[test]
+fn team_and_state_names_use_filtered_connections_without_metadata_scans() {
+    let f = Fixture::new();
+    f.read(json!({"teams":{"nodes":[{"id":TEAM_ID,"name":"Engineering","key":"ENG"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}));
+    fs::write(f.path().join("mutation"), "{}").unwrap();
+    f.failure(&[
+        "linear",
+        "create",
+        "--team",
+        "engineering",
+        "--title",
+        "New",
+    ]);
+    assert_eq!(
+        f.calls(),
+        2,
+        "one filtered lookup and one attempted mutation"
+    );
+    // The fixture keeps every request, making the actual transport contract visible.
+    let history = fs::read_to_string(f.path().join("requests")).unwrap();
+    assert!(history.contains("$filter:TeamFilter!"));
+    assert!(history.contains("eqIgnoreCase"));
+    assert!(history.contains("engineering"));
+    let f = Fixture::new();
+    f.read(json!({
+        "issue":{"id":ISSUE_ID,"team":{"id":TEAM_ID}},
+        "workflowStates":{"nodes":[{"id":ISSUE_ID,"name":"In Progress","team":{"id":TEAM_ID}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+    }));
+    f.success(&["linear", "set", "--id", "ENG-12", "status", "In Progress"]);
+    assert_eq!(
+        f.calls(),
+        3,
+        "one issue read, one filtered state lookup, one mutation"
+    );
+    let history = fs::read_to_string(f.path().join("requests")).unwrap();
+    assert!(history.contains("$filter:WorkflowStateFilter!"));
+    assert!(history.contains("eqIgnoreCase"));
+}

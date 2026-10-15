@@ -62,7 +62,11 @@ fn git_directory(current: &Path) -> Result<Root, Error> {
 }
 
 pub fn resolve_current() -> Result<LinkedIssue, Error> {
-    read_link(&git_directory(&std::env::current_dir().map_err(storage)?)?)
+    resolve_at(&std::env::current_dir().map_err(storage)?)
+}
+
+pub fn resolve_at(worktree: &Path) -> Result<LinkedIssue, Error> {
+    read_link(&git_directory(worktree)?)
 }
 
 fn read_link(root: &Root) -> Result<LinkedIssue, Error> {
@@ -106,15 +110,25 @@ fn validate(issue: &LinkedIssue) -> Result<(), Error> {
 }
 
 pub fn link(issue_id: &str, workspace: Option<&str>) -> Result<LinkedIssue, Error> {
+    link_at(
+        &std::env::current_dir().map_err(storage)?,
+        issue_id,
+        workspace,
+    )
+}
+
+/// Link an explicit checkout without changing the process-wide current directory.
+pub fn link_at(
+    worktree: &Path,
+    issue_id: &str,
+    workspace: Option<&str>,
+) -> Result<LinkedIssue, Error> {
     let issue = LinkedIssue {
         issue_id: super::issue_reference(issue_id)?,
         workspace: workspace.map(str::to_ascii_uppercase),
     };
     validate(&issue)?;
-    write_link(
-        &git_directory(&std::env::current_dir().map_err(storage)?)?,
-        &issue,
-    )?;
+    write_link(&git_directory(worktree)?, &issue)?;
     Ok(issue)
 }
 

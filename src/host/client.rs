@@ -320,6 +320,140 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
     Ok(())
 }
 
+fn reopen_worktree_project(
+    host: &SharedHost,
+    repository: &std::path::Path,
+) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|poison| poison.into_inner());
+    let existing = state
+        .read_model()?
+        .projects
+        .into_iter()
+        .find(|project| project.repository == repository);
+    let (name, kind) = existing
+        .map(|project| (project.name, project.kind))
+        .unwrap_or_else(|| {
+            (
+                crate::workspace_model::repository_display_name(repository),
+                crate::model::ProjectKind::Git,
+            )
+        });
+    state.edit_model(
+        0,
+        crate::workspace_model::ModelEdit::ReopenProject {
+            repository: repository.to_path_buf(),
+            name,
+            kind,
+        },
+    )?;
+    Ok(())
+}
+
+fn start_worktree_setup(
+    host: &SharedHost,
+    repository: &std::path::Path,
+    path: &std::path::Path,
+    command: &str,
+    run_id: crate::model::OperationId,
+    creation_id: crate::model::OperationId,
+) -> Result<crate::model::TerminalSession, ProtocolError> {
+    use crate::{
+        model::{CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+        workspace_model::{
+            ModelEdit,
+            views::{Change, Pane, Scope},
+        },
+    };
+    let started = crate::chat::now_ms().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The setup start time is unavailable",
+            false,
+        )
+    })?;
+    let recipe = LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), command.into()],
+        working_directory: path.to_path_buf(),
+        environment: std::collections::BTreeMap::from([
+            ("CAGENTS_WORKTREE_SETUP".into(), "1".into()),
+            ("CAGENTS_WORKTREE_SETUP_ID".into(), run_id.to_string()),
+            (
+                "CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),
+                creation_id.to_string(),
+            ),
+            (
+                "CAGENTS_WORKTREE_SETUP_STARTED_AT".into(),
+                started.to_string(),
+            ),
+        ]),
+        unset_environment: Default::default(),
+    };
+    super::state::verify_worktree_setup_generation(&recipe)?;
+    reopen_worktree_project(host, repository)?;
+    let session = TerminalSession {
+        id: TerminalId::new(),
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let pane = CardId::new();
+    {
+        let mut state = host.lock().unwrap_or_else(|poison| poison.into_inner());
+        let scope = Scope::Worktree {
+            repository: repository.to_path_buf(),
+            path: path.to_path_buf(),
+        };
+        let revision = state
+            .read_model()?
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .map_or(0, |view| view.revision);
+        state.edit_model(
+            0,
+            ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Insert {
+                    pane: Pane {
+                        id: pane,
+                        title: "Worktree setup".into(),
+                        user_title: None,
+                        pending_terminal_start: true,
+                        width_fraction: 1.0,
+                        kind: CardKind::Terminal(session.clone()),
+                        scope: Some(path.to_path_buf()),
+                    },
+                    before: None,
+                },
+            },
+        )?;
+    }
+    // Publish ownership before starting the child, so completed-unattached
+    // retirement cannot race a short setup command's durable pane membership.
+    let terminal = super::state::spawn_reviewed_worktree_setup(
+        host,
+        0,
+        pane,
+        session.id,
+        run_id,
+        crate::terminal::TerminalSpawnOptions::default(),
+    )?;
+    host.lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .detach(0, terminal.session.id)?;
+    Ok(terminal.session)
+}
+
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
@@ -355,24 +489,56 @@ pub(super) fn process_request(
         operation: crate::device_service::Operation::RemoveMergedWorktree { request },
     } = &request
     {
+        use crate::device_service::{CleanupRefusal, CleanupRefusalKind};
+        let path = request.path.clone();
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
-            ensure_control_open(host)?;
-            crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
+            ensure_control_open(host)
+                .map_err(|error| {
+                    CleanupRefusal::new(CleanupRefusalKind::ShutdownOrUpgrade, error.message)
+                })
+                .and_then(|()| {
+                    crate::worktree_cleanup::PreparedRemoval::prepare(request.clone()).map_err(
+                        |detail| CleanupRefusal::new(CleanupRefusalKind::SafetyCheckFailed, detail),
+                    )
+                })
         };
         let removed = match prepared {
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
-                ensure_control_open(host)?;
-                prepared
-                    .remove(|windows| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .allow_automatic_worktree_cleanup(client_id, windows)
+                ensure_control_open(host)
+                    .map_err(|error| {
+                        CleanupRefusal::new(CleanupRefusalKind::ShutdownOrUpgrade, error.message)
                     })
-                    .ok()
+                    .and_then(|()| {
+                        let mut refusal = None;
+                        prepared
+                            .remove(|windows| {
+                                // Only capture daemon ownership under the host lock. The
+                                // process/holder census must not stall terminal delivery.
+                                let scope = host
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .automatic_worktree_cleanup_scope(client_id, windows);
+                                scope
+                                    .and_then(|scope| scope.check(&path))
+                                    .map_err(|reason| {
+                                        let detail = reason.to_string();
+                                        refusal = Some(reason);
+                                        detail
+                                    })
+                            })
+                            .map_err(|detail| {
+                                refusal.unwrap_or_else(|| {
+                                    CleanupRefusal::new(
+                                        CleanupRefusalKind::SafetyCheckFailed,
+                                        detail,
+                                    )
+                                })
+                            })
+                    })
             }
-            Err(_) => None,
+            Err(refusal) => Err(refusal),
         };
         return Ok((
             ServerResponse::DeviceOperation {
@@ -398,13 +564,136 @@ pub(super) fn process_request(
             | ClientRequest::DeviceOperation {
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
+            | ClientRequest::DeviceOperation {
+                operation: crate::device_service::Operation::Worktree {
+                    operation: crate::worktree_control::Operation::Remove { .. }
+                        | crate::worktree_control::Operation::DeleteBranch { .. }
+                        | crate::worktree_control::Operation::StaleLock { unlock: true, .. }
+                }
+            }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
+    let reviewed_setup_run = match &request {
+        ClientRequest::StartWorktreeSetup { run_id, .. } => Some(*run_id),
+        _ => None,
+    };
     match request {
+        ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::Worktree { operation },
+        } => {
+            let repository = operation.repository().map(std::path::Path::to_path_buf);
+            let mutates = operation.mutates();
+            let mut scope = if matches!(
+                &operation,
+                crate::worktree_control::Operation::Remove { .. }
+            ) {
+                Some(
+                    host.lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .worktree_removal_scope()
+                        .map_err(|error| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::InvalidRequest,
+                                error.to_string(),
+                                false,
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let mut result = crate::worktree_control::service::execute(operation, |path| {
+                if let Some(scope) = scope.take() {
+                    scope.check(path).map_err(|error| error.to_string())?;
+                }
+                Ok(host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .worktree_live_sessions(path))
+            });
+            if let Ok(crate::worktree_control::service::Execution {
+                reply: crate::worktree_control::Reply::Created { warnings, .. },
+                ..
+            }) = &mut result
+            {
+                if let Some(repository) = &repository {
+                    if let Err(error) = reopen_worktree_project(host, repository) {
+                        warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {}", error.message));
+                    }
+                }
+            }
+            // Publish the project before its inventory edge, so a window can
+            // refresh a repository that this command opened for the first time.
+            // A later setup/branch failure can follow a committed Git mutation.
+            // Refresh on either outcome so a retained worktree is never hidden.
+            if mutates && let Some(repository) = &repository {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .announce_worktrees_changed(repository);
+            }
+            let execution = result.map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            let mut reply = execution.reply;
+            let _setup_reservation = execution.setup_reservation;
+            let setup_creation_id = execution.setup_creation_id;
+            let prepared = match &mut reply {
+                crate::worktree_control::Reply::Created {
+                    worktree,
+                    setup: Some(setup),
+                    warnings,
+                } => Some((&worktree.path, setup, warnings)),
+                crate::worktree_control::Reply::SetupPrepared {
+                    path,
+                    setup: Some(setup),
+                    warnings,
+                    ..
+                } => Some((&*path, setup, warnings)),
+                _ => None,
+            };
+            if let Some((path, setup, warnings)) = prepared {
+                if setup.error.is_none() {
+                    let started = match (repository.as_deref(), setup.run_id, setup_creation_id) {
+                        (Some(repository), Some(run_id), Some(creation_id)) => {
+                            start_worktree_setup(
+                                host,
+                                repository,
+                                path,
+                                &setup.command,
+                                run_id,
+                                creation_id,
+                            )
+                        }
+                        _ => Err(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            "Setup has no retained repository/run identity",
+                            false,
+                        )),
+                    };
+                    match started {
+                        Ok(session) => setup.terminal = Some(session),
+                        Err(error) => {
+                            warnings.push(format!(
+                                "Worktree was created, but its setup terminal could not start: {}",
+                                error.message
+                            ));
+                            setup.error = Some(error.message);
+                        }
+                    }
+                }
+            }
+            Ok((
+                ServerResponse::DeviceOperation {
+                    reply: crate::device_service::Reply::Worktree(reply),
+                },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
                 let account =
@@ -765,9 +1054,25 @@ pub(super) fn process_request(
             pane,
             terminal_id,
             options,
+        }
+        | ClientRequest::StartWorktreeSetup {
+            pane,
+            terminal_id,
+            options,
+            ..
         } => {
-            let terminal =
-                super::state::spawn_pending_terminal(host, client_id, pane, terminal_id, options)?;
+            let terminal = if let Some(run_id) = reviewed_setup_run {
+                super::state::spawn_reviewed_worktree_setup(
+                    host,
+                    client_id,
+                    pane,
+                    terminal_id,
+                    run_id,
+                    options,
+                )?
+            } else {
+                super::state::spawn_pending_terminal(host, client_id, pane, terminal_id, options)?
+            };
             {
                 let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Every other observer learns that this terminal exists here,
@@ -1386,6 +1691,48 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn automatic_cleanup_shutdown_refusal_keeps_typed_reason() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        let mut state = super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("cleanup"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        state.shutting_down = true;
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        let repository =
+            crate::github_identity::GitHubRepoKey::new("github.com", None, "fixture", "repo")
+                .unwrap();
+        let request = ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::RemoveMergedWorktree {
+                request: crate::worktree_cleanup::RemovalRequest {
+                    repository: "/does-not-exist".into(),
+                    path: "/does-not-exist/wt".into(),
+                    branch: "feature".into(),
+                    head_oid: "a".repeat(40),
+                    source_repository: repository.clone(),
+                    pull_request: crate::github_identity::PullRequestKey::new(repository, 1)
+                        .unwrap(),
+                },
+            },
+        };
+        let (response, extras, shutdown) = process_request(&host, 1, request).unwrap();
+        let ServerResponse::DeviceOperation {
+            reply: crate::device_service::Reply::MergedWorktreeRemoved(Err(reason)),
+        } = response
+        else {
+            panic!("cleanup refusal lost its typed reply");
+        };
+        assert_eq!(
+            reason.kind,
+            crate::device_service::CleanupRefusalKind::ShutdownOrUpgrade
+        );
+        assert!(!reason.detail.is_empty());
+        assert!(extras.is_empty());
+        assert!(!shutdown);
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {

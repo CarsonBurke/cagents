@@ -143,7 +143,9 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 carries typed refusal reasons for automatic worktree cleanup.
+/// Version 79 adds daemon worktree control and immediate sidebar refresh edges.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -472,6 +474,14 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Explicit first launch or reviewed recovery of a marked setup recipe.
+    /// Generic restoration never grants permission to replay setup commands.
+    StartWorktreeSetup {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        run_id: crate::model::OperationId,
+        options: TerminalSpawnOptions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +686,10 @@ pub enum ServerMessage {
     NotificationsChanged,
     NotificationActivated {
         target: crate::notifications::Target,
+    },
+    /// Sent only to shared-model subscribers after journaled worktree mutations.
+    WorktreesChanged {
+        repository: PathBuf,
     },
 }
 

@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+mod worktrees;
+pub use worktrees::WorktreeCommand;
 mod accounts;
+pub(crate) mod format;
 pub use accounts::AccountCommand;
 mod agents;
 pub use agents::AgentCommand;
@@ -86,6 +89,9 @@ pub struct Cli {
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Connect to an existing daemon without starting one (also CAGENTS_NO_START=1).
+    #[arg(long, global = true)]
+    pub no_start: bool,
 
     #[command(subcommand)]
     pub command: TopCommand,
@@ -152,6 +158,11 @@ pub enum TopCommand {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Create, inspect and safely remove daemon-owned Git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
     },
     /// Manage the channels every window shares.
     Channel {
@@ -440,6 +451,11 @@ pub enum ControlError {
 }
 
 /// A bounded, synchronous client for the current cagents daemon protocol.
+pub enum WorkspaceModelEvent {
+    Edited { sequence: u64, edit: ModelEdit },
+    WorktreesChanged { repository: PathBuf },
+}
+
 pub struct ControlClient {
     stream: UnixStream,
     proof: HostSessionProof,
@@ -453,6 +469,7 @@ pub struct ControlClient {
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_worktrees: VecDeque<PathBuf>,
     observed_notifications: VecDeque<crate::notifications::Update>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
@@ -569,6 +586,7 @@ impl ControlClient {
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
+            observed_worktrees: VecDeque::new(),
             observed_notifications: VecDeque::new(),
             attached_chats: BTreeSet::new(),
         })
@@ -788,8 +806,24 @@ impl ControlClient {
     /// polling: a timeout expiring mid-frame would desynchronize the stream, and
     /// a subscribed connection issues no further requests.
     pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+        loop {
+            if let WorkspaceModelEvent::Edited { sequence, edit } =
+                self.next_workspace_model_update()?
+            {
+                return Ok((sequence, edit));
+            }
+        }
+    }
+
+    pub fn next_workspace_model_update(&mut self) -> Result<WorkspaceModelEvent, ControlError> {
+        if let Some(repository) = self.observed_worktrees.pop_front() {
+            return Ok(WorkspaceModelEvent::WorktreesChanged { repository });
+        }
         if let Some(edge) = self.observed_model.pop_front() {
-            return Ok(edge);
+            return Ok(WorkspaceModelEvent::Edited {
+                sequence: edge.0,
+                edit: edge.1,
+            });
         }
         self.stream
             .set_read_timeout(None)
@@ -799,7 +833,10 @@ impl ControlClient {
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
                 ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    return Ok((sequence, edit));
+                    return Ok(WorkspaceModelEvent::Edited { sequence, edit });
+                }
+                ServerMessage::WorktreesChanged { repository } => {
+                    return Ok(WorkspaceModelEvent::WorktreesChanged { repository });
                 }
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
@@ -953,14 +990,40 @@ impl ControlClient {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     ) -> Result<TerminalDescriptor, ControlError> {
-        let response = self.request_attached(
+        self.complete_pending_terminal_request(
             ClientRequest::CompletePendingTerminal {
                 pane,
                 terminal_id,
                 options,
             },
             terminal_id,
-        )?;
+        )
+    }
+
+    pub fn start_worktree_setup(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        run_id: crate::model::OperationId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        self.complete_pending_terminal_request(
+            ClientRequest::StartWorktreeSetup {
+                pane,
+                terminal_id,
+                run_id,
+                options,
+            },
+            terminal_id,
+        )
+    }
+
+    fn complete_pending_terminal_request(
+        &mut self,
+        request: ClientRequest,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        let response = self.request_attached(request, terminal_id)?;
         let terminal = match response {
             ServerResponse::Spawned { terminal } if terminal.session.id == terminal_id => terminal,
             ServerResponse::Spawned { terminal } => {
@@ -1547,6 +1610,11 @@ impl ControlClient {
             ServerMessage::WorkspaceModelEdited { sequence, edit } => {
                 self.observed_model.push_back((sequence, edit));
             }
+            ServerMessage::WorktreesChanged { repository } => {
+                if !self.observed_worktrees.contains(&repository) {
+                    self.observed_worktrees.push_back(repository);
+                }
+            }
             ServerMessage::NotificationsChanged => {
                 if !self
                     .observed_notifications
@@ -1761,6 +1829,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::TerminalCreated { .. }
+        | ServerMessage::WorktreesChanged { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
@@ -1784,6 +1853,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
+        ServerMessage::WorktreesChanged { .. } => "worktrees_changed",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
@@ -1941,6 +2011,58 @@ impl AppError {
     }
 }
 
+static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn daemon_autostart_disabled() -> bool {
+    NO_START.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct StartPolicy(bool);
+impl Drop for StartPolicy {
+    fn drop(&mut self) {
+        NO_START.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn control_daemon_socket() -> Result<PathBuf, AppError> {
+    if !daemon_autostart_disabled() {
+        return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
+    }
+    let socket = daemon_socket_path().map_err(|e| {
+        AppError::new(
+            if daemon_missing(&e) {
+                "daemon_not_running"
+            } else {
+                "socket_path"
+            },
+            e,
+        )
+    })?;
+    match UnixStream::connect(&socket) {
+        Ok(_) => Ok(socket),
+        Err(error) if daemon_missing(&error) => Err(AppError::new(
+            "daemon_not_running",
+            "The daemon is not running; omit --no-start to start it",
+        )),
+        Err(error) => Err(AppError::new("daemon_connection", error)),
+    }
+}
+
+fn daemon_missing(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn already_stopped() -> CommandOutput {
+    CommandOutput {
+        command: "daemon.stop",
+        data: json!({"state": "already_stopped"}),
+        human: "Daemon already stopped".into(),
+    }
+}
+
 pub fn run_from<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -1966,6 +2088,11 @@ where
             return ExitCode::from(2);
         }
     };
+
+    let no_start = cli.no_start
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
@@ -2008,7 +2135,7 @@ where
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
-        let recover = staged_command_requires_daemon(&cli.command);
+        let recover = !no_start && staged_command_requires_daemon(&cli.command);
         match crate::install_guard::staged_owner_bin(
             &std::env::current_exe().unwrap_or_default(),
             recover,
@@ -2071,6 +2198,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Ui { .. }
         | TopCommand::Terminal { .. }
         | TopCommand::Project { .. }
+        | TopCommand::Worktree { .. }
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
         | TopCommand::Account { .. }
@@ -2198,6 +2326,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
         TopCommand::Project { command } => execute_project(command),
+        TopCommand::Worktree { command } => worktrees::execute(command),
         TopCommand::Channel { command } => execute_channel(command),
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
@@ -2584,9 +2713,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket =
-                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let socket = match daemon_socket_path() {
+                Ok(socket) => socket,
+                Err(error) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(error) => return Err(AppError::new("socket_path", error)),
+            };
+            let mut client = match ControlClient::connect(&socket) {
+                Ok(client) => client,
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+                    return Ok(already_stopped());
+                }
+                Err(error) => return Err(protocol_error(error)),
+            };
             let outcome = match confirm {
                 // A capability is already a counted, daemon-bound, expiring
                 // authority over one observed inventory, so a script that
@@ -2873,8 +3011,7 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     // Inside a hosted session the daemon lets these commands change only the
@@ -2893,11 +3030,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
     match command {
         TerminalCommand::List => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
-                .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(
+                &["ID", "ATTACHMENT", "PROGRAM", "DIRECTORY"],
+                terminals
+                    .iter()
+                    .map(|terminal| {
+                        descriptor_line(terminal)
+                            .split('\t')
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .collect(),
+                "No terminals",
+            );
             Ok(CommandOutput {
                 command: "terminal.list",
                 data: json!({ "terminals": terminals }),
@@ -3035,8 +3180,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3233,8 +3377,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3490,7 +3633,17 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
         return Err(format!("`{}` is not a directory", directory.display()));
     }
     let output = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .current_dir(directory)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

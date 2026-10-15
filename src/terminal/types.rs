@@ -36,6 +36,10 @@ pub struct TerminalConfig {
     pub adoption: Option<std::path::PathBuf>,
     #[cfg(feature = "host")]
     pub holder_recovery: Option<super::holder::Recovery>,
+    /// Original creation flock passed to the actual setup holder. Execution
+    /// authority must survive loss of its daemon; never part of a recipe.
+    #[cfg(feature = "host")]
+    pub setup_execution_lease: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl Default for TerminalConfig {
@@ -57,6 +61,8 @@ impl Default for TerminalConfig {
             adoption: None,
             #[cfg(feature = "host")]
             holder_recovery: None,
+            #[cfg(feature = "host")]
+            setup_execution_lease: None,
         }
     }
 }

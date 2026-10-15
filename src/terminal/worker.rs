@@ -1656,11 +1656,12 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable(
+                    holder::spawn_recoverable_with_setup_lease(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        config.setup_execution_lease.clone(),
                     )?,
                     Vec::new(),
                 )
