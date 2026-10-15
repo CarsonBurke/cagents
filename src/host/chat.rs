@@ -5288,19 +5288,20 @@ for line in sys.stdin:
         };
         previous.close().unwrap();
         assert!(previous.is_completed());
-        let ServerResponse::ChatAttached {
-            session: restarted, ..
-        } = process(
+        let response = process(
             &host,
             1,
             ClientRequest::ChatAttach {
                 session: session.clone(),
             },
         )
-        .unwrap()
-        else {
-            panic!("restart did not attach");
+        .unwrap();
+        let ServerResponse::ChatRestarted { receipt, .. } = response else {
+            panic!("completed Attach did not return its correlated restart receipt: {response:?}");
         };
+        assert!(receipt.is_valid());
+        assert_eq!(receipt.source(), &session);
+        let restarted = receipt.replacement().clone();
         let replacement = host.lock().unwrap().chats[&session.id].handle.clone();
         assert!(!replacement.same_actor(&previous));
         assert_eq!(restarted.id, session.id);
@@ -5309,7 +5310,9 @@ for line in sys.stdin:
             restarted.launch.recipe.environment,
             session.launch.recipe.environment
         );
-        process(&host, 1, ClientRequest::ChatAttach { session }).unwrap();
+        let repeated = process(&host, 1, ClientRequest::ChatAttach { session }).unwrap();
+        assert!(matches!(repeated, ServerResponse::ChatRestarted { receipt: same, .. } if same == receipt),
+            "repeated Attach must reuse the exact restart operation");
         assert!(
             host.lock().unwrap().chats[&restarted.id]
                 .handle
