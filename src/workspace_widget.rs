@@ -4467,6 +4467,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             self.input.keyboard_focus(),
             Some(
                 FocusedPane::TextInput
+                    | FocusedPane::Other
                     | FocusedPane::OutsideWorkspace
                     | FocusedPane::SidebarRows
                     | FocusedPane::SidebarFiles
@@ -6472,6 +6473,7 @@ mod tests {
         let card = CardId::new();
         for (region, expected) in [
             (KeyboardRegion::from(FocusedPane::TextInput), false),
+            (KeyboardRegion::from(FocusedPane::Other), false),
             (KeyboardRegion::from(FocusedPane::OutsideWorkspace), false),
             (KeyboardRegion::from(FocusedPane::SidebarRows), false),
             (KeyboardRegion::from(FocusedPane::SidebarFiles), false),

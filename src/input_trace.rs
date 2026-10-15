@@ -251,6 +251,14 @@ fn keyboard_event_needs_focus(event: &Event) -> bool {
     )
 }
 
+fn pressed_position(event: &Event, cursor: mouse::Cursor) -> Option<Point> {
+    match event {
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => cursor.position(),
+        Event::Touch(cosmic::iced::touch::Event::FingerPressed { position, .. }) => Some(*position),
+        _ => None,
+    }
+}
+
 /// Marks custom multiline text controls for native keyboard-focus queries.
 /// Unlike text_input, iced's text_editor exposes only its focusable state.
 pub(crate) struct TextEditing;
@@ -352,7 +360,21 @@ impl KeyboardFocus {
                     .rev()
                     .find_map(|(candidate, inherited)| {
                         let region = self.region_for(candidate, regions, *inherited);
-                        (region.pane == FocusedPane::TextInput).then_some((candidate, region))
+                        (region.pane == FocusedPane::TextInput || self.is_text_input(candidate))
+                            .then_some((candidate, region))
+                    })
+            })
+            .or_else(|| {
+                self.focused_candidates
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, inherited)| {
+                        // A title can own a card logically while living
+                        // outside its content. Prefer that native control
+                        // over a raw pane retaining focus after a captured
+                        // outside click, without overriding text controls.
+                        inherited.and_then(|region| region.card).is_none()
+                            .then_some((candidate, self.region_for(candidate, regions, *inherited)))
                     })
             })
             .or_else(|| {
@@ -369,6 +391,27 @@ impl KeyboardFocus {
         regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
     ) -> Option<cosmic::iced::widget::Id> {
         self.selected(regions).and_then(|((id, _), _)| id.clone())
+    }
+
+    fn is_text_input(&self, candidate: &(Option<cosmic::iced::widget::Id>, Rectangle)) -> bool {
+        self.inputs.iter().any(|input| input == candidate)
+    }
+
+    fn reconcile(
+        &self,
+        event: &Event,
+        regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
+    ) -> Option<RetainNativeFocus> {
+        // Releases remain available for the original widget's paired-key
+        // cleanup. The usual single-owner path needs no second traversal.
+        if self.focused_candidates.len() <= 1
+            || !matches!(event,
+                Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::InputMethod(_))
+        {
+            return None;
+        }
+        self.selected(regions)
+            .map(|(candidate, _)| RetainNativeFocus(candidate.clone()))
     }
 
     fn region_for(
@@ -403,6 +446,49 @@ impl KeyboardFocus {
             }
         } else {
             container
+        }
+    }
+}
+
+/// Clear contradictory native flags before children can admit ignored input.
+/// Do not refocus the owner: doing so can reset selection or IME state.
+struct RetainNativeFocus((Option<cosmic::iced::widget::Id>, Rectangle));
+
+impl Operation for RetainNativeFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&cosmic::iced::widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        if state.is_focused() && (id != self.0.0.as_ref() || bounds != self.0.1) {
+            state.unfocus();
+        }
+    }
+}
+
+/// Some native widgets skip outside-click handling after a sibling captures
+/// the pointer. Complete only that missing unfocus step, after the chosen
+/// widget has processed its own press. Never grant focus from hit testing.
+struct UnfocusOutside(Point);
+
+impl Operation for UnfocusOutside {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        _id: Option<&cosmic::iced::widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        if state.is_focused() && !bounds.contains(self.0) {
+            state.unfocus();
         }
     }
 }
@@ -484,6 +570,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             );
             self.trace.1.set(Some(focus.region(regions)));
             *self.trace.2.borrow_mut() = focus.widget_id(regions);
+            if let Some(mut reconcile) = focus.reconcile(event, regions) {
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0], layout, renderer, &mut reconcile,
+                );
+            }
         } else if matches!(event, Event::Keyboard(_)) && self.focus_regions.is_some() {
             // Modifier updates without a focus sample must not reuse a
             // previous chord's pane after pointer focus changes.
@@ -506,6 +597,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             shell,
             viewport,
         );
+        if self.focus_regions.is_some()
+            && let Some(point) = pressed_position(event, cursor)
+        {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0], layout, renderer, &mut UnfocusOutside(point),
+            );
+        }
         if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
             shell.capture_event();
         }
@@ -698,6 +796,9 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
             owns_keyboard = focus.focused.is_some();
             self.trace.1.set(Some(focus.region(regions)));
             *self.trace.2.borrow_mut() = focus.widget_id(regions);
+            if let Some(mut reconcile) = focus.reconcile(event, regions) {
+                self.content.as_overlay_mut().operate(layout, renderer, &mut reconcile);
+            }
         }
         let region = self
             .trace
@@ -708,6 +809,11 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         self.content
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, clipboard, shell);
+        if self.focus_regions.is_some()
+            && let Some(point) = pressed_position(event, cursor)
+        {
+            self.content.as_overlay_mut().operate(layout, renderer, &mut UnfocusOutside(point));
+        }
         if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
             shell.capture_event();
         }
@@ -823,6 +929,209 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn native_controls_outrank_retained_raw_flags_without_losing_text_priority() {
+        use cosmic::iced::advanced::widget::operation::Focusable;
+        struct Focus;
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool { true }
+            fn focus(&mut self) {}
+            fn unfocus(&mut self) {}
+        }
+        let raw = cosmic::iced::widget::Id::new("conflict.raw");
+        let container = cosmic::iced::widget::Id::new("conflict.card");
+        let control = cosmic::iced::widget::Id::new("conflict.control");
+        let text = cosmic::iced::widget::Id::new("conflict.text");
+        let bounds = Rectangle::with_size(Size::new(100.0, 30.0));
+        let raw_region = KeyboardRegion { pane: FocusedPane::Terminal, card: Some(CardId::new()) };
+        for card in [None, Some(CardId::new())] {
+            let control_region = KeyboardRegion { pane: FocusedPane::Other, card };
+            for reverse in [false, true] {
+                for text_pane in [None, Some(FocusedPane::TextInput), Some(FocusedPane::Editor),
+                    Some(FocusedPane::OutsideWorkspace), Some(FocusedPane::SidebarRows)] {
+                    let mut regions = vec![(container.clone(), raw_region),
+                        (raw.clone(), raw_region), (control.clone(), control_region)];
+                    if let Some(pane) = text_pane { regions.push((text.clone(), pane.into())); }
+                    let mut query = KeyboardFocus {
+                        known_regions: regions.iter().cloned().collect(),
+                        ..KeyboardFocus::default()
+                    };
+                    let mut ids = vec![&raw, &control];
+                    if text_pane.is_some() { ids.push(&text); }
+                    if reverse { ids.reverse(); }
+                    for id in ids {
+                        if id == &raw {
+                            query.container(Some(&container), bounds);
+                            query.traverse(&mut |operation| operation.focusable(Some(id), bounds, &mut Focus));
+                        } else {
+                            query.focusable(Some(id), bounds, &mut Focus);
+                            if id == &text && matches!(text_pane, Some(FocusedPane::Editor | FocusedPane::TextInput)) {
+                                query.custom(Some(id), bounds, &mut TextEditing);
+                            }
+                        }
+                    }
+                    let expected = if text_pane.is_some() { &text } else { &control };
+                    assert_eq!(query.widget_id(&regions).as_ref(), Some(expected), "reverse={reverse} text={text_pane:?} card={card:?}");
+                    if text_pane.is_none() { assert_eq!(query.region(&regions), control_region); }
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum FocusConflictMessage {
+        Click,
+        Edited(String),
+        RawInput,
+        Key(KeyboardRegion, Option<cosmic::iced::widget::Id>),
+    }
+
+    /// Models a raw native control that missed an outside pointer event,
+    /// while honoring the same explicit Focusable contract as real panes.
+    struct RetainedRaw {
+        id: cosmic::iced::widget::Id,
+        focused: Rc<Cell<bool>>,
+    }
+    impl cosmic::iced::advanced::widget::operation::Focusable for RetainedRaw {
+        fn is_focused(&self) -> bool { self.focused.get() }
+        fn focus(&mut self) { self.focused.set(true); }
+        fn unfocus(&mut self) { self.focused.set(false); }
+    }
+    impl Widget<FocusConflictMessage, Theme, Renderer> for RetainedRaw {
+        fn size(&self) -> Size<Length> { Size::new(Length::Fixed(160.0), Length::Fixed(40.0)) }
+        fn layout(&mut self, _tree: &mut Tree, _renderer: &Renderer, _limits: &layout::Limits) -> layout::Node {
+            layout::Node::new(Size::new(160.0, 40.0))
+        }
+        fn operate(&mut self, _tree: &mut Tree, layout: Layout<'_>, _renderer: &Renderer, operation: &mut dyn Operation) {
+            operation.focusable(Some(&self.id.clone()), layout.bounds(), self);
+        }
+        fn draw(&self, _tree: &Tree, _renderer: &mut Renderer, _theme: &Theme,
+            _style: &renderer::Style, _layout: Layout<'_>, _cursor: mouse::Cursor, _viewport: &Rectangle) {}
+        fn update(&mut self, _tree: &mut Tree, event: &Event, layout: Layout<'_>,
+            cursor: mouse::Cursor, _renderer: &Renderer, _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, FocusConflictMessage>, _viewport: &Rectangle) {
+            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)))
+                && cursor.is_over(layout.bounds()) {
+                self.focused.set(true);
+                shell.capture_event();
+            }
+            if self.focused.get() && matches!(event,
+                Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::InputMethod(_)) {
+                shell.publish(FocusConflictMessage::RawInput);
+            }
+        }
+    }
+
+    #[test]
+    fn observer_clears_retained_raw_admission_before_native_control_input() {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::keyboard::key::{Code, Physical};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+        for control_first in [true, false] {
+            // Buttons get keyboard focus through native operations; actual
+            // pointer focus is separately covered with a stock text field.
+            for (text_field, card) in [(false, None), (false, Some(CardId::new())), (true, None)] {
+                let trace = InputTrace::default();
+                let control = cosmic::iced::widget::Id::unique();
+                let raw_id = cosmic::iced::widget::Id::unique();
+                let container = cosmic::iced::widget::Id::unique();
+                let raw_focused = Rc::new(Cell::new(true));
+                let raw: Element<'_, FocusConflictMessage> = cosmic::widget::id_container(
+                    Element::new(RetainedRaw { id: raw_id.clone(), focused: raw_focused.clone() }),
+                    container.clone(),
+                ).into();
+                let native: Element<'_, FocusConflictMessage> = if text_field {
+                    cosmic::widget::text_input("Query", "retained").id(control.clone())
+                        .on_input(FocusConflictMessage::Edited).width(160.0).into()
+                } else {
+                    cosmic::widget::button::text("Native action").id(control.clone())
+                        .on_press(FocusConflictMessage::Click).width(160.0).into()
+                };
+                let row = cosmic::widget::row::with_children(if control_first { vec![native, raw] } else { vec![raw, native] });
+                let control_region = KeyboardRegion { pane: if text_field { FocusedPane::TextInput } else { FocusedPane::Other }, card };
+                let raw_region = KeyboardRegion { pane: FocusedPane::Terminal, card: Some(CardId::new()) };
+                let mut element = observe_keyboard_events(row, &trace,
+                    vec![(control.clone(), control_region), (raw_id.clone(), raw_region), (container, raw_region)],
+                    |_, _, region, widget| FocusConflictMessage::Key(region, widget));
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                    &layout::Limits::new(viewport.size(), viewport.size()));
+                let mut messages = Vec::new();
+                if text_field {
+                    let point = Point::new(if control_first { 40.0 } else { 200.0 }, 15.0);
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(&mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Layout::new(&node),
+                        mouse::Cursor::Available(point), &renderer, &mut clipboard::Null, &mut shell, &viewport);
+                    assert!(shell.is_event_captured(), "actual field pointer focus must be captured");
+                } else {
+                    element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                        &mut focusable::focus::<()>(control.clone()));
+                    // Recreate the contradictory retained native flag after
+                    // the ordinary focus operation, not an invented owner.
+                    raw_focused.set(true);
+                }
+                if text_field {
+                    assert!(!raw_focused.get(), "captured field pointer clears outside raw focus");
+                    // Also cover contradictions inherited from before this
+                    // observer was mounted, including parked native trees.
+                    raw_focused.set(true);
+                }
+                assert!(raw_focused.get(), "fixture requires retained raw native focus");
+                for event in [
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character("q".into()), modified_key: keyboard::Key::Character("q".into()),
+                        physical_key: Physical::Code(Code::KeyQ), location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+                    }),
+                    Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("ime".into())),
+                ] {
+                    messages.clear();
+                    element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+                        &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                    assert!(!messages.contains(&FocusConflictMessage::RawInput), "{messages:?}");
+                    assert!(!raw_focused.get(), "conflicting native flag must be cleared before child delivery");
+                    assert_eq!(trace.keyboard_widget_id(), Some(control.clone()));
+                    assert_eq!(trace.keyboard_focus(), Some(control_region.pane));
+                    assert_eq!(trace.keyboard_card(), card);
+                }
+                // The selected native control remains focused, without a
+                // second focus() that could disturb its selection or IME.
+                let mut query = KeyboardFocus::default();
+                element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut query);
+                assert_eq!(query.focused_candidates.len(), 1);
+                assert_eq!(query.focused.as_ref().and_then(|(id, _)| id.clone()), Some(control));
+
+                // A raw pane may capture its pointer press before a later
+                // native button can clear its old flag. Ownership must also
+                // return in this direction, rather than pinning the toolbar.
+                let raw_point = Point::new(if control_first { 200.0 } else { 40.0 }, 15.0);
+                messages.clear();
+                {
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(&mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Layout::new(&node),
+                        mouse::Cursor::Available(raw_point), &renderer, &mut clipboard::Null, &mut shell, &viewport);
+                    assert!(shell.is_event_captured());
+                }
+                assert!(raw_focused.get());
+                messages.clear();
+                let key = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("q".into()), modified_key: keyboard::Key::Character("q".into()),
+                    physical_key: Physical::Code(Code::KeyQ), location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+                });
+                element.as_widget_mut().update(&mut tree, &key, Layout::new(&node), mouse::Cursor::Unavailable,
+                    &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                assert!(messages.contains(&FocusConflictMessage::RawInput), "{messages:?}");
+                assert_eq!(trace.keyboard_widget_id(), Some(raw_id));
+                assert_eq!(trace.keyboard_focus(), Some(FocusedPane::Terminal));
+                assert_eq!(trace.keyboard_card(), raw_region.card);
+            }
+        }
+    }
 
     fn moved(x: f32) -> Event {
         Event::Mouse(mouse::Event::CursorMoved {
