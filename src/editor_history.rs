@@ -556,6 +556,16 @@ impl Excerpt {
             .collect()
     }
 
+    /// Captures exactly one explicit server range while retaining the native
+    /// removed line boundaries. Every position must lie in this excerpt.
+    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+        let (from, to) = (self.offset(start)?, self.offset(end)?);
+        let removed = self.text.get(from..to)?;
+        let inserted = Self::document(replacement);
+        Some(TextChange { start, removed: removed.to_owned(), inserted: replacement.to_owned(),
+            removed_breaks: self.slice_breaks(from, to), inserted_breaks: inserted.slice_breaks(0, replacement.len()) })
+    }
+
     /// The line an offset falls on, by index into `lines`.
     fn line_of(&self, offset: usize) -> usize {
         self.lines
@@ -702,6 +712,21 @@ mod tests {
 
     fn at(line: usize, column: usize) -> Position {
         Position { line, column }
+    }
+
+    #[test]
+    fn explicit_range_changes_preserve_adjacent_native_line_endings() {
+        let mut excerpt = Excerpt::new(10);
+        excerpt.push_line("a", "\n");
+        excerpt.push_line("", "\r");
+        excerpt.push_line("b", "");
+        let change = excerpt.range_change(at(10, 1), at(12, 0), "\r\n").unwrap();
+        assert_eq!(change.removed, "\n\r");
+        assert_eq!(change.removed_breaks, [1, 2]);
+        assert_eq!(change.inserted_breaks, [2]);
+        assert_eq!(change.removed_end(), at(12, 0));
+        assert_eq!(change.inserted_end(), at(11, 0));
+        assert!(excerpt.range_change(at(12, 1), at(10, 0), "").is_none());
     }
 
     fn caret(line: usize, column: usize) -> Cursor {

@@ -1580,6 +1580,37 @@ where
         )
     }
 
+    /// Resolves explicit byte offsets in one native-line pass. Offsets inside
+    /// a line ending or Unicode code point are refused.
+    pub fn positions_for_offsets(&self, offsets: &[usize]) -> Option<Vec<Position>> {
+        let internal = self.0.borrow();
+        let mut ordered = offsets.iter().copied().enumerate().collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, offset)| *offset);
+        let mut positions = vec![Position { line: 0, column: 0 }; offsets.len()];
+        let mut request = 0;
+        let mut start = 0;
+        let count = internal.editor.line_count();
+        for index in 0..count {
+            let line = internal.editor.line(index)?;
+            let end = start + line.text.len();
+            while let Some(&(output, offset)) = ordered.get(request).filter(|(_, offset)| *offset <= end) {
+                let column = offset.checked_sub(start)?;
+                if !line.text.is_char_boundary(column) { return None; }
+                positions[output] = Position { line: index, column };
+                request += 1;
+            }
+            if request == ordered.len() { return Some(positions); }
+            start = end + terminator(line.ending, index + 1 == count).len();
+        }
+        (request == ordered.len()).then_some(positions)
+    }
+
+    /// Prepares an explicit range without widening distant edits into a
+    /// whole-document history entry.
+    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+        self.excerpt(start.line, end.line).range_change(start, end, replacement)
+    }
+
     pub fn replace_range_recorded(
         &mut self,
         start: Position,
@@ -4565,6 +4596,14 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn explicit_offset_batch_preserves_order_and_refuses_unicode_or_ending_splits() {
+        let content: Content = Content::with_text("é\r\n😀\n");
+        assert_eq!(content.positions_for_offsets(&[9, 0, 8, 4, 2]), Some(vec![Position { line: 2, column: 0 }, Position { line: 0, column: 0 }, Position { line: 1, column: 4 }, Position { line: 1, column: 0 }, Position { line: 0, column: 2 }]));
+        for offset in [1, 3, 5, 6, 7, 10] { assert!(content.positions_for_offsets(&[offset]).is_none(), "split or missing byte {offset}"); }
+        assert_eq!(content.positions_for_offsets(&[]), Some(Vec::new()));
     }
 
     #[test]

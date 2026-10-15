@@ -815,7 +815,7 @@ struct EditorDocument {
     active_save: Option<SaveTicket>,
     /// A prepared workspace edit holds this buffer stable while unopened files
     /// are published. The ticket fences stale publication completions.
-    workspace_edit: Option<(u64, Option<TextChange>)>,
+    workspace_edit: Option<(u64, Vec<TextChange>)>,
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
@@ -3909,14 +3909,22 @@ impl RepositoryRuntime {
             || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
             return Err("An edited buffer changed after the preview was prepared".into());
         }
-        let change = document.content.replacement_to_text(&plan.after);
-        if plan.before != plan.after && change.is_none() { return Err("This buffer cannot represent the server edit safely".into()); }
-        if let Some(change) = &change {
-            if document.content.range_end(change.start, &change.removed).is_none() {
-                return Err("The server edit does not address the native buffer".into());
-            }
+        let offsets = plan.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
+        let positions = document.content.positions_for_offsets(&offsets).ok_or("The server edit names an invalid native boundary")?;
+        let mut changes = Vec::new();
+        for (index, edit) in plan.edits.iter().enumerate().rev() {
+            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) { continue; }
+            let (start, end) = (positions[index * 2], positions[index * 2 + 1]);
+            let expected = plan.before.get(edit.range.clone()).ok_or("The server edit has an invalid range")?;
+            if document.content.range_end(start, expected) != Some(end) { return Err("The server edit does not address the native buffer".into()); }
+            let change = document.content.range_change(start, end, &edit.new_text).ok_or("The server edit does not address a native text range")?;
+            changes.push(change);
         }
-        document.workspace_edit = Some((ticket, change));
+        // Keep the explicit whole-transition helper usable for reload/tests.
+        if plan.edits.is_empty() && plan.before != plan.after {
+            changes.push(document.content.replacement_to_text(&plan.after).ok_or("This buffer cannot represent the server edit safely")?);
+        }
+        document.workspace_edit = Some((ticket, changes));
         Ok(())
     }
 
@@ -3936,17 +3944,25 @@ impl RepositoryRuntime {
         if !document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
             return Err("The workspace-edit publication is stale".into());
         }
-        let (_, change) = document.workspace_edit.take().unwrap();
-        let Some(change) = change else { return Ok(()); };
+        let (_, changes) = document.workspace_edit.take().unwrap();
+        if changes.is_empty() { return Ok(()); }
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
         let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
-        if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
-            return Err("The prepared edit could not be applied; the buffer was preserved".into());
+        for (index, change) in changes.iter().enumerate() {
+            if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+                let mut restored = true;
+                for previous in changes[..index].iter().rev() {
+                    restored &= buffer.replace(previous.start, &previous.inserted, &previous.removed, &previous.removed_breaks);
+                }
+                buffer.content.set_cursor(cursor);
+                buffer.content.restore_scroll_position(scroll);
+                return Err(if restored { "The prepared edit could not be applied; the buffer was preserved" } else { "The prepared edit failed and its buffer rollback could not complete" }.into());
+            }
         }
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        document.history.record_group(vec![change], cursor, document.content.cursor(), Instant::now());
+        document.history.record_group(changes, cursor, document.content.cursor(), Instant::now());
         document.text_changed();
         if let Some(version) = document.bump_lsp_version() {
             self.lsp_edits.clear();
@@ -16249,6 +16265,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sparse_workspace_edits_retain_only_changed_fragments_in_one_undo_group() {
+        let card = CardId::new();
+        let before = format!("old();\n{}old();\n", "unchanged source line\n".repeat(16_000));
+        let after = before.replace("old()", "new_name()");
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
+        let last = before.rfind("old()").unwrap();
+        let plan = crate::editor_workspace_edit::DocumentPlan { path: "/repo/main.rs".into(), relative: "main.rs".into(),
+            before: before.clone().into(), after: after.clone().into(), before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: Vec::new(),
+            edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new_name".into() }).collect() };
+        runtime.begin_workspace_edit(51, &plan).unwrap();
+        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        let changes = &document.workspace_edit.as_ref().unwrap().1;
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().map(|change| change.removed.len() + change.inserted.len()).sum::<usize>() < 32, "the unchanged middle must not be copied into history");
+        runtime.finish_workspace_edit(51).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), after);
     }
 
     #[test]
