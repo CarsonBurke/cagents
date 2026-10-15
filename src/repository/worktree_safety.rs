@@ -4,6 +4,19 @@ use std::collections::HashSet;
 
 const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
 
+fn require_complete_inventory(output: &ProcessOutput) -> Result<(), RepositoryError> {
+    if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        return Err(RepositoryError::InvalidOutput {
+            field: "worktree_safety",
+            reason: format!(
+                "Git could not inspect every file; worktree was kept: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn default_disposable_ignored_directories() -> Vec<String> {
     [
         "node_modules",
@@ -62,6 +75,18 @@ impl WorktreeSafetySnapshot {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Safety decisions require a complete census, even when Git returns
+    /// success while warning that a directory could not be read.
+    pub(crate) fn status_for_removal(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        let output = self.run_checked(&self.status_command(worktree), cancellation)?;
+        require_complete_inventory(&output)?;
+        invalid_output(parse_status(&output.stdout), output)
+    }
+
     pub fn disposable_ignored_directories(
         &self,
         worktree: &Path,
@@ -133,6 +158,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ],
         );
         let output = self.run_checked(&command, cancellation)?;
+        require_complete_inventory(&output)?;
         let mut notable = std::collections::BTreeSet::new();
         let mut directories = Vec::new();
         for (index, raw) in nul_fields(&output.stdout, "ignored worktree files")?
@@ -169,6 +195,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let output =
                 self.run_checked(&self.git_literal_read(worktree, arguments), cancellation)?;
+            require_complete_inventory(&output)?;
             for (index, raw) in nul_fields(&output.stdout, "ignored worktree files")?
                 .into_iter()
                 .filter(|raw| !raw.is_empty())
@@ -200,7 +227,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<WorktreeSafetySnapshot, RepositoryError> {
-        let status = self.status(worktree, cancellation)?;
+        let status = self.status_for_removal(worktree, cancellation)?;
         let modified = status
             .entries
             .iter()
@@ -433,6 +460,69 @@ mod tests {
                 .set_disposable_ignored_directories(root, &["../secret".into()], &cancellation)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unreadable_inventory_warnings_never_authorize_removal() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses directory permissions. The fw16 validation runs as
+        // the ordinary user and exercises each real Git warning below.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = fixture.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-m", "initial"]);
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        for name in ["ignored", "ignored/locked", "untracked"] {
+            let unreadable = root.join(name);
+            fs::create_dir_all(&unreadable).unwrap();
+            fs::write(unreadable.join("secret"), "preserve").unwrap();
+            // Git can return a partial listing and a warning together.
+            if name == "ignored/locked" {
+                fs::write(root.join("ignored/readable"), "preserve").unwrap();
+            }
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o300)).unwrap();
+            let result = if name == "untracked" {
+                service.status_for_removal(root, &cancel).map(|_| ())
+            } else {
+                service.notable_ignored_files(root, &cancel).map(|_| ())
+            };
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("Git could not inspect every file"), "{error}");
+            assert_eq!(fs::read_to_string(unreadable.join("secret")).unwrap(), "preserve");
+            fs::remove_dir_all(root.join(if name.starts_with("ignored") { "ignored" } else { "untracked" })).unwrap();
+        }
+        struct LocksAfterCollapsedInventory(PathBuf);
+        impl ProcessExecutor for LocksAfterCollapsedInventory {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let output = SystemProcessExecutor.execute(command, cancellation)?;
+                if command.arguments.iter().any(|argument| argument == "--directory") {
+                    assert!(output.success && output.stderr.is_empty());
+                    fs::set_permissions(&self.0, fs::Permissions::from_mode(0o300)).unwrap();
+                }
+                Ok(output)
+            }
+        }
+        // Change permissions after a complete collapsed scan. This forces
+        // the production expansion call to receive the real Git warning.
+        let locked = root.join("ignored/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("secret"), "preserve").unwrap();
+        let service = RepositoryService::new("git", Arc::new(LocksAfterCollapsedInventory(locked.clone())));
+        let result = service.notable_ignored_files(root, &cancel);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.unwrap_err().to_string().contains("Git could not inspect every file"));
+        assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "preserve");
     }
 
     #[test]

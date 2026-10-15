@@ -107,7 +107,7 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
         return Err("Worktree source repository changed".into());
     }
     let status = service
-        .status(&request.path, &cancellation)
+        .status_for_removal(&request.path, &cancellation)
         .map_err(|error| error.to_string())?;
     if status.untracked_omitted || status.dirty.is_dirty() || !status.entries.is_empty() {
         return Err("Worktree has changes or untracked files".into());
