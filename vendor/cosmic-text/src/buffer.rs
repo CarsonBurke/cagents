@@ -375,16 +375,30 @@ impl Buffer {
     /// physical line is not laid out yet.
     /// This method does not shape missing text or estimate missing geometry.
     pub fn into_layout_snapshot(self) -> Result<crate::LayoutSnapshot, Self> {
-        if !self.dirty.is_empty() || self.lines.iter().any(|line| line.shape_opt().is_none() || line.layout_opt().is_none()) {
+        if !self.dirty.is_empty()
+            || self
+                .lines
+                .iter()
+                .any(|line| line.shape_opt().is_none() || line.layout_opt().is_none())
+        {
             return Err(self);
         }
         let metrics = self.metrics;
         let width = self.width_opt;
-        let lines = self.lines.into_iter().map(BufferLine::into_render_layout).collect();
+        let lines = self
+            .lines
+            .into_iter()
+            .map(BufferLine::into_render_layout)
+            .collect();
         Ok(crate::LayoutSnapshot::new(lines, metrics, width))
     }
 
-    pub(crate) fn from_visual_layout(metrics: Metrics, width: Option<f32>, height: f32, lines: Vec<BufferLine>) -> Self {
+    pub(crate) fn from_visual_layout(
+        metrics: Metrics,
+        width: Option<f32>,
+        height: f32,
+        lines: Vec<BufferLine>,
+    ) -> Self {
         let mut buffer = Self::new_empty(metrics);
         buffer.width_opt = width;
         buffer.height_opt = Some(height);

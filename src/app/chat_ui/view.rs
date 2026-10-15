@@ -1211,7 +1211,12 @@ impl Runtime {
 
     /// The logical copy/selection catalog is rebuilt only when exposed text
     /// or disclosure changes, never for mouse motion, copying, find or timers.
-    pub(super) fn selection_document(&self) -> (Arc<selection::Catalog>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>) {
+    pub(super) fn selection_document(
+        &self,
+    ) -> (
+        Arc<selection::Catalog>,
+        std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
+    ) {
         use std::hash::{Hash, Hasher};
         let mut fingerprint = std::hash::DefaultHasher::new();
         self.selected_subagent.hash(&mut fingerprint);
@@ -1336,8 +1341,12 @@ impl Runtime {
             builder.plain(&item.id, &[2], text.into());
             return;
         }
-        let Some(cached) = self.cache.get(&item.id) else { return; };
-        if cached.placeholder { return; }
+        let Some(cached) = self.cache.get(&item.id) else {
+            return;
+        };
+        if cached.placeholder {
+            return;
+        }
         if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) {
             let selected = self
                 .selected_subagent
@@ -1415,12 +1424,22 @@ impl Runtime {
         }
         if opened {
             if let Some(input) = &cached.tool_input {
-                builder.indexed(&item.id, &[4], input.text.clone(), input.reader_source.prefixes());
+                builder.indexed(
+                    &item.id,
+                    &[4],
+                    input.text.clone(),
+                    input.reader_source.prefixes(),
+                );
             }
             if let Some(output) = &cached.tool_output
                 && !output.text.is_empty()
             {
-                builder.indexed(&item.id, &[5], output.text.clone(), output.reader_source.prefixes());
+                builder.indexed(
+                    &item.id,
+                    &[5],
+                    output.text.clone(),
+                    output.reader_source.prefixes(),
+                );
             }
             if let ItemContent::Changes { changes, .. } = &item.content {
                 for (index, change) in changes.iter().enumerate() {
@@ -1431,7 +1450,12 @@ impl Runtime {
                     if let Some(patch) = cached.patches.get(index)
                         && !patch.text.is_empty()
                     {
-                        builder.indexed(&item.id, &[6, index as u32], patch.text.clone(), patch.reader_source.prefixes());
+                        builder.indexed(
+                            &item.id,
+                            &[6, index as u32],
+                            patch.text.clone(),
+                            patch.reader_source.prefixes(),
+                        );
                     }
                 }
             }
@@ -1787,11 +1811,18 @@ impl Runtime {
             transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
         content.extend(self.plan_view());
-        if let Some(error)=self.preparation.error() {
-            content.push(widget::row::with_children(vec![design::caption(error.to_owned()).width(Length::Fill).into(),
-                crate::ui_controls::button::secondary("Retry loading")
-                    .on_press(action(Action::RetryMarkdown(target))).into()])
-                .spacing(step::GAP_S).width(Length::Fill).into());
+        if let Some(error) = self.preparation.error() {
+            content.push(
+                widget::row::with_children(vec![
+                    design::caption(error.to_owned()).width(Length::Fill).into(),
+                    crate::ui_controls::button::secondary("Retry loading")
+                        .on_press(action(Action::RetryMarkdown(target)))
+                        .into(),
+                ])
+                .spacing(step::GAP_S)
+                .width(Length::Fill)
+                .into(),
+            );
         }
         let find_bar: Element<'_, Message> = if let Some(query) = &self.find {
             widget::row::with_children(vec![
@@ -8613,31 +8644,52 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod prepared_disclosure_tests {
     use super::*;
 
     #[test]
     fn prose_disclosure_keeps_prepared_source_and_palette_owners() {
-        let item = chat::Item { id: "prepared-thought".into(), role: chat::Role::Assistant,
-            content: ItemContent::Text { text: format!("Long **thought** {}\n\n```rust\nlet answer = 42;\n```", "ordinary words ".repeat(10_000)),
-                thinking: true, phase: chat::Phase::Commentary }, at: None, started_at: None };
+        let item = chat::Item {
+            id: "prepared-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: format!(
+                    "Long **thought** {}\n\n```rust\nlet answer = 42;\n```",
+                    "ordinary words ".repeat(10_000)
+                ),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
         let (mut live, _handle) = frame_cost::live_runtime(&[item]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
-        let mut target = live.target; target.card = app.workspace.focused().unwrap(); live.target = target;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
         let cached = &live.cache["prepared-thought"];
         let revision = cached.revision;
         let item = cached.item.clone().expect("prepared item owner");
-        let palettes = cached.palette_views.clone().expect("worker prepared syntax palettes");
-        app.cards.insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let palettes = cached
+            .palette_views
+            .clone()
+            .expect("worker prepared syntax palettes");
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
         for expanded in [true, false, true] {
             drop(app.handle_chat_ui(Action::Toggle(target, "prepared-thought".into())));
-            let CardRuntime::Chat(runtime) = &app.cards[&target.card] else { panic!("mounted chat") };
+            let CardRuntime::Chat(runtime) = &app.cards[&target.card] else {
+                panic!("mounted chat")
+            };
             assert_eq!(runtime.expanded.contains("prepared-thought"), expanded);
             let cached = &runtime.cache["prepared-thought"];
-            assert_eq!(cached.revision, revision, "disclosure must not rebuild prepared prose");
+            assert_eq!(
+                cached.revision, revision,
+                "disclosure must not rebuild prepared prose"
+            );
             assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &item));
             let current = cached.palette_views.as_ref().unwrap();
             assert!(Arc::ptr_eq(&current[0], &palettes[0]));

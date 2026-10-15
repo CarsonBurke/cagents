@@ -99,9 +99,14 @@ impl Shape {
 
 impl State {
     #[cfg(test)]
-    pub(super) fn flow_readiness(&self) -> Option<bool> {self.flow.as_ref().map(|_|self.flow_ready.is_some())}
+    pub(super) fn flow_readiness(&self) -> Option<bool> {
+        self.flow.as_ref().map(|_| self.flow_ready.is_some())
+    }
     fn paragraph(&self) -> &ParagraphBuffer {
-        debug_assert!(self.flow.is_none(), "flow text must never shape synchronously");
+        debug_assert!(
+            self.flow.is_none(),
+            "flow text must never shape synchronously"
+        );
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
@@ -121,9 +126,14 @@ impl State {
             return None;
         }
         let byte = byte - logical.start;
-        if byte > self.plain.len() { return None; }
+        if byte > self.plain.len() {
+            return None;
+        }
         if self.flow.is_some() {
-            return self.flow_ready.as_ref()?.byte_bounds(byte, self.plain.len());
+            return self
+                .flow_ready
+                .as_ref()?
+                .byte_bounds(byte, self.plain.len());
         }
         let paragraph = self.paragraph();
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
@@ -152,7 +162,10 @@ impl State {
 
     pub(super) fn hit(&self, position: Point) -> usize {
         if self.flow.is_some() {
-            return self.flow_ready.as_ref().map_or(0, |ready| ready.hit(position, self.plain.len()));
+            return self
+                .flow_ready
+                .as_ref()
+                .map_or(0, |ready| ready.hit(position, self.plain.len()));
         }
         hit(self.paragraph(), &self.plain, position)
     }
@@ -196,18 +209,33 @@ pub(super) struct Logical {
 
 impl Logical {
     fn flow_search(&self) -> flow_layout::Search<'_> {
-        let ranges = self.paint.as_ref()
+        let ranges = self
+            .paint
+            .as_ref()
             .and_then(|paint| paint.blocks.get(&self.identity))
             .map_or(&[][..], |ranges| ranges.as_ref());
-        let current = self.paint.as_ref().and_then(|paint| paint.current.as_ref())
+        let current = self
+            .paint
+            .as_ref()
+            .and_then(|paint| paint.current.as_ref())
             .filter(|found| found.identity == self.identity)
             .map(|found| found.range.clone());
-        flow_layout::Search { ranges, current, offset: self.start }
+        flow_layout::Search {
+            ranges,
+            current,
+            offset: self.start,
+        }
     }
 }
 
-pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
+pub(super) fn logical_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical), None)
 }
 
@@ -220,28 +248,74 @@ pub(super) fn text(
 ) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, None, None)
 }
-pub(super) fn flow_source(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
-    flow_source_optional(size,font,target,find,Some(logical),flow)
+pub(super) fn flow_source(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
+    flow_source_optional(size, font, target, find, Some(logical), flow)
 }
-pub(super) fn flow_source_optional(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: flow_layout::Handle) -> Element<'static, Message> {
+pub(super) fn flow_source_optional(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
     let ready = flow.borrow().prepared();
-    let spans = ready.as_ref().map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
-    let plain: Arc<str> = ready.as_ref().map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
+    let spans = ready
+        .as_ref()
+        .map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
+    let plain: Arc<str> = ready
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
     // Indexed logical blocks share the worker's ranges. A full-context flow
     // can contain millions of occurrences; do not copy or rescan them here.
-    let matches = if logical.is_some() { Vec::new() }
-        else { super::find::highlights(&plain, find.unwrap_or_default()).ranges };
-    Element::new(Selectable { logical, flow: Some(flow), flow_ready: ready, matches, current: None, spans, plain, size, font, target })
+    let matches = if logical.is_some() {
+        Vec::new()
+    } else {
+        super::find::highlights(&plain, find.unwrap_or_default()).ranges
+    };
+    Element::new(Selectable {
+        logical,
+        flow: Some(flow),
+        flow_ready: ready,
+        matches,
+        current: None,
+        spans,
+        plain,
+        size,
+        font,
+        target,
+    })
 }
 
 #[cfg(test)]
-pub(super) fn flow_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced::Font,
-    target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
+pub(super) fn flow_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical), Some(flow))
 }
 
-fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: Option<flow_layout::Handle>) -> Element<'static, Message> {
+fn build_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: Option<flow_layout::Handle>,
+) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
@@ -527,36 +601,63 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         state.dirty = false;
-        let same_target=state.target==Some(self.target);
-        let same_logical=state.logical.as_ref().map(|logical|(logical.identity,logical.start))
-            ==self.logical.as_ref().map(|logical|(logical.identity,logical.start));
-        let mut flow=self.flow.clone();
-        if same_target && same_logical
-            && let (Some(previous),Some(current))=(&state.flow,&self.flow)
-            && !std::rc::Rc::ptr_eq(previous,current)
-            && previous.borrow_mut().adopt(&current.borrow()) {
-            flow=Some(previous.clone());
+        let same_target = state.target == Some(self.target);
+        let same_logical = state
+            .logical
+            .as_ref()
+            .map(|logical| (logical.identity, logical.start))
+            == self
+                .logical
+                .as_ref()
+                .map(|logical| (logical.identity, logical.start));
+        let mut flow = self.flow.clone();
+        if same_target
+            && same_logical
+            && let (Some(previous), Some(current)) = (&state.flow, &self.flow)
+            && !std::rc::Rc::ptr_eq(previous, current)
+            && previous.borrow_mut().adopt(&current.borrow())
+        {
+            flow = Some(previous.clone());
         }
-        let same_flow=state.flow.as_ref().zip(flow.as_ref()).is_some_and(|(old,current)|std::rc::Rc::ptr_eq(old,current));
-        state.target=Some(self.target);state.logical=self.logical.clone();
-        if !same_flow {state.flow_ready=None;state.flow_projection.borrow_mut().take();}
-        state.flow=flow;
-        #[cfg(test)] { state.search_paint = (self.matches.clone(), self.current.clone()); }
+        let same_flow = state
+            .flow
+            .as_ref()
+            .zip(flow.as_ref())
+            .is_some_and(|(old, current)| std::rc::Rc::ptr_eq(old, current));
+        state.target = Some(self.target);
+        state.logical = self.logical.clone();
+        if !same_flow {
+            state.flow_ready = None;
+            state.flow_projection.borrow_mut().take();
+        }
+        state.flow = flow;
+        #[cfg(test)]
+        {
+            state.search_paint = (self.matches.clone(), self.current.clone());
+        }
         if state
             .spans
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
         {
-            if if self.flow.is_some() { !same_flow } else { !self.plain.starts_with(state.plain.as_ref()) } {
+            if if self.flow.is_some() {
+                !same_flow
+            } else {
+                !self.plain.starts_with(state.plain.as_ref())
+            } {
                 state.identity = NEXT_SELECTION.fetch_add(1, Ordering::Relaxed);
                 state.anchor = 0;
                 state.end = 0;
                 state.dragging = false;
             }
-            if state.flow.is_none() || !same_flow {state.plain = self.plain.clone();}
+            if state.flow.is_none() || !same_flow {
+                state.plain = self.plain.clone();
+            }
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
-        if state.flow.is_none() {state.validate_selection(&self.plain);}
+        if state.flow.is_none() {
+            state.validate_selection(&self.plain);
+        }
         let shape = Shape {
             bounds: limits.max(),
             size: self.size,
@@ -569,12 +670,17 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             let mut flow = flow.borrow_mut();
             flow.configure(shape.bounds.width, self.size, self.font);
             flow.bind_target(self.target);
-            state.flow_ready=flow.prepared();
-            if let Some(ready)=&state.flow_ready {
-                state.plain=ready.plain.clone();state.spans=Some(ready.spans.clone());
+            state.flow_ready = flow.prepared();
+            if let Some(ready) = &state.flow_ready {
+                state.plain = ready.plain.clone();
+                state.spans = Some(ready.spans.clone());
             }
             state.validate_selection(&state.plain.clone());
-            return layout::Node::new(limits.resolve(Length::Shrink,Length::Shrink,flow.bounds(state.plain.len())));
+            return layout::Node::new(limits.resolve(
+                Length::Shrink,
+                Length::Shrink,
+                flow.bounds(state.plain.len()),
+            ));
         }
         if state
             .spans
@@ -629,21 +735,49 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 // LayoutGlyph exposes placed advances rather than exact ink
                 // outlines. Keep four ems of raster overscan on either edge;
                 // native font/edge fixtures qualify the supported fonts.
-                let overscan=self.size.0*4.0;
-                let left=viewport.x-layout.bounds().x-overscan;
-                let right=viewport.x+viewport.width-layout.bounds().x+overscan;
-                if let Some(projection)=ready.projection_rect(top,top+viewport.height+self.size.0*1.3,left,right) {
+                let overscan = self.size.0 * 4.0;
+                let left = viewport.x - layout.bounds().x - overscan;
+                let right = viewport.x + viewport.width - layout.bounds().x + overscan;
+                if let Some(projection) = ready.projection_rect(
+                    top,
+                    top + viewport.height + self.size.0 * 1.3,
+                    left,
+                    right,
+                ) {
                     let search = self.logical.as_ref().map_or_else(
-                        || flow_layout::Search { ranges: &self.matches, current: self.current.clone(), offset: 0 },
-                        Logical::flow_search);
-                    flow_layout::paint(renderer, &projection, &ready.spans, search,
-                        state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
-                        layout.position(), theme, defaults, viewport);
+                        || flow_layout::Search {
+                            ranges: &self.matches,
+                            current: self.current.clone(),
+                            offset: 0,
+                        },
+                        Logical::flow_search,
+                    );
+                    flow_layout::paint(
+                        renderer,
+                        &projection,
+                        &ready.spans,
+                        search,
+                        state.anchor.min(state.end)..state.anchor.max(state.end),
+                        self.size,
+                        layout.position(),
+                        theme,
+                        defaults,
+                        viewport,
+                    );
                     *state.flow_projection.borrow_mut() = Some(projection);
                 }
             } else if let Some(shape) = state.shape {
-                let label = if flow.borrow().failed() { "Text could not be displayed" } else { "Loading…" };
-                renderer.fill_text(shape.text(label.to_owned()), layout.position(), defaults.text_color, *viewport);
+                let label = if flow.borrow().failed() {
+                    "Text could not be displayed"
+                } else {
+                    "Loading…"
+                };
+                renderer.fill_text(
+                    shape.text(label.to_owned()),
+                    layout.position(),
+                    defaults.text_color,
+                    *viewport,
+                );
             }
             return;
         }
@@ -734,8 +868,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if std::mem::take(&mut state.dirty) {
             shell.invalidate_layout();
         }
-        if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_)))
-            && layout.bounds().intersection(viewport).is_some()
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) && layout.bounds().intersection(viewport).is_some()
             && let Some(flow) = &state.flow
             && let Some(request) = flow.borrow_mut().request()
         {
@@ -747,7 +883,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.dragging = false;
         }
-        let current_plain=state.plain.clone();
+        let current_plain = state.plain.clone();
         state.validate_selection(&current_plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -1306,27 +1442,68 @@ mod flow_tests {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(210_000))].into();
         let cache = flow_layout::Cache::default();
         let flow = cache.entry(99, spans.clone());
-        let target = Target { card: CardId::new(), generation: 0 };
-        let mut element = flow_text(spans, iced::Pixels(16.0), iced::Font::DEFAULT, target, None,
-            Logical { identity: 99, start: 0, paint: None }, flow);
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = flow_text(
+            spans,
+            iced::Pixels(16.0),
+            iced::Font::DEFAULT,
+            target,
+            None,
+            Logical {
+                identity: 99,
+                start: 0,
+                paint: None,
+            },
+            flow,
+        );
         let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)),
+        );
         assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
         assert!(tree.children.is_empty());
         let mut messages = Vec::new();
-        let event = Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()));
+        let event = Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
         let hidden = Rectangle::new(Point::new(1000.0, 0.0), Size::new(100.0, 400.0));
-        element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-            &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &hidden);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &hidden,
+        );
         assert!(messages.is_empty());
         let visible = Rectangle::with_size(Size::new(720.0, 400.0));
         for _ in 0..2 {
-            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-                &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &visible);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &visible,
+            );
         }
-        assert_eq!(messages.len(), 1, "one pending request per source/font/width generation");
-        assert!(matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target));
+        assert_eq!(
+            messages.len(),
+            1,
+            "one pending request per source/font/width generation"
+        );
+        assert!(
+            matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target)
+        );
         assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
     }
 }

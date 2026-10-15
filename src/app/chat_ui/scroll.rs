@@ -89,15 +89,35 @@ impl Memory {
         }
     }
     pub fn reader_width(&self, context: Option<&str>, identity: u64) -> f32 {
-        self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
-            .map_or(0.0, |saved| saved.content_width).max(0.0)
+        self.1
+            .borrow()
+            .entries
+            .get(&(context.map(str::to_owned), identity))
+            .map_or(0.0, |saved| saved.content_width)
+            .max(0.0)
     }
-    pub fn reader_width_for(&self, context: Option<&str>, identity: u64, source: &super::reader_source::Source) -> f32 {
-        self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
+    pub fn reader_width_for(
+        &self,
+        context: Option<&str>,
+        identity: u64,
+        source: &super::reader_source::Source,
+    ) -> f32 {
+        self.1
+            .borrow()
+            .entries
+            .get(&(context.map(str::to_owned), identity))
             .filter(|saved| saved.source.is_some_and(|digest| source.accepts(digest)))
-            .map_or(0.0, |saved| saved.content_width).max(0.0)
+            .map_or(0.0, |saved| saved.content_width)
+            .max(0.0)
     }
-    pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
+    pub fn retained_rows(&self) -> usize {
+        self.0
+            .borrow()
+            .contexts
+            .iter()
+            .map(|context| context.rows.len())
+            .sum()
+    }
 }
 
 pub(super) fn transcript_observed<'a>(
@@ -188,7 +208,10 @@ pub(super) fn item_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-item-{id}"))
 }
 #[derive(Clone, Copy, Hash)]
-pub(super) enum ReaderAxis { Horizontal, Vertical }
+pub(super) enum ReaderAxis {
+    Horizontal,
+    Vertical,
+}
 pub(super) fn reader_key(logical: u64, axis: ReaderAxis) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut key = std::hash::DefaultHasher::new();
@@ -253,13 +276,23 @@ impl LocateLogical {
             // content space. Center from the innermost viewport outward.
             let mut projected = bounds;
             let horizontal = if stage >= 2 {
-                self.horizontal.iter().rev().map(|(id, viewport, content)| {
-                    let offset = (projected.x - content.x - (viewport.width - projected.width) / 2.0)
-                        .clamp(0.0, (content.width - viewport.width).max(0.0));
-                    projected.x -= offset;
-                    HorizontalLocation { id: id.clone(), offset }
-                }).collect()
-            } else { vec![] };
+                self.horizontal
+                    .iter()
+                    .rev()
+                    .map(|(id, viewport, content)| {
+                        let offset =
+                            (projected.x - content.x - (viewport.width - projected.width) / 2.0)
+                                .clamp(0.0, (content.width - viewport.width).max(0.0));
+                        projected.x -= offset;
+                        HorizontalLocation {
+                            id: id.clone(),
+                            offset,
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
             self.found = Some((bounds, stage, horizontal));
         }
     }
@@ -267,7 +300,9 @@ impl LocateLogical {
 impl Operation<Option<LogicalLocation>> for LocateLogical {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
         let previous = self.horizontal.len();
-        if let Some(viewport) = self.pending_horizontal.take() { self.horizontal.push(viewport); }
+        if let Some(viewport) = self.pending_horizontal.take() {
+            self.horizontal.push(viewport);
+        }
         visit(self);
         self.horizontal.truncate(previous);
     }
@@ -279,7 +314,9 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         _: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         if id == Some(&self.scroll) {
             self.content = Some(content);
             self.viewport = Some(viewport);
@@ -304,7 +341,9 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
             }
             return;
         }
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         if let Some((bounds, stage)) =
             virtualized::logical_bounds(state, bounds, self.identity, self.byte)
         {
@@ -324,13 +363,22 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         }
     }
     fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
-        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found.as_ref()).map(
-            |((content, viewport), (found, stage, horizontal))| {
-                let travel = (content.height - viewport.height).max(0.0);
-                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0).clamp(0.0, travel);
-                LogicalLocation { offset: travel - from_top, exact: *stage == 3, stage: *stage, horizontal: horizontal.clone() }
-            },
-        ))
+        operation::Outcome::Some(
+            self.content
+                .zip(self.viewport)
+                .zip(self.found.as_ref())
+                .map(|((content, viewport), (found, stage, horizontal))| {
+                    let travel = (content.height - viewport.height).max(0.0);
+                    let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0)
+                        .clamp(0.0, travel);
+                    LogicalLocation {
+                        offset: travel - from_top,
+                        exact: *stage == 3,
+                        stage: *stage,
+                        horizontal: horizontal.clone(),
+                    }
+                }),
+        )
     }
 }
 
@@ -1096,13 +1144,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             );
         }
         if let Some(target) = self.target {
-            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(true));
+            operation.custom(
+                Some(&card_control_id(target.card, "chat-transcript")),
+                layout.bounds(),
+                &mut LogicalScope(true),
+            );
         }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
         if let Some(target) = self.target {
-            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(false));
+            operation.custom(
+                Some(&card_control_id(target.card, "chat-transcript")),
+                layout.bounds(),
+                &mut LogicalScope(false),
+            );
         }
         if self.target.is_some() {
             let mut after = ReadTop::default();
@@ -1525,7 +1581,10 @@ mod tests {
     #[test]
     fn logical_find_uses_horizontal_ancestors_without_moving_overlapping_siblings() {
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let identity = 0x7618;
         let earlier = Id::new("earlier-overlapping-content");
         let outer = Id::new("actual-outer-viewport");
@@ -1533,147 +1592,388 @@ mod tests {
         for nested in [false, true] {
             let prose = selectable_prose::logical_text(
                 vec![iced::widget::text::Span::new("matching prose".to_owned())].into(),
-                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
-                selectable_prose::Logical { identity, start: 0, paint: None });
+                design::TEXT_BODY.into(),
+                iced::Font::MONOSPACE,
+                target,
+                None,
+                selectable_prose::Logical {
+                    identity,
+                    start: 0,
+                    paint: None,
+                },
+            );
             let matched: Element<'static, Message> = if nested {
-                widget::scrollable(widget::container(widget::scrollable(widget::container(prose).width(4000))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-                    .width(600).id(inner.clone())).width(6000))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-                    .id(outer.clone()).into()
-            } else { prose };
+                widget::scrollable(
+                    widget::container(
+                        widget::scrollable(widget::container(prose).width(4000))
+                            .direction(iced::widget::scrollable::Direction::Horizontal(
+                                design::scrollbar(),
+                            ))
+                            .width(600)
+                            .id(inner.clone()),
+                    )
+                    .width(6000),
+                )
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(outer.clone())
+                .into()
+            } else {
+                prose
+            };
             let sibling = widget::scrollable(widget::Space::new().width(30000).height(10000))
-                .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-                .height(80).id(earlier.clone());
-            let mut element = transcript(widget::column::with_children(vec![sibling.into(), item("answer", matched),
-                widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .height(80)
+                .id(earlier.clone());
+            let mut element = transcript(
+                widget::column::with_children(vec![
+                    sibling.into(),
+                    item("answer", matched),
+                    widget::Space::new().height(1000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                false,
+                vec![],
+            );
             let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(&mut tree, &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0)));
-            let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
-            let mut locate = operation::map(LocateLogical {
-                scroll: card_control_id(target.card, "chat-transcript"), item: item_id("answer"), identity, byte: 0,
-                content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
-                active: false, scopes: vec![],
-            }, move |location| { *sink.lock().unwrap() = location; });
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0)),
+            );
+            let result = Arc::new(std::sync::Mutex::new(None));
+            let sink = result.clone();
+            let mut locate = operation::map(
+                LocateLogical {
+                    scroll: card_control_id(target.card, "chat-transcript"),
+                    item: item_id("answer"),
+                    identity,
+                    byte: 0,
+                    content: None,
+                    viewport: None,
+                    found: None,
+                    horizontal: vec![],
+                    pending_horizontal: None,
+                    active: false,
+                    scopes: vec![],
+                },
+                move |location| {
+                    *sink.lock().unwrap() = location;
+                },
+            );
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
             let _ = locate.finish();
-            let location = result.lock().unwrap().take().expect("target glyph is mounted");
+            let location = result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("target glyph is mounted");
             assert!(location.exact);
-            assert_eq!(location.horizontal.into_iter().map(|viewport| viewport.id).collect::<Vec<_>>(), if nested { vec![inner.clone(), outer.clone()] } else { vec![] },
-                "only the nearest native ancestor belongs to this match; overlapping sibling content is unrelated");
+            assert_eq!(
+                location
+                    .horizontal
+                    .into_iter()
+                    .map(|viewport| viewport.id)
+                    .collect::<Vec<_>>(),
+                if nested {
+                    vec![inner.clone(), outer.clone()]
+                } else {
+                    vec![]
+                },
+                "only the nearest native ancestor belongs to this match; overlapping sibling content is unrelated"
+            );
         }
     }
 
     #[test]
     fn logical_find_reveals_a_glyph_through_every_nested_horizontal_viewport() {
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let identity = 0x9927;
-        let outer = Id::new("nested-outer"); let inner = Id::new("nested-inner");
+        let outer = Id::new("nested-outer");
+        let inner = Id::new("nested-inner");
         let text = selectable_prose::logical_text(
-            vec![iced::widget::text::Span::new(format!("{}needle", "w".repeat(3000)))].into(),
-            design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
-            selectable_prose::Logical { identity, start: 0, paint: None });
+            vec![iced::widget::text::Span::new(format!(
+                "{}needle",
+                "w".repeat(3000)
+            ))]
+            .into(),
+            design::TEXT_BODY.into(),
+            iced::Font::MONOSPACE,
+            target,
+            None,
+            selectable_prose::Logical {
+                identity,
+                start: 0,
+                paint: None,
+            },
+        );
         let nested = widget::scrollable(widget::container(text).width(40000))
-            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-            .width(600).id(inner.clone());
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .width(600)
+            .id(inner.clone());
         let outer_scroll = widget::scrollable(widget::row::with_children(vec![
-            widget::Space::new().width(2000).into(), nested.into(), widget::Space::new().width(3000).into(),
-        ])).direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
-            .width(Length::Fill).id(outer.clone());
-        let mut element = transcript(widget::column::with_children(vec![item("nested", outer_scroll),
-            widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+            widget::Space::new().width(2000).into(),
+            nested.into(),
+            widget::Space::new().width(3000).into(),
+        ]))
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            design::scrollbar(),
+        ))
+        .width(Length::Fill)
+        .id(outer.clone());
+        let mut element = transcript(
+            widget::column::with_children(vec![
+                item("nested", outer_scroll),
+                widget::Space::new().height(1000).into(),
+            ]),
+            target,
+            None,
+            vec![],
+            false,
+            vec![],
+        );
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
-        let mut locate = operation::map(LocateLogical {
-            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("nested"), identity, byte: 3000,
-            content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
-            active: false, scopes: vec![],
-        }, move |location| { *sink.lock().unwrap() = location; });
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let sink = result.clone();
+        let mut locate = operation::map(
+            LocateLogical {
+                scroll: card_control_id(target.card, "chat-transcript"),
+                item: item_id("nested"),
+                identity,
+                byte: 3000,
+                content: None,
+                viewport: None,
+                found: None,
+                horizontal: vec![],
+                pending_horizontal: None,
+                active: false,
+                scopes: vec![],
+            },
+            move |location| {
+                *sink.lock().unwrap() = location;
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
         let _ = locate.finish();
         let location = result.lock().unwrap().take().unwrap();
         assert!(location.exact);
-        assert_eq!(location.horizontal.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>(), vec![inner.clone(), outer.clone()]);
-        assert!(location.horizontal.iter().all(|entry| entry.offset > 1000.0), "both nested viewports need correction");
+        assert_eq!(
+            location
+                .horizontal
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            vec![inner.clone(), outer.clone()]
+        );
+        assert!(
+            location
+                .horizontal
+                .iter()
+                .all(|entry| entry.offset > 1000.0),
+            "both nested viewports need correction"
+        );
         for entry in location.horizontal {
-            let mut correction = operation::scrollable::scroll_to::<()>(entry.id,
-                operation::scrollable::AbsoluteOffset { x: Some(entry.offset), y: None });
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut correction);
+            let mut correction = operation::scrollable::scroll_to::<()>(
+                entry.id,
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(entry.offset),
+                    y: None,
+                },
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut correction,
+            );
         }
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         struct Screen {
-            translation: Vector, pending: Option<Vector>,
-            viewports: HashMap<Id, Rectangle>, glyph: Option<Rectangle>, identity: u64,
+            translation: Vector,
+            pending: Option<Vector>,
+            viewports: HashMap<Id, Rectangle>,
+            glyph: Option<Rectangle>,
+            identity: u64,
         }
         impl Operation for Screen {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 let previous = self.translation;
-                if let Some(offset) = self.pending.take() { self.translation += offset; }
-                visit(self); self.translation = previous;
+                if let Some(offset) = self.pending.take() {
+                    self.translation += offset;
+                }
+                visit(self);
+                self.translation = previous;
             }
-            fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, _: Rectangle, translation: Vector, _: &mut dyn operation::Scrollable) {
-                if let Some(id) = id { self.viewports.insert(id.clone(), Rectangle::new(viewport.position() - self.translation, viewport.size())); }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                viewport: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if let Some(id) = id {
+                    self.viewports.insert(
+                        id.clone(),
+                        Rectangle::new(viewport.position() - self.translation, viewport.size()),
+                    );
+                }
                 self.pending = Some(translation);
             }
             fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
                 if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-                    && let Some(local) = prose.logical_byte_bounds(self.identity, 3000) {
-                    self.glyph = Some(Rectangle::new(bounds.position() + Vector::new(local.x, local.y) - self.translation, local.size()));
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, 3000)
+                {
+                    self.glyph = Some(Rectangle::new(
+                        bounds.position() + Vector::new(local.x, local.y) - self.translation,
+                        local.size(),
+                    ));
                 }
             }
         }
-        let mut screen = Screen { translation: Vector::ZERO, pending: None, viewports: HashMap::new(), glyph: None, identity };
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut screen);
+        let mut screen = Screen {
+            translation: Vector::ZERO,
+            pending: None,
+            viewports: HashMap::new(),
+            glyph: None,
+            identity,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut screen);
         let glyph = screen.glyph.unwrap();
         for id in [outer, inner] {
             let viewport = screen.viewports[&id];
-            assert!(glyph.x >= viewport.x && glyph.x + glyph.width <= viewport.x + viewport.width
-                && glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height,
-                "actual glyph must be visible through every native ancestor: {id:?}, {glyph:?}, {viewport:?}");
+            assert!(
+                glyph.x >= viewport.x
+                    && glyph.x + glyph.width <= viewport.x + viewport.width
+                    && glyph.y >= viewport.y
+                    && glyph.y + glyph.height <= viewport.y + viewport.height,
+                "actual glyph must be visible through every native ancestor: {id:?}, {glyph:?}, {viewport:?}"
+            );
         }
     }
 
     #[test]
     fn logical_find_geometry_is_scoped_to_its_transcript_when_source_ids_repeat() {
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target { card: CardId::new(), generation: 0 };
-        let other = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let other = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let identity = 0x5517;
-        let make = |target, prefix: f32| transcript(widget::column::with_children(vec![
-            widget::Space::new().height(prefix).into(),
-            item("shared-source", selectable_prose::logical_text(
-                vec![iced::widget::text::Span::new("same imported source".to_owned())].into(),
-                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
-                selectable_prose::Logical { identity, start: 0, paint: None })),
-            widget::Space::new().height(2000).into(),
-        ]), target, None, vec![], false, vec![]);
+        let make = |target, prefix: f32| {
+            transcript(
+                widget::column::with_children(vec![
+                    widget::Space::new().height(prefix).into(),
+                    item(
+                        "shared-source",
+                        selectable_prose::logical_text(
+                            vec![iced::widget::text::Span::new(
+                                "same imported source".to_owned(),
+                            )]
+                            .into(),
+                            design::TEXT_BODY.into(),
+                            iced::Font::MONOSPACE,
+                            target,
+                            None,
+                            selectable_prose::Logical {
+                                identity,
+                                start: 0,
+                                paint: None,
+                            },
+                        ),
+                    ),
+                    widget::Space::new().height(2000).into(),
+                ]),
+                target,
+                None,
+                vec![],
+                false,
+                vec![],
+            )
+        };
         let mut first = make(target, 0.0);
         let mut decoy = make(other, 1500.0);
         let mut first_tree = Tree::new(&first);
         let mut other_tree = Tree::new(&decoy);
         let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
-        let first_node = first.as_widget_mut().layout(&mut first_tree, &renderer, &limits);
-        let other_node = decoy.as_widget_mut().layout(&mut other_tree, &renderer, &limits);
+        let first_node = first
+            .as_widget_mut()
+            .layout(&mut first_tree, &renderer, &limits);
+        let other_node = decoy
+            .as_widget_mut()
+            .layout(&mut other_tree, &renderer, &limits);
         let result = Arc::new(std::sync::Mutex::new(None));
         let sink = result.clone();
-        let mut locate = operation::map(LocateLogical {
-            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("shared-source"),
-            identity, byte: 0, content: None, viewport: None, found: None,
-            horizontal: vec![], pending_horizontal: None, active: false, scopes: vec![],
-        }, move |location| { *sink.lock().unwrap() = location; });
-        first.as_widget_mut().operate(&mut first_tree, Layout::new(&first_node), &renderer, &mut locate);
+        let mut locate = operation::map(
+            LocateLogical {
+                scroll: card_control_id(target.card, "chat-transcript"),
+                item: item_id("shared-source"),
+                identity,
+                byte: 0,
+                content: None,
+                viewport: None,
+                found: None,
+                horizontal: vec![],
+                pending_horizontal: None,
+                active: false,
+                scopes: vec![],
+            },
+            move |location| {
+                *sink.lock().unwrap() = location;
+            },
+        );
+        first.as_widget_mut().operate(
+            &mut first_tree,
+            Layout::new(&first_node),
+            &renderer,
+            &mut locate,
+        );
         let _ = locate.finish();
-        let expected = result.lock().unwrap().take().expect("target transcript has an exact glyph");
+        let expected = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("target transcript has an exact glyph");
         assert!(expected.exact);
-        decoy.as_widget_mut().operate(&mut other_tree, Layout::new(&other_node), &renderer, &mut locate);
+        decoy.as_widget_mut().operate(
+            &mut other_tree,
+            Layout::new(&other_node),
+            &renderer,
+            &mut locate,
+        );
         let _ = locate.finish();
         let after = result.lock().unwrap().take().unwrap();
-        assert_eq!(after.offset, expected.offset,
-            "another pane displaying identical source IDs cannot replace the target glyph geometry");
+        assert_eq!(
+            after.offset, expected.offset,
+            "another pane displaying identical source IDs cannot replace the target glyph geometry"
+        );
     }
 
     #[test]
@@ -1737,9 +2037,9 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
-        pending_horizontal: None,
-        active: false,
-        scopes: Vec::new(),
+                        pending_horizontal: None,
+                        active: false,
+                        scopes: Vec::new(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;
@@ -1758,7 +2058,9 @@ mod tests {
                     .take()
                     .expect("mounted code glyph exists");
                 let horizontal = location
-                    .horizontal.into_iter().next()
+                    .horizontal
+                    .into_iter()
+                    .next()
                     .expect("glyph belongs to a horizontal code viewport");
                 assert_eq!(horizontal.id, horizontal_id);
                 assert!(
@@ -1900,7 +2202,8 @@ mod tests {
                 start: 0,
                 paint: None,
             }),
-            None, None,
+            None,
+            None,
         );
         let mut cases = vec![(text, identity, byte)];
         let list = format!(
@@ -1985,9 +2288,9 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
-        pending_horizontal: None,
-        active: false,
-        scopes: Vec::new(),
+                        pending_horizontal: None,
+                        active: false,
+                        scopes: Vec::new(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;

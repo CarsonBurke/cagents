@@ -74,11 +74,13 @@ impl CodeBlock {
             }
     }
 
-
     /// Share immutable prepared palettes across worker snapshots. Streaming
     /// highlighter continuations are never cloned or transferred this way.
     pub(super) fn settled_clone(&self) -> Self {
-        Self { spans: self.spans.clone(), tail: None }
+        Self {
+            spans: self.spans.clone(),
+            tail: None,
+        }
     }
 
     /// The font a block's paragraph is set in. Its spans name their own only
@@ -260,14 +262,32 @@ pub(super) fn fence_language(info: &str) -> Option<&str> {
         .find(|word| !word.is_empty())
 }
 
-pub(super) type PaletteMap=HashMap<u64,Arc<[Span<'static,String>]>>;
-pub(super) type Palettes=[Arc<PaletteMap>;2];
-pub(super) fn palettes(blocks:&HashMap<u64,CodeBlock>)->Palettes {
-    std::array::from_fn(|dark|Arc::new(blocks.iter().map(|(key,block)|(*key,block.spans(dark!=0).clone())).collect()))
+pub(super) type PaletteMap = HashMap<u64, Arc<[Span<'static, String>]>>;
+pub(super) type Palettes = [Arc<PaletteMap>; 2];
+pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
+    std::array::from_fn(|dark| {
+        Arc::new(
+            blocks
+                .iter()
+                .map(|(key, block)| (*key, block.spans(dark != 0).clone()))
+                .collect(),
+        )
+    })
 }
-fn palette(cached:&CachedItem,dark:bool)->Arc<PaletteMap> {
-    cached.palette_views.as_ref().map(|palettes|palettes[usize::from(dark)].clone())
-        .unwrap_or_else(||Arc::new(cached.blocks.iter().map(|(key,block)|(*key,block.spans(dark).clone())).collect()))
+fn palette(cached: &CachedItem, dark: bool) -> Arc<PaletteMap> {
+    cached
+        .palette_views
+        .as_ref()
+        .map(|palettes| palettes[usize::from(dark)].clone())
+        .unwrap_or_else(|| {
+            Arc::new(
+                cached
+                    .blocks
+                    .iter()
+                    .map(|(key, block)| (*key, block.spans(dark).clone()))
+                    .collect(),
+            )
+        })
 }
 
 /// An item's parsed Markdown as an element that owns what it draws.
@@ -282,11 +302,19 @@ pub(super) fn view(
     }
     Renderer {
         target,
-        blocks: palette(cached,cosmic::theme::is_dark()),
+        blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
         path: vec![0],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
@@ -307,12 +335,31 @@ pub(super) fn content_view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: palette(cached,cosmic::theme::is_dark()),
+        blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
-        path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
+        path: vec![
+            1,
+            cached
+                .coordination
+                .as_ref()
+                .and_then(|coordinated| {
+                    coordinated
+                        .contents()
+                        .position(|candidate| std::ptr::eq(candidate, content))
+                })
+                .unwrap_or_default() as u32,
+        ],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
         paint: cached.find_paint.clone(),
@@ -328,11 +375,19 @@ pub(super) fn items_for_test(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        blocks: palette(cached,cosmic::theme::is_dark()),
+        blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
-        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
-        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
         path: vec![0],
         dark: true,
         find: None,
@@ -431,14 +486,31 @@ impl Renderer {
         }
     }
     fn child(&self, index: u32) -> Self {
-        let mut path = self.path.clone(); path.push(index);
-        Self { paint: self.paint.clone(), flow_cache: self.flow_cache.clone(), item: self.item.clone(), path, find: self.find.clone(), target: self.target,
-            reader_memory: self.reader_memory.clone(), reader_context: self.reader_context.clone(),
-            blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
+        let mut path = self.path.clone();
+        path.push(index);
+        Self {
+            paint: self.paint.clone(),
+            flow_cache: self.flow_cache.clone(),
+            item: self.item.clone(),
+            path,
+            find: self.find.clone(),
+            target: self.target,
+            reader_memory: self.reader_memory.clone(),
+            reader_context: self.reader_context.clone(),
+            blocks: self.blocks.clone(),
+            revision: self.revision,
+            dark: self.dark,
+        }
     }
-    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical { self.logical_identity(start) }
+    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
+        self.logical_identity(start)
+    }
     fn logical_identity(&self, start: usize) -> selectable_prose::Logical {
-        selectable_prose::Logical { paint: self.paint.clone(), identity: selection::logical_identity(&self.item, &self.path), start }
+        selectable_prose::Logical {
+            paint: self.paint.clone(),
+            identity: selection::logical_identity(&self.item, &self.path),
+            start,
+        }
     }
     fn items(
         &self,
@@ -547,13 +619,31 @@ impl Renderer {
     ) -> Element<'static, Message> {
         use markdown::Item;
         match item {
-            Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache))
-            }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache)),
-            Item::CodeBlock { language, code, source, reader_source, .. } => {
-                self.code_block(settings, language.as_deref(), code, source, reader_source)
-            }
+            Item::Heading(level, text) => heading(
+                settings,
+                *level,
+                text,
+                index,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical_identity(0)),
+                Some(&self.flow_cache),
+            ),
+            Item::Paragraph(text) => paragraph(
+                settings,
+                text,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical_identity(0)),
+                Some(&self.flow_cache),
+            ),
+            Item::CodeBlock {
+                language,
+                code,
+                source,
+                reader_source,
+                ..
+            } => self.code_block(settings, language.as_deref(), code, source, reader_source),
             Item::List { start, bullets } => self.list(settings, *start, bullets),
             Item::Quote(items) => {
                 iced::widget::row![iced::widget::rule::vertical(4), self.items(items, settings),]
@@ -837,18 +927,34 @@ impl Renderer {
             CodeBlock::FONT,
             self.target,
             self.find.as_deref(),
-            Some(self.logical(Arc::from(""), 0)), Some(self.flow_cache.clone()), Some(reader_source.clone()),
+            Some(self.logical(Arc::from(""), 0)),
+            Some(self.flow_cache.clone()),
+            Some(reader_source.clone()),
         );
         step::code_frame(
-            scroll::block_source(widget::scrollable(
-                scroll::minimum_width(widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
-                    self.reader_memory.reader_width_for(self.reader_context.as_deref(),
-                        selection::logical_identity(&self.item, &self.path), reader_source)),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            )).id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path))), self.reader_memory.clone(), self.reader_context.clone(),
-                selection::logical_identity(&self.item, &self.path), false, Some(reader_source.clone())),
+            scroll::block_source(
+                widget::scrollable(scroll::minimum_width(
+                    widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
+                    self.reader_memory.reader_width_for(
+                        self.reader_context.as_deref(),
+                        selection::logical_identity(&self.item, &self.path),
+                        reader_source,
+                    ),
+                ))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(scroll::block_id(
+                    self.target,
+                    self.reader_context.as_deref(),
+                    selection::logical_identity(&self.item, &self.path),
+                )),
+                self.reader_memory.clone(),
+                self.reader_context.clone(),
+                selection::logical_identity(&self.item, &self.path),
+                false,
+                Some(reader_source.clone()),
+            ),
             Some(
                 language
                     .and_then(fence_language)
@@ -871,16 +977,25 @@ fn heading(
     flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(paragraph(markdown::Settings {
-        text_size: match level {
-            HeadingLevel::H1 => settings.h1_size,
-            HeadingLevel::H2 => settings.h2_size,
-            HeadingLevel::H3 => settings.h3_size,
-            HeadingLevel::H4 => settings.h4_size,
-            HeadingLevel::H5 => settings.h5_size,
-            HeadingLevel::H6 => settings.h6_size,
-        }, style: heading_style(settings, level), ..settings
-    }, text, target, find, logical, flow_cache))
+    widget::container(paragraph(
+        markdown::Settings {
+            text_size: match level {
+                HeadingLevel::H1 => settings.h1_size,
+                HeadingLevel::H2 => settings.h2_size,
+                HeadingLevel::H3 => settings.h3_size,
+                HeadingLevel::H4 => settings.h4_size,
+                HeadingLevel::H5 => settings.h5_size,
+                HeadingLevel::H6 => settings.h6_size,
+            },
+            style: heading_style(settings, level),
+            ..settings
+        },
+        text,
+        target,
+        find,
+        logical,
+        flow_cache,
+    ))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
     } else {
@@ -927,9 +1042,15 @@ fn leaf_text(
 /// Read-only code shares one source, and only styles/shapes bounded mounted
 /// ranges. The logical block keeps source newlines intact for selection/copy.
 pub(super) fn code_text(
-    text: Arc<str>, spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>,
-    flow_cache: Option<flow_layout::Cache>, reader_source: Option<reader_source::Source>,
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>,
+    reader_source: Option<reader_source::Source>,
 ) -> Element<'static, Message> {
     if text.len() <= 2048 {
         let spans = if spans.is_empty() {
@@ -948,61 +1069,151 @@ pub(super) fn code_text(
     let find: Option<Arc<str>> = find.map(Arc::from);
     let mut ranges = Vec::new();
     let mut start = 0;
-    for line in text.split_inclusive('\n') { ranges.push(start..start + line.len()); start += line.len(); }
-    if text.ends_with('\n') { ranges.push(text.len()..text.len()); }
-    let rows = ranges.into_iter().map(|range| {
-        use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
-        let key = key.finish();
-        let mut revision = std::hash::DefaultHasher::new();
-        (Arc::as_ptr(&text) as *const u8 as usize, &range, &find, logical.as_ref().and_then(|l| l.paint.as_ref()).map(|p| (p.generation, p.current.as_ref().map(|m| (m.identity, m.range.start)))), font, size.0.to_bits()).hash(&mut revision);
-        let revision = revision.finish();
-        let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
-        let flow_cache = flow_cache.clone(); let reader_source = reader_source.clone();
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: false });
-        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
-        let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
-            // Newlines belong to the logical document. Each physical line
-            // contributes one visual row, including the real terminal empty
-            // line, instead of an extra empty paragraph at every chunk seam.
-            let mut display = range.clone();
-            if text[display.clone()].ends_with('\n') {
-                display.end -= 1;
-                if text[display.clone()].ends_with('\r') { display.end -= 1; }
-            }
-            if display.is_empty() { return widget::Space::new().height(size.0 * 1.3).into(); }
-            code_line(text.clone(), spans.clone(), starts.clone(), display,
-                size, font, target, find.clone(), logical.clone(), flow_cache.clone(), reader_source.clone())
-        });
-        row.anchor = true; row.logical = descriptor; row
-    }).collect();
+    for line in text.split_inclusive('\n') {
+        ranges.push(start..start + line.len());
+        start += line.len();
+    }
+    if text.ends_with('\n') {
+        ranges.push(text.len()..text.len());
+    }
+    let rows = ranges
+        .into_iter()
+        .map(|range| {
+            use std::hash::{Hash, Hasher};
+            let mut key = std::hash::DefaultHasher::new();
+            (
+                logical.as_ref().map(|logical| logical.identity),
+                range.start,
+            )
+                .hash(&mut key);
+            let key = key.finish();
+            let mut revision = std::hash::DefaultHasher::new();
+            (
+                Arc::as_ptr(&text) as *const u8 as usize,
+                &range,
+                &find,
+                logical.as_ref().and_then(|l| l.paint.as_ref()).map(|p| {
+                    (
+                        p.generation,
+                        p.current.as_ref().map(|m| (m.identity, m.range.start)),
+                    )
+                }),
+                font,
+                size.0.to_bits(),
+            )
+                .hash(&mut revision);
+            let revision = revision.finish();
+            let text = text.clone();
+            let spans = spans.clone();
+            let starts = starts.clone();
+            let find = find.clone();
+            let flow_cache = flow_cache.clone();
+            let reader_source = reader_source.clone();
+            let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+                identity: logical.identity,
+                bytes: logical.start + range.start..logical.start + range.end,
+                chunk: false,
+            });
+            let logical = logical.clone().map(|mut logical| {
+                logical.start += range.start;
+                logical
+            });
+            let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
+                // Newlines belong to the logical document. Each physical line
+                // contributes one visual row, including the real terminal empty
+                // line, instead of an extra empty paragraph at every chunk seam.
+                let mut display = range.clone();
+                if text[display.clone()].ends_with('\n') {
+                    display.end -= 1;
+                    if text[display.clone()].ends_with('\r') {
+                        display.end -= 1;
+                    }
+                }
+                if display.is_empty() {
+                    return widget::Space::new().height(size.0 * 1.3).into();
+                }
+                code_line(
+                    text.clone(),
+                    spans.clone(),
+                    starts.clone(),
+                    display,
+                    size,
+                    font,
+                    target,
+                    find.clone(),
+                    logical.clone(),
+                    flow_cache.clone(),
+                    reader_source.clone(),
+                )
+            });
+            row.anchor = true;
+            row.logical = descriptor;
+            row
+        })
+        .collect();
     virtualized::column(rows, Default::default())
 }
 
-fn code_line(text: Arc<str>, spans: Arc<[Span<'static, String>]>, starts: Arc<[usize]>, range: std::ops::Range<usize>,
-    size: iced::Pixels, font: iced::Font, target: Target, find: Option<Arc<str>>, logical: Option<selectable_prose::Logical>,
-    flow_cache: Option<flow_layout::Cache>, reader_source: Option<reader_source::Source>) -> Element<'static, Message> {
+fn code_line(
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    starts: Arc<[usize]>,
+    range: std::ops::Range<usize>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<Arc<str>>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>,
+    reader_source: Option<reader_source::Source>,
+) -> Element<'static, Message> {
     if range.len() > 2048
-        && let (Some(cache),Some(source)) = (flow_cache,reader_source) {
+        && let (Some(cache), Some(source)) = (flow_cache, reader_source)
+    {
         // The worker shapes the complete physical line with its original
         // ligatures, Bidi context and tab stops; display projection may cull
         // glyphs but never introduces an artificial source boundary.
-        use std::hash::{Hash,Hasher};
+        use std::hash::{Hash, Hasher};
         let mut key = std::hash::DefaultHasher::new();
-        ("code-line", logical.as_ref().map(|logical| logical.identity), logical.as_ref().map_or(range.start, |logical| logical.start)).hash(&mut key);
-        let flow = cache.code_entry(key.finish(),text,range,spans,starts,source);
-        return selectable_prose::flow_source_optional(size,font,target,find.as_deref(),logical,flow);
+        (
+            "code-line",
+            logical.as_ref().map(|logical| logical.identity),
+            logical
+                .as_ref()
+                .map_or(range.start, |logical| logical.start),
+        )
+            .hash(&mut key);
+        let flow = cache.code_entry(key.finish(), text, range, spans, starts, source);
+        return selectable_prose::flow_source_optional(
+            size,
+            font,
+            target,
+            find.as_deref(),
+            logical,
+            flow,
+        );
     }
-    let styled = if spans.is_empty() {vec![Span::new(text[range.clone()].to_owned())].into()}
-        else {sliced_spans(&spans,&starts,range)};
-    leaf_text(styled,size,font,target,find.as_deref(),logical)
+    let styled = if spans.is_empty() {
+        vec![Span::new(text[range.clone()].to_owned())].into()
+    } else {
+        sliced_spans(&spans, &starts, range)
+    };
+    leaf_text(styled, size, font, target, find.as_deref(), logical)
 }
 
-pub(super) fn sliced_spans(spans: &[Span<'static, String>], starts: &[usize], range: std::ops::Range<usize>) -> Arc<[Span<'static, String>]> {
-    let first = starts.partition_point(|start| *start <= range.start).saturating_sub(1);
-    spans.iter().enumerate().skip(first).take_while(|(index, _)| starts[*index] < range.end)
+pub(super) fn sliced_spans(
+    spans: &[Span<'static, String>],
+    starts: &[usize],
+    range: std::ops::Range<usize>,
+) -> Arc<[Span<'static, String>]> {
+    let first = starts
+        .partition_point(|start| *start <= range.start)
+        .saturating_sub(1);
+    spans
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take_while(|(index, _)| starts[*index] < range.end)
         .filter_map(|(index, span)| {
             let start = range.start.saturating_sub(starts[index]);
             let end = range.end.saturating_sub(starts[index]).min(span.text.len());
@@ -1049,9 +1260,16 @@ pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
         }
         // Prefer a source whitespace boundary near the cap. A giant token is
         // still bounded and wraps with the same glyph fallback as short prose.
-        if end < text.len() && let Some((at, grapheme)) = text[start..end].grapheme_indices(true).rev().find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace)) {
+        if end < text.len()
+            && let Some((at, grapheme)) = text[start..end]
+                .grapheme_indices(true)
+                .rev()
+                .find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace))
+        {
             let boundary = start + at + grapheme.len();
-            if boundary >= start + BYTES / 2 { end = boundary; }
+            if boundary >= start + BYTES / 2 {
+                end = boundary;
+            }
         }
         ranges.push(start..end);
         start = end;
@@ -1072,9 +1290,23 @@ fn paragraph(
         && let Some(logical) = logical.clone()
     {
         let flow = cache.markdown_entry(logical.identity, text.clone(), settings.style);
-        return selectable_prose::flow_source(settings.text_size, settings.style.font, target, find, logical, flow);
+        return selectable_prose::flow_source(
+            settings.text_size,
+            settings.style.font,
+            target,
+            find,
+            logical,
+            flow,
+        );
     }
-    leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical)
+    leaf_text(
+        text.spans(settings.style),
+        settings.text_size,
+        settings.style.font,
+        target,
+        find,
+        logical,
+    )
 }
 
 /// A table column's alignment as the layout takes it.
@@ -1096,34 +1328,71 @@ mod tests {
 
     #[test]
     fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
-        let theme=crate::settings::EditorSyntaxTheme::Auto;
-        let blocks=(0..200).map(|key|(key,CodeBlock::new(Some("rust"),"let value = 1;",theme))).collect();
-        let prepared=palettes(&blocks);
-        let mut cached=CachedItem::new(&ItemContent::Text{text:"body".into(),thinking:false,phase:chat::Phase::Final},theme);
-        cached.blocks=blocks;cached.palette_views=Some(prepared.clone());
-        for _ in 0..1000 {for dark in [false,true] {
-            assert!(Arc::ptr_eq(&palette(&cached,dark),&prepared[usize::from(dark)]));
-        }}
-        let weak=Arc::downgrade(&prepared[0]);drop(prepared);drop(cached);
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let blocks = (0..200)
+            .map(|key| (key, CodeBlock::new(Some("rust"), "let value = 1;", theme)))
+            .collect();
+        let prepared = palettes(&blocks);
+        let mut cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "body".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            theme,
+        );
+        cached.blocks = blocks;
+        cached.palette_views = Some(prepared.clone());
+        for _ in 0..1000 {
+            for dark in [false, true] {
+                assert!(Arc::ptr_eq(
+                    &palette(&cached, dark),
+                    &prepared[usize::from(dark)]
+                ));
+            }
+        }
+        let weak = Arc::downgrade(&prepared[0]);
+        drop(prepared);
+        drop(cached);
         assert!(weak.upgrade().is_none());
     }
     #[test]
     fn huge_inline_paragraph_does_not_materialize_presentation_on_ui_layout() {
         use iced::advanced::{layout, widget::Tree};
-        let source = "**bold** ordinary *emphasis* [link](https://example.com) `code` ".repeat(4000);
+        let source =
+            "**bold** ordinary *emphasis* [link](https://example.com) `code` ".repeat(4000);
         let content = markdown::Content::parse(&source);
-        let markdown::Item::Paragraph(text) = &content.items()[0] else { panic!("paragraph fixture") };
+        let markdown::Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph fixture")
+        };
         let before = markdown::materialized_bytes();
         let cache = flow_layout::Cache::default();
         let mut element = paragraph(
-            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE), text,
-            Target { card: CardId::new(), generation: 0 }, None,
-            Some(selectable_prose::Logical { identity: 7, start: 0, paint: None }), Some(&cache));
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            text,
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+            Some(selectable_prose::Logical {
+                identity: 7,
+                start: 0,
+                paint: None,
+            }),
+            Some(&cache),
+        );
         let mut tree = Tree::new(&element);
-        element.as_widget_mut().layout(&mut tree, &crate::app::tests::headless_renderer(),
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
-        assert_eq!(markdown::materialized_bytes(), before,
-            "UI realization must not copy full plain text or style thousands of inline spans");
+        element.as_widget_mut().layout(
+            &mut tree,
+            &crate::app::tests::headless_renderer(),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+        );
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "UI realization must not copy full plain text or style thousands of inline spans"
+        );
     }
 
     #[test]
@@ -1222,9 +1491,21 @@ mod tests {
                 None,
             );
             let mut reference_tree = Tree::new(&reference);
-            let reference_node = reference.as_widget_mut().layout(&mut reference_tree, &renderer, &limits);
-            let mut actual = code_text(Arc::from(source.as_str()), Arc::from([]), size,
-                CodeBlock::FONT, target, None, None, None, None);
+            let reference_node =
+                reference
+                    .as_widget_mut()
+                    .layout(&mut reference_tree, &renderer, &limits);
+            let mut actual = code_text(
+                Arc::from(source.as_str()),
+                Arc::from([]),
+                size,
+                CodeBlock::FONT,
+                target,
+                None,
+                None,
+                None,
+                None,
+            );
             let mut tree = Tree::new(&actual);
             let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
             assert!(
@@ -1251,9 +1532,16 @@ mod tests {
     fn chunk_boundaries_preserve_complete_graphemes() {
         use unicode_segmentation::UnicodeSegmentation;
         for seam in ["e\u{301}", "👩‍💻", "🇨🇦", "\r\n", " \u{301}"] {
-            let source = format!("{}{seam}{}", "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }), "z".repeat(4096));
-            let boundaries: HashSet<_> = source.grapheme_indices(true)
-                .map(|(at, _)| at).chain(std::iter::once(source.len())).collect();
+            let source = format!(
+                "{}{seam}{}",
+                "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }),
+                "z".repeat(4096)
+            );
+            let boundaries: HashSet<_> = source
+                .grapheme_indices(true)
+                .map(|(at, _)| at)
+                .chain(std::iter::once(source.len()))
+                .collect();
             let ranges = chunk_ranges(&source);
             assert_eq!(
                 ranges

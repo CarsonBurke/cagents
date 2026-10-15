@@ -292,40 +292,88 @@ impl Pane {
     /// Loading placeholder is never accepted as the giant-body workload.
     fn settle_geometry(&mut self) -> usize {
         use iced::advanced::widget::Operation;
-        #[derive(Default)]struct Probe {pending:usize,ready_bytes:usize,plain_bytes:usize}
+        #[derive(Default)]
+        struct Probe {
+            pending: usize,
+            ready_bytes: usize,
+            plain_bytes: usize,
+        }
         impl Operation for Probe {
-            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
-            fn custom(&mut self,_:Option<&widget::Id>,_:iced::Rectangle,state:&mut dyn std::any::Any){
-                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {
-                    self.plain_bytes+=state.plain.len();
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(state) = state.downcast_ref::<selectable_prose::State>() {
+                    self.plain_bytes += state.plain.len();
                     match state.flow_readiness() {
-                        Some(false)=>self.pending+=1,Some(true)=>self.ready_bytes+=state.plain.len(),None=>{}
+                        Some(false) => self.pending += 1,
+                        Some(true) => self.ready_bytes += state.plain.len(),
+                        None => {}
                     }
                 }
             }
         }
-        self.runtime.refresh();preparation::drain_fixture(&mut self.runtime);
+        self.runtime.refresh();
+        preparation::drain_fixture(&mut self.runtime);
         for _ in 0..16 {
-            let element=self.runtime.view(None,false,true,&self.shortcuts,720.0,Place {
-                channel:None,name:"project".into(),branch:None,
-            },true,None,Vec::new());
-            let mut ui=UserInterface::build(element,WINDOW,std::mem::replace(&mut self.cache,Cache::new()),&mut self.renderer);
-            let mut changed=Vec::new();
-            for (id,cached) in &self.runtime.cache {
-                let mut completed=cached.flow_cache.complete_fixture();
-                for tool in cached.tool_input.iter().chain(cached.tool_output.iter()).chain(cached.patches.iter()) {
-                    completed |=tool.flow_cache.complete_fixture();
+            let element = self.runtime.view(
+                None,
+                false,
+                true,
+                &self.shortcuts,
+                720.0,
+                Place {
+                    channel: None,
+                    name: "project".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(
+                element,
+                WINDOW,
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let mut changed = Vec::new();
+            for (id, cached) in &self.runtime.cache {
+                let mut completed = cached.flow_cache.complete_fixture();
+                for tool in cached
+                    .tool_input
+                    .iter()
+                    .chain(cached.tool_output.iter())
+                    .chain(cached.patches.iter())
+                {
+                    completed |= tool.flow_cache.complete_fixture();
                 }
-                if completed {changed.push(id.clone());}
+                if completed {
+                    changed.push(id.clone());
+                }
             }
-            let mut probe=Probe::default();ui.operate(&self.renderer,&mut probe);
-            self.cache=ui.into_cache();
+            let mut probe = Probe::default();
+            ui.operate(&self.renderer, &mut probe);
+            self.cache = ui.into_cache();
             if changed.is_empty() {
-                assert_eq!(probe.pending,0,"steady benchmark must not measure Loading placeholders");
-                assert!(probe.plain_bytes>0,"steady benchmark must expose actual transcript text");
+                assert_eq!(
+                    probe.pending, 0,
+                    "steady benchmark must not measure Loading placeholders"
+                );
+                assert!(
+                    probe.plain_bytes > 0,
+                    "steady benchmark must expose actual transcript text"
+                );
                 return probe.ready_bytes;
             }
-            for id in changed {self.runtime.cache.get_mut(&id).unwrap().revision=CachedItem::next_revision();}
+            for id in changed {
+                self.runtime.cache.get_mut(&id).unwrap().revision = CachedItem::next_revision();
+            }
         }
         panic!("visible geometry preparation did not quiesce");
     }
@@ -1000,10 +1048,19 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
         ));
         let mut pane = Pane::new(items);
         pane.runtime.tool_groups_expanded = true;
-        let prepared_bytes=pane.settle_geometry();
-        if form!=1 {assert!(prepared_bytes>=bytes,"the full giant physical paragraph/code line must be prepared");}
-        println!("settled geometry ready visible-flow bytes={prepared_bytes}; cold worker work excluded from this steady-frame measurement");
-        for _ in 0..WARMUP { pane.frame_with_pointer(true); }
+        let prepared_bytes = pane.settle_geometry();
+        if form != 1 {
+            assert!(
+                prepared_bytes >= bytes,
+                "the full giant physical paragraph/code line must be prepared"
+            );
+        }
+        println!(
+            "settled geometry ready visible-flow bytes={prepared_bytes}; cold worker work excluded from this steady-frame measurement"
+        );
+        for _ in 0..WARMUP {
+            pane.frame_with_pointer(true);
+        }
         let mut totals = Stage::default();
         let mut stages = Stages::default();
         for _ in 0..SAMPLES {

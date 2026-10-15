@@ -50,7 +50,8 @@ impl Catalog {
     }
     pub fn builder() -> Builder {
         Builder {
-            read: Read::new(None), prefixes: HashMap::new(),
+            read: Read::new(None),
+            prefixes: HashMap::new(),
         }
     }
     pub fn endpoints(&self) -> Option<(Endpoint, Endpoint)> {
@@ -118,7 +119,10 @@ pub(in crate::app::chat_ui) fn identity(item: &str, path: &[u32]) -> u64 {
     hash.finish()
 }
 
-pub(in crate::app::chat_ui) struct Builder { read: Read, prefixes:HashMap<u64,Arc<Vec<[u8;32]>>> }
+pub(in crate::app::chat_ui) struct Builder {
+    read: Read,
+    prefixes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
+}
 impl Builder {
     pub fn logical(&mut self, identity: u64, text: Arc<str>) {
         let mut logical = LogicalText {
@@ -130,8 +134,16 @@ impl Builder {
     pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
         self.logical(identity(item, path), text);
     }
-    pub fn indexed(&mut self,item:&str,path:&[u32],text:Arc<str>,prefixes:Arc<Vec<[u8;32]>>) {
-        let key=identity(item,path);self.logical(key,text);self.prefixes.insert(key,prefixes);
+    pub fn indexed(
+        &mut self,
+        item: &str,
+        path: &[u32],
+        text: Arc<str>,
+        prefixes: Arc<Vec<[u8; 32]>>,
+    ) {
+        let key = identity(item, path);
+        self.logical(key, text);
+        self.prefixes.insert(key, prefixes);
     }
     fn enter(&mut self, item: &str, path: &[u32], kind: Kind) {
         self.read.custom(
@@ -152,8 +164,14 @@ impl Builder {
             let mut key = path.to_vec();
             key.push(index as u32);
             match node {
-                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => self.indexed(item, &key, text.plain(),text.plain_prefixes()),
-                markdown::Item::CodeBlock { source, reader_source,.. } => self.indexed(item, &key, source.clone(),reader_source.prefixes()),
+                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => {
+                    self.indexed(item, &key, text.plain(), text.plain_prefixes())
+                }
+                markdown::Item::CodeBlock {
+                    source,
+                    reader_source,
+                    ..
+                } => self.indexed(item, &key, source.clone(), reader_source.prefixes()),
                 markdown::Item::Quote(items) => self.markdown(item, &key, items),
                 markdown::Item::List { start, bullets } => {
                     for (index, bullet) in bullets.iter().enumerate() {
@@ -210,9 +228,16 @@ impl Builder {
                     self.exit();
                 }
                 markdown::Item::Image { title, alt, .. } => {
-                    let mut part = key.clone(); part.push(0);
-                    if !alt.plain().is_empty() { self.indexed(item, &part, alt.plain(),alt.plain_prefixes()); }
-                    if !title.is_empty() { part.pop(); part.push(1); self.plain(item, &part, Arc::from(title.as_str())); }
+                    let mut part = key.clone();
+                    part.push(0);
+                    if !alt.plain().is_empty() {
+                        self.indexed(item, &part, alt.plain(), alt.plain_prefixes());
+                    }
+                    if !title.is_empty() {
+                        part.pop();
+                        part.push(1);
+                        self.plain(item, &part, Arc::from(title.as_str()));
+                    }
                 }
                 markdown::Item::Rule => {}
             }
@@ -230,21 +255,37 @@ impl Builder {
             .map(|(index, block)| (block.identity, index))
             .collect();
         let plain_bytes = self.read.blocks.iter().map(|block| block.plain.len()).sum();
-        let prefix_hashes = self.read.blocks.iter().map(|block| {
-            if let Some(prefixes)=self.prefixes.get(&block.identity) {return (block.identity,prefixes.clone());}
-            if let Some(previous) = previous
-                && previous.text(block.identity).is_some_and(|plain| Arc::ptr_eq(&plain, &block.plain))
-                && let Some(prefixes) = previous.prefix_hashes.get(&block.identity) {
-                return (block.identity, prefixes.clone());
-            }
-            let mut hash = blake3::Hasher::new();
-            let mut prefixes = vec![*hash.finalize().as_bytes()];
-            for chunk in block.plain.as_bytes().chunks_exact(4096) {
-                hash.update(chunk); prefixes.push(*hash.finalize().as_bytes());
-            }
-            (block.identity, Arc::new(prefixes))
-        }).collect();
-        Arc::new(Catalog { read: self.read, positions, plain_bytes, prefix_hashes })
+        let prefix_hashes = self
+            .read
+            .blocks
+            .iter()
+            .map(|block| {
+                if let Some(prefixes) = self.prefixes.get(&block.identity) {
+                    return (block.identity, prefixes.clone());
+                }
+                if let Some(previous) = previous
+                    && previous
+                        .text(block.identity)
+                        .is_some_and(|plain| Arc::ptr_eq(&plain, &block.plain))
+                    && let Some(prefixes) = previous.prefix_hashes.get(&block.identity)
+                {
+                    return (block.identity, prefixes.clone());
+                }
+                let mut hash = blake3::Hasher::new();
+                let mut prefixes = vec![*hash.finalize().as_bytes()];
+                for chunk in block.plain.as_bytes().chunks_exact(4096) {
+                    hash.update(chunk);
+                    prefixes.push(*hash.finalize().as_bytes());
+                }
+                (block.identity, Arc::new(prefixes))
+            })
+            .collect();
+        Arc::new(Catalog {
+            read: self.read,
+            positions,
+            plain_bytes,
+            prefix_hashes,
+        })
     }
 }
 
@@ -253,15 +294,22 @@ mod tests {
     use super::*;
     #[test]
     fn worker_prepared_prefix_checkpoints_are_adopted_without_body_hashing() {
-        let plain:Arc<str>="prepared λ paragraph ".repeat(100_000).into();
-        let source=super::super::super::reader_source::Source::new(&plain);
-        let prefixes=source.prefixes();
-        let mut builder=Catalog::builder();builder.indexed("source",&[0],plain.clone(),prefixes.clone());
-        let catalog=builder.finish();let identity=identity("source",&[0]);
-        assert!(Arc::ptr_eq(&catalog.prefix_hashes[&identity],&prefixes));
-        let mut reference=Catalog::builder();reference.plain("source",&[0],plain.clone());let reference=reference.finish();
-        for byte in [0,4095,8192,plain.len()] {
-            if plain.is_char_boundary(byte) {let point=Endpoint{identity,byte};assert_eq!(catalog.fingerprint(point),reference.fingerprint(point));}
+        let plain: Arc<str> = "prepared λ paragraph ".repeat(100_000).into();
+        let source = super::super::super::reader_source::Source::new(&plain);
+        let prefixes = source.prefixes();
+        let mut builder = Catalog::builder();
+        builder.indexed("source", &[0], plain.clone(), prefixes.clone());
+        let catalog = builder.finish();
+        let identity = identity("source", &[0]);
+        assert!(Arc::ptr_eq(&catalog.prefix_hashes[&identity], &prefixes));
+        let mut reference = Catalog::builder();
+        reference.plain("source", &[0], plain.clone());
+        let reference = reference.finish();
+        for byte in [0, 4095, 8192, plain.len()] {
+            if plain.is_char_boundary(byte) {
+                let point = Endpoint { identity, byte };
+                assert_eq!(catalog.fingerprint(point), reference.fingerprint(point));
+            }
         }
     }
     #[test]
