@@ -616,50 +616,6 @@ impl HostState {
         self.chat_observer_stamps.insert(id, (instance, stamp));
     }
 
-    /// Called under HostLock with the callback's private actor incarnation.
-    /// A late callback cannot enrich a successor that reused its numeric ID.
-    pub(super) fn observe_chat_directory_thread(
-        &mut self,
-        id: TerminalId,
-        instance: uuid::Uuid,
-    ) -> Result<(), String> {
-        let Some(record) = self
-            .chats
-            .get(&id)
-            .filter(|record| record.execution_instance == instance)
-        else {
-            return Ok(());
-        };
-        let Some(thread) = record.handle.confirmed_session_id() else {
-            return Ok(());
-        };
-        if record.session.launch.session_id.as_ref() == Some(&thread) {
-            return Ok(());
-        }
-        if self
-            .directory_thread_retry
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
-            return Ok(());
-        }
-        let mut source = record.session.clone();
-        source.launch.session_id = Some(thread);
-        if let Some(registry) = self.model.as_mut() {
-            if let Err(error) = registry.observe_owned_session_thread(
-                &crate::agent_execution::HostedSession::Chat(source.clone()),
-            ) {
-                self.directory_thread_retry = Some(Instant::now() + Duration::from_secs(1));
-                return Err(error);
-            }
-        }
-        self.directory_thread_retry = None;
-        self.chats
-            .get_mut(&id)
-            .expect("actor held under HostLock")
-            .session = source;
-        Ok(())
-    }
-
     /// How many hosted agents are working, and how many are waiting on the
     /// user, across running terminals and native conversations.
     pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
@@ -897,6 +853,7 @@ impl HostState {
                             || self.spawning.contains(id)
                             || self.browser_logins_spawning.contains(id)
                             || self.chat_spawning.contains_key(id)
+                            || self.native_actor_startups.contains_key(id)
                             || self.chat_bindings.contains_key(id)
                             || self.native_closing.contains_key(id)
                             || self.upgrade_chats.contains_key(id)

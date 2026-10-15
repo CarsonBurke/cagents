@@ -4663,45 +4663,41 @@ pub(super) fn close_for_terminal(
 /// Close only the actor inspected before leaving the host lock. A replacement
 /// with the same durable ID must not be stopped or retired by an old receipt.
 pub(super) fn close_terminal_actor(
-    host: &SharedHost,
-    terminal_id: TerminalId,
-    handle: &Handle,
+    host: &SharedHost, terminal_id: TerminalId, handle: &Handle,
+) -> Result<(), ProtocolError> {
+    close_terminal_actor_inner(host, terminal_id, handle, None)
+}
+
+/// Preserve the ordinary close's lifecycle and registry admission for bounded
+/// cleanup too. A deadline grants no additional actor or successor authority.
+pub(super) fn close_terminal_actor_until(
+    host: &SharedHost, terminal_id: TerminalId, handle: &Handle, deadline: Instant,
+) -> Result<(), ProtocolError> {
+    close_terminal_actor_inner(host, terminal_id, handle, Some(deadline))
+}
+
+fn close_terminal_actor_inner(
+    host: &SharedHost, terminal_id: TerminalId, handle: &Handle, deadline: Option<Instant>,
 ) -> Result<(), ProtocolError> {
     let transition = restart::transition_gate(host, terminal_id);
     let _transition = match transition.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return Err(unavailable(
-                "The paired conversation is restarting; its owner was retained. Retry close after that transition finishes",
-            ));
-        }
+        Err(std::sync::TryLockError::WouldBlock) => return Err(unavailable(
+            "The paired conversation is restarting; its owner was retained. Retry close after that transition finishes")),
     };
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .chats
-            .get(&terminal_id)
-            .filter(|record| record.handle.same_actor(handle))
+        state.chats.get(&terminal_id).filter(|record| record.handle.same_actor(handle))
             .map(|record| record.session.clone())
     };
     if let Some(source) = &source {
         super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
     }
-    handle.close().map_err(unavailable)?;
-    retire_terminal_actor(host, terminal_id, handle)
-}
-
-/// A source-checked terminal close must release control admission even when
-/// provider cleanup is stuck. Deadline failure keeps this exact actor record
-/// available for an explicit retry; it never grants replacement authority.
-pub(super) fn close_terminal_actor_until(
-    host: &SharedHost,
-    terminal_id: TerminalId,
-    handle: &Handle,
-    deadline: Instant,
-) -> Result<(), ProtocolError> {
-    handle.close_until(deadline).map_err(unavailable)?;
+    match deadline {
+        Some(deadline) => handle.close_until(deadline).map_err(unavailable)?,
+        None => handle.close().map_err(unavailable)?,
+    }
     retire_terminal_actor(host, terminal_id, handle)
 }
 
