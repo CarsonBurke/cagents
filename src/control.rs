@@ -1887,6 +1887,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::AgentActivity { .. } => "agent_activity",
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
+        ServerResponse::ProjectOperation { .. } => "project operation",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",

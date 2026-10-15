@@ -177,6 +177,18 @@ pub(crate) fn repair(relocation: &Relocation, worktrees: &[PathBuf]) -> Result<(
     RepairPlan::prepare(relocation,worktrees)?.apply_remaining()
 }
 
+/// Disposable Git fixtures must never inherit a user's redirected config,
+/// command-config injection, template hooks, index, or repository selection.
+#[cfg(test)]
+pub(crate) fn fixture_git_command(directory:&Path,arguments:impl IntoIterator<Item=impl Into<std::ffi::OsString>>)->crate::repository::CommandSpec {
+    let mut command=crate::repository::CommandSpec::new("git").cwd(directory);
+    for (key,_) in std::env::vars_os().filter(|(key,_)|key.as_encoded_bytes().starts_with(b"GIT_")) {command=command.env_remove(key);}
+    command.args(["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null","-c","init.templateDir=","-c","commit.gpgsign=false","-c","user.name=Fixture","-c","user.email=fixture@example.invalid"])
+        .args(arguments).env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_TEMPLATE_DIR","")
+        .timeout(std::time::Duration::from_secs(5)).output_limits(1024*1024,1024*1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,12 +199,7 @@ mod tests {
         let fixture=tempfile::tempdir().unwrap();let old=fixture.path().join("old");
         let moved=fixture.path().join("moved");let common=fixture.path().join("metadata.git");
         let git=|directory:&Path,args:Vec<String>| {
-            let command=CommandSpec::new("git").cwd(directory)
-                .args(["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null"])
-                .args(args).env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR")
-                .env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
-                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
-                .timeout(std::time::Duration::from_secs(5)).output_limits(1024*1024,1024*1024);
+            let command=fixture_git_command(directory,args);
             SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap().require_success(&command.program).unwrap()
         };
         git(fixture.path(),vec!["init".into(),"--separate-git-dir".into(),common.to_string_lossy().into_owned(),old.to_string_lossy().into_owned()]);
@@ -249,11 +256,9 @@ mod tests {
         let fixture=tempfile::tempdir().unwrap();
         let primary=fixture.path().join("primary");let old=fixture.path().join("linked");let moved=fixture.path().join("moved");
         let git=|directory:&Path,args:&[&str]| {
-            let output=std::process::Command::new("git").current_dir(directory)
-                .env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
-                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
-                .args(["-c","core.fsmonitor=false","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","-c","user.name=Fixture","-c","user.email=fixture@example.invalid"]).args(args).output().unwrap();
-            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));output
+            use crate::repository::{CancellationToken,ProcessExecutor,SystemProcessExecutor};
+            let command=fixture_git_command(directory,args.iter().copied());
+            SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap().require_success(&command.program).unwrap()
         };
         git(fixture.path(),&["init","-b","main",primary.to_str().unwrap()]);
         git(&primary,&["commit","--allow-empty","-m","fixture"]);

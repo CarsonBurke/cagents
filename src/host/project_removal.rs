@@ -506,10 +506,7 @@ mod tests {
         let old=fixture.root.clone();let moved=fixture._directory.path().join("moved");
         let common=fixture._directory.path().join("metadata.git");
         let git=|directory:&std::path::Path,args:Vec<String>| {
-            let command=CommandSpec::new("git").cwd(directory).args(["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null"])
-                .args(args).env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
-                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
-                .timeout(Duration::from_secs(5)).output_limits(1024*1024,1024*1024);
+            let command=crate::project_recovery::git_repair::fixture_git_command(directory,args);
             SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap().require_success(&command.program).unwrap()
         };
         git(fixture._directory.path(),vec!["init".into(),"--separate-git-dir".into(),common.to_string_lossy().into_owned(),old.to_string_lossy().into_owned()]);
