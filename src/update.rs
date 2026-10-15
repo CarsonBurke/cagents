@@ -3,6 +3,7 @@
 mod candidate;
 mod confirmation;
 mod installed;
+pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
 use std::{
