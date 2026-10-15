@@ -4241,6 +4241,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok((output, truncated))
     }
 
+    /// A bounded read-only status projection for sidebar/watch presentation.
+    /// Counts are lower bounds when `listing_truncated` is true. This result
+    /// must never authorize all-path mutations or deletion safety decisions;
+    /// those callers continue to use the complete `status` read.
+    pub fn status_projection(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        self.status_listing(worktree, untracked, Some(limit.clamp(1, 100_000)), cancellation)
+    }
+
     fn status_listing(&self, worktree: &Path, untracked: bool, limit: Option<usize>, cancellation: &CancellationToken) -> Result<StatusSnapshot, RepositoryError> {
         let command = self.status_command_with_untracked(worktree, untracked);
         let (output, truncated) = self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
@@ -7902,7 +7916,7 @@ mod tests {
         assert!(stdout.len() > 16 * 1024 * 1024);
         let executor = Arc::new(FakeExecutor::with_outputs(vec![success(&stdout)]));
         let service = RepositoryService::new("git", executor.clone());
-        let status = service.status_listing(Path::new("/repo"), true, Some(10_000), &CancellationToken::new()).unwrap();
+        let status = service.status_projection(Path::new("/repo"), true, 10_000, &CancellationToken::new()).unwrap();
         assert!(status.listing_truncated);
         assert_eq!(status.entries.len(), 10_000);
         let command = &executor.commands.lock().unwrap()[0];
