@@ -50,6 +50,9 @@ struct Deletion {
 }
 
 impl State {
+    pub(super) fn show_setup_review(&mut self, review: super::worktree_setup_ui::Review) {
+        self.dialog = None; self.remove_dialog = None; self.setup_review = Some(review);
+    }
     pub(super) fn is_reopening(&self, repository: &Path) -> bool {
         self.reopening.values().any(|path| path == repository)
     }
@@ -188,10 +191,10 @@ pub enum Action {
         command: ProjectCommand,
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
-    SetupReviewLoaded { request: crate::model::OperationId, result: Result<(super::worktree_setup_ui::SetupIntent, bool), String> },
+    SetupReviewLoaded { request: crate::model::OperationId, result: Result<super::worktree_setup_ui::ReviewSnapshot, String> },
     SetupReviewTrust(bool),
     ConfirmSetupReview { skip: bool },
-    SetupReviewReady { request: crate::model::OperationId, result: Result<(crate::model::OperationId, PathBuf, super::worktree_setup_ui::SetupIntent), String> },
+    SetupReviewReady { request: crate::model::OperationId, result: Result<super::worktree_setup_ui::ReviewCompletion, String> },
     ConfirmDelete,
     ConfirmRemove,
     RemovedProject {
