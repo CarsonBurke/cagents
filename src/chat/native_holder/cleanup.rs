@@ -87,9 +87,103 @@ pub(crate) fn actor_close_proved(
     record: &Record,
     proof: &HostSessionProof,
 ) -> Result<bool, String> {
+    // The sole caller recovers a lost provider-Close reply, then independently
+    // authenticates its exact final ActorIdentity snapshot. Semantic/helper
+    // retirement remains a separate operation and receipt.
+    if read_actor_provider_close(record, proof)?.is_some() { return Ok(true); }
+    // Preserve the existing fully-retired receipt retry after discovery is
+    // gone. This path retains consume's original retirement requirement.
     consume(record.terminal, &record.holder, true, |receipt| {
         receipt.record == *record && receipt.proof == *proof
     })
+}
+
+/// Authenticated provider-family closure from one exact retained actor. The
+/// helper may still own its journal/Store and discovery record. This evidence
+/// grants neither semantic retirement nor permission to discard that owner.
+pub(crate) struct ActorProviderClosed {
+    receipt: Receipt,
+    source: [u8; 32],
+}
+impl ActorProviderClosed {
+    pub(crate) fn paired_closed(&self) -> bool { self.receipt.paired_closed }
+}
+
+pub(crate) fn actor_provider_closed(
+    record: &Record,
+    source: &crate::chat::Session,
+    proof: &HostSessionProof,
+) -> Result<Option<ActorProviderClosed>, String> {
+    if source.id != record.terminal {
+        return Err("Actor provider-close evidence names another conversation".into());
+    }
+    let digest = source_digest(source)?;
+    Ok(read_actor_provider_close(record, proof)?.filter(|receipt| receipt.sources.contains(&digest))
+        .map(|receipt| ActorProviderClosed { receipt, source: digest }))
+}
+
+/// Called only after the actual paired owner has proved cleanup. Re-read the
+/// exact phase evidence before updating it; a replacement or changed receipt
+/// cannot acquire the earlier close's pair acknowledgement.
+pub(crate) fn confirm_actor_pair_closed(closed: ActorProviderClosed) -> Result<(), String> {
+    let paired_was_closed = closed.paired_closed();
+    let previous = closed.receipt;
+    let mut current = read_actor_provider_close(&previous.record, &previous.proof)?
+        .ok_or("The exact actor provider-close evidence is unavailable")?;
+    if current.record != previous.record || current.proof != previous.proof
+        || current.sources != previous.sources || current.paired_holder != previous.paired_holder
+        || !current.sources.contains(&closed.source)
+        || paired_was_closed && !current.paired_closed
+    {
+        return Err("Actor provider-close evidence changed before paired cleanup was recorded".into());
+    }
+    if current.paired_closed { return Ok(()); }
+    current.paired_closed = true;
+    save(&path(current.record.terminal, &current.record.holder)?, &current)
+}
+
+fn read_actor_provider_close(record: &Record, proof: &HostSessionProof) -> Result<Option<Receipt>, String> {
+    if record.version != 4 || !registry::record_application_matches(record)
+        || !crate::chat::runtime::Handle::is_remote_record(record)
+        || !proof.is_complete() || record.boot != proof.boot_id
+    {
+        return Err("Provider-close evidence requires an exact retained actor and complete daemon proof".into());
+    }
+    let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+    if crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?
+        != std::process::id()
+    {
+        return Err("Actor provider-close caller no longer owns the daemon lease".into());
+    }
+    let directory = registry::directory(Kind::Native)?;
+    let socket = registry::socket(&directory, record.terminal);
+    let before = registry::evidence(&socket, Kind::Native)?;
+    if before.as_ref().is_some_and(|current| current != record) {
+        return Err("A replacement retained actor exists; its provider was preserved".into());
+    }
+    if before.is_none() { return Ok(None); }
+    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record.terminal, &record.holder)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024 + 1).read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+    if bytes.len() > 256 * 1024 { return Err("Actor provider-close evidence is oversized".into()); }
+    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if receipt.record != *record || receipt.proof != *proof || receipt.sources.is_empty() {
+        return Err("Actor provider-close evidence belongs to another exact owner or daemon".into());
+    }
+    if registry::evidence(&socket, Kind::Native)? != before {
+        return Err("Retained actor discovery changed while reading provider-close evidence".into());
+    }
+    if crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?
+        != std::process::id()
+    {
+        return Err("Actor provider-close daemon authority changed while reading evidence".into());
+    }
+    Ok(Some(receipt))
 }
 
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {

@@ -387,7 +387,13 @@ pub(super) fn close_retained_inner_then(host: &SharedHost, source: &Session, res
             }
             state.retire_terminal(pair.holder.terminal);
         }
-        chat::native_holder::confirm_pair_closed(source, &proof)?;
+        if let NativeOwner::Actor { record, .. } = &pending.owner {
+            let closed = chat::native_holder::actor_provider_closed(record, source, &proof)?
+                .ok_or("The exact retained actor has no provider-close evidence for this descriptor")?;
+            chat::native_holder::confirm_actor_pair_closed(closed)?;
+        } else {
+            chat::native_holder::confirm_pair_closed(source, &proof)?;
+        }
         if let NativeOwner::Actor { handle, .. } = &pending.owner {
             retained_actor::finish_close(host, handle, source)?;
         }
