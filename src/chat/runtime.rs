@@ -2712,9 +2712,13 @@ fn provider_exit_diagnostic(
     } else {
         " Restart session to continue."
     };
-    let detail = if error.to_lowercase().contains("tungstenite")
-        || error.to_lowercase().contains("inspect")
-    {
+    let transport_boilerplate = |message: &str| {
+        let lower = message.to_lowercase();
+        lower.contains("tungstenite")
+            || lower.contains("inspect the exact thread")
+            || lower.contains("inspect exact thread")
+    };
+    let detail = if transport_boilerplate(error) {
         "Provider connection closed".into()
     } else {
         super::protocol::preview(error.as_bytes(), 240)
@@ -2727,9 +2731,8 @@ fn provider_exit_diagnostic(
     let lines: Vec<_> = output
         .lines()
         .filter(|line| {
-            let line=line.trim();
-            let lower=line.to_lowercase();
-            !line.is_empty() && !lower.contains("tungstenite") && !lower.contains("inspect")
+            let line = line.trim();
+            !line.is_empty() && !transport_boilerplate(line)
         })
         .rev()
         .take(3)
@@ -3854,6 +3857,27 @@ mod tests {
         assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
         assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
         assert_eq!(diagnostic.output,stderr,"saved readable output must remain faithful to provider diagnostics");
+    }
+
+    #[test]
+    fn compact_provider_notice_preserves_inspection_failures_with_or_without_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+        let cause = "Configuration inspection failed: permission denied";
+        let stderr = format!("{cause}\n");
+        let diagnostic = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(3 << 8)),
+            "socket closed",
+            &stderr,
+        );
+        assert!(diagnostic.summary.contains(cause));
+        assert_eq!(diagnostic.output, stderr);
+        let without_stderr = provider_exit_diagnostic(None, cause, "");
+        assert!(without_stderr.summary.contains(cause));
+        for boilerplate in ["inspect the exact thread before recovery", "inspect exact thread before recovery"] {
+            let diagnostic = provider_exit_diagnostic(None, boilerplate, boilerplate);
+            assert!(!diagnostic.summary.to_lowercase().contains(boilerplate));
+            assert_eq!(diagnostic.output, boilerplate);
+        }
     }
 
     #[test]
