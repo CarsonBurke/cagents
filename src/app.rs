@@ -13271,7 +13271,7 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut terminal_visual_only = false;
+        let mut metadata_unchanged = false;
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
@@ -13320,7 +13320,11 @@ impl Application for Cagents {
             Message::HostedTerminalsObserved(terminals) => {
                 self.observe_hosted_descriptors(terminals)
             }
-            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
+            Message::WorkspaceModelObserved(update) => {
+                let (task, changed) = self.apply_workspace_model_update_effect(update);
+                metadata_unchanged = !changed;
+                task
+            }
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -13354,7 +13358,7 @@ impl Application for Cagents {
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
                 let (task, metadata_changed) = self.drain_terminal_update(card, generation);
-                terminal_visual_only = !metadata_changed;
+                metadata_unchanged = !metadata_changed;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -16469,7 +16473,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        if !terminal_visual_only {
+        if !metadata_unchanged {
             self.sync_notification_presence();
             self.sync_worktree_protections();
             self.sync_popup_keyboard_nav();
@@ -16491,7 +16495,7 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        if terminal_visual_only {
+        if metadata_unchanged {
             return Task::batch([
                 task,
                 self.reconcile_notice_popup(),
