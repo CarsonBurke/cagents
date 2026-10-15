@@ -2689,13 +2689,20 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
-        let session = crate::chat::fresh_session(
+        let mut session = crate::chat::fresh_session(
             Provider::Claude,
             crate::model::TerminalId::new(),
             automation.definition.agent.target.directory.clone(),
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
+        // A completed hosted run has an authenticated live descriptor, unlike
+        // the pre-host recipe returned by fresh_session.
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("automation-fixture"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("host"),
+        });
         let agent = registry
             .bind_agent(accepted.agent.id, None, HostedSession::Chat(session))
             .unwrap();
