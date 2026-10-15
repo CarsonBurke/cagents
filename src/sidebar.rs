@@ -6866,7 +6866,7 @@ fn change_context_controls<'a>(
     if blocked {
         return content;
     }
-    let mut entries = vec![
+    let mut entries: Vec<widget::menu::Item<ChangeContextCommand<'_>, String>> = vec![
         widget::menu::Item::Button(
             "Open file".into(),
             None,
@@ -11817,12 +11817,29 @@ mod row_interaction {
                         }
                     }
                     Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(character),
+                        modifiers,
+                        ..
+                    }) if state.focused && modifiers.is_empty() && character.as_str() == " " => {
+                        shell.publish(SidebarAction::InvokeChangeRows {
+                            key: key.clone(),
+                            row: row.clone(),
+                            command: if row.area == super::ChangeArea::Staged {
+                                super::ChangeGroupCommand::Unstage
+                            } else {
+                                super::ChangeGroupCommand::Stage
+                            },
+                        });
+                        shell.capture_event();
+                        return;
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(named),
                         modifiers,
                         ..
                     }) if state.focused => {
                         let action = match named {
-                            keyboard::key::Named::Space | keyboard::key::Named::Enter
+                            keyboard::key::Named::Enter
                                 if modifiers.is_empty() =>
                             {
                                 Some(SidebarAction::InvokeChangeRows {

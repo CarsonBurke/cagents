@@ -1699,8 +1699,8 @@ mod tests {
     }
     #[test]
     fn mutation_deferral_preserves_sibling_reads_and_the_final_pending_change() {
-        let active = WorktreeId(Uuid::from_u128(501));
-        let sibling = WorktreeId(Uuid::from_u128(502));
+        let active = WorktreeId::from_uuid(uuid::Uuid::from_u128(501));
+        let sibling = WorktreeId::from_uuid(uuid::Uuid::from_u128(502));
         let mut change = git_watch::Change {
             worktrees: BTreeSet::from([active, sibling]),
             metadata: true,
