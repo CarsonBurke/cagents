@@ -10596,49 +10596,56 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
 
 pub use crate::worktree_cleanup::RemovedWorktree;
 
-/// Releases the identities held by the applied creations of `removed`.
-///
-/// An applied creation keeps its identity so that a replay of the request
-/// cannot run while what it made exists. Once the user has deleted the
-/// worktree there is nothing left to protect, and holding on would refuse
-/// creating the same worktree again for good (#269).
-///
-/// A creation is known to have made `removed` by the administrative
-/// directory it recorded, which follows the worktree wherever it was moved
-/// and is never shared by two live worktrees, so a creation whose worktree
-/// still exists is never released. A creation recorded before that directory
-/// was must have been made at the removed path on the branch the removed
-/// worktree had checked out; Git refuses checking a branch out twice, so its
-/// worktree cannot be live elsewhere on that branch. A worktree removed
-/// outside the app keeps its creation's identity: nothing here saw the user
-/// ask for that.
-///
-/// Every matching creation is attempted; the failures are returned.
-pub fn release_deleted_worktree_creations(
-    store: &StateStore,
-    removed: &RemovedWorktree,
-) -> Result<(), Vec<StoreError>> {
-    let mut failures = Vec::new();
-    let operations = store
-        .journaled_worktree_operations()
-        .map_err(|error| vec![error])?;
-    for operation in operations {
-        if operation.status != PendingOperationStatus::Applied {
-            continue;
+/// Descriptive creation rows captured before a removal, bound to the same
+/// original Store. This grants no filesystem or deletion authority.
+pub struct WorktreeCreationRetirements {
+    store: Arc<StateStore>,
+    planned: RemovedWorktree,
+    candidates: Vec<PendingOperation>,
+}
+
+/// Capture before effects, never from a delayed Removed reply. Unknown or
+/// malformed historical rows stay retained; later new rows are not candidates.
+pub fn capture_worktree_creation_retirements(
+    store: Arc<StateStore>,
+    planned: &RemovedWorktree,
+) -> Result<WorktreeCreationRetirements, StoreError> {
+    let candidates = store.worktree_creation_retirement_candidates()?.into_iter()
+        .filter(|operation| operation.status == PendingOperationStatus::Applied)
+        .filter(|operation| serde_json::from_value::<WorktreeJournal>(operation.payload.clone())
+            .is_ok_and(|journal| journal.created(planned))).collect();
+    Ok(WorktreeCreationRetirements { store, planned: planned.clone(), candidates })
+}
+impl WorktreeCreationRetirements {
+    /// Known removal is preserved even if this bookkeeping CAS refuses.
+    pub fn finish(self, removed: &RemovedWorktree) -> Result<(), Vec<StoreError>> {
+        if self.planned != *removed {
+            return Err(vec![StoreError::InvalidState("The removed worktree differs from the pre-effect creation snapshot; metadata was kept".into())]);
         }
-        let Ok(journal) = serde_json::from_value::<WorktreeJournal>(operation.payload) else {
-            continue;
-        };
-        if journal.created(removed)
-            && let Err(error) = store.release_worktree_creation(operation.id)
-        {
-            failures.push(error);
-        }
+        let failures = self.candidates.iter().filter_map(|expected|
+            self.store.release_captured_worktree_creation(expected).err()).collect::<Vec<_>>();
+        if failures.is_empty() { Ok(()) } else { Err(failures) }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures)
+}
+
+impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Local worker convenience for the original Store. These are metadata
+    /// candidates only; the independently inspected deletion still authorizes
+    /// all effects. Remote paths must never use a local system executor here.
+    pub fn creation_retirements_before_removal(
+        &self, store: Arc<StateStore>, repository: &Path, path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<WorktreeCreationRetirements, String> {
+        let path = path.canonicalize().map_err(|error| error.to_string())?;
+        let record = self.list_worktrees(repository, cancellation).map_err(|error| error.to_string())?
+            .into_iter().find(|record| !record.bare && record.path == path)
+            .ok_or("The selected worktree is no longer registered")?;
+        let planned = RemovedWorktree {
+            common_dir: self.common_dir(repository, cancellation).map_err(|error| error.to_string())?,
+            admin_dir: self.git_dir(&path, cancellation).map_err(|error| error.to_string())?,
+            path, branch: record.branch,
+        };
+        capture_worktree_creation_retirements(store, &planned).map_err(|error| error.to_string())
     }
 }
 
@@ -10769,7 +10776,7 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 
 impl WorktreeJournal {
     /// Whether this creation made `removed`; see
-    /// [`release_deleted_worktree_creations`].
+    /// [`capture_worktree_creation_retirements`].
     fn created(&self, removed: &RemovedWorktree) -> bool {
         if self.common_dir != removed.common_dir {
             return false;
@@ -11700,9 +11707,32 @@ mod worktree_journal_tests {
 
     struct Fixture {
         directory: tempfile::TempDir,
-        store: StateStore,
+        store: Arc<StateStore>,
         request: CreateWorktreeRequest,
         service: RepositoryService,
+    }
+
+    fn fixture_git_command(repository: &Path) -> Command {
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .arg("-C")
+            .arg(repository)
+            .args([
+                "-c", "user.name=Test",
+                "-c", "user.email=test@example.invalid",
+                "-c", "commit.gpgsign=false",
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "init.templateDir=",
+            ])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
     }
 
     impl Fixture {
@@ -11711,12 +11741,8 @@ mod worktree_journal_tests {
             let repository = directory.path().join("repo");
             fs::create_dir(&repository).unwrap();
             let git = |arguments: &[&str]| {
-                let output = Command::new("git")
-                    .arg("-C")
-                    .arg(&repository)
+                let output = fixture_git_command(&repository)
                     .args(arguments)
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
                     .output()
                     .unwrap();
                 assert!(
@@ -11758,7 +11784,7 @@ mod worktree_journal_tests {
             };
             Self {
                 directory,
-                store,
+                store: Arc::new(store),
                 request,
                 service: RepositoryService::system("git"),
             }
@@ -11808,22 +11834,8 @@ mod worktree_journal_tests {
         }
 
         fn git(&self, arguments: &[&str]) -> String {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&self.request.repository)
-                .args([
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ])
+            let output = fixture_git_command(&self.request.repository)
                 .args(arguments)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .output()
                 .unwrap();
             assert!(
@@ -11905,9 +11917,10 @@ mod worktree_journal_tests {
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         let destination = fixture.request.destination.clone();
         let removed = fixture.removal(&destination);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
-        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
+        retirements.finish(&removed).unwrap();
         assert!(
             !fixture.holds(report.operation_id),
             "the applied creation still holds its identity"
@@ -11941,7 +11954,7 @@ mod worktree_journal_tests {
 
         let mut other_repository = fixture.removal(&destination);
         other_repository.common_dir = PathBuf::from("/elsewhere/.git");
-        release_deleted_worktree_creations(&fixture.store, &other_repository).unwrap();
+        capture_worktree_creation_retirements(fixture.store.clone(), &other_repository).unwrap().finish(&other_repository).unwrap();
         assert!(
             fixture.holds(doomed.operation_id),
             "another repository's deletion released this creation"
@@ -11964,26 +11977,77 @@ mod worktree_journal_tests {
             moved_from.to_str().unwrap(),
         ]);
         let squatter = fixture.removal(&moved_from);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &squatter).unwrap();
         fixture.git(&["worktree", "remove", moved_from.to_str().unwrap()]);
-        release_deleted_worktree_creations(&fixture.store, &squatter).unwrap();
+        retirements.finish(&squatter).unwrap();
         assert!(
             fixture.holds(moved.operation_id),
             "deleting the worktree at its old path released the live creation"
         );
 
         let removed = fixture.removal(&destination);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
-        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
+        retirements.finish(&removed).unwrap();
         assert!(!fixture.holds(doomed.operation_id));
         assert!(fixture.holds(moved.operation_id));
 
         let removed = fixture.removal(&moved_to);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", moved_to.to_str().unwrap()]);
-        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
+        retirements.finish(&removed).unwrap();
         assert!(
             !fixture.holds(moved.operation_id),
             "deleting the moved worktree kept its creation's identity"
         );
+    }
+
+    #[test]
+    fn delayed_deletion_does_not_retire_a_new_creation_that_reuses_its_names() {
+        let mut fixture = Fixture::new();
+        fixture.resolve(fixture.input("foo"));
+        let original = fixture.run(&CancellationToken::new());
+        assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+        let destination = fixture.request.destination.clone();
+        let removed = fixture.removal(&destination);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+
+        fixture.resolve(fixture.input("bar"));
+        fixture.request.destination = destination.clone();
+        let replacement = fixture.run(&CancellationToken::new());
+        assert_eq!(replacement.state, WorktreeOperationState::Created, "{replacement:?}");
+        let current = fixture.removal(&destination);
+        assert_eq!(current.common_dir, removed.common_dir);
+        assert_eq!(current.admin_dir, removed.admin_dir, "exercise actual Git administrative-name reuse");
+        assert_ne!(current.branch, removed.branch);
+
+        retirements.finish(&removed).unwrap();
+        assert!(!fixture.holds(original.operation_id));
+        assert!(fixture.holds(replacement.operation_id), "a delayed reply retired the newer creation");
+        assert!(destination.join("tracked.txt").is_file());
+    }
+
+    #[test]
+    fn changed_creation_receipt_is_retained_after_known_removal() {
+        let mut fixture = Fixture::new();
+        fixture.resolve(fixture.input("foo"));
+        let original = fixture.run(&CancellationToken::new());
+        assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+        let destination = fixture.request.destination.clone();
+        let removed = fixture.removal(&destination);
+        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let row = fixture.store.journaled_worktree_operation(original.operation_id).unwrap().unwrap();
+        let mut updated = row.payload.clone();
+        updated["detail"] = serde_json::Value::String("newer creation evidence".into());
+        fixture.store.update_operation(row.id, &row.payload, &updated, PendingOperationStatus::Applied).unwrap();
+        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+
+        assert!(retirements.finish(&removed).is_err());
+        assert!(!destination.exists(), "bookkeeping failure must not erase known removal");
+        let retained = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
+        assert_eq!(retained.payload, updated);
+        assert_eq!(retained.status, PendingOperationStatus::Applied);
     }
 
     /// A creation journaled before administrative directories were recorded
