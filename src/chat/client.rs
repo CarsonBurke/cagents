@@ -88,7 +88,10 @@ struct PendingReply {
     sender: crossbeam_channel::Sender<CommandResult>,
 }
 impl PendingReply {
-    fn try_send(&self, result: CommandResult) -> Result<(), crossbeam_channel::TrySendError<CommandResult>> {
+    fn try_send(
+        &self,
+        result: CommandResult,
+    ) -> Result<(), crossbeam_channel::TrySendError<CommandResult>> {
         self.sender.try_send(result)
     }
 }
@@ -215,9 +218,10 @@ fn valid_restart_attachment(
         && receipt.source() == expected
         && receipt.replacement().proof.as_ref() == Some(proof)
         && snapshot.session_id == receipt.replacement().launch.session_id
-        && binding.is_some_and(|binding|
+        && binding.is_some_and(|binding| {
             valid_source_binding(binding, receipt.replacement(), instance, proof)
-                && &binding.source == receipt.replacement())
+                && &binding.source == receipt.replacement()
+        })
 }
 
 struct Inner {
@@ -405,11 +409,21 @@ fn receive(
 
 // The same deadline is applied before EVERY partial read/write, so a peer
 // dripping one frame cannot renew the retry budget with each socket syscall.
-struct ReturnReplayIo { stream: UnixStream, deadline: Instant }
+struct ReturnReplayIo {
+    stream: UnixStream,
+    deadline: Instant,
+}
 impl ReturnReplayIo {
     fn remaining(&self) -> io::Result<Duration> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {Err(io::Error::new(io::ErrorKind::TimedOut, "The original Return retry deadline elapsed"))} else {Ok(remaining)}
+        if remaining.is_zero() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The original Return retry deadline elapsed",
+            ))
+        } else {
+            Ok(remaining)
+        }
     }
 }
 impl io::Read for ReturnReplayIo {
@@ -428,14 +442,28 @@ impl io::Write for ReturnReplayIo {
         io::Write::flush(&mut self.stream)
     }
 }
-fn return_replay_response(io: &mut ReturnReplayIo, codec: &mut FrameCodec, request: u64, proof: &HostSessionProof) -> Result<ServerResponse, String> {
-    let frame: ServerEnvelope = codec.read(io).map_err(|error| error.to_string())?.ok_or("The original Return daemon disconnected")?;
+fn return_replay_response(
+    io: &mut ReturnReplayIo,
+    codec: &mut FrameCodec,
+    request: u64,
+    proof: &HostSessionProof,
+) -> Result<ServerResponse, String> {
+    let frame: ServerEnvelope = codec
+        .read(io)
+        .map_err(|error| error.to_string())?
+        .ok_or("The original Return daemon disconnected")?;
     io.remaining().map_err(|error| error.to_string())?;
-    if frame.version != PROTOCOL_VERSION || frame.proof != *proof || !frame.proof.is_complete() || frame.request_id != Some(request) {
-        return Err("The original Return retry response changed its protocol, proof or request".into());
+    if frame.version != PROTOCOL_VERSION
+        || frame.proof != *proof
+        || !frame.proof.is_complete()
+        || frame.request_id != Some(request)
+    {
+        return Err(
+            "The original Return retry response changed its protocol, proof or request".into(),
+        );
     }
     match frame.message {
-        ServerMessage::Response {response} => Ok(response),
+        ServerMessage::Response { response } => Ok(response),
         ServerMessage::Error(error) => Err(error.message),
         _ => Err("The original Return retry received an unsolicited payload".into()),
     }
@@ -703,7 +731,10 @@ impl ClientHandle {
             assert_eq!(receipt.source(), resolved);
         }
         let replacement = receipt.replacement().clone();
-        let proof = replacement.proof.clone().expect("complete fixture restart proof");
+        let proof = replacement
+            .proof
+            .clone()
+            .expect("complete fixture restart proof");
         let mut handle = Self::fixture(replacement.clone(), snapshot);
         let inner = Arc::get_mut(&mut handle.inner).unwrap();
         inner.proof = proof.clone();
@@ -712,8 +743,14 @@ impl ClientHandle {
             execution_instance: inner.execution_instance,
             backend: uuid::Uuid::new_v4(),
         };
-        assert!(valid_restart_attachment(&receipt, receipt.source(),
-            inner.snapshot.lock().unwrap().as_ref(), inner.execution_instance, Some(&binding), &proof));
+        assert!(valid_restart_attachment(
+            &receipt,
+            receipt.source(),
+            inner.snapshot.lock().unwrap().as_ref(),
+            inner.execution_instance,
+            Some(&binding),
+            &proof
+        ));
         *inner.source_binding.lock().unwrap() = Some(binding);
         inner.restart_receipt = Some(receipt);
         inner.upgrade_recovery = upgrade_recovery;
@@ -729,8 +766,16 @@ impl ClientHandle {
         expected_host: Option<HostSessionProof>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        Self::connect_on(stream, session, Intent::Restore, expected_host,
-            false, None, None, wake)
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Restore,
+            expected_host,
+            false,
+            None,
+            None,
+            wake,
+        )
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -962,7 +1007,12 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
-        let return_endpoint = stream.peer_addr().ok().and_then(|address| address.as_pathname().filter(|path| path.is_absolute()).map(std::path::Path::to_path_buf));
+        let return_endpoint = stream.peer_addr().ok().and_then(|address| {
+            address
+                .as_pathname()
+                .filter(|path| path.is_absolute())
+                .map(std::path::Path::to_path_buf)
+        });
         stream
             .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -1134,19 +1184,40 @@ impl ClientHandle {
                     }
                     break (session, snapshot, execution_instance, binding, None);
                 }
-                ServerMessage::Response { response: ServerResponse::ChatRestarted {
-                    receipt, snapshot, execution_instance, binding,
-                }} if envelope.request_id == Some(attach_request) => {
-                    let expected_source = restart_source.as_ref().ok_or_else(||
-                        StartFailure::from("A restarted attachment did not answer an original ChatAttach request"))?;
-                    if !valid_restart_attachment(&receipt, expected_source, &snapshot,
-                        execution_instance, binding.as_ref(), &proof) {
+                ServerMessage::Response {
+                    response:
+                        ServerResponse::ChatRestarted {
+                            receipt,
+                            snapshot,
+                            execution_instance,
+                            binding,
+                        },
+                } if envelope.request_id == Some(attach_request) => {
+                    let expected_source = restart_source.as_ref().ok_or_else(|| {
+                        StartFailure::from(
+                            "A restarted attachment did not answer an original ChatAttach request",
+                        )
+                    })?;
+                    if !valid_restart_attachment(
+                        &receipt,
+                        expected_source,
+                        &snapshot,
+                        execution_instance,
+                        binding.as_ref(),
+                        &proof,
+                    ) {
                         return Err("The restarted attachment did not confirm its exact source, actor and replacement binding".into());
                     }
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
                     let session = receipt.replacement().clone();
-                    break (session, snapshot, execution_instance, binding, Some(receipt));
+                    break (
+                        session,
+                        snapshot,
+                        execution_instance,
+                        binding,
+                        Some(receipt),
+                    );
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
@@ -1169,7 +1240,9 @@ impl ClientHandle {
             // chain rather than treating a new paired view as an upgrade alias.
             let confirmed = match restart_receipt.as_ref() {
                 Some(receipt) if receipt.source() == resolved => receipt.replacement(),
-                Some(_) => return Err("The restart did not continue the exact upgrade replacement".into()),
+                Some(_) => {
+                    return Err("The restart did not continue the exact upgrade replacement".into());
+                }
                 None => resolved,
             };
             if &session != confirmed || initial.session_id != confirmed.launch.session_id {
@@ -1581,11 +1654,21 @@ impl ClientHandle {
                 return Err("Chat client command capacity reached".into());
             }
             let kind = match &request {
-                ClientRequest::ChatReturnTerminal { expected, .. } => PendingKind::Handoff(Arc::new(expected.clone())),
-                ClientRequest::ChatClose { .. } | ClientRequest::ChatCloseSession { .. } => PendingKind::Close,
+                ClientRequest::ChatReturnTerminal { expected, .. } => {
+                    PendingKind::Handoff(Arc::new(expected.clone()))
+                }
+                ClientRequest::ChatClose { .. } | ClientRequest::ChatCloseSession { .. } => {
+                    PendingKind::Close
+                }
                 _ => PendingKind::Command,
             };
-            pending.insert(id, PendingReply { kind, sender: reply });
+            pending.insert(
+                id,
+                PendingReply {
+                    kind,
+                    sender: reply,
+                },
+            );
         }
         let result = transmit(&self.inner.wire, &self.inner.proof, id, request).and_then(|()| {
             response
@@ -1617,9 +1700,21 @@ impl ClientHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn publish_source_binding_for_test(&self, binding: crate::terminal_ipc::ChatSourceBinding) {
-        assert!(valid_source_binding(&binding, &self.inner.session, self.inner.execution_instance, &self.inner.proof));
-        *self.inner.source_binding.lock().unwrap_or_else(|p| p.into_inner()) = Some(binding);
+    pub(crate) fn publish_source_binding_for_test(
+        &self,
+        binding: crate::terminal_ipc::ChatSourceBinding,
+    ) {
+        assert!(valid_source_binding(
+            &binding,
+            &self.inner.session,
+            self.inner.execution_instance,
+            &self.inner.proof
+        ));
+        *self
+            .inner
+            .source_binding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(binding);
     }
 
     /// Presentation connection liveness only; this is not native backend or
@@ -1680,37 +1775,79 @@ impl ClientHandle {
         let _replay = match self.inner.return_replay.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Err("The original Return retry is already in progress".into()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err("The original Return retry is already in progress".into());
+            }
         };
-        let endpoint = self.inner.return_endpoint.as_ref().ok_or("The original authenticated Return endpoint is unavailable; no retry was sent")?;
+        let endpoint = self.inner.return_endpoint.as_ref().ok_or(
+            "The original authenticated Return endpoint is unavailable; no retry was sent",
+        )?;
         let deadline = Instant::now() + Duration::from_secs(40);
-        let stream = crate::control::connect_control_socket(endpoint, Duration::from_secs(5)).map_err(|error| error.to_string())?;
+        let stream = crate::control::connect_control_socket(endpoint, Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
         let mut io = ReturnReplayIo { stream, deadline };
         let mut requests = FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES);
         let mut responses = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-        requests.write(&mut io, &ClientEnvelope {
-            version:PROTOCOL_VERSION, request_id:1, proof:None,
-            request:ClientRequest::Connect {expected_host:Some(self.inner.proof.clone()), resume:Vec::new()},
-        }).map_err(|error| error.to_string())?;
+        requests
+            .write(
+                &mut io,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 1,
+                    proof: None,
+                    request: ClientRequest::Connect {
+                        expected_host: Some(self.inner.proof.clone()),
+                        resume: Vec::new(),
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
         match return_replay_response(&mut io, &mut responses, 1, &self.inner.proof)? {
-            ServerResponse::Connected {proof, resumed} if proof == self.inner.proof && resumed.is_empty() => {},
-            _ => return Err("The original Return daemon did not confirm its captured proof".into()),
+            ServerResponse::Connected { proof, resumed }
+                if proof == self.inner.proof && resumed.is_empty() => {}
+            _ => {
+                return Err("The original Return daemon did not confirm its captured proof".into());
+            }
         }
-        requests.write(&mut io, &ClientEnvelope {
-            version:PROTOCOL_VERSION, request_id:2, proof:Some(self.inner.proof.clone()),
-            request:ClientRequest::ChatReturnTerminal {chat_id:self.inner.id, expected:expected.clone()},
-        }).map_err(|error| error.to_string())?;
+        requests
+            .write(
+                &mut io,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 2,
+                    proof: Some(self.inner.proof.clone()),
+                    request: ClientRequest::ChatReturnTerminal {
+                        chat_id: self.inner.id,
+                        expected: expected.clone(),
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
         // Control replay returns only the receipt. Final snapshots never
         // replace the old attachment's cached state or mark it alive again.
         let receipt = match return_replay_response(&mut io, &mut responses, 2, &self.inner.proof)? {
-            ServerResponse::ChatTerminal {chat_id, session, receipt, ..}
-                if chat_id == self.inner.id && session == receipt.terminal.session
-                    && valid_handoff_receipt(&receipt, expected, &self.inner.proof) => receipt,
-            _ => return Err("The original Return retry did not confirm its exact captured receipt".into()),
+            ServerResponse::ChatTerminal {
+                chat_id,
+                session,
+                receipt,
+                ..
+            } if chat_id == self.inner.id
+                && session == receipt.terminal.session
+                && valid_handoff_receipt(&receipt, expected, &self.inner.proof) =>
+            {
+                receipt
+            }
+            _ => {
+                return Err(
+                    "The original Return retry did not confirm its exact captured receipt".into(),
+                );
+            }
         };
         io.remaining().map_err(|error| error.to_string())?;
         let current = self.source_binding();
-        if current.as_ref().is_some_and(|current| current != expected && receipt.retained_binding.as_ref() != Some(current)) {
+        if current.as_ref().is_some_and(|current| {
+            current != expected && receipt.retained_binding.as_ref() != Some(current)
+        }) {
             return Err("The original Return owner changed before its retry completed".into());
         }
         Ok(receipt)
@@ -2352,7 +2489,8 @@ mod tests {
     #[test]
     fn completed_handoff_retains_exact_operation_proof_without_a_live_continuity_claim() {
         let terminal = handoff_terminal();
-        let source = Session { archive_report: None,
+        let source = Session {
+            archive_report: None,
             id: TerminalId::new(),
             proof: Some(handoff_proof()),
             launch: crate::chat::Launch {
@@ -2394,7 +2532,19 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum ReaderCase { Completed, Shared, Late, Backend, Actor, Thread, ForeignProof, WrongKind, CurrentConflict, CurrentNone, Close }
+    enum ReaderCase {
+        Completed,
+        Shared,
+        Late,
+        Backend,
+        Actor,
+        Thread,
+        ForeignProof,
+        WrongKind,
+        CurrentConflict,
+        CurrentNone,
+        Close,
+    }
 
     // In-process framed peer only: finite socket/latch/reply deadlines and an
     // armed socket shutdown guard cover assertion paths. No child/provider or
@@ -2412,7 +2562,9 @@ mod tests {
             let _ = self.release.try_send(());
             let _ = self.socket.shutdown(Shutdown::Both);
             if !self.settled && self.done.recv_timeout(Duration::from_secs(6)) != Ok(true) {
-                eprintln!("Framed handoff peer did not acknowledge shutdown; outer guardian retains quiescence obligation");
+                eprintln!(
+                    "Framed handoff peer did not acknowledge shutdown; outer guardian retains quiescence obligation"
+                );
             }
             // JoinHandle destruction detaches; a bounded fixture never calls
             // join based only on is_finished or a message from before TLS exit.
@@ -2423,14 +2575,25 @@ mod tests {
         let proof = handoff_proof();
         let source = omp_card(Some("original"), Some(proof.clone()));
         let binding = crate::terminal_ipc::ChatSourceBinding {
-            source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
         };
         let terminal = handoff_terminal();
-        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), None);
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            terminal.id,
+            terminal.launch.clone(),
+            None,
+        );
         descriptor.execution_instance = uuid::Uuid::new_v4();
         let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
-            operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance,
-            source_binding: binding.clone(), retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor,
+            operation: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(),
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: descriptor,
         };
         assert!(valid_handoff_receipt(&receipt, &binding, &proof));
         assert!(receipt.terminal.session.continuity.live_proof().is_none());
@@ -2439,87 +2602,242 @@ mod tests {
         let (release, released) = crossbeam_channel::bounded(1);
         let (done, completed) = crossbeam_channel::bounded(1);
         let (wake, wakes) = crossbeam_channel::unbounded();
-        let sent_binding = binding.clone(); let sent_receipt = receipt.clone(); let sent_proof = proof.clone();
+        let sent_binding = binding.clone();
+        let sent_receipt = receipt.clone();
+        let sent_proof = proof.clone();
         let worker = thread::spawn(move || {
-            struct Done { send: crossbeam_channel::Sender<bool>, success: bool }
-            impl Drop for Done { fn drop(&mut self) { let _ = self.send.try_send(self.success); } }
-            let mut completion = Done { send: done, success: false };
-            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            struct Done {
+                send: crossbeam_channel::Sender<bool>,
+                success: bool,
+            }
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    let _ = self.send.try_send(self.success);
+                }
+            }
+            let mut completion = Done {
+                send: done,
+                success: false,
+            };
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
             let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            handoff_reply(&mut server, &mut codec, Some(connect.request_id), &sent_proof,
-                ServerMessage::Response { response: ServerResponse::Connected { proof: sent_proof.clone(), resumed: vec![] } });
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(connect.request_id),
+                &sent_proof,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: sent_proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
             let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            handoff_reply(&mut server, &mut codec, Some(attach.request_id), &sent_proof,
-                ServerMessage::Response { response: ServerResponse::ChatAttached {
-                    session: sent_binding.source.clone(), execution_instance: sent_binding.execution_instance,
-                    binding: Some(sent_binding.clone()), snapshot: Snapshot { generation: 1, session_id: Some("original".into()), ..Default::default() },
-                } });
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(attach.request_id),
+                &sent_proof,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: sent_binding.source.clone(),
+                        execution_instance: sent_binding.execution_instance,
+                        binding: Some(sent_binding.clone()),
+                        snapshot: Snapshot {
+                            generation: 1,
+                            session_id: Some("original".into()),
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
             let request = loop {
                 let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                if matches!(request.request, ClientRequest::ChatReturnTerminal {..} | ClientRequest::ChatCommand {..} | ClientRequest::ChatClose {..}) { break request; }
-                handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof,
-                    ServerMessage::Response { response: ServerResponse::Accepted });
+                if matches!(
+                    request.request,
+                    ClientRequest::ChatReturnTerminal { .. }
+                        | ClientRequest::ChatCommand { .. }
+                        | ClientRequest::ChatClose { .. }
+                ) {
+                    break request;
+                }
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &sent_proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
             };
             if matches!(case, ReaderCase::Late) {
-                handoff_reply(&mut server, &mut codec, Some(request.request_id + 1000), &sent_proof,
-                    ServerMessage::Response { response: ServerResponse::ChatTerminal {
-                        chat_id: sent_binding.source.id, session: sent_receipt.terminal.session.clone(), receipt: sent_receipt.clone(),
-                        snapshot: Snapshot { generation: 99, exited: true, ..Default::default() },
-                    } });
-                handoff_reply(&mut server, &mut codec, None, &sent_proof,
-                    ServerMessage::ChatActivity { chat_id: sent_binding.source.id, state: ActivityState::Waiting, generation: 10, outcome: None });
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id + 1000),
+                    &sent_proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatTerminal {
+                            chat_id: sent_binding.source.id,
+                            session: sent_receipt.terminal.session.clone(),
+                            receipt: sent_receipt.clone(),
+                            snapshot: Snapshot {
+                                generation: 99,
+                                exited: true,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                );
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &sent_proof,
+                    ServerMessage::ChatActivity {
+                        chat_id: sent_binding.source.id,
+                        state: ActivityState::Waiting,
+                        generation: 10,
+                        outcome: None,
+                    },
+                );
                 released.recv_timeout(Duration::from_secs(5)).unwrap();
             }
             if matches!(case, ReaderCase::CurrentConflict | ReaderCase::CurrentNone) {
-                let mut newer = sent_binding.clone(); newer.backend = uuid::Uuid::new_v4();
-                handoff_reply(&mut server, &mut codec, None, &sent_proof,
-                    ServerMessage::Response { response: ServerResponse::ChatSnapshot {
-                        chat_id: sent_binding.source.id, execution_instance: sent_binding.execution_instance,
-                        binding: matches!(case, ReaderCase::CurrentConflict).then_some(newer),
-                        snapshot: Some(Snapshot { generation: 2, session_id: Some("original".into()), ..Default::default() }),
-                    } });
+                let mut newer = sent_binding.clone();
+                newer.backend = uuid::Uuid::new_v4();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &sent_proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatSnapshot {
+                            chat_id: sent_binding.source.id,
+                            execution_instance: sent_binding.execution_instance,
+                            binding: matches!(case, ReaderCase::CurrentConflict).then_some(newer),
+                            snapshot: Some(Snapshot {
+                                generation: 2,
+                                session_id: Some("original".into()),
+                                ..Default::default()
+                            }),
+                        },
+                    },
+                );
             }
             let mut response = sent_receipt;
             match case {
                 ReaderCase::Backend => response.source_binding.backend = uuid::Uuid::new_v4(),
-                ReaderCase::Actor => { response.source_execution_instance = uuid::Uuid::new_v4(); response.source_binding.execution_instance = response.source_execution_instance; },
+                ReaderCase::Actor => {
+                    response.source_execution_instance = uuid::Uuid::new_v4();
+                    response.source_binding.execution_instance = response.source_execution_instance;
+                }
                 ReaderCase::Thread => response.source.launch.session_id = Some("another".into()),
-                ReaderCase::ForeignProof => response.terminal.session.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
-                    host_session_id: sent_proof.host_session_id.clone(), boot_id: sent_proof.boot_id.clone(),
-                    host_incarnation: crate::model::HostIncarnation::new("another"),
-                },
-                _ => {},
+                ReaderCase::ForeignProof => {
+                    response.terminal.session.continuity =
+                        crate::model::TerminalContinuity::DetachedSameBoot {
+                            host_session_id: sent_proof.host_session_id.clone(),
+                            boot_id: sent_proof.boot_id.clone(),
+                            host_incarnation: crate::model::HostIncarnation::new("another"),
+                        }
+                }
+                _ => {}
             }
-            let snapshot = Snapshot { generation: 77, session_id: Some("original".into()), exited: !matches!(case, ReaderCase::Shared), ..Default::default() };
+            let snapshot = Snapshot {
+                generation: 77,
+                session_id: Some("original".into()),
+                exited: !matches!(case, ReaderCase::Shared),
+                ..Default::default()
+            };
             let response = if matches!(case, ReaderCase::Close) {
-                ServerResponse::ChatClosed { chat_id: sent_binding.source.id, snapshot }
-            } else { ServerResponse::ChatTerminal { chat_id: sent_binding.source.id, session: response.terminal.session.clone(), receipt: response, snapshot } };
-            handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof, ServerMessage::Response { response });
+                ServerResponse::ChatClosed {
+                    chat_id: sent_binding.source.id,
+                    snapshot,
+                }
+            } else {
+                ServerResponse::ChatTerminal {
+                    chat_id: sent_binding.source.id,
+                    session: response.terminal.session.clone(),
+                    receipt: response,
+                    snapshot,
+                }
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(request.request_id),
+                &sent_proof,
+                ServerMessage::Response { response },
+            );
             if matches!(case, ReaderCase::Shared) {
                 loop {
                     let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                     let command = matches!(request.request, ClientRequest::ChatCommand { .. });
-                    handoff_reply(&mut server, &mut codec, Some(request.request_id), &sent_proof,
-                        ServerMessage::Response { response: ServerResponse::Accepted });
-                    if command { break; }
+                    handoff_reply(
+                        &mut server,
+                        &mut codec,
+                        Some(request.request_id),
+                        &sent_proof,
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    );
+                    if command {
+                        break;
+                    }
                 }
                 let _ = released.recv_timeout(Duration::from_secs(5));
             }
             completion.success = true;
         });
-        let mut peer = ReaderPeer { socket, release, done: completed, settled: false, workers: vec![worker] };
-        let handle = ClientHandle::connect_on(client, source, Intent::Restore, Some(proof), false, None, None,
-            move |event| { let _ = wake.send(event); }).unwrap();
+        let mut peer = ReaderPeer {
+            socket,
+            release,
+            done: completed,
+            settled: false,
+            workers: vec![worker],
+        };
+        let handle = ClientHandle::connect_on(
+            client,
+            source,
+            Intent::Restore,
+            Some(proof),
+            false,
+            None,
+            None,
+            move |event| {
+                let _ = wake.send(event);
+            },
+        )
+        .unwrap();
         assert_eq!(handle.source_binding(), Some(binding.clone()));
-        let requester = handle.clone(); let expected = binding.clone();
+        let requester = handle.clone();
+        let expected = binding.clone();
         let (result, reply) = crossbeam_channel::bounded(1);
         peer.workers.push(thread::spawn(move || {
             let response = match case {
-                ReaderCase::WrongKind => requester.request(ClientRequest::ChatCommand { chat_id: expected.source.id,
-                    command: Command::SetModel { model: "original".into(), reasoning: None } }).map(|()|None),
-                ReaderCase::Close => requester.request(ClientRequest::ChatClose { chat_id: expected.source.id }).map(|()|None),
+                ReaderCase::WrongKind => requester
+                    .request(ClientRequest::ChatCommand {
+                        chat_id: expected.source.id,
+                        command: Command::SetModel {
+                            model: "original".into(),
+                            reasoning: None,
+                        },
+                    })
+                    .map(|()| None),
+                ReaderCase::Close => requester
+                    .request(ClientRequest::ChatClose {
+                        chat_id: expected.source.id,
+                    })
+                    .map(|()| None),
                 _ => requester.return_terminal(expected).map(Some),
             };
             let _ = result.try_send(response);
@@ -2527,56 +2845,134 @@ mod tests {
         if matches!(case, ReaderCase::Late) {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                match wakes.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+                match wakes
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
                     Wake::Activity => break,
-                    Wake::Disconnected(reason) => panic!("uncorrelated final payload must not close the actor: {reason}"),
-                    _ => {},
+                    Wake::Disconnected(reason) => {
+                        panic!("uncorrelated final payload must not close the actor: {reason}")
+                    }
+                    _ => {}
                 }
             }
-            assert_eq!(handle.snapshot().generation, 1, "late response cannot publish its final payload");
+            assert_eq!(
+                handle.snapshot().generation,
+                1,
+                "late response cannot publish its final payload"
+            );
             assert!(handle.inner.alive.load(Ordering::Acquire));
             peer.release.try_send(()).unwrap();
         }
-        let result = reply.recv_timeout(Duration::from_secs(5)).expect("actual reader must resolve the matched request");
-        if matches!(case, ReaderCase::Backend | ReaderCase::Actor | ReaderCase::Thread | ReaderCase::ForeignProof | ReaderCase::WrongKind | ReaderCase::CurrentConflict) {
+        let result = reply
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actual reader must resolve the matched request");
+        if matches!(
+            case,
+            ReaderCase::Backend
+                | ReaderCase::Actor
+                | ReaderCase::Thread
+                | ReaderCase::ForeignProof
+                | ReaderCase::WrongKind
+                | ReaderCase::CurrentConflict
+        ) {
             let error = result.expect_err("invalid receipt must not become a return success");
             let expected = match case {
                 ReaderCase::WrongKind => "another pending command",
-                ReaderCase::CurrentConflict => "backend changed before terminal handoff publication",
+                ReaderCase::CurrentConflict => {
+                    "backend changed before terminal handoff publication"
+                }
                 _ => "inconsistent terminal handoff authority",
             };
-            assert!(error.contains(expected), "protocol admission must refuse before payload effects, not succeed through peer EOF: {error}");
-            assert_eq!(handle.snapshot().generation, if matches!(case, ReaderCase::CurrentConflict) { 2 } else { 1 }, "invalid final payload must not replace the current snapshot");
+            assert!(
+                error.contains(expected),
+                "protocol admission must refuse before payload effects, not succeed through peer EOF: {error}"
+            );
+            assert_eq!(
+                handle.snapshot().generation,
+                if matches!(case, ReaderCase::CurrentConflict) {
+                    2
+                } else {
+                    1
+                },
+                "invalid final payload must not replace the current snapshot"
+            );
         } else {
-            assert_eq!(result.unwrap(), if matches!(case, ReaderCase::Close) { None } else { Some(receipt) });
+            assert_eq!(
+                result.unwrap(),
+                if matches!(case, ReaderCase::Close) {
+                    None
+                } else {
+                    Some(receipt)
+                }
+            );
             assert_eq!(handle.snapshot().generation, 77);
-            assert_eq!(handle.inner.alive.load(Ordering::Acquire), matches!(case, ReaderCase::Shared));
+            assert_eq!(
+                handle.inner.alive.load(Ordering::Acquire),
+                matches!(case, ReaderCase::Shared)
+            );
             if matches!(case, ReaderCase::Shared) {
-                handle.request(ClientRequest::ChatCommand { chat_id: binding.source.id,
-                    command: Command::SetModel { model: "still-alive".into(), reasoning: None } }).unwrap();
+                handle
+                    .request(ClientRequest::ChatCommand {
+                        chat_id: binding.source.id,
+                        command: Command::SetModel {
+                            model: "still-alive".into(),
+                            reasoning: None,
+                        },
+                    })
+                    .unwrap();
                 assert!(handle.inner.alive.load(Ordering::Acquire));
             }
         }
         let _ = peer.release.try_send(());
-        assert!(peer.done.recv_timeout(Duration::from_secs(6)).expect("finite actual peer completion"), "the actual peer must finish its complete scripted exchange without panic");
+        assert!(
+            peer.done
+                .recv_timeout(Duration::from_secs(6))
+                .expect("finite actual peer completion"),
+            "the actual peer must finish its complete scripted exchange without panic"
+        );
         peer.settled = true;
     }
 
     #[test]
-    fn handoff_reader_accepts_completed_receipt_without_live_continuity() { reader_case(ReaderCase::Completed); reader_case(ReaderCase::CurrentNone); }
-    #[test]
-    fn handoff_reader_refuses_wrong_source_actor_and_request_kind_before_final_payload() {
-        for case in [ReaderCase::Backend, ReaderCase::Actor, ReaderCase::Thread, ReaderCase::ForeignProof, ReaderCase::WrongKind, ReaderCase::CurrentConflict] { reader_case(case); }
+    fn handoff_reader_accepts_completed_receipt_without_live_continuity() {
+        reader_case(ReaderCase::Completed);
+        reader_case(ReaderCase::CurrentNone);
     }
     #[test]
-    fn handoff_reader_ignores_uncorrelated_final_payload_until_exact_request() { reader_case(ReaderCase::Late); }
+    fn handoff_reader_refuses_wrong_source_actor_and_request_kind_before_final_payload() {
+        for case in [
+            ReaderCase::Backend,
+            ReaderCase::Actor,
+            ReaderCase::Thread,
+            ReaderCase::ForeignProof,
+            ReaderCase::WrongKind,
+            ReaderCase::CurrentConflict,
+        ] {
+            reader_case(case);
+        }
+    }
     #[test]
-    fn handoff_reader_preserves_shared_server_and_later_command_admission() { reader_case(ReaderCase::Shared); }
+    fn handoff_reader_ignores_uncorrelated_final_payload_until_exact_request() {
+        reader_case(ReaderCase::Late);
+    }
     #[test]
-    fn handoff_reader_preserves_correlated_chat_close() { reader_case(ReaderCase::Close); }
+    fn handoff_reader_preserves_shared_server_and_later_command_admission() {
+        reader_case(ReaderCase::Shared);
+    }
+    #[test]
+    fn handoff_reader_preserves_correlated_chat_close() {
+        reader_case(ReaderCase::Close);
+    }
 
     #[derive(Clone, Copy)]
-    enum ReplayCase { Exact, CanonicalPair, ForeignProof, WrongBackend, Refused }
+    enum ReplayCase {
+        Exact,
+        CanonicalPair,
+        ForeignProof,
+        WrongBackend,
+        Refused,
+    }
     fn disconnected_return_replay(case: ReplayCase) {
         use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
@@ -2585,122 +2981,304 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let proof = handoff_proof();
         let source = omp_card(Some("original"), Some(proof.clone()));
-        let binding = ipc::ChatSourceBinding {source:source.clone(), execution_instance:uuid::Uuid::new_v4(), backend:uuid::Uuid::new_v4()};
-        let mut descriptor = ipc::TerminalDescriptor::relaunchable(if matches!(case,ReplayCase::CanonicalPair) {source.id} else {TerminalId::new()}, handoff_terminal().launch, None);
+        let binding = ipc::ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut descriptor = ipc::TerminalDescriptor::relaunchable(
+            if matches!(case, ReplayCase::CanonicalPair) {
+                source.id
+            } else {
+                TerminalId::new()
+            },
+            handoff_terminal().launch,
+            None,
+        );
         descriptor.execution_instance = uuid::Uuid::new_v4();
-        let mut receipt = ipc::TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(), source:source.clone(), source_execution_instance:binding.execution_instance,
-            source_binding:binding.clone(), retained_binding:None, terminal_native_epoch:uuid::Uuid::new_v4(), terminal:descriptor};
-        if matches!(case,ReplayCase::CanonicalPair) {
-            let mut canonical=binding.clone();canonical.backend=uuid::Uuid::new_v4();
-            canonical.source.terminal=Some(receipt.terminal.session.clone());
-            receipt.retained_binding=Some(canonical);
+        let mut receipt = ipc::TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(),
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: descriptor,
+        };
+        if matches!(case, ReplayCase::CanonicalPair) {
+            let mut canonical = binding.clone();
+            canonical.backend = uuid::Uuid::new_v4();
+            canonical.source.terminal = Some(receipt.terminal.session.clone());
+            receipt.retained_binding = Some(canonical);
         }
         let sockets = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
         let abort = Arc::new(AtomicBool::new(false));
         let (done, completed) = crossbeam_channel::bounded(1);
-        struct Peer { sockets:Arc<Mutex<Vec<UnixStream>>>, abort:Arc<AtomicBool>, done:crossbeam_channel::Receiver<bool>, settled:bool }
+        struct Peer {
+            sockets: Arc<Mutex<Vec<UnixStream>>>,
+            abort: Arc<AtomicBool>,
+            done: crossbeam_channel::Receiver<bool>,
+            settled: bool,
+        }
         impl Drop for Peer {
             fn drop(&mut self) {
                 self.abort.store(true, Ordering::Release);
-                for socket in self.sockets.lock().unwrap_or_else(|p|p.into_inner()).iter() {let _ = socket.shutdown(Shutdown::Both);}
-                if !self.settled {let _ = self.done.recv_timeout(Duration::from_secs(6));}
+                for socket in self
+                    .sockets
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                if !self.settled {
+                    let _ = self.done.recv_timeout(Duration::from_secs(6));
+                }
             }
         }
-        let mut peer = Peer {sockets:sockets.clone(), abort:abort.clone(), done:completed, settled:false};
-        let original = binding.clone(); let sent_receipt = receipt.clone(); let sent_proof = proof.clone();
+        let mut peer = Peer {
+            sockets: sockets.clone(),
+            abort: abort.clone(),
+            done: completed,
+            settled: false,
+        };
+        let original = binding.clone();
+        let sent_receipt = receipt.clone();
+        let sent_proof = proof.clone();
         let worker = thread::spawn(move || {
-            struct Done {sender:crossbeam_channel::Sender<bool>, success:bool}
-            impl Drop for Done {fn drop(&mut self) {let _ = self.sender.try_send(self.success);}}
-            let mut finished = Done {sender:done, success:false};
+            struct Done {
+                sender: crossbeam_channel::Sender<bool>,
+                success: bool,
+            }
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    let _ = self.sender.try_send(self.success);
+                }
+            }
+            let mut finished = Done {
+                sender: done,
+                success: false,
+            };
             let accept = || {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                loop {match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-                        sockets.lock().unwrap().push(stream.try_clone().unwrap());
-                        return stream;
-                    },
-                    Err(error) if error.kind()==io::ErrorKind::WouldBlock => {
-                        assert!(!abort.load(Ordering::Acquire) && Instant::now()<deadline, "bounded original peer accept");
-                        thread::sleep(Duration::from_millis(2));
-                    }, Err(error) => panic!("private peer accept: {error}"),
-                }}
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            sockets.lock().unwrap().push(stream.try_clone().unwrap());
+                            return stream;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                !abort.load(Ordering::Acquire) && Instant::now() < deadline,
+                                "bounded original peer accept"
+                            );
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("private peer accept: {error}"),
+                    }
+                }
             };
-            let mut first = accept(); let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let connect:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
-            handoff_reply(&mut first, &mut codec, Some(connect.request_id), &sent_proof,
-                ServerMessage::Response {response:ServerResponse::Connected {proof:sent_proof.clone(), resumed:vec![]}});
-            let attach:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
-            assert!(matches!(attach.request, ClientRequest::ChatStart {..}));
-            handoff_reply(&mut first, &mut codec, Some(attach.request_id), &sent_proof,
-                ServerMessage::Response {response:ServerResponse::ChatAttached {
-                    session:original.source.clone(), execution_instance:original.execution_instance, binding:Some(original.clone()),
-                    snapshot:Snapshot {generation:1, session_id:Some("original".into()), ..Default::default()},
-                }});
+            let mut first = accept();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+            handoff_reply(
+                &mut first,
+                &mut codec,
+                Some(connect.request_id),
+                &sent_proof,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: sent_proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let attach: ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+            assert!(matches!(attach.request, ClientRequest::ChatStart { .. }));
+            handoff_reply(
+                &mut first,
+                &mut codec,
+                Some(attach.request_id),
+                &sent_proof,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: original.source.clone(),
+                        execution_instance: original.execution_instance,
+                        binding: Some(original.clone()),
+                        snapshot: Snapshot {
+                            generation: 1,
+                            session_id: Some("original".into()),
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
             let submitted = loop {
-                let frame:ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
-                if matches!(frame.request, ClientRequest::ChatVisibility {..}) {continue;}
+                let frame: ClientEnvelope = codec.read(&mut first).unwrap().unwrap();
+                if matches!(frame.request, ClientRequest::ChatVisibility { .. }) {
+                    continue;
+                }
                 break frame;
             };
-            assert!(matches!(submitted.request, ClientRequest::ChatReturnTerminal {expected, ..} if expected==original));
-            if let Some(canonical)=sent_receipt.retained_binding.as_ref() {
-                handoff_reply(&mut first,&mut codec,None,&sent_proof,ServerMessage::Response {response:ServerResponse::ChatSnapshot {
-                    chat_id:original.source.id,execution_instance:original.execution_instance,binding:Some(canonical.clone()),
-                    snapshot:Some(Snapshot {generation:2,session_id:Some("original".into()),..Default::default()}),
-                }});
+            assert!(
+                matches!(submitted.request, ClientRequest::ChatReturnTerminal {expected, ..} if expected==original)
+            );
+            if let Some(canonical) = sent_receipt.retained_binding.as_ref() {
+                handoff_reply(
+                    &mut first,
+                    &mut codec,
+                    None,
+                    &sent_proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatSnapshot {
+                            chat_id: original.source.id,
+                            execution_instance: original.execution_instance,
+                            binding: Some(canonical.clone()),
+                            snapshot: Some(Snapshot {
+                                generation: 2,
+                                session_id: Some("original".into()),
+                                ..Default::default()
+                            }),
+                        },
+                    },
+                );
             }
             // Model the response-loss seam, not provider/family cleanup proof.
             // Shutdown all duplicate descriptors for this original connection.
             first.shutdown(Shutdown::Both).unwrap();
             drop(first);
-            let mut retry = accept(); let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let connect:ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
-            assert!(matches!(connect.request, ClientRequest::Connect {expected_host:Some(ref expected), ref resume} if *expected==sent_proof && resume.is_empty()));
+            let mut retry = accept();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
+            assert!(
+                matches!(connect.request, ClientRequest::Connect {expected_host:Some(ref expected), ref resume} if *expected==sent_proof && resume.is_empty())
+            );
             assert!(connect.proof.is_none());
-            let response_proof = if matches!(case,ReplayCase::ForeignProof) {host_proof("replacement-daemon")} else {sent_proof.clone()};
-            handoff_reply(&mut retry, &mut codec, Some(connect.request_id), &response_proof,
-                ServerMessage::Response {response:ServerResponse::Connected {proof:response_proof.clone(), resumed:vec![]}});
-            if matches!(case,ReplayCase::ForeignProof) {
-                assert!(codec.read::<ClientEnvelope>(&mut retry).unwrap().is_none(), "proof mismatch must send no Return/Attach/List");
-                finished.success=true;return;
-            }
-            let request:ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
-            assert_eq!(request.proof, Some(sent_proof.clone()));
-            assert!(matches!(request.request,ClientRequest::ChatReturnTerminal {chat_id, expected} if chat_id==original.source.id && expected==original), "retry must send ONLY original captured intent, without Attach/List");
-            let message = if matches!(case,ReplayCase::Refused) {
-                ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::InvalidRequest,"exact original Return refused",false))
+            let response_proof = if matches!(case, ReplayCase::ForeignProof) {
+                host_proof("replacement-daemon")
             } else {
-                let mut receipt=sent_receipt;
-                if matches!(case,ReplayCase::WrongBackend) {receipt.source_binding.backend=uuid::Uuid::new_v4();}
-                ServerMessage::Response {response:ServerResponse::ChatTerminal {chat_id:original.source.id,
-                    session:receipt.terminal.session.clone(), receipt,
-                    snapshot:Snapshot {generation:77, exited:true, ..Default::default()}}}
+                sent_proof.clone()
             };
-            handoff_reply(&mut retry, &mut codec, Some(request.request_id), &sent_proof, message);
-            finished.success=true;
+            handoff_reply(
+                &mut retry,
+                &mut codec,
+                Some(connect.request_id),
+                &response_proof,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: response_proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            if matches!(case, ReplayCase::ForeignProof) {
+                assert!(
+                    codec.read::<ClientEnvelope>(&mut retry).unwrap().is_none(),
+                    "proof mismatch must send no Return/Attach/List"
+                );
+                finished.success = true;
+                return;
+            }
+            let request: ClientEnvelope = codec.read(&mut retry).unwrap().unwrap();
+            assert_eq!(request.proof, Some(sent_proof.clone()));
+            assert!(
+                matches!(request.request,ClientRequest::ChatReturnTerminal {chat_id, expected} if chat_id==original.source.id && expected==original),
+                "retry must send ONLY original captured intent, without Attach/List"
+            );
+            let message = if matches!(case, ReplayCase::Refused) {
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::InvalidRequest,
+                    "exact original Return refused",
+                    false,
+                ))
+            } else {
+                let mut receipt = sent_receipt;
+                if matches!(case, ReplayCase::WrongBackend) {
+                    receipt.source_binding.backend = uuid::Uuid::new_v4();
+                }
+                ServerMessage::Response {
+                    response: ServerResponse::ChatTerminal {
+                        chat_id: original.source.id,
+                        session: receipt.terminal.session.clone(),
+                        receipt,
+                        snapshot: Snapshot {
+                            generation: 77,
+                            exited: true,
+                            ..Default::default()
+                        },
+                    },
+                }
+            };
+            handoff_reply(
+                &mut retry,
+                &mut codec,
+                Some(request.request_id),
+                &sent_proof,
+                message,
+            );
+            finished.success = true;
         });
         let client = UnixStream::connect(&endpoint).unwrap();
-        let handle = ClientHandle::connect_on(client, source, Intent::Start, None, false, None, None, |_|{}).unwrap();
+        let handle = ClientHandle::connect_on(
+            client,
+            source,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(handle.inner.return_endpoint.as_ref(), Some(&endpoint));
-        assert!(handle.return_terminal(binding.clone()).is_err(), "first request has no receipt");
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while handle.inner.alive.load(Ordering::Acquire) {assert!(Instant::now()<deadline);thread::yield_now();}
-        if matches!(case,ReplayCase::CanonicalPair) {
-            assert_eq!(handle.source_binding(),receipt.retained_binding,"the actual old reader must have accepted canonical post-pair metadata before EOF");
-            assert_eq!(handle.snapshot().generation,2);
+        assert!(
+            handle.return_terminal(binding.clone()).is_err(),
+            "first request has no receipt"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.inner.alive.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
         }
-        let result=handle.return_terminal(binding);
+        if matches!(case, ReplayCase::CanonicalPair) {
+            assert_eq!(
+                handle.source_binding(),
+                receipt.retained_binding,
+                "the actual old reader must have accepted canonical post-pair metadata before EOF"
+            );
+            assert_eq!(handle.snapshot().generation, 2);
+        }
+        let result = handle.return_terminal(binding);
         match case {
-            ReplayCase::Exact|ReplayCase::CanonicalPair => assert_eq!(result.unwrap(),receipt),
+            ReplayCase::Exact | ReplayCase::CanonicalPair => assert_eq!(result.unwrap(), receipt),
             ReplayCase::ForeignProof => assert!(result.unwrap_err().contains("proof")),
-            ReplayCase::WrongBackend => assert!(result.unwrap_err().contains("exact captured receipt")),
-            ReplayCase::Refused => assert_eq!(result.unwrap_err(),"exact original Return refused"),
+            ReplayCase::WrongBackend => {
+                assert!(result.unwrap_err().contains("exact captured receipt"))
+            }
+            ReplayCase::Refused => assert_eq!(result.unwrap_err(), "exact original Return refused"),
         }
-        assert!(!handle.inner.alive.load(Ordering::Acquire), "control replay cannot revive old attachment");
-        assert_ne!(handle.snapshot().generation,77, "replayed final payload is not installed");
-        assert_eq!(peer.done.recv_timeout(Duration::from_secs(6)),Ok(true),"actual bounded peer script must finish");
-        peer.settled=true;drop(worker);
+        assert!(
+            !handle.inner.alive.load(Ordering::Acquire),
+            "control replay cannot revive old attachment"
+        );
+        assert_ne!(
+            handle.snapshot().generation,
+            77,
+            "replayed final payload is not installed"
+        );
+        assert_eq!(
+            peer.done.recv_timeout(Duration::from_secs(6)),
+            Ok(true),
+            "actual bounded peer script must finish"
+        );
+        peer.settled = true;
+        drop(worker);
     }
     #[test]
     fn disconnected_return_replays_only_original_endpoint_proof_and_intent() {
@@ -2715,22 +3293,27 @@ mod tests {
     }
     #[test]
     fn original_return_replay_deadline_is_not_renewed_by_partial_frame_bytes() {
-        let (client, mut server)=UnixStream::pair().unwrap();
-        let cancel=server.try_clone().unwrap();
-        let (done, completed)=crossbeam_channel::bounded(1);
-        let worker=thread::spawn(move || {
-            for byte in [0,0,0,16,0,0,0,0] {
-                if io::Write::write_all(&mut server,&[byte]).is_err() {break;}
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let cancel = server.try_clone().unwrap();
+        let (done, completed) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            for byte in [0, 0, 0, 16, 0, 0, 0, 0] {
+                if io::Write::write_all(&mut server, &[byte]).is_err() {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(15));
             }
-            let _=done.send(());
+            let _ = done.send(());
         });
-        let start=Instant::now();
-        let mut io=ReturnReplayIo {stream:client,deadline:start+Duration::from_millis(40)};
-        let result=FrameCodec::new(ipc::MAX_FRAME_BYTES).read::<ServerEnvelope>(&mut io);
+        let start = Instant::now();
+        let mut io = ReturnReplayIo {
+            stream: client,
+            deadline: start + Duration::from_millis(40),
+        };
+        let result = FrameCodec::new(ipc::MAX_FRAME_BYTES).read::<ServerEnvelope>(&mut io);
         assert!(result.is_err());
-        assert!(start.elapsed()<Duration::from_millis(500));
-        let _=cancel.shutdown(Shutdown::Both);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let _ = cancel.shutdown(Shutdown::Both);
         assert!(completed.recv_timeout(Duration::from_secs(1)).is_ok());
         drop(worker);
     }
@@ -2738,7 +3321,8 @@ mod tests {
     #[test]
     fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
         let terminal = handoff_terminal();
-        let source = Session { archive_report: None,
+        let source = Session {
+            archive_report: None,
             id: TerminalId::new(),
             proof: Some(handoff_proof()),
             launch: crate::chat::Launch {
