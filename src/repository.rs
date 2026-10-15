@@ -60,7 +60,7 @@ mod stash_mutations;
 #[path = "repository_recovery.rs"]
 mod recovery;
 pub use recovery::{
-    DiscardRecovery, DiscardRecoveryEntry, LiveDiscardRecovery, RecoverableDiscard, SavedEntry, TrashReceipt,
+    DiscardRecovery, DiscardRecoveryEntry, DiscardRecoveryResolution, LiveDiscardRecovery, RecoverableDiscard, SavedEntry, TrashReceipt,
 };
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";

@@ -60,6 +60,9 @@ pub struct LiveDiscardRecovery(Arc<std::sync::Mutex<LiveDiscardState>>);
 struct LiveDiscardState {
     authority: Option<crate::recovery_authority::RecoveryAuthority>,
     uncertain: bool,
+    completed: std::collections::BTreeSet<RepoPath>,
+    resolution_required: bool,
+    resumed_until_unix_ms: u64,
 }
 impl LiveDiscardRecovery {
     pub fn authority(&self) -> Option<crate::recovery_authority::RecoveryAuthority> {
@@ -67,6 +70,27 @@ impl LiveDiscardRecovery {
     }
     pub fn is_pending(&self) -> bool {
         self.authority().is_some_and(|authority| !authority.is_resolved())
+    }
+    pub fn needs_resolution(&self) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).resolution_required
+    }
+    fn is_completed(&self, path: &RepoPath) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).completed.contains(path)
+    }
+    fn completed_count(&self) -> usize {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).completed.len()
+    }
+    fn mark_completed(&self, path: &RepoPath) {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).completed.insert(path.clone());
+    }
+    fn resume_deadline(&self) -> u64 {
+        self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).resumed_until_unix_ms
+    }
+    fn acknowledge_resolution(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner());
+        state.uncertain = false;
+        state.resolution_required = false;
+        state.resumed_until_unix_ms = unix_ms().saturating_add(60_000);
     }
     fn set_uncertain(&self, uncertain: bool) {
         self.0.lock().unwrap_or_else(|poisoned|poisoned.into_inner()).uncertain = uncertain;
@@ -76,6 +100,7 @@ impl LiveDiscardRecovery {
     }
     fn retain(&self, authority: crate::recovery_authority::RecoveryAuthority) {
         let mut current = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.resolution_required = true;
         current.authority = Some(match current.authority.take() {
             Some(previous) => previous.combine(authority), None => authority,
         });
@@ -90,10 +115,18 @@ impl Eq for LiveDiscardRecovery {}
 
 impl DiscardRecovery {
     pub fn can_undo(&self) -> bool {
-        self.live_recovery.is_pending()
-            || (!self.entries.is_empty() && unix_ms() <= self.expires_unix_ms)
+        self.live_recovery.needs_resolution()
+            || (self.remaining_paths() > 0 && unix_ms() <= self.expires_unix_ms.max(self.live_recovery.resume_deadline()))
+    }
+    pub fn remaining_paths(&self) -> usize {
+        self.entries.len().saturating_sub(self.live_recovery.completed_count())
     }
 }
+
+/// Cleanup completion is distinct from a file Undo. The same receipt retains
+/// every unattempted path; callers keep it when remaining_paths is nonzero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardRecoveryResolution { pub remaining_paths: usize }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverableDiscard {
@@ -494,18 +527,33 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         })
     }
 
+    /// Resolves only retained artifacts/metadata. This does NOT perform the
+    /// remaining file Undo or consume its intent, and needs no pathname Git
+    /// recapture. Run on a worker and keep the original receipt on failure.
+    pub fn resolve_discard_recovery(
+        &self, recovery: &DiscardRecovery, cancellation: &CancellationToken,
+    ) -> Result<DiscardRecoveryResolution, RepositoryError> {
+        if cancellation.is_cancelled() {
+            return Err(ValidationError::Io("Discard recovery was cancelled before retry".into()).into());
+        }
+        if let Some(authority) = recovery.live_recovery.authority() {
+            if let Err(message) = authority.retry() {
+                return Err(RepositoryError::Recovery { message, authority });
+            }
+        }
+        recovery.live_recovery.acknowledge_resolution();
+        Ok(DiscardRecoveryResolution { remaining_paths: recovery.remaining_paths() })
+    }
+
     pub fn undo_discard(
         &self,
         recovery: &DiscardRecovery,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
-        if let Some(authority) = recovery.live_recovery.authority().filter(|authority| !authority.is_resolved()) {
-            return Ok(match authority.retry() {
-                Ok(()) => { recovery.live_recovery.set_uncertain(false); MutationOutcome::Applied { paths: vec![] } },
-                Err(reason) => MutationOutcome::NotApplied { failure: MutationFailure::Rejected {
-                    reason: format!("Discard recovery is still unresolved; no new Undo was attempted: {reason}"),
-                } },
-            });
+        if recovery.live_recovery.needs_resolution() {
+            return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected {
+                reason: "Resolve the pending discard recovery first. No additional paths were undone; the original receipt retains the remaining paths.".into(),
+            } });
         }
         if !recovery.can_undo() {
             return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "Undo discard has expired; backups remain in Git objects and the system Trash".into() } });
@@ -532,6 +580,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut entries = recovery.entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.path.as_path().components().cmp(right.path.as_path().components()));
         for entry in entries {
+            if recovery.live_recovery.is_completed(&entry.path) { continue; }
             created_directories.flush_before(Some(&entry.path), &mut failures);
             let result = if recovery.live_recovery.is_pending() {
                 Err("An earlier recovery entry is unresolved; this path was not changed".into())
@@ -548,6 +597,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
             match result {
                 Ok(warning) => {
+                    recovery.live_recovery.mark_completed(&entry.path);
                     paths.push(entry.path.clone());
                     if let Some(reason) = warning {
                         failures.push(MutationFailure::Reconciliation {
@@ -674,7 +724,7 @@ impl OwnedRecoveryDirectory {
         let expected = if self.mode_installed { self.mode } else { 0o700 | (self.mode & 0o2000) };
         if metadata.mode() & 0o7777 != expected & 0o7777
             || (metadata.uid(),metadata.gid()) != (initial.uid(),initial.gid())
-        { return Err("The created directory's permissions or ownership changed; newer metadata was preserved".into()); }
+        { return Err("The created directory's permissions or ownership differ from the recovery proof; current metadata was preserved".into()); }
         if self.sync_file.is_none() {
             self.sync_file = Some(open_directory_sync_handle(self.publication.directory()).map_err(|error|error.to_string())?);
         }

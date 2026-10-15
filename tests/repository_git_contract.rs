@@ -6132,8 +6132,11 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
         assert_eq!(fs::read(entry.path()).unwrap(), b"EVIL");
         fs::remove_file(entry.path()).unwrap();
     }
-    assert!(matches!(fixture.service().undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+    let resolution = fixture.service().resolve_discard_recovery(&receipt, &cancel).unwrap();
+    assert_eq!(resolution.remaining_paths, 1, "cleanup cannot consume the unperformed file Undo");
+    assert!(receipt.can_undo(), "remaining Undo intent resumes after successful cleanup");
     assert!(!receipt.live_recovery.is_pending());
+    assert!(!receipt.live_recovery.needs_resolution());
     assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"replacement");
     assert_eq!(fs::read(fixture.work().join(&holding).join("foreign")).unwrap(), b"preserve");
     assert_eq!(fs::read(parked.join("tracked.txt")).unwrap(), b"base");
