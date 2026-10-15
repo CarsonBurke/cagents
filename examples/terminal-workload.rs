@@ -306,6 +306,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut observations = 0u64;
         let mut resized = false;
         let mut latencies = Vec::new();
+        // Retain the actual bounded thirty-probe evidence, in observation order.
+        // Percentile summaries alone cannot reconstruct paired measurements.
+        let mut input_samples = Vec::new();
         let mut probe = 0;
         let mut sent_at = Instant::now();
         let mut pending = true;
@@ -401,7 +404,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Capture the final elapsed sample AFTER sealing:
                             // every counted commit precedes this timestamp,
                             // including if this consumer is preempted here.
-                            latencies.push(sent_at.elapsed().as_nanos() as u64);
+                            let observed_at = Instant::now();
+                            let elapsed_ns = observed_at.duration_since(sent_at).as_nanos() as u64;
+                            latencies.push(elapsed_ns);
+                            input_samples.push((
+                                probe,
+                                sent_at.duration_since(start).as_nanos() as u64,
+                                observed_at.duration_since(start).as_nanos() as u64,
+                                elapsed_ns,
+                            ));
                             probe += 1;
                             sent_at = Instant::now();
                             handle.input(if probe == 30 {
@@ -473,7 +484,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "consumer_process_cpu_ns": cpu_ns().saturating_sub(cpu_start), "output_batches": batches, "resize_exercised": resized,
                 "snapshot_generations": generations, "observed_snapshots": observations, "wake_callbacks": wakes.load(Ordering::Relaxed),
                 "terminal_ids": handles.iter().filter_map(BenchTerminal::id).map(|id| id.to_string()).collect::<Vec<_>>(),
-                "input_samples": latencies.len(), "input_to_snapshot_p50_ns": percentile(50), "input_to_snapshot_p95_ns": percentile(95), "input_to_snapshot_p99_ns": percentile(99),
+                "input_samples": latencies.len(),
+                "input_sample_fields": ["probe", "sent_since_start_ns", "observed_since_start_ns", "elapsed_ns"],
+                "input_sample_timebase": "monotonic workload start; last observation follows the serialized pane-cycle seal",
+                "input_sample_values": input_samples,
+                "input_to_snapshot_p50_ns": percentile(50), "input_to_snapshot_p95_ns": percentile(95), "input_to_snapshot_p99_ns": percentile(99),
                 "sustained_output_bytes": sustained_bytes,
                 "sustained_mib_per_second": sustained_bytes.map(|bytes| bytes as f64 * 1e9 / wall_ns as f64 / (1024.0 * 1024.0)),
                 "sustained_budget_pass": sustained_budget_pass,
