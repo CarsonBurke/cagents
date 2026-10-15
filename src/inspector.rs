@@ -513,7 +513,11 @@ pub struct ChatMemory {
 }
 
 pub fn with_chat_memory(mut model: InspectorModel, memory: ChatMemory) -> InspectorModel {
-    if let Some(section) = model.sections.iter_mut().find(|section| section.title == "Chat") {
+    if let Some(section) = model
+        .sections
+        .iter_mut()
+        .find(|section| section.title == "Chat")
+    {
         section.facts.extend([
             Fact::new("Loaded transcript payload", format!("{} bytes", memory.source_bytes)).diagnostic(),
             Fact::new("Prepared presentation payload", format!("{} bytes", memory.presentation_bytes)).diagnostic(),

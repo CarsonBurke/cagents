@@ -292,40 +292,88 @@ impl Pane {
     /// Loading placeholder is never accepted as the giant-body workload.
     fn settle_geometry(&mut self) -> usize {
         use iced::advanced::widget::Operation;
-        #[derive(Default)]struct Probe {pending:usize,ready_bytes:usize,plain_bytes:usize}
+        #[derive(Default)]
+        struct Probe {
+            pending: usize,
+            ready_bytes: usize,
+            plain_bytes: usize,
+        }
         impl Operation for Probe {
-            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
-            fn custom(&mut self,_:Option<&widget::Id>,_:iced::Rectangle,state:&mut dyn std::any::Any){
-                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {
-                    self.plain_bytes+=state.plain.len();
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(state) = state.downcast_ref::<selectable_prose::State>() {
+                    self.plain_bytes += state.plain.len();
                     match state.flow_readiness() {
-                        Some(false)=>self.pending+=1,Some(true)=>self.ready_bytes+=state.plain.len(),None=>{}
+                        Some(false) => self.pending += 1,
+                        Some(true) => self.ready_bytes += state.plain.len(),
+                        None => {}
                     }
                 }
             }
         }
-        self.runtime.refresh();preparation::drain_fixture(&mut self.runtime);
+        self.runtime.refresh();
+        preparation::drain_fixture(&mut self.runtime);
         for _ in 0..16 {
-            let element=self.runtime.view(None,false,true,&self.shortcuts,720.0,Place {
-                channel:None,name:"project".into(),branch:None,
-            },true,None,Vec::new());
-            let mut ui=UserInterface::build(element,WINDOW,std::mem::replace(&mut self.cache,Cache::new()),&mut self.renderer);
-            let mut changed=Vec::new();
-            for (id,cached) in &self.runtime.cache {
-                let mut completed=cached.flow_cache.complete_fixture();
-                for tool in cached.tool_input.iter().chain(cached.tool_output.iter()).chain(cached.patches.iter()) {
-                    completed |=tool.flow_cache.complete_fixture();
+            let element = self.runtime.view(
+                None,
+                false,
+                true,
+                &self.shortcuts,
+                720.0,
+                Place {
+                    channel: None,
+                    name: "project".into(),
+                    branch: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(
+                element,
+                WINDOW,
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let mut changed = Vec::new();
+            for (id, cached) in &self.runtime.cache {
+                let mut completed = cached.flow_cache.complete_fixture();
+                for tool in cached
+                    .tool_input
+                    .iter()
+                    .chain(cached.tool_output.iter())
+                    .chain(cached.patches.iter())
+                {
+                    completed |= tool.flow_cache.complete_fixture();
                 }
-                if completed {changed.push(id.clone());}
+                if completed {
+                    changed.push(id.clone());
+                }
             }
-            let mut probe=Probe::default();ui.operate(&self.renderer,&mut probe);
-            self.cache=ui.into_cache();
+            let mut probe = Probe::default();
+            ui.operate(&self.renderer, &mut probe);
+            self.cache = ui.into_cache();
             if changed.is_empty() {
-                assert_eq!(probe.pending,0,"steady benchmark must not measure Loading placeholders");
-                assert!(probe.plain_bytes>0,"steady benchmark must expose actual transcript text");
+                assert_eq!(
+                    probe.pending, 0,
+                    "steady benchmark must not measure Loading placeholders"
+                );
+                assert!(
+                    probe.plain_bytes > 0,
+                    "steady benchmark must expose actual transcript text"
+                );
                 return probe.ready_bytes;
             }
-            for id in changed {self.runtime.cache.get_mut(&id).unwrap().revision=CachedItem::next_revision();}
+            for id in changed {
+                self.runtime.cache.get_mut(&id).unwrap().revision = CachedItem::next_revision();
+            }
         }
         panic!("visible geometry preparation did not quiesce");
     }
@@ -391,7 +439,9 @@ impl Pane {
     }
 
     /// One frame: the refresh, the view, its diff and layout, and its draw.
-    fn frame(&mut self) -> [Duration; 4] { self.frame_with_pointer(false) }
+    fn frame(&mut self) -> [Duration; 4] {
+        self.frame_with_pointer(false)
+    }
 
     fn frame_with_pointer(&mut self, pointer_event: bool) -> [Duration; 4] {
         let clock = Instant::now();
@@ -425,9 +475,15 @@ impl Pane {
         let clock = Instant::now();
         if pointer_event {
             let point = cosmic::iced::Point::new(400.0, 400.0);
-            ui.update(&[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved { position: point })],
-                mouse::Cursor::Available(point), &mut self.renderer,
-                &mut cosmic::iced::advanced::clipboard::Null, &mut Vec::new());
+            ui.update(
+                &[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved {
+                    position: point,
+                })],
+                mouse::Cursor::Available(point),
+                &mut self.renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
         }
         ui.draw(
             &mut self.renderer,
@@ -943,7 +999,10 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
 #[test]
 #[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
 fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
-    assert!(!cfg!(debug_assertions), "use optimized dev-runtime with opt-level2");
+    assert!(
+        !cfg!(debug_assertions),
+        "use optimized dev-runtime with opt-level2"
+    );
     let mut medians = Vec::new();
     for (name, bytes, tools, form) in [
         ("small", 16_usize * 1024, 10, 0),
@@ -951,27 +1010,57 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
         ("many paragraphs", 1024 * 1024, 300, 1),
         ("giant fence", 1024 * 1024, 300, 2),
     ] {
-        let mut items = vec![item("viewport-prompt".into(), chat::Role::User,
-            prose("Inspect the transcript.".into(), false, chat::Phase::Final))];
+        let mut items = vec![item(
+            "viewport-prompt".into(),
+            chat::Role::User,
+            prose("Inspect the transcript.".into(), false, chat::Phase::Final),
+        )];
         for index in 0..tools {
-            items.push(item(format!("viewport-tool-{index}"), chat::Role::Assistant,
-                ItemContent::Command { label: String::new(), command: format!("read file-{index}.rs"),
-                    working_directory: "/fixture".into(), action: chat::CommandAction::Read,
-                    status: chat::ToolStatus::Succeeded, exit_code: Some(0), duration_ms: Some(1),
-                    output: "fixture output\n".repeat(8) }));
+            items.push(item(
+                format!("viewport-tool-{index}"),
+                chat::Role::Assistant,
+                ItemContent::Command {
+                    label: String::new(),
+                    command: format!("read file-{index}.rs"),
+                    working_directory: "/fixture".into(),
+                    action: chat::CommandAction::Read,
+                    status: chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    output: "fixture output\n".repeat(8),
+                },
+            ));
         }
-        let atom = if form == 1 { "Measured plain paragraph.\n\n" } else { "Measured plain paragraph. " };
+        let atom = if form == 1 {
+            "Measured plain paragraph.\n\n"
+        } else {
+            "Measured plain paragraph. "
+        };
         let mut body = atom.repeat(bytes.div_ceil(atom.len()));
         body.truncate(bytes);
-        if form == 2 { body = format!("```text\n{body}\n```\n"); }
-        items.push(item("viewport-answer".into(), chat::Role::Assistant,
-            prose(body, false, chat::Phase::Final)));
+        if form == 2 {
+            body = format!("```text\n{body}\n```\n");
+        }
+        items.push(item(
+            "viewport-answer".into(),
+            chat::Role::Assistant,
+            prose(body, false, chat::Phase::Final),
+        ));
         let mut pane = Pane::new(items);
         pane.runtime.tool_groups_expanded = true;
-        let prepared_bytes=pane.settle_geometry();
-        if form!=1 {assert!(prepared_bytes>=bytes,"the full giant physical paragraph/code line must be prepared");}
-        println!("settled geometry ready visible-flow bytes={prepared_bytes}; cold worker work excluded from this steady-frame measurement");
-        for _ in 0..WARMUP { pane.frame_with_pointer(true); }
+        let prepared_bytes = pane.settle_geometry();
+        if form != 1 {
+            assert!(
+                prepared_bytes >= bytes,
+                "the full giant physical paragraph/code line must be prepared"
+            );
+        }
+        println!(
+            "settled geometry ready visible-flow bytes={prepared_bytes}; cold worker work excluded from this steady-frame measurement"
+        );
+        for _ in 0..WARMUP {
+            pane.frame_with_pointer(true);
+        }
         let mut totals = Stage::default();
         let mut stages = Stages::default();
         for _ in 0..SAMPLES {
@@ -986,8 +1075,18 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
     }
     let small = medians[0].1;
     for (name, median) in medians {
-        println!("{name}: event median {:.3}ms, ratio {:.3}", median.as_secs_f64()*1000.0, median.as_secs_f64()/small.as_secs_f64());
-        assert!(median <= Duration::from_millis(2), "{name} exceeded2ms viewport budget: {median:?}");
-        assert!(median <= small * 2, "{name} exceeded2x fixed-viewport scaling budget");
+        println!(
+            "{name}: event median {:.3}ms, ratio {:.3}",
+            median.as_secs_f64() * 1000.0,
+            median.as_secs_f64() / small.as_secs_f64()
+        );
+        assert!(
+            median <= Duration::from_millis(2),
+            "{name} exceeded2ms viewport budget: {median:?}"
+        );
+        assert!(
+            median <= small * 2,
+            "{name} exceeded2x fixed-viewport scaling budget"
+        );
     }
 }

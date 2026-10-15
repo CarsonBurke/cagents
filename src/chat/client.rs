@@ -278,7 +278,11 @@ fn transmit(
         ClientRequest::ChatVisibility { visible: false, .. }
     );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
-    let Wire { stream, codec, body_requested } = &mut *wire;
+    let Wire {
+        stream,
+        codec,
+        body_requested,
+    } = &mut *wire;
     codec
         .write(
             stream,
@@ -1381,7 +1385,11 @@ impl ClientHandle {
             .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.inner
+            .append_lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         SourceClock::observe(
             &mut self
                 .inner
@@ -1538,8 +1546,16 @@ impl ClientHandle {
             command,
         })
     }
-    pub(crate) fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {
-        self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).proves(previous, current)
+    pub(crate) fn known_append(
+        &self,
+        previous: &Arc<super::Item>,
+        current: &Arc<super::Item>,
+    ) -> bool {
+        self.inner
+            .append_lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proves(previous, current)
     }
 
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -1567,7 +1583,11 @@ impl ClientHandle {
             if !self.inner.alive.load(Ordering::Acquire) {
                 return Err("Chat is disconnected".into());
             }
-            self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            self.inner
+                .append_lineage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
             let bytes = snapshot.transcript_bytes();
             Arc::make_mut(&mut snapshot).evict_transcript();
             self.inner
@@ -3191,27 +3211,67 @@ mod tests {
                 started_at: None,
                 at: None,
             };
-            respond(&mut codec, &mut server, Some(read.request_id), ServerMessage::Response {
-                response: ServerResponse::ChatUpdate {
-                    chat_id,
-                    update: Presentation {
-                        base_generation: 99, file_changes_unchanged: true,
-                        metadata: Snapshot { generation: 100, ready: true, ..Default::default() },
-                        order: vec![], changes: vec![], children: vec![],
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate {
+                        chat_id,
+                        update: Presentation {
+                            base_generation: 99,
+                            file_changes_unchanged: true,
+                            metadata: Snapshot {
+                                generation: 100,
+                                ready: true,
+                                ..Default::default()
+                            },
+                            order: vec![],
+                            changes: vec![],
+                            children: vec![],
+                        },
                     },
                 },
-            });
+            );
             let resync: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            assert!(matches!(resync.request, ClientRequest::ChatRead { after_generation: None, .. }),
-                "hidden controls must reject an update with a mismatched metadata base");
-            respond(&mut codec, &mut server, Some(resync.request_id), ServerMessage::Response {
-                response: ServerResponse::ChatSnapshot {
-                    chat_id, snapshot: Some(Snapshot { generation: 1, ..Default::default() }),
+            assert!(
+                matches!(
+                    resync.request,
+                    ClientRequest::ChatRead {
+                        after_generation: None,
+                        ..
+                    }
+                ),
+                "hidden controls must reject an update with a mismatched metadata base"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(resync.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        }),
+                    },
                 },
-            });
-            respond(&mut codec, &mut server, None, ServerMessage::ChatChanged { chat_id });
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
             let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            assert!(matches!(read.request, ClientRequest::ChatRead { after_generation: Some(1), .. }));
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(1),
+                    ..
+                }
+            ));
             respond(
                 &mut codec,
                 &mut server,
@@ -3238,9 +3298,14 @@ mod tests {
             assert!(matches!(&command.request, ClientRequest::ChatCommand {
                 command: Command::Prompt { text, .. }, ..
             } if text.len() > 1024 * 1024));
-            respond(&mut codec, &mut server, Some(command.request_id), ServerMessage::Response {
-                response: ServerResponse::Accepted,
-            });
+            respond(
+                &mut codec,
+                &mut server,
+                Some(command.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             respond(
                 &mut codec,
@@ -3272,9 +3337,16 @@ mod tests {
             );
             // This ordered control edge lets the client prove it consumed the
             // unchanged response while still hidden before requesting reveal.
-            respond(&mut codec, &mut server, None, ServerMessage::ChatActivity {
-                chat_id, state: ActivityState::Working, generation: 2,
-            });
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state: ActivityState::Working,
+                    generation: 2,
+                },
+            );
             stage_tx.send(()).unwrap();
             // The next frame must be reveal, not another automatic full read.
             let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
@@ -3338,7 +3410,9 @@ mod tests {
         .unwrap();
         {
             let mut wire = handle.inner.wire.lock().unwrap();
-            wire.codec.write(&mut std::io::sink(), &"large prompt".repeat(128 * 1024)).unwrap();
+            wire.codec
+                .write(&mut std::io::sink(), &"large prompt".repeat(128 * 1024))
+                .unwrap();
             assert!(wire.codec.buffer_capacities_for_test().1 > 1024 * 1024);
         }
         handle.set_interest(true, false).unwrap();
@@ -3346,22 +3420,51 @@ mod tests {
             wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.inner.wire.lock().unwrap().codec.buffer_capacities_for_test().1 > 256 * 1024 {
-            assert!(Instant::now() < deadline, "hidden interested transport retained its large prompt buffer");
+        while handle
+            .inner
+            .wire
+            .lock()
+            .unwrap()
+            .codec
+            .buffer_capacities_for_test()
+            .1
+            > 256 * 1024
+        {
+            assert!(
+                Instant::now() < deadline,
+                "hidden interested transport retained its large prompt buffer"
+            );
             thread::sleep(Duration::from_millis(1));
         }
         assert!(handle.snapshot().ready);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         assert!(handle.has_observed_user_item());
         assert!(handle.resident_snapshot_with_clock().is_none());
-        handle.send(Command::Prompt {
-            text: "large prompt".repeat(128 * 1024), attachments: vec![], mode: super::super::PromptMode::Send,
-        }).unwrap();
-        assert!(handle.inner.wire.lock().unwrap().codec.buffer_capacities_for_test().1 <= 256 * 1024,
-            "new large hidden commands release scratch without another visibility transition");
+        handle
+            .send(Command::Prompt {
+                text: "large prompt".repeat(128 * 1024),
+                attachments: vec![],
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        assert!(
+            handle
+                .inner
+                .wire
+                .lock()
+                .unwrap()
+                .codec
+                .buffer_capacities_for_test()
+                .1
+                <= 256 * 1024,
+            "new large hidden commands release scratch without another visibility transition"
+        );
         advance_tx.send(()).unwrap();
         stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        while !matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Activity) {}
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Activity
+        ) {}
         handle.set_visible(true).unwrap();
         while handle.resident_snapshot_with_clock().is_none() {
             wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();

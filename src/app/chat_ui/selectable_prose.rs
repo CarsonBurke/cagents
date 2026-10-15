@@ -1,7 +1,7 @@
 //! Owned selectable rich text: selection uses the same shaped paragraph as prose.
 use super::*;
-use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::Renderer as _;
+use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
@@ -96,9 +96,14 @@ impl Shape {
 
 impl State {
     #[cfg(test)]
-    pub(super) fn flow_readiness(&self) -> Option<bool> {self.flow.as_ref().map(|_|self.flow_ready.is_some())}
+    pub(super) fn flow_readiness(&self) -> Option<bool> {
+        self.flow.as_ref().map(|_| self.flow_ready.is_some())
+    }
     fn paragraph(&self) -> &ParagraphBuffer {
-        debug_assert!(self.flow.is_none(), "flow text must never shape synchronously");
+        debug_assert!(
+            self.flow.is_none(),
+            "flow text must never shape synchronously"
+        );
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
@@ -114,24 +119,38 @@ impl State {
     /// existing bounded paragraph and never shapes an offscreen source.
     pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {
         let logical = self.logical.as_ref()?;
-        if logical.identity != identity || byte < logical.start { return None; }
+        if logical.identity != identity || byte < logical.start {
+            return None;
+        }
         let byte = byte - logical.start;
-        if byte > self.plain.len() { return None; }
+        if byte > self.plain.len() {
+            return None;
+        }
         if self.flow.is_some() {
-            return self.flow_ready.as_ref()?.byte_bounds(byte, self.plain.len());
+            return self
+                .flow_ready
+                .as_ref()?
+                .byte_bounds(byte, self.plain.len());
         }
         let paragraph = self.paragraph();
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
         let mut offset = 0;
         for line in &paragraph.buffer().lines {
-            prefixes.push(offset); offset += line.text().len() + line.ending().as_str().len();
+            prefixes.push(offset);
+            offset += line.text().len() + line.ending().as_str().len();
         }
         let mut last = None;
         for run in paragraph.buffer().layout_runs() {
             for glyph in run.glyphs {
-                let bounds = Rectangle::new(Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
-                    Size::new(glyph.w.abs(), run.line_height));
-                if prefixes[run.line_i] + glyph.start <= byte && byte < prefixes[run.line_i] + glyph.end { return Some(bounds); }
+                let bounds = Rectangle::new(
+                    Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
+                    Size::new(glyph.w.abs(), run.line_height),
+                );
+                if prefixes[run.line_i] + glyph.start <= byte
+                    && byte < prefixes[run.line_i] + glyph.end
+                {
+                    return Some(bounds);
+                }
                 last = Some(bounds);
             }
         }
@@ -140,7 +159,10 @@ impl State {
 
     pub(super) fn hit(&self, position: Point) -> usize {
         if self.flow.is_some() {
-            return self.flow_ready.as_ref().map_or(0, |ready| ready.hit(position, self.plain.len()));
+            return self
+                .flow_ready
+                .as_ref()
+                .map_or(0, |ready| ready.hit(position, self.plain.len()));
         }
         hit(self.paragraph(), &self.plain, position)
     }
@@ -181,8 +203,14 @@ pub(super) struct Logical {
     pub start: usize,
 }
 
-pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
+pub(super) fn logical_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical), None)
 }
 
@@ -195,25 +223,67 @@ pub(super) fn text(
 ) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, None, None)
 }
-pub(super) fn flow_source(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
-    flow_source_optional(size,font,target,find,Some(logical),flow)
+pub(super) fn flow_source(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
+    flow_source_optional(size, font, target, find, Some(logical), flow)
 }
-pub(super) fn flow_source_optional(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: flow_layout::Handle) -> Element<'static, Message> {
+pub(super) fn flow_source_optional(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
     let ready = flow.borrow().prepared();
-    let spans = ready.as_ref().map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
-    let plain: Arc<str> = ready.as_ref().map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
+    let spans = ready
+        .as_ref()
+        .map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
+    let plain: Arc<str> = ready
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
     let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    Element::new(Selectable { logical, flow: Some(flow), flow_ready: ready, matches: highlights.ranges, spans, plain, size, font, target })
+    Element::new(Selectable {
+        logical,
+        flow: Some(flow),
+        flow_ready: ready,
+        matches: highlights.ranges,
+        spans,
+        plain,
+        size,
+        font,
+        target,
+    })
 }
 
 #[cfg(test)]
-pub(super) fn flow_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced::Font,
-    target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
+pub(super) fn flow_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical), Some(flow))
 }
 
-fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: Option<flow_layout::Handle>) -> Element<'static, Message> {
+fn build_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: Option<flow_layout::Handle>,
+) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
@@ -335,17 +405,36 @@ impl Selectable {
 
 /// Paint byte-range backgrounds against the existing shaped glyph runs. This
 /// is independent of syntax span count and never reshapes selected text.
-fn paint_ranges(renderer: &mut cosmic::Renderer, paragraph: &ParagraphBuffer,
-    ranges: &[std::ops::Range<usize>], translation: iced::Vector, color: iced::Color) {
+fn paint_ranges(
+    renderer: &mut cosmic::Renderer,
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    translation: iced::Vector,
+    color: iced::Color,
+) {
     visit_range_bounds(paragraph, ranges, |bounds| {
-        renderer.fill_quad(renderer::Quad { bounds: Rectangle { x: bounds.x + translation.x,
-            y: bounds.y + translation.y, ..bounds }, ..Default::default() }, color);
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: Rectangle {
+                    x: bounds.x + translation.x,
+                    y: bounds.y + translation.y,
+                    ..bounds
+                },
+                ..Default::default()
+            },
+            color,
+        );
     });
 }
 
-fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usize>],
-    mut paint: impl FnMut(Rectangle)) {
-    if ranges.is_empty() { return; }
+fn visit_range_bounds(
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    mut paint: impl FnMut(Rectangle),
+) {
+    if ranges.is_empty() {
+        return;
+    }
     let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
     let mut offset = 0;
     for line in &paragraph.buffer().lines {
@@ -357,8 +446,10 @@ fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usi
         let mut bounds: Option<(f32, f32)> = None;
         let mut flush = |bounds: &mut Option<(f32, f32)>| {
             if let Some((left, right)) = bounds.take() {
-                paint(Rectangle::new(Point::new(left, run.line_top),
-                    Size::new(right - left, run.line_height)));
+                paint(Rectangle::new(
+                    Point::new(left, run.line_top),
+                    Size::new(right - left, run.line_height),
+                ));
             }
         };
         for glyph in run.glyphs {
@@ -368,9 +459,15 @@ fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usi
             if ranges.get(found).is_some_and(|range| range.start < end) {
                 let left = glyph.x.min(glyph.x + glyph.w);
                 let right = glyph.x.max(glyph.x + glyph.w);
-                if let Some((lo, hi)) = bounds.as_mut() { *lo = lo.min(left); *hi = hi.max(right); }
-                else { bounds = Some((left, right)); }
-            } else { flush(&mut bounds); }
+                if let Some((lo, hi)) = bounds.as_mut() {
+                    *lo = lo.min(left);
+                    *hi = hi.max(right);
+                } else {
+                    bounds = Some((left, right));
+                }
+            } else {
+                flush(&mut bounds);
+            }
         }
         flush(&mut bounds);
     }
@@ -426,7 +523,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn state(&self) -> tree::State {
         tree::State::new(State::default())
     }
-    fn children(&self) -> Vec<Tree> { vec![] }
+    fn children(&self) -> Vec<Tree> {
+        vec![]
+    }
     fn diff(&mut self, _tree: &mut Tree) {}
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
@@ -439,35 +538,59 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         state.dirty = false;
-        let same_target=state.target==Some(self.target);
-        let same_logical=state.logical.as_ref().map(|logical|(logical.identity,logical.start))
-            ==self.logical.as_ref().map(|logical|(logical.identity,logical.start));
-        let mut flow=self.flow.clone();
-        if same_target && same_logical
-            && let (Some(previous),Some(current))=(&state.flow,&self.flow)
-            && !std::rc::Rc::ptr_eq(previous,current)
-            && previous.borrow_mut().adopt(&current.borrow()) {
-            flow=Some(previous.clone());
+        let same_target = state.target == Some(self.target);
+        let same_logical = state
+            .logical
+            .as_ref()
+            .map(|logical| (logical.identity, logical.start))
+            == self
+                .logical
+                .as_ref()
+                .map(|logical| (logical.identity, logical.start));
+        let mut flow = self.flow.clone();
+        if same_target
+            && same_logical
+            && let (Some(previous), Some(current)) = (&state.flow, &self.flow)
+            && !std::rc::Rc::ptr_eq(previous, current)
+            && previous.borrow_mut().adopt(&current.borrow())
+        {
+            flow = Some(previous.clone());
         }
-        let same_flow=state.flow.as_ref().zip(flow.as_ref()).is_some_and(|(old,current)|std::rc::Rc::ptr_eq(old,current));
-        state.target=Some(self.target);state.logical=self.logical.clone();
-        if !same_flow {state.flow_ready=None;state.flow_projection.borrow_mut().take();}
-        state.flow=flow;
+        let same_flow = state
+            .flow
+            .as_ref()
+            .zip(flow.as_ref())
+            .is_some_and(|(old, current)| std::rc::Rc::ptr_eq(old, current));
+        state.target = Some(self.target);
+        state.logical = self.logical.clone();
+        if !same_flow {
+            state.flow_ready = None;
+            state.flow_projection.borrow_mut().take();
+        }
+        state.flow = flow;
         if state
             .spans
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
         {
-            if if self.flow.is_some() { !same_flow } else { !self.plain.starts_with(state.plain.as_ref()) } {
+            if if self.flow.is_some() {
+                !same_flow
+            } else {
+                !self.plain.starts_with(state.plain.as_ref())
+            } {
                 state.identity = NEXT_SELECTION.fetch_add(1, Ordering::Relaxed);
                 state.anchor = 0;
                 state.end = 0;
                 state.dragging = false;
             }
-            if state.flow.is_none() || !same_flow {state.plain = self.plain.clone();}
+            if state.flow.is_none() || !same_flow {
+                state.plain = self.plain.clone();
+            }
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
-        if state.flow.is_none() {state.validate_selection(&self.plain);}
+        if state.flow.is_none() {
+            state.validate_selection(&self.plain);
+        }
         let shape = Shape {
             bounds: limits.max(),
             size: self.size,
@@ -480,12 +603,17 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             let mut flow = flow.borrow_mut();
             flow.configure(shape.bounds.width, self.size, self.font);
             flow.bind_target(self.target);
-            state.flow_ready=flow.prepared();
-            if let Some(ready)=&state.flow_ready {
-                state.plain=ready.plain.clone();state.spans=Some(ready.spans.clone());
+            state.flow_ready = flow.prepared();
+            if let Some(ready) = &state.flow_ready {
+                state.plain = ready.plain.clone();
+                state.spans = Some(ready.spans.clone());
             }
             state.validate_selection(&state.plain.clone());
-            return layout::Node::new(limits.resolve(Length::Shrink,Length::Shrink,flow.bounds(state.plain.len())));
+            return layout::Node::new(limits.resolve(
+                Length::Shrink,
+                Length::Shrink,
+                flow.bounds(state.plain.len()),
+            ));
         }
         if state
             .spans
@@ -504,7 +632,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, state.paragraph().min_bounds()))
+        layout::Node::new(limits.resolve(
+            Length::Shrink,
+            Length::Shrink,
+            state.paragraph().min_bounds(),
+        ))
     }
     fn operate(
         &mut self,
@@ -526,7 +658,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if layout.bounds().intersection(viewport).is_none() { return; }
+        if layout.bounds().intersection(viewport).is_none() {
+            return;
+        }
         let state = tree.state.downcast_ref::<State>();
         if let Some(flow) = &state.flow {
             if let Some(ready) = &state.flow_ready {
@@ -534,18 +668,41 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 // LayoutGlyph exposes placed advances rather than exact ink
                 // outlines. Keep four ems of raster overscan on either edge;
                 // native font/edge fixtures qualify the supported fonts.
-                let overscan=self.size.0*4.0;
-                let left=viewport.x-layout.bounds().x-overscan;
-                let right=viewport.x+viewport.width-layout.bounds().x+overscan;
-                if let Some(projection)=ready.projection_rect(top,top+viewport.height+self.size.0*1.3,left,right) {
-                    flow_layout::paint(renderer, &projection, &ready.spans, &self.matches,
-                        state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
-                        layout.position(), theme, defaults, viewport);
+                let overscan = self.size.0 * 4.0;
+                let left = viewport.x - layout.bounds().x - overscan;
+                let right = viewport.x + viewport.width - layout.bounds().x + overscan;
+                if let Some(projection) = ready.projection_rect(
+                    top,
+                    top + viewport.height + self.size.0 * 1.3,
+                    left,
+                    right,
+                ) {
+                    flow_layout::paint(
+                        renderer,
+                        &projection,
+                        &ready.spans,
+                        &self.matches,
+                        state.anchor.min(state.end)..state.anchor.max(state.end),
+                        self.size,
+                        layout.position(),
+                        theme,
+                        defaults,
+                        viewport,
+                    );
                     *state.flow_projection.borrow_mut() = Some(projection);
                 }
             } else if let Some(shape) = state.shape {
-                let label = if flow.borrow().failed() { "Text could not be displayed" } else { "Loading…" };
-                renderer.fill_text(shape.text(label.to_owned()), layout.position(), defaults.text_color, *viewport);
+                let label = if flow.borrow().failed() {
+                    "Text could not be displayed"
+                } else {
+                    "Loading…"
+                };
+                renderer.fill_text(
+                    shape.text(label.to_owned()),
+                    layout.position(),
+                    defaults.text_color,
+                    *viewport,
+                );
             }
             return;
         }
@@ -554,32 +711,64 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         // Preserve inline code surfaces, emphasis, links and strike-throughs
         // without allocating a second rich-text widget or shaped buffer.
         for (index, span) in self.spans.iter().enumerate() {
-            if span.highlight.is_none() && !span.underline && !span.strikethrough { continue; }
+            if span.highlight.is_none() && !span.underline && !span.strikethrough {
+                continue;
+            }
             for bounds in paragraph.span_bounds(index) {
                 if let Some(highlight) = span.highlight {
-                    renderer.fill_quad(renderer::Quad {
-                        bounds: Rectangle::new(bounds.position() - iced::Vector::new(span.padding.left, span.padding.top),
-                            bounds.size() + Size::new(span.padding.x(), span.padding.y())) + translation,
-                        border: highlight.border, ..Default::default()
-                    }, highlight.background);
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(
+                                bounds.position()
+                                    - iced::Vector::new(span.padding.left, span.padding.top),
+                                bounds.size() + Size::new(span.padding.x(), span.padding.y()),
+                            ) + translation,
+                            border: highlight.border,
+                            ..Default::default()
+                        },
+                        highlight.background,
+                    );
                 }
                 let size = span.size.unwrap_or(self.size);
                 let line_height = span.line_height.unwrap_or_default().to_absolute(size).0;
                 let baseline = size.0 + (line_height - size.0) / 2.0;
-                for (draw, shift) in [(span.underline, size.0 * 0.08), (span.strikethrough, size.0 / 2.0)] {
+                for (draw, shift) in [
+                    (span.underline, size.0 * 0.08),
+                    (span.strikethrough, size.0 / 2.0),
+                ] {
                     if draw {
-                        renderer.fill_quad(renderer::Quad {
-                            bounds: Rectangle::new(bounds.position() + translation + iced::Vector::new(0.0, baseline - shift),
-                                Size::new(bounds.width, 1.0)), ..Default::default()
-                        }, span.color.unwrap_or(defaults.text_color));
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle::new(
+                                    bounds.position()
+                                        + translation
+                                        + iced::Vector::new(0.0, baseline - shift),
+                                    Size::new(bounds.width, 1.0),
+                                ),
+                                ..Default::default()
+                            },
+                            span.color.unwrap_or(defaults.text_color),
+                        );
                     }
                 }
             }
         }
-        paint_ranges(renderer, paragraph, &self.matches, translation, design::accent_wash(theme));
+        paint_ranges(
+            renderer,
+            paragraph,
+            &self.matches,
+            translation,
+            design::accent_wash(theme),
+        );
         let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
         if !selection.is_empty() {
-            paint_ranges(renderer, paragraph, &[selection], translation, design::accent_color(theme));
+            paint_ranges(
+                renderer,
+                paragraph,
+                &[selection],
+                translation,
+                design::accent_color(theme),
+            );
         }
         renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
@@ -598,8 +787,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if std::mem::take(&mut state.dirty) {
             shell.invalidate_layout();
         }
-        if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_)))
-            && layout.bounds().intersection(viewport).is_some()
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) && layout.bounds().intersection(viewport).is_some()
             && let Some(flow) = &state.flow
             && let Some(request) = flow.borrow_mut().request()
         {
@@ -611,7 +802,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.dragging = false;
         }
-        let current_plain=state.plain.clone();
+        let current_plain = state.plain.clone();
         state.validate_selection(&current_plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -690,8 +881,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let state = tree.state.downcast_ref::<State>();
-            if state.link(position).is_some()
-            {
+            if state.link(position).is_some() {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::Text
@@ -756,7 +946,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let state = State {
             spans: Some(spans),
             shape: Some(Shape {
@@ -788,50 +978,94 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         let source = "Latin fi e\u{301} αβ العربية text";
         let identity = 0x1234;
-        let mut element = logical_text(vec![Span::new(source.to_owned())].into(),
-            design::TEXT_PROSE.into(), iced::Font::default(),
-            Target { card: CardId::new(), generation: 0 }, None, Logical { identity, start: 100 });
+        let mut element = logical_text(
+            vec![Span::new(source.to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+            Logical {
+                identity,
+                start: 100,
+            },
+        );
         let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)),
+        );
         let state = tree.state.downcast_ref::<State>();
         for (byte, ch) in source.char_indices().filter(|(_, ch)| !ch.is_whitespace()) {
             let mut painted = Vec::new();
-            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| painted.push(bounds));
-            assert!(!painted.is_empty(), "every selected grapheme paints its existing cluster");
+            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| {
+                painted.push(bounds)
+            });
+            assert!(
+                !painted.is_empty(),
+                "every selected grapheme paints its existing cluster"
+            );
             for bounds in painted {
-                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <=150.5);
-                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height +0.5);
+                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <= 150.5);
+                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height + 0.5);
             }
             assert!(state.logical_byte_bounds(identity, 100 + byte).is_some());
         }
         assert!(state.logical_byte_bounds(identity, 99).is_none());
-        assert!(state.logical_byte_bounds(identity +1, 100).is_none());
-        assert_eq!(state.paragraph_builds.get(), 1, "paint/navigation reuse the same paragraph");
+        assert!(state.logical_byte_bounds(identity + 1, 100).is_none());
+        assert_eq!(
+            state.paragraph_builds.get(),
+            1,
+            "paint/navigation reuse the same paragraph"
+        );
     }
 
     #[test]
     fn selection_reuses_the_paragraph_used_for_drawing_and_hit_testing() {
         let renderer = crate::app::tests::headless_renderer();
-        let mut element = text(vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
-            design::TEXT_PROSE.into(), iced::Font::default(),
-            Target { card: CardId::new(), generation: 0 }, Some("prose"));
+        let mut element = text(
+            vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            Some("prose"),
+        );
         let mut tree = Tree::new(&element);
         let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
-        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         let state = tree.state.downcast_ref::<State>();
         let buffer = state.paragraph().buffer() as *const _ as usize;
         assert_eq!(state.paragraph_builds.get(), 1);
-        assert!(tree.children.is_empty(), "no second rich-text paragraph tree");
+        assert!(
+            tree.children.is_empty(),
+            "no second rich-text paragraph tree"
+        );
         for end in [1, 20, 100, 300] {
             let state = tree.state.downcast_mut::<State>();
             state.anchor = 0;
             state.end = end;
-            element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
             let state = tree.state.downcast_ref::<State>();
-            assert_eq!(state.paragraph_builds.get(), 1, "selection does not construct another paragraph");
-            assert_eq!(buffer, state.paragraph().buffer() as *const _ as usize,
-                "selection changes paint bounds instead of reshaping spans");
+            assert_eq!(
+                state.paragraph_builds.get(),
+                1,
+                "selection does not construct another paragraph"
+            );
+            assert_eq!(
+                buffer,
+                state.paragraph().buffer() as *const _ as usize,
+                "selection changes paint bounds instead of reshaping spans"
+            );
         }
     }
 
@@ -973,7 +1207,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let state = State {
             anchor: "before ".len(),
             end: "before αβ".len(),
@@ -1018,7 +1252,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         assert_eq!(
             selectable
                 .selected_spans(&State::default())
@@ -1045,7 +1279,7 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            };
+        };
         let spans = selectable.selected_spans(&State::default());
         assert_eq!(
             spans
@@ -1067,27 +1301,67 @@ mod flow_tests {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(210_000))].into();
         let cache = flow_layout::Cache::default();
         let flow = cache.entry(99, spans.clone());
-        let target = Target { card: CardId::new(), generation: 0 };
-        let mut element = flow_text(spans, iced::Pixels(16.0), iced::Font::DEFAULT, target, None,
-            Logical { identity: 99, start: 0 }, flow);
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = flow_text(
+            spans,
+            iced::Pixels(16.0),
+            iced::Font::DEFAULT,
+            target,
+            None,
+            Logical {
+                identity: 99,
+                start: 0,
+            },
+            flow,
+        );
         let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)),
+        );
         assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
         assert!(tree.children.is_empty());
         let mut messages = Vec::new();
-        let event = Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()));
+        let event = Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
         let hidden = Rectangle::new(Point::new(1000.0, 0.0), Size::new(100.0, 400.0));
-        element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-            &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &hidden);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &hidden,
+        );
         assert!(messages.is_empty());
         let visible = Rectangle::with_size(Size::new(720.0, 400.0));
         for _ in 0..2 {
-            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-                &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &visible);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &visible,
+            );
         }
-        assert_eq!(messages.len(), 1, "one pending request per source/font/width generation");
-        assert!(matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target));
+        assert_eq!(
+            messages.len(),
+            1,
+            "one pending request per source/font/width generation"
+        );
+        assert!(
+            matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target)
+        );
         assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
     }
 }

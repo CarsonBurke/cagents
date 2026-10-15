@@ -303,12 +303,25 @@ impl Runtime {
                 }
             );
         code_frame(
-            block.view_logical_with_reader(self.syntax_theme, limit.map(|height| (height, follows)), target,
-                self.find.as_deref(), selectable_prose::Logical {
-                    identity: selection::logical_identity(&item.id, &match part {
-                        CopyPart::Input => vec![4], CopyPart::Change(index) => vec![6, index as u32], _ => vec![5],
-                    }), start: 0,
-                }, self.scroll_memory.clone(), self.selected_subagent.clone()),
+            block.view_logical_with_reader(
+                self.syntax_theme,
+                limit.map(|height| (height, follows)),
+                target,
+                self.find.as_deref(),
+                selectable_prose::Logical {
+                    identity: selection::logical_identity(
+                        &item.id,
+                        &match part {
+                            CopyPart::Input => vec![4],
+                            CopyPart::Change(index) => vec![6, index as u32],
+                            _ => vec![5],
+                        },
+                    ),
+                    start: 0,
+                },
+                self.scroll_memory.clone(),
+                self.selected_subagent.clone(),
+            ),
             Some(caption.to_owned()),
             Some(copy),
         )
