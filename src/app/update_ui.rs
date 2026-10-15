@@ -33,6 +33,21 @@ pub(super) struct State {
     manual_check: bool,
 }
 
+fn installation_candidate(executable: &Path) -> bool {
+    executable.parent().is_some_and(|bin| {
+        bin.file_name().is_some_and(|name| name == "bin")
+            && bin.parent().and_then(Path::parent).and_then(Path::file_name)
+                .is_some_and(|name| name == "versions")
+    })
+}
+
+fn installation_checks_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::current_exe().ok().is_some_and(|path| installation_candidate(&path))
+    });
+    *ENABLED
+}
+
 /// How long background checks wait between attempts.
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// The first retry after a failed background check; each further failure
@@ -483,20 +498,16 @@ impl Cagents {
     }
 
     pub(super) fn update_subscription(&self) -> Subscription<Message> {
-        // An install performed under this window breaks every terminal it owns
-        // the moment the daemon restarts, so the window has to notice on its
-        // own timescale rather than on the release check's. This needs no
-        // instance gate: it is inert unless the running executable is itself
-        // inside an installation tree, which a source build never is.
-        let installation = iced::time::every(Duration::from_secs(5))
-            .map(|_| Message::UpdateUi(Action::InspectInstallation));
+        // Installation changes are checked at startup and on focus gain.
+        // No timer is needed while the user is working in another window,
+        // and source builds must not wake up to inspect an absent install.
         // Release discovery talks to GitHub and drives the installer, neither
         // of which a development instance may do.
         if crate::instance::NAME == "development"
             && !self.update_ui.updating()
             && !self.update_ui.poll_retry
         {
-            return installation;
+            return Subscription::none();
         }
         let progress = if self.update_ui.updating() || self.update_ui.poll_retry {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
@@ -506,7 +517,7 @@ impl Cagents {
         } else {
             Subscription::none()
         };
-        Subscription::batch([progress, installation])
+        progress
     }
 
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
@@ -919,7 +930,8 @@ impl Cagents {
                 Task::none()
             }
             Action::InspectInstallation => {
-                if self.update_ui.inspecting
+                if !installation_checks_enabled()
+                    || self.update_ui.inspecting
                     || self.update_ui.restarting
                     || self.update_ui.updating()
                     // A release update owns the same launch fence and reopens
@@ -976,6 +988,22 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_builds_have_no_installation_timer_or_inspection() {
+        assert!(!installation_candidate(Path::new("/repo/target/dev-runtime/cagents-ui")));
+        assert!(installation_candidate(Path::new("/app/versions/v1/bin/cagents-ui")));
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.check_for_updates = false;
+        for focused in [true, false] {
+            app.refresh_ui.focused = focused;
+            assert!(iced::advanced::subscription::into_recipes(app.update_subscription()).is_empty());
+        }
+        if !installation_checks_enabled() {
+            drop(app.update_update_ui(Action::InspectInstallation));
+            assert!(!app.update_ui.inspecting);
+        }
+    }
 
     #[test]
     fn a_reconciled_historical_failure_clears_the_live_warning() {

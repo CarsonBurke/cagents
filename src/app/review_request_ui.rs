@@ -3,6 +3,18 @@ use super::*;
 pub use crate::pull_request_review::request_ui::monitor::Action;
 pub(super) type State = crate::pull_request_review::request_ui::monitor::Monitor;
 
+const BACKGROUND_REVIEW_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+fn review_interval(focused: bool, daemon_unavailable: bool) -> Duration {
+    if !focused {
+        BACKGROUND_REVIEW_INTERVAL
+    } else if daemon_unavailable {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
 impl Cagents {
     pub(super) fn review_request_subscription(&self) -> Subscription<Message> {
         if self
@@ -12,12 +24,9 @@ impl Cagents {
         {
             return Subscription::none();
         }
-        cosmic::iced::time::every(Duration::from_secs(
-            if crate::daemon_health::current().unavailable() {
-                30
-            } else {
-                10
-            },
+        cosmic::iced::time::every(review_interval(
+            self.refresh_ui.focused,
+            crate::daemon_health::current().unavailable(),
         ))
         .map(|_| Message::ReviewRequests(Action::Tick))
     }
@@ -88,5 +97,18 @@ impl Cagents {
         }
         self.review_alert_focus_changed();
         Task::batch([task, report])
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+
+    #[test]
+    fn unfocused_review_polling_backs_off_even_when_daemon_is_healthy() {
+        assert_eq!(review_interval(false, false), Duration::from_secs(300));
+        assert_eq!(review_interval(false, true), Duration::from_secs(300));
+        assert_eq!(review_interval(true, false), Duration::from_secs(10));
+        assert_eq!(review_interval(true, true), Duration::from_secs(30));
     }
 }

@@ -28,6 +28,9 @@ pub enum Event {
     /// A window was resized.
     Resized(Size),
 
+    /// A window became fully occluded or visible again.
+    Occluded(bool),
+
     /// A window changed its scale factor.
     Rescaled(f32),
 

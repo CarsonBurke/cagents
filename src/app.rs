@@ -13100,6 +13100,7 @@ impl Application for Cagents {
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
+            app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -16137,6 +16138,7 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(id, focused)
                         if self.core.main_window_id() == Some(id) =>
                     {
+                        crate::ui_controls::set_activity_animation_active(focused);
                         Some((focused, focused && !self.refresh_ui.focused))
                     }
                     _ => None,
@@ -16152,7 +16154,15 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                let resumed = if account_focus.is_some_and(|(_, regained)| regained) {
+                    Task::batch([
+                        self.update_update_ui(update_ui::Action::InspectInstallation),
+                        self.update_review_requests(review_request_ui::Action::Tick),
+                    ])
+                } else {
+                    Task::none()
+                };
+                Task::batch([refresh, self.flush_document_tone(), accounts, shared, resumed])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {

@@ -13,9 +13,17 @@ use cosmic::{
 static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
     std::sync::LazyLock::new(cosmic::iced::time::Instant::now);
 
-/// How often a visible spinner asks for a frame: thirty steps a second, ten
-/// degrees of rotation each, which still reads as continuous motion.
-const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(33);
+/// Bound whole-window redraws to eight activity steps per second.
+const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(125);
+
+// A newly mounted spinner may not have observed the window's last focus event.
+// Seed it from the main-window state rather than animating hidden new content.
+static ANIMATION_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_activity_animation_active(active: bool) {
+    ANIMATION_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// The arc the spinner draws `elapsed` after [`SPINNER_EPOCH`], as start and
 /// end angles in radians measured from twelve o'clock.
@@ -87,11 +95,39 @@ struct ActivitySpinner {
     handle: cosmic::iced::advanced::svg::Handle,
 }
 
-#[derive(Default)]
 struct SpinnerState {
+    active: bool,
+    occluded: bool,
+    minimized: bool,
     /// Time since [`SPINNER_EPOCH`] as of the last frame, kept here because
     /// `draw` is handed no clock of its own.
     elapsed: std::time::Duration,
+}
+
+impl Default for SpinnerState {
+    fn default() -> Self {
+        Self {
+            active: ANIMATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+            occluded: false,
+            minimized: false,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl SpinnerState {
+    fn observe(&mut self, event: &cosmic::iced::Event) {
+        use cosmic::iced::{Event, window};
+        match event {
+            Event::Window(window::Event::Occluded(occluded)) => self.occluded = *occluded,
+            Event::Window(window::Event::Focused) => self.active = true,
+            Event::Window(window::Event::Unfocused | window::Event::Closed) => self.active = false,
+            Event::Window(window::Event::Resized(size)) => {
+                self.minimized = size.width == 0.0 || size.height == 0.0;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
@@ -132,6 +168,11 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         shell: &mut cosmic::iced::advanced::Shell<'_, Message>,
         viewport: &cosmic::iced::Rectangle,
     ) {
+        let state = tree.state.downcast_mut::<SpinnerState>();
+        state.observe(event);
+        if !state.active || state.occluded || state.minimized {
+            return;
+        }
         // A spinner nobody can see must not hold the frame clock. Indicators
         // are mounted in cards sitting in an off-screen workspace column and
         // in strips scrolled past their own viewport, and asking for the next
@@ -144,7 +185,6 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         if let cosmic::iced::Event::Window(cosmic::iced::window::Event::RedrawRequested(now)) =
             event
         {
-            let state = tree.state.downcast_mut::<SpinnerState>();
             state.elapsed = now.saturating_duration_since(*SPINNER_EPOCH);
             // A redraw repaints the whole window, so the arc is stepped at a
             // fixed cadence instead of holding the window at display refresh
@@ -510,6 +550,27 @@ mod tests {
     /// once pin the whole window to the compositor's cadence for motion
     /// nobody can see.
     #[test]
+    fn unfocused_or_minimized_spinners_do_not_animate() {
+        use cosmic::iced::{Event, Size, window};
+        let mut state = SpinnerState {
+            active: true,
+            occluded: false,
+            minimized: false,
+            elapsed: Duration::ZERO,
+        };
+        state.observe(&Event::Window(window::Event::Unfocused));
+        assert!(!state.active);
+        state.observe(&Event::Window(window::Event::Focused));
+        assert!(state.active);
+        state.observe(&Event::Window(window::Event::Resized(Size::ZERO)));
+        assert!(state.minimized);
+        state.observe(&Event::Window(window::Event::Resized(Size::new(640.0, 480.0))));
+        assert!(!state.minimized);
+        assert!(state.active, "restoring a focused window resumes animation");
+        assert!(SPINNER_FRAME >= Duration::from_millis(100));
+    }
+
+    #[test]
     fn an_offscreen_spinner_stops_asking_for_frames() {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
         use cosmic::iced::{Event, Point, Rectangle, Size, window};
@@ -522,12 +583,19 @@ mod tests {
             *SPINNER_EPOCH + crate::design::SPINNER_PERIOD / 2,
         ));
 
-        let requested = |origin: Point| {
+        let requested = |origin: Point, focus_event: Option<Event>| {
             let mut element: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
             let mut tree = Tree::new(element.as_widget());
+            tree.state.downcast_mut::<SpinnerState>().active = true;
             let node = layout::Node::new(Size::new(24.0, 24.0)).move_to(origin);
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
+            if let Some(event) = focus_event {
+                element.as_widget_mut().update(
+                    &mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+                    &renderer, &mut clipboard::Null, &mut shell, &viewport,
+                );
+            }
             element.as_widget_mut().update(
                 &mut tree,
                 &redraw,
@@ -544,7 +612,7 @@ mod tests {
             )
         };
 
-        let (visible, advanced) = requested(Point::new(8.0, 8.0));
+        let (visible, advanced) = requested(Point::new(8.0, 8.0), None);
         // Stepped at the spinner's own cadence, not at display refresh.
         assert_eq!(
             visible,
@@ -554,9 +622,15 @@ mod tests {
         );
         assert_ne!(advanced, Duration::ZERO, "the visible arc did not advance");
 
-        let (hidden, frozen) = requested(Point::new(8.0, 900.0));
+        let (hidden, frozen) = requested(Point::new(8.0, 900.0), None);
         assert_eq!(hidden, window::RedrawRequest::Wait);
         assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
+        for event in [window::Event::Unfocused, window::Event::Occluded(true),
+            window::Event::Resized(Size::ZERO)] {
+            let (inactive, elapsed) = requested(Point::new(8.0, 8.0), Some(Event::Window(event)));
+            assert_eq!(inactive, window::RedrawRequest::Wait);
+            assert_eq!(elapsed, Duration::ZERO);
+        }
     }
 
     #[test]

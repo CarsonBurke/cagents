@@ -560,13 +560,19 @@ impl SidebarProject {
             u64,
             crate::github::review_requests::scan::Requested,
         >,
-    ) {
-        let apply = |row: &mut SidebarPullRequest| {
+    ) -> bool {
+        let mut changed = false;
+        let mut apply = |row: &mut SidebarPullRequest| {
             let request = requested.get(&row.number);
-            row.needs_review = request.is_some();
-            row.review_requested_again = request.is_some_and(|request| {
+            let needs_review = request.is_some();
+            let requested_again = request.is_some_and(|request| {
                 request.history == crate::github::review_requests::scan::History::ReRequested
             });
+            if (row.needs_review, row.review_requested_again) != (needs_review, requested_again) {
+                row.needs_review = needs_review;
+                row.review_requested_again = requested_again;
+                changed = true;
+            }
         };
         for row in &mut self.pull_requests {
             apply(row);
@@ -584,6 +590,7 @@ impl SidebarProject {
                 }
             }
         }
+        changed
     }
 
     pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
@@ -11402,6 +11409,20 @@ pub(crate) mod tests {
         let pr = project.pull_requests[0].clone();
         project.worktrees[1].set_pull_request(pr);
         project
+    }
+
+    #[test]
+    fn unchanged_review_requests_do_not_mutate_project_rows() {
+        let mut project = project();
+        let empty = std::collections::BTreeMap::new();
+        let original = project.clone();
+        assert!(!project.apply_review_requests(&empty));
+        assert_eq!(project, original);
+        project.pull_requests[0].needs_review = true;
+        assert!(project.apply_review_requests(&empty));
+        let settled = project.clone();
+        assert!(!project.apply_review_requests(&empty));
+        assert_eq!(project, settled);
     }
 
     #[test]
