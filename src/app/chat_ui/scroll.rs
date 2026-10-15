@@ -141,6 +141,24 @@ pub(super) fn locate_logical(target: Target, item: String, identity: u64, byte: 
         item: item_id(&item), identity, byte, content: None, viewport: None, found: None })
 }
 
+/// Restore a source offset after the Find bar and temporary disclosures
+/// change the viewport height. Native chat offsets are bottom anchored.
+pub(super) fn restore_top<T: Send + 'static>(target: Target, top: f32) -> iced::Task<T> {
+    struct Restore { scroll: Id, top: f32 }
+    impl<T: 'static> Operation<T> for Restore {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) { visit(self); }
+        fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, content: Rectangle,
+            _: Vector, state: &mut dyn operation::Scrollable) {
+            if id == Some(&self.scroll) {
+                state.scroll_to(operation::scrollable::AbsoluteOffset {
+                    x:None,y:Some(((content.height-viewport.height).max(0.0)-self.top).max(0.0)),
+                });
+            }
+        }
+    }
+    iced::advanced::widget::operate(Restore {scroll:card_control_id(target.card,"chat-transcript"),top})
+}
+
 struct ItemBounds<'a> {
     ids: std::collections::HashMap<Id, Vec<&'a str>>,
     rows: std::collections::HashMap<&'a str, Rectangle>,

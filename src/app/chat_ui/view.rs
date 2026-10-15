@@ -708,6 +708,8 @@ impl Scroll {
 
     /// The height of the loaded transcript, which is what tells the page the
     /// reader has already asked for from the one they are asking for now.
+    pub(super) fn from_top(self) -> f32 { self.from_top }
+
     pub(super) fn bottom_offset(self) -> f32 { (self.travel() - self.from_top).max(0.0) }
 
     pub(super) fn content(self) -> f32 {
@@ -1494,8 +1496,7 @@ impl Runtime {
             transcript.push(notice_entry(error, target));
         }
         content.extend(self.plan_view());
-        if let Some(query) = &self.find {
-            content.push(
+        let find_bar: Element<'_, Message> = if let Some(query) = &self.find {
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
                         crate::ui_controls::field::search(
@@ -1510,7 +1511,7 @@ impl Runtime {
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
-                        "0 matches".to_owned()
+                        if self.find_waiting.is_some() { "Searching…".to_owned() } else { "0 matches".to_owned() }
                     } else {
                         format!(
                             "{} of {} matches",
@@ -1537,15 +1538,16 @@ impl Runtime {
                 ])
                 .align_y(Alignment::Center)
                 .spacing(step::GAP_S)
-                .into(),
-            );
-        }
+                .into()
+        } else {
+            widget::Space::new().height(0).into()
+        };
         let transcript = widget::container(virtualized::column(transcript.children, Default::default()))
             .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
         let (catalog, bookmark) = self.selection_document();
-        content.push(selection::transcript_virtualized(
+        let selected_transcript = selection::transcript_virtualized(
             scroll::transcript_observed(
                 transcript,
                 target,
@@ -1574,7 +1576,11 @@ impl Runtime {
             self.selected_subagent.as_deref(),
             catalog,
             bookmark,
-        ));
+        );
+        content.push(widget::column::with_children(vec![find_bar, selected_transcript])
+            .spacing(if self.find.is_some() { step::GAP_S } else { 0.0 })
+            .height(Length::Fill)
+            .into());
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))

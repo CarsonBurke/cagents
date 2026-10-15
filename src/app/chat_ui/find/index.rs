@@ -120,14 +120,14 @@ mod tests {
 #[derive(Clone, Default, Debug)]
 pub(in crate::app::chat_ui) struct Paint {
     pub generation: u64,
-    pub blocks: HashMap<u64, Arc<[Range<usize>]>>,
+    pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
     pub current: Option<Match>,
 }
 impl Paint {
     pub fn new(generation: u64, matches: &[Match], current: Option<Match>) -> Self {
         let mut blocks: HashMap<u64, Vec<Range<usize>>> = HashMap::new();
         for found in matches { blocks.entry(found.identity).or_default().push(found.range.clone()); }
-        Self { generation, blocks: blocks.into_iter().map(|(key,ranges)| (key,ranges.into())).collect(), current }
+        Self { generation, blocks: Arc::new(blocks.into_iter().map(|(key,ranges)| (key,ranges.into())).collect()), current }
     }
     pub fn fragment(&self, identity: u64, start: usize, length: usize) -> (Vec<Range<usize>>, Option<Range<usize>>) {
         let end = start.saturating_add(length);
@@ -139,6 +139,32 @@ impl Paint {
         }).unwrap_or_default();
         let current = self.current.as_ref().filter(|found| found.identity == identity).and_then(|found| clip(&found.range));
         (ranges,current)
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::app::chat_ui) struct Results {
+    pub matches: Arc<Vec<Match>>,
+    pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
+    pub revisions: HashMap<String,u64>,
+    positions: HashMap<(String,u64,usize,usize),usize>,
+}
+impl Results {
+    pub fn new(matches: Vec<Match>) -> Self {
+        let blocks = Paint::new(0,&matches,None).blocks;
+        let positions = matches.iter().enumerate().map(|(index,found)|
+            ((found.item.clone(),found.identity,found.range.start,found.range.end),index)).collect();
+        Self { matches:Arc::new(matches),blocks,positions,revisions:HashMap::new() }
+    }
+    pub fn with_revisions(matches:Vec<Match>,inputs:&[Input]) -> Self {
+        let mut result=Self::new(matches);
+        let matched:HashSet<_>=result.matches.iter().map(|found|found.item.as_str()).collect();
+        result.revisions=inputs.iter().filter(|input|matched.contains(input.item.id.as_str()))
+            .map(|input|(input.item.id.clone(),input.revision)).collect();
+        result
+    }
+    pub fn position(&self, found: &Match) -> Option<usize> {
+        self.positions.get(&(found.item.clone(),found.identity,found.range.start,found.range.end)).copied()
     }
 }
 
@@ -209,4 +235,17 @@ fn document(input: &Input, provider: crate::agent::Provider) -> Document {
     }
     let blocks = builder.finish().search_blocks().into_iter().map(|(identity,text)| Block {identity,text}).collect();
     Document {item:item.id.clone(),revision:input.revision,turn:input.turn.clone(),blocks}
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+    #[test]
+    fn a_match_crossing_mount_chunks_keeps_both_halves_and_one_current_identity() {
+        let found = Match {turn:"t".into(),item:"i".into(),identity:7,range:2046..2054};
+        let paint = Paint::new(1,&[found.clone()],Some(found));
+        assert_eq!(paint.fragment(7,0,2048),(vec![2046..2048],Some(2046..2048)));
+        assert_eq!(paint.fragment(7,2048,2048),(vec![0..6],Some(0..6)));
+        assert_eq!(paint.fragment(8,2048,2048),(Vec::new(),None));
+    }
 }
