@@ -2374,6 +2374,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::ComparisonMetadata { .. }
+            | RepositoryAction::DiskLoaded { .. }
+            | RepositoryAction::BranchBasisRefreshed { .. }
+            | RepositoryAction::DiskComparisonLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -14021,25 +14026,42 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
             }
-            Message::Repository(action @ (RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. })) => {
+            Message::Repository(
+                action
+                @ (RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. }),
+            ) => {
                 let card = action.card();
-                if self.modal_is_open() || crate::device::is_remote() { return Task::none(); }
+                if self.modal_is_open() || crate::device::is_remote() {
+                    return Task::none();
+                }
                 let reveal = matches!(action, RepositoryAction::RevealFile { .. });
                 let path = match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime)) => runtime.selected_path().map(|path| runtime.descriptor.worktree.join(path)),
+                    Some(CardRuntime::Repository(runtime)) => runtime
+                        .selected_path()
+                        .map(|path| runtime.descriptor.worktree.join(path)),
                     _ => None,
                 };
-                path.map_or_else(Task::none, |path| cosmic::task::future(async move {
-                    if reveal { Message::FileRevealed(file_manager::reveal(&path).await) }
-                    else { Message::ExternalUrlOpened(match url::Url::from_file_path(path) { Ok(url) => open_system_url(url).await, Err(_) => Err("Could not open file path".into()) }) }
-                }))
+                path.map_or_else(Task::none, |path| {
+                    cosmic::task::future(async move {
+                        if reveal {
+                            Message::FileRevealed(file_manager::reveal(&path).await)
+                        } else {
+                            Message::ExternalUrlOpened(match url::Url::from_file_path(path) {
+                                Ok(url) => open_system_url(url).await,
+                                Err(_) => Err("Could not open file path".into()),
+                            })
+                        }
+                    })
+                })
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let selected = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => runtime.selected_path().map(|path| (runtime.descriptor.worktree.join(path), runtime.editor_caret_for(&editor_id))),
                     _ => None,
                 };
-                selected.map_or_else(Task::none, |(path, caret)| self.open_file_in_editor_at(path, editor_id, caret))
+                selected.map_or_else(Task::none, |(path, caret)| {
+                    self.open_file_in_editor_at(path, editor_id, caret)
+                })
             }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {

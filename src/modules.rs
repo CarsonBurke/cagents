@@ -52,6 +52,8 @@ pub(crate) mod editor_navigation;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_indent;
 #[cfg(feature = "ui")]
+pub(crate) mod editor_reload;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;

@@ -147,6 +147,7 @@ pub enum Message {
     WindowFocused(window::Id, bool),
     WindowResized(iced::Size),
     RefreshVisible,
+    RefreshDocuments,
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -684,6 +685,12 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
+            | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::ComparisonMetadata { .. }
+            | RepositoryAction::DiskLoaded { .. }
+            | RepositoryAction::DiskComparisonLoaded { .. }
+            | RepositoryAction::BranchBasisRefreshed { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -2333,6 +2340,15 @@ impl Editor {
         Task::batch([files, review, self.refresh_snapshot(id, false)])
     }
 
+    fn refresh_documents(&mut self) -> Task<Message> {
+        if !self.can_refresh_documents() { return Task::none(); }
+        Task::batch(self.tabs.iter_mut().map(|tab| repository_task(tab.runtime.refresh_open_sources(tab.id))).collect::<Vec<_>>())
+    }
+
+    fn can_refresh_documents(&self) -> bool {
+        !self.exiting && self.tabs.iter().any(|tab| tab.runtime.observes_open_sources())
+    }
+
     fn refresh(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -3223,6 +3239,7 @@ impl Application for Editor {
                     // mode watch, so the periodic refresh catches that one.
                     Task::batch([self.refresh_visible(), self.flush_document_tone()])
                 }
+                Message::RefreshDocuments => self.refresh_documents(),
                 Message::DocumentToneStale => {
                     self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                     self.flush_document_tone()
@@ -4599,6 +4616,9 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
+        let documents = if self.can_refresh_documents() {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshDocuments)
+        } else { Subscription::none() };
         let frames = if self.sidebar_transition.is_some() {
             window::frames().map(|(_, now)| Message::Frame(now))
         } else {
@@ -4618,6 +4638,7 @@ impl Application for Editor {
         Subscription::batch([
             events,
             refresh,
+            documents,
             frames,
             review_requests,
             self.document_tone_subscription(),
@@ -7746,8 +7767,117 @@ mod tests {
     }
 
     #[test]
+    fn comparison_metadata_refreshes_staged_content_without_a_working_file_change() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "staged first\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "working stays\n").unwrap();
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, Some("tracked.txt"));
+        app.window_focused = true;
+        let task = app.update(Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(1));
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "staged one\nstaged two\nstaged three\n").unwrap();
+        let blob = git(root, &["hash-object", "-w", input.path().to_str().unwrap()]);
+        git(root, &["update-index", "--cacheinfo", "100644", &blob, "tracked.txt"]);
+        app.window_focused = false;
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        let tab = app.tab(card).unwrap();
+        assert_eq!(tab.runtime.inspector_context().diff_additions, Some(3));
+        assert_eq!(tab.runtime.editor_text().as_deref(), Some("working stays\n"));
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(3));
+    }
+
+    #[test]
+    fn comparison_metadata_refreshes_live_branch_refs_and_preserves_historical_ranges() {
+        use cagents::repository::{Oid, ValidatedRefName};
+        let directory = git_fixture();
+        let root = directory.path();
+        let initial = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
+        git(root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("tracked.txt"), "topic one\ntopic two\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        git(root, &["commit", "-m", "Topic"]);
+        let head = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
+        let reference = ValidatedRefName::parse("refs/heads/main").unwrap();
+        let live = DiffBasis::MergeBaseToHead { base_ref: reference.clone(), head: head.clone(), merge_base: initial.clone() };
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, Some("tracked.txt"));
+        app.window_focused = true;
+        let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: live }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &initial));
+        app.window_focused = false;
+        app.settings_open = true;
+        git(root, &["update-ref", "refs/heads/main", head.as_str()]);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
+        app.settings_open = false;
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "topic one\ntopic two\n");
+        for basis in [
+            DiffBasis::CommitToParent { oid: head.clone(), parent: Some(initial.clone()) },
+            DiffBasis::PullRequest { number: 1, base_ref: reference, head: head.clone(), merge_base: initial.clone() },
+        ] {
+            let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: basis.clone() }));
+            run_tasks(&mut app, task);
+            git(root, &["update-ref", "refs/heads/main", initial.as_str()]);
+            let task = app.update(Message::RefreshDocuments);
+            run_tasks(&mut app, task);
+            assert_eq!(app.tab(card).unwrap().runtime.selected_diff_basis(), &basis);
+            assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(2));
+        }
+    }
+
+    #[test]
+    fn document_refresh_updates_inactive_clean_tabs_and_preserves_dirty_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.window_focused = true;
+        std::fs::write(root.join("a.rs"), "before a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "before b\n").unwrap();
+        let a = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        load_selected(&mut app, a);
+        let b = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        load_selected(&mut app, b);
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
+            card: b, action: EditorAction::Edit(EditorEdit::Insert('x')),
+        })));
+        let dirty = app.tab(b).unwrap().runtime.editor_text().unwrap();
+        std::fs::write(root.join("a.rs"), "outside a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "outside b\n").unwrap();
+        app.window_focused = false;
+        app.settings_open = true;
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(b));
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("outside a\n"));
+        assert_eq!(app.tab(b).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "outside b\n");
+        app.settings_open = false;
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card: a })));
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("before a\n"));
+    }
+
+    #[test]
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
+        assert!(repository_action_allowed_while_modal(&RepositoryAction::DiskMetadata {
+            identity: AsyncIdentity { card, worktree: "/fixture".into(), path: "a.rs".into(), generation: 1 },
+            ticket: 1, result: Err("fixture".into()),
+        }));
         assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,

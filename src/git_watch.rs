@@ -173,6 +173,7 @@ impl Project {
                     || relative == Path::new("packed-refs")
                     || relative.starts_with("refs")
             }) {
+                change.metadata = true;
                 change
                     .worktrees
                     .extend(self.worktrees.iter().map(|worktree| worktree.id));
@@ -202,6 +203,7 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                 }
                 if metadata_owner == Some(worktree.id) {
+                    change.metadata = true;
                     change.worktrees.insert(worktree.id);
                     change.membership = true;
                     change.topology |= path
@@ -225,6 +227,7 @@ pub(crate) struct Change {
     pub worktrees: BTreeSet<WorktreeId>,
     pub topology: bool,
     pub membership: bool,
+    pub metadata: bool,
     pub error: Option<String>,
     pub coverage: Option<bool>,
 }
@@ -234,6 +237,7 @@ impl Change {
         self.worktrees.extend(other.worktrees);
         self.topology |= other.topology;
         self.membership |= other.membership;
+        self.metadata |= other.metadata;
         if let Some(coverage) = other.coverage {
             self.coverage = Some(coverage);
             if coverage {
