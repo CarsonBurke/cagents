@@ -2067,7 +2067,7 @@ impl Actor {
                 None
             };
             let mut command=command;
-            let starts_turn = matches!(&command, Command::Prompt { .. });
+            let starts_turn = matches!(&command, Command::Prompt { .. }|Command::PromptOriginal{..});
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2079,6 +2079,7 @@ impl Actor {
             }
             let authorizes_work = match &command {
                 Command::Prompt { .. }
+                | Command::PromptOriginal { .. }
                 | Command::Compact
                 | Command::Slash { .. }
                 | Command::StartQueued { .. }
@@ -2098,20 +2099,30 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            let retry=if let Command::PromptOriginal{session_id,original,turn_generation}=&command{
+                let state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+                let allowed=run.is_none() && state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty() && state.queued_messages.is_empty() && state.turn_generation==*turn_generation && state.session_id.as_deref()==Some(session_id.as_str()) && state.capabilities.original_retry && self.pending.is_empty() && self.output.is_empty();
+                drop(state);
+                if !allowed{let _=reply.send(Err("The current idle original changed or exact Retry is unavailable".into()));continue;}
+                let settings=original.settings.clone();
+                let prepared=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare_retry(session_id,original);
+                match prepared{Ok((id,prompt))=>{command=prompt;Some((id,settings))},Err(error)=>{let _=reply.send(Err(format!("Exact original Retry is unavailable: {error:?}")));continue;}}
+            }else{None};
+            let is_retry=retry.is_some();
             // Original capture is optional product metadata. A capture failure
             // leaves the ordinary command and picker paths intact, and cannot
             // prevent the user from sending work to the provider.
-            let original=if run.is_none() && self.adapter.supports_original_commands(&command){
+            let original=if let Some((id,_))=&retry{Some(id.clone())}else if run.is_none() && self.adapter.supports_original_commands(&command){
                 match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare(&mut command,&self.working_directory){
                     Ok(id)=>id,
                     Err(error)=>{tracing::warn!(?error,"original command capture unavailable");None},
                 }
             }else{None};
             self.adapter.original_command(original.clone());
-            let prepared = match run {
+            let prepared = if let Some((_,settings))=&retry{self.adapter.retry_original(settings,command)}else{match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
-            };
+            }};
             match prepared {
                 Ok(step) => {
                     if login_recovery.is_some() {
@@ -2138,10 +2149,10 @@ impl Actor {
                     // is safe to retire this never-dispatched intent.
                     if let Some(id)=original && let Err(error)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).abandon(&id){tracing::warn!(%error,"original refusal cleanup unavailable");}
                     self.adapter.original_command(None);
-                    self.apply(Event::Error {
+                    if !is_retry{self.apply(Event::Error {
                         message: message.clone(),
                         fatal: false,
-                    });
+                    });}
                     let _ = reply.send(Err(message));
                 }
             }

@@ -799,7 +799,7 @@ impl Adapter for Omp {
             Command::Compact => step.writes.push(self.request("compact")),
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. } =>
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. } | Command::PromptOriginal { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
             Command::LoadEarlier => return Err("OMP history is loaded completely during connection.".into()),
