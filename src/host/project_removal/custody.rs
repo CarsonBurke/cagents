@@ -28,6 +28,11 @@ pub(super) struct Operation {
     request_digest:String,
     commit_digest:String,
     work:Mutex<Work>,
+    // Store the ORIGINAL plan and issuer before later proof work. Failed
+    // preparation/Busy/lost return cannot replace pins or select a new issuer.
+    repair:Mutex<Option<Arc<Mutex<crate::project_recovery::git_repair::RepairPlan>>>>,
+    adoption_issuer:Mutex<Option<Arc<super::super::recovery_placement::Issuer>>>,
+    adoption:Mutex<Option<super::super::recovery_placement::operation_adoption::OperationAdoption>>,
     claimed:AtomicBool,
     settled:AtomicBool,
 }
@@ -37,10 +42,18 @@ impl Operation {
     pub(super) fn retains_prepared(&self)->bool {
         matches!(*self.work.lock().unwrap_or_else(|p|p.into_inner()),Work::Locate(_)|Work::Remove(_))
     }
+    #[cfg(test)]
+    pub(super) fn adoption_for_test(&self)->Option<super::super::recovery_placement::operation_adoption::OperationAdoption> {
+        self.adoption.lock().unwrap_or_else(|p|p.into_inner()).clone()
+    }
+    #[cfg(test)]
+    pub(super) fn repair_for_test(&self)->Option<Arc<Mutex<crate::project_recovery::git_repair::RepairPlan>>> {
+        self.repair.lock().unwrap_or_else(|p|p.into_inner()).clone()
+    }
     pub(super) fn lost(row:&Obligation,scope:&SavedScope)->Result<Self,String> {
         Ok(Self{operation:row.operation,project:scope.project.clone(),request:None,
             request_digest:row.request_digest.clone(),commit_digest:row.commit_digest.clone(),
-            work:Mutex::new(Work::Lost),claimed:AtomicBool::new(false),settled:AtomicBool::new(false)})
+            work:Mutex::new(Work::Lost),repair:Mutex::new(None),adoption_issuer:Mutex::new(None),adoption:Mutex::new(None),claimed:AtomicBool::new(false),settled:AtomicBool::new(false)})
     }
 }
 struct Claim(Arc<Operation>);
@@ -58,6 +71,39 @@ impl CommitAuthority<'_> {
         let hook=host.lock().unwrap_or_else(|p|p.into_inner()).project_operation_before_commit.clone();
         if let Some(hook)=hook {hook(self.operation());}
     }
+    pub(in crate::host) fn original_repair_plan(&self,prepare:impl FnOnce()->Result<crate::project_recovery::git_repair::RepairPlan,String>)
+        ->Result<Arc<Mutex<crate::project_recovery::git_repair::RepairPlan>>,ProtocolError> {
+        let mut original=self.operation.repair.lock().unwrap_or_else(|p|p.into_inner());
+        if original.is_none(){
+            let prepared=prepare().map_err(error)?;
+            if prepared.retained_bytes()>MAX_RETAINED_BYTES||prepared.retained_directories()>MAX_RETAINED_DIRECTORIES {
+                return Err(error("Locate exceeds its original retained proof capacity; no metadata repair was started"));
+            }
+            *original=Some(Arc::new(Mutex::new(prepared)));
+        }
+        Ok(original.as_ref().expect("original plan installed").clone())
+    }
+    pub(in crate::host) fn prepare_adoption(&self,host:&SharedHost,client:ClientId,edit:&ModelEdit,
+        repair:&crate::project_recovery::git_repair::RepairPlan)->Result<(),ProtocolError> {
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        let issuer={
+            let mut original=self.operation.adoption_issuer.lock().unwrap_or_else(|p|p.into_inner());
+            if original.is_none(){*original=Some(super::super::recovery_placement::current(host,client,deadline).map_err(error)?);}
+            original.as_ref().expect("original issuer installed").clone()
+        };
+        let mut slot=self.operation.adoption.lock().unwrap_or_else(|p|p.into_inner());
+        if slot.is_none() {
+            let existing=issuer.existing_operation_adoption(self.operation(),self.request_digest()).map_err(error)?;
+            let token=match existing {Some(token)=>token,None=>issuer.reserve_operation_adoption(self.operation(),self.request_digest(),edit,repair,&crate::repository::CancellationToken::new(),deadline).map_err(error)?};
+            *slot=Some(token); // BEFORE subsequent provider/directory proof work
+        }
+        Ok(())
+    }
+    pub(in crate::host) fn original_adoption(&self)->Result<super::super::recovery_placement::operation_adoption::OperationAdoption,ProtocolError> {
+        self.operation.adoption.lock().unwrap_or_else(|p|p.into_inner()).clone()
+            .ok_or_else(||error("Original Locate adoption custody is unavailable; no paths or current issuer were selected"))
+    }
+
     pub(in crate::host) fn operation(&self)->uuid::Uuid {self.operation.operation}
     pub(in crate::host) fn request_digest(&self)->&str {&self.operation.request_digest}
     pub(in crate::host) fn ensure_reservation(&self,edit:&ModelEdit)->Result<(),ProtocolError> {
@@ -109,12 +155,29 @@ fn aborted(operation:uuid::Uuid,reason:impl Into<String>)->Result<(ServerRespons
 /// A COMMIT response can be lost after SQLite positively settled the row.
 /// Re-reading that exact immutable receipt releases only its original lease;
 /// it never repeats effects or lets an unrelated operation consume custody.
-fn settle_original_receipt(host:&SharedHost,operation:uuid::Uuid) {
+fn settle_adoption(owner:&Operation)->Result<(),ProtocolError> {
+    let mut token=owner.adoption.lock().unwrap_or_else(|p|p.into_inner());
+    // Recover only the SAME original issuer's retained object after a lost
+    // reserve return. Never consult a new control connection/current issuer.
+    if token.is_none() {
+        if let Some(issuer)=owner.adoption_issuer.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {
+            *token=issuer.existing_operation_adoption(owner.operation,&owner.request_digest).map_err(error)?;
+        }
+    }
+    if let Some(token)=token.as_ref(){token.settle().map_err(error)?;}
+    *token=None;
+    Ok(())
+}
+fn settle_original_receipt(host:&SharedHost,operation:uuid::Uuid)->Result<(),ProtocolError> {
     if let Some((reservation,owner))=super::reservation::retained_operation(host,operation) {
+        settle_adoption(&owner)?;
         owner.settled.store(true,Ordering::Release);
         if let Ok(mut work)=owner.work.try_lock() {*work=Work::Complete;}
+        owner.repair.lock().unwrap_or_else(|p|p.into_inner()).take();
+        owner.adoption_issuer.lock().unwrap_or_else(|p|p.into_inner()).take();
         drop(reservation);
     }
+    Ok(())
 }
 fn public_phase(phase:Phase)->PublicPhase {
     match phase {Phase::Admitted=>PublicPhase::Preparing,Phase::Repairing=>PublicPhase::Repairing,
@@ -212,13 +275,19 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
             if row.request_digest!=digest || row.commit_digest!=commit_digest {return Err(error("This operation belongs to another original project request"));}
             match row.phase {
                 Phase::Resolved=> {
-                    settle_original_receipt(host,request.operation);
+                    drop(_writer);
+                    if let Err(reason)=settle_original_receipt(host,request.operation) {
+                        return pending(request.operation,PublicPhase::ModelCommitted,format!("The original outcome is durable but its exact custody release remains pending: {}",reason.message));
+                    }
                     let model=registry.lock().unwrap_or_else(|p|p.into_inner()).model().map_err(error)?;
                     if model.identity!=request.project.registry {return Err(error("The original operation receipt belongs to a different registry"));}
                     return Ok((ServerResponse::ProjectOperation{outcome:Outcome::Committed{operation:request.operation,model}},Vec::new(),false));
                 }
                 Phase::Aborted=> {
-                    settle_original_receipt(host,request.operation);
+                    drop(_writer);
+                    if let Err(reason)=settle_original_receipt(host,request.operation) {
+                        return pending(request.operation,PublicPhase::Preparing,format!("The pre-effect abort is durable but its exact custody release remains pending: {}",reason.message));
+                    }
                     return aborted(request.operation,"This original operation ended before repair or session close. Start a fresh explicit project action.");
                 }
                 _=>{},
@@ -258,7 +327,7 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
             };
             let scope=reservation.saved_scope(match &request.action {Action::Locate{relocation}=>Some(relocation.clone()),Action::Remove{..}=>None})?;
             let operation=Arc::new(Operation{operation:request.operation,project:request.project.clone(),request:Some(request.clone()),request_digest:digest.clone(),commit_digest:commit_digest.clone(),
-                work:Mutex::new(Work::Preparing),claimed:AtomicBool::new(true),settled:AtomicBool::new(false)});
+                work:Mutex::new(Work::Preparing),repair:Mutex::new(None),adoption_issuer:Mutex::new(None),adoption:Mutex::new(None),claimed:AtomicBool::new(true),settled:AtomicBool::new(false)});
             reservation.bind_operation(operation.clone())?;
             let admission_result=registry.lock().unwrap_or_else(|p|p.into_inner()).begin_project_operation(request.operation,&digest,&commit_digest,&scope);
             if let Err(reason)=admission_result {
@@ -281,7 +350,7 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
         let _admitted=gate.read().unwrap_or_else(|p|p.into_inner());
         super::super::client::ensure_control_open(host)?;
         let prepared=match &request.action {
-            Action::Locate{relocation}=>super::super::session_locations::prepare_relocation(host,client,request.project.clone(),relocation.clone()).and_then(|prepared| {
+            Action::Locate{relocation}=>super::super::session_locations::prepare_relocation(host,client,request.project.clone(),relocation.clone(),&authority).and_then(|prepared| {
                 if prepared.retained_bytes()>MAX_RETAINED_BYTES || prepared.retained_directories()>MAX_RETAINED_DIRECTORIES {return Err(error("Locate exceeds its retained proof capacity; no metadata repair was started"));}
                 Ok(Work::Locate(prepared))
             }),
@@ -291,6 +360,11 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
             Ok(prepared)=>*work=prepared,
             Err(reason)=> {
                 if authority.advance_phase(host,Phase::Admitted,Phase::Aborted).is_ok() {
+                    if let Err(release)=settle_adoption(&operation) {
+                        return pending(operation.operation,PublicPhase::Preparing,format!("{} Its pre-effect abort is durable; original adoption custody is still retained: {}",reason.message,release.message));
+                    }
+                    operation.repair.lock().unwrap_or_else(|p|p.into_inner()).take();
+                    operation.adoption_issuer.lock().unwrap_or_else(|p|p.into_inner()).take();
                     operation.settled.store(true,Ordering::Release);*work=Work::Complete;
                     drop(work);drop(claim);drop(reservation);
                     return aborted(operation.operation,format!("{} No repair or session close began. Start a fresh explicit project action.",reason.message));
@@ -318,6 +392,11 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
                     return pending(operation.operation,PublicPhase::ModelCommitted,reason);
                 }
             }
+            if let Err(reason)=settle_adoption(&operation) {
+                return pending(operation.operation,PublicPhase::ModelCommitted,format!("The original outcome is durable but its adoption custody release is pending: {}",reason.message));
+            }
+            operation.repair.lock().unwrap_or_else(|p|p.into_inner()).take();
+            operation.adoption_issuer.lock().unwrap_or_else(|p|p.into_inner()).take();
             operation.settled.store(true,Ordering::Release);*work=Work::Complete;
             drop(work);drop(claim);drop(reservation);
             Ok((ServerResponse::ProjectOperation{outcome:Outcome::Committed{operation:operation.operation,model}},Vec::new(),false))

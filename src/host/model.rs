@@ -266,6 +266,14 @@ impl Registry {
         &mut self,edit:&ModelEdit,moves:&[SessionMove],agent_moves:&[AgentMove],
         operation:Option<(Uuid,&str)>,
     )->Result<Applied,String> {
+        self.apply_with_project_operation_and_recovery(edit,moves,agent_moves,operation,None)
+    }
+
+    pub(crate) fn apply_with_project_operation_and_recovery(
+        &mut self,edit:&ModelEdit,moves:&[SessionMove],agent_moves:&[AgentMove],
+        operation:Option<(Uuid,&str)>,
+        adoption:Option<&super::recovery_placement::AdoptionAdmission<'_>>,
+    )->Result<Applied,String> {
         if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
             return Err(
                 "Session directory proofs may only accompany their project relocation".into(),
@@ -278,9 +286,12 @@ impl Registry {
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
-        let behavior=if operation.is_some() {rusqlite::TransactionBehavior::Immediate} else {rusqlite::TransactionBehavior::Deferred};
+        let behavior=if operation.is_some()||adoption.is_some() {rusqlite::TransactionBehavior::Immediate} else {rusqlite::TransactionBehavior::Deferred};
         let transaction=self.db.transaction_with_behavior(behavior).map_err(|error|error.to_string())?;
-        if operation.is_some() {schema::require_current_write(&transaction)?;}
+        if operation.is_some()||adoption.is_some() {schema::require_current_write(&transaction)?;}
+        // Actual CLI issuer9ee prerequisite: this consumes the SAME held
+        // admission in the SAME model+journal transaction, never a second apply.
+        recovery_placements::admit_adoption(&transaction,edit,adoption)?;
         if let ModelEdit::RelocateProject { project, relocation } = edit {
             if project.repository != relocation.repository { return Err("The located paths do not name the original project instance".into()); }
             project_instances::require_relocation(&transaction, project, relocation)?;

@@ -301,7 +301,7 @@ impl PreparedRemoval {
     let _commit = super::client::try_scoped_control_write(&gate)?;
     super::client::ensure_control_open(host)?;
     let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
-    state.apply_project_operation(client,&ModelEdit::CloseProjectInstance{project:self.project.clone()},&[],&[],authority)
+    state.apply_project_operation(client,&ModelEdit::CloseProjectInstance{project:self.project.clone()},&[],&[],authority,None)
     }
 }
 
@@ -559,6 +559,7 @@ mod tests {
         git(&old,vec!["config".into(),"core.worktree".into(),old.to_string_lossy().into_owned()]);
         {
             let mut state=fixture.host.lock().unwrap();
+            state.edit_model(1,ModelEdit::OpenProject{repository:other.clone(),checkout:Some(other.clone()),primary_checkout:None,name:"independent".into(),kind:ProjectKind::Folder}).unwrap();
             state.edit_model(1,ModelEdit::CloseProject{repository:old.clone()}).unwrap();
             let model=state.edit_model(1,ModelEdit::OpenProject{repository:common.clone(),checkout:Some(old.clone()),primary_checkout:Some(old.clone()),name:"git".into(),kind:ProjectKind::Git}).unwrap();
             fixture.expected=ProjectInstance{registry:model.identity,repository:common.clone(),ordinal:model.project(&common).unwrap().ordinal};
@@ -567,6 +568,11 @@ mod tests {
         let request=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Locate{relocation:crate::project_recovery::Relocation{repository:common.clone(),destination:common.clone(),old_root:old.clone(),new_root:moved.clone()}}};
         let held=hold_final_commit(&fixture.host,request.operation);
         assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::PendingCommit,..}));
+        let (_,original_operation)=reservation::retained_operation(&fixture.host,request.operation).unwrap();
+        let original_plan=original_operation.repair_for_test().unwrap();
+        let original_adoption=original_operation.adoption_for_test().unwrap();
+        let original_root=original_adoption.original_root().unwrap();
+        assert!(original_adoption.settle().is_err(),"PendingCommit is not permission to release original negative Roots");
         let after=std::fs::read(common.join("config")).unwrap();let inode=std::fs::metadata(common.join("config")).unwrap().ino();
         assert!(String::from_utf8_lossy(&after).contains(moved.to_str().unwrap()),"real Git config repair preceded final busy");
         let model=fixture.host.lock().unwrap().read_model().unwrap();
@@ -598,15 +604,40 @@ mod tests {
         assert!(ensure_available(&restarted,Some(&common),Some(&moved),None).is_err());drop(restarted);
         std::fs::write(common.join("config.lock"),b"foreign lock after original repair").unwrap();
         fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
-        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}));
+        // The original delivery connection can vanish. Metadata-only Resume
+        // uses the retained original issuer, not the replacement client's scope.
+        {
+            let mut state=fixture.host.lock().unwrap();state.forget_client_delivery(1);state.register_client(2);
+            state.edit_model(2,ModelEdit::CreateChannel{id:crate::model::ChannelId::new(),repository:other.clone(),title:"unrelated catalog progress".into(),title_source:Default::default()}).unwrap();
+        }
+        let short=original_adoption.admit_original(&CancellationToken::new(),Instant::now()+Duration::from_secs(10)).unwrap();
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Pending{..}),"Busy cannot replace or drop the owned original adoption");
+        assert!(original_adoption.original_root().is_err(),"held short admission is try-only, never re-entered by the worker");
+        assert!(Arc::ptr_eq(&original_plan,&original_operation.repair_for_test().unwrap()));
+        assert!(super::super::client::process_request(&fixture.host,2,ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"domain busy leaves input live\n".to_vec()}).is_ok());
+        drop(short);
+        assert!(Arc::ptr_eq(&original_root,&original_adoption.original_root().unwrap()));
+        // Real SQL settlement is durable before this injected lost completion.
+        // Original Roots and the same repair plan remain available to new UI
+        // discovery until same-operation release positively succeeds.
+        let operation=request.operation;
+        fixture.host.lock().unwrap().project_operation_after_settlement=Some(Arc::new(move |current|{assert_eq!(current,operation);Err("Lost post-COMMIT completion with actual original adoption retained".into())}));
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::ModelCommitted,..}));
+        let status=pending_status(&fixture.host,2,request.project.registry);
+        assert!(status.iter().any(|row|row.operation==request.operation&&row.resumable));
+        assert!(Arc::ptr_eq(&original_root,&original_adoption.original_root().unwrap()));
+        fixture.host.lock().unwrap().project_operation_after_settlement=None;
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Committed{..}));
+        assert!(original_adoption.original_root().is_err(),"positive settlement releases only the original owned Root scope");
+        assert!(original_operation.repair_for_test().is_none());
         assert_eq!(std::fs::metadata(common.join("config")).unwrap().ino(),inode,"retry cannot repeat a completed Git write");
         assert_eq!(std::fs::read(common.join("config.lock")).unwrap(),b"foreign lock after original repair");
         assert_eq!(std::fs::read(common.join("config")).unwrap(),after);
         let model=fixture.host.lock().unwrap().read_model().unwrap();assert_eq!(model.project(&common).unwrap().checkout.as_ref(),Some(&moved));
         assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
-        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}),"same operation has an idempotent settled reply");
+        assert!(matches!(resume_original(&fixture.host,2,request.project.registry,request.operation),ProjectOperationOutcome::Committed{..}),"same operation has an idempotent settled reply");
         let mut changed=request;changed.project.ordinal+=1;
-        assert!(super::super::client::process_request(&fixture.host,1,ClientRequest::ProjectOperation{request:changed}).is_err());
+        assert!(super::super::client::process_request(&fixture.host,2,ClientRequest::ProjectOperation{request:changed}).is_err());
         assert!(!fixture.handles[0].is_completed());
     }
     #[test]

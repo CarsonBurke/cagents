@@ -152,6 +152,7 @@ pub(super) fn prepare_relocation(
     origin: ClientId,
     project: crate::project_recovery::ProjectInstance,
     relocation: Relocation,
+    authority:&super::project_removal::custody::CommitAuthority<'_>,
 ) -> Result<PreparedRelocation, ProtocolError> {
     let edit = ModelEdit::RelocateProject { project:project.clone(), relocation }
         .canonicalized()
@@ -170,11 +171,14 @@ pub(super) fn prepare_relocation(
     };
     // Retain root/admin authority before effects. All provider/agent proofs
     // below are prepared before this plan's first metadata publication.
-    let repair = if kind==crate::model::ProjectKind::Git && !relocation.verification_only() {
+    let repair=authority.original_repair_plan(||if kind==crate::model::ProjectKind::Git && !relocation.verification_only() {
         crate::project_recovery::git_repair::RepairPlan::prepare(relocation,&worktrees)
     } else {
         crate::project_recovery::git_repair::RepairPlan::pin(relocation)
-    }.map_err(error)?;
+    })?;
+    // The operation owns its exact initial plan/issuer/token BEFORE any later
+    // proof can fail. Initial aliases compare against these original File pins.
+    authority.prepare_adoption(host,origin,&edit,&repair.lock().unwrap_or_else(|p|p.into_inner()))?;
     let sources = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let model = state.read_model()?;
@@ -357,14 +361,14 @@ pub(super) struct PreparedRelocation {
     edit: ModelEdit,
     prepared: Vec<Prepared>,
     agent_moves: Vec<super::model::AgentMove>,
-    repair: crate::project_recovery::git_repair::RepairPlan,
+    repair: std::sync::Arc<std::sync::Mutex<crate::project_recovery::git_repair::RepairPlan>>,
     chat_gates:Vec<std::sync::Arc<std::sync::Mutex<()>>>,
     model_committed: bool,
     actor_cursor: usize,
 }
 impl PreparedRelocation {
-    pub(super) fn retained_bytes(&self)->usize {self.repair.retained_bytes()}
-    pub(super) fn retained_directories(&self)->usize {self.repair.retained_directories()+self.prepared.len()+self.agent_moves.len()}
+    pub(super) fn retained_bytes(&self)->usize {self.repair.lock().unwrap_or_else(|p|p.into_inner()).retained_bytes()}
+    pub(super) fn retained_directories(&self)->usize {self.repair.lock().unwrap_or_else(|p|p.into_inner()).retained_directories()+self.prepared.len()+self.agent_moves.len()}
     pub(super) fn advance(&mut self,host:&SharedHost,origin:ClientId,authority:&super::project_removal::custody::CommitAuthority<'_>)->Result<WorkspaceModel,ProtocolError> {
         let registry=super::agent_execution::registry(host).map_err(error)?;
         let _transitions=self.chat_gates.iter().map(|gate|match gate.try_lock() {
@@ -372,17 +376,23 @@ impl PreparedRelocation {
             Err(std::sync::TryLockError::WouldBlock)=>Err(error("The original conversation has a lifecycle transition in progress; its prepared Locate operation was retained")),
         }).collect::<Result<Vec<_>,ProtocolError>>()?;
         if authority.model_is_committed(host)? {self.model_committed=true;}
+        let original_adoption=authority.original_adoption()?;
+        // This short !Send domain admission stays on this worker through the
+        // actual repair and SAME SQL transaction. Busy drops only this guard;
+        // the original token, issuer, plan and roots remain operation-owned.
+        let adoption=if self.model_committed {None}else{Some(original_adoption.admit_original(
+            &crate::repository::CancellationToken::new(),Instant::now()+Duration::from_secs(10)).map_err(error)?)};
         {
         let gate=super::client::control_gate(host);
         let _admitted=gate.read().unwrap_or_else(|p|p.into_inner());
         super::client::ensure_control_open(host)?;
         if !self.model_committed {
             authority.before_repair(host)?;
-            self.repair.apply_remaining().map_err(error)?;
+            self.repair.lock().unwrap_or_else(|p|p.into_inner()).apply_remaining().map_err(error)?;
             authority.pending_commit(host)?;
         }
         #[cfg(test)] if !self.model_committed {authority.before_final_commit(host);}
-        self.repair.require_current().map_err(error)?;
+        self.repair.lock().unwrap_or_else(|p|p.into_inner()).require_current().map_err(error)?;
         if !self.model_committed {
             for item in &self.prepared {
                 match &item.proof {
@@ -443,9 +453,12 @@ impl PreparedRelocation {
             .iter()
             .map(|item| item.movement.clone())
             .collect::<Vec<_>>();
-        state.apply_project_operation(origin,&self.edit,&moves,&self.agent_moves,authority)?;
+        state.apply_project_operation(origin,&self.edit,&moves,&self.agent_moves,authority,adoption.as_ref())?;
         self.model_committed=true;
     }
+    // Actor-local catch-up may wait on providers. Release the short domain
+    // admission after the model TX; the owned negative token remains retained.
+    drop(adoption);
     // The scoped reservation excludes related edits/starts while actor-local
     // operational paths catch up; unrelated input stays responsive. Keep failed
     // actor moves explicitly blocked.

@@ -701,11 +701,12 @@ impl HostState {
     /// lease; every other reservation still fences the final prepared edit.
     pub(super) fn apply_project_operation(&mut self,origin:ClientId,edit:&ModelEdit,
         moves:&[super::model::SessionMove],agent_moves:&[super::model::AgentMove],
-        authority:&super::project_removal::custody::CommitAuthority<'_>)->Result<WorkspaceModel,ProtocolError> {
+        authority:&super::project_removal::custody::CommitAuthority<'_>,
+        adoption:Option<&super::recovery_placement::AdoptionAdmission<'_>>)->Result<WorkspaceModel,ProtocolError> {
         if let Some(reason)=&self.project_operation_startup_error {return Err(model_unavailable(reason.clone()));}
         authority.ensure_reservation(edit)?;
-        let applied=self.registry()?.apply_with_project_operation(edit,moves,agent_moves,
-            Some((authority.operation(),authority.request_digest()))).map_err(model_unavailable)?;
+        let applied=self.registry()?.apply_with_project_operation_and_recovery(edit,moves,agent_moves,
+            Some((authority.operation(),authority.request_digest())),adoption).map_err(model_unavailable)?;
         if applied.changed && matches!(edit,ModelEdit::CloseProjectInstance{..}) {
             self.announce_model_edit(origin,applied.model.sequence,edit);
         }
