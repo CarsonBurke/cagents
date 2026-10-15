@@ -1422,6 +1422,7 @@ mod tests {
             let old=PathBuf::from("/old/primary");
             let new=PathBuf::from("/new/primary");
             let (mut app,id)=app(metadata);
+            app.sidebar_model.projects.iter_mut().find(|project|project.id==id).unwrap().kind=ProjectKind::Git;
             Arc::make_mut(&mut app.durable).shared_project_bindings.insert(id,crate::model::SharedProjectBinding {ordinal:7,root:Some(old.clone())});
             let relocation=Relocation {repository:metadata.into(),destination:metadata.into(),old_root:old.clone(),new_root:new.clone()};
             let _=app.apply_project_relocation(&relocation);
