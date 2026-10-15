@@ -6868,7 +6868,7 @@ impl RepositoryRuntime {
                     Ok(LoadedFile { source, content: FileContent::SavedAbsence }) => {
                         match self.undo_lru.take(&identity.path, &source, blake3::hash(b""), false) {
                             Some(retained) => {
-                                let markdown = source.extension().is_some_and(|ext| matches!(ext.to_str(), Some("md" | "markdown")));
+                                let markdown = crate::editor::is_markdown_path(&source);
                                 let mut document = EditorDocument::new(identity.path, source, String::new(), blake3::hash(b""), markdown);
                                 document.restore_undo(retained);
                                 DocumentState::Editable(document)

@@ -567,6 +567,19 @@ fn link_target_beneath(root: &Root, link: &Path, target: &Path) -> Option<Option
 
 /// Reads and classifies the regular file at `relative_path`, whose name was
 /// just found to describe something other than a link.
+/// The same source classification is used when restoring a saved absence.
+pub(crate) fn is_markdown_path(path: &Path) -> bool {
+    path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
+        || relative_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
+            })
+}
+
 fn load_regular_file(
     root: &Root,
     worktree: &Path,
@@ -682,15 +695,7 @@ fn load_regular_file(
         )));
     }
     let text = String::from_utf8(bytes).expect("UTF-8 validated above");
-    let markdown = relative_path
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
-        || relative_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
-            });
+    let markdown = is_markdown_path(relative_path);
     Ok(FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
