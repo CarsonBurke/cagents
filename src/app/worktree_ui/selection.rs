@@ -1,5 +1,6 @@
 //! Navigation commits only after its target's filesystem lease is held.
 use super::*;
+use crate::chat;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -348,7 +349,7 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    pub(super) fn prepared_selection_navigates(&self, generation: u64, receipt: &Receipt) -> bool {
+    pub(in crate::app) fn prepared_selection_navigates(&self, generation: u64, receipt: &Receipt) -> bool {
         generation == self.worktree_selection.generation
             && self.worktree_selection.pending
             && receipt.0.lock().unwrap().as_ref().is_some_and(
@@ -854,7 +855,7 @@ mod tests {
             Vec::new(),
         )];
         let channel = ChannelId::new();
-        app.durable_mut()
+        Arc::make_mut(&mut app.durable)
             .channels
             .push(crate::model::ProjectChannel {
                 id: channel,

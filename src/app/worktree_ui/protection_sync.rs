@@ -241,7 +241,7 @@ mod tests {
     fn empty_window() -> Cagents {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.active_workspace = None;
-        app.durable_mut().cards.clear();
+        Arc::make_mut(&mut app.durable).cards.clear();
         app.cards.clear();
         app
     }
@@ -307,8 +307,8 @@ mod tests {
             crate::agent::Provider::Codex, TerminalId::new(), nested.clone(),
             &crate::account::Account::system(crate::agent::Provider::Codex),
         ).unwrap());
-        app.durable_mut().cards.push(draft);
-        app.durable_mut().card_scopes.insert(id, filing.clone());
+        Arc::make_mut(&mut app.durable).cards.push(draft);
+        Arc::make_mut(&mut app.durable).card_scopes.insert(id, filing.clone());
         app.worktree_owners.insert(id, filing.clone());
         app.active_workspace = Some(filing.clone());
         assert!(app.cards.is_empty(), "no daemon actor protects this unstarted draft");
@@ -331,7 +331,7 @@ mod tests {
         assert!(matches!(crate::instance::owned_lock(&ready, libc::LOCK_SH | libc::LOCK_NB),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
         denied(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true));
-        app.durable_mut().cards[0].existence = Existence::Closed {
+        Arc::make_mut(&mut app.durable).cards[0].existence = Existence::Closed {
             tombstone: crate::model::Tombstone {
                 operation_id: None, closed_at_unix_ms: 1, reason: Some("fixture pane closed".into()),
             },
