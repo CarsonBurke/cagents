@@ -5627,7 +5627,6 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_restores_blob_under_restrictive_umask() {
     const NAME: &str = "recoverable_discard_restores_blob_under_restrictive_umask";
@@ -5659,6 +5658,7 @@ fn recoverable_discard_restores_blob_under_restrictive_umask() {
     assert!(!discarded.recovery.live_recovery.needs_resolution());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
     if recovery_context::run_isolated_case(
