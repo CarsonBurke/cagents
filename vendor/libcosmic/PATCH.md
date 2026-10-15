@@ -31,8 +31,11 @@ the renderer's startup default. Explicit per-label sizes still take precedence.
 
 Toolkit text buttons use the same default size and grow their default line box
 and minimum height accordingly. Menu buttons retain their existing minimum
-height and grow when a larger selected font needs more room. These changes do
-not write desktop preferences or change package features and dependencies.
+height and grow when a larger selected font needs more room. Their height uses
+iced's actual default text line height plus the existing vertical padding, so it
+tracks the text renderer rather than assuming a separate relative multiplier.
+These changes do not write desktop preferences or change package features and
+dependencies.
 
 Application layout regressions exercise toolkit text, text buttons and an actual
 right-click context-menu overlay at small and large interface sizes. The menu

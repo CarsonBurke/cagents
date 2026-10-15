@@ -409,7 +409,7 @@ mod settings_typography_tests {
         );
         assert!(
             large_menu >= large_label + 8.0,
-            "menu padding must not clip the line box"
+            "menu padding must not clip the line box: row={large_menu}, text={large_label}"
         );
         assert!(
             text_height(
