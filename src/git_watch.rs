@@ -1494,16 +1494,17 @@ pub(crate) mod tests {
         );
         assert!(!plan.worktrees[0].directories.contains(&root.join("target")));
         assert!(plan.metadata_paths().contains_key(&common));
-        assert_eq!(
-            plan.polling.as_deref(),
-            Some("directory watch limit reached")
-        );
+
         let registrations = Registrations::within(
             &BTreeMap::from([(id, Arc::new(plan.clone()))]),
             watch_budget(),
         );
         assert!(registrations.desired.contains_key(&root.join("z/nested")));
         assert!(registrations.desired.contains_key(&common));
+        assert_eq!(
+            registrations.failures.get(&id).map(String::as_str),
+            Some("directory watch limit reached")
+        );
         let monitor = Monitor::start().unwrap();
         monitor.configure(vec![Arc::new(plan)]);
         wait_for(&monitor, id, |change| change.coverage.is_some());
@@ -1551,8 +1552,12 @@ pub(crate) mod tests {
             plan.worktrees[0].directories,
             BTreeSet::from([root.to_owned()])
         );
+        let registrations = Registrations::within(
+            &BTreeMap::from([(plan.id, Arc::new(plan.clone()))]),
+            watch_budget(),
+        );
         assert_eq!(
-            plan.polling.as_deref(),
+            registrations.failures.get(&plan.id).map(String::as_str),
             Some("directory watch limit reached")
         );
     }
@@ -1585,7 +1590,11 @@ pub(crate) mod tests {
         assert_eq!(plan.worktrees.len(), 1);
         assert!(plan.worktrees[0].directories.contains(root));
         assert!(plan.metadata_paths().contains_key(&common));
-        assert!(plan.polling.is_some());
+        let registrations = Registrations::within(
+            &BTreeMap::from([(plan.id, Arc::new(plan.clone()))]),
+            watch_budget(),
+        );
+        assert!(registrations.failures.contains_key(&plan.id));
     }
 
     #[test]
