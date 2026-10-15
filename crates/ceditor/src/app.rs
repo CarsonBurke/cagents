@@ -143,6 +143,7 @@ pub enum Message {
     WindowFocused(window::Id, bool),
     WindowResized(iced::Size),
     RefreshVisible,
+    RefreshDocuments,
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -678,6 +679,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
+            | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::DiskLoaded { .. }
+            | RepositoryAction::DiskComparisonLoaded { .. }
+            | RepositoryAction::BranchBasisRefreshed { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -2279,6 +2285,13 @@ impl Editor {
         Task::batch([files, review, self.refresh_snapshot(id, false)])
     }
 
+    fn refresh_documents(&mut self) -> Task<Message> {
+        if !self.can_refresh_visible() { return Task::none(); }
+        Task::batch(self.tabs.iter_mut().map(|tab| {
+            repository_task(tab.runtime.refresh_open_document(tab.id))
+        }).collect::<Vec<_>>())
+    }
+
     fn refresh(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -3166,6 +3179,7 @@ impl Application for Editor {
                     // mode watch, so the periodic refresh catches that one.
                     Task::batch([self.refresh_visible(), self.flush_document_tone()])
                 }
+                Message::RefreshDocuments => self.refresh_documents(),
                 Message::DocumentToneStale => {
                     self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                     self.flush_document_tone()
@@ -4508,6 +4522,9 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
+        let documents = if self.can_refresh_visible() {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshDocuments)
+        } else { Subscription::none() };
         let frames = if self.sidebar_transition.is_some() {
             window::frames().map(|(_, now)| Message::Frame(now))
         } else {
@@ -4527,6 +4544,7 @@ impl Application for Editor {
         Subscription::batch([
             events,
             refresh,
+            documents,
             frames,
             review_requests,
             self.document_tone_subscription(),
@@ -7471,8 +7489,41 @@ mod tests {
     }
 
     #[test]
+    fn document_refresh_updates_inactive_clean_tabs_and_preserves_dirty_tabs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.window_focused = true;
+        std::fs::write(root.join("a.rs"), "before a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "before b\n").unwrap();
+        let a = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        load_selected(&mut app, a);
+        let b = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        load_selected(&mut app, b);
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
+            card: b, action: EditorAction::Edit(EditorEdit::Insert('x')),
+        })));
+        let dirty = app.tab(b).unwrap().runtime.editor_text().unwrap();
+        std::fs::write(root.join("a.rs"), "outside a\n").unwrap();
+        std::fs::write(root.join("b.rs"), "outside b\n").unwrap();
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(b));
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("outside a\n"));
+        assert_eq!(app.tab(b).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "outside b\n");
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card: a })));
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("before a\n"));
+    }
+
+    #[test]
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
+        assert!(repository_action_allowed_while_modal(&RepositoryAction::DiskMetadata {
+            identity: AsyncIdentity { card, worktree: "/fixture".into(), path: "a.rs".into(), generation: 1 },
+            ticket: 1, result: Err("fixture".into()),
+        }));
         assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,
