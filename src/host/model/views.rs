@@ -15,7 +15,9 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if legacy { schema::require_legacy_views(tx)?; }
+    if legacy {
+        schema::require_legacy_views(tx)?;
+    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS shared_view_scopes(
             scope TEXT PRIMARY KEY,

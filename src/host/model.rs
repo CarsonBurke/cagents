@@ -201,7 +201,9 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
-        let transaction = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        let transaction = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current(&transaction)?;
         let changed = match edit {
@@ -455,7 +457,11 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 
 /// Runs the published migration bodies inside the caller's writer transaction.
 /// The header is published only after every body and the final layout validate.
-fn migrate_through(tx: &rusqlite::Transaction<'_>, version: u32, target: u32) -> Result<(), String> {
+fn migrate_through(
+    tx: &rusqlite::Transaction<'_>,
+    version: u32,
+    target: u32,
+) -> Result<(), String> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects(
              repository TEXT PRIMARY KEY,
@@ -507,22 +513,51 @@ fn migrate_through(tx: &rusqlite::Transaction<'_>, version: u32, target: u32) ->
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
-    if version < 1 && target >= 1 { execution::migrate(tx)?; schema::migration_checkpoint(1)?; }
-    if version < 2 && target >= 2 { automations::migrate(tx)?; schema::migration_checkpoint(2)?; }
+    if version < 1 && target >= 1 {
+        execution::migrate(tx)?;
+        schema::migration_checkpoint(1)?;
+    }
+    if version < 2 && target >= 2 {
+        automations::migrate(tx)?;
+        schema::migration_checkpoint(2)?;
+    }
     if version < 3 && target >= 3 {
         tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2);")
             .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(3)?;
     }
-    if version < 4 && target >= 4 { lineage::migrate(tx)?; schema::migration_checkpoint(4)?; }
-    if version < 5 && target >= 5 { mailbox::migrate(tx)?; schema::migration_checkpoint(5)?; }
-    if version < 6 && target >= 6 { terminal_owners::migrate(tx)?; schema::migration_checkpoint(6)?; }
-    if version < 8 && target >= 8 { views::migrate(tx)?; schema::migration_checkpoint(8)?; }
+    if version < 4 && target >= 4 {
+        lineage::migrate(tx)?;
+        schema::migration_checkpoint(4)?;
+    }
+    if version < 5 && target >= 5 {
+        mailbox::migrate(tx)?;
+        schema::migration_checkpoint(5)?;
+    }
+    if version < 6 && target >= 6 {
+        terminal_owners::migrate(tx)?;
+        schema::migration_checkpoint(6)?;
+    }
+    if version < 8 && target >= 8 {
+        views::migrate(tx)?;
+        schema::migration_checkpoint(8)?;
+    }
     // Version nine changed the wire contract without changing the layout.
-    if version < 9 && target >= 9 { schema::migration_checkpoint(9)?; }
-    if version < 10 && target >= 10 { execution::migrate_names(tx)?; schema::migration_checkpoint(10)?; }
-    if version < 11 && target >= 11 { automation_proposals::migrate(tx)?; schema::migration_checkpoint(11)?; }
-    if version < 12 && target >= 12 { mailbox::migrate_attention(tx)?; schema::migration_checkpoint(12)?; }
+    if version < 9 && target >= 9 {
+        schema::migration_checkpoint(9)?;
+    }
+    if version < 10 && target >= 10 {
+        execution::migrate_names(tx)?;
+        schema::migration_checkpoint(10)?;
+    }
+    if version < 11 && target >= 11 {
+        automation_proposals::migrate(tx)?;
+        schema::migration_checkpoint(11)?;
+    }
+    if version < 12 && target >= 12 {
+        mailbox::migrate_attention(tx)?;
+        schema::migration_checkpoint(12)?;
+    }
     Ok(())
 }
 

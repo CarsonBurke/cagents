@@ -667,7 +667,10 @@ mod tests {
             .db
             .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
             .unwrap();
-        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         migrate_attention(&tx).unwrap();
         tx.pragma_update(None, "user_version", 12).unwrap();
         tx.commit().unwrap();
@@ -685,7 +688,10 @@ mod tests {
             .db
             .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
             .unwrap();
-        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         migrate_attention(&tx).unwrap();
         tx.pragma_update(None, "user_version", 12).unwrap();
         tx.commit().unwrap();
@@ -892,7 +898,10 @@ mod tests {
             .db
             .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
             .unwrap();
-        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         migrate_attention(&tx).unwrap();
         tx.pragma_update(None, "user_version", 12).unwrap();
         tx.commit().unwrap();
