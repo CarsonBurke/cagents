@@ -8,6 +8,7 @@ mod owned_listener;
 mod startup_tests;
 use crate::{
     agent::Provider,
+    agent_execution::HostedSession,
     chat::{
         self, Session,
         runtime::{Handle, Update},
@@ -2603,7 +2604,19 @@ fn process_inner(
             }
             Ok(ServerResponse::Accepted)
         }
-        ClientRequest::ChatClose { chat_id } => {
+        ClientRequest::ChatClose { chat_id } => close_chat_source(host, client, chat_id, None, None),
+        _ => Err(error("Not a native chat request")),
+    }
+}
+
+/// Cleanup never attaches or restarts a stopped provider. The caller holds
+/// source-specific removal admission and retains this exact actor throughout.
+pub(super) fn close_project_session(host: &SharedHost, client: ClientId, source: &Session, instance: uuid::Uuid, actor: &Handle, deadline: Instant) -> Result<(),ProtocolError> {
+    close_chat_source(host, client, source.id, Some((source,instance,actor)), Some(deadline)).map(|_| ())
+}
+
+fn close_chat_source(host: &SharedHost, client: ClientId, chat_id: TerminalId, selected: Option<(&Session,uuid::Uuid,&Handle)>, deadline: Option<Instant>) -> Result<ServerResponse,ProtocolError> {
+
             let handle = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
@@ -2611,11 +2624,17 @@ fn process_inner(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                let handle = attached(&state, client, chat_id)?.handle.clone();
+                let handle = if let Some((source, instance, expected)) = selected {
+                    let record = state.chats.get(&chat_id).ok_or_else(|| unavailable("The selected native actor is no longer hosted"))?;
+                    if record.execution_instance != instance || !record.handle.same_actor(expected) || !HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(source.clone()))
+                        || (source.launch.session_id.is_some() && source.launch.session_id != record.handle.session_id()) { return Err(unavailable("The selected native actor changed; its replacement was preserved")); }
+                    record.handle.clone()
+                } else { attached(&state, client, chat_id)?.handle.clone() };
                 state.issued_chat_ids.insert(chat_id);
                 handle
             };
-            handle.close_for_resume().map_err(unavailable)?;
+            if let Some(deadline) = deadline { handle.close_for_resume_until(deadline).map_err(unavailable)?; }
+            else { handle.close_for_resume().map_err(unavailable)?; }
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
             let (retained, pending_cleanup) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2722,9 +2741,7 @@ fn process_inner(
             }
             drop(record);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
-        }
-        _ => Err(error("Not a native chat request")),
-    }
+
 }
 
 pub(super) fn resolve_upgrade(

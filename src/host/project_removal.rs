@@ -29,57 +29,15 @@ pub(super) fn inventory(host: &SharedHost, client: ClientId, project: &ProjectIn
     Ok(sessions)
 }
 
-pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstance, sessions: Vec<SessionClose>, _reservation: &Reservation) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
+pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstance, sessions: Vec<SessionClose>, reservation: &Reservation) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
     if sessions.len() > MAX_SESSIONS { return Err(error("Too many project sessions to close at once; close some panes and retry")); }
     let registry = super::agent_execution::registry(host).map_err(error)?;
-    let model = {
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        registry.require_project_instance(&project).map_err(error)?;
-        registry.model().map_err(error)?
-    };
-    let mut foreign = HashSet::new();
-    let mut owned = HashSet::new();
-    let mut roots = model.project(&project.repository).into_iter().flat_map(|project| project.primary_checkout.iter().chain(project.checkout.iter()).cloned().chain((project.kind == crate::model::ProjectKind::Folder).then(|| project.repository.clone()))).collect::<Vec<_>>();
-    for view in &model.views {
-        let repository = match &view.scope {
-            Scope::Worktree { repository, .. } => Some(repository),
-            Scope::Channel(channel) => model.channel(*channel).map(|channel| &channel.repository),
-        };
-        if repository == Some(&project.repository) {
-            if let Scope::Worktree { path, .. } = &view.scope { roots.push(path.clone()); }
-            for pane in &view.panes {
-                match &pane.kind {
-                    crate::model::CardKind::Terminal(session) => { owned.insert(session.id); },
-                    crate::model::CardKind::Chat(session) => { owned.insert(session.id); if let Some(terminal) = &session.terminal { owned.insert(terminal.id); } },
-                    _ => {},
-                }
-            }
-            continue;
-        }
-        for pane in &view.panes {
-            match &pane.kind {
-                crate::model::CardKind::Terminal(session) => { foreign.insert(session.id); },
-                crate::model::CardKind::Chat(session) => { foreign.insert(session.id); if let Some(terminal) = &session.terminal { foreign.insert(terminal.id); } },
-                _ => {},
-            }
-        }
-    }
-    for agent in &model.agents {
-        let repository = model.agent_locations.iter().find(|location| location.agent == agent.id).map(|location| &location.repository).unwrap_or(&agent.spec.target.repository);
-        if *repository == project.repository {
-            if let Some(source) = &agent.session { owned.insert(source.id()); }
-            if let Some(console) = &agent.console { owned.insert(console.id); }
-        } else {
-            if let Some(source) = &agent.session { foreign.insert(source.id()); }
-            if let Some(console) = &agent.console { foreign.insert(console.id); }
-        }
-    }
+    registry.lock().unwrap_or_else(|p| p.into_inner()).require_project_instance(&project).map_err(error)?;
     // A start admitted before this request must not escape its confirmation.
     let selected_ids = sessions.iter().map(|session| (session.source.id(), matches!(session.source, HostedSession::Chat(_)))).collect::<HashSet<_>>();
     for current in inventory(host, client, &project)? {
         let id = current.source.id();
-        let directory = match &current.source { HostedSession::Chat(source) => &source.launch.recipe.working_directory, HostedSession::Terminal(source) => &source.launch.working_directory };
-        if !foreign.contains(&id) && (owned.contains(&id) || roots.iter().any(|root| directory.starts_with(root)))
+        if reservation.qualifies(&current.source)
             && !selected_ids.contains(&(id, matches!(current.source, HostedSession::Chat(_)))) {
             return Err(error("A new session appeared in this project after its removal inventory. Refresh Projects and retry; no sessions were closed."));
         }
@@ -92,7 +50,7 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
             let id = selected.source.id();
             let kind = matches!(selected.source, HostedSession::Chat(_));
             if !seen.insert((id, kind)) { return Err(error("Project removal contains a repeated session source")); }
-            if foreign.contains(&id) { return Err(error(format!("Session {id} is retained by another project; no project sessions were closed"))); }
+            if !reservation.qualifies(&selected.source) { return Err(error(format!("Session {id} is not verified as owned by this project; no project sessions were closed"))); }
             match &selected.source {
                 HostedSession::Chat(source) => {
                     let record = state.chats.get(&id).ok_or_else(|| error("A selected native session changed; refresh Projects before removing it"))?;
@@ -129,8 +87,7 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
                 let unchanged = state.chats.get(&id).is_some_and(|record| record.handle.same_actor(&owner));
                 if !unchanged { if owner.is_completed() && !state.chats.contains_key(&id) { continue; } return Err(error("A selected native actor changed; its replacement was preserved")); }
                 drop(state);
-                super::chat::process(host, client, ClientRequest::ChatAttach { session: source })?;
-                super::chat::process(host, client, ClientRequest::ChatClose { chat_id: id })?;
+                super::chat::close_project_session(host, client, &source, selected.execution_instance.ok_or_else(|| error("Missing native actor identity"))?, &owner, deadline.min(Instant::now() + Duration::from_secs(10)))?;
             },
             (HostedSession::Terminal(source), Owner::Terminal(owner)) => {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -232,6 +189,42 @@ mod tests {
         assert!(!fixture.handles[0].is_completed()); assert!(handle.is_completed());
         assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
         assert!(ensure_available(&fixture.host,None,Some(&fixture.root),None).is_ok());
+    }
+
+    #[test]
+    fn unrelated_valid_source_refuses_the_entire_project_roster() {
+        let mut fixture = Fixture::new(); let own = fixture.spawn(crate::model::TerminalId::new());
+        let unrelated_dir = fixture._directory.path().join("unrelated"); std::fs::create_dir(&unrelated_dir).unwrap();
+        let unrelated = fixture.spawn_at(crate::model::TerminalId::new(), &unrelated_dir);
+        let error = fixture.request(fixture.expected.clone(), vec![own, unrelated]).unwrap_err();
+        assert!(error.message.contains("does not belong"));
+        assert!(fixture.handles.iter().all(|handle| !handle.is_completed()), "qualification precedes every close effect");
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some());
+    }
+
+    #[test]
+    fn exact_completed_native_cleanup_never_attaches_or_spawns_a_provider() {
+        use crate::{agent::Provider, chat::{self, Command, protocol::{Adapter, ProcessSpec, Step}, runtime::Handle}};
+        use std::collections::BTreeMap;
+        struct Idle;
+        impl Adapter for Idle { fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())} fn command(&mut self,_:Command)->Result<Step,String>{Ok(Step::default())} fn receive(&mut self,_:serde_json::Value)->Result<Step,String>{Ok(Step::default())} }
+        let fixture = Fixture::new(); let counter = fixture._directory.path().join("starts");
+        let mut recipe = LaunchRecipe::shell(fixture.root.clone()).unwrap(); recipe.program = "/bin/sh".into(); recipe.arguments = vec!["-c".into(), "printf 'started\n' >> \"$1\"; exec /bin/cat".into(), "fixture".into(), counter.to_string_lossy().into_owned()];
+        let spec = ProcessSpec::from(&recipe); let mut initial = Step::default(); let store = chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let actor = Handle::start(spec,Box::new(Idle),initial,store,None,|_|{}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !counter.exists() { assert!(Instant::now() < deadline); std::thread::yield_now(); }
+        actor.close_for_resume().unwrap(); assert!(actor.is_completed());
+        let instance = uuid::Uuid::new_v4(); let id = crate::model::TerminalId::new();
+        let source = {
+            let mut state = fixture.host.lock().unwrap();
+            let source = chat::Session { id, launch: chat::Launch { provider:Provider::Claude,recipe,session_id:None },proof:Some(state.proof().clone()),terminal:None,native_continuity:Default::default(),owned_codex_listener:None };
+            state.chats.insert(id,super::super::chat::Record { execution_instance:instance, console_recipe:None, paired_terminal:None,session:source.clone(),handle:actor.clone(),source_process:None,subscribers:BTreeMap::new(),observations:BTreeMap::new(),completion_observed:true,returning_terminal:false }); source
+        };
+        super::super::chat::close_project_session(&fixture.host,1,&source,instance,&actor,Instant::now()+Duration::from_secs(2)).unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(),"started\n");
+        assert!(!fixture.host.lock().unwrap().chats.contains_key(&id));
     }
 
     #[test]

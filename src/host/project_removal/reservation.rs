@@ -11,13 +11,23 @@ pub(crate) struct ReservedProject {
     channels: HashSet<ChannelId>,
     panes: HashSet<CardId>,
     sessions: HashSet<TerminalId>,
+    protected_sessions: HashSet<TerminalId>,
+    infer_directory: bool,
 }
 pub(crate) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, ReservedProject>>>;
 pub(crate) struct Reservation { entries: Reservations, token: uuid::Uuid }
+impl Reservation {
+    pub(super) fn qualifies(&self, source: &HostedSession) -> bool { self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).is_some_and(|scope| scope.qualifies(source)) }
+}
 impl Drop for Reservation {
     fn drop(&mut self) { self.entries.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.token); }
 }
 impl ReservedProject {
+    fn qualifies(&self, source: &HostedSession) -> bool {
+        if self.protected_sessions.contains(&source.id()) { return false; }
+        let directory = match source { HostedSession::Chat(source) => &source.launch.recipe.working_directory, HostedSession::Terminal(source) => &source.launch.working_directory };
+        self.sessions.contains(&source.id()) || (self.infer_directory && self.directory(directory))
+    }
     fn scope(&self, scope: &Scope) -> bool {
         match scope { Scope::Channel(channel) => self.channels.contains(channel), Scope::Worktree { repository, path } => *repository == self.project.repository || self.directory(path) }
     }
@@ -60,7 +70,7 @@ fn busy() -> ProtocolError { ProtocolError::new(ProtocolErrorCode::InvalidReques
 pub(crate) fn reserve(host: &SharedHost, project: &ProjectInstance, selected: &[SessionClose]) -> Result<Reservation,ProtocolError> {
     let registry = super::super::agent_execution::registry(host).map_err(error)?;
     let model = { let registry = registry.lock().unwrap_or_else(|p| p.into_inner()); registry.require_project_instance(project).map_err(error)?; registry.model().map_err(error)? };
-    let mut reserved = ReservedProject { project: project.clone(), roots: Vec::new(), protected: Vec::new(), channels: model.channels.iter().filter(|channel| channel.repository == project.repository).map(|channel| channel.id).collect(), panes: HashSet::new(), sessions: selected.iter().map(|selected| selected.source.id()).collect() };
+    let mut reserved = ReservedProject { project: project.clone(), roots: Vec::new(), protected: Vec::new(), channels: model.channels.iter().filter(|channel| channel.repository == project.repository).map(|channel| channel.id).collect(), panes: HashSet::new(), sessions: HashSet::new(), protected_sessions: HashSet::new(), infer_directory: !model.projects.iter().any(|other| other.repository != project.repository && other.kind == crate::model::ProjectKind::Git) };
     for current in &model.projects {
         let roots = if current.repository == project.repository { &mut reserved.roots } else { &mut reserved.protected };
         roots.extend(current.primary_checkout.iter().chain(current.checkout.iter()).cloned());
@@ -70,11 +80,15 @@ pub(crate) fn reserve(host: &SharedHost, project: &ProjectInstance, selected: &[
     for view in &model.views {
         let own = match &view.scope { Scope::Channel(channel) => reserved.channels.contains(channel), Scope::Worktree { repository, .. } => *repository == project.repository };
         if let Scope::Worktree { path, .. } = &view.scope { if own { reserved.roots.push(path.clone()); } else { reserved.protected.push(path.clone()); } }
-        if own { for pane in &view.panes { reserved.panes.insert(pane.id); match &pane.kind {
-            crate::model::CardKind::Terminal(session) => { reserved.sessions.insert(session.id); },
-            crate::model::CardKind::Chat(session) => { reserved.sessions.insert(session.id); if let Some(terminal) = &session.terminal { reserved.sessions.insert(terminal.id); } },
-            _ => {},
-        } } }
+        for pane in &view.panes {
+            if own { reserved.panes.insert(pane.id); }
+            let ids = if own { &mut reserved.sessions } else { &mut reserved.protected_sessions };
+            match &pane.kind {
+                crate::model::CardKind::Terminal(session) => { ids.insert(session.id); },
+                crate::model::CardKind::Chat(session) => { ids.insert(session.id); if let Some(terminal) = &session.terminal { ids.insert(terminal.id); } },
+                _ => {},
+            }
+        }
     }
     for agent in &model.agents {
         let location = model.agent_locations.iter().find(|location| location.agent == agent.id);
@@ -83,8 +97,17 @@ pub(crate) fn reserve(host: &SharedHost, project: &ProjectInstance, selected: &[
             reserved.panes.insert(CardId::from_uuid(agent.id.as_uuid()));
             if let Some(source) = &agent.session { reserved.sessions.insert(source.id()); }
             if let Some(console) = &agent.console { reserved.sessions.insert(console.id); }
-        } else { reserved.protected.push(location.map(|location| location.logical_directory().to_owned()).unwrap_or_else(|| agent.spec.target.directory.clone())); }
+        } else {
+            reserved.protected.push(location.map(|location| location.logical_directory().to_owned()).unwrap_or_else(|| agent.spec.target.directory.clone()));
+            if let Some(source) = &agent.session { reserved.protected_sessions.insert(source.id()); }
+            if let Some(console) = &agent.console { reserved.protected_sessions.insert(console.id); }
+        }
     }
+    // Another Git project may own external linked roots absent from this
+    // snapshot. In that case only explicit shared membership can authorize
+    // teardown; a guessed path prefix must never broaden ownership.
+    if selected.iter().any(|selected| !reserved.qualifies(&selected.source)) { return Err(error("A selected session does not belong to this project's verified shared membership or known directory scope. No sessions were closed; close an unregistered pane explicitly before removing the project.")); }
+    reserved.sessions.extend(selected.iter().map(|selected| selected.source.id()));
     let entries = entries(host); let token = uuid::Uuid::new_v4();
     { let mut entries = entries.lock().unwrap_or_else(|p| p.into_inner()); if entries.values().any(|active| active.project == *project) { return Err(busy()); } entries.insert(token,reserved); }
     Ok(Reservation { entries, token })

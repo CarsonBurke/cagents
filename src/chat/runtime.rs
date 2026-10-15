@@ -1082,6 +1082,11 @@ impl Handle {
         self.close()
     }
 
+    pub(crate) fn close_for_resume_until(&self, deadline: Instant) -> Result<(), String> {
+        if matches!(self.native_continuity(), super::NativeContinuity::Durable { .. }) { self.0.retain_cleanup_receipt.store(true, Ordering::Release); }
+        self.close_until(deadline)
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
