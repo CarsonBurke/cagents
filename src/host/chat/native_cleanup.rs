@@ -5,9 +5,38 @@ use crate::daemon::holder_registry::{self as registry, Kind};
 #[derive(Clone)]
 pub(in crate::host) struct NativeClose {
     source: Session,
-    owner: chat::native_holder::Detached,
+    owner: NativeOwner,
     closed: bool,
     paired: Option<RetainedPair>,
+}
+
+impl NativeClose {
+    pub(super) fn owns(&self, owner: &registry::Record, source: &Session) -> bool {
+        self.owner.record() == owner && self.source == *source
+    }
+}
+
+#[derive(Clone)]
+enum NativeOwner {
+    Server(chat::native_holder::Detached),
+    Actor {
+        record: registry::Record,
+        handle: Handle,
+    },
+}
+impl NativeOwner {
+    fn record(&self) -> &registry::Record {
+        match self {
+            Self::Server(owner) => &owner.record,
+            Self::Actor { record, .. } => record,
+        }
+    }
+    fn close_retaining_receipt(&self) -> Result<(), String> {
+        match self {
+            Self::Server(owner) => owner.close_retaining_receipt(),
+            Self::Actor { handle, .. } => handle.close(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -21,6 +50,19 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    if retained_actor::reconcile_startup(host, source)? {
+        return Ok(());
+    }
+    close_retained_inner(host, source, false)
+}
+
+/// A proved-dead provider can be restarted without closing its accepted agent
+/// or dropping the old transcript. Live retained owners must be reattached.
+pub(super) fn close_for_restart(host: &SharedHost, source: &Session) -> Result<(), String> {
+    close_retained_inner(host, source, true)
+}
+
+fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> Result<(), String> {
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -30,7 +72,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() {
+            if record.handle.owns_work() && !(restart && record.handle.is_completed()) {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
             let ServerResponse::ChatAttached {
@@ -54,6 +96,9 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         } else {
             None
         };
+        if restart && actor.as_ref().is_none_or(|handle| !handle.is_completed()) {
+            return Err("Only the exact completed native actor can prepare a restart".into());
+        }
         let pending = state.native_closing.get(&source.id).cloned();
         if pending
             .as_ref()
@@ -75,7 +120,31 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
         if let Some((record, true)) = &receipt {
-            retire_closed_execution(host, source, record, &proof)?;
+            if Handle::is_remote_record(record) && record.holder.is_current() {
+                let handle = match pending.as_ref().map(|pending| &pending.owner) {
+                    Some(NativeOwner::Actor { handle, .. }) => handle.clone(),
+                    _ => Handle::adopt_remote(record, source.clone(), proof.clone(), |_| {})?,
+                };
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .native_closing
+                    .insert(
+                        source.id,
+                        NativeClose {
+                            source: source.clone(),
+                            owner: NativeOwner::Actor {
+                                record: record.clone(),
+                                handle: handle.clone(),
+                            },
+                            closed: true,
+                            paired: None,
+                        },
+                    );
+                retained_actor::finish_close(host, &handle, source)?;
+            }
+            if !restart {
+                retire_closed_execution(host, source, record, &proof)?;
+            }
             return Ok(());
         }
         let mut pending = match pending {
@@ -84,11 +153,11 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                 let (record, _) = receipt.unwrap();
                 let pending = NativeClose {
                     source: source.clone(),
-                    owner: chat::native_holder::Detached {
+                    owner: NativeOwner::Server(chat::native_holder::Detached {
                         record,
                         source: source.clone(),
                         proof: proof.clone(),
-                    },
+                    }),
                     closed: true,
                     paired: retained_pair(
                         host,
@@ -106,30 +175,65 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             None => {
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
-                let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
-                if &recovery.source != source && !recovery.previous_sources.contains(source) {
-                    return Err(
-                        "Native holder does not recognize this exact issued descriptor".into(),
-                    );
+                if Handle::is_remote_record(&record) {
+                    if restart {
+                        return Err(
+                            "The retained Claude actor must restart inside its existing owner"
+                                .into(),
+                        );
+                    }
+                    let inspection = Handle::inspect_remote(&record, proof.clone())?;
+                    let paired = retained_pair(
+                        host,
+                        inspection.source.terminal.as_ref(),
+                        inspection.paired_holder.as_ref(),
+                        &proof,
+                    )?;
+                    // The helper independently recognizes the entire issued
+                    // descriptor before changing attachment epoch or closing.
+                    let handle =
+                        Handle::adopt_remote(&record, source.clone(), proof.clone(), |_| {})?;
+                    let pending = NativeClose {
+                        source: source.clone(),
+                        owner: NativeOwner::Actor { record, handle },
+                        closed: false,
+                        paired,
+                    };
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_closing
+                        .insert(source.id, pending.clone());
+                    pending
+                } else {
+                    let (recovery, exited) = chat::native_holder::inspect(&record, &proof)?;
+                    if restart && !exited {
+                        return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into());
+                    }
+
+                    if &recovery.source != source && !recovery.previous_sources.contains(source) {
+                        return Err(
+                            "Native holder does not recognize this exact issued descriptor".into(),
+                        );
+                    }
+                    let paired = retained_pair(
+                        host,
+                        recovery.source.terminal.as_ref(),
+                        recovery.paired_holder.as_ref(),
+                        &proof,
+                    )?;
+                    let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
+                    let pending = NativeClose {
+                        source: source.clone(),
+                        owner: NativeOwner::Server(holder.preserve()),
+                        closed: false,
+                        paired,
+                    };
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_closing
+                        .insert(source.id, pending.clone());
+                    pending
                 }
-                let paired = retained_pair(
-                    host,
-                    recovery.source.terminal.as_ref(),
-                    recovery.paired_holder.as_ref(),
-                    &proof,
-                )?;
-                let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
-                let pending = NativeClose {
-                    source: source.clone(),
-                    owner: holder.preserve(),
-                    closed: false,
-                    paired,
-                };
-                host.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .native_closing
-                    .insert(source.id, pending.clone());
-                pending
             }
         };
         if let Some(pair) = &pending.paired {
@@ -185,9 +289,14 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             state.retire_terminal(pair.holder.terminal);
         }
         chat::native_holder::confirm_pair_closed(source, &proof)?;
+        if let NativeOwner::Actor { handle, .. } = &pending.owner {
+            retained_actor::finish_close(host, handle, source)?;
+        }
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        if !restart {
+            retire_closed_execution(host, source, pending.owner.record(), &proof)?;
+        }
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -205,15 +314,21 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                         .into(),
                 );
             }
-            state.chats.remove(&source.id);
+            if !restart {
+                state.chats.remove(&source.id);
+            }
         }
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
-        if let Some(notifications) = &state.notifications {
-            notifications.retire(source.id);
+        if !restart {
+            if let Some(notifications) = &state.notifications {
+                notifications.retire(source.id);
+            }
         }
         drop(state);
-        super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        if !restart {
+            super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        }
     }
     result
 }

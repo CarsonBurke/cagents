@@ -145,7 +145,8 @@ use crate::{
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 /// Version 78 carries terminal provider outcomes and readable exit diagnostics.
 /// Version 79 pages immutable retained provider output by opaque log identity.
-pub const PROTOCOL_VERSION: u16 = 79;
+/// Version 80 carries an exact same-daemon provider and console restart receipt.
+pub const PROTOCOL_VERSION: u16 = 80;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -480,6 +481,10 @@ pub enum ClientRequest {
         log_id: String,
         offset: u64,
     },
+    /// Close an exact existing conversation without attaching or restarting it.
+    ChatCloseSession {
+        session: crate::chat::Session,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -799,6 +804,10 @@ pub enum ServerResponse {
         bytes: Vec<u8>,
         next_offset: Option<u64>,
         omitted: u64,
+    },
+    ChatRestarted {
+        receipt: crate::chat::RestartReceipt,
+        snapshot: crate::chat::Snapshot,
     },
 }
 
@@ -1888,14 +1897,20 @@ mod tests {
             chat_id: TerminalId::new(),
             state: crate::agent::ActivityState::Idle,
             generation: 42,
-            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "Provider exited with status 3".into() }),
+            outcome: Some(crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            }),
         };
         let binary = postcard::to_stdvec(&message).unwrap();
         let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
-        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
         let json = serde_json::to_value(&message).unwrap();
         let decoded: ServerMessage = serde_json::from_value(json).unwrap();
-        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use std::{
 };
 const ARGUMENT: &str = "--cagents-native-actor";
 const PROTOCOL: u32 = 1;
-const CAPABILITY: &str = "claude-actor-v1";
+const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME: usize = 34 * 1024 * 1024;
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
@@ -739,6 +739,7 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
+                        let identity_changed=state.confirmed_session != old.confirmed_session;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -766,6 +767,7 @@ impl RemoteActor {
                                 outcome,
                             });
                         }
+                        if identity_changed { (actor.0.notify)(Update::Identity); }
                         if ready {
                             (actor.0.notify)(Update::Ready);
                         }
@@ -1436,7 +1438,7 @@ fn validate_pair(
         || pair.is_some_and(|record| {
             record.terminal != source.id
                 || record.kind != Kind::Terminal
-                || record.application != crate::instance::APPLICATION_ID
+                || !registry::record_application_matches(record)
                 || source
                     .proof
                     .as_ref()
@@ -2306,7 +2308,7 @@ impl Server {
 
 fn validate_record(record: &Record) -> Result<(), String> {
     if record.kind != Kind::Native
-        || record.application != crate::instance::APPLICATION_ID
+        || !registry::record_application_matches(record)
         || !record.holder.is_current()
         || record.boot != crate::daemon::read_boot_id().map_err(|error| error.to_string())?
         || !record.build.as_ref().is_some_and(|build| {

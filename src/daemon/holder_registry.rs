@@ -317,6 +317,32 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
     read_file(file, true).map(|actual| actual == *expected)
 }
 
+pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v1";
+
+/// Ordinary terminal compatibility is separate from native actor capability.
+/// Keep Codex native holders exact; a Claude actor's matching capability grants
+/// discovery visibility only. Socket peer, daemon lease and actor epoch still
+/// authenticate attachment and every semantic ACK.
+pub(crate) fn application_matches(kind: Kind, application: &str) -> bool {
+    application_matches_for(kind, application, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+}
+fn application_matches_for(kind: Kind, application: &str, current: &str, development: bool) -> bool {
+    application == current || (kind == Kind::Terminal && production_family(application, current, development))
+}
+fn production_family(application: &str, current: &str, development: bool) -> bool {
+    !development && matches!(current, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
+        && matches!(application, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
+}
+pub(crate) fn record_application_matches(record: &Record) -> bool {
+    record_application_matches_for(record, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+}
+fn record_application_matches_for(record: &Record, current: &str, development: bool) -> bool {
+    application_matches_for(record.kind, &record.application, current, development)
+        || (record.kind == Kind::Native
+            && record.build.as_ref().is_some_and(|build| build.capabilities.iter().any(|capability| capability == RETAINED_CLAUDE_CAPABILITY))
+            && production_family(&record.application, current, development))
+}
+
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
@@ -327,7 +353,7 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
     if !record.supported_version()
         || record.kind != kind
-        || record.application != crate::instance::APPLICATION_ID
+        || !record_application_matches(&record)
         || record.boot != boot
         || socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string()))
     {
@@ -368,7 +394,7 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
         let record = read(&path)?;
         if record.kind == kind
             && record.supported_version()
-            && record.application == crate::instance::APPLICATION_ID
+            && record_application_matches(&record)
             && record.boot == boot
             && record.path(&directory) == path
             && record.holder.is_current()
@@ -402,7 +428,7 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
         };
         if !record.supported_version()
             || record.kind != kind
-            || record.application != crate::instance::APPLICATION_ID
+            || !record_application_matches(&record)
             || record.path(directory) != path
             || &record.boot != boot
         {
@@ -438,6 +464,39 @@ mod tests {
             holder: process.clone(),
             root: process,
         }
+    }
+
+    #[test]
+    fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
+        const FULL: &str = "dev.cagents.Cagents";
+        const BROWSERLESS: &str = "dev.cagents.Cagents.Browserless";
+        for (current, prior) in [(FULL, BROWSERLESS), (BROWSERLESS, FULL)] {
+            let mut actor = record();
+            actor.version = 4;
+            actor.kind = Kind::Native;
+            actor.application = prior.into();
+            actor.build = Some(BuildIdentity::current(Kind::Native));
+            let original = serde_json::to_vec(&actor).unwrap();
+            assert!(!record_application_matches_for(&actor, current, false), "native Codex stays exact");
+            actor.build.as_mut().unwrap().capabilities.push("claude-actor-v1".into());
+            let original_actor = serde_json::to_vec(&actor).unwrap();
+            assert!(record_application_matches_for(&actor, current, false));
+            assert!(!record_application_matches_for(&actor, current, true), "development cannot acquire production actors");
+            assert!(!record_application_matches_for(&actor, "another.installation", false));
+            assert_eq!(serde_json::to_vec(&actor).unwrap(), original_actor, "visibility never retags application/process provenance");
+            actor.build.as_mut().unwrap().capabilities.pop();
+            assert_eq!(serde_json::to_vec(&actor).unwrap(), original);
+            assert!(!record_application_matches_for(&actor, current, false));
+            actor.build = None;
+            assert!(!record_application_matches_for(&actor, current, false), "legacy records cannot infer the actor protocol");
+        }
+        let mut foreign = record();
+        foreign.kind = Kind::Native;
+        foreign.application = "dev.cagents.Cagents.Development".into();
+        foreign.build.as_mut().unwrap().capabilities.push("claude-actor-v1".into());
+        assert!(!record_application_matches_for(&foreign, FULL, false));
+        foreign.application = "another.installation".into();
+        assert!(!record_application_matches_for(&foreign, BROWSERLESS, false));
     }
 
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {

@@ -92,13 +92,14 @@ pub(super) fn restore(
         if state
             .chats
             .get(&source.id)
-            .is_some_and(|record| record.handle.owns_work())
+            .is_some_and(|record| !record.handle.is_completed())
         {
             return Err("The native conversation already has a live actor; attach to it".into());
         }
         if state.chat_handoffs.contains_key(&source.id)
             || state.chats.values().any(|record| {
                 record.handle.owns_work()
+                    && !(record.session.id == source.id && record.handle.is_completed())
                     && same_conversation(&record.session.launch, &source.launch)
             })
             || state
@@ -130,6 +131,9 @@ fn restore_reserved(
     let directory = registry::directory(Kind::Native)?;
     let record = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?
         .ok_or("The durable native holder is unavailable; this conversation was not restarted or resent")?;
+    if Handle::is_remote_record(&record) {
+        return super::retained_actor::restore(host, client, source, proof, record);
+    }
     let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());
@@ -191,7 +195,17 @@ fn restore_authenticated(
         .clone();
     let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
-    let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
+    let previous = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&source.id)
+        .filter(|record| record.handle.is_completed())
+        .map(|record| record.handle.clone());
+    let store = match previous.as_ref() {
+        Some(previous) => chat::runtime::preflight_retained_restart(&spec, &mut initial, previous)?,
+        None => chat::runtime::preflight_retained(&spec, &mut initial)?,
+    };
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
     let mut session = recovery.source.clone();
     let execution_console = recovery.execution_console.clone();
@@ -202,13 +216,14 @@ fn restore_authenticated(
     let weak = Arc::downgrade(host);
     let id = session.id;
     let execution_instance = uuid::Uuid::new_v4();
-    let handle = Handle::start_adopted(
+    let handle = Handle::start_adopted_with_previous(
         spec,
         adapter,
         initial,
         store,
         recovery,
         holder,
+        previous.as_ref(),
         move |update| {
             if let Update::Execution { run, update } = update {
                 if let Some(host) = weak.upgrade() {
@@ -327,6 +342,7 @@ fn restore_authenticated(
         let _ = handle.close();
         return Err(error);
     }
+    handle.commit_native_installation()?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&session.terminal, &paired) {
         (None, None) => true,
@@ -370,7 +386,6 @@ fn restore_authenticated(
         returning_terminal: false,
     };
     let response = session_snapshot(&record);
-    record.handle.commit_native_installation();
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
@@ -382,7 +397,7 @@ fn restore_authenticated(
     Ok(response)
 }
 
-fn retained_upgrade_sources(
+pub(super) fn retained_upgrade_sources(
     sources: Vec<Session>,
     successor: &Session,
 ) -> Vec<crate::upgrade::handoff::ChatSource> {
@@ -425,8 +440,13 @@ pub(in crate::host) fn restore_orphaned_native(
         {
             continue;
         }
-        let result = chat::native_holder::inspect(&record, &proof)
-            .and_then(|(recovery, _)| restore(host, 0, &recovery.source));
+        let result = if Handle::is_remote_record(&record) {
+            Handle::inspect_remote(&record, proof.clone())
+                .and_then(|inspection| restore(host, 0, &inspection.source))
+        } else {
+            chat::native_holder::inspect(&record, &proof)
+                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+        };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");
         }

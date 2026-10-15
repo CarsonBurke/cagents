@@ -86,6 +86,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatVisibility { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }
+        | R::ChatCloseSession { .. }
         | R::ChatCloseRetained { .. }
         | R::ChatList
         | R::ChatAcknowledge { .. }
