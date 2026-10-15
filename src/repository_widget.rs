@@ -2390,6 +2390,7 @@ pub struct RepositoryRuntime {
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     // Captured once by the actual window before any initial file task.
     recovery_endpoint: Option<crate::recovery_domain::LocalRecoveryEndpoint>,
+    edited_root_admissions: Option<crate::edited_root_admission::SharedEditedRootAdmissions>,
     directory_only: bool,
     external_source: Option<PathBuf>,
     standalone: bool,
@@ -2653,6 +2654,7 @@ impl RepositoryRuntime {
             descriptor,
             worktree_protection: None,
             recovery_endpoint: None,
+            edited_root_admissions: None,
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             editor_tab_width: 4,
@@ -3643,6 +3645,11 @@ impl RepositoryRuntime {
     /// effect or edited-root lease. Retargeting must keep the original endpoint.
     pub fn set_recovery_endpoint(&mut self, endpoint: crate::recovery_domain::LocalRecoveryEndpoint) {
         if self.recovery_endpoint.is_none() { self.recovery_endpoint = Some(endpoint); }
+    }
+    /// Share the actual window's bounded custody before initial load. Runtime
+    /// clones this SAME ledger; it never creates a separate registration owner.
+    pub fn set_edited_root_admissions(&mut self, admissions: crate::edited_root_admission::SharedEditedRootAdmissions) {
+        if self.edited_root_admissions.is_none() { self.edited_root_admissions = Some(admissions); }
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
