@@ -4657,6 +4657,8 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        self.notices.resolve(&format!("chat-resume:{card}"));
+        self.notices.resolve_target("daemon-interrupted-turns", card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -6516,7 +6518,7 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.error = Some(failure.message.clone());
+                            runtime.error = Some("Couldn’t reopen this conversation. Open application notices for details.".into());
                             self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
@@ -6524,7 +6526,7 @@ impl Cagents {
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Chat(_))
                         ) {
-                            self.fail_runtime(target.card, failure.message.clone());
+                            self.fail_runtime(target.card, "Couldn’t reopen this conversation. Open application notices for details.".into());
                             self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
                         } else {
                             // Failed recognition/attachment must never replace or
@@ -7629,6 +7631,9 @@ impl Cagents {
                 }
                 let pending = runtime.pending.take().unwrap();
                 let provider = runtime.session.launch.provider;
+                if result.is_ok() && pending.sent.is_some() {
+                    self.notices.resolve_target("daemon-interrupted-turns", target.card);
+                }
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
                 {
@@ -12924,6 +12929,26 @@ mod tests {
                 saved.native_continuity
             );
         }
+    }
+
+    #[test]
+    fn successful_resume_retry_clears_its_keyed_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().disconnected = true;
+        drop(app.update(Message::ChatUi(Action::Reconnect(target))));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry("Exact native chat not found")));
+        let key = format!("chat-resume:{card}");
+        assert!(app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
+        let retry = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Reconnect(retry))));
+        let attempt = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, attempt, Ok(handle));
+        assert!(chat_runtime(&app, card).connected());
+        assert!(!app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
     }
 
     #[test]

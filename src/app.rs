@@ -307,6 +307,14 @@ impl NoticeLog {
         self.entries.retain(|entry| entry.notice.key.as_deref() != Some(key));
     }
 
+    fn resolve_target(&mut self, key: &str, card: CardId) {
+        self.entries.retain_mut(|entry| {
+            if entry.notice.key.as_deref() != Some(key) { return true; }
+            entry.notice.targets.retain(|target| *target != card);
+            !entry.notice.targets.is_empty()
+        });
+    }
+
     fn expire(&mut self, now: Instant) {
         self.entries.retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
     }
@@ -326,7 +334,7 @@ impl NoticeLog {
         // in turn would otherwise alternate them forever and fill the log with
         // copies. The repeat moves to the back because the user cares that it
         // is happening now, and `recent` reads newest first.
-        if let Some(index) = self.entries.iter().position(|entry| entry.notice.severity == notice.severity && entry.notice.message == notice.message && entry.notice.key == notice.key) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
             let mut entry = self.entries.remove(index).expect("index came from the log");
             entry.repeats = entry.repeats.saturating_add(1);
             entry.expires_at = expires_at;
@@ -19939,6 +19947,27 @@ mod tests {
         log.record(TransientNotice::success("Reopened").key("chat:1"));
         assert_eq!(log.severity(), Some(NoticeSeverity::Success));
         log.resolve("chat:1");
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn unkeyed_notices_keep_distinct_object_details() {
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::warning("Interrupted").details("first").targets([CardId::new()]));
+        log.record(TransientNotice::warning("Interrupted").details("second").targets([CardId::new()]));
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn keyed_notice_targets_resolve_individually() {
+        let first = CardId::new();
+        let second = CardId::new();
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::warning("Some turns were interrupted").key("daemon-interrupted-turns").targets([first, second]));
+        log.resolve_target("daemon-interrupted-turns", first);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.targets, [second]);
+        log.resolve_target("daemon-interrupted-turns", second);
         assert!(log.is_empty());
     }
 
