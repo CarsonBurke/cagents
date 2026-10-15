@@ -33,7 +33,7 @@ pub(super) fn disconnected(pending: &Pending, reason: &str) {
     }
 }
 
-fn append_page(
+pub(super) fn append_page(
     output: &mut Vec<u8>,
     log: &super::super::ProviderExitLog,
     page: Page,
@@ -58,7 +58,7 @@ fn append_page(
     Ok(page.next_offset)
 }
 
-fn readable(bytes: Vec<u8>) -> String {
+pub(super) fn readable(bytes: Vec<u8>) -> String {
     let text = String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
     let mut text = super::super::terminal_output::display(text);
