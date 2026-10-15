@@ -9,6 +9,10 @@ pub(in crate::app) struct State {
     pub(in crate::app) initialize_runtimes: bool,
     /// Superseded workers can still own a not-yet-delivered directory lease.
     pub(super) inflight: HashSet<u64>,
+    #[cfg(test)]
+    local_window_override: Option<bool>,
+    #[cfg(test)]
+    canonicalize_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl State {
     #[cfg(test)]
@@ -179,11 +183,44 @@ impl Cagents {
         create: bool,
         intent: Intent,
     ) -> Task<Message> {
+        let local_window = crate::instance::window_is_initialized() && !crate::device::is_remote();
+        #[cfg(test)]
+        let local_window = self.worktree_selection.local_window_override.unwrap_or(local_window);
+        self.select_worktree_then_with_window(path, create, intent, local_window)
+    }
+
+    fn select_worktree_then_with_window(
+        &mut self,
+        path: PathBuf,
+        create: bool,
+        intent: Intent,
+        local_window: bool,
+    ) -> Task<Message> {
         let cancelled = self.cancel_worktree_selection();
+        let epoch = local_window.then(|| self.worktree_owner_paths.invalidate_watched());
+        let resolved = self.refresh_worktree_owners(Some(&path));
+        if local_window
+            && !create
+            && matches!(&intent, Intent::Navigate)
+            && self.durable.active_channel.is_none()
+            && self.active_workspace.as_ref() == Some(&path)
+            && resolved.as_ref() == Some(&path)
+            && self.worktree_owner_paths.cached.get(&path)
+                .is_some_and(|physical| self.worktree_protections.protects_exact(physical))
+        {
+            // A repository reload can reproject the current strip from cached
+            // ownership without opening another directory or creating a pane.
+            // Invalidated mappings and semantic continuations still prepare.
+            let selected = self.select_worktree_inner(path, false);
+            let initialization = self.initialize_prepared_scope_runtimes();
+            return Task::batch([
+                cancelled, selected, initialization, self.resolve_worktree_owner_paths(),
+            ]);
+        }
         // Headless fixture windows own no filesystem leases. Keep their
         // existing synchronous navigation semantics; production takes the
         // exact same commit path after off-thread preparation.
-        if !crate::instance::window_is_initialized() || crate::device::is_remote() {
+        if !local_window {
             let scope = self.commit_worktree_selection_scope(path, create, &intent);
             let initialization = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(intent);
@@ -195,8 +232,7 @@ impl Cagents {
                 self.resolve_worktree_owner_paths(),
             ]);
         }
-        let epoch = self.worktree_owner_paths.invalidate_watched();
-        self.refresh_worktree_owners(Some(&path));
+        let epoch = epoch.expect("local window sampled its ownership epoch");
         let generation = self.worktree_selection.generation;
         self.worktree_selection.pending = true;
         let roots = self
@@ -212,6 +248,8 @@ impl Cagents {
             .collect::<Vec<_>>();
         let cached = self.worktree_owner_paths.cached.get(&path).cloned();
         let watch = self.worktree_owner_paths.watch.clone();
+        #[cfg(test)]
+        let canonicalize_calls = self.worktree_selection.canonicalize_calls.clone();
         let prepare =
             self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
                 prepare_target(
@@ -219,7 +257,13 @@ impl Cagents {
                     roots,
                     cached,
                     &watch,
-                    |path| path.canonicalize(),
+                    move |path| {
+                        #[cfg(test)]
+                        if let Some(calls) = &canonicalize_calls {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        path.canonicalize()
+                    },
                     |path| {
                         crate::worktree_cleanup::protect(path)?
                             .ok_or_else(|| {
@@ -232,6 +276,34 @@ impl Cagents {
                 )
             });
         Task::batch([cancelled, prepare])
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn force_local_selection_with_counter_for_test(
+        &mut self,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.worktree_selection.local_window_override = Some(true);
+        self.worktree_selection.canonicalize_calls = Some(calls);
+    }
+
+    /// Repository discovery updates ownership without superseding a deliberate
+    /// navigation that is still preparing its destination.
+    pub(super) fn reproject_current_workspace_scope(&mut self) -> Task<Message> {
+        let Some(active) = self.active_workspace.clone() else {
+            return Task::none();
+        };
+        self.refresh_worktree_owners(Some(&active));
+        if self.worktree_selection.pending {
+            // A changed root set fences the pending receipt, which will retry
+            // its own destination. Reloading A must never navigate away from B.
+            return self.resolve_worktree_owner_paths();
+        }
+        if let Some(channel) = self.durable.active_channel {
+            self.select_channel(channel)
+        } else {
+            self.select_worktree(active, false)
+        }
     }
 
     /// Drop superseded prepared guards even if a modal is keeping successful
@@ -506,6 +578,90 @@ impl Cagents {
 mod tests {
     use super::*;
     use cosmic::Application as _;
+
+    fn protected_reload_app() -> (Cagents, tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut selected = None;
+        for index in 0..12 {
+            let path = directory.path().join(format!("worktree-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            app.known_worktree_roots.insert(path.clone());
+            app.worktree_owner_paths.cached.insert(path.clone(), path.canonicalize().unwrap());
+            if index == 0 { selected = Some(path); }
+        }
+        let selected = selected.unwrap();
+        drop(app.select_worktree_inner(selected.clone(), false));
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), &selected, false).unwrap(),
+        ));
+        (app, runtime, directory, selected)
+    }
+
+    #[test]
+    fn unchanged_protected_worktree_reload_schedules_no_local_filesystem_preparation() {
+        let (mut app, _runtime, _directory, selected) = protected_reload_app();
+        for _ in 0..3 {
+            // Force the initialized-local-window branch. The headless shortcut
+            // cannot make this test pass without the real held-lease shortcut.
+            drop(app.select_worktree_then_with_window(selected.clone(), false, Intent::Navigate, true));
+            assert!(!app.worktree_selection.pending);
+            assert!(app.worktree_selection.inflight.is_empty());
+            assert!(app.worktree_owner_paths.queued.is_empty());
+            assert!(app.worktree_owner_paths.inflight_generation.is_none());
+            assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+        }
+        drop(app.select_worktree_then_with_window(selected, false, Intent::EnsureDefaultPane, true));
+        assert!(app.worktree_selection.pending, "dependent actions must still prepare");
+    }
+
+    #[test]
+    fn newly_discovered_parent_root_cannot_reuse_a_nested_directory_lease() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("repository");
+        let nested = parent.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.worktree_owner_paths.cached.insert(nested.clone(), nested.canonicalize().unwrap());
+        drop(app.select_worktree_inner(nested.clone(), false));
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), &nested, false).unwrap(),
+        ));
+        app.known_worktree_roots.insert(parent.clone());
+        app.worktree_owner_paths.cached.insert(parent.clone(), parent.canonicalize().unwrap());
+        assert!(!app.worktree_protections.protects_exact(&parent));
+        drop(app.select_worktree_then_with_window(nested.clone(), false, Intent::Navigate, true));
+        assert!(app.worktree_selection.pending);
+        assert!(!app.worktree_selection.inflight.is_empty());
+        assert_eq!(app.active_workspace.as_ref(), Some(&nested));
+        assert!(!app.worktree_protections.protects_exact(&parent));
+    }
+
+    #[test]
+    fn automatic_repository_reprojection_preserves_pending_explicit_navigation() {
+        let (mut app, _runtime, _directory, selected) = protected_reload_app();
+        let destination = selected.parent().unwrap().join("worktree-1");
+        drop(app.select_worktree_then_with_window(destination, false, Intent::EnsureDefaultPane, true));
+        let generation = app.worktree_selection.generation;
+        let inflight = app.worktree_selection.inflight.clone();
+        assert!(app.worktree_selection.pending);
+        drop(app.reproject_current_workspace_scope());
+        assert_eq!(app.worktree_selection.generation, generation);
+        assert_eq!(app.worktree_selection.inflight, inflight);
+        assert!(app.worktree_selection.pending);
+        assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+    }
+
+    #[test]
+    fn invalidated_current_worktree_mapping_cannot_reuse_its_old_lease() {
+        let (mut app, _runtime, _directory, selected) = protected_reload_app();
+        app.worktree_owner_paths.cached.remove(&selected);
+        drop(app.select_worktree_then_with_window(selected, false, Intent::Navigate, true));
+        assert!(app.worktree_selection.pending);
+        assert!(!app.worktree_selection.inflight.is_empty());
+    }
 
     #[test]
     fn delayed_preparation_keeps_old_scope_and_input_responsive_then_discards_stale_intent() {

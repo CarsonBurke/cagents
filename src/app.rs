@@ -13979,11 +13979,7 @@ impl Application for Cagents {
                             // into distinct worktrees after session restoration.
                             // Only the project holding the scope can move it,
                             // and re-selecting resolves every card's owner.
-                            task = if let Some(channel) = self.durable.active_channel {
-                                self.select_channel(channel)
-                            } else {
-                                self.select_worktree(active, false)
-                            };
+                            task = self.reproject_current_workspace_scope();
                         }
                         // Every window shares which projects exist, and a
                         // channel the shared model named in this repository

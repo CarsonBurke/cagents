@@ -2871,6 +2871,16 @@ mod owner_path_cache_tests {
         assert!(app.worktree_owner_paths.finish(generation, paths));
         let initial = calls.load(Ordering::Relaxed);
         assert!(initial >= 12);
+        let selected = records[0].path.clone();
+        let destination = records[1].path.clone();
+        // Exercise the real RepositoryLoaded -> selection path as an
+        // initialized local window with a physically held directory lease.
+        drop(app.select_worktree_inner(selected.clone(), false));
+        let runtime = tempfile::tempdir().unwrap();
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), &selected, false).unwrap(),
+        ));
+        app.force_local_selection_with_counter_for_test(calls.clone());
         let loaded = LoadedRepository {
             project: ProjectState {
                 id: project,
@@ -2906,8 +2916,24 @@ mod owner_path_cache_tests {
                 "unchanged reload scheduled owner I/O"
             );
             assert!(app.worktree_owner_paths.take_batch().is_none());
+            assert!(!app.worktree_selection.pending, "unchanged active reload prepared navigation");
+            assert_eq!(app.active_workspace.as_ref(), Some(&selected));
             assert_eq!(calls.load(Ordering::Relaxed), initial);
         }
+        // An automatic reload of A must not cancel the explicit dependent
+        // navigation to B which is preparing while A remains displayed.
+        drop(app.select_worktree_then(destination, false, selection::Intent::EnsureDefaultPane));
+        let pending_generation = app.worktree_selection.generation_for_test();
+        assert!(app.worktree_selection.pending);
+        app.repository_generations.insert(project, 4);
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false, project_id: project, generation: 4,
+            result: Ok(Box::new(loaded)),
+        }));
+        assert!(app.worktree_selection.pending);
+        assert_eq!(app.worktree_selection.generation_for_test(), pending_generation);
+        assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+        assert_eq!(calls.load(Ordering::Relaxed), initial);
     }
 
     #[test]
