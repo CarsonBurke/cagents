@@ -2033,7 +2033,10 @@ impl Server {
                 Ok(Value::Null)
             }
             "observe" => {
-                self.actor.observe_next_update();
+                // The proxy already returned its cached generation. The helper
+                // only rearms observation, so reading state here would queue
+                // control behind off-loop snapshot hydration unnecessarily.
+                self.actor.0.observe_next.store(true, Ordering::Release);
                 Ok(Value::Null)
             }
             "pinned_directory" => value!(self.actor.pinned_directory_identity()?),
