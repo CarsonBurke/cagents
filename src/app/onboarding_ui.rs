@@ -238,8 +238,8 @@ impl Cagents {
                     "Agent accounts",
                     Icon::Avatar,
                     "empty.accounts",
-                    None,
-                    Message::AccountUi(account_ui::Action::OpenPane),
+                    Some(Command::OpenAgentAccounts),
+                    Message::Onboarding(Action::Command(Command::OpenAgentAccounts)),
                 ),
             ] {
                 content.push(
@@ -796,15 +796,17 @@ mod tests {
         use workspace_widget::GlobalShortcut as Command;
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.active_workspace = Some(PathBuf::from("/workspace/selected"));
-        for remote_device in [false, true] {
+        for (remote_device, save_in_flight) in [(false, false), (true, false), (false, true)] {
             for (id, command) in [
                 ("empty.new-conversation", Command::NewThread),
                 ("empty.resume-conversation", Command::ResumeConversation),
                 ("empty.new-terminal", Command::NewTerminal),
                 ("empty.new-browser", Command::NewBrowser),
+                ("empty.accounts", Command::OpenAgentAccounts),
             ] {
                 let mut context = app.chrome_command_context();
                 context.remote_device = remote_device;
+                context.save_in_flight = save_in_flight;
                 assert!(context.sidebar_commands.is_none());
                 let expected = workspace_widget::shortcut_descriptor(command).available(&context);
                 let messages = activate(app.empty_workspace_view_with_context(context), id);
@@ -814,13 +816,13 @@ mod tests {
             }
         }
         assert!(activate(app.empty_workspace_view(), "empty.accounts").iter().any(|message|
-            matches!(message, Message::AccountUi(account_ui::Action::OpenPane))));
+            matches!(message, Message::Onboarding(Action::Command(Command::OpenAgentAccounts)))));
     }
 
     #[test]
     fn queued_home_commands_respect_update_freeze_without_a_confirmation_modal() {
         use workspace_widget::GlobalShortcut as Command;
-        for command in [Command::NewThread, Command::CloneRepository, Command::ResumeConversation] {
+        for command in [Command::NewThread, Command::CloneRepository, Command::ResumeConversation, Command::OpenAgentAccounts] {
             let mut app = super::super::tests::context_inspector_test_app(false);
             assert!(!app.modal_is_open());
             assert!(!app.workspace_inputs_blocked());
