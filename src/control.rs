@@ -3341,8 +3341,24 @@ fn close_project(
 
 /// The verified checkout is presentation metadata, separate from Git identity.
 fn project_display_path(project: &ModelProject) -> String {
-    let path = project.checkout.as_deref().or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path()));
-    path.map(|path|path.display().to_string()).unwrap_or_else(||"(checkout unavailable)".into())
+    if let Some(path)=project.checkout.as_deref().or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path())) {
+        return path.display().to_string();
+    }
+    // Legacy rows only persisted Git identity. An ordinary .git spelling gives
+    // a candidate, never proof: verify it against the selected device before
+    // displaying it. Separate metadata directories have no reversible mapping.
+    if project.repository.file_name()==Some(OsStr::new(".git")) && let Some(candidate)=project.repository.parent() {
+        let verified=if crate::device::is_remote() {
+            match crate::device_service::request(crate::device_service::Operation::Discover{path:candidate.to_path_buf()}) {
+                Ok(crate::device_service::Reply::Project{key,checkout,..}) if key==project.repository=>checkout,
+                _=>None,
+            }
+        } else {
+            crate::project_location::discover(candidate).ok().filter(|location|location.key==project.repository).and_then(|location|location.checkout)
+        };
+        if let Some(checkout)=verified {return checkout.display().to_string();}
+    }
+    "(checkout unavailable)".into()
 }
 fn project_line(project: &ModelProject) -> String {
     format!("{}\t{}", project_display_path(project), project.name)
@@ -4367,6 +4383,18 @@ mod tests {
         assert_eq!(opened.data["project"]["repository"],json!(metadata));
         assert_eq!(opened.data["project"]["checkout"],json!(checkout));
         assert!(!opened.human.contains("metadata"));
+    }
+
+    #[test]
+    fn legacy_project_checkout_fallback_requires_verified_repository_identity() {
+        let Some(checkout)=git_checkout() else {return;};
+        let root=checkout.path().canonicalize().unwrap();
+        let mut project=ModelProject{kind:crate::model::ProjectKind::Git,repository:root.join(".git"),checkout:None,name:"legacy".into(),ordinal:0};
+        assert_eq!(project_display_path(&project),root.display().to_string());
+        let unrelated=tempfile::tempdir().unwrap();
+        std::fs::create_dir(unrelated.path().join(".git")).unwrap();
+        project.repository=unrelated.path().canonicalize().unwrap().join(".git");
+        assert_eq!(project_display_path(&project),"(checkout unavailable)");
     }
 
     #[test]
