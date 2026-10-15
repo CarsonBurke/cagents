@@ -181,7 +181,7 @@ pub enum Action {
     RequestDelete(ChannelId),
     ConfirmDelete,
     Dismiss,
-    SessionsClosed(ChannelId, Result<(), String>),
+    SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
     RetryDelete(ChannelId),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
@@ -208,6 +208,8 @@ pub struct State {
     /// Deletions under way. Each runs behind its channel's row rather than a
     /// dialog, so the rest of the window stays usable meanwhile.
     deleting: HashSet<ChannelId>,
+    /// Exact local targets retained until the matching close worker completes.
+    closing: HashMap<ChannelId, ChannelCloseAttempt>,
     /// Deletions that failed, with why, until retried or declined.
     failed: HashMap<ChannelId, String>,
     /// Channels this window has deleted.
@@ -218,6 +220,39 @@ pub struct State {
     /// channel straight back. An identity is never reused, so remembering it
     /// for the life of the window is exact.
     deleted: HashSet<ChannelId>,
+}
+
+#[derive(Debug)]
+struct ChannelCloseAttempt {
+    operation: uuid::Uuid,
+    registry: uuid::Uuid,
+    project: ProjectId,
+    members: Vec<CardId>,
+    inactive: Vec<CardId>,
+    panes: Vec<(CardId, CardKind, bool)>,
+}
+
+// Closing a terminal may publish its ended projection before the worker's
+// completion. Allow that projection, but never a different session, launch,
+// proof, recovery generation, or native conversation descriptor.
+fn closed_channel_source_matches(before: &CardKind, current: &CardKind) -> bool {
+    if before == current {
+        return true;
+    }
+    let (CardKind::Terminal(before), CardKind::Terminal(current)) = (before, current) else {
+        return false;
+    };
+    if before.continuity.live_proof().is_none() || !terminal_ended(current) {
+        return false;
+    }
+    if let TerminalContinuity::RelaunchAvailable { recipe, .. } = &current.continuity
+        && recipe != &before.launch
+    {
+        return false;
+    }
+    let mut ended = current.clone();
+    ended.continuity = before.continuity.clone();
+    &ended == before
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +278,14 @@ impl State {
         self.failed
             .get(&id)
             .map(|reason| crate::sidebar::RowDeletion::Failed(reason.as_str().into()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_operation(&self, id: ChannelId) -> uuid::Uuid {
+        self.closing
+            .get(&id)
+            .expect("channel close worker")
+            .operation
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
@@ -308,11 +351,28 @@ impl Cagents {
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
         if let Action::RetryDelete(id) = action {
+            if self.channel_ui.closing.contains_key(&id) {
+                return Task::none();
+            }
             self.channel_ui.deleting.remove(&id);
             return self.delete_channel(id);
         }
-        if let Action::SessionsClosed(id, result) = action {
+        if let Action::SessionsClosed(id, operation, result) = action {
+            if !self
+                .channel_ui
+                .closing
+                .get(&id)
+                .is_some_and(|attempt| attempt.operation == operation)
+            {
+                return Task::none();
+            }
+            let attempt = self.channel_ui.closing.remove(&id).unwrap();
             self.channel_ui.deleting.remove(&id);
+            let result = result.and_then(|()| {
+                self.channel_close_targets_current(id, &attempt).then_some(()).ok_or_else(|| {
+                    "The channel's panes changed while sessions were closing; review them before deleting again".into()
+                })
+            });
             return match result {
                 Ok(()) => self.finish_delete_channel(id),
                 Err(error) => {
@@ -551,6 +611,12 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
+            self.status = Some(TransientNotice::warning(
+                "Wait for the pane move to finish before deleting this channel.",
+            ));
+            return Task::none();
+        }
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
@@ -596,14 +662,104 @@ impl Cagents {
             self.channel_ui.deleting.remove(&id);
             return Task::batch([leave, self.finish_delete_channel(id)]);
         }
+        let operation = uuid::Uuid::new_v4();
+        let panes = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
+            .map(|card| {
+                (
+                    card.id,
+                    card.kind.clone(),
+                    self.workspace_model
+                        .views
+                        .iter()
+                        .any(|view| view.panes.iter().any(|pane| pane.id == card.id)),
+                )
+            })
+            .collect();
+        let project = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap()
+            .project_id;
+        let inactive = cards
+            .iter()
+            .copied()
+            .filter(|card| {
+                self.card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open())
+            })
+            .collect();
+        self.channel_ui.closing.insert(
+            id,
+            ChannelCloseAttempt {
+                operation,
+                registry: self.workspace_model.identity,
+                project,
+                members: cards,
+                inactive,
+                panes,
+            },
+        );
         let close = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::ChannelUi(Action::SessionsClosed(id, result))
+            Message::ChannelUi(Action::SessionsClosed(id, operation, result))
         });
         Task::batch([leave, close])
+    }
+
+    fn channel_close_targets_current(&self, id: ChannelId, attempt: &ChannelCloseAttempt) -> bool {
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return false;
+        };
+        if self.workspace_model.identity != attempt.registry
+            || channel.project_id != attempt.project
+            || channel.cards != attempt.members
+            || attempt.inactive.iter().any(|card| {
+                self.card_state(*card)
+                    .is_some_and(|state| state.existence.is_open())
+            })
+        {
+            return false;
+        }
+        attempt.panes.iter().all(|(card, before, was_shared)| {
+            let mut owners = self.workspace_model.views.iter().flat_map(|view| {
+                view.panes
+                    .iter()
+                    .filter(move |pane| pane.id == *card)
+                    .map(move |pane| (&view.scope, pane))
+            });
+            let shared_current = match (owners.next(), owners.next()) {
+                (None, None) => !was_shared,
+                (Some((scope, pane)), None) => {
+                    *scope == crate::workspace_model::views::Scope::Channel(id)
+                        && closed_channel_source_matches(before, &pane.kind)
+                }
+                _ => false,
+            };
+            !self.pane_transfer_pending(*card)
+                && !self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id != id && channel.cards.contains(card))
+                && shared_current
+                && self
+                    .card_state(*card)
+                    .is_some_and(|current| closed_channel_source_matches(before, &current.kind))
+        })
     }
 
     pub(super) fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
@@ -1390,7 +1546,11 @@ mod tests {
 
         let _ = app.handle_channel_ui(Action::ConfirmDelete);
         assert!(app.channel_ui.is_deleting(doomed));
-        let _ = app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Ok(()),
+        ));
         assert!(
             !app.durable.channels.iter().any(|row| row.id == doomed),
             "the confirmed deletion removes the channel"
@@ -1450,6 +1610,7 @@ mod tests {
 
         let _ = app.handle_channel_ui(Action::SessionsClosed(
             doomed,
+            app.channel_ui.close_operation(doomed),
             Err("the daemon is unreachable".into()),
         ));
         assert!(!app.channel_ui.is_deleting(doomed));
@@ -1467,6 +1628,7 @@ mod tests {
         assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
         let _ = app.handle_channel_ui(Action::SessionsClosed(
             doomed,
+            app.channel_ui.close_operation(doomed),
             Err("the daemon is still unreachable".into()),
         ));
 
@@ -1482,7 +1644,11 @@ mod tests {
         );
         let _ = app.handle_channel_ui(Action::ConfirmDelete);
         assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
-        let _ = app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Ok(()),
+        ));
         assert!(!app.durable.channels.iter().any(|row| row.id == doomed));
     }
 

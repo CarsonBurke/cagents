@@ -4753,6 +4753,11 @@ impl Cagents {
     }
     /// The control and its handler share the reason a handoff cannot start.
     pub(super) fn chat_switch_blocker(&self, card: CardId) -> Option<Cow<'static, str>> {
+        if self.pane_transfer_pending(card) {
+            return Some(Cow::Borrowed(
+                "This pane is moving to a channel. Wait for the move to finish before changing views.",
+            ));
+        }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
                 Phase::Starting(_) => {

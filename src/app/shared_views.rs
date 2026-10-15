@@ -560,8 +560,14 @@ impl Cagents {
         }
     }
 
+    fn pane_move_lifecycle_pending(&self, card: CardId) -> bool {
+        self.pane_close_owned(card)
+            || self.terminal_start_in_flight(card)
+            || self.chat_start_pending(card)
+    }
+
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
-        if self.pane_close_owned(card)
+        if self.pane_move_lifecycle_pending(card)
             || self.focused_repository_is_saving()
             || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
         {
@@ -588,7 +594,9 @@ impl Cagents {
             .views
             .iter()
             .find(|view| view.panes.iter().any(|pane| pane.id == card))?;
-        if self.shared_views.blocked.contains(&source.scope) {
+        if self.shared_views.blocked.contains(&source.scope)
+            || matches!(&source.scope, Scope::Channel(id) if self.channel_ui.is_deleting(*id) || self.channel_ui.was_deleted(*id))
+        {
             return None;
         }
         let repository = match &source.scope {
@@ -696,6 +704,12 @@ impl Cagents {
         channel: crate::model::ChannelId,
     ) -> Task<Message> {
         if self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if self.pane_move_lifecycle_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "Wait for this pane to finish opening, closing or changing views before moving it.",
+            ));
             return Task::none();
         }
         let Some((scope, expected_revision)) = self.pane_channel_transfer(card, channel) else {
@@ -1864,6 +1878,25 @@ mod tests {
         app.workspace_model.views = vec![source_view, View::empty(destination)];
         Arc::make_mut(&mut app.durable).active_channel = Some(source);
         drop(app.reconcile_shared_views());
+        if let CardKind::Terminal(session) = &pane.kind {
+            // Projection dispatches an attach before returning its Task. This
+            // fixture intentionally never polls that worker, so deliver its
+            // explicit failed completion through the actual reducer before
+            // testing a settled pane. Do not bypass the production start fence
+            // or pretend that an actual terminal attachment succeeded.
+            assert!(app.terminal_start_in_flight(pane.id));
+            drop(app.update(Message::TerminalStarted {
+                card: pane.id,
+                terminal: session.id,
+                result: Err("fixture terminal attach was intentionally not executed".into()),
+            }));
+            assert!(!app.terminal_start_in_flight(pane.id));
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Failed(_))
+            ));
+            assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        }
         (app, source, destination, pane)
     }
 
@@ -4188,5 +4221,506 @@ mod tests {
         ));
         app.acknowledge_view_edit(Scope::Channel(a), None);
         assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
+    }
+
+    #[test]
+    fn channel_move_waits_for_actual_terminal_start_completion() {
+        let (mut app, source, destination, mut pane) = channel_move_fixture();
+        pane.kind = moving_terminal_kind();
+        let CardKind::Terminal(session) = &pane.kind else {
+            unreachable!();
+        };
+        app.workspace_model
+            .views
+            .iter_mut()
+            .flat_map(|view| &mut view.panes)
+            .find(|current| current.id == pane.id)
+            .unwrap()
+            .kind = pane.kind.clone();
+        // Projection registers the actual start before its worker Task runs.
+        // Hold that Task and exercise the ordinary menu/direct/drop handlers.
+        let attach = app.reconcile_shared_views();
+        assert!(app.terminal_start_in_flight(pane.id));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
+        drop(attach);
+        drop(app.update(Message::TerminalStarted {
+            card: pane.id,
+            terminal: session.id,
+            result: Err("fixture holds the real terminal attach".into()),
+        }));
+        assert!(!app.terminal_start_in_flight(pane.id));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            change: Change::Transfer { id, .. }, ..
+        } if id == pane.id));
+    }
+
+    fn assert_lifecycle_refuses_moves(
+        app: &mut Cagents,
+        rx: &async_channel::Receiver<ModelEdit>,
+        source: ChannelId,
+        destination: ChannelId,
+        card: CardId,
+    ) {
+        let before = app.workspace_model.clone();
+        assert!(!app.pane_has_move_destination(card));
+        assert!(!app.can_move_pane_to_channel(card, destination));
+        assert!(app.pane_move_destinations(card).is_empty());
+        drop(app.move_pane_to_channel(card, destination));
+        drop(app.update(Message::MovePaneToChannel {
+            card,
+            channel: destination,
+        }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card,
+            channel: destination,
+        }));
+        drop(app.update_palette(super::super::palette_ui::Action::MovePane(card)));
+        assert!(!app.palette.is_open());
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(card));
+        assert_eq!(app.workspace_model, before);
+        assert_eq!(app.durable.active_channel, Some(source));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn channel_move_waits_for_an_existing_workspace_close_handoff() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        // Hold the real close's focus task before it can commit removal.
+        let close = app.begin_card_close(pane.id);
+        assert!(
+            app.workspace
+                .pending_close()
+                .is_some_and(|handoff| handoff.unmounting == pane.id)
+        );
+        assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
+        drop(close);
+        app.workspace.cancel_close(pane.id).unwrap();
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            change: Change::Transfer { id, .. }, ..
+        } if id == pane.id));
+    }
+
+    #[test]
+    fn channel_move_waits_for_pending_terminal_cleanup_and_explicit_dismissal() {
+        let (mut app, source, destination, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        // Begin the actual production close, but hold its worker task unpolled.
+        let close = app.begin_card_close(pane.id);
+        let intent = app.terminal_close.as_ref().unwrap().clone();
+        assert!(intent.pending);
+        assert!(!app.modal_is_open());
+        assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
+        drop(close);
+        drop(app.terminal_close_finished(
+            pane.id,
+            intent.terminal,
+            intent.proof,
+            intent.generation,
+            super::super::terminal_close::CloseOutcome::Unreachable("fixture held close".into()),
+        ));
+        assert!(!app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.cancel_terminal_close());
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            change: Change::Transfer { id, .. }, ..
+        } if id == pane.id));
+    }
+
+    #[test]
+    fn channel_move_stays_available_while_an_unrelated_terminal_is_closing() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let mut other = pane.clone();
+        other.id = CardId::new();
+        other.kind = moving_terminal_kind();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .panes
+            .push(other.clone());
+        drop(app.reconcile_shared_views());
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let close = app.begin_card_close(other.id);
+        assert!(app.terminal_close_pending(other.id));
+        assert!(!app.modal_is_open());
+        assert!(!app.can_move_pane_to_channel(other.id, destination));
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            change: Change::Transfer { id, .. }, ..
+        } if id == pane.id));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.terminal_close.as_ref().unwrap().card, other.id);
+        assert!(app.card_state(other.id).unwrap().existence.is_open());
+        drop(close);
+    }
+
+    fn retained_chat_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, source, destination, mut pane) = channel_move_fixture();
+        let CardKind::Terminal(terminal) = moving_terminal_kind() else {
+            unreachable!()
+        };
+        let session = chat::Session {
+            id: TerminalId::new(),
+            proof: terminal.continuity.live_proof(),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::Durable {
+                provider_version: "fixture".into(),
+            },
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal.launch,
+                session_id: Some("retained-close-fixture".into()),
+            },
+        };
+        let kind = CardKind::Chat(session);
+        pane.kind = kind.clone();
+        app.card_state_mut(pane.id).unwrap().kind = kind.clone();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .flat_map(|view| &mut view.panes)
+            .find(|candidate| candidate.id == pane.id)
+            .unwrap()
+            .kind = kind;
+        // This is the real recovery path: the saved owner remains while its
+        // unavailable surface waits for an exact native close receipt.
+        app.cards.insert(
+            pane.id,
+            CardRuntime::Failed("fixture detached native surface".into()),
+        );
+        (app, source, destination, pane)
+    }
+
+    #[test]
+    fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
+        let (mut app, source, destination, pane) = retained_chat_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.can_move_pane_to_channel(pane.id, destination));
+        let close = app.begin_chat_close(pane.id);
+        assert!(app.chat_start_pending(pane.id));
+        assert!(!app.modal_is_open());
+        assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
+        drop(close);
+    }
+
+    #[test]
+    fn pending_channel_move_refuses_native_close_and_switch_until_refused() {
+        let (mut app, source, destination, pane) = retained_chat_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let before = app.workspace_model.clone();
+        drop(app.move_pane_to_channel(pane.id, destination));
+        let ModelEdit::ChangeView {
+            operation,
+            change: Change::Transfer { .. },
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("transfer request")
+        };
+        assert!(app.pane_transfer_pending(pane.id));
+        assert!(!app.chat_start_pending(pane.id));
+        assert!(app.chat_switch_blocker(pane.id).is_some());
+        drop(app.begin_chat_close(pane.id));
+        drop(app.update(Message::CloseCard(pane.id)));
+        drop(app.handle_chat_ui(super::super::chat_ui::Action::Switch(pane.id)));
+        assert!(!app.chat_start_pending(pane.id));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert_eq!(app.durable.active_channel, Some(source));
+        assert_eq!(app.workspace_model, before);
+        assert!(rx.try_recv().is_err());
+        app.reject_pane_transfer(operation, "fixture rejected move".into());
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert!(app.chat_switch_blocker(pane.id).is_none());
+        let close = app.begin_chat_close(pane.id);
+        assert!(app.chat_start_pending(pane.id));
+        drop(close);
+    }
+
+    #[test]
+    fn pending_channel_move_refuses_bulk_channel_delete_before_close_capture() {
+        let (mut app, source, destination, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.move_pane_to_channel(pane.id, destination));
+        let ModelEdit::ChangeView {
+            operation,
+            change: Change::Transfer { .. },
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("transfer request");
+        };
+        let close = app.delete_channel(source);
+        assert!(!app.channel_ui.is_deleting(source));
+        assert!(app.pane_transfer_pending(pane.id));
+        assert_eq!(app.durable.active_channel, Some(source));
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(
+            rx.try_recv().is_err(),
+            "delete cannot capture or publish while the move owns its pane"
+        );
+        drop(close);
+        app.reject_pane_transfer(operation, "fixture refusal".into());
+        let close = app.delete_channel(source);
+        assert!(
+            app.channel_ui.is_deleting(source),
+            "ordinary deletion is eligible after refusal"
+        );
+        assert!(!app.channel_ui.close_operation(source).is_nil());
+        drop(close); // Keep the real production close task unpolled: no daemon effects.
+    }
+
+    #[test]
+    fn held_bulk_channel_delete_refuses_moves_from_its_source_only() {
+        let (mut app, source, destination, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let close = app.delete_channel(source);
+        assert!(app.channel_ui.is_deleting(source));
+        while rx.try_recv().is_ok() {}
+        assert!(!app.pane_has_move_destination(pane.id));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        drop(app.update(Message::MovePaneToChannel {
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card: pane.id,
+            channel: destination,
+        }));
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView {
+                    change: Change::Transfer { .. },
+                    ..
+                }
+            ))
+        );
+        let operation = app.channel_ui.close_operation(source);
+        drop(
+            app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                source,
+                operation,
+                Err("fixture cleanup refused".into()),
+            )),
+        );
+        assert!(
+            app.can_move_pane_to_channel(pane.id, destination),
+            "failed deletion releases only its local ownership"
+        );
+        drop(close);
+    }
+
+    #[test]
+    fn delayed_channel_close_never_retires_moved_replaced_or_new_members() {
+        for changed in [
+            "moved",
+            "replacement",
+            "model replacement",
+            "missing shared pane",
+            "new member",
+            "replacement registry",
+            "reopened member",
+            "previously missing member",
+        ] {
+            let (mut app, source, destination, pane) =
+                channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let inactive = CardId::new();
+            if matches!(changed, "reopened member" | "previously missing member") {
+                Arc::make_mut(&mut app.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == source)
+                    .unwrap()
+                    .cards
+                    .push(inactive);
+                if changed == "reopened member" {
+                    let mut closed = app.card_state(pane.id).unwrap().clone();
+                    closed.id = inactive;
+                    closed.existence =
+                        super::super::project_ui::removed_existence("fixture already closed");
+                    Arc::make_mut(&mut app.durable).cards.push(closed);
+                }
+            }
+            let close = app.delete_channel(source);
+            let operation = app.channel_ui.close_operation(source);
+            while rx.try_recv().is_ok() {}
+            match changed {
+                "moved" => {
+                    views::transfer(
+                        &mut app.workspace_model.views,
+                        &Scope::Channel(source),
+                        pane.id,
+                        &Scope::Channel(destination),
+                        None,
+                    )
+                    .unwrap();
+                    drop(app.reconcile_shared_views());
+                }
+                "replacement" | "model replacement" => {
+                    let CardKind::Terminal(mut successor) = pane.kind.clone() else {
+                        unreachable!()
+                    };
+                    successor.id = TerminalId::new();
+                    successor.continuity = TerminalContinuity::Live {
+                        host_session_id: crate::model::HostSessionId::new("successor-host"),
+                        boot_id: crate::model::BootId::new("move-boot"),
+                        host_incarnation: crate::model::HostIncarnation::new(
+                            "successor-incarnation",
+                        ),
+                    };
+                    if changed == "replacement" {
+                        app.card_state_mut(pane.id).unwrap().kind = CardKind::Terminal(successor);
+                    } else {
+                        app.workspace_model
+                            .views
+                            .iter_mut()
+                            .flat_map(|view| &mut view.panes)
+                            .find(|candidate| candidate.id == pane.id)
+                            .unwrap()
+                            .kind = CardKind::Terminal(successor);
+                    }
+                }
+                "replacement registry" => {
+                    let mut replacement = app.workspace_model.clone();
+                    replacement.identity = uuid::Uuid::new_v4();
+                    let identity = replacement.identity;
+                    drop(app.apply_workspace_model_update(
+                        super::super::workspace_model_sync::ModelUpdate::Connected(replacement),
+                    ));
+                    assert_eq!(app.workspace_model.identity, identity);
+                    assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+                }
+                "reopened member" => {
+                    app.card_state_mut(inactive).unwrap().existence = Existence::Open
+                }
+                "previously missing member" => {
+                    let mut reopened = app.card_state(pane.id).unwrap().clone();
+                    reopened.id = inactive;
+                    Arc::make_mut(&mut app.durable).cards.push(reopened);
+                }
+                "missing shared pane" => app
+                    .workspace_model
+                    .views
+                    .iter_mut()
+                    .for_each(|view| view.panes.retain(|candidate| candidate.id != pane.id)),
+                "new member" => Arc::make_mut(&mut app.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == source)
+                    .unwrap()
+                    .cards
+                    .push(CardId::new()),
+                _ => unreachable!(),
+            }
+            drop(
+                app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                    source,
+                    operation,
+                    Ok(()),
+                )),
+            );
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == source),
+                "{changed}"
+            );
+            assert!(
+                app.card_state(pane.id).unwrap().existence.is_open(),
+                "{changed}"
+            );
+            assert!(!app.channel_ui.is_deleting(source));
+            assert!(
+                !std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|edit| matches!(edit, ModelEdit::DeleteChannel { .. })),
+                "{changed}"
+            );
+            drop(close);
+        }
+    }
+
+    #[test]
+    fn channel_close_completion_is_attempt_bound_and_accepts_ordinary_terminal_exit() {
+        let (mut app, source, _, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let first = app.delete_channel(source);
+        let old = app.channel_ui.close_operation(source);
+        drop(
+            app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                source,
+                old,
+                Err("fixture retry".into()),
+            )),
+        );
+        let second = app.handle_channel_ui(super::super::channel_ui::Action::RetryFailed(source));
+        let current = app.channel_ui.close_operation(source);
+        assert_ne!(old, current);
+        drop(
+            app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                source,
+                old,
+                Ok(()),
+            )),
+        );
+        assert!(
+            app.channel_ui.is_deleting(source),
+            "a late old completion cannot consume the new attempt"
+        );
+        assert_eq!(app.channel_ui.close_operation(source), current);
+        app.retire_ended_terminal(pane.id, 0, None, true);
+        assert!(
+            terminal_ended(match &app.card_state(pane.id).unwrap().kind {
+                CardKind::Terminal(session) => session,
+                _ => unreachable!(),
+            }),
+            "the actual terminal event reducer produced its normal ended descriptor"
+        );
+        drop(
+            app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+                source,
+                current,
+                Ok(()),
+            )),
+        );
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == source)
+        );
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        drop((first, second));
     }
 }

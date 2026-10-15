@@ -2869,7 +2869,11 @@ mod tests {
             ..registry(Vec::new())
         }));
 
-        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(id, Ok(())));
+        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+            id,
+            uuid::Uuid::new_v4(),
+            Ok(()),
+        ));
 
         assert!(
             !app.durable.channels.iter().any(|channel| channel.id == id),
