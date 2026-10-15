@@ -4,6 +4,15 @@
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Work {
+    pub disable_reuse: std::cell::Cell<bool>,
+    pub prefix_copied: std::cell::Cell<usize>,
+    pub materialized: std::cell::Cell<usize>,
+    pub completed_reused: std::cell::Cell<usize>,
+}
+
 #[derive(Default)]
 pub(super) struct Changes(HashMap<String, [Option<usize>; 2]>);
 impl Changes {
@@ -27,6 +36,11 @@ fn body(content: &ItemContent, field: usize) -> Option<&str> {
 }
 
 impl Store {
+    fn append_reuse_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.publication_work.disable_reuse.get() { return false; }
+        true
+    }
     pub(super) fn append_changed(&mut self, id: &str, field: usize, offset: usize) {
         let first_change = self.changed.as_ref().is_some_and(|changed| !changed.contains(id));
         let previous = self.appended.remove(id);
@@ -45,9 +59,12 @@ impl Store {
         let (ItemContent::Text { text, thinking: old_thinking, phase: old_phase },
             ItemContent::Text { thinking, phase, .. }) = (&previous.content, &current.content)
             else { return false; };
-        previous.role == current.role && old_thinking == thinking && old_phase == phase
+        let reusable = self.append_reuse_enabled() && previous.role == current.role && old_thinking == thinking && old_phase == phase
             && text.len() == end.saturating_sub(start)
-            && self.appended.0.get(id).and_then(|fields| fields[0]).is_some_and(|offset| end <= offset)
+            && self.appended.0.get(id).and_then(|fields| fields[0]).is_some_and(|offset| end <= offset);
+        #[cfg(test)]
+        if reusable { self.publication_work.completed_reused.set(self.publication_work.completed_reused.get() + text.len()); }
+        reusable
     }
 
     /// A validated append permits restoring a resident prefix from memory and
@@ -55,7 +72,9 @@ impl Store {
     /// missing/changed IDs and untrusted replacements use the full read path.
     pub(super) fn field_reusing(&self, id: &str, field: usize, start: usize, end: usize,
         previous: Option<&Item>) -> Result<(String, bool), String> {
-        if let Some(proof) = self.appended.0.get(id)
+        #[cfg(test)]
+        self.publication_work.materialized.set(self.publication_work.materialized.get() + end.saturating_sub(start));
+        if self.append_reuse_enabled() && let Some(proof) = self.appended.0.get(id)
             && let Some(old) = previous.and_then(|item| body(&item.content, field)) {
             let old_end = start.checked_add(old.len()).ok_or("Transcript prefix range overflow")?;
             let stable = match proof[field] {
@@ -64,6 +83,8 @@ impl Store {
             };
             if stable && old_end <= end {
                 let suffix = self.field(id, field as i64, old_end, end)?;
+                #[cfg(test)]
+                self.publication_work.prefix_copied.set(self.publication_work.prefix_copied.get() + old.len());
                 let mut text = String::with_capacity(end - start);
                 text.push_str(old);
                 text.push_str(std::str::from_utf8(&suffix).map_err(|error| error.to_string())?);

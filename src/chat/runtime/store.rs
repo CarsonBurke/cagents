@@ -76,6 +76,8 @@ pub(crate) struct Store {
     appended: append::Changes,
     #[cfg(test)]
     field_bytes: std::cell::Cell<usize>,
+    #[cfg(test)]
+    publication_work: append::Work,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -176,6 +178,8 @@ impl Store {
                 appended: Default::default(),
                 #[cfg(test)]
                 field_bytes: Default::default(),
+                #[cfg(test)]
+                publication_work: Default::default(),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -1650,6 +1654,50 @@ mod tests {
         assert_eq!(actual, format!("{source}尾"));
         assert_eq!(window.changes.iter().filter(|change| matches!(change,
             crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 1);
+    }
+
+    /// Isolated producer microbenchmark. The reference disables only local
+    /// append reuse; it is not a historical-native UI/RSS comparison.
+    #[test]
+    #[ignore = "run explicitly in the optimized dev-runtime host lane"]
+    fn append_publication_cost_breakdown() {
+        struct Sample { micros: u128, sql: usize, prefix: usize, bodies: usize, reused: usize, wire: usize }
+        fn sample(bytes: usize, reuse: bool) -> Sample {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            store.apply(Event::Item(history_item("measured", &"x".repeat(bytes)))).unwrap();
+            let mut previous = store.window().unwrap().items;
+            store.field_bytes.set(0);
+            store.publication_work.materialized.set(0);
+            store.publication_work.disable_reuse.set(!reuse);
+            let started = std::time::Instant::now();
+            let mut wire = 0;
+            for _ in 0..200 {
+                store.apply(Event::TextDelta { id: "measured".into(), role: Role::Assistant,
+                    thinking: false, delta: " measured stream delta ".into() }).unwrap();
+                let next = store.window_reusing(&mut previous).unwrap();
+                wire += postcard::to_stdvec(&next.changes).unwrap().len();
+                previous = next.items;
+            }
+            Sample { micros: started.elapsed().as_micros(), sql: store.field_bytes.get(),
+                prefix: store.publication_work.prefix_copied.get(),
+                bodies: store.publication_work.materialized.get(),
+                reused: store.publication_work.completed_reused.get(), wire }
+        }
+        eprintln!("source_bytes,reuse,updates,elapsed_us,sqlite_read_bytes,prefix_copy_bytes,materialized_body_bytes,reused_completed_bytes,change_wire_bytes");
+        for bytes in [64 * 1024, 300 * 1024, 1024 * 1024 + 2000] {
+            let reference = sample(bytes, false);
+            let optimized = sample(bytes, true);
+            for (enabled, sample) in [(false, &reference), (true, &optimized)] {
+                eprintln!("{bytes},{enabled},200,{},{},{},{},{},{}", sample.micros,
+                    sample.sql, sample.prefix, sample.bodies, sample.reused, sample.wire);
+            }
+            assert!(optimized.sql < reference.sql / 4,
+                "validated appends must avoid reading the resident source from SQLite");
+            if bytes > PART_BYTES * 2 {
+                assert!(optimized.bodies < reference.bodies / 2,
+                    "completed fragments must avoid materializing immutable bodies");
+            }
+        }
     }
 
     #[test]
