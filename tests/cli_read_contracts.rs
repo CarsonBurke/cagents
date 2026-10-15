@@ -131,3 +131,29 @@ fn unresolved_runtime_is_an_error_rather_than_an_already_stopped_daemon() {
         assert!(!fixture.root.path().join("spawned").exists());
     }
 }
+
+#[test]
+fn a_closed_listener_with_a_held_inventory_lease_is_not_daemon_absence() {
+    use std::os::{fd::AsRawFd,unix::fs::OpenOptionsExt};
+    let fixture=Fixture::new();
+    let runtime=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime,fs::Permissions::from_mode(0o700)).unwrap();
+    let lock=fs::OpenOptions::new().create_new(true).read(true).write(true).mode(0o600)
+        .open(runtime.join("cagentsd.lock")).unwrap();
+    // SAFETY: lock is an owned regular private fixture descriptor.
+    assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+    for arguments in [["daemon","stop"],["agent","list"],["daemon","start"]] {
+        let output=fixture.output(&arguments,true);
+        assert_eq!(output.exit_code,Some(1),"{output:?}");
+        let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"],"daemon_busy","{error}");
+    }
+    configure_remote_fixture(&fixture,false);
+    let path=format!("{}:/usr/bin:/bin",fixture.root.path().join("bin").display());
+    let output=fixture.run(fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",path));
+    assert_eq!(output.exit_code,Some(1),"{output:?}");
+    let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"],"device","{error}");
+    assert!(!fixture.root.path().join("spawned").exists());
+}

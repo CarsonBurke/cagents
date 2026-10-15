@@ -995,11 +995,18 @@ pub fn serve_stdio() -> io::Result<()> {
     } else {
         crate::terminal::ensure_daemon_ready().map_err(io::Error::other)?
     };
-    let stream = UnixStream::connect(path).map_err(|error| {
-        if crate::control::daemon_autostart_disabled() && matches!(error.kind(),io::ErrorKind::NotFound|io::ErrorKind::ConnectionRefused) {
-            io::Error::new(io::ErrorKind::NotConnected,DaemonNotRunning)
-        } else {error}
-    })?;
+    let stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error) if crate::control::daemon_autostart_disabled()
+            && matches!(error.kind(),io::ErrorKind::NotFound|io::ErrorKind::ConnectionRefused) => {
+                if crate::daemon::HostLease::is_held_at(&path).map_err(io::Error::other)? {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                        "The daemon still owns its inventory lease but is not accepting connections"));
+                }
+                return Err(io::Error::new(io::ErrorKind::NotConnected,DaemonNotRunning));
+            }
+        Err(error) => return Err(error),
+    };
     let mut upstream = stream.try_clone()?;
     let input = thread::spawn(move || {
         let result = copy_flushed(&mut io::stdin().lock(), &mut upstream);
