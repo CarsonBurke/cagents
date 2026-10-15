@@ -133,7 +133,6 @@ mod tests {
                     "only {visible} complete tabs fit in {viewport:?}"
                 );
             }
-
         }
     }
 
@@ -1084,8 +1083,12 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -2381,7 +2384,10 @@ impl Cagents {
             )
             .padding([0.0, space::XS])
             .height(design::PRIMARY_CONTROL_SIZE)
-            .id(chrome.map_or_else(|| card_control_id(id, "tab"), |chrome| chrome.tab_id.clone()))
+            .id(chrome.map_or_else(
+                || card_control_id(id, "tab"),
+                |chrome| chrome.tab_id.clone(),
+            ))
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
                 column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
