@@ -1387,6 +1387,7 @@ impl Runtime {
         {
             transcript.push(notice_entry(error, target));
         }
+        content.extend(hydration::notice(self));
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
             content.push(
@@ -1446,6 +1447,7 @@ impl Runtime {
                     .items
                     .iter()
                     .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                    .chain(self.logical_sources.scroll_aliases(self.selected_subagent.as_deref()))
                     .chain(self.turns.iter().flat_map(|turn| {
                         let key = turn
                             .steps

@@ -22,6 +22,7 @@ mod coordination;
 mod find;
 mod fold;
 mod hover;
+mod hydration;
 mod images;
 mod layout;
 mod markdown_source;
@@ -167,6 +168,8 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    LogicalSourceLoaded(Target, hydration::Key, u64, Result<hydration::Loaded, String>),
+    RetryLogicalSources(Target),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     SignIn(Target, Account),
@@ -326,6 +329,7 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
+                | Self::LogicalSourceLoaded(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -1497,6 +1501,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    logical_sources: hydration::State,
     source_clock: Option<chat::client::SourceClock>,
     /// Tiny interaction metadata survives transcript window/cache eviction.
     turn_started_at: Option<u64>,
@@ -2071,6 +2076,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            logical_sources: hydration::State::default(),
             source_clock: None,
             turn_started_at: None,
             turn_prompt_id: None,
@@ -2149,6 +2155,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.logical_sources.clear();
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2267,7 +2274,8 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
+        let (raw_snapshot, source_clock) = handle.snapshot_with_clock();
+        let mut snapshot = self.logical_sources.project(raw_snapshot,self.selected_subagent.as_deref());
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -2653,8 +2661,12 @@ impl Runtime {
                     .min(self.find_matches.len().saturating_sub(1))
             });
     }
+    pub(super) fn logical_source_metrics(&self)->(usize,usize,usize) {
+        (self.logical_sources.retained_bytes(),hydration::live_source_bytes(),self.logical_sources.alias_count())
+    }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {hydration::release(self);}
         images::sync(self);
         self.present()
     }
@@ -4602,6 +4614,7 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                subscriptions.extend(hydration::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6280,6 +6293,7 @@ impl Cagents {
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
+                            runtime.logical_sources.clear();
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -7658,6 +7672,7 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    runtime.refresh();
                     images::sync(runtime);
                 }
             }
@@ -7768,6 +7783,12 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.thumbnails.complete(&path, loaded);
                 }
+            }
+            Action::LogicalSourceLoaded(target, key, attempt, loaded) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::complete(runtime,&key,attempt,loaded);}
+            }
+            Action::RetryLogicalSources(target) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::retry(runtime);}
             }
             Action::ImageLoaded(target, item, attempt, loaded) => {
                 let explicit_pressure = self
