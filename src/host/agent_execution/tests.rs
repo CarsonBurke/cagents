@@ -1030,6 +1030,117 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
 }
 
 #[test]
+fn combined_close_retains_real_cleanup_receipt_after_late_view_conflict_and_retries_provider_free() {
+    if isolated("combined_close_retains_real_cleanup_receipt_after_late_view_conflict_and_retries_provider_free").is_some() { return; }
+    use crate::daemon::holder_registry::{self as holders, Kind};
+    use chat::protocol::{ExecutionContext, ProcessSpec, TransportSpec};
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else { unreachable!() };
+    spec.provider = Provider::Codex;
+    let store = registry(&host).unwrap();
+    let accepted = store.lock().unwrap().submit_agent(&Origin::User, &request, now()).unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let mut original_proof = current_proof.clone();
+    original_proof.host_incarnation = HostIncarnation::new("before-holder-adoption");
+    let directory = path.parent().unwrap();
+    let id = TerminalId::new();
+    let mut original = chat::fresh_session(Provider::Codex, id, directory.to_owned(),
+        &Account::system(Provider::Codex)).unwrap();
+    original.proof = Some(original_proof.clone());
+    original.claim_owned_codex_listener(Path::new("/var/tmp"), &original_proof);
+    let socket = original.owned_codex_listener.as_ref().unwrap().socket.clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &original_proof).unwrap();
+    let context = Arc::new(ExecutionContext::new(Some(Arc::new(std::fs::File::open(directory).unwrap()))));
+    let process = ProcessSpec {execution: Some(context.clone()), messages: None,
+        transport: TransportSpec::OwnedUnixWebSocket {socket}, program: "/bin/sleep".into(),
+        arguments: vec!["60".into()], working_directory: directory.to_owned(),
+        environment: Default::default(), unset_environment: Default::default()};
+    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    context.installed();
+    let owner = holders::evidence(&holders::socket(&holders::directory(Kind::Native).unwrap(), id),
+        Kind::Native).unwrap().unwrap();
+    holder.confirm(uuid::Uuid::new_v4().to_string(), chat::protocol::ServerIdentity {
+        user_agent: "cagents/0.157.1 (Linux)".into(), canonical_home: directory.to_owned(),
+        reported_home: directory.display().to_string()}, owner.root.clone()).unwrap();
+    holder.preserve();
+    store.lock().unwrap().bind_agent(accepted.agent.id, None, HostedSession::Chat(original.clone())).unwrap();
+    drop(lease);
+    let _lease = crate::daemon::HostLease::acquire(&paths, &current_proof).unwrap();
+    let (adopted, recovery) = chat::native_holder::adopt(&owner, &original, &current_proof).unwrap();
+    let detached = adopted.preserve();
+    assert_ne!(recovery.source.proof, original.proof);
+    assert!(recovery.previous_sources.contains(&original));
+    let current = HostedSession::Chat(recovery.source.clone());
+    store.lock().unwrap().adopt_authenticated_agent_session(
+        &recovery.previous_sources.iter().cloned().map(HostedSession::Chat).collect::<Vec<_>>(), &current).unwrap();
+    let (agent, scope, pane) = {
+        let mut store = store.lock().unwrap();
+        let mut recipe = recovery.source.launch.recipe.clone();
+        recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {id, launch: recipe,
+            owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            transcript_path: None, resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+                code: Some(0), signal: None, occurred_at_unix_ms: 1}}};
+        let agent = store.bind_agent_console(accepted.agent.id, &current, terminal.clone()).unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy adopted console".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(terminal), scope: None};
+        store.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        (agent, scope, pane)
+    };
+
+    let before_agent = store.lock().unwrap().agent(agent.id).unwrap();
+    let before_run = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    assert!(close(&host, &Authority::default(), agent.id).unwrap_err().contains("historical generation proof"));
+    assert!(owner.root.is_current());
+    let Reply::PresentationClose(Some(target)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else { panic!("missing close target") };
+    assert_eq!(target.observation.agent, before_agent);
+    let target_revision = target.observation.view_revision;
+    let wire = postcard::to_allocvec(&Operation::ConfirmPresentationClose {observed: target.clone()}).unwrap();
+    assert_eq!(postcard::from_bytes::<Operation>(&wire).unwrap(), Operation::ConfirmPresentationClose {observed: target.clone()});
+    let database = path.clone();
+    crate::host::chat::before_presentation_close_commit(move || {
+        // This executes only AFTER the real native holder has confirmed
+        // cleanup, with neither Registry nor HostState locked.
+        let db = rusqlite::Connection::open(database).unwrap();
+        db.execute("UPDATE shared_views SET revision=revision+1", []).unwrap();
+    });
+    let error = process(&host, Authority::default(), Operation::ConfirmPresentationClose {observed: target}).unwrap_err();
+    assert!(error.contains("view revision changed"), "{error}");
+    assert!(!owner.root.is_current(), "first consent performed genuine provider teardown");
+    assert!(host.lock().unwrap().native_closing.contains_key(&id), "late CAS refusal must retain exact cleanup owner");
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), before_agent);
+    assert_eq!(store.lock().unwrap().agent_run(accepted.run.id).unwrap(), before_run);
+    assert_eq!(store.lock().unwrap().view_revision(&scope).unwrap(), target_revision + 1);
+    let receipt = chat::native_holder::closed_source(&recovery.source, &current_proof).unwrap().unwrap();
+    assert_eq!(receipt.0, owner); assert!(receipt.1);
+    // The holder's discovery socket and process are gone. A successful retry
+    // can only consume the exact retained durable close receipt.
+    assert!(holders::evidence(&holders::socket(&holders::directory(Kind::Native).unwrap(), id), Kind::Native).unwrap().is_none());
+    let Reply::PresentationClose(Some(fresh)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else { panic!("missing receipt-backed target") };
+    assert_eq!(fresh.observation.view_revision, target_revision + 1);
+    assert_eq!(fresh.observation.pane, pane);
+    assert_eq!(fresh.owner, crate::host::chat::presentation_close::owner_identity(&owner));
+    let Reply::Closed(closed) = process(&host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: fresh}).unwrap() else { panic!("not closed") };
+    assert!(closed.closed);
+    assert_eq!(closed.session, before_agent.session);
+    assert_eq!(closed.console, before_agent.console);
+    let cancelled = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    assert_eq!(cancelled.state, State::Cancelled);
+    assert_eq!(cancelled.result, before_run.result);
+    assert!(!host.lock().unwrap().native_closing.contains_key(&id));
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, agent.id).unwrap().is_none());
+    assert_eq!(close(&host, &Authority::default(), agent.id).unwrap(), closed);
+    drop(detached); // No close command: the already-confirmed receipt owns retry.
+}
+
+#[test]
 fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority() {
     if isolated("committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority")
         .is_some()
