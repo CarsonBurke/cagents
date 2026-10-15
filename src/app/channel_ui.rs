@@ -264,6 +264,15 @@ impl State {
 }
 
 impl Cagents {
+    /// Utility panes and closed chats do not own the channel conversation name.
+    pub(super) fn channel_primary_chat(&self, channel: &ProjectChannel) -> Option<CardId> {
+        channel.cards.iter().copied().find(|id| {
+            self.card_state(*id).is_some_and(|card| {
+                card.existence.is_open() && matches!(card.kind, CardKind::Chat(_))
+            })
+        })
+    }
+
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
         let scope = self.select_channel(id);
         if self.durable.active_channel != Some(id) {
@@ -823,8 +832,8 @@ impl Cagents {
     pub(super) fn channel_needs_name(&self, card: CardId) -> bool {
         self.durable.channels.iter().any(|channel| {
             (channel.title.is_empty()
-                || channel.title_source == crate::model::ChannelTitleSource::Prompt)
-                && channel.cards.contains(&card)
+                || channel.title_source != crate::model::ChannelTitleSource::Manual)
+                && self.channel_primary_chat(channel) == Some(card)
         })
     }
 
@@ -833,7 +842,12 @@ impl Cagents {
     /// Prompt fallbacks may later improve to provider titles. Manual and legacy
     /// titles remain authoritative, including renames from another window.
     pub(super) fn name_channel_from_prompt(&mut self, card: CardId, prompt: &str) {
-        if let Some(title) = channel_title_from_prompt(prompt) {
+        // Later messages do not replace an established task. Restored snapshots
+        // may repair a poor historical fallback using the first substantive prompt.
+        if self.durable.channels.iter().any(|channel| {
+            channel.title.is_empty() && self.channel_primary_chat(channel) == Some(card)
+        }) && let Some(title) = channel_title_from_prompt(prompt)
+        {
             self.suggest_channel_title(card, title, crate::model::ChannelTitleSource::Prompt);
         }
     }
@@ -843,18 +857,34 @@ impl Cagents {
         card: CardId,
         title: String,
         source: crate::model::ChannelTitleSource,
-    ) {
+    ) -> bool {
         let Some(index) = self.durable.channels.iter().position(|channel| {
-            channel.title_source.accepts(&channel.title, source) && channel.cards.contains(&card)
+            channel.title_source.accepts_refresh(&channel.title, source)
+                && self.channel_primary_chat(channel) == Some(card)
+                && (channel.title != title || channel.title_source != source)
         }) else {
-            return;
+            return false;
         };
         let id = self.durable.channels[index].id;
+        let Some(view) = self.workspace_model.views.iter().find(|view| {
+            view.scope == crate::workspace_model::views::Scope::Channel(id)
+                && view.primary_chat() == Some(card)
+        }) else {
+            return false;
+        };
+        let expected_revision = view.revision;
         Arc::make_mut(&mut self.durable).channels[index].title = title.clone();
         Arc::make_mut(&mut self.durable).channels[index].title_source = source;
-        self.publish_model_edit(ModelEdit::SuggestChannelTitle { id, title, source });
+        self.publish_model_edit(ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        });
         self.refresh_sidebar_channels();
         self.persist();
+        true
     }
 
     /// Refresh cached rows after state changes, never during rendering.
@@ -1127,6 +1157,20 @@ mod tests {
             "New channel"
         );
 
+        app.workspace_model
+            .views
+            .push(crate::workspace_model::views::View {
+                scope: crate::workspace_model::views::Scope::Channel(id),
+                revision: 1,
+                panes: vec![
+                    crate::workspace_model::views::Pane::from_card(
+                        &app.durable.cards[0],
+                        Some("/repo".into()),
+                    )
+                    .unwrap(),
+                ],
+                retired: Vec::new(),
+            });
         let prompt = format!("Explain the parser {}", "with detailed context ".repeat(12));
         let expected = channel_title_from_prompt(&prompt).expect("prompt has a title");
         app.name_channel_from_prompt(card, &prompt);
@@ -1139,6 +1183,94 @@ mod tests {
         app.refresh_sidebar_channels();
         assert_eq!(app.sidebar_model.projects[0].channels[0].title, expected);
         assert_eq!(app.durable.channels[0].title, expected);
+    }
+
+    #[test]
+    fn channel_title_consumer_requires_primary_chat_and_current_view_despite_local_order() {
+        use crate::model::ChannelTitleSource;
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let utility = app.durable.cards[0].id;
+        let mut a = app.durable.cards[0].clone();
+        a.id = CardId::new();
+        a.kind = CardKind::Chat(chat_session());
+        let mut b = a.clone();
+        b.id = CardId::new();
+        b.kind = CardKind::Chat(chat_session());
+        let id = ChannelId::new();
+        let project = ProjectId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([a.clone(), b.clone()]);
+        durable.channels.push(ProjectChannel {
+            id,
+            project_id: project,
+            title: String::new(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 0,
+            shared: true,
+            cards: vec![utility, a.id, b.id],
+            focused: Some(a.id),
+        });
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            panes: vec![
+                Pane::from_card(&a, Some("/repo".into())).unwrap(),
+                Pane::from_card(&b, Some("/repo".into())).unwrap(),
+            ],
+            retired: Vec::new(),
+        });
+        assert_eq!(
+            app.channel_primary_chat(&app.durable.channels[0]),
+            Some(a.id)
+        );
+        assert!(!app.suggest_channel_title(
+            b.id,
+            "Sibling conversation".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(app.suggest_channel_title(
+            a.id,
+            "Encryption review".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(app.suggest_channel_title(
+            a.id,
+            "Encryption and throughput review".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert!(!app.suggest_channel_title(
+            a.id,
+            "Encryption and throughput review".into(),
+            ChannelTitleSource::Provider
+        ));
+        // A watcher can update the authoritative view before the local cards
+        // are projected. Local stale primary membership alone grants nothing.
+        app.workspace_model.views[0].panes.swap(0, 1);
+        app.workspace_model.views[0].revision += 1;
+        assert!(!app.suggest_channel_title(
+            a.id,
+            "Delayed old owner".into(),
+            ChannelTitleSource::Provider
+        ));
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.cards = vec![utility, b.id, a.id];
+        channel.title.clear();
+        channel.title_source = ChannelTitleSource::Prompt;
+        assert!(app.suggest_channel_title(
+            b.id,
+            "Review the next task".into(),
+            ChannelTitleSource::Prompt
+        ));
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.title = "My project name".into();
+        channel.title_source = ChannelTitleSource::Manual;
+        assert!(!app.suggest_channel_title(
+            b.id,
+            "Late generated name".into(),
+            ChannelTitleSource::Provider
+        ));
+        assert_eq!(app.durable.channels[0].title, "My project name");
     }
 
     fn chat_session() -> crate::chat::Session {

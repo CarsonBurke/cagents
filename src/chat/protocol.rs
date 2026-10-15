@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
+mod claude_titles;
 pub mod codex;
 pub mod omp;
 mod terminal_output;

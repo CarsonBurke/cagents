@@ -1,11 +1,34 @@
 use super::*;
 use crate::interaction::tooltip;
 
+/// Shape once when cached chrome changes, with the same font and size as the tab.
+pub(super) fn measure_tab_title(title: &str) -> f32 {
+    use iced::{
+        Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
+    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
+        content: title,
+        bounds: Size::new(f32::INFINITY, f32::INFINITY),
+        size: Pixels(design::TEXT_BODY),
+        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
+        font: cosmic::font::default(),
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::default(),
+        wrapping: text::Wrapping::None,
+        ellipsize: text::Ellipsize::None,
+    });
+    paragraph.min_bounds().width
+}
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    pub(super) terminal_ordinals: HashMap<CardId, u32>,
+    pub(super) terminal_next_ordinals: HashMap<PathBuf, u32>,
     /// Tab visibility follows pane focus even when a creation path already
     /// updated durable focus before applying its viewport changes.
     pub(super) tabs_focus: Option<CardId>,
@@ -39,6 +62,209 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn narrow_header_mounts_four_complete_tabs() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced::{Rectangle, Size};
+        struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.1 = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        for width in [640.0, 900.0, 1600.0] {
+            let app = tab_fixture(30, width);
+            let mut element =
+                app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)),
+            );
+            let mut bounds = Bounds(HashMap::new(), None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width <= 900.0 {
+                let viewport = bounds.1.expect("native tab viewport");
+                let visible = app
+                    .workspace
+                    .order()
+                    .filter(|id| {
+                        let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                        tab.x >= viewport.x
+                            && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                    })
+                    .count();
+                assert!(
+                    visible >= 4,
+                    "only {visible} complete tabs fit in {viewport:?}"
+                );
+            }
+        }
+    }
+
+    fn tab_fixture(count: usize, width: f32) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let cards: Vec<_> = (0..count)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(width);
+        drop(app.sync_chrome());
+        app
+    }
+
+    #[test]
+    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+        let mut app = tab_fixture(30, 900.0);
+        let (available, width) = app.tab_strip_geometry();
+        assert!(
+            4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
+                <= available + 0.1
+        );
+        let id = app.durable.cards[0].id;
+        app.chrome_ui
+            .user_titles
+            .insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
+        app.workspace.resize_viewport(1600.0);
+        drop(app.sync_chrome());
+        let (_, width) = app.tab_strip_geometry();
+        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == "WWWWWWWWWWWWWWWWWWWW" {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut header = app.column_header(id, true, width);
+        let mut tree = Tree::new(header.as_widget());
+        let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+        let node =
+            header
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut title = TitleBounds(None);
+        header
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+        assert!(
+            title.0.expect("actual mounted title text").width
+                >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
+            "the real title allocation must fit, after its icon, padding and controls"
+        );
+    }
+
+    #[test]
+    fn new_terminal_after_worktree_move_keeps_existing_numbers_distinct() {
+        let mut app = tab_fixture(3, 1600.0);
+        let moved = PathBuf::from("/moved-worktree");
+        for card in &app.durable.cards {
+            app.worktree_owners.insert(card.id, moved.clone());
+        }
+        let card = super::super::tests::terminal_card_state();
+        let added = card.id;
+        app.worktree_owners.insert(added, moved);
+        Arc::make_mut(&mut app.durable).cards.insert(0, card);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(app.card_chrome[&added].title.ends_with("(4)"));
+    }
+
+    #[test]
+    fn reported_terminal_titles_keep_osc_precedence_over_launch_fallbacks() {
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        if let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind {
+            session.launch.working_directory = PathBuf::from("/repo/alpha");
+        }
+        for reported in ["alpha", "Terminal", "/repo/alpha"] {
+            app.apply_reported_title(id, reported.into());
+            drop(app.sync_chrome());
+            assert_eq!(app.card_chrome[&id].title, format!("{reported} (1)"));
+            assert!(app.core.window.header_title.starts_with(reported));
+        }
+    }
+
+    #[test]
+    fn terminal_ordinals_survive_an_unrelated_tab_closing() {
+        let mut app = tab_fixture(3, 1600.0);
+        let survivor = app.durable.cards[2].id;
+        let before = app.card_chrome[&survivor].title.clone();
+        assert!(before.ends_with("(3)"), "{before}");
+        assert!(
+            app.card_chrome[&survivor]
+                .compact_title
+                .as_deref()
+                .unwrap()
+                .starts_with("3 ")
+        );
+        Arc::make_mut(&mut app.durable).cards.remove(0);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&survivor].title, before);
+        assert_eq!(
+            app.chrome_ui.terminal_ordinals.len(),
+            2,
+            "retired pane IDs must not accumulate in the ordinal cache"
+        );
+        let added = super::super::tests::terminal_card_state();
+        let added_id = added.id;
+        Arc::make_mut(&mut app.durable).cards.push(added);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(
+            app.card_chrome[&added_id].title.ends_with("(4)"),
+            "retiring an ID must preserve the worktree's next ordinal"
+        );
+        assert_eq!(app.card_chrome[&survivor].title, before);
+    }
     use super::*;
 
     /// Retain the actual Settings pane while rename and palette modals change.
@@ -420,8 +646,8 @@ mod tests {
             session.launch.program = "codex".into();
             card.title = title.into();
             drop(app.sync_chrome());
-            assert_eq!(app.card_chrome[&id].title, expected);
-            assert_eq!(app.core.window.header_title, expected);
+            assert_eq!(app.card_chrome[&id].title, format!("{expected} (1)"));
+            assert_eq!(app.core.window.header_title, format!("{expected} (1)"));
         }
         let custom = "[ ! ] Action Required documentation";
         app.chrome_ui.user_titles.insert(id, custom.into());
@@ -752,8 +978,12 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -1570,17 +1800,39 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
+        let available = (self.workspace.viewport_width()
+            - self.workspace_header_width()
+            - design::PRIMARY_CONTROL_SIZE
+            - space::XXS)
+            .max(0.0);
         // Reordering uses one shared width. Derive that width from the titles
         // instead of giving every agent the same eight-character title budget.
         let desired = self
             .workspace
             .order()
             .filter_map(|id| self.card_chrome.get(&id))
-            .map(|chrome| 80.0 + chrome.title.chars().count().min(28) as f32 * 7.0)
+            .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        (available, desired)
+        let width = if self.workspace.viewport_width() > 0.0
+            && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
+        {
+            // Keep four compact tabs visible in a tiled workspace. Full names
+            // remain available in each tab's tooltip.
+            let visible = self.workspace.order().count().clamp(1, 4) as f32;
+            let fitting = (available / visible
+                - crate::tab_strip::SPACING
+                - 2.0 * crate::tab_strip::EDGE_INSET / visible)
+                .max(56.0);
+            if visible < 4.0 {
+                desired.min(fitting)
+            } else {
+                fitting.min(112.0)
+            }
+        } else {
+            desired
+        };
+        (available, width)
     }
 
     /// Scrolls the tab strip by the least amount that brings the focused tab
@@ -1859,20 +2111,41 @@ impl Cagents {
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
-        let title_control = widget::button::custom(
-            widget::row::with_children(vec![
-                self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-                design::body(title)
+        let compact = width < design::TAB_MIN_WIDTH;
+        let suffix = (!compact)
+            .then(|| chrome.and_then(|chrome| chrome.terminal_ordinal_suffix.as_deref()))
+            .flatten();
+        let visible_title = if compact {
+            chrome
+                .and_then(|chrome| chrome.compact_title.as_deref())
+                .unwrap_or(title)
+        } else {
+            suffix
+                .and_then(|suffix| title.strip_suffix(suffix))
+                .unwrap_or(title)
+        };
+        let mut title_children = vec![
+            self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
+            design::body(visible_title)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(suffix) = suffix {
+            title_children.push(
+                design::caption(suffix.trim())
                     .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
                     .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
+            );
+        }
+        let title_control = widget::button::custom(
+            widget::row::with_children(title_children)
+                .spacing(if compact { space::XS } else { space::S })
+                .align_y(Alignment::Center)
+                .height(Length::Fill),
         )
         .id(focus_id)
         .name(chrome.map_or_else(
@@ -1971,7 +2244,7 @@ impl Cagents {
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if focused || self.chrome_ui.hovered_tab == Some(id) {
+        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
             children.push(command(
                 Icon::Close,
                 {
@@ -2006,6 +2279,10 @@ impl Cagents {
             )
             .padding([0.0, space::XS])
             .height(design::PRIMARY_CONTROL_SIZE)
+            .id(chrome.map_or_else(
+                || card_control_id(id, "tab"),
+                |chrome| chrome.tab_id.clone(),
+            ))
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
                 column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
