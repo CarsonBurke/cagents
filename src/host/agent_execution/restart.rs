@@ -12,14 +12,21 @@ pub(in crate::host) struct PairPlan {
 }
 #[derive(Clone)]
 enum Kind { None, Execution, Codex(crate::model::LaunchRecipe) }
+/// Take these under HostState, then drop them after releasing that lock.
+/// The final predecessor PTY handle may own expensive worker teardown.
+pub(in crate::host) struct CompletedPair {
+    _paired: Option<crate::terminal::TerminalHandle>,
+    _registry: Option<SharedRegistry>,
+    _agent: Option<Agent>,
+}
 impl PairPlan {
     pub(in crate::host) fn source(&self) -> &chat::Session { &self.source }
-    pub(in crate::host) fn release_completed(&mut self) {
-        // Lost-ACK replay needs only its source/receipt/current actor. Keeping
-        // the predecessor PTY handle here would retain its screen indefinitely.
-        self.paired=None;
-        self.registry=None;
-        self.agent=None;
+    pub(in crate::host) fn release_completed(&mut self) -> CompletedPair {
+        CompletedPair {
+            _paired:self.paired.take(),
+            _registry:self.registry.take(),
+            _agent:self.agent.take(),
+        }
     }
 }
 
