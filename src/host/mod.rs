@@ -9,6 +9,8 @@ mod lock;
 mod model;
 mod notifications;
 mod service;
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests;
 mod state;
 
 use std::{
@@ -396,11 +398,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -414,6 +413,18 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    // Every worker must see shutdown before we wait on any one worker. A
+    // bounded but unfinished join must neither delay the other PTYs' shutdown
+    // requests nor prevent their cleanup from being attempted.
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles.iter().map(|handle| handle.shutdown()).collect()
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
