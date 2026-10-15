@@ -313,11 +313,16 @@ fn replace_or_remove_document_file(
         // racing new destination is refused and the original is put back or
         // retained explicitly; no newer path is overwritten.
         let outcome = restore_document_file(parent, name, text, restoration).map_err(&put_back)?;
-        let cleanup = fs_safety::unlink_within(&holding, acquired_name)
-            .and_then(|()| fs_safety::remove_directory_within(parent, &holding_name));
+        let cleanup = match fs_safety::unlink_within(&holding, acquired_name) {
+            Err(error) => Err(format!("The previous file remains at {}: {error}", holding.path().join(acquired_name).display())),
+            Ok(()) => fs_safety::remove_directory_within(parent, &holding_name)
+                .map_err(|error| format!("The previous file was removed; the empty holding directory remains at {}: {error}", holding.path().display())),
+        };
         return match (outcome, cleanup) {
-            (SaveOutcome::Saved { content_hash, durability }, Ok(())) => Ok(SaveOutcome::Saved { content_hash, durability }),
-            (SaveOutcome::Saved { content_hash, .. }, Err(error)) => Ok(SaveOutcome::Saved { content_hash, durability: SaveDurability::Unconfirmed { error: format!("The older Undo metadata was published; the previous file remains at {}: {error}", holding.path().join(acquired_name).display()) } }),
+            (SaveOutcome::Saved { content_hash, durability }, Ok(())) => Ok(SaveOutcome::Saved {
+                content_hash, durability: if matches!(durability, SaveDurability::Durable) { sync_durability(parent) } else { durability },
+            }),
+            (SaveOutcome::Saved { content_hash, .. }, Err(error)) => Ok(SaveOutcome::Saved { content_hash, durability: SaveDurability::Unconfirmed { error: format!("The older Undo metadata was published. {error}") } }),
             _ => unreachable!("restoration publishes a present file"),
         };
     }
