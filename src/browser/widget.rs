@@ -25,7 +25,9 @@ struct WidgetState {
     shortcut_keys: Vec<keyboard::key::Physical>,
     keyboard_owner: Option<Arc<super::handle::CommandMailbox>>,
     input_focused: bool,
-    window_unfocused: bool,
+    // Native events run before their queued application messages. This
+    // observation overrides the view snapshot only until the next diff.
+    window_focus_observed: Option<bool>,
     focused: bool,
     focus_requested: bool,
     cursor_inside: bool,
@@ -313,9 +315,8 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     fn owns_keyboard(&self, state: &WidgetState) -> bool {
         self.model_focused
-            && self.window_focused
+            && state.window_focus_observed.unwrap_or(self.window_focused)
             && state.input_focused
-            && !state.window_unfocused
             && !self.obscured
     }
 
@@ -397,6 +398,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         // Overlay widgets may stop forwarding events to their covered content.
         // Reconcile at tree construction, before that overlay is first drawn.
         let state = tree.state.downcast_mut::<WidgetState>();
+        // A new view follows application message processing. Its snapshot
+        // supersedes the previous batch, including a parked tree that missed
+        // a window event while absent from native traversal.
+        state.window_focus_observed = None;
         self.attach_keyboard(state);
         let _ = self.synchronize_presentation(state);
         let _ = self.synchronize_focus(state);
@@ -441,8 +446,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         let state = tree.state.downcast_mut::<WidgetState>();
         self.attach_keyboard(state);
         match event {
-            Event::Window(window::Event::Unfocused) => state.window_unfocused = true,
-            Event::Window(window::Event::Focused) => state.window_unfocused = false,
+            Event::Window(window::Event::Unfocused) => state.window_focus_observed = Some(false),
+            Event::Window(window::Event::Focused) => state.window_focus_observed = Some(true),
             Event::Mouse(mouse::Event::ButtonPressed(_)) => {
                 state.input_focused = cursor.is_over(bounds) && cursor.is_over(*viewport);
             }
@@ -850,6 +855,73 @@ mod tests {
         operation::Focusable::focus(tree.state.downcast_mut::<WidgetState>());
         selected.diff(&mut tree);
         assert_eq!(handle.mailbox.drain_coalesced().focused, Some(true));
+    }
+
+    #[test]
+    fn native_window_event_overrides_stale_view_within_the_same_event_batch() {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+        use keyboard::key::Code;
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for view_focused in [false, true] {
+            let handle = BrowserHandle::fixture();
+            let content = Id::unique();
+            let browser = BrowserWidget::<()>::new(&handle)
+                .id(content.clone())
+                .model_focused(true)
+                .window_focused(view_focused);
+            let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
+                Cache::new(), &mut renderer);
+            ui.operate(&renderer, &mut focusable::focus::<()>(content));
+            // UserInterface processes this whole native batch before the
+            // queued application focus message can build a fresh view.
+            let (_, statuses) = ui.update(&[
+                Event::Window(if view_focused { window::Event::Unfocused } else { window::Event::Focused }),
+                press("a", Code::KeyA, keyboard::Modifiers::empty()),
+            ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+            let input = queued_input(&handle);
+            if view_focused {
+                assert!(input.is_empty(), "native blur overrides the stale active view");
+                assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Ignored));
+            } else {
+                assert!(matches!(input.as_slice(), [BrowserInput::Key {
+                    state: ButtonState::Pressed, code, ..
+                }] if code == "KeyA"), "first key after native return must be delivered");
+                assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Captured));
+            }
+        }
+    }
+
+    #[test]
+    fn remounted_same_browser_uses_fresh_window_snapshot_after_missing_an_event() {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+        use keyboard::key::Code;
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let handle = BrowserHandle::fixture();
+        let content = Id::unique();
+        let browser = BrowserWidget::<()>::new(&handle)
+            .id(content.clone()).model_focused(true).window_focused(true);
+        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
+            Cache::new(), &mut renderer);
+        ui.operate(&renderer, &mut focusable::focus::<()>(content.clone()));
+        let _ = ui.update(&[Event::Window(window::Event::Focused)],
+            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        // Preserve the native tree and exact attachment, but deliver no blur
+        // to it while parked. The remounted view has the newer app snapshot.
+        let cache = ui.into_cache();
+        let browser = BrowserWidget::<()>::new(&handle)
+            .id(content).model_focused(true).window_focused(false);
+        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.), cache, &mut renderer);
+        let _ = ui.update(&[press("b", Code::KeyB, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        assert!(queued_input(&handle).is_empty(), "old native true cannot outlive a fresh inactive view");
+        let _ = ui.update(&[Event::Window(window::Event::Focused),
+            press("c", Code::KeyC, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key {
+            state: ButtonState::Pressed, code, ..
+        }] if code == "KeyC"), "remount retains native content focus for the next window return");
     }
 
     #[test]
