@@ -1,12 +1,12 @@
 //! Real hosted-client delivery into Application::update; no daemon or PTY.
 use super::*;
 use crate::terminal::{
-    ipc::{
-        write_frame, ClientEnvelope, ClientRequest, FrameCodec, FrameError, ServerEnvelope,
-        ServerMessage, ServerResponse, TerminalDescriptor, TerminalSnapshot, WireTerminalEvent,
-        MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    },
     RenderSnapshot,
+    ipc::{
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+        ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, TerminalSnapshot,
+        WireTerminalEvent, write_frame,
+    },
 };
 use std::{
     cell::Cell,
@@ -103,7 +103,7 @@ impl Peer {
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) =>
                     {
-                        continue
+                        continue;
                     }
                     Err(error) => panic!("private decode: {error}"),
                 };
@@ -237,11 +237,12 @@ fn grid_output_keeps_workspace_and_protection_preparation_idle() {
     assert_eq!(counts(), (0, 0));
     assert!(Arc::ptr_eq(&durable, &app.durable));
     assert_eq!(peer.handle.snapshot().generation, 32);
-    assert!(app
-        .notices
-        .entries
-        .iter()
-        .any(|notice| notice.notice.message == "output test notice"));
+    assert!(
+        app.notices
+            .entries
+            .iter()
+            .any(|notice| notice.notice.message == "output test notice")
+    );
 }
 
 #[test]
@@ -314,25 +315,68 @@ fn clipboard_reply_is_delivered_even_when_no_metadata_changed() {
 
 #[test]
 fn stable_activity_and_unread_move_on_structural_ownership_changes() {
-    use crate::{agent::{Activity, ActivityState, Provider}, repository::RepositoryId,
-        sidebar::{SidebarProject, SidebarWorktree}, model::{ChannelId, ProjectChannel, WorktreeId},
-        workspace_model::{ModelChannel, ModelProject, WorkspaceModel}};
+    use crate::{
+        agent::{Activity, ActivityState, Provider},
+        model::{ChannelId, ProjectChannel, WorktreeId},
+        repository::RepositoryId,
+        sidebar::{SidebarProject, SidebarWorktree},
+        workspace_model::{ModelChannel, ModelProject, WorkspaceModel},
+    };
     let (mut app, card, mut peer) = fixture();
-    let activity = Activity { provider: Provider::Claude, state: ActivityState::Working };
-    apply(&mut app, card, &mut peer, Some(WireTerminalEvent::AgentActivityChanged { activity: Some(activity) }));
+    let activity = Activity {
+        provider: Provider::Claude,
+        state: ActivityState::Working,
+    };
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::AgentActivityChanged {
+            activity: Some(activity),
+        }),
+    );
     app.sidebar_state.observe_card_update(card);
-    let root = card_directory(app.card_state(card).unwrap()).unwrap().to_path_buf();
+    let root = card_directory(app.card_state(card).unwrap())
+        .unwrap()
+        .to_path_buf();
     let project = ProjectId::new();
     let worktree = WorktreeId::new();
     app.sidebar_model.projects.clear();
-    app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(),
-        "Output fixture".into(), root.clone(), vec![SidebarWorktree::new(worktree,
-            root.clone(), None, false, false, None, None, None)], vec![]));
-    let mut model = WorkspaceModel { identity: uuid::Uuid::new_v4(), sequence: 1,
-        projects: vec![ModelProject { repository: root.clone(), name: "Output fixture".into(),
-            kind: crate::model::ProjectKind::Git, ordinal: 0 }], ..WorkspaceModel::default() };
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model.clone()))));
-    assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Working));
+    app.sidebar_model.projects.push(SidebarProject::new(
+        project,
+        RepositoryId::new(),
+        "Output fixture".into(),
+        root.clone(),
+        vec![SidebarWorktree::new(
+            worktree,
+            root.clone(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        )],
+        vec![],
+    ));
+    let mut model = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 1,
+        projects: vec![ModelProject {
+            repository: root.clone(),
+            name: "Output fixture".into(),
+            kind: crate::model::ProjectKind::Git,
+            ordinal: 0,
+        }],
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(model.clone()),
+    )));
+    assert_eq!(
+        app.sidebar_state.agent_activity(project, worktree),
+        Some(ActivityState::Working)
+    );
     assert!(app.sidebar_state.has_agent_update(project, worktree));
     assert_eq!(app.sidebar_state.card_activity(card), Some(activity));
     reset();
@@ -340,17 +384,35 @@ fn stable_activity_and_unread_move_on_structural_ownership_changes() {
     assert_eq!(counts(), (0, 0));
     assert!(app.sidebar_state.has_agent_update(project, worktree));
     let channel = ChannelId::new();
-    Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
-        id: channel, project_id: project, title: "Moved".into(), title_source: Default::default(),
-        ordinal: 0, shared: true, cards: vec![card], focused: Some(card),
-    });
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .push(ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Moved".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        });
     model.sequence += 1;
-    model.channels.push(ModelChannel { id: channel, repository: root,
-        title: "Moved".into(), title_source: Default::default(), ordinal: 0 });
-    drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model))));
+    model.channels.push(ModelChannel {
+        id: channel,
+        repository: root,
+        title: "Moved".into(),
+        title_source: Default::default(),
+        ordinal: 0,
+    });
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(model),
+    )));
     assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
     assert!(!app.sidebar_state.has_agent_update(project, worktree));
-    assert!(app.sidebar_state.has_card_update(card), "moving scope is not acknowledgement");
+    assert!(
+        app.sidebar_state.has_card_update(card),
+        "moving scope is not acknowledgement"
+    );
     assert_eq!(app.sidebar_state.card_activity(card), Some(activity));
     reset();
     apply(&mut app, card, &mut peer, None);

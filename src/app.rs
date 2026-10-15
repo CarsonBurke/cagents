@@ -41,9 +41,9 @@ mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
 mod terminal_failure;
-mod terminal_ui;
 #[cfg(test)]
 mod terminal_output_tests;
+mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
@@ -7309,7 +7309,9 @@ impl Cagents {
     fn reconcile_agent_attention_owners(&mut self) {
         let cards = self.sidebar_state.attention_cards().collect::<HashSet<_>>();
         for card in cards {
-            let owner = self.agent_worktree(card).map(|key| (key.project_id, key.worktree_id));
+            let owner = self
+                .agent_worktree(card)
+                .map(|key| (key.project_id, key.worktree_id));
             self.sidebar_state.reattribute_card_attention(card, owner);
         }
     }
@@ -11313,8 +11315,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
