@@ -16817,7 +16817,7 @@ impl Application for Cagents {
                     {
                         worktree.apply_status(&read.status);
                         worktree.apply_status_head(&read.status.head);
-                        if worktree.head_repository != head_repository {
+                        if head_repository.is_none() || worktree.head_repository != head_repository {
                             worktree.clear_pull_request();
                         }
                         worktree.head_repository = head_repository;
