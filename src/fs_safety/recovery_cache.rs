@@ -125,7 +125,9 @@ impl<T> RecoveryDirectory<T> {
         &self.private_metadata
     }
     /// Transfer ALL authority into the lower Holding/Undo owner. No uncharged
-    /// bare-Root conversion or second reservation is provided.
+    /// bare-Root conversion or second reservation is provided. A destructuring
+    /// caller must immediately form its aggregate, with native owners before
+    /// the slot, before fallible work: separate locals drop in reverse order.
     pub(crate) fn into_parts(
         self,
     ) -> (
