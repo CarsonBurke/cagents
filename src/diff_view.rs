@@ -4021,7 +4021,7 @@ mod snapshot_performance_receipt {
     #[test]
     #[ignore = "50,000-line snapshot ownership measurement, outside input timing"]
     fn fifty_thousand_line_snapshot_residency() {
-        use crate::editor_widget::{Content, Cursor, Edit, Position, TextSnapshot};
+        use crate::repository_widget::text_editor::{Content, Cursor, Edit, Position, TextSnapshot};
         let source = (0..50_000)
             .map(|line| format!("fn snapshot_owner_{line}() {{}}\n"))
             .collect::<String>();
@@ -4038,7 +4038,7 @@ mod snapshot_performance_receipt {
             content.perform_edit(Edit::Insert(character));
             recent.push(content.text_snapshot());
         }
-        let shared: crate::editor_widget::SnapshotMemory = TextSnapshot::retained_payload(&recent);
+        let shared: crate::repository_widget::text_editor::SnapshotMemory = TextSnapshot::retained_payload(&recent);
         let rewrites: Vec<_> = (0..4)
             .map(|_| {
                 let content: Content = Content::with_text(&source);
