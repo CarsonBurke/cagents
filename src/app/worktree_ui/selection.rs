@@ -343,7 +343,7 @@ impl Cagents {
 
     /// Repository discovery updates ownership without superseding a deliberate
     /// navigation that is still preparing its destination.
-    pub(super) fn reproject_current_workspace_scope(&mut self) -> Task<Message> {
+    pub(in crate::app) fn reproject_current_workspace_scope(&mut self) -> Task<Message> {
         let Some(active) = self.active_workspace.clone() else {
             return Task::none();
         };
