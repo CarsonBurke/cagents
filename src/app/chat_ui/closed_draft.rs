@@ -13,7 +13,7 @@ impl Cagents {
         })
     }
 
-    pub(super) fn sync_closed_chat_draft(&mut self, card: CardId) {
+    pub(in crate::app) fn sync_closed_chat_draft(&mut self, card: CardId) {
         let closed = self.chat_closed_elsewhere(card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.closed_elsewhere = closed;
