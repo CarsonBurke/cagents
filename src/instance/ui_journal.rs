@@ -8,6 +8,7 @@ use super::*;
 use std::{os::fd::FromRawFd, time::Instant};
 
 pub(crate) struct OriginalUiJournalPeer {
+    connection: UnixStream,
     image: File,
     slot: String,
     peer: File, // SO_PEERPIDFD: the ORIGINAL socket peer, never pidfd_open(pid)
@@ -124,6 +125,7 @@ impl OriginalUiJournalPeer {
             ));
         }
         let audience = Self {
+            connection: stream.try_clone()?,
             image,
             slot,
             peer,
@@ -136,6 +138,7 @@ impl OriginalUiJournalPeer {
     }
     pub(crate) fn validate(&self, deadline: Instant) -> io::Result<()> {
         check_deadline(deadline)?;
+        self.validate_connection(deadline)?;
         require_live(&self.peer)?;
         let pid = peer_pid(&self.peer)?;
         if pid != self.owner.pid {
@@ -169,8 +172,18 @@ impl OriginalUiJournalPeer {
             ));
         }
         require_live(&self.peer)?;
+        self.validate_connection(deadline)?;
         check_deadline(deadline)
     }
+    /// Cheap non-consuming final admission check. A process pidfd/slot may
+    /// survive original connection shutdown or exec/reacquisition; that must
+    /// not validate a buffered response. Write-half-close is also refused.
+    /// This does no filesystem/proc census and may be repeated at final gate.
+    pub(crate) fn validate_connection(&self, deadline: Instant) -> io::Result<()> {
+        require_live(&self.peer)?;
+        require_original_connection(&self.connection, deadline)
+    }
+
     /// This proves the original process/window audience only. It grants no
     /// journal row read: SQLite pathname probes cannot bind another connection
     /// to the held database. The UI must answer from its original live store.
@@ -181,6 +194,24 @@ impl OriginalUiJournalPeer {
         self.database.metadata().map(|metadata| identity(&metadata))
     }
 }
+fn require_original_connection(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    loop {
+        check_deadline(deadline)?;
+        let mut fd=libc::pollfd {fd:stream.as_raw_fd(),events:libc::POLLRDHUP,revents:0};
+        // SAFETY: one initialized descriptor, zero timeout, no input consumed.
+        let result=unsafe {libc::poll(&mut fd,1,0)};
+        if result<0 {
+            let error=io::Error::last_os_error();
+            if error.kind()==io::ErrorKind::Interrupted {continue;}
+            return Err(error);
+        }
+        if fd.revents & (libc::POLLRDHUP|libc::POLLHUP|libc::POLLERR|libc::POLLNVAL)!=0 {
+            return Err(refused("The original UI journal connection was closed or shut down"));
+        }
+        return Ok(());
+    }
+}
+
 fn original_peer(stream: &UnixStream) -> io::Result<File> {
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -379,6 +410,20 @@ mod tests {
         assert_eq!(peer_pid(&peer).unwrap(), std::process::id());
         assert!(descriptor_cloexec(&peer).unwrap());
         require_live(&peer).unwrap();
+    }
+
+    #[test]
+    fn live_original_process_does_not_authorize_a_disconnected_socket() {
+        let (a,b)=UnixStream::pair().unwrap();
+        let peer=original_peer(&a).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(1);
+        require_original_connection(&a,deadline).unwrap();
+        drop(b);
+        require_live(&peer).unwrap(); // The original process is still us.
+        assert!(require_original_connection(&a,deadline).is_err());
+        let (a,b)=UnixStream::pair().unwrap();
+        b.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(require_original_connection(&a,deadline).is_err(),"write half-close is unsupported");
     }
 
     #[test]

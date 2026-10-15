@@ -210,6 +210,18 @@ mod host {
         pub(crate) fn generation(&self) -> u64 {
             self.challenge.requirement.generation
         }
+        /// Cheap final locked admission fence AFTER full blocking-worker
+        /// validation. No filesystem/proc/SQL work; this alone proves no scope.
+        pub(crate) fn validate_final_envelope(
+            &self, current_request:u64, current_proof:&HostSessionProof,
+            current_requirement:&DirectoryStartRequirement,
+        ) -> io::Result<()> {
+            check_active(self.deadline,&self.cancellation)?;
+            validate_echo(&self.challenge,&self.challenge,current_request,current_proof,current_requirement)?;
+            self.audience.validate_connection(self.deadline)?;
+            check_active(self.deadline,&self.cancellation)
+        }
+
         pub(crate) fn validate_current(
             &self,
             current_request: u64,
