@@ -53,7 +53,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
             children.push(highlighted(
                 self.label.to_owned(),
                 query,
-                design::heading_font(),
+                TextRole::Heading,
             ));
         }
         children.push(self.control);
@@ -71,7 +71,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
                 children.push(highlighted(
                     format!("Matches: {}", terms.join(" · ")),
                     query,
-                    design::interface_font(),
+                    TextRole::Caption,
                 ));
             }
         }
@@ -88,7 +88,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
             children.push(highlighted(
                 self.detail.into_owned(),
                 query,
-                design::interface_font(),
+                TextRole::Caption,
             ));
         }
         widget::column::with_children(children)
@@ -98,31 +98,64 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     }
 }
 
-/// Build spans at original UTF-8 boundaries, including non-ASCII text.
+#[derive(Clone, Copy)]
+enum TextRole {
+    Heading,
+    Title,
+    Caption,
+}
+
+impl TextRole {
+    fn metrics(self) -> (iced::Font, f32, f32) {
+        match self {
+            Self::Heading => (design::heading_font(), design::interface_size(), design::interface_size() + 5.0),
+            Self::Title => (design::title_font(), design::scaled_interface_size(design::TEXT_TITLE), design::scaled_interface_size(design::LINE_TITLE)),
+            Self::Caption => (design::interface_font(), design::scaled_interface_size(design::TEXT_CAPTION), design::scaled_interface_size(17.0)),
+        }
+    }
+}
+
 fn highlighted<'a, Message: 'a>(
     text: String,
     query: &str,
-    font: iced::Font,
+    role: TextRole,
 ) -> Element<'a, Message> {
-    let size = design::interface_size();
+    // Keep the stock role and a single shaping run in ordinary settings views.
+    if query.trim().is_empty() {
+        return match role {
+            TextRole::Heading => design::heading(text).width(Length::Fill).into(),
+            TextRole::Title => design::title(text).width(Length::Fill).into(),
+            TextRole::Caption => design::caption(text).width(Length::Fill).into(),
+        };
+    }
+    let (font, size, line_height) = role.metrics();
+    let rich = iced::widget::rich_text(highlighted_spans(&text, query, font))
+        .size(size)
+        .font(font)
+        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
+        .width(Length::Fill);
+    if matches!(role, TextRole::Caption) {
+        rich.class(cosmic::theme::Text::Custom(design::muted_text)).into()
+    } else {
+        rich.into()
+    }
+}
+
+/// The native rich-text builder consumes these exact render properties.
+fn highlighted_spans(
+    text: &str,
+    query: &str,
+    font: iced::Font,
+) -> Vec<iced::widget::text::Span<'static, ()>> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let max_chars = words
         .iter()
         .map(|word| word.chars().count())
         .max()
         .unwrap_or(0);
-    // Ordinary settings views need a single shaping run, not one rich span per
-    // character. Search results also coalesce adjacent equal emphasis below.
+    // Adjacent characters with the same emphasis share one shaping run.
     if words.is_empty() {
-        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text).font(font);
-        return iced::widget::rich_text([span])
-            .size(size)
-            .font(font)
-            .line_height(iced::widget::text::LineHeight::Absolute(
-                (size + 5.0).into(),
-            ))
-            .width(Length::Fill)
-            .into();
+        return vec![iced::widget::text::Span::new(text.to_owned()).font(font)];
     }
     let mut spans = Vec::new();
     let boundaries: Vec<_> = text
@@ -152,20 +185,13 @@ fn highlighted<'a, Message: 'a>(
             span.font(iced::Font {
                 weight: iced::font::Weight::Bold,
                 ..font
-            })
+            }).underline(true)
         } else {
             span.font(font)
         });
         run_start = end;
     }
-    iced::widget::rich_text(spans)
-        .size(size)
-        .font(font)
-        .line_height(iced::widget::text::LineHeight::Absolute(
-            (size + 5.0).into(),
-        ))
-        .width(Length::Fill)
-        .into()
+    spans
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -235,7 +261,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         let mut heading: Vec<Element<'a, Message>> = vec![if query.trim().is_empty() {
             design::title(self.title).into()
         } else {
-            highlighted(breadcrumb, query, design::heading_font())
+            highlighted(breadcrumb, query, TextRole::Title)
         }];
         if !self.detail.is_empty() {
             heading.push(
@@ -344,10 +370,11 @@ mod tests {
     #[test]
     fn labels_and_search_highlights_follow_interface_type_size() {
         use iced::advanced::{layout, widget::Tree};
+        let _restore = design::typography_test_guard();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let height = |query| {
             let mut label: Element<'_, ()> =
-                highlighted("Interface font".into(), query, design::heading_font());
+                highlighted("Interface font".into(), query, TextRole::Heading);
             let mut tree = Tree::new(label.as_widget());
             label
                 .as_widget_mut()
@@ -367,6 +394,62 @@ mod tests {
             assert_eq!(large, 29.0);
         }
         design::configure_typography("", 13.0, "", 14.0);
+    }
+
+    #[test]
+    fn settings_search_keeps_heading_title_and_caption_roles() {
+        use iced::advanced::{layout, widget::Tree};
+        let _restore = design::typography_test_guard();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0));
+        let measure = |mut element: Element<'_, ()>| {
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(&mut tree, &renderer, &limits).size().height
+        };
+        for size in [13.0, 24.0] {
+            design::configure_typography("", size, "", 14.0);
+            let heading_height = measure(design::heading("Font").into());
+            let title_height = measure(design::title("Editor > Font").into());
+            let caption_height = measure(design::caption("Font detail").into());
+            assert!(title_height > heading_height);
+            for query in ["", "Font"] {
+                let mut setting = field::<()>("Font", "Font detail",
+                    widget::Space::new().width(1).height(1).into()).view(query);
+                let mut tree = Tree::new(setting.as_widget());
+                let node = setting.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(node.children()[0].size().height, heading_height);
+                assert_eq!(node.children().len(), if query.is_empty() { 3 } else { 4 });
+                for caption in &node.children()[2..] {
+                    assert_eq!(caption.size().height, caption_height,
+                        "details and keyword matches retain caption metrics at {size}px/query={query}");
+                }
+                let mut element = group("Font", "", vec![field::<()>("Font", "",
+                    widget::Space::new().width(1).height(1).into())])
+                    .view("Editor", query).unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(node.children()[0].children()[0].size().height, title_height,
+                    "breadcrumb retains its title role at {size}px/query={query}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_matches_remain_visible_when_the_title_is_already_bold() {
+        for (label, query, matched) in [
+            ("Editor > Font", "editor", "Editor"),
+            ("Editor > naïve fonts", "NAÏVE", "naïve"),
+        ] {
+            let font = design::title_font();
+            assert_eq!(font.weight, iced::font::Weight::Bold);
+            let spans = highlighted_spans(label, query, font);
+            assert_eq!(spans.iter().map(|span| span.text.as_ref()).collect::<String>(), label);
+            assert_eq!(spans.iter().filter(|span| span.underline)
+                .map(|span| span.text.as_ref()).collect::<String>(), matched);
+            assert!(spans.iter().any(|span| !span.underline));
+            assert!(spans.iter().all(|span| span.font == Some(font)));
+            assert!(highlighted_spans(label, "", font).iter().all(|span| !span.underline));
+        }
     }
 
     #[test]
