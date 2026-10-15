@@ -2827,7 +2827,7 @@ pub(in crate::host) fn reserved_automation_actor(
     let identity = record.handle.try_close_identity().map_err(unavailable)?;
     if identity.completed
         || !reserved_automation_record_matches(agent, &record.session, &identity.native_continuity)
-        || identity.session_id != issued.launch.session_id {
+        || identity.confirmed_session_id != issued.launch.session_id {
         return Err(unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"));
     }
     Ok(record.handle.clone())
@@ -2875,7 +2875,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
         if identity.completed { return Err(unavailable("The pending archive actor already ended")); }
         (record.session.clone(), record.execution_instance, identity)
     };
-    issued.launch.session_id = identity.session_id;
+    issued.launch.session_id = identity.confirmed_session_id;
     issued.native_continuity = identity.native_continuity;
     if !reserved_automation_request_matches(agent, requested, &issued) {
         return Err(error(
@@ -2900,7 +2900,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     let identity = record.handle.try_close_identity().map_err(unavailable)?;
     if identity.completed
         || !reserved_automation_record_matches(agent, &record.session, &identity.native_continuity)
-        || identity.session_id != issued.launch.session_id
+        || identity.confirmed_session_id != issued.launch.session_id
         || identity.native_continuity != issued.native_continuity {
         return Err(unavailable("The pending archive actor changed during attachment"));
     }

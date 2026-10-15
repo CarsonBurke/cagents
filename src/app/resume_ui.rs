@@ -212,8 +212,7 @@ fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
         let (Some(left), Some(right)) = (&a.archive_report, &b.archive_report) else {
             return false;
         };
-        if left.registry != right.registry
-            || left.agent != right.agent
+        if left != right
             || a.id != b.id
             || a.proof != b.proof
         {
@@ -1804,6 +1803,36 @@ mod tests {
             CardRuntime::Chat(chat) if chat.session.id == original.id)));
     }
 
+
+    #[test]
+    fn existing_report_reuse_requires_the_exact_original_source_reference() {
+        let (mut app, original, owner, _) = crate::app::chat_ui::qualified_closed_console_archive_for_test();
+        let mut issued = app.chat_return_session(original).unwrap();
+        let reference = chat::ArchiveReportReference {
+            format: 1, registry: app.workspace_model.identity, agent: owner,
+            source_operation: uuid::Uuid::new_v4(),
+        };
+        issued.archive_report = Some(reference.clone());
+        let (report_card, hydration) = app.new_archive_report_card(issued.clone()).unwrap();
+        drop(hydration); // No private-body or provider task runs in this identity fixture.
+        assert_eq!(app.existing_conversation_card(&issued), Some(report_card));
+        for change_format in [false, true] {
+            let mut other = issued.clone();
+            let other_reference = other.archive_report.as_mut().unwrap();
+            if change_format { other_reference.format += 1; }
+            else { other_reference.source_operation = uuid::Uuid::new_v4(); }
+            assert!(!same_conversation(&issued, &other));
+            assert!(app.existing_conversation_card(&other).is_none());
+            let entry = SavedConversation { card: CardId::new(), title: "Another original receipt".into(),
+                session: other.clone(), open: false, updated_at_unix_ms: 2 };
+            drop(app.resume_saved_conversation(entry));
+            assert_eq!(app.resume_ui.report_query.as_ref().unwrap().entry.session, other,
+                "a different receipt must reach exact private qualification, never reuse the open report");
+            assert!(app.card_state(report_card).unwrap().existence.is_open());
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+        }
+        assert_eq!(app.existing_conversation_card(&issued), Some(report_card));
+    }
 
     // Joint fixture: requires the real protected-selection provider plus the
     // ArchiveReport feature and modal adapters. No provider/daemon task runs.

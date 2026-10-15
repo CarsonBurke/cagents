@@ -411,6 +411,7 @@ impl RemoteActor {
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
         Ok(super::CloseIdentity {
             session_id: state.session_id.clone(),
+            confirmed_session_id: state.confirmed_session.clone(),
             native_continuity: state.native_continuity.clone(),
             owns_work: !self.0.preserved.load(Ordering::Acquire) && state.owns_work,
             completed: state.completed,

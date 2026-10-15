@@ -233,6 +233,8 @@ impl Drop for OwnedSocket {
 /// or serialization crosses this boundary.
 pub(crate) struct CloseIdentity {
     pub session_id: Option<String>,
+    /// Native confirmation is distinct from a speculative presentation selector.
+    pub confirmed_session_id: Option<String>,
     pub native_continuity: super::NativeContinuity,
     pub owns_work: bool,
     pub completed: bool,
@@ -251,6 +253,8 @@ impl LocalHandle {
     pub(crate) fn try_close_identity(&self) -> Result<CloseIdentity, String> {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
+        let confirmed = self.0.confirmed_session.try_lock()
+            .map_err(|_| "Provider confirmed identity is busy or unavailable; retry after it settles".to_owned())?;
         let completed = self.is_completed();
         let owns_work = if self.0.history_only {
             false
@@ -268,6 +272,7 @@ impl LocalHandle {
         };
         Ok(CloseIdentity {
             session_id: state.session_id.clone(),
+            confirmed_session_id: confirmed.clone(),
             native_continuity: state.native_continuity.clone(),
             owns_work,
             completed,

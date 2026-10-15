@@ -99,7 +99,6 @@ pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
-pub mod layout_metrics;
 pub mod model;
 pub mod notifications;
 pub mod performance;
@@ -109,8 +108,6 @@ pub mod persistence;
 pub mod process;
 pub mod project_location;
 pub mod project_recovery;
-#[cfg(feature = "ui")]
-pub mod project_search;
 #[cfg(feature = "ui")]
 pub mod project_search;
 #[cfg(feature = "ui")]
