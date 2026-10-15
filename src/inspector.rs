@@ -1572,9 +1572,10 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
         markdown_body(&value)
     } else if selectable {
         widget::selectable_text(value)
-            .size(design::TEXT_BODY)
+            .font(design::interface_font())
+            .size(design::interface_size())
             .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-                18.0.into(),
+                (design::interface_size() + 5.0).into(),
             ))
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
