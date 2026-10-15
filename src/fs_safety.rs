@@ -400,6 +400,76 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
     resolve_directory(root, relative)
 }
 
+#[path = "fs_safety/directory_creation.rs"]
+mod directory_creation;
+pub use directory_creation::{
+    DirectoryCreateError, DirectoryCreation, DirectoryNamespace, DirectoryPreparation,
+    DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
+    create_directory_in_namespace, stage_directory_in_namespace,
+};
+#[cfg(test)]
+pub(crate) use directory_creation::fixture_directory_preparation_failure;
+
+/// Changes permissions through the exact retained directory descriptor.
+pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{}", directory.descriptor()),
+        std::fs::Permissions::from_mode(mode),
+    )
+}
+
+/// Removes only an empty directory beneath the held root; never follows links.
+pub fn remove_empty_directory_beneath(root: &Root, relative: &Path) -> Result<bool, ResolveError> {
+    let (parent, name) = open_parent_beneath(root, relative)?;
+    let leaf = c_component(&name, &parent.path)?;
+    // SAFETY: both the held parent and leaf remain live through unlinkat.
+    let result = unsafe { libc::unlinkat(parent.descriptor(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+    ) {
+        return Ok(false);
+    }
+    Err(ResolveError::io(&parent.path.join(name), &error))
+}
+
+/// Creates a literal symlink entry inside its retained parent.
+pub fn symlink_within(directory: &Root, target: &Path, name: &OsStr) -> Result<(), ResolveError> {
+    let leaf = c_component(name, &directory.path)?;
+    let target = c_path(target).map_err(|error| ResolveError::io(&directory.path, &error))?;
+    // SAFETY: both C strings and the held directory outlive symlinkat.
+    let result = unsafe { libc::symlinkat(target.as_ptr(), directory.descriptor(), leaf.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ))
+    }
+}
+
+/// Removes only an empty direct child through its retained parent.
+pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError> {
+    let raw = c_component(name, &directory.path)?;
+    // SAFETY: the held directory and C string outlive unlinkat; AT_REMOVEDIR
+    // removes only an empty directory entry and never follows a symbolic link.
+    let status =
+        unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
+    if status < 0 {
+        return Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 /// Creates missing directory components without following symbolic links.
 /// Existing components must be real directories beneath the retained root.
 pub fn create_directories_beneath(
