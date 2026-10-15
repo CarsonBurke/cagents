@@ -12,11 +12,15 @@ pub struct GitTarget {
 
 // Availability is queried while menus and shortcut scopes are built. Keep it
 // independent of the complete message; only activation constructs that payload.
-fn commit_available(source: &SourceControlModel, state: &SidebarState) -> bool {
+pub(super) fn commit_available(source: &SourceControlModel, state: &SidebarState) -> bool {
     source.mutations_available()
         && !source.busy()
         && state.commit_draft.ready()
-        && (!state.commit_draft.amend || source.operation.is_none())
+        && (!state.commit_draft.amend
+            || (source.operation.is_none()
+                && state.commit_draft.amend_head.as_ref().is_some_and(|head| {
+                    source.head_oid.as_deref() == Some(head.as_str())
+                })))
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0
             || (state.commit_draft.amend && source.head_oid.is_some())
@@ -278,6 +282,19 @@ mod tests {
         let Some(SidebarAction::Commit { key: captured, message, amend }) = target.action(&model, &state, Command::GitCommit) else { panic!("ready commit action"); };
         assert_eq!(captured, key); assert_eq!(message, loaded); assert!(amend);
         assert!(state.submitted_commit_revision(&key, &message, amend).is_some());
+        let current_head = model.source_control.as_mut().unwrap().head_oid.take();
+        assert!(!target.available(&model, &state, Command::GitCommit), "staged rows cannot authorize amend without HEAD");
+        assert!(target.action(&model, &state, Command::GitCommit).is_none());
+        model.source_control.as_mut().unwrap().head_oid = Some("b".repeat(40));
+        assert!(!target.available(&model, &state, Command::GitCommit), "a known changed HEAD cannot authorize the pinned amend");
+        assert!(target.action(&model, &state, Command::GitCommit).is_none());
+        model.source_control.as_mut().unwrap().head_oid = current_head;
+        let pinned_head = state.commit_draft.amend_head.take();
+        assert!(!target.available(&model, &state, Command::GitCommit), "a retained message cannot authorize an unpinned amend");
+        assert!(target.action(&model, &state, Command::GitCommit).is_none());
+        assert!(target.available(&model, &state, Command::GitAmend), "OFF recovers a stale checked draft");
+        state.commit_draft.amend_head = pinned_head;
+        assert!(target.available(&model, &state, Command::GitCommit));
         model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only host")));
         assert!(!target.available(&model, &state, Command::GitCommit));
         assert!(target.action(&model, &state, Command::GitCommit).is_none());
