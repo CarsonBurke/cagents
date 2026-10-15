@@ -171,6 +171,23 @@ impl Handle {
         Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
     }
 
+    /// Retain an actual native holder after closing the fixture's local actor.
+    /// Cleanup still requires the real holder protocol and receipt.
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_native_holder(
+        &self,
+        holder: super::native_holder::Holder,
+        reason: String,
+    ) {
+        assert!(self.is_completed(), "fixture requires a closed actor");
+        assert!(self.0.worker.lock().unwrap().is_none());
+        let mut retained = self.0.retained_native.lock().unwrap();
+        assert!(retained.is_none());
+        *retained = Some(holder);
+        *self.0.failure.lock().unwrap() = Some(reason);
+        self.0.completed.store(false, Ordering::Release);
+    }
+
     pub(crate) fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
