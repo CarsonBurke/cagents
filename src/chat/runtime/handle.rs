@@ -16,6 +16,14 @@ enum Owner {
     Remote(RemoteActor),
 }
 impl Handle {
+    /// Exact authenticated helper metadata. Callers must compare the complete
+    /// record against an installed host entry; this is never cleanup authority.
+    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {
+        match &self.0 {
+            Owner::Local(local)=>local.native_holder_record(),
+            Owner::Remote(remote)=>Some(remote.native_holder_record()),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,

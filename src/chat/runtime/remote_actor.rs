@@ -371,6 +371,7 @@ impl RemoteActor {
             (self.0.notify)(Update::RetainedOutcomes);
         }
     }
+    pub fn native_holder_record(&self)->&Record {&self.0.identity.record}
     pub fn identity(&self) -> ActorIdentity {
         self.0.identity.clone()
     }

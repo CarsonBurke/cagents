@@ -198,6 +198,9 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    /// Exact discovery metadata; observing it grants no release authority.
+    pub(crate) fn record(&self)->&Record { &self.identity.record }
+
     pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
         if !self.identity.record.build.as_ref().is_some_and(|build| {
             build
