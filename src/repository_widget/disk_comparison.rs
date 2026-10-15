@@ -19,6 +19,19 @@ pub(super) struct Job {
 }
 impl Drop for Job { fn drop(&mut self) { self.cancellation.cancel(); } }
 impl RepositoryRuntime {
+    /// Exact current external observation, independent of button availability.
+    /// Ordinary captured command targets include this value, so a queued Reload,
+    /// Compare or Keep mine cannot silently adopt a newer disk observation.
+    pub fn disk_command_observation(&self) -> Option<RepositoryDiskObservation> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        Some(RepositoryDiskObservation {
+            external_hash: document.external_version.as_ref().map(|version| version.content_hash),
+            external_deleted: document.external_deleted,
+            baseline_hash: document.disk_hash,
+            stamp: self.disk_stamp,
+        })
+    }
+
     pub fn can_compare_disk(&self) -> bool {
         !self.has_editor_recovery() && !self.is_saving() && !self.is_read_only_source()
             && !matches!(self.disk_comparison, Some(DiffState::Loading { .. }))
@@ -121,6 +134,26 @@ mod tests {
         }
         panic!("comparison task must return its owned receipt");
     }
+    #[test]
+    fn captured_disk_actions_refuse_a_new_external_observation_without_buffer_changes() {
+        for action in [RepositoryAction::CompareDisk { card: CardId::new() }, RepositoryAction::KeepMine { card: CardId::new() }, RepositoryAction::Reload { card: CardId::new() }] {
+            let card = action.card(); let mut runtime = fixture(card);
+            let target = runtime.command_target(card);
+            assert!(runtime.resolve_captured_command(&target, action.clone()).is_some(), "unchanged captured disk action remains available");
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+            let version = document.external_version.as_mut().unwrap();
+            version.text = "newer disk".into(); version.content_hash = blake3::hash(version.text.as_bytes());
+            assert!(runtime.resolve_captured_command(&target, action.clone()).is_none(), "same buffer revision must not authorize newer external bytes");
+            let target = runtime.command_target(card);
+            runtime.disk_stamp = Some(None);
+            assert!(runtime.resolve_captured_command(&target, action.clone()).is_none(), "same external hash must not erase a newer metadata observation");
+            let target = runtime.command_target(card);
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+            document.external_deleted = true;
+            assert!(runtime.resolve_captured_command(&target, action).is_none(), "deletion state belongs to the emitted action");
+        }
+    }
+
     #[tokio::test]
     async fn actual_compare_admissions_coalesce_edits_and_reject_duplicate_old_completion() {
         let card = CardId::new(); let mut runtime = fixture(card);

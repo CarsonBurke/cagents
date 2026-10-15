@@ -305,6 +305,16 @@ impl PartialEq for RepositoryMenuIdentity {
 }
 impl Eq for RepositoryMenuIdentity {}
 
+/// O(1) external-disk observation for emitted controls. Hashes and metadata
+/// stamps are copied; no text, native snapshot or path is cloned for this proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryDiskObservation {
+    external_hash: Option<blake3::Hash>,
+    external_deleted: bool,
+    baseline_hash: blake3::Hash,
+    stamp: Option<Option<crate::editor_reload::Stamp>>,
+}
+
 /// A palette action names the displayed document and native selection. Shared
 /// model ownership prevents pointer reuse from accepting a replacement source;
 /// equality compares the Arc identity without traversing diff text or rows.
@@ -314,6 +324,7 @@ pub struct RepositoryCommandTarget {
     identity: AsyncIdentity,
     editor_revision: Option<u64>,
     external_editors_generation: u64,
+    disk_observation: Option<RepositoryDiskObservation>,
     editor_selection: Option<((usize, usize), (usize, usize))>,
     cursor: Option<(usize, usize, Option<(usize, usize)>)>,
     surface: SourceSurface,
@@ -331,7 +342,7 @@ impl std::fmt::Debug for RepositoryCommandTarget {
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.identity == other.identity && self.external_editors_generation == other.external_editors_generation && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
+        Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.identity == other.identity && self.external_editors_generation == other.external_editors_generation && self.disk_observation == other.disk_observation && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
         }
     }
@@ -4981,6 +4992,8 @@ impl RepositoryRuntime {
             RepositoryAction::Save { overwrite, .. } => self.editor_surface_command_action(card,
                 if *overwrite { EditorSurfaceCommand::Overwrite } else { EditorSurfaceCommand::Save }).is_some(),
             RepositoryAction::Reload { .. } => self.editor_surface_command_action(card, EditorSurfaceCommand::Reload).is_some(),
+            RepositoryAction::CompareDisk { .. } => self.can_compare_disk(),
+            RepositoryAction::KeepMine { .. } => self.can_keep_mine(),
             RepositoryAction::DiscardEdits { .. } => self.can_discard_edits(),
             RepositoryAction::ApplyMarkdownMode { preview, .. } => self.can_apply_markdown_mode(*preview),
             RepositoryAction::ApplySourceSurface { diff: true, .. } => self.can_show_diff(),
@@ -5036,6 +5049,7 @@ impl RepositoryRuntime {
             incarnation: Arc::clone(&self.command_incarnation),
             identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
             external_editors_generation: self.external_editors.generation(),
+            disk_observation: self.disk_command_observation(),
             editor_selection: match &self.document {
                 DocumentState::Editable(document) => document.content.selection_bounds().map(|(start, end)| ((start.line, start.column), (end.line, end.column))),
                 _ => None,
