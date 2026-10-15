@@ -260,12 +260,19 @@ fn held_old_attachment_cannot_retire_a_new_attachment_of_the_same_receipt() {
     let second = app.terminal_start_operation(card).unwrap();
     assert_ne!(first, second);
     app.chat_ui.handoff_closes.get_mut(&card).unwrap().attachment_operation = second;
+    app.chat_ui.handoff_attachments.insert(second, (card, Arc::new(receipt.clone())));
     let peer = Peer::attach(receipt.terminal.clone(), receipt.source.proof.clone().unwrap());
     drop(app.update(Message::ChatUi(Action::HandoffAttached(card, first, Arc::new(receipt.clone()), Ok(peer.started(&receipt))))));
     assert_eq!(app.terminal_start_operation(card), Some(second));
     assert_eq!(app.chat_ui.handoff_closes[&card].attachment_operation, second);
     assert!(!app.chat_ui.handoff_closes[&card].attached);
     assert!(app.chat_ui.phases.is_empty());
+    // Deliver the old result again after its owner was settled. The remaining
+    // count and nonce still belong exclusively to the second attachment.
+    drop(app.update(Message::ChatUi(Action::HandoffAttached(card, first, Arc::new(receipt.clone()), Ok(peer.started(&receipt))))));
+    assert_eq!(app.terminal_start_operation(card), Some(second));
+    assert!(app.terminal_start_in_flight(card));
+    assert!(app.chat_ui.handoff_attachments.contains_key(&second));
     drop(app.update(Message::ChatUi(Action::HandoffAttached(card, second, Arc::new(receipt.clone()), Ok(peer.started(&receipt))))));
     assert!(!app.terminal_start_in_flight(card));
     assert!(app.chat_ui.handoff_closes.is_empty());

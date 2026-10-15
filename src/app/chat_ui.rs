@@ -470,6 +470,7 @@ pub(super) struct State {
     /// Captured before Return IO; retained even if its presentation is evicted.
     pub(super) handoff_bindings: HashMap<Target, CapturedHandoffBinding>,
     handoff_closes: HashMap<CardId, HandoffClose>,
+    pub(super) handoff_attachments: HashMap<uuid::Uuid, (CardId, Arc<crate::terminal::ipc::TerminalHandoffReceipt>)>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -528,6 +529,7 @@ impl Default for State {
             end_requests: HashMap::new(),
             handoff_bindings: HashMap::new(),
             handoff_closes: HashMap::new(),
+            handoff_attachments: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -555,7 +557,7 @@ impl State {
 
 impl State {
     pub(super) fn transition_pending(&self) -> bool {
-        !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty() || !self.handoff_bindings.is_empty() || !self.handoff_closes.is_empty()
+        !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty() || !self.handoff_bindings.is_empty() || !self.handoff_closes.is_empty() || !self.handoff_attachments.is_empty()
     }
 
     #[cfg(test)]
@@ -8433,6 +8435,11 @@ impl Cagents {
                 return task;
             }
             Action::HandoffAttached(card, operation, receipt, result) => {
+                // A duplicate old callback must not release a successor's
+                // counted start slot or consume its pending Close.
+                if self.chat_ui.handoff_attachments.get(&operation).is_none_or(|(expected_card, expected_receipt)|
+                    *expected_card != card || expected_receipt.as_ref() != receipt.as_ref()) { return Task::none(); }
+                self.chat_ui.handoff_attachments.remove(&operation);
                 let current = self.terminal_start_operation(card) == Some(operation)
                     && self.card_state(card).is_some_and(|state| state.existence.is_open()
                         && crate::workspace_model::views::same_card_source(&CardKind::Terminal(receipt.terminal.session.clone()), &state.kind));

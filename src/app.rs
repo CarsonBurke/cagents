@@ -7146,7 +7146,9 @@ impl Cagents {
     /// Reserve worst-case response space before the Return can mutate an actor.
     fn terminal_handoff_capacity_available(&self) -> bool {
         let Ok(bytes) = crate::model::validate_terminal_handoffs(&self.durable.terminal_handoff_receipts) else { return false; };
-        let inflight = self.chat_ui.handoff_bindings.len();
+        let detached_attachments = self.chat_ui.handoff_attachments.values().filter(|(_, receipt)|
+            !self.durable.terminal_handoff_receipts.contains_key(&receipt.operation)).count();
+        let inflight = self.chat_ui.handoff_bindings.len().saturating_add(detached_attachments);
         self.durable.terminal_handoff_receipts.len().saturating_add(inflight) < crate::model::MAX_TERMINAL_HANDOFFS
             && bytes.saturating_add(inflight.saturating_add(1).saturating_mul(crate::terminal::ipc::MAX_HANDOFF_RECEIPT_JSON_BYTES + 256)) <= crate::model::MAX_TERMINAL_HANDOFF_BYTES
     }
@@ -7217,6 +7219,7 @@ impl Cagents {
         // before IO. Every later start invalidates this attachment owner.
         let operation = self.terminal_start_operation(card).expect("handoff attachment started");
         let receipt = Arc::new(receipt);
+        self.chat_ui.handoff_attachments.insert(operation, (card, receipt.clone()));
         let attach = attach.map(move |action| match action {
             cosmic::Action::App(Message::TerminalStarted { card: actual, terminal, result })
                 if actual == card && terminal == receipt.terminal.session.id =>
