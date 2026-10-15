@@ -358,6 +358,7 @@ fn create_inner(
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            approval_states: BTreeMap::new(),
             output_streams: BTreeMap::new(),
             models: Vec::new(),
             listing: Vec::new(),
@@ -494,6 +495,7 @@ struct Codex {
     pending: BTreeMap<String, Pending>,
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
+    approval_states: BTreeMap<String, ToolStatus>,
     /// What is held of each running command's output between deltas: the
     /// start of an escape sequence the next delta finishes. An entry exists
     /// only for an item in `active_items`, and goes when the item does.
@@ -735,8 +737,10 @@ impl Codex {
         // Full completed-turn items also cover output that arrived before the
         // request acknowledgement. They upsert the same transcript identities.
         for value in array(turn, "items")? {
-            step.events
-                .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
+            for mut item in parse_item(value, true, id)? {
+                self.normalize_approval(&mut item);
+                step.events.push(Event::Item(item));
+            }
         }
         if let Some(message) = turn["error"]["message"].as_str() {
             step.events.push(Event::Error {
@@ -1114,7 +1118,8 @@ impl Codex {
                         self.discover_child(id, &metadata, step)?;
                     }
                 }
-                for item in parse_item(value, !active, turn_id)? {
+                for mut item in parse_item(value, !active, turn_id)? {
+                    self.normalize_approval(&mut item);
                     if active && self.busy {
                         if self.tracks(value, &item) {
                             self.active_items
@@ -1226,8 +1231,120 @@ impl Codex {
         named
     }
     fn invalidate(&mut self, step: &mut Step) {
+        self.approval_states
+            .retain(|_, status| *status != ToolStatus::AwaitingApproval);
         for id in std::mem::take(&mut self.requests).into_keys() {
             step.events.push(Event::RequestResolved { id });
+        }
+    }
+    fn approval_item_key(frame: &Value) -> Option<String> {
+        let params = &frame["params"];
+        Some(item_key(
+            params["turnId"].as_str()?,
+            params["itemId"].as_str()?,
+        ))
+    }
+    fn normalize_approval(&self, item: &mut Item) {
+        match self.approval_states.get(&item.id).copied() {
+            Some(ToolStatus::AwaitingApproval)
+                if item.content.status() == Some(ToolStatus::Running) =>
+            {
+                item.content.set_status(ToolStatus::AwaitingApproval)
+            }
+            Some(status @ (ToolStatus::Denied | ToolStatus::Stopped)) => {
+                item.content.set_status(status)
+            }
+            _ => {}
+        }
+    }
+    fn set_approval(&mut self, frame: &Value, status: ToolStatus, step: &mut Step) {
+        let Some(key) = Self::approval_item_key(frame) else {
+            return;
+        };
+        if status == ToolStatus::Running {
+            self.approval_states.remove(&key);
+        } else {
+            if self.approval_states.len() >= MAX_ACTIVE_ITEMS * 2
+                && !self.approval_states.contains_key(&key)
+                && let Some(old) = self
+                    .approval_states
+                    .iter()
+                    .find(|(_, status)| **status != ToolStatus::AwaitingApproval)
+                    .map(|(key, _)| key.clone())
+            {
+                self.approval_states.remove(&old);
+            }
+            self.approval_states.insert(key.clone(), status);
+        }
+        let existing = self.active_items.get(&key).cloned();
+        let (action, label) = command_intent(&frame["params"]["commandActions"]);
+        let content = match frame["method"].as_str() {
+            Some("item/commandExecution/requestApproval") => ItemContent::Command {
+                command: frame["params"]["command"]
+                    .as_str()
+                    .unwrap_or("Command awaiting approval")
+                    .into(),
+                working_directory: frame["params"]["cwd"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.cwd.to_string_lossy().into_owned()),
+                label,
+                action,
+                output: String::new(),
+                status,
+                exit_code: None,
+                duration_ms: None,
+            },
+            Some("item/fileChange/requestApproval") => ItemContent::Changes {
+                changes: Vec::new(),
+                status,
+            },
+            Some("item/permissions/requestApproval") => ItemContent::Tool {
+                name: "Additional permissions".into(),
+                input: frame["params"]["permissions"].to_string(),
+                output: String::new(),
+                status,
+            },
+            _ => return,
+        };
+        let mut item = existing.unwrap_or(Item {
+            id: key.clone(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content,
+        });
+        item.content.set_status(status);
+        if self.active_items.len() < MAX_ACTIVE_ITEMS || self.active_items.contains_key(&key) {
+            self.active_items.insert(key, item.clone());
+        }
+        step.events.push(Event::Item(item));
+    }
+    fn release_approval(&mut self, frame: &Value) {
+        if let Some(child_id) = frame["params"]["threadId"].as_str()
+            && self.thread.as_deref() != Some(child_id)
+            && let Some(child) = self.children.get_mut(child_id)
+        {
+            child.release_approval(frame);
+            return;
+        }
+        if let Some(key) = Self::approval_item_key(frame)
+            && self.approval_states.get(&key) == Some(&ToolStatus::AwaitingApproval)
+        {
+            self.approval_states.remove(&key);
+        }
+    }
+    fn routed_approval(&mut self, frame: &Value, status: ToolStatus, step: &mut Step) {
+        if let Some(child_id) = frame["params"]["threadId"].as_str()
+            && self.thread.as_deref() != Some(child_id)
+            && let Some(child) = self.children.get_mut(child_id)
+        {
+            let mut local = Step::default();
+            child.set_approval(frame, status, &mut local);
+            step.events
+                .extend(chat::child_events(child_id, local.events));
+        } else {
+            self.set_approval(frame, status, step);
         }
     }
     fn request(&mut self, frame: Value, step: &mut Step) -> Result<(), String> {
@@ -1237,9 +1354,17 @@ impl Codex {
         if let Some(child_id) = params["threadId"].as_str()
             && let Some(child) = self.children.get_mut(child_id)
         {
+            let first = step.events.len();
             child.request(frame.clone(), step)?;
             self.requests.append(&mut child.requests);
-            for event in &mut step.events {
+            for event in &mut step.events[first..] {
+                if let Event::Item(item) = event {
+                    *event = Event::SubagentItem {
+                        id: child_id.into(),
+                        item: item.clone(),
+                    };
+                    continue;
+                }
                 if let Event::Request(request) = event {
                     request.title = format!("Child agent · {}", request.title);
                 }
@@ -1403,6 +1528,9 @@ impl Codex {
             fields: fields.clone(),
             actions: choices,
         }));
+        if matches!(kind, RequestKind::Decision | RequestKind::Permissions) {
+            self.set_approval(&frame, ToolStatus::AwaitingApproval, step);
+        }
         self.requests.insert(
             id,
             PendingRequest {
@@ -1469,8 +1597,29 @@ impl Codex {
                 }
             }
         };
-        step.writes
-            .push(json!({"id":request.frame["id"],"result":result}));
+        let decision = if matches!(
+            request.kind,
+            RequestKind::Decision | RequestKind::Permissions
+        ) {
+            Some(
+                if matches!(choice.as_str(), Some("decline"))
+                    || (matches!(request.kind, RequestKind::Permissions) && action == "deny")
+                {
+                    ToolStatus::Denied
+                } else if choice.as_str() == Some("cancel") {
+                    ToolStatus::Stopped
+                } else {
+                    ToolStatus::Running
+                },
+            )
+        } else {
+            None
+        };
+        let frame = request.frame.clone();
+        step.writes.push(json!({"id":frame["id"],"result":result}));
+        if let Some(status) = decision {
+            self.routed_approval(&frame, status, step);
+        }
         self.requests.remove(&id);
         step.events.push(Event::RequestResolved { id });
         Ok(())
@@ -2302,7 +2451,8 @@ impl Adapter for Codex {
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
                                 for value in turn["items"].as_array().into_iter().flatten() {
-                                    for item in parse_item(value, true, string(turn, "id")?)? {
+                                    for mut item in parse_item(value, true, string(turn, "id")?)? {
+                                        child.normalize_approval(&mut item);
                                         content.events.push(Event::Item(item));
                                     }
                                 }
@@ -2388,7 +2538,9 @@ impl Adapter for Codex {
                     if self.requests.get(&request_id).is_some_and(|request| {
                         request.frame["params"]["threadId"].as_str() == Some(id)
                     }) {
-                        self.requests.remove(&request_id);
+                        if let Some(request) = self.requests.remove(&request_id) {
+                            self.release_approval(&request.frame);
+                        }
                         step.events.push(Event::RequestResolved { id: request_id });
                     }
                     return Ok(step);
@@ -2578,8 +2730,10 @@ impl Adapter for Codex {
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
                 for value in array(turn, "items")? {
-                    for item in parse_item(value, method == "turn/completed", string(turn, "id")?)?
+                    for mut item in
+                        parse_item(value, method == "turn/completed", string(turn, "id")?)?
                     {
+                        self.normalize_approval(&mut item);
                         if method == "turn/started" && self.tracks(value, &item) {
                             self.active_items.insert(item.id.clone(), item.clone());
                         }
@@ -2644,7 +2798,8 @@ impl Adapter for Codex {
                         self.discover_child(id, &value["agentsStates"][id], &mut step)?;
                     }
                 }
-                for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
+                for mut item in parse_item(&params["item"], done, string(params, "turnId")?)? {
+                    self.normalize_approval(&mut item);
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
@@ -2752,7 +2907,9 @@ impl Adapter for Codex {
             }
             "serverRequest/resolved" => {
                 let id = rpc_id(&params["requestId"])?;
-                self.requests.remove(&id);
+                if let Some(request) = self.requests.remove(&id) {
+                    self.release_approval(&request.frame);
+                }
                 step.events.push(Event::RequestResolved { id });
             }
             "thread/tokenUsage/updated" => {
@@ -3086,7 +3243,10 @@ fn streams_updates(value: &Value, content: &ItemContent) -> bool {
     matches!(
         value["type"].as_str(),
         Some("commandExecution" | "fileChange" | "mcpToolCall")
-    ) && content.status() == Some(ToolStatus::Running)
+    ) && matches!(
+        content.status(),
+        Some(ToolStatus::Running | ToolStatus::AwaitingApproval)
+    )
 }
 /// Codex leaves `phase` null for models that do not classify their messages,
 /// and an unclassified message has to be treated as the turn's answer or the
@@ -3198,9 +3358,9 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
     // Codex itself reports as an error - a failed status, an error payload, an
     // explicit `success: false` - marks the step failed.
     let status = match value["status"].as_str() {
+        Some("declined") => ToolStatus::Denied,
         _ if value["success"] == false || value["error"].is_object() => ToolStatus::Failed,
         Some("failed") => ToolStatus::Failed,
-        Some("declined") => ToolStatus::Denied,
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Succeeded,
         _ if done => ToolStatus::Succeeded,
@@ -4255,6 +4415,7 @@ mod tests {
             pending: BTreeMap::new(),
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
+            approval_states: BTreeMap::new(),
             output_streams: BTreeMap::new(),
             models: vec![Model {
                 id: "model".into(),
@@ -6444,5 +6605,170 @@ mod tests {
         adapter.lifecycle_revision += 1;
         let late = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-32000,"message":"old refresh failed"}})).unwrap();
         assert!(late.events.is_empty());
+    }
+    fn approval_frame(thread: &str, id: i64, method: &str) -> Value {
+        json!({"id":id,"method":method,"params":{"threadId":thread,"turnId":"turn","itemId":"tool",
+            "command":"git status","cwd":"/repo","availableDecisions":["accept","decline"]}})
+    }
+    fn command_frame(thread: &str, status: &str) -> Value {
+        json!({"method":if status == "inProgress" {"item/started"} else {"item/completed"},
+            "params":{"threadId":thread,"turnId":"turn","item":{"id":"tool","type":"commandExecution",
+                "command":"git status","cwd":"/repo","status":status,"aggregatedOutput":"diagnostic"}}})
+    }
+    #[test]
+    fn correlated_codex_approvals_wait_and_denials_survive_later_failure() {
+        let mut adapter = adapter();
+        adapter
+            .receive(command_frame("thread-exact", "inProgress"))
+            .unwrap();
+        let waiting = adapter
+            .receive(approval_frame(
+                "thread-exact",
+                1,
+                "item/commandExecution/requestApproval",
+            ))
+            .unwrap();
+        assert!(waiting.events.iter().any(|event|matches!(event,Event::Item(item)
+            if item.id == "turn/tool" && item.content.status() == Some(ToolStatus::AwaitingApproval))));
+        let denied = adapter
+            .command(Command::Answer {
+                request_id: "1".into(),
+                action: "decision-1".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert_eq!(denied.writes[0]["result"]["decision"], "decline");
+        assert!(denied.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+        let mut failed = command_frame("thread-exact", "failed");
+        failed["params"]["item"]["error"] = json!({"message":"denied"});
+        let completed = adapter.receive(failed).unwrap();
+        assert!(completed.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+        let history=adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn","status":"completed","items":[command_frame("thread-exact","failed")["params"]["item"].clone()]}}})).unwrap();
+        assert!(history.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+    }
+    #[test]
+    fn codex_allow_runs_and_file_denial_remains_neutral() {
+        let mut adapter = adapter();
+        adapter
+            .receive(approval_frame(
+                "thread-exact",
+                1,
+                "item/commandExecution/requestApproval",
+            ))
+            .unwrap();
+        let allowed = adapter
+            .command(Command::Answer {
+                request_id: "1".into(),
+                action: "decision-0".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert!(allowed.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Running))));
+        let done = adapter
+            .receive(command_frame("thread-exact", "completed"))
+            .unwrap();
+        assert!(done.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Succeeded))));
+        adapter
+            .receive(approval_frame(
+                "thread-exact",
+                2,
+                "item/fileChange/requestApproval",
+            ))
+            .unwrap();
+        let denied = adapter
+            .command(Command::Answer {
+                request_id: "2".into(),
+                action: "decline".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert!(denied.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+        let done=adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn",
+            "item":{"id":"tool","type":"fileChange","status":"failed","changes":[]}}})).unwrap();
+        assert!(done.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status() == Some(ToolStatus::Denied))));
+    }
+    #[test]
+    fn child_approval_states_stay_in_the_child_transcript() {
+        let mut parent = adapter();
+        let mut child = adapter();
+        child.thread = Some("child".into());
+        child.is_child = true;
+        parent.children.insert("child".into(), Box::new(child));
+        let waiting = parent
+            .receive(approval_frame(
+                "child",
+                1,
+                "item/commandExecution/requestApproval",
+            ))
+            .unwrap();
+        assert!(waiting.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item} if id == "child" && item.content.status() == Some(ToolStatus::AwaitingApproval))));
+        assert!(
+            !waiting
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        let denied = parent
+            .command(Command::Answer {
+                request_id: "1".into(),
+                action: "decision-1".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert!(denied.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item} if id == "child" && item.content.status() == Some(ToolStatus::Denied))));
+        let done = parent.receive(command_frame("child", "failed")).unwrap();
+        assert!(done.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item} if id == "child" && item.content.status() == Some(ToolStatus::Denied))));
+    }
+
+    #[test]
+    fn codex_approval_correlation_does_not_change_other_turns_or_threads() {
+        let mut adapter = adapter();
+        adapter.turn = Some("new-turn".into());
+        adapter
+            .receive(approval_frame(
+                "thread-exact",
+                1,
+                "item/commandExecution/requestApproval",
+            ))
+            .unwrap();
+        adapter
+            .command(Command::Answer {
+                request_id: "1".into(),
+                action: "decision-1".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        let mut current = command_frame("thread-exact", "inProgress");
+        current["params"]["turnId"] = json!("new-turn");
+        let current = adapter.receive(current).unwrap();
+        assert!(
+            current
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item)
+            if item.id == "new-turn/tool" && item.content.status() == Some(ToolStatus::Running)))
+        );
+        let other = adapter
+            .receive(approval_frame(
+                "unrelated-thread",
+                2,
+                "item/commandExecution/requestApproval",
+            ))
+            .unwrap();
+        assert!(!other.events.iter().any(|event| matches!(
+            event,
+            Event::Item(_) | Event::SubagentItem { .. } | Event::Request(_)
+        )));
+        let old = adapter
+            .receive(command_frame("thread-exact", "failed"))
+            .unwrap();
+        assert!(
+            old.events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item)
+            if item.id == "turn/tool" && item.content.status() == Some(ToolStatus::Denied)))
+        );
+        assert_eq!(adapter.turn.as_deref(), Some("new-turn"));
     }
 }
