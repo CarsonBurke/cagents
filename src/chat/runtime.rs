@@ -96,6 +96,8 @@ pub(crate) enum Update {
     },
     Attention(crate::notifications::Evidence),
     Presentation,
+    /// Wake the host's single coalescing broker; this is never a durable ACK.
+    RetainedOutcomes,
     Observed {
         generation: u64,
     },

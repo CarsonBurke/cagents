@@ -165,6 +165,7 @@ impl Journal {
     }
     pub fn next_input(&self)->Result<u64,String> {self.number("input_sequence")?.checked_add(1).ok_or("Input sequence exhausted".into())}
     pub fn acknowledged(&self)->Result<u64,String> {self.number("outcome_ack")}
+    pub fn latest(&self)->Result<u64,String> {let ack=self.acknowledged()?;self.db.query_row("SELECT COALESCE(MAX(sequence),?1) FROM outcomes",[ack],|row|row.get(0)).map_err(|error|error.to_string())}
     fn number(&self,key:&str)->Result<u64,String> {
         let value:String=self.db.query_row("SELECT value FROM metadata WHERE key=?1",[key],|row|row.get(0)).map_err(|error|error.to_string())?;
         value.parse().map_err(|_|"Invalid actor journal sequence".into())

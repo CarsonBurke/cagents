@@ -47,7 +47,8 @@ pub(crate) struct Resident {
     pub interrupt_subagents:Vec<String>,
     pub account_reports:Vec<Update>,
     next_input:u64,
-    outbox_ack:u64,
+    pub outbox_ack:u64,
+    pub outbox_latest:u64,
     changed:u64,
 }
 #[derive(Clone,Serialize,Deserialize)]
@@ -131,7 +132,7 @@ impl RemoteActor {
         use crate::model::{BootId,HostSessionId,HostIncarnation,TerminalId};
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
-        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,changed:1};
+        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,outbox_latest:0,changed:1};
         Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
@@ -140,6 +141,8 @@ impl RemoteActor {
         {let mut state=actor.0.state.lock().unwrap();let state=Arc::make_mut(&mut state);state.completed=true;state.failure=Some("Provider cleanup is unconfirmed".into());state.owns_work=true;}
         actor
     }
+    pub fn is_record(record:&Record)->bool {record.kind==Kind::Native&&record.build.as_ref().is_some_and(|build|build.capabilities.iter().any(|capability|capability==CAPABILITY))}
+    pub fn wake_outcomes(&self) {let state=self.state();if state.outbox_latest>state.outbox_ack {(self.0.notify)(Update::RetainedOutcomes);}}
     pub fn identity(&self)->ActorIdentity {self.0.identity.clone()}
     pub fn state(&self)->Arc<Resident> {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
     pub fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {self.0.environment.clone()}
@@ -234,11 +237,13 @@ impl RemoteActor {
                     let outcome=state.outcome.clone();
                     let activity_changed=activity!=old.activity||outcome!=old.outcome;
                     let ready=state.ready&&!old.ready;
+                    let outcomes=state.outbox_latest>state.outbox_ack && state.outbox_latest!=old.outbox_latest;
                     let usage:Vec<_>=state.account_reports.iter().filter(|report|!old.account_reports.contains(report)).cloned().collect();
                     *actor.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(state);
                     if changed {(actor.0.notify)(Update::Observed {generation});(actor.0.notify)(Update::Presentation);}
                     if activity_changed {(actor.0.notify)(Update::Activity {state:activity,generation,outcome});}
                     if ready {(actor.0.notify)(Update::Ready);}
+                    if outcomes {(actor.0.notify)(Update::RetainedOutcomes);}
                     for report in usage {(actor.0.notify)(report);}
                 }
                 let identities:Vec<_>=actor.0.pending.lock().unwrap_or_else(|p|p.into_inner()).iter().filter(|pending|pending.reply.is_some()).map(|pending|pending.identity.clone()).collect();
@@ -443,7 +448,7 @@ impl Server {
         drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.revision()})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed:self.revision()})
     }
 
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
@@ -471,6 +476,7 @@ impl Server {
         macro_rules! value {($expression:expr)=>{serde_json::to_value($expression).map_err(|error|error.to_string())};}
         match request.method.as_str() {
             "state"=>{let (after,)=decode!((u64,));if after==self.revision() {Ok(Value::Null)}else {value!(Some(self.resident()?))}},
+            "outbox_unacked"=>{let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());value!(journal.page(journal.acknowledged()?)?)},
             "outbox"=>{let (after,)=decode!((u64,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).page(after)?)},
             "ack_outbox"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).ack(through)?;Ok(Value::Null)},
             "input_receipt"=>{let (identity,)=decode!((InputIdentity,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).input(&identity)?)},

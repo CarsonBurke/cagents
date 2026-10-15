@@ -39,6 +39,9 @@ impl Handle {
         RemoteActor::adopt(record,source,proof,notify).map(|remote|Self(Owner::Remote(remote)))
     }
     pub(crate) fn inspect_remote(record:&crate::daemon::holder_registry::Record,proof:crate::model::HostSessionProof)->Result<super::remote_actor::ActorInspection,String> {RemoteActor::inspect(record,proof)}
+    pub(crate) fn is_remote_record(record:&crate::daemon::holder_registry::Record)->bool {RemoteActor::is_record(record)}
+    pub(crate) fn wake_retained_outcomes(&self) {if let Owner::Remote(remote)=&self.0 {remote.wake_outcomes();}}
+    pub(crate) fn uncommitted_outcomes(&self)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox_unacked",serde_json::Value::Null),_=>Err("This actor has no retained outcome outbox".into())}}
     pub(crate) fn actor_identity(&self)->Option<ActorIdentity> {match &self.0 {Owner::Remote(remote)=>Some(remote.identity()),_=>None}}
     pub(crate) fn retained_outcomes(&self,after:u64)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox",serde_json::json!([after])),_=>Err("This actor has no remote outbox".into())}}
     pub(crate) fn commit_retained_outcomes(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_outbox",serde_json::json!([through])),_=>Err("This actor has no remote outbox".into())}}
