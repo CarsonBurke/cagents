@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline native UI fixture. No network or credential reads; durable Claude JSONL."""
-import json, os, pathlib, re, sys, time, uuid
+import datetime, json, os, pathlib, re, sys, time, uuid
 args = sys.argv[1:]
 config = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR', str(pathlib.Path.home() / '.claude')))
 account_label = {'11111111-1111-4111-8111-111111111111': 'a', '22222222-2222-4222-8222-222222222222': 'b'}.get(config.name, 'system')
@@ -17,11 +17,14 @@ if args and args[0] == 'auth':
     print(json.dumps({'loggedIn': not marker.exists(), 'email': account_label + '@fixture.invalid', 'subscriptionType': 'pro'}))
     sys.exit()
 session = str(uuid.uuid4())
+resuming = False
 for i, arg in enumerate(args):
     if arg in ('--session-id', '--resume') and i + 1 < len(args):
         session = args[i + 1]
+        resuming = arg == '--resume'
     elif arg.startswith(('--session-id=', '--resume=')):
         session = arg.split('=', 1)[1]
+        resuming = arg.startswith('--resume=')
 with (pathlib.Path.home().parent / 'fixture-processes.jsonl').open('a') as output:
     start_ticks = pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
     output.write(json.dumps({'role': 'fake_claude', 'pid': os.getpid(),
@@ -30,17 +33,26 @@ project = re.sub('[^a-zA-Z0-9]', '-', os.getcwd())
 history = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR', str(pathlib.Path.home() / '.claude'))) / 'projects' / project / (session + '.jsonl')
 history.parent.mkdir(parents=True, exist_ok=True)
 records = [json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+original_users = [record for record in records if record.get('type') == 'user'
+                  and not (isinstance(record.get('message', {}).get('content'), list)
+                           and any(part.get('type') == 'tool_result' for part in record['message']['content']))]
+# The memory workload uses one unchanged cwd. This deliberately narrow fixture
+# does not model account relocation or Claude's cross-project lookup contract.
+if resuming and (not original_users or any(record.get('sessionId') != session for record in records)):
+    print('Memory fixture resume requires saved matching history in the unchanged project.', file=sys.stderr)
+    sys.exit(42)
 parent = records[-1].get('uuid') if records else None
-turn = sum((r.get('type') == 'assistant' for r in records))
+turn = len(original_users)
 pending = None
 pending_tool = None
 
 def emit(frame, persist=False):
     global parent
     if persist:
-        frame.update(sessionId=session, parentUuid=parent)
+        frame.update(sessionId=session, parentUuid=parent, cwd=os.getcwd(),
+                     timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat())
         with history.open('a') as out:
-            out.write(json.dumps(frame) + '\n')
+            out.write(json.dumps(frame, separators=(',', ':')) + '\n')
         parent = frame.get('uuid')
     print(json.dumps(frame), flush=True)
 
@@ -49,6 +61,8 @@ def assistant(content, message_id=None):
 
 def done():
     emit({'type': 'result', 'uuid': str(uuid.uuid4()), 'subtype': 'success', 'is_error': False, 'session_id': session})
+emit({'type': 'system', 'subtype': 'init', 'session_id': session,
+      'claude_code_version': '2.1.286', 'model': 'haiku'})
 for line in sys.stdin:
     try:
         frame = json.loads(line)
@@ -59,7 +73,9 @@ for line in sys.stdin:
         log.write(json.dumps({'session': session, 'frame': frame}) + '\n')
     if kind == 'control_request':
         subtype = frame.get('request', {}).get('subtype')
-        metadata = {'claude_code_version': '2.1.286', 'current_permission_mode': 'default', 'models': [{'value': 'haiku', 'displayName': 'Claude Haiku'}]} if subtype == 'initialize' else {}
+        metadata = {'claude_code_version': '2.1.286', 'current_permission_mode': 'default',
+                    'session_id': session, 'model': 'haiku',
+                    'models': [{'value': 'haiku', 'displayName': 'Claude Haiku'}]} if subtype == 'initialize' else {}
         if subtype == 'get_usage':
             metadata = {'subscription_type': 'pro', 'rate_limits': {'limits': [{'kind': 'session', 'group': 'session', 'percent': 100 if (config / '.fixture-limited').exists() else 25, 'resets_at': int(time.time() + 3600), 'is_active': True}]}}
         emit({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': frame['request_id'], 'response': metadata}})
