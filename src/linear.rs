@@ -1,6 +1,7 @@
 //! Linear ticket operations, independent of the desktop UI and daemon.
 pub mod api;
 pub mod context;
+pub mod credentials;
 
 use serde_json::Value;
 
@@ -93,5 +94,76 @@ mod tests {
         ] {
             assert!(issue_reference(value).is_err(), "{value}");
         }
+    }
+}
+
+/// Metadata needed to preview and create a ticket's checkout. Secrets never
+/// leave the client and this value is safe to send to the UI worker result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuePreview {
+    pub id: String,
+    pub identifier: String,
+    pub title: String,
+    pub branch_name: String,
+    pub url: String,
+    pub state: String,
+}
+
+impl IssuePreview {
+    pub fn fetch(reference: &str, workspace: Option<&str>) -> Result<Self, Error> {
+        let reference = issue_reference(reference)?;
+        let client = api::Client::from_workspace(workspace)?;
+        Self::from_response(client.request(
+            "query($id:String!){issue(id:$id){id identifier title branchName url state{name}}}",
+            serde_json::json!({"id": reference}),
+            false,
+        )?)
+    }
+
+    fn from_response(response: Value) -> Result<Self, Error> {
+        let issue = &response["issue"];
+        let text = |field: &str| {
+            issue[field]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::new(
+                        "linear_issue_invalid",
+                        format!("Linear issue response omitted {field}"),
+                    )
+                })
+        };
+        Ok(Self {
+            id: text("id")?,
+            identifier: text("identifier")?,
+            title: text("title")?,
+            branch_name: text("branchName")?,
+            url: text("url")?,
+            state: issue["state"]["name"]
+                .as_str()
+                .unwrap_or("Unknown state")
+                .to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn mocked_linear_response_retains_suggested_branch_title_and_state() {
+        let issue = IssuePreview::from_response(serde_json::json!({"issue": {
+            "id": "2b498c52-7dc7-4c76-ad59-dfc488c40111", "identifier":"ENG-123",
+            "title":"Fix login redirect", "branchName":"user/eng-123-fix-login-redirect",
+            "url":"https://linear.app/team/issue/ENG-123", "state":{"name":"Todo"}
+        }}))
+        .unwrap();
+        assert_eq!(issue.branch_name, "user/eng-123-fix-login-redirect");
+        assert_eq!(issue.title, "Fix login redirect");
+        assert_eq!(issue.state, "Todo");
+        assert!(issue_reference("ENG-123").is_ok());
+        assert!(issue_reference("https://linear.app/team/issue/ENG-123/title").is_ok());
+        assert!(issue_reference("feature/plain-branch").is_err());
     }
 }

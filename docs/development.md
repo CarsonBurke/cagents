@@ -24,7 +24,7 @@ sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
   build-essential clang cmake git libclang-dev libdbus-1-dev \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
-  libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
+  libgl1-mesa-dev libsecret-tools libssl-dev libudev-dev libwayland-dev \
   libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
 rustup toolchain install 1.93.0 --profile minimal
 rustup default 1.93.0
