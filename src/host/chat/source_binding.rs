@@ -218,6 +218,9 @@ pub(super) fn refresh(
         .get(&id)
         .filter(|r| r.execution_instance == instance && r.handle.same_actor(&handle))
         .ok_or_else(|| unavailable("Native actor changed while authenticating its backend"))?;
+    if !handle.backend_identity_is_current(&witness) {
+        return Err(unavailable("Provider identity changed while authenticating its backend; retry the current pane"));
+    }
     let mut source = session_descriptor(record);
     source.launch.session_id = witness.conversation();
     validate_proof(source.proof.as_ref(), state.proof())?;
@@ -1152,6 +1155,9 @@ mod tests {
         }
         let binding = fixture.capture().unwrap();
         let revision = owner.0.observed_backend_revision().unwrap();
+        let proof = fixture.host.lock().unwrap().proof().clone();
+        let stale_witness = owner.0.backend_identity(&proof).unwrap();
+        assert!(owner.0.backend_identity_is_current(&stale_witness));
         let receipt = {
             let mut state = fixture.host.lock().unwrap();
             let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
@@ -1195,6 +1201,8 @@ mod tests {
         }
         assert_eq!(owner.0.confirmed_session_id().as_deref(), Some("first"));
         assert_eq!(owner.0.observed_backend_revision(), Some(revision + 2));
+        assert!(!owner.0.backend_identity_is_current(&stale_witness),
+            "a fresh-read witness cannot be republished after a producer-side ABA revocation");
         assert!(
             fixture
                 .host

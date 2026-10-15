@@ -328,6 +328,28 @@ impl Handle {
             Owner::Remote(remote) => remote.state().backend_conversation_revision,
         }
     }
+    /// Cheap coherence recheck after an off-host authenticated state read.
+    /// A producer revocation that raced that read cannot be republished later.
+    pub(crate) fn backend_identity_is_current(&self, expected: &BackendIdentity) -> bool {
+        match &self.0 {
+            Owner::Local(local) => {
+                let (thread, revision) = local.backend_confirmation();
+                local.backend_instance() == expected.actor
+                    && thread == expected.conversation
+                    && revision == expected.conversation_revision
+                    && local.confirmed_session_id() == thread
+            }
+            Owner::Remote(remote) => {
+                let current = remote.state();
+                expected.helper == Some(remote.identity().instance)
+                    && current.backend_instance == Some(expected.actor)
+                    && current.backend_conversation_revision == Some(expected.conversation_revision)
+                    && !current.backend_confirmation_pending
+                    && current.confirmed_session == expected.conversation
+                    && current.provider_process.as_ref() == Some(&expected.process)
+            }
+        }
+    }
     pub(crate) fn actor_identity(&self) -> Option<ActorIdentity> {
         match &self.0 {
             Owner::Remote(remote) => Some(remote.identity()),

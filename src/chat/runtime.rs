@@ -3343,6 +3343,9 @@ impl Actor {
         }
     }
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
+        // Negative authority publication precedes even fallible durable-holder
+        // confirmation. Failure there must never leave the previous thread valid.
+        let backend_identity_changed = self.observe_backend_conversation(&step);
         // An account report is not output of this conversation, so it does
         // not mark an offscreen pane as having something new to read.
         let observed = step
@@ -3399,7 +3402,7 @@ impl Actor {
             };
             self.dirty = true;
         }
-        self.apply_step(step, identity)?;
+        self.apply_observed_step(step, identity, backend_identity_changed)?;
         if observed {
             self.observe_update();
         }
@@ -3408,28 +3411,34 @@ impl Actor {
     fn step(&mut self, step: Step) -> Result<(), String> {
         self.apply_step(step, None)
     }
-    /// Applies one frame. `confirmed` is the conversation identity the
-    /// provider left the frame with, when the frame changed it.
-    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
-        // Invalidate historical unknown-thread consent BEFORE any frame work
-        // which can publish or fail. Capture all identities, not only the last
-        // Session observed by a callback/UI snapshot.
-        let backend_identity_changed = {
-            let mut history = self
-                .backend_conversation
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+    /// Revoke old conversation authority before the first fallible frame or
+    /// durable-holder operation. Each Step passes here exactly once.
+    fn observe_backend_conversation(&self, step: &Step) -> bool {
+        let changed = {
+            let mut history = self.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
             let previous = history.revision;
             for event in &step.events {
                 history.observe(event);
             }
             previous != history.revision
         };
-        // Revocation cannot depend on successful Store writes/frame I/O.
-        // Fresh positive proof separately checks that confirmation is coherent.
-        if backend_identity_changed {
+        if changed {
             (self.notify)(Update::Identity);
         }
+        changed
+    }
+    /// Applies a locally produced frame; provider frames revoke before their
+    /// additional durable confirmation and enter apply_observed_step directly.
+    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        let changed = self.observe_backend_conversation(&step);
+        self.apply_observed_step(step, confirmed, changed)
+    }
+    fn apply_observed_step(
+        &mut self,
+        step: Step,
+        confirmed: Option<Option<String>>,
+        backend_identity_changed: bool,
+    ) -> Result<(), String> {
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
