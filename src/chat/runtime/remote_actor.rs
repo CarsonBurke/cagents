@@ -501,7 +501,11 @@ impl Server {
             "visible"=>{let (visible,)=decode!((bool,));self.actor.set_visible(visible);Ok(Value::Null)},
             "observe"=>{self.actor.observe_next_update();Ok(Value::Null)},
             "readiness"=>value!(self.actor.check_update_readiness()?),
-            "commit"=>{self.installed=true;self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)},
+            "commit"=>{
+                self.installed=true;
+                confirm_installed_snapshot(&mut self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner()));
+                self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)
+            },
             "preserve"=>{if !self.installed {return Err("Cannot preserve an uninstalled actor".into());}Ok(Value::Null)},
             "update_source"=>{
                 let (source,console,pair)=decode!((chat::Session,Option<crate::model::LaunchRecipe>,Option<crate::terminal::holder::Record>));
@@ -620,6 +624,10 @@ extern "C" fn serve_if_requested() {
     std::process::exit(73);
 }
 
+fn confirm_installed_snapshot(state:&mut Snapshot) {
+    let durable=chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()};
+    if state.native_continuity!=durable {state.native_continuity=durable;state.generation=state.generation.saturating_add(1);}
+}
 fn authority_result<T,E:std::fmt::Display>(result:Result<T,E>)->Result<T,String> {
     result.map_err(|error|format!("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: {error}"))
 }
@@ -630,6 +638,16 @@ fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_install_updates_full_publication_once_and_is_idempotent() {
+        let mut snapshot=Snapshot::default();
+        assert_eq!(snapshot.native_continuity,chat::NativeContinuity::ReconnectOnly);
+        confirm_installed_snapshot(&mut snapshot);
+        assert!(matches!(snapshot.native_continuity,chat::NativeContinuity::Durable {..}));
+        let generation=snapshot.generation;
+        confirm_installed_snapshot(&mut snapshot);
+        assert_eq!(snapshot.generation,generation);
+    }
     #[test]
     fn missing_install_commit_cannot_advertise_durable_continuity() {
         let actor=RemoteActor::fixture();
