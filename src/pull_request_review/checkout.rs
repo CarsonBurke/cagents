@@ -29,7 +29,7 @@ use crate::{
     github::GitHubService,
     repository::{
         CommandSpec, ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, LocalRefRecord,
-        PrCheckoutTracking, ProcessExecutor, RemoteRecord, SystemProcessExecutor,
+        PrCheckoutDisposition, PrCheckoutTracking, ProcessExecutor, RemoteRecord, SystemProcessExecutor,
         ValidatedBranchName, VerifiedPrCheckout, WorktreeRecord,
     },
 };
@@ -56,6 +56,11 @@ pub fn verified_existing_path(
     receipt: &VerifiedPrCheckout,
 ) -> Result<PathBuf, String> {
     let request = plan.request();
+    let expected_local_head = if plan.disposition() == PrCheckoutDisposition::OpenPreservingLocal {
+        plan.local_head()
+    } else {
+        &request.expected_head
+    };
     let upstream = match request.tracking {
         PrCheckoutTracking::RemoteBranch => Some(format!(
             "refs/remotes/{}/{}",
@@ -67,7 +72,8 @@ pub fn verified_existing_path(
     if request.repository != target.repository
         || request.expected_head != target.head
         || receipt.path() != plan.path()
-        || receipt.head() != &request.expected_head
+        || receipt.disposition() != plan.disposition()
+        || receipt.head() != expected_local_head
         || receipt.branch() != &request.branch
         || receipt.upstream() != upstream.as_deref()
     {
@@ -169,13 +175,28 @@ pub fn prepare(
         },
     )?;
     if let Some(request) = &prepared.existing_request {
-        let reconciliation = RepositoryService::system("git")
-            .prepare_existing_pr_checkout(request, cancellation)
-            .map_err(|error| error.to_string())?;
+        let reconciliation = prepare_existing_confirmation(
+            &RepositoryService::system("git"), request, cancellation,
+        )?;
         prepared.notice = format!("{} {}", prepared.notice, reconciliation.notice());
         prepared.reconciliation = Some(reconciliation);
     }
     Ok(prepared)
+}
+
+/// Both alternatives only prepare a confirmation. Opening preserved local work
+/// must remain an explicit decision and still needs a verified worker receipt.
+pub(super) fn prepare_existing_confirmation<E: ProcessExecutor>(
+    service: &RepositoryService<E>,
+    request: &ExistingPrCheckoutRequest,
+    cancellation: &CancellationToken,
+) -> Result<ExistingPrCheckoutPlan, String> {
+    match service.prepare_existing_pr_checkout(request, cancellation) {
+        Ok(plan) => Ok(plan),
+        Err(error) if cancellation.is_cancelled() => Err(error.to_string()),
+        Err(error) => service.prepare_existing_pr_checkout_preserving_local(request, cancellation)
+            .map_err(|preserve| format!("{error} Opening the existing checkout without updating it is also unavailable: {preserve}")),
+    }
 }
 
 /// Resolve identity before creating anything. Existing branches are never reset;

@@ -231,6 +231,7 @@ impl State {
                 "Reconciling checkout…"
             } else {
                 match plan.disposition() {
+                    PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
                     PrCheckoutDisposition::AlreadyCurrent => "Verify existing checkout",
                     PrCheckoutDisposition::FastForward => "Update checkout",
                     PrCheckoutDisposition::RepairTracking => "Set PR upstream",
@@ -481,6 +482,92 @@ mod tests {
             git(&worktree, &["rev-parse", "HEAD"]),
             "ordinary git push must publish the existing checkout's fix to its PR head branch"
         );
+    }
+
+    #[test]
+    fn preserving_ahead_and_dirty_local_work_requires_confirmation_and_a_matching_typed_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let remote = directory.path().join("remote.git");
+        git(directory.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(directory.path(), &["init", "--initial-branch=main", repository.to_str().unwrap()]);
+        git(&repository, &["config", "user.name", "Fixture"]);
+        git(&repository, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(repository.join("README"), "Reviewed content\n").unwrap();
+        git(&repository, &["add", "README"]);
+        git(&repository, &["commit", "-m", "Reviewed fixture"]);
+        let reviewed = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        git(&repository, &["checkout", "-b", "feature"]);
+        let url = "https://fixture.invalid/owner/repo.git";
+        git(&repository, &["remote", "add", "origin", url]);
+        git(&repository, &["config", &format!("url.{}.insteadOf", remote.display()), url]);
+        git(&repository, &["push", "--set-upstream", "origin", "feature"]);
+        std::fs::write(repository.join("README"), "A committed local fix\n").unwrap();
+        git(&repository, &["add", "README"]);
+        git(&repository, &["commit", "-m", "Unpublished local fix"]);
+        let local = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(repository.join("README"), "Staged local work\n").unwrap();
+        git(&repository, &["add", "README"]);
+        std::fs::write(repository.join("README"), "Unstaged local work\n").unwrap();
+        let config = std::fs::read(repository.join(".git/config")).unwrap();
+        let index = std::fs::read(repository.join(".git/index")).unwrap();
+        let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
+        let request = ExistingPrCheckoutRequest {
+            repository: repository.clone(), worktree: repository.clone(),
+            branch: ValidatedBranchName::parse("feature").unwrap(),
+            head_repository: key.clone(), head_branch: ValidatedBranchName::parse("feature").unwrap(),
+            expected_head: reviewed.clone(), remote: "origin".into(), tracking: PrCheckoutTracking::RemoteBranch,
+        };
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        assert!(service.prepare_existing_pr_checkout(&request, &cancel).is_err());
+        let plan = checkout::prepare_existing_confirmation(&service, &request, &cancel).unwrap();
+        assert_eq!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+        assert_eq!(plan.local_head(), &local);
+        let target = CheckoutTarget { repository: repository.clone(), number: 7, head: reviewed.clone(),
+            pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()), head_ref_name: "feature".into() };
+        let pr: PullRequest = serde_json::from_value(serde_json::json!({
+            "number":7,"title":"Fixture","state":"OPEN","headRefName":"feature","headRefOid":reviewed.as_str(),
+            "baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
+        })).unwrap();
+        let mut state = State::new(Arc::new(crate::github::GitHubService::system("gh")), RepositoryService::system("git"));
+        state.target = Some(ReviewTarget { repository:key, worktree:repository.clone(), pull_request:Arc::new(pr) });
+        state.range = Some(crate::repository::PullRequestRange {
+            number:7, base_branch:ValidatedBranchName::parse("main").unwrap(),
+            head_mirror:ValidatedRefName::parse("refs/cagents/fixture/head").unwrap(),
+            base_mirror:ValidatedRefName::parse("refs/cagents/fixture/base").unwrap(),
+            head:reviewed.clone(), base_tip:reviewed.clone(), merge_base:reviewed,
+        });
+        state.load = LoadState::Ready;
+        state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into());
+        drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
+        assert!(state.take_effects().is_empty(), "preparing or opening before confirmation grants no navigation");
+        let task = state.update(super::super::Action::ExistingCheckout(Action::Confirm));
+        let reply = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action @ super::super::Action::ExistingCheckout(Action::Finished { .. })) = action { return action; }
+            }
+            panic!("confirmation produced no receipt");
+        });
+        drop(state.update(reply));
+        let receipt = state.existing_checkout.completed.as_ref().unwrap();
+        assert_eq!(receipt.head(), &local);
+        assert_eq!(receipt.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+        let mut writer_request = request;
+        writer_request.expected_head = local.clone();
+        let writer_plan = service.prepare_existing_pr_checkout(&writer_request, &cancel).unwrap();
+        let mut writer_target = target;
+        writer_target.head = local.clone();
+        assert!(checkout::verified_existing_path(&writer_target, &writer_plan, receipt).is_err(),
+            "a preserve-local receipt cannot masquerade as a strict writer receipt even with the same head");
+        assert!(state.take_effects().is_empty());
+        drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
+        assert_eq!(state.take_effects(), vec![Effect::OpenCheckout(repository.canonicalize().unwrap())]);
+        assert_eq!(git(&repository, &["rev-parse", "HEAD"]), local.as_str());
+        assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config);
+        assert_eq!(std::fs::read(repository.join(".git/index")).unwrap(), index);
+        assert_eq!(std::fs::read_to_string(repository.join("README")).unwrap(), "Unstaged local work\n");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, VerifiedPrCheckout, WorktreeInput, WorktreeOperationReport,
+        CreateWorktreeRequest, PrCheckoutDisposition, VerifiedPrCheckout, WorktreeInput, WorktreeOperationReport,
         WorktreeOperationState,
     },
 };
@@ -497,7 +497,7 @@ impl Editor {
                     .as_ref()
                     .is_some_and(|prepared| prepared.reconciliation.is_some())
                 {
-                    "Reconcile PR worktree"
+                    "Open existing PR worktree"
                 } else {
                     "Create PR worktree"
                 },
@@ -535,7 +535,13 @@ impl Editor {
                 widget::button::suggested(if dialog.busy() {
                     "Reconciling checkout…"
                 } else {
-                    "Confirm checkout reconciliation"
+                    match plan.disposition() {
+                        PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
+                        PrCheckoutDisposition::AlreadyCurrent => "Verify existing worktree",
+                        PrCheckoutDisposition::FastForward => "Update existing worktree",
+                        PrCheckoutDisposition::RepairTracking => "Set PR upstream",
+                        PrCheckoutDisposition::FastForwardAndRepair => "Update worktree and set PR upstream",
+                    }
                 })
                 .on_press_maybe(
                     (!dialog.busy() && !dialog.accepted).then(|| action(Action::ReconcileExisting)),
