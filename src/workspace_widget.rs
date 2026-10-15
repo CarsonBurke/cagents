@@ -226,6 +226,8 @@ pub enum GlobalShortcut {
     EditorFormatSelection,
     EditorCodeActions,
     EditorSignatureHelp,
+    SettingsOpenFile,
+    SettingsRevealFile,
 
     CommandPalette,
     NewThread,
@@ -553,6 +555,8 @@ impl GlobalShortcut {
             Self::EditorFormatSelection => "editor_format_selection",
             Self::EditorCodeActions => "editor_code_actions",
             Self::EditorSignatureHelp => "editor_signature_help",
+            Self::SettingsOpenFile => "settings_open_file",
+            Self::SettingsRevealFile => "settings_reveal_file",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -2205,6 +2209,8 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::EditorFormatSelection, label: "Format selection", repeatable: false, scope: ShortcutScope::Editor },
     ShortcutDescriptor { action: GlobalShortcut::EditorCodeActions, label: "Show code actions", repeatable: false, scope: ShortcutScope::Editor },
     ShortcutDescriptor { action: GlobalShortcut::EditorSignatureHelp, label: "Show signature help", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::SettingsOpenFile, label: "Open settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::SettingsRevealFile, label: "Reveal settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
 
 ];
 
@@ -2397,6 +2403,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::EditorFormatSelection => &shortcuts.editor_format_selection,
         GlobalShortcut::EditorCodeActions => &shortcuts.editor_code_actions,
         GlobalShortcut::EditorSignatureHelp => &shortcuts.editor_signature_help,
+        GlobalShortcut::SettingsOpenFile => &shortcuts.settings_open_file,
+        GlobalShortcut::SettingsRevealFile => &shortcuts.settings_reveal_file,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,

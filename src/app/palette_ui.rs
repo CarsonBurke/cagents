@@ -1249,16 +1249,6 @@ impl Cagents {
             .enumerate()
             .map(|(index, id)| (id, index))
             .collect();
-        entries.push((
-            "Open settings.toml".into(),
-            "Edit application configuration".into(),
-            Message::OpenSettingsFile { reveal: false },
-        ));
-        entries.push((
-            "Reveal settings.toml".into(),
-            "Show configuration in file manager".into(),
-            Message::OpenSettingsFile { reveal: true },
-        ));
         if category.is_none_or(|category| category == '@') {
             for card in self.durable.cards.iter().filter(|card| {
                 card.existence.is_open()
@@ -2182,6 +2172,9 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if matches!(command, Command::SettingsOpenFile | Command::SettingsRevealFile) {
+            return self.update(Message::OpenSettingsFile { reveal: command == Command::SettingsRevealFile });
+        }
         if workspace_widget::editor_feature_command_bit(command).is_some() {
             let action = self.workspace.focused().filter(|card| self.editor_feature_command_capabilities(*card) & workspace_widget::editor_feature_command_bit(command).unwrap() != 0).and_then(|card| match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime.registered_editor_feature_action(card, command), _ => None,
@@ -2647,6 +2640,8 @@ impl Cagents {
             | Command::EditorFormatSelection
             | Command::EditorCodeActions
             | Command::EditorSignatureHelp
+            | Command::SettingsOpenFile
+            | Command::SettingsRevealFile
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -3000,6 +2995,8 @@ impl SettingsField {
             Self::ShortcutEditorFormatSelection => Some(Command::EditorFormatSelection),
             Self::ShortcutEditorCodeActions => Some(Command::EditorCodeActions),
             Self::ShortcutEditorSignatureHelp => Some(Command::EditorSignatureHelp),
+            Self::ShortcutSettingsOpenFile => Some(Command::SettingsOpenFile),
+            Self::ShortcutSettingsRevealFile => Some(Command::SettingsRevealFile),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -3383,6 +3380,8 @@ impl ShortcutDraft {
             (Command::EditorFormatSelection, self.editor_format_selection.as_str()),
             (Command::EditorCodeActions, self.editor_code_actions.as_str()),
             (Command::EditorSignatureHelp, self.editor_signature_help.as_str()),
+            (Command::SettingsOpenFile, self.settings_open_file.as_str()),
+            (Command::SettingsRevealFile, self.settings_reveal_file.as_str()),
         ]
     }
 }
@@ -3868,6 +3867,21 @@ mod tests {
             assert_eq!(drafts[index].0, action);
             assert_eq!(action.id(), KeyboardShortcuts::action_names()[index]);
         }
+    }
+
+    #[test]
+    fn settings_file_commands_are_bindable_and_absent_from_the_pane_picker() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.update_palette(Action::Open));
+        for command in [Command::SettingsOpenFile, Command::SettingsRevealFile] {
+            assert!(app.palette_entries().iter().any(|entry| entry_command(&entry.2) == Some(command)));
+            let field = SettingsField::SHORTCUTS.iter().copied().find(|field| field.shortcut_action() == Some(command)).unwrap();
+            app.settings.keyboard_shortcuts.set_action(SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).unwrap(), vec!["Ctrl+Alt+Shift+K".into()]);
+            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), "Ctrl+Alt+Shift+K");
+            app.settings.keyboard_shortcuts.set_action(SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).unwrap(), Vec::new());
+        }
+        drop(app.update_palette(Action::OpenPanes));
+        assert!(app.palette_entries().iter().all(|entry| entry_category(&entry.2) == '@'));
     }
 
     #[test]

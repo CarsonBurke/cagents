@@ -453,6 +453,8 @@ pub struct KeyboardShortcuts {
     pub editor_format_selection: Vec<String>,
     pub editor_code_actions: Vec<String>,
     pub editor_signature_help: Vec<String>,
+    pub settings_open_file: Vec<String>,
+    pub settings_reveal_file: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -674,6 +676,8 @@ impl Default for KeyboardShortcuts {
             editor_format_selection: Vec::new(),
             editor_code_actions: vec!["Ctrl+.".into()],
             editor_signature_help: vec!["Ctrl+Shift+Space".into()],
+            settings_open_file: Vec::new(),
+            settings_reveal_file: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -706,7 +710,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 207] {
+    pub fn actions(&self) -> [&Vec<String>; 209] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -915,12 +919,14 @@ impl KeyboardShortcuts {
             &self.editor_format_selection,
             &self.editor_code_actions,
             &self.editor_signature_help,
+            &self.settings_open_file,
+            &self.settings_reveal_file,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 207] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 209] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1129,6 +1135,8 @@ impl KeyboardShortcuts {
             &mut self.editor_format_selection,
             &mut self.editor_code_actions,
             &mut self.editor_signature_help,
+            &mut self.settings_open_file,
+            &mut self.settings_reveal_file,
         ]
     }
 
@@ -1190,7 +1198,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 207] = [
+const SHORTCUT_ACTIONS: [&str; 209] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1398,6 +1406,8 @@ const SHORTCUT_ACTIONS: [&str; 207] = [
     "editor_format_selection",
     "editor_code_actions",
     "editor_signature_help",
+    "settings_open_file",
+    "settings_reveal_file",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -2787,7 +2797,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 202] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 204] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2990,6 +3000,8 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 202] = [
     "editor_format_selection",
     "editor_code_actions",
     "editor_signature_help",
+    "settings_open_file",
+    "settings_reveal_file",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

@@ -3127,6 +3127,8 @@ pub enum SettingsField {
     ShortcutEditorFormatSelection,
     ShortcutEditorCodeActions,
     ShortcutEditorSignatureHelp,
+    ShortcutSettingsOpenFile,
+    ShortcutSettingsRevealFile,
     ShortcutTerminalReview,
 }
 
@@ -3219,7 +3221,7 @@ impl SettingsField {
     }
 
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 207] = [
+    const SHORTCUTS: [Self; 209] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3427,6 +3429,8 @@ impl SettingsField {
         Self::ShortcutEditorFormatSelection,
         Self::ShortcutEditorCodeActions,
         Self::ShortcutEditorSignatureHelp,
+        Self::ShortcutSettingsOpenFile,
+        Self::ShortcutSettingsRevealFile,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3652,6 +3656,8 @@ impl SettingsField {
             Self::ShortcutEditorFormatSelection => "Format selection",
             Self::ShortcutEditorCodeActions => "Show code actions",
             Self::ShortcutEditorSignatureHelp => "Show signature help",
+            Self::ShortcutSettingsOpenFile => "Open settings.toml",
+            Self::ShortcutSettingsRevealFile => "Reveal settings.toml",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3930,6 +3936,8 @@ impl SettingsField {
             | Self::ShortcutEditorFormatSelection
             | Self::ShortcutEditorCodeActions
             | Self::ShortcutEditorSignatureHelp
+            | Self::ShortcutSettingsOpenFile
+            | Self::ShortcutSettingsRevealFile
             | Self::ShortcutTerminalReview
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
@@ -4164,6 +4172,8 @@ struct ShortcutDraft {
     editor_format_selection: String,
     editor_code_actions: String,
     editor_signature_help: String,
+    settings_open_file: String,
+    settings_reveal_file: String,
 
     terminal_review: String,
     command_palette: String,
@@ -4387,6 +4397,8 @@ impl ShortcutDraft {
             editor_format_selection: settings::format_chords(&shortcuts.editor_format_selection),
             editor_code_actions: settings::format_chords(&shortcuts.editor_code_actions),
             editor_signature_help: settings::format_chords(&shortcuts.editor_signature_help),
+            settings_open_file: settings::format_chords(&shortcuts.settings_open_file),
+            settings_reveal_file: settings::format_chords(&shortcuts.settings_reveal_file),
 
             terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4958,6 +4970,8 @@ impl SettingsDraft {
             SettingsField::ShortcutEditorFormatSelection => self.keyboard_shortcuts.editor_format_selection = value,
             SettingsField::ShortcutEditorCodeActions => self.keyboard_shortcuts.editor_code_actions = value,
             SettingsField::ShortcutEditorSignatureHelp => self.keyboard_shortcuts.editor_signature_help = value,
+            SettingsField::ShortcutSettingsOpenFile => self.keyboard_shortcuts.settings_open_file = value,
+            SettingsField::ShortcutSettingsRevealFile => self.keyboard_shortcuts.settings_reveal_file = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5972,6 +5986,8 @@ fn settings_update(
         SettingsField::ShortcutEditorFormatSelection => { next.keyboard_shortcuts.editor_format_selection = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorCodeActions => { next.keyboard_shortcuts.editor_code_actions = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorSignatureHelp => { next.keyboard_shortcuts.editor_signature_help = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutSettingsOpenFile => { next.keyboard_shortcuts.settings_open_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutSettingsRevealFile => { next.keyboard_shortcuts.settings_reveal_file = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

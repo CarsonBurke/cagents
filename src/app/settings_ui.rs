@@ -509,8 +509,8 @@ fn settings_category_controls<'a>(
                 "Settings file",
                 "Hand edits apply live in every open window. Invalid edits keep your working settings.",
                 widget::row::with_children(vec![
-                    crate::ui_controls::button::secondary("Open settings.toml").on_press(Message::OpenSettingsFile { reveal: false }).into(),
-                    crate::ui_controls::button::secondary("Reveal settings.toml").on_press(Message::OpenSettingsFile { reveal: true }).into(),
+                    crate::ui_controls::button::secondary("Open settings.toml").on_press(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsOpenFile)).into(),
+                    crate::ui_controls::button::secondary("Reveal settings.toml").on_press(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsRevealFile)).into(),
                 ]).spacing(space::S).into(),
             ).keywords("configuration TOML dotfiles language_servers custom_terminal_theme");
             let reset = setting_field(
@@ -1371,7 +1371,7 @@ fn settings_layout<'a>(
                 .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into(),
                 crate::ui_controls::button::secondary("Open file")
-                    .on_press(Message::OpenSettingsFile { reveal: false })
+                    .on_press(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsOpenFile))
                     .into(),
             ])
             .spacing(space::S)
@@ -1963,7 +1963,7 @@ impl Cagents {
                 crate::ui_controls::button::secondary("Open file")
                     .on_press_maybe(
                         (!self.modal_is_open())
-                            .then_some(Message::OpenSettingsFile { reveal: false }),
+                            .then_some(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsOpenFile)),
                     )
                     .into(),
             ])
