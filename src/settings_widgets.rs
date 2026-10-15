@@ -373,12 +373,18 @@ mod tests {
             assert_eq!(font.weight, iced::font::Weight::Bold);
             let spans = highlighted_spans(label, query, font);
             assert_eq!(
-                spans.iter().map(|span| span.text.as_ref()).collect::<String>(),
+                spans
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>(),
                 label,
             );
             assert_eq!(
-                spans.iter().filter(|span| span.underline)
-                    .map(|span| span.text.as_ref()).collect::<String>(),
+                spans
+                    .iter()
+                    .filter(|span| span.underline)
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>(),
                 matched,
             );
             assert!(
@@ -387,7 +393,9 @@ mod tests {
             );
             assert!(spans.iter().all(|span| span.font == Some(font)));
             assert!(
-                highlighted_spans(label, "", font).iter().all(|span| !span.underline),
+                highlighted_spans(label, "", font)
+                    .iter()
+                    .all(|span| !span.underline),
             );
         }
     }
