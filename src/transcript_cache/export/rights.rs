@@ -135,11 +135,10 @@ mod tests {
     fn actual_rights_are_cloexec_and_queued_sh_survives_sender_drop() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap(); lifetime::initialize(root.path()).unwrap();
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let lock = File::open(root.path().join("readers.lock")).unwrap();
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
-        let files = [lock.try_clone().unwrap(), lock.try_clone().unwrap(), lock.try_clone().unwrap(), lock.try_clone().unwrap()];
+        let reader = lifetime::ReaderHold::acquire(root.path(), deadline()).unwrap();
+        let files = std::array::from_fn::<_, 4, _>(|_| reader.duplicate_for_private_transfer().unwrap());
         send(&sender, b"private-metadata", &files.each_ref().map(File::as_fd), deadline()).unwrap();
-        drop(files); drop(lock); drop(sender);
+        drop(files); drop(reader); drop(sender);
         assert!(matches!(lifetime::disposal(root.path(), Instant::now() + Duration::from_millis(20)), Err(Error::Deadline)));
         let packet = receive(&receiver, deadline()).unwrap();
         assert_eq!(packet.metadata, b"private-metadata");

@@ -43,6 +43,9 @@ impl ReaderHold {
         Ok(Self { _directory: dir, _lock: lock, header: before })
     }
     pub(super) fn cache_nonce(&self) -> Uuid { self.header.nonce }
+    pub(super) fn duplicate_for_private_transfer(&self) -> Result<File> {
+        self._lock.duplicate_for_private_transfer()
+    }
 }
 
 /// A FRESH EX OFD held through removal; never upgrade a reader's duplicated SH.
@@ -85,8 +88,11 @@ impl RevocationEpoch {
             if result < 0 && error.kind() == io::ErrorKind::WouldBlock {
                 // A saturated eventfd is already permanently readable. Never
                 // read it to make room: all readers rely on poll-only state.
-                return self.probe()?.check().and_then(|()| Err(Error::Incomplete("Saturated source epoch was not revoked")))
-                    .or_else(|error| if matches!(error, Error::Revoked) { Ok(()) } else { Err(error) });
+                return match self.probe()?.check() {
+                    Err(Error::Revoked) => Ok(()),
+                    Err(error) => Err(error),
+                    Ok(()) => Err(Error::Incomplete("Saturated source epoch was not revoked")),
+                };
             }
             return Err(if result >= 0 { Error::Incomplete("Source revocation signal was a partial write") } else { error.into() });
         }
@@ -94,6 +100,7 @@ impl RevocationEpoch {
 }
 impl RevocationProbe {
     pub(super) fn incarnation(&self) -> Uuid { self.incarnation }
+    pub(super) fn duplicate_for_private_transfer(&self) -> Result<File> { Ok(self.signal.try_clone()?) }
     pub(super) fn check(&self) -> Result<()> {
         let mut fd = libc::pollfd { fd: self.signal.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         loop {

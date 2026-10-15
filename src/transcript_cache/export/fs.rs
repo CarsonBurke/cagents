@@ -9,6 +9,9 @@ use std::{ffi::{CString, OsStr, OsString}, fs::{File, OpenOptions}, io::{Read, W
 pub(super) struct Directory { file: File, identity: FileIdentity }
 pub(super) struct Locked { _file: File }
 pub(super) enum Mode { Shared, Exclusive }
+impl Locked {
+    pub(super) fn duplicate_for_private_transfer(&self) -> Result<File> { Ok(self._file.try_clone()?) }
+}
 
 fn identity(metadata: &std::fs::Metadata) -> FileIdentity {
     FileIdentity { device: metadata.dev(), inode: metadata.ino() }
