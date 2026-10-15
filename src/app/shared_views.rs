@@ -2574,7 +2574,7 @@ mod tests {
             let (mut app,card,target)=local_dismissal_fixture();
             let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
             if registry_missing {app.workspace_model.identity=crate::workspace_model::NO_REGISTRY;}else{app.workspace_model.views[0].revision+=1;}
-            drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
+            drop(app.completed_terminal_closed(card,source,None,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
             assert!(app.local_terminal_unavailable_notice(card).is_none());
             assert!(!app.status.as_ref().unwrap().message.contains("Dismiss locally"));
             assert!(app.status.as_ref().unwrap().message.contains("Reconnect"));
@@ -2589,7 +2589,8 @@ mod tests {
         let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
         drop(app.close_cards_in_order(vec![card,other]));
         assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.queued_card_closes.len(),1);
-        drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        let batch=app.pane_close_batch_for(card);
+        drop(app.completed_terminal_closed(card,source,batch,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
         assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
         assert!(app.status.as_ref().unwrap().message.contains("Other selected panes were kept"));
         assert!(app.local_terminal_unavailable_notice(card).is_some());
@@ -2599,13 +2600,32 @@ mod tests {
     }
 
     #[test]
+    fn old_completed_result_cannot_revoke_or_offer_dismissal_for_a_new_batch() {
+        for failed in [false,true] {
+            let (mut app,card,target)=local_dismissal_fixture();
+            let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
+            let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+            drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
+            drop(app.close_cards_in_order(vec![card,other]));let current=app.pane_close_batch_for(card);
+            let queued=app.queued_card_closes.len();let model=app.workspace_model.clone();
+            assert_ne!(old,current);
+            let result=if failed {Err("old failure".into())}else{Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})};
+            drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:old,result}));
+            assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.pane_close_batch_for(card),current);
+            assert_eq!(app.queued_card_closes.len(),queued);assert!(app.local_terminal_unavailable_notice(card).is_none());
+            assert!(app.workspace.card(card).is_some());assert!(app.workspace.card(other).is_some());
+            assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+        }
+    }
+
+    #[test]
     fn old_absence_cannot_offer_or_hide_a_fresh_start_without_confirmed_worker_metadata() {
         let (mut app,card,target)=local_dismissal_fixture();
         let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
         // A new successful startup may publish the same ended descriptor before
         // optional worker metadata arrives; its presentation generation differs.
         drop(app.terminal_local_presentation_started(card));
-        drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        drop(app.completed_terminal_closed(card,source,None,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
         assert!(app.local_terminal_unavailable_notice(card).is_none());
         drop(app.dismiss_terminal_locally(target));
         assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));

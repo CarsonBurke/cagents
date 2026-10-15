@@ -4128,6 +4128,7 @@ pub enum Message {
     CompletedTerminalClosed {
         card: CardId,
         session: TerminalSession,
+        batch:Option<uuid::Uuid>,
         result: Result<terminal_close::CompletedCloseOutcome, String>,
     },
     SaveAndCloseRepository(CardId),
@@ -4414,6 +4415,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
+    batch:Option<uuid::Uuid>,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -11905,6 +11907,7 @@ impl Cagents {
         let restore_card = self.workspace.focused();
         let focused = self.primary_dirty_close_control(card);
         self.dirty_repository_close = Some(DirtyRepositoryClose {
+            batch:if matches!(intent,DirtyCloseIntent::Card(_)){self.pane_close_batch_for(card)}else{None},
             card,
             remaining: cards,
             intent,
@@ -11928,6 +11931,7 @@ impl Cagents {
         let Some(mut close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
+        if !self.pane_close_batch_current(close.batch) {return Task::none();}
         // Every close resolution is revalidated at this boundary. In
         // particular, discarding an editor buffer cannot clear an unresolved
         // post-persist durability warning, and no stale control message may
@@ -11969,10 +11973,7 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
-        if self.project_recovery_ui.closing_panes {
-            self.queued_card_closes.clear();
-            self.project_recovery_ui.closing_panes = false;
-        }
+        self.stop_pane_close_batch(close.batch);
         if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
             self.chrome_ui.closing_group.clear();
         }
@@ -13183,6 +13184,11 @@ impl Application for Cagents {
             },
             message => message,
         };
+        if matches!(&message,Message::SaveAndCloseRepository(_)|Message::OverwriteAndCloseRepository(_)|Message::DiscardAndCloseRepository(_))
+            && self.dirty_repository_close.as_ref().is_some_and(|close|!self.pane_close_batch_current(close.batch)) {
+            self.status=Some(TransientNotice::warning("The Close panes selection changed. Cancel this old dialog before choosing a new action."));
+            return Task::none();
+        }
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -15100,8 +15106,9 @@ impl Application for Cagents {
             Message::CompletedTerminalClosed {
                 card,
                 session,
+                batch,
                 result,
-            } => self.completed_terminal_closed(card, session, result),
+            } => self.completed_terminal_closed(card, session, batch, result),
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
@@ -18739,6 +18746,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
+            batch:None,
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -20706,6 +20714,25 @@ mod tests {
     }
 
     #[test]
+    fn revoked_project_batch_dirty_actions_preserve_buffer_and_new_batch() {
+        let (mut app,card)=editing_repository_app();
+        drop(app.close_cards_in_order(vec![card]));
+        drop(app.begin_dirty_close(DirtyCloseIntent::Card(card),VecDeque::from([card])));
+        let old=app.dirty_repository_close.as_ref().unwrap().batch;
+        drop(app.close_cards_in_order(vec![card]));let current=app.pane_close_batch_for(card);
+        assert_ne!(old,current);
+        for message in [Message::SaveAndCloseRepository(card),Message::OverwriteAndCloseRepository(card),Message::DiscardAndCloseRepository(card)] {
+            drop(app.update(message));
+            let CardRuntime::Repository(runtime)=app.cards.get(&card).unwrap()else{panic!()};
+            assert!(runtime.blocks_navigation());assert!(!runtime.is_saving());
+            assert!(app.card_state(card).unwrap().existence.is_open());assert_eq!(app.pane_close_batch_for(card),current);
+        }
+        drop(app.cancel_dirty_close());
+        assert!(app.pane_close_batch_current(current),"old dirty-dialog cancellation must not revoke a later batch");
+        assert!(app.dirty_repository_close.is_none());
+    }
+
+    #[test]
     fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -20713,6 +20740,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            batch:None,
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -20776,6 +20804,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            batch:None,
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),

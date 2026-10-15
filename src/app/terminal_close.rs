@@ -18,6 +18,8 @@ pub(super) struct Bindings {
     adoptions: HashMap<CardId, (uuid::Uuid, HostSessionProof, uuid::Uuid, HostSessionProof)>,
     removals: HashMap<CardId, CapturedTerminal>,
     local: local_presentation::State,
+    batch:Option<uuid::Uuid>,
+    selected:HashMap<CardId,uuid::Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,7 @@ pub(super) struct CloseIntent {
     pub proof: HostSessionProof,
     completed_source: Option<TerminalSession>,
     captured: Option<CapturedTerminal>,
+    batch:Option<uuid::Uuid>,
     pub generation: u64,
     pub restore_card: Option<CardId>,
     pub pending: bool,
@@ -67,6 +70,7 @@ pub enum CompletedCloseOutcome {
 
 #[derive(Debug, Clone)]
 pub struct QueuedCardClose {
+    batch:Option<uuid::Uuid>,
     card: CardId,
     unasked: bool,
     kind: Option<CardKind>,
@@ -244,13 +248,33 @@ impl Cagents {
     }
 
     fn terminal_close_binding_current(&self, intent: &CloseIntent) -> bool {
-        same_captured(intent.captured.as_ref(),self.terminal_close_bindings.bound.get(&intent.card))
+        self.pane_close_decision_current(intent.card,intent.batch) && same_captured(intent.captured.as_ref(),self.terminal_close_bindings.bound.get(&intent.card))
             && self.surface_close_binding_current(intent.card,intent.captured.as_ref())
     }
 
+    pub(super) fn pane_close_batch_current(&self,batch:Option<uuid::Uuid>)->bool {
+        batch.is_none_or(|batch|self.project_recovery_ui.closing_panes&&self.terminal_close_bindings.batch==Some(batch))
+    }
+    pub(super) fn pane_close_batch_for(&self,card:CardId)->Option<uuid::Uuid> {
+        self.terminal_close_bindings.selected.get(&card).copied().filter(|batch|self.pane_close_batch_current(Some(*batch)))
+    }
+    fn pane_close_decision_current(&self,card:CardId,batch:Option<uuid::Uuid>)->bool {
+        self.pane_close_batch_current(batch) && batch.is_none_or(|batch|self.terminal_close_bindings.selected.get(&card)==Some(&batch))
+    }
+    /// Revoke only this batch. Independent direct/login closes have no token.
+    pub(super) fn stop_pane_close_batch(&mut self,batch:Option<uuid::Uuid>)->bool {
+        let Some(batch)=batch.filter(|batch|self.pane_close_batch_current(Some(*batch))) else{return false;};
+        let remaining=self.terminal_close_bindings.selected.values().filter(|selected|**selected==batch).count()>1 || self.queued_card_closes.iter().any(|queued|queued.batch==Some(batch));
+        self.queued_card_closes.retain(|queued|queued.batch!=Some(batch));
+        self.terminal_close_bindings.selected.retain(|_,selected|*selected!=batch);
+        self.terminal_close_bindings.batch=None;
+        self.project_recovery_ui.closing_panes=false;
+        remaining
+    }
     fn queued_card_close(&mut self, card: CardId, unasked: bool) -> QueuedCardClose {
         self.capture_terminal_close_binding(card, false);
         QueuedCardClose {
+            batch:self.pane_close_batch_for(card),
             card,
             unasked,
             kind: self.card_state(card).map(|state| state.kind.clone()),
@@ -259,6 +283,11 @@ impl Cagents {
     }
 
     pub(super) fn close_cards_in_order(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        let previous=self.terminal_close_bindings.batch;
+        self.stop_pane_close_batch(previous);
+        let batch=uuid::Uuid::new_v4();
+        self.terminal_close_bindings.batch=Some(batch);
+        self.terminal_close_bindings.selected=cards.iter().copied().map(|card|(card,batch)).collect();
         self.project_recovery_ui.closing_panes = true;
         let selected = cards
             .into_iter()
@@ -269,7 +298,10 @@ impl Cagents {
     }
 
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
+        let open=self.durable.cards.iter().filter(|card|card.existence.is_open()).map(|card|card.id).collect::<HashSet<_>>();
+        self.terminal_close_bindings.selected.retain(|card,_|open.contains(card));
         while let Some(queued) = self.queued_card_closes.pop_front() {
+            if !self.pane_close_batch_current(queued.batch) {continue;}
             if self
                 .card_state(queued.card)
                 .is_some_and(|state| state.existence.is_open())
@@ -277,11 +309,16 @@ impl Cagents {
                 return cosmic::task::message(Message::CloseQueuedCard(queued));
             }
         }
-        self.project_recovery_ui.closing_panes = false;
+
+        if self.terminal_close_bindings.selected.is_empty() {
+            self.project_recovery_ui.closing_panes=false;
+            self.terminal_close_bindings.batch=None;
+        }
         Task::none()
     }
 
     pub(super) fn resolve_queued_card_close(&mut self, queued: QueuedCardClose) -> Option<Message> {
+        if !self.pane_close_decision_current(queued.card,queued.batch) {return None;}
         self.capture_terminal_close_binding(queued.card, false);
         let current = self
             .card_state(queued.card)
@@ -311,8 +348,7 @@ impl Cagents {
             || self.terminal_start_in_flight(queued.card)
             || self.chat_start_pending(queued.card)
         {
-            self.queued_card_closes.clear();
-            self.project_recovery_ui.closing_panes = false;
+            self.stop_pane_close_batch(queued.batch);
             self.status = Some(TransientNotice::warning(
                 "A selected pane changed while Close panes was waiting. Its new session was preserved; select Close again.",
             ));
@@ -403,6 +439,7 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        let batch=self.pane_close_batch_for(card);
         if self.terminal_start_in_flight(card)
             || (matches!(
                 self.card_state(card).map(|state| &state.kind),
@@ -412,10 +449,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(
                 "This pane still has a session handoff or startup in progress. Wait for its identity before closing it.",
             ));
-            if self.project_recovery_ui.closing_panes {
-                self.queued_card_closes.clear();
-                self.project_recovery_ui.closing_panes = false;
-            }
+            self.stop_pane_close_batch(batch);
             return Task::none();
         }
         self.capture_terminal_close_binding(card, false);
@@ -446,6 +480,7 @@ impl Cagents {
                 Message::CompletedTerminalClosed {
                     card,
                     session,
+                    batch,
                     result,
                 }
             });
@@ -488,6 +523,7 @@ impl Cagents {
                 proof,
                 completed_source: None,
                 captured,
+                batch,
                 generation: 0,
                 restore_card: self.workspace.focused(),
                 pending: false,
@@ -512,13 +548,16 @@ impl Cagents {
         &mut self,
         card: CardId,
         session: TerminalSession,
+        batch:Option<uuid::Uuid>,
         result: Result<CompletedCloseOutcome, String>,
     ) -> Task<Message> {
         self.terminal_close_attempts.remove(&session.id);
+        if !self.pane_close_decision_current(card,batch) {return Task::none();}
         if !self.card_state(card).is_some_and(|state| {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
         }) {
+            self.stop_pane_close_batch(batch);
             return Task::none();
         }
         let mut captured = self.terminal_close_bindings.bound.get(&card).cloned();
@@ -530,6 +569,7 @@ impl Cagents {
                 if captured.as_ref().is_none_or(|current| {
                     current.execution_instance != execution_instance || current.proof != proof
                 }) {
+                    self.stop_pane_close_batch(batch);
                     return Task::none();
                 }
                 Ok(CompletedCloseOutcome::Closed)
@@ -542,6 +582,7 @@ impl Cagents {
                 if captured.as_ref().is_none_or(|current| {
                     current.execution_instance != execution_instance || current.proof != proof
                 }) {
+                    self.stop_pane_close_batch(batch);
                     return Task::none();
                 }
                 captured = Some(CapturedTerminal {
@@ -560,6 +601,7 @@ impl Cagents {
                     .map(|current| (current.execution_instance, current.proof.clone()))
                     != expected_worker
                 {
+                    self.stop_pane_close_batch(batch);
                     return Task::none();
                 }
                 // Absence grants only an explicit, revision-bound local
@@ -568,11 +610,7 @@ impl Cagents {
                 // This pane was retained, so the batch has not completed.
                 // Discard its remaining intents instead of letting a later,
                 // unrelated successful close silently resume the old batch.
-                let remaining=self.project_recovery_ui.closing_panes && !self.queued_card_closes.is_empty();
-                if self.project_recovery_ui.closing_panes {
-                    self.queued_card_closes.clear();
-                    self.project_recovery_ui.closing_panes=false;
-                }
+                let remaining=self.stop_pane_close_batch(batch);
                 let message=if offered {
                     "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved."
                 } else {
@@ -602,6 +640,7 @@ impl Cagents {
                     proof,
                     completed_source: Some(session),
                     captured,
+                    batch,
                     generation: 0,
                     restore_card: self.workspace.focused(),
                     restore_keyboard_nav: self.core.keyboard_nav(),
@@ -615,6 +654,7 @@ impl Cagents {
                 close_focus(1)
             }
             Err(error) => {
+                self.stop_pane_close_batch(batch);
                 self.status = Some(TransientNotice::error(format!(
                     "Could not release the completed terminal: {error}. Its card is retained; retry Close."
                 )));
@@ -817,10 +857,7 @@ impl Cagents {
         let Some(intent) = self.terminal_close.take() else {
             return Task::none();
         };
-        if self.project_recovery_ui.closing_panes {
-            self.queued_card_closes.clear();
-            self.project_recovery_ui.closing_panes = false;
-        }
+        self.stop_pane_close_batch(intent.batch);
         // Dismissing a report ends the attempt it reported on. The fence
         // exists so one intent cannot submit two concurrent requests and so
         // no automatic path retries a request whose fate is unknown; it is
@@ -1238,6 +1275,40 @@ mod tests {
     }
 
     #[test]
+    fn emitted_batch_decisions_are_revoked_on_stop_and_replacement() {
+        for replace in [false,true] {
+            let (mut app,card,_)=bound_fixture();
+            let Message::CloseQueuedCard(held)=super::super::tests::task_app_message(app.close_cards_in_order(vec![card]))else{panic!()};
+            let token=held.batch;
+            let fresh=if replace {Some(super::super::tests::task_app_message(app.close_cards_in_order(vec![card])))}else{app.stop_pane_close_batch(token);None};
+            assert!(app.resolve_queued_card_close(held).is_none());
+            assert!(app.card_state(card).unwrap().existence.is_open());assert!(app.terminal_close.is_none());
+            if let Some(Message::CloseQueuedCard(fresh))=fresh {
+                assert_ne!(fresh.batch,token);
+                assert!(matches!(app.resolve_queued_card_close(fresh),Some(Message::CloseCard(id))if id==card));
+            }else{assert!(!app.project_recovery_ui.closing_panes);}
+        }
+    }
+    #[test]
+    fn revoked_batch_dialog_cannot_persist_optout_or_submit_close_for_same_worker() {
+        let (mut app,card,_)=bound_fixture();
+        drop(app.close_cards_in_order(vec![card]));
+        drop(app.begin_card_close(card));
+        let intent=app.terminal_close.as_ref().unwrap().clone();
+        drop(app.terminal_close_finished(card,intent.terminal,intent.proof.clone(),intent.generation,CloseOutcome::Active));
+        app.terminal_close.as_mut().unwrap().dont_ask_again=true;
+        let preference=app.settings.confirm_terminal_close;
+        drop(app.close_cards_in_order(vec![card]));
+        assert!(!app.terminal_close_binding_current(app.terminal_close.as_ref().unwrap()));
+        drop(app.confirm_terminal_close());
+        assert_eq!(app.settings.confirm_terminal_close,preference);
+        assert!(!app.terminal_close.as_ref().unwrap().pending);assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
+        assert!(app.card_state(card).unwrap().existence.is_open());assert!(!app.closed_terminal_cards.contains(&card));
+        let current=app.pane_close_batch_for(card);assert_ne!(current,intent.batch);
+        drop(app.cancel_terminal_close());assert!(app.pane_close_batch_current(current),"cancelling old dialog must not revoke replacement batch");
+    }
+
+    #[test]
     fn close_consent_keeps_original_worker_when_identical_source_is_replaced_before_confirmation() {
         let (mut app, card, captured) = bound_fixture();
         let _ = app.begin_card_close(card);
@@ -1323,7 +1394,7 @@ mod tests {
             let mut replacement = captured;
             replacement.execution_instance = uuid::Uuid::new_v4();
             app.terminal_close_bindings.bound.insert(card, replacement);
-            let _ = app.completed_terminal_closed(card, ended, Ok(outcome));
+            let _ = app.completed_terminal_closed(card, ended, None, Ok(outcome));
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(!app.closed_terminal_cards.contains(&card));
         }
@@ -1463,6 +1534,7 @@ mod tests {
         let _ = app.completed_terminal_closed(
             card,
             ended,
+            None,
             Ok(CompletedCloseOutcome::Absent {
                 expected_worker: Some((captured.execution_instance, captured.proof)),
                 presentation:None,
@@ -1572,6 +1644,7 @@ mod tests {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.terminal_close_pending(card));
         let _ = app.update(Message::CompletedTerminalClosed {
+            batch:None,
             card,
             session: source.clone(),
             result: Err("holder unavailable".into()),
@@ -1584,6 +1657,7 @@ mod tests {
         };
         session.id = TerminalId::new();
         let _ = app.update(Message::CompletedTerminalClosed {
+            batch:None,
             card,
             session: source,
             result: Ok(CompletedCloseOutcome::Closed),
@@ -1615,6 +1689,7 @@ mod tests {
         };
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            batch:None,
             card,
             session: source.clone(),
             result: Ok(CompletedCloseOutcome::Active(proof.clone())),
@@ -1667,6 +1742,7 @@ mod tests {
         // holds the shell's traversal aside.
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            batch:None,
             card,
             session: source,
             result: Ok(CompletedCloseOutcome::Active(proof)),
@@ -1710,6 +1786,7 @@ mod tests {
         let source = session.clone();
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            batch:None,
             card,
             session: source,
             result: Ok(CompletedCloseOutcome::Active(proof)),
