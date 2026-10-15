@@ -4822,6 +4822,17 @@ mod tests {
             session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive};
         let expected=crate::terminal_ipc::ServerEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:Some(1),proof,
             message:crate::terminal_ipc::ServerMessage::Response {response:crate::terminal_ipc::ServerResponse::Automation(crate::automations::Response::ArchiveReport(Box::new(report)))}};
+        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&issued).unwrap();
+        for operation in [crate::automations::Request::ArchiveReportSource {identity,card:crate::model::CardId::from_uuid(agent.id.as_uuid()),descriptor:descriptor.clone()},
+            crate::automations::Request::ReadArchiveReport {reference:issued.archive_report.clone().unwrap(),descriptor:descriptor.clone()}] {
+            let client=crate::terminal_ipc::ClientEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:1,proof:None,
+                request:crate::terminal_ipc::ClientRequest::Automation {authority:Default::default(),operation}};
+            let mut request=Vec::new();crate::terminal_ipc::write_frame(&mut request,&client).unwrap();
+            assert!(request.len()<crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES);
+            let decoded:crate::terminal_ipc::ClientEnvelope=crate::terminal_ipc::read_frame_with_limit(&mut std::io::Cursor::new(request),crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES).unwrap().unwrap();
+            assert_eq!(decoded,client);
+        }
+        assert!(postcard::to_stdvec(&issued).unwrap().len()>crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES,"the descriptor request must not embed the native recipe");
         let mut frame=Vec::new();
         crate::terminal_ipc::write_frame(&mut frame,&expected).unwrap();
         assert!(frame.len()<crate::terminal_ipc::MAX_FRAME_BYTES);
@@ -4845,12 +4856,18 @@ mod tests {
         let Some(crate::agent_execution::HostedSession::Chat(mut native))=agent.session.clone() else{unreachable!()};
         native.terminal=agent.console.clone();
         let report=registry.archive_report_source(model.identity,original.id,&native).unwrap().unwrap();
+        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&native).unwrap();
+        assert_eq!(registry.archive_report_source_descriptor(model.identity,original.id,&descriptor).unwrap(),Some(report.clone()));
         assert_eq!(report.reference.source_operation,source_operation);
         assert_eq!(report.reference.agent,agent.id);
         assert_eq!(report.source_revision,revision);
         assert_eq!(report.scope,scope);
         let mut presented=native.clone();presented.archive_report=Some(report.reference.clone());
         assert!(crate::automations::archive::ArchivedPaneReadiness::qualify_report(&report,&presented).is_ok());
+        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&presented).unwrap();
+        assert_eq!(registry.read_archive_report_descriptor(&report.reference,&descriptor).unwrap(),report);
+        let mut different=descriptor.clone();different.digest[0]^=1;
+        assert!(registry.read_archive_report_descriptor(&report.reference,&different).is_err());
         let new_id=crate::model::CardId::new();
         assert_ne!(new_id,original.id);
         let pane=crate::workspace_model::views::Pane {id:new_id,kind:crate::model::CardKind::Chat(presented.clone()),scope:report.presentation_scope.clone(),..original.clone()};
@@ -4864,6 +4881,16 @@ mod tests {
         assert!(view.retired.contains(&original.id));
         assert!(!view.panes.iter().any(|pane|pane.id==original.id));
         assert_eq!(view.panes,vec![pane.clone()]);
+        let mut plain=presented.clone();plain.archive_report=None;
+        let mut fresh=plain.clone();fresh.id=crate::model::TerminalId::new();fresh.proof=None;fresh.terminal=None;fresh.launch.session_id=None;
+        let forged_before=crate::workspace_model::views::Pane {kind:crate::model::CardKind::Chat(plain),..pane.clone()};
+        let desired=crate::workspace_model::views::Pane {kind:crate::model::CardKind::Chat(fresh),..pane.clone()};
+        let forged=Change::Update {before:forged_before,pane:desired};
+        assert!(view.clone().apply(&forged).is_err(),"actual current report identity fences a forged ordinary source basis");
+        assert!(registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:view.revision,operation:Uuid::new_v4(),change:forged}).is_err());
+        assert_eq!(registry.model().unwrap().views.iter().find(|view|view.scope==scope).unwrap().panes,vec![pane.clone()]);
+        let mut titled=pane.clone();titled.title="A safe presentation title".into();
+        assert!(view.clone().apply(&Change::Update {before:pane.clone(),pane:titled}).unwrap(),"presentation metadata remains editable");
         assert_eq!(registry.agent(agent.id).unwrap(),agent);
         assert_eq!(registry.latest_agent_run(agent.id).unwrap(),old_run);
         assert_eq!(serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap()).unwrap(),old_snapshot);
@@ -4894,6 +4921,47 @@ mod tests {
         let view=registry.model().unwrap().views.into_iter().find(|view|view.scope==scope).unwrap();
         assert!(view.retired.contains(&original.id)&&view.retired.contains(&new_id));
         assert!(view.panes.is_empty());
+    }
+
+    #[test]
+    fn one_hundred_report_presentations_share_native_bodies_and_ttl_retires_only_their_receipts() {
+        use crate::workspace_model::views::Change;
+        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
+        let model=registry.model().unwrap();
+        let operation=Uuid::new_v4();
+        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:model.views[0].revision,operation,
+            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(mut session))=agent.session.clone() else{unreachable!()};session.terminal=agent.console.clone();
+        let report=registry.archive_report_source(model.identity,original.id,&session).unwrap().unwrap();
+        session.archive_report=Some(report.reference.clone());
+        let original_run=registry.latest_agent_run(agent.id).unwrap();
+        let mut panes=Vec::new();
+        for ordinal in 0..100 {
+            let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
+            let pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:format!("Report {ordinal}"),scope:report.presentation_scope.clone(),kind:crate::model::CardKind::Chat(session.clone()),..original.clone()};
+            registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),
+                change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}}).unwrap();
+            panes.push(pane);
+        }
+        assert_eq!(registry.model().unwrap().views.iter().find(|view|view.scope==scope).unwrap().panes.len(),100);
+        for pane in panes {
+            let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
+            registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),
+                change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:pane.clone()}}).unwrap();
+            let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&session).unwrap();
+            let reread=registry.archive_report_source_descriptor(model.identity,pane.id,&descriptor).unwrap().unwrap();
+            assert_eq!(reread.reference.agent,agent.id);
+        }
+        let (bodies,receipts,bytes):(u64,u64,u64)=registry.db.query_row("SELECT (SELECT count(*) FROM automation_report_descriptors),receipts,receipt_bytes FROM automation_report_usage WHERE key=0",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(bodies,2,"one original console and one normalized read-only Chat body, independent of title/new-card/ref changes");
+        assert_eq!(receipts,101);
+        assert!(bytes<256*1024,"one hundred ordinary End receipts are tiny metadata, not copied native recipes");
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),original_run);
+        assert_eq!(registry.agent(agent.id).unwrap(),agent);
+        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1",[agent.id.to_string()]).unwrap();
+        assert_eq!(registry.db.query_row("SELECT descriptors,receipts,receipt_bytes FROM automation_report_usage WHERE key=0",[],|row|Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?,row.get::<_,u64>(2)?))).unwrap(),(0,0,0));
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),original_run);
+        assert_eq!(registry.agent(agent.id).unwrap(),agent);
     }
 
     #[test]
@@ -5704,7 +5772,7 @@ mod tests {
         // Simulate an older store lacking the new cleanup authority table.
         registry
             .db
-            .execute_batch("DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;")
+            .execute_batch("DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; DROP TABLE IF EXISTS automation_report_descriptors; DROP TABLE IF EXISTS automation_report_usage; PRAGMA user_version=12;")
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

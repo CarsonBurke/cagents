@@ -5138,7 +5138,7 @@ impl Cagents {
                     let socket=crate::terminal::ipc::daemon_socket_path().map_err(|error|error.to_string())?;
                     let mut client=crate::control::ControlClient::connect(&socket).map_err(|error|error.to_string())?;
                     match client.automation(crate::agent_execution::Authority::default(),
-                        crate::automations::Request::ReadArchiveReport {reference,session}).map_err(|error|error.to_string())? {
+                        crate::automations::Request::ReadArchiveReport {reference,descriptor:crate::automations::ArchiveReportDescriptor::from_session(&session)?}).map_err(|error|error.to_string())? {
                         crate::automations::Response::ArchiveReport(report)=>Ok(*report),
                         _=>Err("The saved report returned no private presentation receipt".into()),
                     }

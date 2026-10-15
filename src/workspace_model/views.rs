@@ -369,8 +369,9 @@ impl View {
             }
             Change::Update { before, pane } => {
                 let report=|kind:&CardKind|matches!(kind,CardKind::Chat(session) if session.archive_report.is_some());
-                if report(&before.kind) || report(&pane.kind) {
-                    if !matches!((&before.kind,&pane.kind),(CardKind::Chat(a),CardKind::Chat(b)) if a==b) {
+                let current=self.panes.iter().find(|current|current.id==before.id);
+                if report(&before.kind) || report(&pane.kind) || current.is_some_and(|current|report(&current.kind)) {
+                    if !current.is_some_and(|current|current.kind==before.kind && current.kind==pane.kind) {
                         return Err("The saved report presentation cannot become an executable descriptor".into());
                     }
                 }

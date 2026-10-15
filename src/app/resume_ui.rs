@@ -37,6 +37,7 @@ pub(super) struct State {
     /// Whether a chosen conversation is being prepared to resume.
     pub(super) loading: bool,
     report_query: Option<ReportQuery>,
+    report_restore_nonce: Option<uuid::Uuid>,
     deferred_report: Option<(u64, uuid::Uuid, SavedConversation, Arc<Result<Option<crate::automations::ArchiveReport>,String>>)> ,
     pub(super) error: Option<String>,
     limit: usize,
@@ -55,6 +56,17 @@ struct ReportQuery {
     card: CardId,
     session: chat::Session,
     picker: bool,
+}
+
+/// A qualified report travels with destination preparation. It never becomes
+/// an ordinary Resume intent, which would reset the provider identity.
+pub(in crate::app) struct ReportRestore {
+    nonce: uuid::Uuid,
+    generation: u64,
+    registry: uuid::Uuid,
+    picker_origin: bool,
+    entry: SavedConversation,
+    report: crate::automations::ArchiveReport,
 }
 
 /// A conversation as the picker lists it.
@@ -467,6 +479,7 @@ impl Cagents {
         state.error = None;
         state.loading = false;
         state.report_query = None;
+        state.report_restore_nonce = None;
         state.deferred_report = None;
         state.indexing = Some((0, 0));
         state.limit = PAGE;
@@ -898,14 +911,16 @@ impl Cagents {
         let generation=self.resume_ui.generation;
         let nonce=uuid::Uuid::new_v4();
         self.resume_ui.deferred_report=None;
+        self.resume_ui.report_restore_nonce=None;
         self.resume_ui.report_query=Some(ReportQuery {nonce,registry:identity,card:entry.card,session:entry.session.clone(),picker:self.resume_ui.open});
         self.resume_ui.loading=true;
         cosmic::task::future(async move {
-            let request=crate::automations::Request::ArchiveReportSource {identity,card:entry.card,session:entry.session.clone()};
+            let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&entry.session);
+            let request=descriptor.map(|descriptor|crate::automations::Request::ArchiveReportSource {identity,card:entry.card,descriptor});
             let result=tokio::task::spawn_blocking(move|| {
                 let socket=crate::terminal::ipc::daemon_socket_path().map_err(|error|error.to_string())?;
                 let mut client=crate::control::ControlClient::connect(&socket).map_err(|error|error.to_string())?;
-                match client.automation(crate::agent_execution::Authority::default(),request).map_err(|error|error.to_string())? {
+                match client.automation(crate::agent_execution::Authority::default(),request?).map_err(|error|error.to_string())? {
                     crate::automations::Response::ArchiveReportSource(report)=>Ok(report.map(|report|*report)),
                     _=>Err("The saved conversation returned no report-source receipt".into()),
                 }
@@ -921,32 +936,78 @@ impl Cagents {
             self.resume_error("The saved report's private source changed. No provider was resumed.");
             return Task::none();
         }
-        if self.existing_conversation_card(&issued).is_some() {
-            return self.resume_saved_conversation(SavedConversation {session:issued,..entry});
-        }
-        // Reopening creates only a new presentation. The old CardId/native
-        // process/proof and permanent close tombstones are never replaced.
-        let selected=match &report.scope {
+        let restore=ReportRestore {nonce:uuid::Uuid::new_v4(),generation:self.resume_ui.generation,
+            registry:self.workspace_model.identity,picker_origin:self.resume_ui.open,entry,report};
+        // Hand off only our own picker. The captured intent survives in the
+        // selection receipt; another modal cannot be closed by this path.
+        if restore.picker_origin {self.close_resume();}
+        self.resume_ui.report_restore_nonce=Some(restore.nonce);
+        let selected=match &restore.report.scope {
             crate::agent_execution::Placement::Channel(channel)=> {
                 if !self.durable.channels.iter().any(|current|current.id==*channel && current.shared)
                     || self.workspace_model.channel(*channel).is_none() {
-                    self.resume_error("Open the saved report's original project and channel before reopening it.");return Task::none();
+                    self.resume_error("Open the saved report's original project and channel before reopening it.");
+                    return self.abandon_archive_report_restore(restore);
                 }
                 self.select_channel(*channel)
             }
             crate::agent_execution::Placement::Worktree{path,..}=> {
-                if self.worktree_view_scope(path).as_ref()!=Some(&report.scope) {
-                    self.resume_error("Open the saved report's original project before reopening it.");return Task::none();
+                if self.worktree_view_scope(path).as_ref()!=Some(&restore.report.scope) {
+                    self.resume_error("Open the saved report's original project before reopening it.");
+                    return self.abandon_archive_report_restore(restore);
                 }
                 self.select_worktree(path.clone(),false)
             }
         };
-        let session=issued;
-        self.close_resume();
-        let Some((_card,inserted))=self.insert_archive_report_card(session,&report,entry.title) else{return selected;};
-        self.recently_closed.retain(|(closed,_)|closed.id!=entry.card);
+        // The legacy synchronous provider can refuse selection. Do not insert
+        // into the old channel/strip merely because a selection was requested.
+        // The protected asynchronous provider carries this typed intent and
+        // invokes finish only after its exact scope/lease receipt commits.
+        let after=self.finish_archive_report_restore(restore);
+        Task::batch([selected,after])
+    }
+
+    pub(in crate::app) fn archive_report_restore_is_current(&self,restore:&ReportRestore)->bool {
+        let mut issued=restore.entry.session.clone();issued.archive_report=Some(restore.report.reference.clone());
+        self.resume_ui.report_restore_nonce==Some(restore.nonce)
+            && self.resume_ui.generation==restore.generation
+            && self.workspace_model.identity==restore.registry
+            && restore.report.reference.registry==restore.registry
+            && crate::automations::archive::ArchivedPaneReadiness::qualify_report(&restore.report,&issued).is_ok()
+    }
+
+    fn archive_report_destination_selected(&self,restore:&ReportRestore)->bool {
+        match &restore.report.scope {
+            crate::agent_execution::Placement::Channel(channel)=>self.durable.active_channel==Some(*channel),
+            crate::agent_execution::Placement::Worktree{path,..}=>self.durable.active_channel.is_none()
+                && self.active_workspace.as_ref()==Some(path),
+        }
+    }
+
+    pub(in crate::app) fn abandon_archive_report_restore(&mut self,restore:ReportRestore)->Task<Message> {
+        if self.resume_ui.report_restore_nonce==Some(restore.nonce) {self.resume_ui.report_restore_nonce=None;}
+        Task::none()
+    }
+
+    pub(in crate::app) fn finish_archive_report_restore(&mut self,restore:ReportRestore)->Task<Message> {
+        if !self.archive_report_restore_is_current(&restore)
+            || self.update_prepared || self.modal_is_open()
+            || !self.archive_report_destination_selected(&restore) {
+            return self.abandon_archive_report_restore(restore);
+        }
+        self.resume_ui.report_restore_nonce=None;
+        let mut issued=restore.entry.session.clone();issued.archive_report=Some(restore.report.reference.clone());
+        if let Some(card)=self.existing_conversation_card(&issued) {
+            // Reuse only a pane actually in the now-committed destination.
+            // A separately moved report must be reached through its own scope.
+            return if self.workspace.card(card).is_some() {
+                cosmic::task::message(Message::FocusCard(card))
+            } else {Task::none()};
+        }
+        let Some((_card,inserted))=self.insert_archive_report_card(issued,&restore.report,restore.entry.title) else{return Task::none();};
+        self.recently_closed.retain(|(closed,_)|closed.id!=restore.entry.card);
         self.persist();
-        Task::batch([selected,inserted])
+        inserted
     }
 
     fn saved_conversation_is_automation_report(&self, entry: &SavedConversation) -> bool {
@@ -1009,6 +1070,7 @@ impl Cagents {
         state.open = false;
         state.indexing = None;
         state.report_query = None;
+        state.report_restore_nonce = None;
         state.deferred_report = None;
         state.replace = None;
         state.cancel.store(true, Ordering::Relaxed);
@@ -1294,6 +1356,32 @@ mod tests {
         assert_eq!(runtime.session.proof,original.proof);
         assert!(app.terminal_starts.lock().unwrap().is_empty());
         assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn a_report_continuation_cannot_insert_into_the_old_scope_or_outlive_its_request() {
+        for scenario in 0..4 {
+            let (mut app,card,agent,archive)=crate::app::chat_ui::qualified_closed_console_archive_for_test();
+            let CardKind::Chat(session)=app.card_state(card).unwrap().kind.clone() else{unreachable!()};
+            let reference=chat::ArchiveReportReference {format:1,registry:app.workspace_model.identity,agent,source_operation:uuid::Uuid::new_v4()};
+            let mut issued=session.clone();issued.archive_report=Some(reference.clone());
+            let report=crate::automations::ArchiveReport {reference,scope:app.workspace_model.views[0].scope.clone(),source_revision:1,
+                presentation_scope:Some(session.launch.recipe.working_directory.clone()),session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive:(*archive).clone()};
+            let nonce=uuid::Uuid::new_v4();app.resume_ui.report_restore_nonce=Some(nonce);
+            let restore=ReportRestore {nonce,generation:app.resume_ui.generation,registry:app.workspace_model.identity,picker_origin:false,
+                entry:SavedConversation {card,title:"Report".into(),session,open:false,updated_at_unix_ms:1},report};
+            match scenario {
+                0=>Arc::make_mut(&mut app.durable).active_channel=Some(ChannelId::new()),
+                1=>app.resume_ui.report_restore_nonce=Some(uuid::Uuid::new_v4()),
+                2=>app.workspace_model.identity=uuid::Uuid::new_v4(),
+                _=>app.update_prepared=true,
+            }
+            let cards=app.durable.cards.clone();let order=app.workspace.order().collect::<Vec<_>>();
+            drop(app.finish_archive_report_restore(restore));
+            assert_eq!(app.durable.cards,cards);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(),order);
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

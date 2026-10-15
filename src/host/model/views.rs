@@ -259,10 +259,12 @@ pub(super) fn apply(
                     }
                     view.apply(change)?
                 }
-                Change::Update {before,pane} if (
-                    matches!(&before.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some())
-                    || matches!(&pane.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some()))
-                    && !matches!((&before.kind,&pane.kind),(crate::model::CardKind::Chat(a),crate::model::CardKind::Chat(b)) if a==b) => {
+                Change::Update {before,pane} if {
+                    let report=|kind:&crate::model::CardKind|matches!(kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some());
+                    let current=view.panes.iter().find(|current|current.id==before.id);
+                    (report(&before.kind)||report(&pane.kind)||current.is_some_and(|current|report(&current.kind)))
+                        && !current.is_some_and(|current|current.kind==before.kind && current.kind==pane.kind)
+                } => {
                     return Err("The saved report presentation identity cannot change".into());
                 }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {

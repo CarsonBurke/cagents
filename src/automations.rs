@@ -111,11 +111,11 @@ pub enum Request {
     ArchiveReportSource {
         identity: Uuid,
         card: crate::model::CardId,
-        session: crate::chat::Session,
+        descriptor: ArchiveReportDescriptor,
     },
     ReadArchiveReport {
         reference: crate::chat::ArchiveReportReference,
-        session: crate::chat::Session,
+        descriptor: ArchiveReportDescriptor,
     },
     ArchivedAgents {
         scope: agent_execution::Placement,
@@ -156,6 +156,21 @@ pub enum Response {
     ArchiveReportSource(Option<Box<ArchiveReport>>),
     ArchiveReport(Box<ArchiveReport>),
     ArchivedAgents(ArchiveAgentPage),
+}
+
+/// The request binds an exact saved descriptor without copying its recipe
+/// into the smaller client frame. The server must find and privately qualify
+/// that exact digest from its closed source; this is never execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReportDescriptor {
+    pub id: crate::model::TerminalId,
+    pub digest: [u8;32],
+    pub reference: Option<crate::chat::ArchiveReportReference>,
+}
+impl ArchiveReportDescriptor {
+    pub fn from_session(session:&crate::chat::Session)->Result<Self,String> {
+        Ok(Self {id:session.id,digest:ArchiveReport::session_digest(session)?,reference:session.archive_report.clone()})
+    }
 }
 
 /// Private bounded history plus the immutable registry-issued removal reference.
