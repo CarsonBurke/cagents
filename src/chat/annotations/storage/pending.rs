@@ -15,7 +15,7 @@ impl Store {
     /// Publish before dispatch. Until acceptance, only an explicit proven
     /// rejection/abandonment or history deletion can retire this durable intent.
     pub(crate) fn prepare_command(&mut self,id:&str,expected_session:Option<&str>,text:&mut PendingText,captures:&mut[PendingAttachment])->Result<PreparedCommand,OriginalError>{
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         if !valid_id(id)||expected_session.is_some_and(|id|!valid_id(id))||captures.len()>32{return Err(OriginalError::TooLarge);}
         let command=PreparedCommand{command_id:id.to_owned(),expected_session:expected_session.map(str::to_owned),text:text.0.attachment.clone(),attachments:captures.iter().map(|capture|capture.attachment.clone()).collect(),settings:None};
         let metadata=postcard::to_stdvec(&command).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
@@ -33,7 +33,7 @@ impl Store {
         Ok(command)
     }
     pub(crate) fn prepared(&self,id:&str)->Result<PreparedCommand,OriginalError>{
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         if !valid_id(id){return Err(OriginalError::TooLarge);}
         let metadata:Option<Vec<u8>>=self.db.query_row("SELECT metadata FROM pending_commands WHERE command_id=?1",[id],|row|row.get(0)).optional().map_err(storage_error)?;
         let metadata=metadata.ok_or_else(||OriginalError::Unavailable("No exact original command intent is retained".into()))?;
@@ -46,8 +46,8 @@ impl Store {
     /// ordered dispatch. A later settings response cannot rewrite this record.
     pub(crate) fn prepared_settings(&mut self,id:&str,settings:&OriginalSettings)->Result<(),OriginalError>{
         if !settings.is_exact(){return Err(OriginalError::Unavailable("The original provider settings are not known exactly".into()));}
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         let transaction=self.db.transaction().map_err(storage_error)?;
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
         let metadata:Vec<u8>=transaction.query_row("SELECT metadata FROM pending_commands WHERE command_id=?1",[id],|row|row.get(0)).map_err(storage_error)?;
         let mut command:PreparedCommand=postcard::from_bytes(&metadata).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         if command.settings.as_ref().is_some_and(|previous|previous!=settings){return Err(OriginalError::Changed);}
@@ -57,7 +57,7 @@ impl Store {
         transaction.commit().map_err(storage_error)
     }
     pub(crate) fn abandon_command(&mut self,id:&str)->Result<(),OriginalError>{
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         self.db.execute("DELETE FROM pending_commands WHERE command_id=?1",[id]).map_err(storage_error)?;
         self.recover_pending().map_err(OriginalError::Unavailable)
     }

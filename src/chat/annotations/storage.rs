@@ -5,7 +5,7 @@ pub(crate) use pending::PreparedCommand;
 use crate::account::scope::LaunchAccountScope;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{fs, os::unix::{ffi::OsStrExt, fs::OpenOptionsExt}, path::{Path, PathBuf}};
+use std::{fs, os::unix::{ffi::OsStrExt, fs::{OpenOptionsExt,MetadataExt}}, path::{Path, PathBuf}};
 
 const CHUNK: usize = 128 * 1024;
 const ID_BYTES: usize = 4096;
@@ -16,6 +16,7 @@ pub(crate) struct Store {
     scope: LaunchAccountScope,
     session:Option<String>,
     directory: PathBuf,
+    namespace:((u64,u64),(u64,u64)),
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pending_text_bytes:std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -48,6 +49,15 @@ fn account_key(scope: &LaunchAccountScope) -> String {
     hash.update(scope.inode.to_le_bytes());
     format!("{:x}", hash.finalize())
 }
+fn reject_revoked(root:&Path,key:&str)->Result<(),String>{
+    let marker=root.join("revoked-accounts").join(key);
+    match fs::symlink_metadata(marker){Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.to_string()),Ok(_)=>Err("Original command authority was explicitly deleted for this physical account".into())}
+}
+fn revoke_account(root:&Path,key:&str)->Result<(),String>{
+    let directory=root.join("revoked-accounts");crate::secure_file::prepare_private_directory(&directory).map_err(|e|e.to_string())?;
+    let path=directory.join(key);let file=fs::OpenOptions::new().write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
+    crate::secure_file::validate_and_privatize_open_file(&path,&file).map_err(|e|e.to_string())?;file.sync_all().map_err(|e|e.to_string())?;fs::File::open(directory).and_then(|file|file.sync_all()).map_err(|e|e.to_string())
+}
 fn installation_root() -> Result<PathBuf, String> {
     crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("conversation-annotations"))
         .ok_or_else(|| "Cannot locate private conversation annotations".into())
@@ -66,7 +76,8 @@ pub(crate) fn purge_session(scope:&LaunchAccountScope,confirmed_session:&str)->R
 }
 fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), String> {
     scope.revalidate()?;
-    let path=root.join(account_key(scope));
+    let key=account_key(scope);revoke_account(root,&key)?;
+    let path=root.join(key);
     crate::secure_file::reject_symlink_components(&path).map_err(|e|e.to_string())?;
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(()),
@@ -93,6 +104,7 @@ fn purge_registered_at(root:&Path,id:&crate::account::AccountId)->Result<Option<
         let entry=entry.map_err(|e|e.to_string())?;let name=entry.file_name();let name=name.to_str().ok_or("Invalid annotation purge association")?;
         if name.len()!=64||!name.bytes().all(|b|b.is_ascii_hexdigit()){return Err("Invalid annotation purge association".into());}
         crate::secure_file::open_existing_private_file(&entry.path()).map_err(|e|e.to_string())?;
+        revoke_account(root,name)?;
         let path=root.join(name);crate::secure_file::reject_symlink_components(&path).map_err(|e|e.to_string())?;
         match fs::symlink_metadata(&path){Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string()),Ok(_)=>{
             crate::secure_file::validate_owned_directory(&path).map_err(|e|e.to_string())?;fs::remove_dir_all(path).map_err(|e|e.to_string())?;removed+=1;
@@ -117,6 +129,14 @@ fn associate_for_purge(root:&Path,scope:&LaunchAccountScope)->Result<(),String>{
 }
 
 impl Store {
+    fn revalidate(&self)->Result<(),String>{
+        self.scope.revalidate()?;
+        let root=self.directory.parent().ok_or("Invalid annotation namespace")?;reject_revoked(root,&account_key(&self.scope))?;
+        let directory=fs::symlink_metadata(&self.directory).map_err(|e|e.to_string())?;
+        let database=fs::symlink_metadata(self.directory.join("annotations.sqlite")).map_err(|e|e.to_string())?;
+        if !directory.is_dir() || !database.is_file() || directory.uid()!=unsafe{libc::geteuid()} || database.uid()!=unsafe{libc::geteuid()} || directory.mode()&0o077!=0 || database.mode()&0o077!=0 || ((directory.dev(),directory.ino()),(database.dev(),database.ino()))!=self.namespace{return Err("Original command namespace was deleted or replaced".into());}
+        Ok(())
+    }
     /// `session` must come from adapter confirmation, never a requested resume
     /// recipe or a later UI selection. Callers retain that provenance.
     pub(crate) fn installation(scope: &LaunchAccountScope, session: &str) -> Result<Self,String> {
@@ -134,14 +154,18 @@ impl Store {
     fn open(root:&Path,scope:&LaunchAccountScope,session:Option<&str>)->Result<Self,String> {
         scope.revalidate()?;
         if session.is_some_and(|id|!valid_id(id)) {return Err("Invalid confirmed conversation identity".into());}
+        reject_revoked(root,&account_key(scope))?;
         associate_for_purge(root,scope)?;
         let account=root.join(account_key(scope));
         crate::secure_file::prepare_private_directory(&account).map_err(|e|e.to_string())?;
         let directory=account;
+        let directory_metadata=fs::symlink_metadata(&directory).map_err(|e|e.to_string())?;
         let path=directory.join("annotations.sqlite");
         let file=fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
         crate::secure_file::validate_and_privatize_open_file(&path,&file).map_err(|e|e.to_string())?;
+        let database_metadata=file.metadata().map_err(|e|e.to_string())?;
+        let namespace=((directory_metadata.dev(),directory_metadata.ino()),(database_metadata.dev(),database_metadata.ino()));
         let db=Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX|OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(|e|e.to_string())?;
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e|e.to_string())?;
         let version:u32=db.pragma_query_value(None,"user_version",|row|row.get(0)).map_err(|e|e.to_string())?;
@@ -160,7 +184,7 @@ impl Store {
           CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
           CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL); PRAGMA user_version=1;")
             .map_err(|e|e.to_string())?;
-        let store=Self{db,scope:scope.clone(),session:session.map(str::to_owned),directory,pending_bytes:Default::default(),pending_text_bytes:Default::default()};
+        let store=Self{db,scope:scope.clone(),session:session.map(str::to_owned),directory,namespace,pending_bytes:Default::default(),pending_text_bytes:Default::default()};
         store.recover_pending()?;
         Ok(store)
     }
@@ -169,7 +193,7 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn fail_latest_for_test(&self){self.db.execute_batch("CREATE TRIGGER fixture_latest_error BEFORE INSERT ON latest BEGIN SELECT RAISE(FAIL,'fixture latest write failure'); END;").unwrap();}
     fn purge_current_session(&mut self)->Result<(),String>{
-        self.scope.revalidate()?;let session=self.confirmed()?.to_owned();
+        self.revalidate()?;let session=self.confirmed()?.to_owned();
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;
         transaction.execute("DELETE FROM pending_commands WHERE expected_session=?1",[&session]).map_err(|e|e.to_string())?;
         transaction.execute("DELETE FROM prompts WHERE session=?1",[&session]).map_err(|e|e.to_string())?;
@@ -227,7 +251,7 @@ impl Store {
     }
     fn retain_reader(&self,mut input:impl std::io::Read,reserved_bytes:u64,original_path:&Path,extension:Option<&str>,budget:std::sync::Arc<std::sync::atomic::AtomicU64>,budget_limit:u64)->Result<PendingAttachment,OriginalError>{
         use std::{io::Write,os::fd::AsRawFd,sync::atomic::Ordering};
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         self.recover_pending().map_err(OriginalError::Unavailable)?;
         budget.fetch_update(Ordering::AcqRel,Ordering::Acquire,|bytes|bytes.checked_add(reserved_bytes).filter(|total|*total<=budget_limit)).map_err(|_|OriginalError::TooLarge)?;
         let name=format!("capture-{}{}",uuid::Uuid::new_v4(),extension.map(|value|format!(".{value}")).unwrap_or_default());
@@ -267,7 +291,7 @@ impl Store {
         self.accept_reader(original,file,text.0.attachment.sha256,aliases,captures,None)
     }
     fn accept_reader(&mut self,original:&OriginalPrompt,mut text:impl std::io::Read,text_sha:[u8;32],aliases:&[String],captures:&mut[PendingAttachment],prepared:Option<&str>)->Result<(),OriginalError>{
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         let session=self.confirmed().map_err(OriginalError::Unavailable)?.to_owned();
         if !valid_id(&original.user_id)||!valid_id(&original.turn_id)||aliases.len()>128||aliases.iter().any(|id|!valid_id(id)) {return Err(OriginalError::TooLarge);}
         if !original.settings.is_exact() {return Err(OriginalError::Unavailable("The accepted provider settings are unknown".into()));}
@@ -310,11 +334,11 @@ impl Store {
     /// Called only for the newest live confirmed user, in conversation order.
     /// An unannotated newest user intentionally makes latest lookup unavailable.
     pub(crate) fn latest_user(&mut self,user_id:&str)->Result<(),String>{
-        self.scope.revalidate()?;let session=self.confirmed()?;if !valid_id(user_id){return Err("Invalid user identity".into());}
+        self.revalidate()?;let session=self.confirmed()?;if !valid_id(user_id){return Err("Invalid user identity".into());}
         self.db.execute("INSERT INTO latest VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET user_id=excluded.user_id",params![session,user_id]).map(|_|()).map_err(|e|e.to_string())
     }
     pub(crate) fn original(&self,user_id:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         let session=self.confirmed().map_err(OriginalError::Unavailable)?;
         if !(4..=ORIGINAL_PAGE_BYTES).contains(&limit){return Err(OriginalError::InvalidRange);}
         let latest:Option<String>=if user_id.is_none(){self.db.query_row("SELECT user_id FROM latest WHERE session=?1",[session],|r|r.get(0)).optional().map_err(storage_error)?}else{None};
@@ -332,12 +356,13 @@ impl Store {
         let text=String::from_utf8(bytes).map_err(|_|OriginalError::InvalidRange)?;
         let next_offset=offset+text.len();
         let complete=next_offset==original.text_bytes;
+        self.revalidate().map_err(OriginalError::Unavailable)?;
         Ok(OriginalPage{session_id:session.to_owned(),original,offset,next_offset,text,complete})
     }
     /// Repeated delivery of an already seen Awaiting request is replay and
     /// cannot reopen a denied action. Only a distinct request starts a decision.
     pub(crate) fn approval(&mut self,key:&ApprovalKey,request:&str,decision:ApprovalDecision)->Result<(),String>{
-        self.scope.revalidate()?;let session=self.confirmed()?.to_owned();let agent=key.agent_id.as_deref().unwrap_or("");
+        self.revalidate()?;let session=self.confirmed()?.to_owned();let agent=key.agent_id.as_deref().unwrap_or("");
         if !valid_id(&key.item_id)||!valid_id(request)||agent.len()>ID_BYTES{return Err("Approval identity exceeds its limit".into());}
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;
         let known:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE session=?1 AND agent=?2 AND item=?3 AND request=?4)",params![session,agent,key.item_id,request],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -352,7 +377,7 @@ impl Store {
         transaction.commit().map_err(|e|e.to_string())
     }
     pub(crate) fn denied(&self,key:&ApprovalKey)->Result<bool,String>{
-        self.scope.revalidate()?;
+        self.revalidate()?;
         let session=self.confirmed()?;
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM current_approval c JOIN approvals a USING(session,agent,item,request) WHERE c.session=?1 AND c.agent=?2 AND c.item=?3 AND a.decision=2)",params![session,key.agent_id.as_deref().unwrap_or(""),key.item_id],|r|r.get(0)).map_err(|e|e.to_string())
     }
@@ -439,7 +464,7 @@ mod tests {
         assert!(purge_account_at(&annotations,&account).is_err(),"replacement cannot authorize deleting another physical home's annotations");
         fs::remove_dir(&account.canonical_home).unwrap();fs::rename(root.path().join("old-home"),&account.canonical_home).unwrap();
         drop(store);purge_account_at(&annotations,&account).unwrap();
-        let reopened=Store::at(&annotations,&account,"session").unwrap();assert!(matches!(reopened.original(Some("user"),0,4),Err(OriginalError::Unavailable(_))));
+        assert!(Store::at(&annotations,&account,"session").is_err(),"Explicit account deletion revokes this physical authority even if home removal has not finished");
     }
     #[test]
     fn attachment_snapshot_keeps_original_bytes_and_registered_purge_works_after_home_loss(){
@@ -539,6 +564,15 @@ mod tests {
         let root=test_directory();let mut account=scope(root.path(),crate::agent::Provider::Claude);let first=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("first")).id();let second=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("second")).id();account.registered_id=None;account.purge_ids=vec![first.clone(),second.clone(),first.clone()];
         let annotations=root.path().join("annotations");let mut store=Store::at(&annotations,&account,"session").unwrap();let original=prompt("user","text");store.accept(&original,"text",&[],&mut []).unwrap();drop(store);fs::remove_dir_all(&account.canonical_home).unwrap();
         assert_eq!(purge_registered_at(&annotations,&second).unwrap(),Some(1));assert_eq!(purge_registered_at(&annotations,&first).unwrap(),Some(0));assert!(!annotations.join(account_key(&account)).exists());assert!(Store::at(&annotations,&account,"session").is_err(),"Purge IDs cannot grant access to an absent physical home");
+    }
+
+    #[test]
+    fn explicit_purge_revokes_open_sqlite_descriptors_even_when_account_home_removal_fails(){
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");let mut store=Store::at(&annotations,&account,"session").unwrap();let original=prompt("user","private text");store.accept(&original,"private text",&[],&mut []).unwrap();
+        assert!(store.original(Some("user"),0,32).is_ok());purge_account_at(&annotations,&account).unwrap();assert!(account.canonical_home.exists(),"Simulate later physical-account removal failure");
+        assert!(matches!(store.original(Some("user"),0,32),Err(OriginalError::Unavailable(_))));assert!(Store::at(&annotations,&account,"session").is_err());assert!(matches!(store.capture_text("new text"),Err(OriginalError::Unavailable(_))));
+        // An unrelated account's namespace remains readable.
+        let other=scope(root.path(),crate::agent::Provider::Codex);let mut other_store=Store::at(&annotations,&other,"session").unwrap();other_store.accept(&original,"private text",&[],&mut []).unwrap();assert!(other_store.original(Some("user"),0,32).is_ok());
     }
 
 }
