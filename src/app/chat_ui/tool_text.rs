@@ -211,7 +211,9 @@ impl ToolText {
             .as_ref()
             .map(|previous| previous.flow_cache.clone())
             .unwrap_or_default();
-        let reader_identity = previous.as_ref().map_or(key, |previous| previous.reader_identity);
+        let reader_identity = previous
+            .as_ref()
+            .map_or(key, |previous| previous.reader_identity);
         Self {
             key,
             reader_identity,
@@ -295,7 +297,8 @@ impl ToolText {
         logical: Option<selectable_prose::Logical>,
         reader: Option<(scroll::Memory, Option<String>, u64)>,
     ) -> Element<'static, Message> {
-        let reader = Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.reader_identity)));
+        let reader =
+            Some(reader.unwrap_or_else(|| (scroll::Memory::default(), None, self.reader_identity)));
         let mut syntax = self.syntax.borrow_mut();
         if self.text.len() > CachedItem::HIGHLIGHT_LIMIT {
             *syntax = None;

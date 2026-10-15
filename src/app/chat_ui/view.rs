@@ -6510,7 +6510,8 @@ mod tests {
 
     #[test]
     fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
-        let items: Vec<_> = frame_cost::transcript(2).into_iter()
+        let items: Vec<_> = frame_cost::transcript(2)
+            .into_iter()
             .filter(|item| item.role == chat::Role::User || item.id.ends_with("-answer"))
             .collect();
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
@@ -6762,14 +6763,7 @@ mod tests {
             } else {
                 prose::view(&cached, settings, runtime.target, None)
             };
-            let content = scroll::transcript(
-                body,
-                runtime.target,
-                None,
-                vec![],
-                true,
-                vec![],
-            );
+            let content = scroll::transcript(body, runtime.target, None, vec![], true, vec![]);
             let mut element = selection::transcript_virtualized(
                 content,
                 runtime.target,
@@ -6786,7 +6780,9 @@ mod tests {
             // Full-context flow is prepared explicitly in this geometry
             // oracle. Production/cold timing never invokes the fixture drain.
             if cached.flow_cache.complete_fixture() {
-                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
             }
             #[derive(Default)]
             struct ReadText(Vec<(String, iced::Rectangle, usize)>);
@@ -6802,15 +6798,22 @@ mod tests {
                 ) {
                     if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
                         if prose.empty_line_caret() {
-                            assert_eq!(bounds.width, 0.0, "caret adds no horizontal content extent");
+                            assert_eq!(
+                                bounds.width, 0.0,
+                                "caret adds no horizontal content extent"
+                            );
                             assert!(bounds.height > 0.0);
                             let logical = prose.logical.as_ref().unwrap();
-                            let caret = prose.logical_byte_bounds(logical.identity, logical.start)
+                            let caret = prose
+                                .logical_byte_bounds(logical.identity, logical.start)
                                 .expect("empty physical row exposes its logical caret");
                             assert!(caret.width > 0.0 && caret.height > 0.0);
                         }
-                        self.0.push((prose.plain.to_string(), bounds,
-                            prose.logical.as_ref().map_or(0, |logical| logical.start)));
+                        self.0.push((
+                            prose.plain.to_string(),
+                            bounds,
+                            prose.logical.as_ref().map_or(0, |logical| logical.start),
+                        ));
                     }
                 }
             }
@@ -6821,14 +6824,33 @@ mod tests {
                 &renderer,
                 &mut text,
             );
-            assert!(!text.0.is_empty(), "current selectable glyph geometry is mounted");
+            assert!(
+                !text.0.is_empty(),
+                "current selectable glyph geometry is mounted"
+            );
             if raw_code {
-                assert_eq!(expected, source, "raw code oracle preserves every newline byte");
-                assert!(text.0.iter().filter(|(plain, _, _)| plain.is_empty()).count() > 1,
-                    "both middle and terminal empty rows are mounted");
-                assert!(text.0.len() > 2, "code selection crosses real physical row widgets");
+                assert_eq!(
+                    expected, source,
+                    "raw code oracle preserves every newline byte"
+                );
+                assert!(
+                    text.0
+                        .iter()
+                        .filter(|(plain, _, _)| plain.is_empty())
+                        .count()
+                        > 1,
+                    "both middle and terminal empty rows are mounted"
+                );
+                assert!(
+                    text.0.len() > 2,
+                    "code selection crosses real physical row widgets"
+                );
             } else {
-                assert_eq!(text.0.len(), 1, "paragraph preserves one full-context shaped flow");
+                assert_eq!(
+                    text.0.len(),
+                    1,
+                    "paragraph preserves one full-context shaped flow"
+                );
                 assert_eq!(text.0[0].0, expected);
             }
             #[derive(Default)]

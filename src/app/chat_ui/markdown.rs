@@ -97,7 +97,9 @@ impl Content {
         {
             let suffix = visible_suffix(markdown, &mut self.pending_spaces);
             self.state.leftover.push_str(markdown);
-            if !suffix.is_empty() { text.append_plain(&suffix); }
+            if !suffix.is_empty() {
+                text.append_plain(&suffix);
+            }
             return;
         }
         self.open_plain = false;
@@ -156,7 +158,10 @@ impl Content {
                 table_tail = Some((self.items.len(), start));
             } else if table_tail.is_some() {
                 let prefix = input[..start].strip_suffix('\n').unwrap_or(&input[..start]);
-                let separated = prefix.rsplit('\n').next().is_some_and(|line| line.trim().is_empty());
+                let separated = prefix
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.trim().is_empty());
                 if separated || !matches!(&item, Item::Paragraph(_)) {
                     table_tail = None;
                 }
@@ -1400,9 +1405,12 @@ mod tests {
             let mut previous = 0;
             for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
                 streamed.push_str(&source[previous..end]);
-                assert_eq!(native_outline(streamed.items()),
+                assert_eq!(
+                    native_outline(streamed.items()),
                     native_outline(Content::parse(&source[..end]).items()),
-                    "table prefix {:?}", &source[..end]);
+                    "table prefix {:?}",
+                    &source[..end]
+                );
                 previous = end;
             }
         }
@@ -1490,9 +1498,26 @@ mod tests {
         for initial in ["Answer", "Answer **bold** tail"] {
             let mut source = initial.to_owned();
             let mut content = Content::parse(initial);
-            for suffix in [" ", " ", "α", " ", "new ", " ", "words", "  ", "**markup** ", " ", "after"] {
-                source.push_str(suffix); content.push_str(suffix);
-                assert_eq!(native_outline(content.items()), original_outline(original::Content::parse(&source).items()), "{source:?}");
+            for suffix in [
+                " ",
+                " ",
+                "α",
+                " ",
+                "new ",
+                " ",
+                "words",
+                "  ",
+                "**markup** ",
+                " ",
+                "after",
+            ] {
+                source.push_str(suffix);
+                content.push_str(suffix);
+                assert_eq!(
+                    native_outline(content.items()),
+                    original_outline(original::Content::parse(&source).items()),
+                    "{source:?}"
+                );
             }
         }
     }
