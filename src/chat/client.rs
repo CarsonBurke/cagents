@@ -1554,6 +1554,18 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    /// Scheduling hint for a read-only daemon readiness query. This cached
+    /// generation never authorizes stopping, switching or writing a provider.
+    /// Borrow only control metadata, without retaining/hydrating transcript.
+    pub(crate) fn account_switch_idle_observation(&self) -> Option<u64> {
+        let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        ((snapshot.ready || snapshot.exited)
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && snapshot.queued_messages.is_empty())
+            .then_some(snapshot.generation)
+    }
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
         let snapshot = self
             .inner
