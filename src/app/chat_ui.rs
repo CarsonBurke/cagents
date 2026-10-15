@@ -14,6 +14,7 @@ use std::sync::{
 };
 
 mod auth_recovery;
+mod autolink;
 mod changes;
 mod clipboard_image;
 mod completion;
@@ -21,6 +22,12 @@ mod coordination;
 mod find;
 mod fold;
 mod hover;
+mod hydration;
+mod changes_sources;
+mod disclosure_intent;
+mod clipboard_intent;
+mod changes_find;
+mod reader_source;
 mod images;
 mod layout;
 mod markdown_source;
@@ -166,6 +173,18 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    LogicalSourceLoaded(Target, hydration::Key, u64, Result<hydration::Loaded, String>),
+    RetryLogicalSources(Target),
+    ChangesManifestReady(Target,chat::cache::SourceKey,usize,u64,Result<Arc<chat::cache::changes::Manifest>,String>),
+    ChangePatchReady(Target,chat::cache::SourceKey,usize,u64,Result<changes_sources::PatchReady,String>),
+    ToggleChangeFile(Target,String,usize),
+    LoadChangePage(Target,String,usize),
+    RetryChangeSource(Target,String,Option<usize>),
+    CopyChangePatch(Target,String,usize),
+    CopyAllChangePatches(Target,String),
+    ChangesFindReady(Target,u64,changes_find::Ready),
+    CompleteChangeCopy(Target,String,chat::cache::SourceEpoch,u64,Result<changes_sources::CopyReady,String>),
+
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     SignIn(Target, Account),
@@ -271,6 +290,7 @@ pub enum Action {
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
+    DenyInstructions(Target, String, bool),
     /// Puts a completion row's text over the word being completed. When the
     /// row is no longer offered, because the word changed under the key that
     /// chose it, the key does what it does without the list: the action
@@ -324,6 +344,11 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
+                | Self::LogicalSourceLoaded(..)
+                | Self::ChangesManifestReady(..)
+                | Self::ChangePatchReady(..)
+                | Self::CompleteChangeCopy(..)
+                | Self::ChangesFindReady(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -388,6 +413,7 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
+            | Self::DenyInstructions(target, _, _)
             | Self::Complete(target, _, _)
             | Self::Scrolled(target, _, _, _)
             | Self::ModelPicker(target, _)
@@ -472,6 +498,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    copy_intents: clipboard_intent::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -499,6 +526,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            copy_intents: clipboard_intent::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -595,6 +623,7 @@ impl ChangeToken {
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
+            chat::ToolStatus::AwaitingApproval => 5,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -823,6 +852,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::AwaitingApproval => "Awaiting approval",
     }
 }
 
@@ -1492,7 +1522,13 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    logical_sources: hydration::State,
+    logical_changes: changes_sources::State,
+    changes_find: changes_find::State,
     source_clock: Option<chat::client::SourceClock>,
+    /// Tiny interaction metadata survives transcript window/cache eviction.
+    turn_started_at: Option<u64>,
+    turn_prompt_id: Option<String>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
@@ -2063,7 +2099,12 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            logical_sources: hydration::State::default(),
+            logical_changes: changes_sources::State::default(),
+            changes_find: changes_find::State::default(),
             source_clock: None,
+            turn_started_at: None,
+            turn_prompt_id: None,
             finished_stamp: None,
             connection,
             queued: None,
@@ -2139,6 +2180,8 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.logical_sources.clear();
+        self.logical_changes.clear();self.changes_find.clear();self.set_find_external(HashMap::new(),false);
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2257,7 +2300,9 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
+        let (raw_snapshot, source_clock) = handle.snapshot_with_clock();
+        let snapshot = self.logical_sources.project(raw_snapshot,self.selected_subagent.as_deref());
+        let mut snapshot = self.logical_changes.project(snapshot,self.selected_subagent.as_deref(),&self.expanded,self.find.as_ref().is_some_and(|query|!query.is_empty()));
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -2491,6 +2536,34 @@ impl Runtime {
                 self.asked_after.insert(last.id.clone());
             }
         }
+        fn latest_user(state: &Snapshot) -> Option<&Arc<chat::Item>> {
+            state.items.iter().rev().find(|item| {
+                item.role == chat::Role::User
+                    && matches!(
+                        item.content,
+                        ItemContent::Text {
+                            thinking: false,
+                            ..
+                        }
+                    )
+            })
+        }
+        let current_user = latest_user(&snapshot);
+        let previous_user = latest_user(&self.snapshot);
+        let new_turn = snapshot.turn_generation != self.snapshot.turn_generation
+            || snapshot.session_id != self.snapshot.session_id
+            || (!self.snapshot.busy && snapshot.busy);
+        if new_turn {
+            self.turn_prompt_id = None;
+            self.turn_started_at = snapshot.turn_started_at;
+        }
+        if self.turn_prompt_id.is_none()
+            && let Some(user) = current_user
+            && previous_user.is_none_or(|previous| previous.id != user.id)
+        {
+            self.turn_started_at = user.started_at.or(user.at).or(self.turn_started_at);
+            self.turn_prompt_id = Some(user.id.clone());
+        }
         self.source_clock = source_clock;
         let cache = &self.cache;
         let turns = turn::group(&snapshot.items, &self.asked_after, |item| {
@@ -2536,6 +2609,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        changes_find::sync(self);
         images::sync(self);
         self.refresh_find();
     }
@@ -2549,7 +2623,27 @@ impl Runtime {
             .count()
     }
 
+    fn denial_response(&self, request_id: &str) -> Option<Command> {
+        if self.session.launch.provider != Provider::Claude
+            || !self.snapshot.requests.iter().any(|request| {
+                request.id == request_id
+                    && request.kind == chat::RequestKind::Approval
+                    && request.actions.iter().any(|choice| choice.id == "deny")
+            })
+        {
+            return None;
+        }
+        let text = self.composer.text();
+        (!text.trim().is_empty()).then(|| Command::Answer {
+            request_id: request_id.to_owned(),
+            action: "deny".into(),
+            answers: vec![chat::Answer::denial_instructions(text)],
+        })
+    }
+
     fn refresh_find(&mut self) {
+        self.logical_changes.reconcile_demand(&self.expanded,self.find.as_ref().is_some_and(|query|!query.is_empty()));
+        changes_find::sync(self);
         let previous = self.find_matches.get(self.find_index).cloned();
         let query = self.find.as_deref().unwrap_or_default();
         self.find_matches = self
@@ -2597,8 +2691,15 @@ impl Runtime {
                     .min(self.find_matches.len().saturating_sub(1))
             });
     }
+    pub(super) fn logical_source_metrics(&self)->(usize,usize,usize) {
+        (self.logical_sources.retained_bytes(),hydration::live_source_bytes(),self.logical_sources.alias_count())
+    }
+    pub(super) fn logical_source_reader_capacity(&self)->usize {
+        hydration::reader_source_capacity()
+    }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {self.logical_changes.evict(self.find.as_ref().is_some_and(|query|!query.is_empty()));self.changes_find.clear();self.set_find_external(HashMap::new(),false);hydration::release(self);}
         images::sync(self);
         self.present()
     }
@@ -4546,6 +4647,9 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                subscriptions.extend(hydration::subscriptions(runtime));
+                subscriptions.extend(changes_sources::subscriptions(runtime));
+                subscriptions.extend(changes_find::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6224,6 +6328,8 @@ impl Cagents {
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
+                            runtime.logical_sources.clear();
+                            runtime.logical_changes.clear();runtime.changes_find.clear();runtime.set_find_external(HashMap::new(),false);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -7245,6 +7351,7 @@ impl Cagents {
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
+                    changes_find::close(runtime);
                 }
                 return iced::widget::operation::focus(card_control_id(
                     target.card,
@@ -7319,7 +7426,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7522,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -7475,7 +7584,9 @@ impl Cagents {
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
-                            runtime.take_attachments();
+                            if pending.request.is_none() {
+                                runtime.take_attachments();
+                            }
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -7543,6 +7654,7 @@ impl Cagents {
                     if !runtime.expanded.remove(&id) {
                         runtime.expanded.insert(id.clone());
                     }
+                    runtime.refresh();
                     if let Some(item) = runtime
                         .snapshot
                         .items
@@ -7598,13 +7710,22 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    runtime.refresh();
                     images::sync(runtime);
                 }
             }
             Action::Copy(target, id, part) => {
+                let intent=self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.logical_changes.epoch(&id).is_some() {
+                    return match part {
+                        CopyPart::Text=>{runtime.logical_changes.request_copy_all(&id,intent);changes_sources::copy_task(runtime,None)},
+                        CopyPart::Change(index)=>changes_sources::copy_task(runtime,Some((id,index,intent))),
+                        _=>Task::none(),
+                    };
+                }
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = match part {
@@ -7709,6 +7830,43 @@ impl Cagents {
                     runtime.thumbnails.complete(&path, loaded);
                 }
             }
+            Action::ChangesFindReady(target,id,ready)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_find::complete(runtime,id,ready);}
+            }
+            Action::ChangesManifestReady(target,key,offset,attempt,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::manifest_ready(runtime,&key,offset,attempt,result);return changes_sources::copy_task(runtime,None);}
+            }
+            Action::ChangePatchReady(target,key,index,attempt,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::patch_ready(runtime,&key,index,attempt,result);return changes_sources::copy_task(runtime,None);}
+            }
+            Action::ToggleChangeFile(target,item,index)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.toggle_file(&item,index,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
+            }
+            Action::LoadChangePage(target,item,offset)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.page(&item,offset,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
+            }
+            Action::RetryChangeSource(target,item,index)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.retry(&item,index,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
+            }
+            Action::CopyChangePatch(target,item,index)=>{
+                let intent=self.chat_ui.copy_intents.next();
+                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index,intent)));}
+            }
+            Action::CopyAllChangePatches(target,item)=>{
+                let intent=self.chat_ui.copy_intents.next();
+                if let Some(runtime)=self.chat_runtime_mut(target) {
+                    runtime.logical_changes.request_copy_all(&item,intent);return changes_sources::copy_task(runtime,None);
+                }
+            }
+            Action::CompleteChangeCopy(target,item,epoch,context,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::complete_copy(runtime,&item,epoch,context,result);}
+            }
+            Action::LogicalSourceLoaded(target, key, attempt, loaded) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::complete(runtime,&key,attempt,loaded);}
+            }
+            Action::RetryLogicalSources(target) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::retry(runtime);}
+            }
             Action::ImageLoaded(target, item, attempt, loaded) => {
                 let explicit_pressure = self
                     .chat_runtime_mut(target)
@@ -7759,6 +7917,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
@@ -8064,6 +8223,31 @@ impl Cagents {
                         }
                     }
                 }
+            }
+            Action::DenyInstructions(target, request_id, send) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.session.launch.provider != Provider::Claude
+                    || !runtime.snapshot.requests.iter().any(|request| {
+                        request.id == request_id
+                            && request.kind == chat::RequestKind::Approval
+                            && request.actions.iter().any(|choice| choice.id == "deny")
+                    })
+                {
+                    return Task::none();
+                }
+                if !send {
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                let Some(command) = runtime.denial_response(&request_id) else {
+                    return Task::none();
+                };
+                return self.chat_send(target, command, true);
             }
             Action::Answer(target, request_id, action) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -8633,6 +8817,71 @@ mod tests {
         assert!(runtime.prompt_suggestion().is_some());
         Arc::make_mut(&mut runtime.snapshot).session_id = Some("other-session".into());
         assert!(runtime.prompt_suggestion().is_none());
+    }
+
+    #[test]
+    fn denying_with_composer_instructions_clears_only_the_acknowledged_draft() {
+        let instructions="  use git push --force-with-lease instead\n\nKeep existing changes.  \n\n";
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("approval"));
+        let target = {
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                unreachable!()
+            };
+            runtime.session.launch.provider = Provider::Claude;
+            runtime.replace_draft(text_editor::Content::with_text(instructions));
+            runtime.attachments.push(Attachment {
+                path: "retained.png".into(),
+            });
+            Arc::make_mut(&mut runtime.snapshot)
+                .requests
+                .push(chat::Request {
+                    kind: chat::RequestKind::Approval,
+                    id: "approval".into(),
+                    title: "Allow Bash?".into(),
+                    description: String::new(),
+                    fields: vec![],
+                    actions: vec![chat::Choice {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: String::new(),
+                    }],
+                });
+            runtime.target
+        };
+        assert_eq!(
+            chat_runtime(&app, card).denial_response("approval"),
+            Some(Command::Answer {
+                request_id: "approval".into(),
+                action: "deny".into(),
+                answers: vec![chat::Answer::denial_instructions(
+                    instructions.into()
+                )],
+            })
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        let runtime = chat_runtime(&app, card);
+        let pending = runtime
+            .pending
+            .as_ref()
+            .expect("the approval is dispatched");
+        assert_eq!(pending.request.as_deref(), Some("approval"));
+        let command_id = pending.id;
+        let next = runtime.next_command;
+        assert_eq!(
+            runtime.composer.text(),
+            instructions
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        assert_eq!(
+            chat_runtime(&app, card).next_command,
+            next,
+            "duplicate clicks cannot dispatch twice"
+        );
+        drop(app.handle_chat_ui(Action::CommandFinished(target, command_id, Ok(()))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.text().trim().is_empty());
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
     }
 
     #[test]
@@ -11147,14 +11396,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11427,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
