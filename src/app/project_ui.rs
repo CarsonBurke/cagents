@@ -3381,7 +3381,7 @@ mod tests {
 
     #[test]
     fn replacing_an_agent_or_its_turn_invalidates_counted_consent() {
-        for replacement in [false, true] {
+        for change in 0..4 {
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
             let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
@@ -3395,7 +3395,13 @@ mod tests {
             confirm_deletion_fixture(&mut app);
             drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
             drop(app.handle_project_action(Action::ConfirmDelete));
-            let changed = BusyAgent { session: if replacement { TerminalId::new() } else { original.session }, instance: original.instance, close_revision: Some(2), turn_generation: Some(4) };
+            let mut changed = original.clone();
+            match change {
+                0 => changed.session = TerminalId::new(),
+                1 => changed.instance = uuid::Uuid::new_v4(),
+                2 => changed.close_revision = Some(2),
+                _ => changed.turn_generation = Some(4),
+            }
             drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus { agents: vec![changed.clone()], census: vec![changed] })) }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
@@ -3403,9 +3409,29 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_actor_change_requires_a_fresh_deletion_confirmation() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        drop(app.open_worktree_delete_dialog(target));
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        let mut actor = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(0) };
+        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus { agents: vec![], census: vec![actor.clone()] })) }));
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        actor.close_revision = Some(2);
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus { agents: vec![], census: vec![actor] })) }));
+        assert!(!app.project_ui.is_deleting(linked.id));
+        assert!(app.project_ui.dialog.as_ref().unwrap().failure.as_deref().unwrap().contains("changed"));
+    }
+
+    #[test]
     fn malformed_or_duplicate_busy_census_is_never_treated_as_idle() {
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
         let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) };
+        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone()], census: vec![] }).is_err());
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent.clone()], census: vec![agent] }).is_err());
     }
 
