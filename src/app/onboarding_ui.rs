@@ -11,6 +11,7 @@ static HOME_DIRECTORY: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Command(workspace_widget::GlobalShortcut),
     HomeChat,
     Clone,
     Url(String),
@@ -163,9 +164,19 @@ impl Cagents {
     }
 
     pub(super) fn empty_workspace_view(&self) -> Element<'_, Message> {
+        self.empty_workspace_view_with_context(self.chrome_command_context())
+    }
+
+    fn empty_workspace_view_with_context(
+        &self,
+        context: workspace_widget::CommandContext,
+    ) -> Element<'_, Message> {
+        use workspace_widget::GlobalShortcut as Command;
         let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
         let first_run = self.sidebar_model.projects.is_empty() && !scoped;
         let enabled = !self.workspace_inputs_blocked();
+        let action_enabled = |command| enabled
+            && workspace_widget::shortcut_descriptor(command).available(&context);
         let mut content: Vec<Element<'_, Message>> = Vec::new();
         if scoped {
             let directory = self.terminal_directory();
@@ -190,24 +201,27 @@ impl Cagents {
             if let Some(path) = directory {
                 content.push(design::caption(display_path(&path).into_owned()).into());
             }
-            for (label, icon, id, message) in [
+            for (label, icon, id, command, message) in [
                 (
                     "New conversation",
                     Icon::Chat,
                     "empty.new-conversation",
-                    Message::ChromeUi(chrome_ui::Action::Launch(chrome_ui::NewTab::Thread)),
+                    Some(Command::NewThread),
+                    Message::Onboarding(Action::Command(Command::NewThread)),
                 ),
                 (
                     "Resume conversation",
                     Icon::History,
                     "empty.resume-conversation",
-                    Message::ResumeConversation(resume_ui::Action::Open),
+                    Some(Command::ResumeConversation),
+                    Message::Onboarding(Action::Command(Command::ResumeConversation)),
                 ),
                 (
                     "New terminal",
                     Icon::Terminal,
                     "empty.new-terminal",
-                    Message::NewTerminal,
+                    Some(Command::NewTerminal),
+                    Message::Onboarding(Action::Command(Command::NewTerminal)),
                 ),
                 (
                     if cfg!(feature = "integrated-browser") {
@@ -217,13 +231,15 @@ impl Cagents {
                     },
                     Icon::Browser,
                     "empty.new-browser",
-                    Message::NewBrowser,
+                    Some(Command::NewBrowser),
+                    Message::Onboarding(Action::Command(Command::NewBrowser)),
                 ),
                 (
                     "Agent accounts",
                     Icon::Avatar,
                     "empty.accounts",
-                    Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts),
+                    None,
+                    Message::AccountUi(account_ui::Action::OpenPane),
                 ),
             ] {
                 content.push(
@@ -231,7 +247,7 @@ impl Cagents {
                         .icon(icon)
                         .id(widget::Id::new(id))
                         .width(Length::Fill)
-                        .on_press_maybe(enabled.then_some(message))
+                        .on_press_maybe(command.map_or(enabled, action_enabled).then_some(message))
                         .into(),
                 );
             }
@@ -249,7 +265,7 @@ impl Cagents {
             } else {
                 "Choose a recent workspace to continue, or open another project folder."
             }).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into());
-            for (label, detail, icon, id, message) in [
+            for (label, detail, icon, id, command, message) in [
                 (
                     "Open folder",
                     onboarding_shortcut_detail(
@@ -258,7 +274,8 @@ impl Cagents {
                     ),
                     Icon::OpenFolder,
                     "onboarding.open-folder",
-                    Message::OpenRepository,
+                    Command::OpenFolder,
+                    Message::Onboarding(Action::Command(Command::OpenFolder)),
                 ),
                 (
                     "Clone repository",
@@ -268,7 +285,8 @@ impl Cagents {
                     ),
                     Icon::Tree,
                     "onboarding.clone",
-                    Message::Onboarding(Action::Clone),
+                    Command::CloneRepository,
+                    Message::Onboarding(Action::Command(Command::CloneRepository)),
                 ),
                 (
                     "Start a chat in ~",
@@ -278,6 +296,7 @@ impl Cagents {
                     ),
                     Icon::Chat,
                     "onboarding.home-chat",
+                    Command::NewThread,
                     Message::Onboarding(Action::HomeChat),
                 ),
             ] {
@@ -292,7 +311,7 @@ impl Cagents {
                             .icon(icon)
                             .id(widget::Id::new(id))
                             .width(Length::Fill)
-                            .on_press_maybe(enabled.then_some(message))
+                            .on_press_maybe(action_enabled(command).then_some(message))
                             .into(),
                         design::caption(detail).into(),
                     ])
@@ -394,7 +413,20 @@ impl Cagents {
         {
             return Task::none();
         }
+        let required = match &action {
+            Action::HomeChat => Some(workspace_widget::GlobalShortcut::NewThread),
+            Action::Clone => Some(workspace_widget::GlobalShortcut::CloneRepository),
+            _ => None,
+        };
+        if let Some(command) = required
+            && !workspace_widget::shortcut_descriptor(command).available(&self.chrome_command_context())
+        {
+            // Reuse the registry's execution refusal if a previously rendered
+            // Home action arrives after its device or save context changed.
+            return self.run_chrome_workspace_command(command);
+        }
         match action {
+            Action::Command(command) => self.run_chrome_workspace_command(command),
             Action::HomeChat => {
                 let Some(home) = HOME_DIRECTORY.clone() else {
                     self.status = Some(TransientNotice::error(
@@ -718,12 +750,12 @@ mod tests {
         assert!(
             activate(app.empty_workspace_view(), "onboarding.open-folder")
                 .iter()
-                .any(|m| matches!(m, Message::OpenRepository))
+                .any(|m| matches!(m, Message::Onboarding(Action::Command(workspace_widget::GlobalShortcut::OpenFolder))))
         );
         assert!(
             activate(app.empty_workspace_view(), "onboarding.clone")
                 .iter()
-                .any(|m| matches!(m, Message::Onboarding(Action::Clone)))
+                .any(|m| matches!(m, Message::Onboarding(Action::Command(workspace_widget::GlobalShortcut::CloneRepository))))
         );
         assert!(
             activate(app.empty_workspace_view(), "onboarding.home-chat")
@@ -731,6 +763,58 @@ mod tests {
                 .any(|m| matches!(m, Message::Onboarding(Action::HomeChat)))
         );
         assert!(!labels.iter().any(|label| label.contains("Workspace /")));
+    }
+
+    #[test]
+    fn home_buttons_match_registry_device_and_save_availability() {
+        use workspace_widget::GlobalShortcut as Command;
+        let app = super::super::tests::context_inspector_test_app(false);
+        for (remote_device, save_in_flight) in [(false, false), (true, false), (false, true)] {
+            for (id, command) in [
+                ("onboarding.open-folder", Command::OpenFolder),
+                ("onboarding.clone", Command::CloneRepository),
+                ("onboarding.home-chat", Command::NewThread),
+            ] {
+                let mut context = app.chrome_command_context();
+                context.remote_device = remote_device;
+                context.save_in_flight = save_in_flight;
+                let expected = workspace_widget::shortcut_descriptor(command).available(&context);
+                let messages = activate(app.empty_workspace_view_with_context(context), id);
+                let actions: Vec<_> = messages.iter().filter(|message| matches!(message,
+                    Message::Onboarding(Action::Command(_) | Action::HomeChat))).collect();
+                assert_eq!(actions.len(), usize::from(expected),
+                    "actual focused Home button must agree with registry: {id}, remote={remote_device}, saving={save_in_flight}");
+                if command != Command::NewThread && expected {
+                    assert!(matches!(actions[0], Message::Onboarding(Action::Command(actual)) if *actual == command));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_empty_buttons_use_workspace_registry_without_sidebar_row_authority() {
+        use workspace_widget::GlobalShortcut as Command;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.active_workspace = Some(PathBuf::from("/workspace/selected"));
+        for remote_device in [false, true] {
+            for (id, command) in [
+                ("empty.new-conversation", Command::NewThread),
+                ("empty.resume-conversation", Command::ResumeConversation),
+                ("empty.new-terminal", Command::NewTerminal),
+                ("empty.new-browser", Command::NewBrowser),
+            ] {
+                let mut context = app.chrome_command_context();
+                context.remote_device = remote_device;
+                assert!(context.sidebar_commands.is_none());
+                let expected = workspace_widget::shortcut_descriptor(command).available(&context);
+                let messages = activate(app.empty_workspace_view_with_context(context), id);
+                assert_eq!(messages.iter().filter(|message| matches!(message,
+                    Message::Onboarding(Action::Command(actual)) if *actual == command)).count(),
+                    usize::from(expected), "scoped button must agree with registry: {id}");
+            }
+        }
+        assert!(activate(app.empty_workspace_view(), "empty.accounts").iter().any(|message|
+            matches!(message, Message::AccountUi(account_ui::Action::OpenPane))));
     }
 
     #[test]
