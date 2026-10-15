@@ -669,10 +669,19 @@ impl Cagents {
         // A scheduled agent can remain headless in this window. Only this
         // explicit user activation may mount its exact authenticated descriptor.
         let managed = self.resolved_activation_agent(session);
-        if managed.is_none() && self.workspace_model.agents.iter().any(|agent| {
-            !agent.closed && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
-                    || agent.console.as_ref().is_some_and(|owner| owner.id == session))
-        }) {
+        if managed.is_none()
+            && self.workspace_model.agents.iter().any(|agent| {
+                !agent.closed
+                    && (agent
+                        .session
+                        .as_ref()
+                        .is_some_and(|owner| owner.id() == session)
+                        || agent
+                            .console
+                            .as_ref()
+                            .is_some_and(|owner| owner.id == session))
+            })
+        {
             // Invalid authoritative membership also fences a retained local
             // projection. It cannot silently downgrade to an unmanaged pane.
             return Task::none();
@@ -683,8 +692,16 @@ impl Cagents {
         } else {
             // Inventory-only aliases have no model AgentId yet. An open exact
             // session is usable; an older closed alias must not shadow it.
-            self.durable.cards.iter().find(|card| card.existence.is_open() && card_session(card) == Some(session))
-                .or_else(|| self.durable.cards.iter().find(|card| card_session(card) == Some(session)))
+            self.durable
+                .cards
+                .iter()
+                .find(|card| card.existence.is_open() && card_session(card) == Some(session))
+                .or_else(|| {
+                    self.durable
+                        .cards
+                        .iter()
+                        .find(|card| card_session(card) == Some(session))
+                })
         };
         if existing.is_some_and(|card| !card.existence.is_open()) {
             self.notification_ui.session_activation = None;
@@ -710,7 +727,13 @@ impl Cagents {
             }
             let id = card.id;
             if let Some(activation) = &managed {
-                adopted = self.adopt_execution_agent_activation_display(&activation.agent, activation.display.clone(), activation.session.clone()).unwrap_or_else(Task::none);
+                adopted = self
+                    .adopt_execution_agent_activation_display(
+                        &activation.agent,
+                        activation.display.clone(),
+                        activation.session.clone(),
+                    )
+                    .unwrap_or_else(Task::none);
                 self.refresh_sidebar_channels();
                 self.persist();
             }
@@ -721,10 +744,17 @@ impl Cagents {
             };
             // General managed adoption belongs to the model/inventory path.
             // Only explicit automation activation may mount a headless actor.
-            if !matches!(activation.agent.origin, crate::agent_execution::Origin::Automation { .. }) {
+            if !matches!(
+                activation.agent.origin,
+                crate::agent_execution::Origin::Automation { .. }
+            ) {
                 return Task::none();
             }
-            let Some(task) = self.adopt_execution_agent_activation_display(&activation.agent, activation.display, activation.session) else {
+            let Some(task) = self.adopt_execution_agent_activation_display(
+                &activation.agent,
+                activation.display,
+                activation.session,
+            ) else {
                 return Task::none();
             };
             adopted = task;
@@ -760,27 +790,43 @@ impl Cagents {
         // Count raw owners before projection. A rejected duplicate must not
         // disappear from the ambiguity fence merely because one pane matches.
         let mut owners = self.workspace_model.agents.iter().filter(|agent| {
-            !agent.closed && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
-                || agent.console.as_ref().is_some_and(|owner| owner.id == session))
+            !agent.closed
+                && (agent
+                    .session
+                    .as_ref()
+                    .is_some_and(|owner| owner.id() == session)
+                    || agent
+                        .console
+                        .as_ref()
+                        .is_some_and(|owner| owner.id == session))
         });
         let agent = owners.next()?;
         if owners.next().is_some() {
             return None;
         }
-        let resolved = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
-            .activation_display(agent, session)?;
+        let resolved =
+            crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
+                .activation_display(agent, session)?;
         let display = resolved.display;
         let owner = resolved.session;
         let repository = match &display.scope {
             Placement::Channel(id) => {
                 let shared = self.workspace_model.channel(*id)?;
-                let local = self.durable.channels.iter().find(|channel| channel.id == *id)?;
+                let local = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == *id)?;
                 let project = self.sidebar_model.project(local.project_id)?;
-                if project.repository != shared.repository { return None; }
+                if project.repository != shared.repository {
+                    return None;
+                }
                 &shared.repository
             }
             Placement::Worktree { repository, path } => {
-                if self.worktree_view_scope(path).as_ref() != Some(&display.scope) { return None; }
+                if self.worktree_view_scope(path).as_ref() != Some(&display.scope) {
+                    return None;
+                }
                 repository
             }
         };
@@ -789,8 +835,14 @@ impl Cagents {
         if (display.pane.is_none() && repository != &agent.spec.target.repository)
             || self.project_ui.closed.contains(repository)
             || self.workspace_model.closed_projects.contains(repository)
-        { return None; }
-        Some(ManagedActivation { agent: agent.clone(), display, session: owner })
+        {
+            return None;
+        }
+        Some(ManagedActivation {
+            agent: agent.clone(),
+            display,
+            session: owner,
+        })
     }
 
     pub(super) fn notification_subscription(&self) -> Subscription<Message> {
@@ -1544,37 +1596,77 @@ mod tests {
     fn attention_activation_follows_saved_surface_and_legacy_display_without_rewriting_execution() {
         use crate::agent_execution::{HostedSession, Placement, Surface};
         use crate::workspace_model::views::{Pane, View};
-        for (saved_chat, shared_uuid) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (saved_chat, shared_uuid) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let (mut app, mut agent) = scheduled_attention_fixture();
             let console = agent.console.clone().unwrap();
             let native = crate::chat::Session {
-                native_continuity: Default::default(), id: if shared_uuid { console.id } else { TerminalId::new() },
-                proof: console.continuity.live_proof(), terminal: None, owned_codex_listener: None,
-                launch: crate::chat::Launch { provider: agent.spec.provider, session_id: None, recipe: console.launch.clone() },
+                native_continuity: Default::default(),
+                id: if shared_uuid {
+                    console.id
+                } else {
+                    TerminalId::new()
+                },
+                proof: console.continuity.live_proof(),
+                terminal: None,
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: agent.spec.provider,
+                    session_id: None,
+                    recipe: console.launch.clone(),
+                },
             };
             agent.session = Some(HostedSession::Chat(native.clone()));
-            agent.spec.surface = if saved_chat { Surface::Terminal } else { Surface::Chat };
+            agent.spec.surface = if saved_chat {
+                Surface::Terminal
+            } else {
+                Surface::Chat
+            };
             let original = agent.clone();
-            app.project_ui.closed.insert(original.spec.target.repository.clone());
+            app.project_ui
+                .closed
+                .insert(original.spec.target.repository.clone());
             let destination = ChannelId::new();
             let project = ProjectId::new();
             let repository = PathBuf::from("/legacy-display");
-            app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Legacy display".into(), repository.clone(), vec![], vec![]));
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Legacy display".into(),
+                repository.clone(),
+                vec![],
+                vec![],
+            ));
             let mut local = app.durable.channels[0].clone();
-            local.id = destination; local.project_id = project;
+            local.id = destination;
+            local.project_id = project;
             Arc::make_mut(&mut app.durable).channels.push(local);
             let mut shared = app.workspace_model.channels[0].clone();
-            shared.id = destination; shared.repository = repository;
+            shared.id = destination;
+            shared.repository = repository;
             app.workspace_model.channels.push(shared);
             let mut card = super::super::tests::terminal_card_state();
             card.id = CardId::from_uuid(agent.id.as_uuid());
             card.title = "Saved moved conversation".into();
             card.width_fraction = 0.65;
-            card.kind = if saved_chat { CardKind::Chat(native.clone()) } else { CardKind::Terminal(console.clone()) };
+            card.kind = if saved_chat {
+                CardKind::Chat(native.clone())
+            } else {
+                CardKind::Terminal(console.clone())
+            };
             let pane = Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap();
             let mut source = View::empty(agent.channel().unwrap());
             source.retired.push(card.id);
-            app.workspace_model.views = vec![source, View { scope: Placement::Channel(destination), revision: 2, panes: vec![pane.clone()], retired: vec![] }];
+            app.workspace_model.views = vec![
+                source,
+                View {
+                    scope: Placement::Channel(destination),
+                    revision: 2,
+                    panes: vec![pane.clone()],
+                    retired: vec![],
+                },
+            ];
             app.workspace_model.agents.push(agent);
             let session = if saved_chat { console.id } else { native.id };
             drop(app.update_notifications(Action::Activated(Target::Session(session))));
@@ -1587,10 +1679,18 @@ mod tests {
             let actual_session = if saved_chat { native.id } else { console.id };
             drop(app.update_notifications(Action::Activated(Target::Session(actual_session))));
             assert_eq!(app.workspace.focused(), Some(card.id));
-            assert_eq!(app.durable.cards.len(), 1, "counterpart and actual-surface clicks reuse one canonical pane");
-            assert_eq!(app.workspace_model.agents[0], original,
-                "display-only activation preserves accepted cwd/spec/placement/provider/native actor");
-            app.project_ui.closed.remove(&original.spec.target.repository);
+            assert_eq!(
+                app.durable.cards.len(),
+                1,
+                "counterpart and actual-surface clicks reuse one canonical pane"
+            );
+            assert_eq!(
+                app.workspace_model.agents[0], original,
+                "display-only activation preserves accepted cwd/spec/placement/provider/native actor"
+            );
+            app.project_ui
+                .closed
+                .remove(&original.spec.target.repository);
             drop(app.select_channel(original.channel().unwrap()));
             assert_ne!(app.workspace.focused(), Some(card.id));
             let focused = app.workspace.focused();
@@ -1598,19 +1698,31 @@ mod tests {
             let current = &mut app.workspace_model.agents[0];
             if saved_chat {
                 let console = current.console.as_mut().unwrap();
-                console.continuity = TerminalContinuity::RelaunchAvailable { recipe: console.launch.clone(), last_exit: None };
-            } else if let Some(HostedSession::Chat(native)) = &mut current.session { native.proof = None; }
+                console.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: console.launch.clone(),
+                    last_exit: None,
+                };
+            } else if let Some(HostedSession::Chat(native)) = &mut current.session {
+                native.proof = None;
+            }
             app.workspace_model.sequence += 1;
             drop(app.update_notifications(Action::Activated(Target::Session(session))));
-            assert_eq!(app.workspace.focused(), focused,
-                "the requested counterpart needs its own complete current proof even when the saved surface is proved, including shared UUIDs");
+            assert_eq!(
+                app.workspace.focused(),
+                focused,
+                "the requested counterpart needs its own complete current proof even when the saved surface is proved, including shared UUIDs"
+            );
             assert_eq!(app.durable.cards, saved_cards);
             app.workspace_model.agents[0] = original.clone();
             app.workspace_model.sequence += 1;
-            app.workspace_model.views[1].panes[0].kind = super::super::tests::terminal_card_state().kind;
+            app.workspace_model.views[1].panes[0].kind =
+                super::super::tests::terminal_card_state().kind;
             drop(app.update_notifications(Action::Activated(Target::Session(session))));
-            assert_eq!(app.workspace.focused(), focused,
-                "replaced canonical ownership cannot reactivate a stale retained local pane");
+            assert_eq!(
+                app.workspace.focused(),
+                focused,
+                "replaced canonical ownership cannot reactivate a stale retained local pane"
+            );
             assert_eq!(app.durable.cards, saved_cards);
             assert_eq!(app.workspace_model.agents[0], original);
         }
@@ -1622,24 +1734,43 @@ mod tests {
         let (mut app, mut agent) = scheduled_attention_fixture();
         let console = agent.console.clone().unwrap();
         let native = crate::chat::Session {
-            native_continuity: Default::default(), id: console.id,
-            proof: console.continuity.live_proof(), terminal: Some(console.clone()), owned_codex_listener: None,
-            launch: crate::chat::Launch { provider: agent.spec.provider, session_id: None, recipe: console.launch.clone() },
+            native_continuity: Default::default(),
+            id: console.id,
+            proof: console.continuity.live_proof(),
+            terminal: Some(console.clone()),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: agent.spec.provider,
+                session_id: None,
+                recipe: console.launch.clone(),
+            },
         };
         agent.session = Some(HostedSession::Chat(native.clone()));
         let original = agent.clone();
         let id = CardId::from_uuid(agent.id.as_uuid());
         let initial_count = app.durable.cards.len();
-        assert!(app.workspace_model.views.iter().all(|view| view.panes.iter().all(|pane| pane.id != id)));
+        assert!(
+            app.workspace_model
+                .views
+                .iter()
+                .all(|view| view.panes.iter().all(|pane| pane.id != id))
+        );
         app.workspace_model.agents.push(agent);
         drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
         assert_eq!(app.workspace.focused(), Some(id));
         assert_eq!(app.card_state(id).unwrap().kind, CardKind::Chat(native));
         assert_eq!(app.durable.cards.len(), initial_count + 1);
-        assert_eq!(app.workspace_model.agents[0], original, "activation cannot rewrite or replay the actor");
+        assert_eq!(
+            app.workspace_model.agents[0], original,
+            "activation cannot rewrite or replay the actor"
+        );
         drop(app.update_notifications(Action::Activated(Target::Session(console.id))));
         assert_eq!(app.workspace.focused(), Some(id));
-        assert_eq!(app.durable.cards.len(), initial_count + 1, "repeated clicks reuse canonical membership");
+        assert_eq!(
+            app.durable.cards.len(),
+            initial_count + 1,
+            "repeated clicks reuse canonical membership"
+        );
     }
 
     #[test]
@@ -1648,13 +1779,19 @@ mod tests {
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
         let session = card_session(app.card_state(card).unwrap()).unwrap();
-        let mut alias = app.card_state(card).unwrap().clone(); alias.id = CardId::new();
+        let mut alias = app.card_state(card).unwrap().clone();
+        alias.id = CardId::new();
         alias.existence = super::super::project_ui::removed_existence("retired inventory alias");
-        Arc::make_mut(&mut app.durable).cards.insert(0, alias.clone());
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .insert(0, alias.clone());
         app.sidebar_state.observe_card_update(card);
         drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert_eq!(app.workspace.focused(), Some(card));
-        assert!(!app.sidebar_state.has_card_update(card), "successful activation acknowledges the open exact session");
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "successful activation acknowledges the open exact session"
+        );
         assert_eq!(app.card_state(alias.id).unwrap().existence, alias.existence);
         assert_eq!(app.durable.cards.len(), 2);
     }
@@ -1670,7 +1807,10 @@ mod tests {
         assert_eq!(app.notification_ui.session_activation, Some(session));
         drop(app.adopt_execution_agent(&agent).unwrap());
         drop(app.retry_notification_activation());
-        assert_eq!(app.workspace.focused(), Some(CardId::from_uuid(agent.id.as_uuid())));
+        assert_eq!(
+            app.workspace.focused(),
+            Some(CardId::from_uuid(agent.id.as_uuid()))
+        );
         assert_eq!(app.durable.cards.len(), 1);
     }
 
@@ -1681,44 +1821,75 @@ mod tests {
         for automation in [false, true] {
             for alias_open in [false, true] {
                 let (mut app, mut agent) = scheduled_attention_fixture();
-                if !automation { agent.origin = Origin::User; }
+                if !automation {
+                    agent.origin = Origin::User;
+                }
                 let session = agent.console.as_ref().unwrap().id;
                 let canonical = CardId::from_uuid(agent.id.as_uuid());
                 app.workspace_model.agents.push(agent.clone());
                 drop(app.adopt_execution_agent(&agent).unwrap());
                 let card = app.card_state(canonical).unwrap().clone();
-                app.workspace_model.views = vec![View { scope: agent.placement.clone(), revision: 1,
-                    panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()], retired: vec![] }];
-                let mut alias = card.clone(); alias.id = CardId::new();
-                if !alias_open { alias.existence = super::super::project_ui::removed_existence("retired inventory alias"); }
+                app.workspace_model.views = vec![View {
+                    scope: agent.placement.clone(),
+                    revision: 1,
+                    panes: vec![
+                        Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap(),
+                    ],
+                    retired: vec![],
+                }];
+                let mut alias = card.clone();
+                alias.id = CardId::new();
+                if !alias_open {
+                    alias.existence =
+                        super::super::project_ui::removed_existence("retired inventory alias");
+                }
                 let alias_id = alias.id;
                 let alias_existence = alias.existence.clone();
                 let durable = Arc::make_mut(&mut app.durable);
                 durable.cards.insert(0, alias);
-                durable.chat_drafts.insert(alias_id, "Preserved alias draft".into());
+                durable
+                    .chat_drafts
+                    .insert(alias_id, "Preserved alias draft".into());
                 let other = ChannelId::new();
                 let mut local = durable.channels[0].clone();
-                local.id = other; local.cards.clear(); local.focused = None;
+                local.id = other;
+                local.cards.clear();
+                local.focused = None;
                 durable.channels.push(local);
-                let mut shared = app.workspace_model.channels[0].clone(); shared.id = other;
+                let mut shared = app.workspace_model.channels[0].clone();
+                shared.id = other;
                 app.workspace_model.channels.push(shared);
                 drop(app.select_channel(other));
                 assert_ne!(app.workspace.focused(), Some(canonical));
                 drop(app.update_notifications(Action::Activated(Target::Session(session))));
-                assert_eq!(app.workspace.focused(), Some(canonical),
-                    "inventory alias order cannot determine managed activation identity");
+                assert_eq!(
+                    app.workspace.focused(),
+                    Some(canonical),
+                    "inventory alias order cannot determine managed activation identity"
+                );
                 assert_eq!(app.card_state(alias_id).unwrap().existence, alias_existence);
-                assert_eq!(app.durable.chat_drafts.get(&alias_id).map(String::as_str), Some("Preserved alias draft"));
+                assert_eq!(
+                    app.durable.chat_drafts.get(&alias_id).map(String::as_str),
+                    Some("Preserved alias draft")
+                );
                 assert_eq!(app.durable.cards.len(), 2);
                 assert_eq!(app.workspace_model.agents[0], agent);
                 drop(app.select_channel(other));
                 let focused = app.workspace.focused();
-                Arc::make_mut(&mut app.durable).cards.iter_mut().find(|card| card.id == canonical).unwrap().existence = super::super::project_ui::removed_existence("explicit canonical close");
+                Arc::make_mut(&mut app.durable)
+                    .cards
+                    .iter_mut()
+                    .find(|card| card.id == canonical)
+                    .unwrap()
+                    .existence =
+                    super::super::project_ui::removed_existence("explicit canonical close");
                 let before = app.durable.cards.clone();
                 drop(app.update_notifications(Action::Activated(Target::Session(session))));
                 assert_eq!(app.workspace.focused(), focused);
-                assert_eq!(app.durable.cards, before,
-                    "an open alias must not bypass explicit canonical closure");
+                assert_eq!(
+                    app.durable.cards, before,
+                    "an open alias must not bypass explicit canonical closure"
+                );
                 assert!(app.notification_ui.session_activation.is_none());
             }
         }
