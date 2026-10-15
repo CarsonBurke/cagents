@@ -538,6 +538,7 @@ impl Handle {
                     actor.apply(Event::ProviderExit(diagnostic));
                 }
                 let code = status.and_then(|status| status.code());
+                let owned_native_cleanup = actor.native_holder.is_some();
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -570,8 +571,11 @@ impl Handle {
                     }
                     if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
                     let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
-                    if let Some(status)=terminal {
-                        finish_snapshot_work(&mut state,status,direct_closed&&native_closed);
+                    if let Some(status)=terminal.filter(|_|owned_native_cleanup && direct_closed && native_closed) {
+                        // A disconnected external socket or exited direct
+                        // provider is not proof that independent processes
+                        // ended. This path requires exact holder cleanup.
+                        finish_snapshot_work(&mut state,status,true);
                         drop(state);
                         if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
                     }
@@ -6341,6 +6345,9 @@ mod tests {
             vec![text("echo", "hello world world")]
         );
     }
+    fn independent_websocket_command()->Item {
+        Item {id:"background-process".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"exec_command".into(),input:"long-running independent process".into(),output:String::new(),status:ToolStatus::Running}}
+    }
     struct WebSocketFixture;
     impl Adapter for WebSocketFixture {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -6358,6 +6365,7 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             let mut step = Echo.receive(frame.clone())?;
+            if frame["background"]==true {step.events.push(Event::Item(independent_websocket_command()));}
             step.events.push(Event::Status {
                 busy: frame["busy"].as_bool().unwrap_or(false),
                 detail: String::new(),
@@ -6415,7 +6423,7 @@ mod tests {
             );
             socket
                 .send(Message::Text(
-                    json!({"text": "hello", "busy": true}).to_string().into(),
+                    json!({"text": "hello", "busy": true,"background":true}).to_string().into(),
                 ))
                 .unwrap();
             socket
@@ -6451,7 +6459,7 @@ mod tests {
         })
         .unwrap();
         until(&handle, |snapshot| {
-            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello")]
+            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello"),independent_websocket_command()]
         });
         pong_received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
@@ -6494,7 +6502,8 @@ mod tests {
         assert!(!snapshot.busy);
         assert_eq!(
             unstamped(&snapshot.items),
-            vec![text("echo", "hello stopped")]
+            vec![text("echo", "hello stopped"),independent_websocket_command()],
+            "disconnecting this unowned server connection cannot invent background process completion"
         );
     }
 
