@@ -294,6 +294,7 @@ pub(super) fn restore(
     proof: &HostSessionProof,
     owner: crate::daemon::holder_registry::Record,
 ) -> Result<ServerResponse, String> {
+    super::super::session_locations::observer_registry(host)?;
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
         || inspection.source.id != requested.id

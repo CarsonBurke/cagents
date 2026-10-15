@@ -49,6 +49,11 @@ fn model_unavailable(error: String) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, error, false)
 }
 
+// Only deliberately constructed diagnostic hosts may omit managed storage.
+// A real daemon records its opening attempt before it can adopt any owner.
+#[derive(Clone, Copy)]
+enum ModelAdmission { Unmanaged, Opening, Ready, Unavailable }
+
 pub(crate) type ClientId = u64;
 /// The lock every host user serializes on; see [`super::lock`].
 pub(crate) type HostLock = super::lock::HostMutex<HostState>;
@@ -251,6 +256,7 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    model_admission: ModelAdmission,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -344,6 +350,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            model_admission: ModelAdmission::Unmanaged,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
@@ -452,6 +459,18 @@ impl HostState {
             }
         };
         self.model = Some(registry);
+        self.model_admission = if self.execution_registry.is_some() {
+            ModelAdmission::Ready
+        } else { ModelAdmission::Unavailable };
+    }
+
+    pub(super) fn expect_model(&mut self) { self.model_admission = ModelAdmission::Opening; }
+    pub(super) fn model_open_failed(&mut self) { self.model_admission = ModelAdmission::Unavailable; }
+
+    /// Resident admission state only; this never opens or probes a store.
+    pub(super) fn managed_registry_unavailable(&self) -> bool {
+        !matches!(self.model_admission, ModelAdmission::Unmanaged)
+            && (self.model.is_none() || self.execution_registry.is_none())
     }
 
     /// In-memory publication of the exact durable observer registration. The

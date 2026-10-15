@@ -53,7 +53,7 @@ fn owned(scope: &Scope, model: &WorkspaceModel, relocation: &Relocation) -> bool
 /// startup may silently publish authority without its durable observer owner.
 pub(super) fn observer_registry(host:&SharedHost)->Result<Option<std::sync::Arc<std::sync::Mutex<super::model::Registry>>>,String> {
     let state=host.lock().unwrap_or_else(|p|p.into_inner());
-    if state.model.is_some() && state.execution_registry.is_none() {
+    if state.managed_registry_unavailable() {
         return Err("Conversation metadata storage is unavailable; recover the registry before retrying its original actor".into());
     }
     Ok(state.execution_registry.clone())

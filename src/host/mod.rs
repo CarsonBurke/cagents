@@ -199,6 +199,19 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+// This same admission path is used by the constructor-failure contract test.
+// No clients, provider restoration or helper adoption runs before it returns.
+fn initialize_model(host: &SharedHost, open: impl FnOnce() -> Result<model::Registry, String>) {
+    host.lock().unwrap_or_else(|p| p.into_inner()).expect_model();
+    match open() {
+        Ok(registry) => host.lock().unwrap_or_else(|p| p.into_inner()).install_model(registry),
+        Err(error) => {
+            host.lock().unwrap_or_else(|p| p.into_inner()).model_open_failed();
+            tracing::error!(%error, "the shared workspace model is unavailable; managed native owners were retained");
+        }
+    }
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -217,16 +230,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
     // and donating its state over and over.
-    match model::Registry::open() {
-        Ok(registry) => host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .install_model(registry),
-        Err(error) => {
-            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
-                                    not be shared between windows")
-        }
-    }
+    initialize_model(&host, model::Registry::open);
     let notification_application = crate::instance::notification_daemon_application(
         &std::env::current_exe()?,
         std::env::args_os()
