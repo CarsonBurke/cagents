@@ -789,6 +789,7 @@ fn close_focus_id(index: usize) -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::mouse;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     #[test]

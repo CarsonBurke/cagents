@@ -299,6 +299,7 @@ fn health_focus_id(index: usize) -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::mouse;
     fn key(key: keyboard::key::Named) -> keyboard::Event {
         keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key.clone()),
