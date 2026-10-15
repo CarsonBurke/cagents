@@ -10,6 +10,7 @@ pub mod presentation;
 pub mod pricing;
 mod restart;
 pub use restart::RestartReceipt;
+pub mod turn_outcomes;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1031,6 +1032,9 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Qualified terminal results joined only to this transcript window.
+    #[serde(default)]
+    pub turn_outcomes: std::sync::Arc<turn_outcomes::TurnOutcomeProjection>,
 }
 
 /// Readable provider failure with a separately expandable bounded stderr tail.
