@@ -243,6 +243,35 @@ mod tests {
     }
 
     #[test]
+    fn ready_cli_selection_waits_for_the_focused_runtime_save_completion() {
+        const TEST: &str = "app::project_activation::tests::ready_cli_selection_waits_for_the_focused_runtime_save_completion";
+        if !crate::test_git::isolated_test(TEST) { return; }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.request_project_activation(root.clone());
+        let load = app.resume_project_activation();
+        // This fixture owns a real Runtime SaveTicket; no application-level
+        // saving flag is injected. The completion models durable success,
+        // while the ordinary Repository reducer owns releasing navigation.
+        let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let completion = runtime.durable_active_save_completion();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        assert!(app.focused_repository_is_saving());
+        let previous = app.active_workspace.clone();
+        complete(&mut app, load);
+        assert_eq!(app.active_workspace, previous);
+        assert!(app.project_ui.activation.is_some());
+        drop(app.update(Message::Frame(Instant::now())));
+        assert_eq!(app.active_workspace, previous);
+        drop(app.update(Message::Repository(completion)));
+        assert!(!app.focused_repository_is_saving());
+        assert_eq!(app.active_workspace.as_ref(), Some(&root));
+        assert!(app.project_ui.activation.is_none());
+    }
+
+    #[test]
     fn cli_selection_waits_for_modal_and_update_admission() {
         const TEST: &str = "app::project_activation::tests::cli_selection_waits_for_modal_and_update_admission";
         if !crate::test_git::isolated_test(TEST) { return; }
