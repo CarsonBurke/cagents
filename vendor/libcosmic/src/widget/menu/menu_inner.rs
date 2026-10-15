@@ -217,6 +217,10 @@ impl Aod {
             self.vertical_direction,
         );
 
+        // Tall menus start at the window edge and scroll; ordinary menus
+        // flip and clamp so every visible item stays inside the parent.
+        let x = x.clamp(0.0, (viewport_size.width - children_size.width).max(0.0));
+        let y = y.clamp(0.0, (viewport_size.height - children_size.height).max(0.0));
         ([x, y].into(), [ox, oy].into())
     }
 }
@@ -259,8 +263,12 @@ impl MenuBounds {
         tree: &mut [Tree],
         is_overlay: bool,
     ) -> Self {
+        let width = match item_width {
+            ItemWidth::Uniform(width) => width,
+            ItemWidth::Static(fallback) => menu_tree.width.unwrap_or(fallback),
+        }.min(viewport_size.width.max(1.0) as u16);
         let (children_size, child_positions, child_sizes) =
-            get_children_layout(menu_tree, renderer, item_width, item_height, tree);
+            get_children_layout(menu_tree, renderer, ItemWidth::Uniform(width), item_height, tree);
 
         // viewport space parent bounds
         let view_parent_bounds = parent_bounds + overlay_offset;
@@ -1705,6 +1713,7 @@ fn process_scroll_events<Message>(
             }
         }
         shell.capture_event();
+        shell.invalidate_layout();
         shell.request_redraw();
     });
 }
