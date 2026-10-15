@@ -4403,7 +4403,7 @@ mod tests {
                 mode: PromptMode::Send,
             })
             .unwrap();
-        let frame = |id| {
+        let frame = |id: &str| {
             json!({"method":"turn/completed","params":{"threadId":"thread-exact",
             "turn":{"id":id,"status":"completed","items":[]}}})
         };
