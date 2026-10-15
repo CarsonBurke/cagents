@@ -24,7 +24,7 @@ pub(super) struct Bindings {
     pending_removals:HashMap<CardId,PendingRemoval>,
 }
 
-struct CompletedAttempt { nonce:uuid::Uuid,card:CardId,batch:Option<uuid::Uuid> }
+struct CompletedAttempt { registry:uuid::Uuid,nonce:uuid::Uuid,card:CardId,batch:Option<uuid::Uuid> }
 
 /// Opaque authority for one pending UI removal, never an execution capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub(super) fn same_chat_removal_source(expected:&crate::chat::Session,current:&c
         && expected.owned_codex_listener==current.owned_codex_listener
         && expected.terminal==current.terminal
 }
-fn same_removal_source(expected:&CardKind,current:&CardKind)->bool {
+pub(super) fn same_removal_source(expected:&CardKind,current:&CardKind)->bool {
     match (expected,current) {
         (CardKind::Terminal(expected),CardKind::Terminal(current))=>{
             let mut source=current.clone(); source.continuity=expected.continuity.clone();
@@ -53,6 +53,7 @@ pub(super) struct CloseIntent {
     pub card: CardId,
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
+    registry:uuid::Uuid,
     completed_source: Option<TerminalSession>,
     captured: Option<CapturedTerminal>,
     batch:Option<uuid::Uuid>,
@@ -96,6 +97,8 @@ pub enum CompletedCloseOutcome {
 
 #[derive(Debug, Clone)]
 pub struct QueuedCardClose {
+    registry:uuid::Uuid,
+    shared:Result<Option<super::shared_views::RemovalSource>,String>,
     batch:Option<uuid::Uuid>,
     card: CardId,
     unasked: bool,
@@ -297,7 +300,7 @@ impl Cagents {
     }
 
     fn terminal_close_binding_current(&self, intent: &CloseIntent) -> bool {
-        self.pane_close_decision_current(intent.card,intent.batch) && same_captured(intent.captured.as_ref(),self.terminal_close_bindings.bound.get(&intent.card))
+        self.workspace_model.identity==intent.registry && self.pane_close_decision_current(intent.card,intent.batch) && same_captured(intent.captured.as_ref(),self.terminal_close_bindings.bound.get(&intent.card))
             && self.surface_close_binding_current(intent.card,intent.captured.as_ref())
     }
 
@@ -339,6 +342,8 @@ impl Cagents {
     fn queued_card_close(&mut self, card: CardId, unasked: bool) -> QueuedCardClose {
         self.capture_terminal_close_binding(card, false);
         QueuedCardClose {
+            registry:self.workspace_model.identity,
+            shared:self.capture_shared_removal_source(card),
             batch:self.pane_close_batch_for(card),
             card,
             unasked,
@@ -383,7 +388,7 @@ impl Cagents {
     }
 
     pub(super) fn resolve_queued_card_close(&mut self, queued: QueuedCardClose) -> Option<Message> {
-        if !self.pane_close_decision_current(queued.card,queued.batch) {return None;}
+        if self.workspace_model.identity!=queued.registry || !self.pane_close_decision_current(queued.card,queued.batch) {return None;}
         // Admission precedes normalization to CloseCard. Otherwise a modal
         // could consume the already-dequeued message and strand its batch.
         if self.modal_is_open() {
@@ -426,6 +431,8 @@ impl Cagents {
             ));
             return None;
         }
+        let shared=match queued.shared {Ok(source)=>source,Err(error)=>{self.stop_pane_close_batch(queued.batch);self.status=Some(TransientNotice::warning(error));return None;}};
+        if !self.install_shared_removal_source(queued.card,shared) {self.stop_pane_close_batch(queued.batch);return None;}
         Some(if queued.unasked {
             Message::CloseCardUnasked(queued.card)
         } else {
@@ -490,6 +497,13 @@ impl Cagents {
         self.close_card_as(card,true,true,batch)
     }
 
+    // Closing one pane grants no unconditional authority to delete its whole
+    // shared channel. A concurrent source may have joined that channel.
+    fn locally_emptied_channels(&self,channels:Vec<ChannelId>)->Vec<ChannelId> {
+        channels.into_iter().filter(|id|self.workspace_model.channel(*id).is_none()
+            && self.durable.channels.iter().find(|channel|channel.id==*id).is_some_and(|channel|!channel.shared)).collect()
+    }
+
     /// Closes `card` from outside the strip on screen, which has no widget
     /// for it to hand focus from. It only retires the card: whatever the
     /// card ran must already have ended or been closed through the daemon,
@@ -502,6 +516,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        if !self.prepare_shared_card_removal(card) { return Task::none(); }
         // Read before anything persists the scope, which prunes the closed
         // card from its channel's membership.
         let emptied = self.channels_emptied_by(&[card]);
@@ -526,6 +541,7 @@ impl Cagents {
             .filter(|&channel| !self.channel_has_open_card(channel))
             .collect();
         self.persist();
+        let emptied=self.locally_emptied_channels(emptied);
         Task::batch([self.delete_channels(emptied), self.sync_chrome()])
     }
 
@@ -542,6 +558,7 @@ impl Cagents {
             self.stop_pane_close_batch(batch);
             return Task::none();
         }
+        if !self.prepare_shared_card_removal(card) {self.stop_pane_close_batch(batch);return Task::none();}
         self.capture_terminal_close_binding(card, false);
         let captured = self.terminal_close_bindings.bound.get(&card).cloned();
         // Unknown completion is not authority to discard a shared pane.
@@ -554,7 +571,7 @@ impl Cagents {
                 return Task::none();
             }
             let attempt=uuid::Uuid::new_v4();
-            self.terminal_close_bindings.completed_attempts.insert(session.id,CompletedAttempt{nonce:attempt,card,batch});
+            self.terminal_close_bindings.completed_attempts.insert(session.id,CompletedAttempt{registry:self.workspace_model.identity,nonce:attempt,card,batch});
             let presentation=self.local_terminal_dismissal_target(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
@@ -619,6 +636,7 @@ impl Cagents {
                 card,
                 terminal: session.id,
                 proof,
+                registry:self.workspace_model.identity,
                 completed_source: None,
                 captured,
                 batch,
@@ -657,8 +675,9 @@ impl Cagents {
     ) -> Task<Message> {
         // A stale/duplicate receipt cannot retire a newer same-ID attempt.
         if !self.terminal_close_bindings.completed_attempts.get(&session.id).is_some_and(|owned|owned.nonce==attempt&&owned.card==card&&owned.batch==batch){return Task::none();}
-        self.terminal_close_bindings.completed_attempts.remove(&session.id);
+        let owned=self.terminal_close_bindings.completed_attempts.remove(&session.id).unwrap();
         self.terminal_close_attempts.remove(&session.id);
+        if owned.registry!=self.workspace_model.identity {return Task::none();}
         if !self.pane_close_decision_current(card,batch) {return Task::none();}
         if !self.card_state(card).is_some_and(|state| {
             state.existence.is_open()
@@ -745,6 +764,7 @@ impl Cagents {
                     card,
                     terminal: session.id,
                     proof,
+                    registry:self.workspace_model.identity,
                     completed_source: Some(session),
                     captured,
                     batch,
@@ -823,6 +843,7 @@ impl Cagents {
     }
     pub(super) fn reserve_card_removal_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Option<crate::workspace::FocusHandoff> {
         if !self.pane_close_decision_current(card,batch) {return None;}
+        if !self.prepare_shared_card_removal(card) {return None;}
         let kind=self.card_state(card).filter(|state|state.existence.is_open())?.kind.clone();
         let observed_chat=matches!(&kind,CardKind::Chat(_)).then(||self.chat_return_session(card)).flatten();
         if let Some(pending)=self.terminal_close_bindings.pending_removals.get(&card) {
@@ -989,6 +1010,7 @@ impl Cagents {
             .into_iter()
             .filter(|&channel| !self.channel_has_open_card(channel))
             .collect();
+        let emptied=self.locally_emptied_channels(emptied);
         let reopen = match utility {
             Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
                 self.reopen_utility = None;

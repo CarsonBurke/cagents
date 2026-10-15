@@ -671,7 +671,11 @@ impl HostState {
                 ));
             }
         }
-        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        let applied = self.registry()?.apply(&edit).map_err(|error| {
+            if error == "workspace view revision conflict" {
+                ProtocolError::new(ProtocolErrorCode::ViewConflict,error,true)
+            } else {model_unavailable(error)}
+        })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }

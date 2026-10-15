@@ -1,6 +1,8 @@
 //! A client projection of daemon-owned scope views. Pending local intentions
 //! are layered over snapshots until acknowledged; snapshots never erase them.
 use super::*;
+mod removal;
+pub(super) use removal::{RemovalSource, removal_current};
 use crate::workspace_model::{
     ModelEdit,
     views::{self, Change, Pane, Scope, View},
@@ -20,6 +22,7 @@ pub(super) struct State {
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
     pending: Vec<(uuid::Uuid, Scope, Change)>,
+    removal_sources: HashMap<CardId, RemovalSource>,
     pub attached: HashSet<CardId>,
     retained: HashSet<CardId>,
     applying: bool,
@@ -520,22 +523,9 @@ impl Cagents {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
                     // tombstones and utility panes are unrelated client state.
-                    let closed = self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == scope)
-                        .map(|view| {
-                            view.panes
-                                .iter()
-                                .filter_map(|pane| {
-                                    self.card_state(pane.id)
-                                        .filter(|card| !card.existence.is_open())
-                                        .map(|_| pane.id)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    // Legacy local tombstones have no captured shared source.
+                    // Seed remains additive; only source-fenced changes remove.
+                    let closed = Vec::new();
                     // Explicit creations replay as stable Insert operations
                     // after the seed acknowledgment, preserving their anchor.
                     // They must not migrate as append-only legacy panes.
@@ -566,6 +556,13 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
+                let change=if let Change::Remove {id}=&change {
+                    let Some(source)=self.shared_views.removal_sources.get(id).filter(|source|source.scope==scope && source.current(&self.workspace_model)) else {
+                        self.status=Some(TransientNotice::warning("An uncaptured shared pane removal was refused; its authoritative pane will be restored."));
+                        continue;
+                    };
+                    source.change()
+                } else {change};
                 let operation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
@@ -615,6 +612,9 @@ impl Cagents {
 
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
         if let Some(operation) = operation {
+            if let Some((_,_,Change::RemoveSource {before,..}))=self.shared_views.pending.iter().find(|(id,_,_)|*id==operation) {
+                self.shared_views.removal_sources.remove(&before.id);
+            }
             self.shared_views
                 .pending
                 .retain(|(id, _, _)| *id != operation);
@@ -629,6 +629,12 @@ impl Cagents {
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
         self.prune_local_terminal_dismissals();
         self.shared_views.prune_restoration_requests(&self.durable);
+        let stale=self.shared_views.pending.iter().filter_map(|(operation,scope,change)|
+            (!removal_current(&self.workspace_model,scope,change)).then_some(*operation)).collect::<HashSet<_>>();
+        if !stale.is_empty() {
+            self.shared_views.pending.retain(|(operation,_,_)|!stale.contains(operation));
+            self.status=Some(TransientNotice::warning("A pending Close no longer matches the shared pane. Its current source was preserved."));
+        }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         let mut views = self.workspace_model.views.clone();
@@ -2727,6 +2733,42 @@ mod tests {
         assert!(app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_none());
         assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
         assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
+    fn removal_fixture()->(Cagents,ChannelId,ChannelId,Pane) {
+        let (mut app,a,b,pane)=fixture();
+        app.workspace_model.projects=vec![crate::workspace_model::ModelProject {repository:"/repo".into(),checkout:None,primary_checkout:None,name:"repo".into(),kind:Default::default(),ordinal:1}];
+        app.workspace_model.channels=[a,b].into_iter().map(|id|crate::workspace_model::ModelChannel {id,repository:"/repo".into(),title:"view".into(),title_source:Default::default(),ordinal:1}).collect();
+        (app,a,b,pane)
+    }
+    #[test]
+    fn pending_source_remove_never_projects_a_replacement_or_replaced_registry() {
+        for registry_replaced in [false,true] {
+            let (mut app,a,_,pane)=removal_fixture();
+            let mut view=View::empty(Scope::Channel(a));view.revision=7;view.panes=vec![pane.clone()];
+            app.workspace_model.views=vec![view.clone()];
+            app.shared_views.applying=true;drop(app.project_shared_view(&view,&HashSet::from([pane.id])));app.shared_views.applying=false;
+            let basis=app.capture_shared_removal_source(pane.id).unwrap().unwrap();
+            let operation=uuid::Uuid::new_v4();app.shared_views.pending.push((operation,view.scope.clone(),basis.change()));
+            if registry_replaced {app.workspace_model.identity=uuid::Uuid::new_v4();}
+            else {if let CardKind::Browser(source)=&mut app.workspace_model.views[0].panes[0].kind {source.id=BrowserId::new();}app.workspace_model.views[0].revision+=1;}
+            let expected=app.workspace_model.views[0].panes[0].clone();
+            drop(app.reconcile_shared_views());
+            assert!(!app.shared_views.pending.iter().any(|(id,_,_)|*id==operation));
+            assert!(app.card_state(pane.id).unwrap().existence.is_open());
+            assert_eq!(crate::workspace_model::views::shared_kind(&app.card_state(pane.id).unwrap().kind),expected.kind);
+            assert!(!app.install_shared_removal_source(pane.id,Some(basis)),"old source must not acquire new shared authority");
+        }
+    }
+    #[test]
+    fn seed_never_publishes_uncaptured_historical_closed_ids() {
+        let (mut app,a,_,pane)=fixture();
+        let mut view=View::empty(Scope::Channel(a));view.panes=vec![pane.clone()];app.workspace_model.views=vec![view];
+        app.shared_views.initialized.remove(&Scope::Channel(a));app.shared_views.seeding.clear();
+        let (tx,rx)=async_channel::unbounded();app.workspace_model_tx=tx;
+        if let Some(state)=app.card_state_mut(pane.id) {state.existence=super::super::project_ui::removed_existence("legacy cache");}
+        app.publish_view_changes();
+        for edit in std::iter::from_fn(||rx.try_recv().ok()) {if let ModelEdit::SeedView {closed,..}=edit {assert!(closed.is_empty());}}
     }
 
 }

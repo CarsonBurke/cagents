@@ -59,6 +59,12 @@ pub enum ModelUpdate {
         operation: Option<uuid::Uuid>,
         model: WorkspaceModel,
     },
+    ViewRemovalRefused {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        model: WorkspaceModel,
+        error: String,
+    },
     NavigationFailed(String),
     Ranked {
         channel: ChannelId,
@@ -258,6 +264,14 @@ fn send(
         _ => None,
     };
     let mut request = edit;
+    let removal=matches!(&request,ModelEdit::ChangeView {change:crate::workspace_model::views::Change::RemoveSource {..}|crate::workspace_model::views::Change::Remove {..},..});
+    if removal {
+        let model=client.read_workspace_model()?;
+        if !prepare_removal_request(&mut request,&model) {
+            refuse_removal(request,model,updates);
+            return Ok(());
+        }
+    }
     let mut conflicts = 0;
     let model = loop {
         match client.edit_workspace_model(request.clone()) {
@@ -274,6 +288,10 @@ fn send(
                 }
                 std::thread::sleep(Duration::from_millis(20 * conflicts));
                 let model = client.read_workspace_model()?;
+                if removal && !prepare_removal_request(&mut request,&model) {
+                    refuse_removal(request,model,updates);
+                    return Ok(());
+                }
                 if let ModelEdit::ChangeView {
                     scope,
                     expected_revision,
@@ -287,6 +305,11 @@ fn send(
                         .map(|view| view.revision)
                         .unwrap_or(0);
                 }
+            }
+            Err(ControlError::Remote {retryable:false,..}) if removal => {
+                let model=client.read_workspace_model()?;
+                refuse_removal(request,model,updates);
+                return Ok(());
             }
             Err(error) => return Err(error),
         }
@@ -316,6 +339,21 @@ fn send(
         let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
     }
     Ok(())
+}
+
+/// The original source travels in the typed request through every transport
+/// reconnect and revision retry. A fresh revision never grants a fresh source.
+fn prepare_removal_request(edit:&mut ModelEdit,model:&WorkspaceModel)->bool {
+    let ModelEdit::ChangeView {scope,expected_revision,change,..}=edit else{return true;};
+    if !super::shared_views::removal_current(model,scope,change){return false;}
+    let Some(view)=model.views.iter().find(|view|&view.scope==scope) else{return false;};
+    *expected_revision=view.revision;
+    true
+}
+fn refuse_removal(edit:ModelEdit,model:WorkspaceModel,updates:&async_channel::Sender<ModelUpdate>) {
+    if let ModelEdit::ChangeView {scope,operation,..}=edit {
+        let _=updates.send_blocking(ModelUpdate::ViewRemovalRefused {scope,operation,model,error:"The original shared Close source changed; the current pane was preserved.".into()});
+    }
 }
 
 /// What adopting one shared row asked of the window.
@@ -413,6 +451,12 @@ impl Cagents {
                     "Could not reorder the sidebar: {error}"
                 )));
                 Task::none()
+            }
+            ModelUpdate::ViewRemovalRefused {scope,operation,model,error} => {
+                self.acknowledge_view_edit(scope,Some(operation));
+                if self.workspace_model.identity==model.identity && model.sequence>=self.workspace_model.sequence {self.workspace_model=model;}
+                self.status=Some(TransientNotice::warning(error));
+                self.reconcile_workspace_model()
             }
             ModelUpdate::ViewApplied {
                 scope,
@@ -2294,4 +2338,53 @@ mod tests {
         );
         assert!(drain(&published).is_empty());
     }
+    fn removal_wire_fixture()->(WorkspaceModel,crate::workspace_model::views::Scope,crate::workspace_model::views::Pane) {
+        use crate::workspace_model::views::{Pane,Scope,View};
+        let scope=Scope::Worktree {repository:"/repo".into(),path:"/repo".into()};
+        let card=super::super::tests::context_inspector_test_app(false).workspace.focused().unwrap();
+        let pane=Pane {id:card,title:"pane".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,scope:Some("/repo".into()),kind:CardKind::Browser(crate::model::BrowserSession {id:crate::model::BrowserId::new(),current_url:"https://example.com".parse().unwrap(),history:vec![],history_index:0,scroll_x:0.0,scroll_y:0.0,fidelity:crate::model::BrowserRestoreFidelity::UrlOnly})};
+        let mut model=WorkspaceModel::default();model.identity=uuid::Uuid::new_v4();model.sequence=7;
+        model.projects=vec![ModelProject {repository:"/repo".into(),checkout:None,primary_checkout:None,name:"repo".into(),kind:Default::default(),ordinal:1}];
+        let mut view=View::empty(scope.clone());view.revision=3;view.panes=vec![pane.clone()];model.views=vec![view];
+        (model,scope,pane)
+    }
+    #[test]
+    fn removal_worker_retries_only_original_source_and_refuses_before_any_unchecked_write() {
+        use crate::terminal::ipc::{ClientEnvelope,ClientRequest,ServerEnvelope,ServerMessage,ServerResponse,ProtocolError,ProtocolErrorCode,PROTOCOL_VERSION,read_frame,write_frame};
+        for replace in [false,true] {
+            let (model,scope,pane)=removal_wire_fixture();let operation=uuid::Uuid::new_v4();
+            let edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:0,operation,change:crate::workspace_model::views::Change::RemoveSource {registry:model.identity,repository:"/repo".into(),before:pane.clone()}};
+            let initial=model.clone();
+            let (reader,mut server)=std::os::unix::net::UnixStream::pair().unwrap();
+            let handle=std::thread::spawn(move || {
+                server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let proof=HostSessionProof {host_session_id:crate::model::HostSessionId::new("source-remove"),boot_id:crate::model::BootId::new("boot"),host_incarnation:crate::model::HostIncarnation::new("daemon")};
+                let reply=|stream:&mut std::os::unix::net::UnixStream,id,message|write_frame(stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(id),proof:proof.clone(),message}).unwrap();
+                let connect:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();assert!(matches!(connect.request,ClientRequest::Connect {..}));
+                reply(&mut server,connect.request_id,ServerMessage::Response {response:ServerResponse::Connected {proof:proof.clone(),resumed:vec![]}});
+                let read:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();assert!(matches!(read.request,ClientRequest::ReadWorkspaceModel));
+                reply(&mut server,read.request_id,ServerMessage::Response {response:ServerResponse::WorkspaceModel {model:initial.clone()}});
+                let first:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();let request_id=first.request_id;let ClientRequest::EditWorkspaceModel {edit:first}=first.request else{panic!()};
+                assert!(matches!(&first,ModelEdit::ChangeView {expected_revision:3,operation:id,change:crate::workspace_model::views::Change::RemoveSource {before,..},..} if *id==operation && before==&pane));
+                // A concurrent mutation wins after verified read, before write.
+                reply(&mut server,request_id,ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::ViewConflict,"concurrent source",true)));
+                let mut current=initial.clone();current.sequence+=1;current.views[0].revision+=1;
+                if replace {if let CardKind::Browser(source)=&mut current.views[0].panes[0].kind {source.id=crate::model::BrowserId::new();}}else{current.views[0].panes[0].title="independent title".into();}
+                let read:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();assert!(matches!(read.request,ClientRequest::ReadWorkspaceModel));
+                reply(&mut server,read.request_id,ServerMessage::Response {response:ServerResponse::WorkspaceModel {model:current.clone()}});
+                if !replace {
+                    let retried:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();
+                    assert!(matches!(&retried.request,ClientRequest::EditWorkspaceModel {edit:ModelEdit::ChangeView {expected_revision:4,operation:id,change:crate::workspace_model::views::Change::RemoveSource {before,..},..}} if *id==operation && before==&pane));
+                    current.views[0].panes.clear();current.views[0].revision+=1;current.sequence+=1;
+                    reply(&mut server,retried.request_id,ServerMessage::Response {response:ServerResponse::WorkspaceModel {model:current}});
+                }
+                assert!(read_frame::<ClientEnvelope>(&mut server).unwrap().is_none(),"replacement must not receive a rebased Remove");
+            });
+            let mut client=ControlClient::from_stream(reader).unwrap();let (updates,rx)=async_channel::unbounded();
+            send(&mut client,edit,&updates).unwrap();drop(client);handle.join().unwrap();
+            let update=rx.try_recv().unwrap();
+            if replace {assert!(matches!(update,ModelUpdate::ViewRemovalRefused {operation:id,..} if id==operation));}else{assert!(matches!(update,ModelUpdate::ViewApplied {operation:Some(id),..} if id==operation));}
+        }
+    }
+
 }
