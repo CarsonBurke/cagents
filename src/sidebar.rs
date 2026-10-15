@@ -4179,6 +4179,7 @@ pub fn view<'a>(
     persisted_width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    static DEFAULT_SHORTCUTS: LazyLock<crate::settings::KeyboardShortcuts> = LazyLock::new(Default::default);
     view_inner(
         model,
         state,
@@ -4186,12 +4187,15 @@ pub fn view<'a>(
         persisted_width,
         modal_open,
         None,
-        &crate::settings::KeyboardShortcuts::default(),
+        &DEFAULT_SHORTCUTS,
     )
 }
 
 #[derive(Default)]
-pub struct NavigationCache(std::cell::RefCell<(Option<NavigationSnapshot>, u64)>);
+pub struct NavigationCache(
+    std::cell::RefCell<(Option<NavigationSnapshot>, u64)>,
+    std::cell::RefCell<(Option<Arc<crate::settings::KeyboardShortcuts>>, u64)>,
+);
 
 /// Exactly the inputs to `project_list`. File trees, history and commit
 /// composers belong to the source-control panel, which is rendered separately.
@@ -4259,6 +4263,14 @@ impl NavigationSnapshot {
 }
 
 impl NavigationCache {
+    fn shortcuts(&self, settings: &crate::settings::KeyboardShortcuts) -> (Arc<crate::settings::KeyboardShortcuts>, u64) {
+        let mut cached = self.1.borrow_mut();
+        if cached.0.as_deref() != Some(settings) {
+            cached.0 = Some(Arc::new(settings.clone()));
+            cached.1 = cached.1.wrapping_add(1);
+        }
+        (Arc::clone(cached.0.as_ref().expect("initialized shortcuts")), cached.1)
+    }
     fn generation(&self, model: &SidebarModel, state: &SidebarState) -> u64 {
         let mut snapshot = self.0.borrow_mut();
         if snapshot
@@ -4337,13 +4349,14 @@ fn view_inner<'a>(
                 && !model.projects.is_empty()
                 && !matches!(model.data_state, SidebarDataState::Error(_))
             {
+                let (shortcuts, shortcut_generation) = cache.shortcuts(shortcuts);
                 cosmic::iced::widget::lazy(
-                    (cache.generation(model, state), compact, modal_open),
-                    move |_| project_list(model, state, compact, modal_open),
+                    (cache.generation(model, state), compact, modal_open, shortcut_generation),
+                    move |_| project_list(model, state, compact, modal_open, &shortcuts),
                 )
                 .into()
             } else {
-                body(model, state, compact, modal_open)
+                body(model, state, compact, modal_open, &Arc::new(shortcuts.clone()))
             },
         )
         .width(Length::Fill)
@@ -4722,14 +4735,15 @@ fn body<'a>(
     state: &'a SidebarState,
     compact: bool,
     modal_open: bool,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'a, SidebarAction> {
     match &model.data_state {
         SidebarDataState::Loading if !model.projects.is_empty() => {
-            project_list(model, state, compact, modal_open)
+            project_list(model, state, compact, modal_open, shortcuts)
         }
         SidebarDataState::Loading => loading(),
         SidebarDataState::Error(message) => error(message, compact, modal_open),
-        SidebarDataState::Ready => project_list(model, state, compact, modal_open),
+        SidebarDataState::Ready => project_list(model, state, compact, modal_open, shortcuts),
     }
 }
 
@@ -4741,6 +4755,7 @@ fn project_list<'a>(
     state: &'a SidebarState,
     compact: bool,
     modal_open: bool,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
@@ -4772,7 +4787,7 @@ fn project_list<'a>(
             selection,
             modal_open,
             sticky_viewport.clone(),
-        ));
+        shortcuts));
     }
 
     let column = RowInteraction::projects(
@@ -5469,6 +5484,7 @@ fn project_view<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
@@ -5489,7 +5505,7 @@ fn project_view<'a>(
         selection
     };
     if compact {
-        return compact_project(project, expanded, selection, modal_open, sticky_viewport);
+        return compact_project(project, expanded, selection, modal_open, sticky_viewport, shortcuts);
     }
 
     let worktree_count = project.worktrees.len();
@@ -5595,7 +5611,8 @@ fn project_view<'a>(
             .state
             .rows
             .context_rows(SelectionRow::Project(project_id)),
-    );
+            shortcuts,
+        );
     let header = RowInteraction::selectable(
         header,
         SelectionRow::Project(project_id),
@@ -5623,6 +5640,7 @@ fn project_view<'a>(
                             .rows
                             .context_rows(SelectionRow::Channel(channel.id)),
                         &project.state.query,
+                        shortcuts,
                     ),
                     SelectionRow::Channel(channel.id),
                     project.state,
@@ -5663,7 +5681,7 @@ fn project_view<'a>(
                             .context_rows(SelectionRow::Worktree(project_id, worktree.id)),
                         &project.state.query,
                         !project.state.hide_worktree_changes_icons,
-                    ),
+                    shortcuts),
                     SelectionRow::Worktree(project_id, worktree.id),
                     project.state,
                     !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
@@ -5716,6 +5734,7 @@ fn compact_project<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let selected = matches!(
@@ -5745,7 +5764,8 @@ fn compact_project<'a>(
             .state
             .rows
             .context_rows(SelectionRow::Project(entity.id)),
-    );
+            shortcuts,
+        );
     let header = RowInteraction::selectable(
         header,
         SelectionRow::Project(entity.id),
@@ -5782,6 +5802,7 @@ fn compact_project<'a>(
                     .rows
                     .context_rows(SelectionRow::Channel(channel.id)),
                 &project.state.query,
+                shortcuts,
             ),
             SelectionRow::Channel(channel.id),
             project.state,
@@ -5833,7 +5854,7 @@ fn compact_project<'a>(
                     .context_rows(SelectionRow::Worktree(entity.id, worktree.id)),
                 &project.state.query,
                 !project.state.hide_worktree_changes_icons,
-            ),
+            shortcuts),
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
             !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
@@ -6139,6 +6160,7 @@ fn channel_view(
     compact: bool,
     selection_rows: Option<Arc<[SelectionRow]>>,
     query: &str,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
@@ -6213,7 +6235,7 @@ fn channel_view(
         compact,
     );
     crate::reorder::channel_target(grid.mount(with_deletion_retry(
-        channel_context_controls(action, channel.id, inert, selection_rows),
+        channel_context_controls(action, channel.id, inert, selection_rows, shortcuts),
         deletion,
         compact,
         &channel.title,
@@ -6261,6 +6283,25 @@ fn row_quick_delete<'a>(
     RowInteraction::actions(content, controls, if compact { 0.0 } else { width })
 }
 
+fn menu_bindings<A: widget::menu::Action<Message = SidebarAction>>(
+    actions: impl IntoIterator<Item = A>,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+    editors: &[SidebarEditor],
+) -> std::collections::HashMap<widget::menu::KeyBind, A> {
+    actions.into_iter().filter_map(|action| {
+        let SidebarAction::RunCommand { command, action: target } = action.message() else { return None; };
+        if command == crate::workspace_widget::GlobalShortcut::OpenInExternalEditor {
+            let editor_id = match &*target {
+                SidebarAction::ProjectCommand { command: ProjectCommand::OpenEditor(id), .. }
+                | SidebarAction::OpenFileInEditor { editor_id: id, .. } => id,
+                _ => return None,
+            };
+            if editors.first().is_none_or(|editor| editor.id != *editor_id) { return None; }
+        }
+        crate::workspace_widget::menu_shortcut(command, shortcuts).map(|key| (key, action))
+    }).collect()
+}
+
 /// The commands a channel row offers on right-click.
 ///
 /// A channel is the only navigation row whose contents exist nowhere else, so
@@ -6271,6 +6312,7 @@ fn channel_context_controls<'a>(
     channel_id: ChannelId,
     modal_open: bool,
     selection_rows: Option<Arc<[SelectionRow]>>,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
@@ -6308,7 +6350,11 @@ fn channel_context_controls<'a>(
                 ),
             );
         }
-        items(&std::collections::HashMap::new(), entries)
+        if selection_count == Some(1) { entries.insert(entries.len() - 1, Item::Divider); }
+        let bindings = menu_bindings(entries.iter().filter_map(|entry| match entry {
+            Item::Button(_, _, action) => Some(action.clone()), _ => None,
+        }), shortcuts, &[]);
+        items(&bindings, entries)
     }) else {
         return content.into();
     };
@@ -6438,6 +6484,7 @@ fn worktree_view<'a>(
     selection_rows: Option<Arc<[SelectionRow]>>,
     query: &str,
     show_changes_icons: bool,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
@@ -6634,6 +6681,7 @@ fn worktree_view<'a>(
             github_ready,
             editors,
             selection_rows,
+            shortcuts,
         ),
         deletion,
         compact,
@@ -6739,10 +6787,12 @@ fn context_controls<'a>(
     github_ready: bool,
     editors: &[SidebarEditor],
     selection_rows: Option<Arc<[SelectionRow]>>,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
     let editors = editors.to_vec();
+    let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
         return content.into();
     }
@@ -6755,9 +6805,9 @@ fn context_controls<'a>(
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
         }
+        commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
         if worktree_id.is_some() {
             commands.push(("Mark worktree read".into(), None, ProjectCommand::MarkRead));
-            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
             if git {
                 commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
                 commands.push((
@@ -6815,9 +6865,22 @@ fn context_controls<'a>(
             };
             commands.push((format!("{label}…"), None, command));
         }
-        let entries = commands
-            .iter()
-            .map(|(label, icon, command)| {
+        fn group(command: &ProjectCommand) -> u8 {
+            match command {
+                ProjectCommand::NewTerminal | ProjectCommand::NewChannel | ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch => 0,
+                ProjectCommand::CopyPath | ProjectCommand::CopyBranch => 1,
+                ProjectCommand::MoveUp | ProjectCommand::MoveDown | ProjectCommand::ResetSidebarOrder => 2,
+                ProjectCommand::Delete | ProjectCommand::Remove => 4,
+                _ => 3,
+            }
+        }
+        commands.sort_by_key(|(_, _, command)| group(command));
+        let mut previous = None;
+        let mut entries = Vec::new();
+        for (label, icon, command) in &commands {
+                let current = group(command);
+                if previous.is_some_and(|previous| previous != current) { entries.push(Item::Divider); }
+                previous = Some(current);
                 let canonical = commands::command_id(&SidebarAction::ProjectCommand {
                     project_id, worktree_id, command: command.clone(),
                 }).map(commands::label).unwrap_or(label.as_str());
@@ -6833,7 +6896,7 @@ fn context_controls<'a>(
                 } else {
                     Item::Button
                 };
-                item(
+                entries.push(item(
                     if !has_branch
                         && matches!(
                             command,
@@ -6854,10 +6917,13 @@ fn context_controls<'a>(
                         selection_rows.as_deref().filter(|rows| rows.len() > 1
                             && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove)),
                     ),
-                )
-            })
-            .collect();
-        items(&std::collections::HashMap::new(), entries)
+                ));
+        }
+        let bindings = menu_bindings(entries.iter().filter_map(|entry| match entry {
+            Item::Button(_, _, action) | Item::ButtonDisabled(_, _, action) => Some(*action),
+            _ => None,
+        }), &shortcuts, &editors);
+        items(&bindings, entries)
     })
 }
 
@@ -6940,13 +7006,18 @@ fn file_context_controls<'a>(
     editors: &'a [SidebarEditor],
     file_management: bool,
     blocked: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     if blocked {
         return content;
     }
     let path = &row.path;
     let mut entries = Vec::with_capacity(5 + editors.len());
+    let mut previous = None;
     for (label, icon, command) in file_commands(row.directory, file_management) {
+        let group = match command { FileCommand::Rename | FileCommand::CopyFile => 0, FileCommand::CopyPath | FileCommand::CopyRelativePath => 1, _ => 2 };
+        if previous.is_some_and(|previous| previous != group) { entries.push(widget::menu::Item::Divider); }
+        previous = Some(group);
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
             Some(icon.handle()),
@@ -6966,10 +7037,11 @@ fn file_context_controls<'a>(
             )
         }));
     }
-    crate::interaction::context_menu(
-        content,
-        widget::menu::items(&std::collections::HashMap::new(), entries),
-    )
+    let bindings = menu_bindings(entries.iter().filter_map(|entry| match entry {
+        widget::menu::Item::Button(_, _, action) => Some(*action),
+        _ => None,
+    }), shortcuts, editors);
+    crate::interaction::context_menu(content, widget::menu::items(&bindings, entries))
 }
 
 fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
@@ -7052,26 +7124,29 @@ pub fn git_panel<'a>(
         WorktreePanel::Changes,
         PanelNavigation::GitViews,
         false,
+        default_menu_shortcuts(),
     )
 }
 
 /// File navigation for the active worktree. Opens files in workspace columns;
 /// this panel contains only the filter, list-mode controls, and file list.
 pub fn file_panel<'a>(
-    model: &'a SidebarModel,
-    state: &'a SidebarState,
-    width: f32,
-    modal_open: bool,
+    model: &'a SidebarModel, state: &'a SidebarState, width: f32, modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(
-        model,
-        state,
-        width,
-        modal_open,
-        WorktreePanel::Files,
-        PanelNavigation::None,
-        false,
-    )
+    file_panel_with_shortcuts(model, state, width, modal_open, default_menu_shortcuts())
+}
+
+pub fn file_panel_with_shortcuts<'a>(
+    model: &'a SidebarModel, state: &'a SidebarState, width: f32, modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'a, SidebarAction> {
+    worktree_panel(model, state, width, modal_open, WorktreePanel::Files,
+        PanelNavigation::None, false, shortcuts)
+}
+
+fn default_menu_shortcuts() -> &'static crate::settings::KeyboardShortcuts {
+    static DEFAULT: LazyLock<crate::settings::KeyboardShortcuts> = LazyLock::new(Default::default);
+    &DEFAULT
 }
 
 /// Files, Git changes, or pull requests, with one tab row between them. Used
@@ -7090,7 +7165,7 @@ pub fn worktree_sidebar<'a>(
     git: bool,
 ) -> Element<'a, SidebarAction> {
     let (panel, navigation) = standalone_navigation(panel, git);
-    worktree_panel(model, state, width, modal_open, panel, navigation, true)
+    worktree_panel(model, state, width, modal_open, panel, navigation, true, default_menu_shortcuts())
 }
 
 /// Standalone panel with application-owned footer actions.
@@ -7106,7 +7181,7 @@ pub fn worktree_sidebar_with_footer<'a, M: 'a>(
 ) -> Element<'a, M> {
     let (panel, navigation) = standalone_navigation(panel, git);
     widget::column::with_children(vec![
-        worktree_panel(model, state, width, modal_open, panel, navigation, false).map(map),
+        worktree_panel(model, state, width, modal_open, panel, navigation, false, default_menu_shortcuts()).map(map),
         crate::design::horizontal_rule(),
         footer,
     ])
@@ -7318,6 +7393,7 @@ fn worktree_panel<'a>(
     panel: WorktreePanel,
     navigation: PanelNavigation,
     settings_footer: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let width = sidebar_pane_width(width);
     let content = match bound_source_control(model, state) {
@@ -7331,6 +7407,7 @@ fn worktree_panel<'a>(
             panel,
             navigation,
             width,
+            shortcuts,
         ),
         None => widget::container(
             widget::column::with_children(vec![
@@ -7509,6 +7586,7 @@ fn source_control_panel<'a>(
     panel: WorktreePanel,
     navigation: PanelNavigation,
     width: f32,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let chrome = &source.chrome;
     let key = &source.key;
@@ -7559,6 +7637,7 @@ fn source_control_panel<'a>(
                 modal_open,
                 editors,
                 file_management,
+                shortcuts,
             )),
         );
     };
@@ -7862,6 +7941,7 @@ fn files_section<'a>(
     modal_open: bool,
     editors: &'a [SidebarEditor],
     file_management: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let key = &source.key;
     let filter_key = key.clone();
@@ -8010,6 +8090,7 @@ fn files_section<'a>(
             editors,
             file_management,
             modal_open || source.reloading || source.busy(),
+            shortcuts,
         ));
         if expanded && let Some(error) = source.ignored_directory_errors.get(&row.path) {
             rows = rows.push(
@@ -11723,6 +11804,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn menu_shortcut_cache_reuses_settings_until_the_binding_changes() {
+        let cache = NavigationCache::default();
+        let mut settings = crate::settings::KeyboardShortcuts::default();
+        let (first, generation) = cache.shortcuts(&settings);
+        let (same, unchanged) = cache.shortcuts(&settings);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(generation, unchanged);
+        settings.rename_channel = vec!["Ctrl+Alt+F9".into()];
+        let (changed, next) = cache.shortcuts(&settings);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_ne!(generation, next);
+        assert_eq!(changed.rename_channel, settings.rename_channel);
+    }
+
+    #[test]
+    fn registered_project_channel_and_file_menus_render_their_configured_chords() {
+        fn assert_hint<A: widget::menu::Action<Message = SidebarAction>>(
+            action: A, settings: &crate::settings::KeyboardShortcuts,
+        ) {
+            use cosmic::iced::{Event, Point, Rectangle, Vector, mouse,
+                advanced::{Shell, clipboard, widget::Operation}};
+            let bindings = menu_bindings([action], settings, &[]);
+            assert_eq!(bindings.len(), 1);
+            let expected = bindings.keys().next().unwrap().to_string();
+            assert!(!expected.is_empty());
+            let renderer = headless_renderer();
+            let window = Size::new(600.0, 400.0);
+            let viewport = Rectangle::with_size(window);
+            let mut element = crate::interaction::context_menu(
+                cosmic::iced::widget::Space::new().width(240).height(32),
+                widget::menu::items(&bindings, vec![widget::menu::Item::Button("Bound command".to_owned(), None, action)]),
+            );
+            let mut tree = Tree::new(&element);
+            element.as_widget_mut().diff(&mut tree);
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            element.as_widget_mut().update(&mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&node), mouse::Cursor::Available(Point::new(20.0, 16.0)),
+                &renderer, &mut clipboard::Null, &mut Shell::new(&mut Vec::new()), &viewport);
+            let mut popup = element.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).expect("native menu");
+            let popup_node = popup.as_overlay_mut().layout(&renderer, window);
+            #[derive(Default)] struct Texts(Vec<String>);
+            impl Operation for Texts {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+                fn text(&mut self, _: Option<&Id>, _: Rectangle, value: &str) { self.0.push(value.to_owned()); }
+            }
+            let mut texts = Texts::default();
+            popup.as_overlay_mut().operate(Layout::new(&popup_node), &renderer, &mut texts);
+            assert!(texts.0.iter().any(|text| text == &expected), "missing {expected}: {:?}", texts.0);
+        }
+        let mut settings = crate::settings::KeyboardShortcuts::default();
+        settings.new_native_thread = vec!["Ctrl+Alt+F8".into()];
+        settings.rename_channel = vec!["Ctrl+Alt+F9".into()];
+        settings.copy_relative_path = vec!["Ctrl+Alt+F10".into()];
+        let command = ProjectCommand::NewChannel;
+        assert_hint(ContextCommand(project_id(1), Some(WorktreeId::new()), &command, None), &settings);
+        assert_hint(ChannelContextCommand(ChannelId::new(), None, ChannelMenuCommand::Rename), &settings);
+        let key = main_key();
+        let path = repo_path("src/main.rs");
+        assert_hint(FileContextCommand::Manage { key: &key, path: &path, command: FileCommand::CopyRelativePath }, &settings);
+    }
+
+    #[test]
+    fn menu_hints_keep_captured_rows_and_only_advertise_the_generic_commands_first_editor() {
+        use widget::menu::Action;
+        let mut settings = crate::settings::KeyboardShortcuts::default();
+        settings.delete_selected_rows = vec!["Ctrl+Alt+F8".into()];
+        settings.open_in_external_editor = vec!["Ctrl+Alt+F9".into()];
+        let rows = [SelectionRow::Channel(ChannelId::new()), SelectionRow::Channel(ChannelId::new())];
+        let action = ChannelContextCommand(ChannelId::new(), Some(&rows), ChannelMenuCommand::Delete);
+        let bindings = menu_bindings([action], &settings, &[]);
+        let SidebarAction::RunCommand { action: intent, .. } = bindings.values().next().unwrap().message() else { panic!("registered action"); };
+        assert_eq!(*intent, SidebarAction::DeleteRows(rows.to_vec()));
+        let editors: Vec<_> = ["first", "second"].into_iter().map(|id| SidebarEditor { id: id.into(), name: id.into(), icon: "text-editor-symbolic".into() }).collect();
+        let key = main_key();
+        let path = repo_path("src/main.rs");
+        let bindings = menu_bindings(editors.iter().map(|editor| FileContextCommand::Editor { key: &key, path: &path, editor_id: &editor.id }), &settings, &editors);
+        assert_eq!(bindings.len(), 1);
+        let SidebarAction::RunCommand { action: intent, .. } = bindings.values().next().unwrap().message() else { panic!("registered editor"); };
+        assert!(matches!(*intent, SidebarAction::OpenFileInEditor { editor_id, .. } if editor_id == "first"));
+    }
+
+    #[test]
     fn navigation_cache_invalidates_attention_query_and_disclosure_but_reuses_identical_views() {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
@@ -11823,11 +11987,11 @@ pub(crate) mod tests {
             project_id(1),
             WorktreeId::from_uuid(Uuid::from_u128(3)),
         ));
-        let quiet = project_list(&model, &state, true, false);
+        let quiet = project_list(&model, &state, true, false, &crate::settings::KeyboardShortcuts::default());
         assert!(Tree::new(&quiet).find(&id).is_none());
         state.controls_expanded = true;
         state.query = "fix".into();
-        let result = project_list(&model, &state, true, false);
+        let result = project_list(&model, &state, true, false, &crate::settings::KeyboardShortcuts::default());
         assert!(
             Tree::new(&result).find(&id).is_some(),
             "a matching inactive worktree must be mounted so Search Down can focus it"
@@ -12089,7 +12253,7 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, modal, compact, Some(Arc::from([SelectionRow::Channel(channel.id)])), "");
+            let mut element = channel_view(&channel, modal, compact, Some(Arc::from([SelectionRow::Channel(channel.id)])), "", default_menu_shortcuts());
             let mut tree = Tree::new(&element);
             let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -12175,7 +12339,7 @@ pub(crate) mod tests {
                     None,
                     "",
                     show,
-                )
+                &crate::settings::KeyboardShortcuts::default())
             };
             let counts = [true, false].map(|show| {
                 let mut element = row(show);
@@ -12238,7 +12402,7 @@ pub(crate) mod tests {
                 Some(Arc::from([SelectionRow::Worktree(project_id(1), worktree.id)])),
                 "",
                 true,
-            );
+            &crate::settings::KeyboardShortcuts::default());
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -12716,7 +12880,7 @@ pub(crate) mod tests {
                 None,
                 query,
                 true,
-            );
+            &crate::settings::KeyboardShortcuts::default());
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(
@@ -12805,7 +12969,7 @@ pub(crate) mod tests {
                     None,
                     false,
                     row_interaction::StickyViewport::default(),
-                ),
+                &crate::settings::KeyboardShortcuts::default()),
                 width,
             )
         };
@@ -13095,7 +13259,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false, Some(Arc::from([SelectionRow::Channel(channel.id)])), "");
+            let mut element = channel_view(channel, false, false, Some(Arc::from([SelectionRow::Channel(channel.id)])), "", default_menu_shortcuts());
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -13156,7 +13320,7 @@ pub(crate) mod tests {
             (false, 259.5),
             (true, COMPACT_WIDTH),
         ] {
-            let mut element = project_list(&model, &state, compact, false);
+            let mut element = project_list(&model, &state, compact, false, &crate::settings::KeyboardShortcuts::default());
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -13567,6 +13731,7 @@ pub(crate) mod tests {
                             editors,
                             file_management,
                             blocked,
+                            default_menu_shortcuts(),
                         );
                         let mut tree = Tree::new(&element);
                         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
@@ -13686,6 +13851,7 @@ pub(crate) mod tests {
             false,
             &[],
             Some(Arc::from([SelectionRow::Project(project_id(1))])),
+            &Arc::new(crate::settings::KeyboardShortcuts::default()),
         );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
@@ -14848,7 +15014,8 @@ pub(crate) mod tests {
                 true,
                 &[],
                 Some(Arc::from([SelectionRow::Worktree(project_id(1), WorktreeId::from_uuid(Uuid::from_u128(2)))])),
-            )
+            &Arc::new(crate::settings::KeyboardShortcuts::default()),
+        )
         };
         let renderer = headless_renderer();
         let viewport = cosmic::iced::Rectangle::with_size(Size::new(120.0, 32.0));
@@ -15832,7 +15999,7 @@ pub(crate) mod tests {
                 None,
                 "",
                 true,
-            );
+            &crate::settings::KeyboardShortcuts::default());
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(460.0, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(

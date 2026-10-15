@@ -2438,6 +2438,27 @@ impl Cagents {
                 }
                 _ => true,
             });
+            fn group(entry: &widget::menu::Item<PaneMenu, String>) -> u8 {
+                match entry {
+                    widget::menu::Item::Button(_, _, PaneMenu(_, command)) => match command {
+                        PaneMenuCommand::Rename | PaneMenuCommand::Clone | PaneMenuCommand::Fork(_) => 0,
+                        PaneMenuCommand::CopyPath => 1,
+                        PaneMenuCommand::CloseOthers | PaneMenuCommand::CloseToRight | PaneMenuCommand::Close | PaneMenuCommand::EndConversation => 3,
+                        _ => 2,
+                    },
+                    _ => 2,
+                }
+            }
+            entries.sort_by_key(group);
+            let mut grouped = Vec::with_capacity(entries.len() + 3);
+            let mut previous = None;
+            for entry in entries {
+                let current = group(&entry);
+                if previous.is_some_and(|previous| previous != current) { grouped.push(widget::menu::Item::Divider); }
+                previous = Some(current);
+                grouped.push(entry);
+            }
+            let mut entries = grouped;
             let bindings = entries
                 .iter()
                 .filter_map(|entry| {
@@ -2629,11 +2650,12 @@ impl Cagents {
                 .into()
             }
             ContextTab::Search => self.project_search_panel(),
-            ContextTab::Files => sidebar::file_panel(
+            ContextTab::Files => sidebar::file_panel_with_shortcuts(
                 &self.sidebar_model,
                 &self.sidebar_state,
                 width,
                 self.modal_is_open(),
+                &self.settings.keyboard_shortcuts,
             )
             .map(Message::Sidebar),
             ContextTab::Changes => sidebar::git_panel(

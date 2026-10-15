@@ -26,10 +26,11 @@ pub fn context_menu<'a, Message: 'static + Clone>(
     let mut this = ContextMenu {
         content: content.into(),
         context_menu: context_menu.map(|menus| {
+            let width = menus.iter().map(menu::Tree::preferred_width).max().unwrap_or(240);
             vec![menu::Tree::with_children(
                 crate::Element::from(crate::widget::Row::new()),
                 menus,
-            )]
+            ).width(width)]
         }),
         close_on_escape: true,
         window_id: window::Id::RESERVED,
@@ -116,7 +117,7 @@ impl<Message: Clone + 'static> ContextMenu<'_, Message> {
                     click_outside: true,
                     click_inside: true,
                 },
-                item_width: ItemWidth::Uniform(240),
+                item_width: ItemWidth::Static(240),
                 item_height: ItemHeight::Dynamic(40),
                 bar_bounds: bounds,
                 main_offset: -(bounds.height as i32),
@@ -501,7 +502,7 @@ impl<Message: 'static + Clone> Widget<Message, crate::Theme, crate::Renderer>
                     click_outside: true,
                     click_inside: true,
                 },
-                item_width: ItemWidth::Uniform(240),
+                item_width: ItemWidth::Static(240),
                 item_height: ItemHeight::Dynamic(40),
                 bar_bounds: bounds,
                 main_offset: -(bounds.height as i32),
