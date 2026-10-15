@@ -381,14 +381,24 @@ fn restore_authenticated(
         return Err(error);
     }
     handle.commit_native_installation()?;
-    let observer_registration={
-        let successor=crate::agent_execution::HostedSession::Chat(session.clone());
-        let result=execution_registry.lock().unwrap_or_else(|p|p.into_inner()).install_session_observer(
-            &successor,execution_instance,None,Some((&operational_directory,pinned.identity)),Some(&retained),
-        );
+    let observer_registration = {
+        let successor = crate::agent_execution::HostedSession::Chat(session.clone());
+        let result = execution_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .install_session_observer(
+                &successor,
+                execution_instance,
+                None,
+                Some((&operational_directory, pinned.identity)),
+                Some(&retained),
+            );
         match result {
-            Ok(registration)=>registration,
-            Err(error)=>{let _=handle.close();return Err(error);}
+            Ok(registration) => registration,
+            Err(error) => {
+                let _ = handle.close();
+                return Err(error);
+            }
         }
     };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -403,7 +413,11 @@ fn restore_authenticated(
     };
     if state.shutting_down || !pair_unchanged {
         drop(state);
-        if let Err(error)=execution_registry.lock().unwrap_or_else(|p|p.into_inner()).restore_session_observer(&observer_registration) {
+        if let Err(error) = execution_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore_session_observer(&observer_registration)
+        {
             tracing::warn!(%error,"cannot restore interrupted native adoption observer");
         }
         let _ = handle.close();
@@ -421,7 +435,7 @@ fn restore_authenticated(
         console_recipe: execution_console,
         paired_terminal: paired,
         handoff_receipt: None,
-            source_binding: None,
+        source_binding: None,
         session,
         handle,
         source_process: None,
@@ -440,8 +454,10 @@ fn restore_authenticated(
     };
     let response = session_snapshot(&record);
     state.issued_chat_ids.insert(id);
-    state.publish_chat_observer(id,execution_instance,observer_registration.stamp());
-    state.native_sources.installed(id, record.execution_instance);
+    state.publish_chat_observer(id, execution_instance, observer_registration.stamp());
+    state
+        .native_sources
+        .installed(id, record.execution_instance);
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

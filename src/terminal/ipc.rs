@@ -2142,26 +2142,69 @@ mod tests {
     #[test]
     fn native_backend_binding_and_exact_terminal_handoff_round_trip() {
         let proof = proof("handoff", "boot", "incarnation");
-        let recipe = LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(),
-            working_directory: "/fixture".into(), environment: Default::default(), unset_environment: Default::default() };
-        let source = crate::chat::Session { id: TerminalId::new(),
-            launch: crate::chat::Launch { provider: crate::agent::Provider::Omp, recipe: recipe.clone(), session_id: Some("confirmed-thread".into()) },
-            proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
-        let binding = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/fixture".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: recipe.clone(),
+                session_id: Some("confirmed-thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let binding = ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
         let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
         terminal.execution_instance = uuid::Uuid::new_v4();
-        terminal.session.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
-        let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance, source_binding: binding.clone(), retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: terminal.clone() };
-        let request = ClientRequest::ChatReturnTerminal { chat_id: source.id, expected: binding };
-        let mut bytes = Vec::new(); write_frame(&mut bytes, &request).unwrap();
+        terminal.session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let receipt = TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(),
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: terminal.clone(),
+        };
+        let request = ClientRequest::ChatReturnTerminal {
+            chat_id: source.id,
+            expected: binding,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
         let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
         assert_eq!(decoded, request);
-        let ack = ClientRequest::ChatCommitTerminalReceipt { receipt: receipt.clone() };
-        let mut bytes = Vec::new(); write_frame(&mut bytes, &ack).unwrap();
+        let ack = ClientRequest::ChatCommitTerminalReceipt {
+            receipt: receipt.clone(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &ack).unwrap();
         let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
         assert_eq!(decoded, ack);
-        let response = ServerResponse::ChatTerminal { chat_id: source.id, session: terminal.session.clone(), receipt, snapshot: Default::default() };
-        let mut bytes = Vec::new(); write_frame(&mut bytes, &response).unwrap();
+        let response = ServerResponse::ChatTerminal {
+            chat_id: source.id,
+            session: terminal.session.clone(),
+            receipt,
+            snapshot: Default::default(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
         let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
         assert_eq!(decoded, response);
     }
@@ -2213,7 +2256,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
+        let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2253,7 +2298,9 @@ mod tests {
             ..Default::default()
         };
         let mut bytes = Vec::new();
-        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
+        let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2280,7 +2327,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
+        let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };

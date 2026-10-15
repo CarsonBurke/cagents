@@ -1615,7 +1615,7 @@ mod tests {
                         .then(|| session.launch.clone()),
                     paired_terminal: Some(terminal),
                     handoff_receipt: None,
-            source_binding: None,
+                    source_binding: None,
                     session: chat::Session {
                         id: session.id,
                         native_continuity: Default::default(),
@@ -1775,7 +1775,7 @@ mod tests {
                     console_recipe: None,
                     paired_terminal: None,
                     handoff_receipt: None,
-            source_binding: None,
+                    source_binding: None,
                     session: chat::Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
@@ -2348,7 +2348,7 @@ mod tests {
                 console_recipe: None,
                 paired_terminal: None,
                 handoff_receipt: None,
-            source_binding: None,
+                source_binding: None,
                 session: chat::Session {
                     native_continuity: Default::default(),
                     owned_codex_listener: None,

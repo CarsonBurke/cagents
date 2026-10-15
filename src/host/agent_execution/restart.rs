@@ -487,7 +487,7 @@ mod tests {
                 console_recipe: Some(terminal.launch.clone()),
                 paired_terminal: Some(worker.clone()),
                 handoff_receipt: None,
-            source_binding: None,
+                source_binding: None,
                 session: session.clone(),
                 handle: actor.clone(),
                 source_process: None,

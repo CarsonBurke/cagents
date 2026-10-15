@@ -370,12 +370,20 @@ pub(super) fn restore(
         )?;
     handle.commit_native_installation()?;
     session.native_continuity = handle.native_continuity();
-    let retained_observer_sources = sources.iter().cloned()
-        .map(crate::agent_execution::HostedSession::Chat).collect::<Vec<_>>();
-    let observer_registration = registry.lock().unwrap_or_else(|p| p.into_inner())
+    let retained_observer_sources = sources
+        .iter()
+        .cloned()
+        .map(crate::agent_execution::HostedSession::Chat)
+        .collect::<Vec<_>>();
+    let observer_registration = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
         .install_session_observer(
             &crate::agent_execution::HostedSession::Chat(session.clone()),
-            identity.instance, None, None, Some(&retained_observer_sources),
+            identity.instance,
+            None,
+            None,
+            Some(&retained_observer_sources),
         )?;
     let observation = Observation {
         after_generation: handle.observe_next_update(),
@@ -387,7 +395,7 @@ pub(super) fn restore(
         console_recipe: inspection.execution_console,
         paired_terminal: paired.clone(),
         handoff_receipt: None,
-            source_binding: None,
+        source_binding: None,
         session,
         handle: handle.clone(),
         source_process: None,
@@ -418,7 +426,9 @@ pub(super) fn restore(
     };
     if state.shutting_down || state.proof() != proof || !pair_unchanged {
         drop(state);
-        if let Err(error) = registry.lock().unwrap_or_else(|p| p.into_inner())
+        if let Err(error) = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .restore_session_observer(&observer_registration)
         {
             tracing::warn!(%error, "cannot restore interrupted retained actor observer registration");
@@ -426,7 +436,9 @@ pub(super) fn restore(
         return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
     }
     state.publish_chat_observer(id, identity.instance, observer_registration.stamp());
-    state.native_sources.installed(id, record.execution_instance);
+    state
+        .native_sources
+        .installed(id, record.execution_instance);
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);

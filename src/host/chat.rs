@@ -3,15 +3,15 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 mod account_isolation_tests;
 mod execution_directory;
 mod handoff_budget;
-pub(in crate::host) mod source_binding;
 mod native_cleanup;
-pub(in crate::host) mod presentation_close;
 mod native_recovery;
 mod owned_listener;
+pub(in crate::host) mod presentation_close;
 pub(super) mod restart;
 pub(in crate::host) mod retained_actor;
 #[cfg(test)]
 mod retained_actor_tests;
+pub(in crate::host) mod source_binding;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -26,11 +26,16 @@ use crate::{
         ServerMessage, ServerResponse, validate_proof,
     },
 };
-pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native, close_with_presentation};
-#[cfg(test)]
-pub(super) use native_cleanup::{before_presentation_close_commit, before_presentation_close_owner_drop, after_presentation_close_commit};
 #[cfg(test)]
 pub(super) use native_cleanup::before_presentation_provider_close;
+pub(super) use native_cleanup::{
+    NativeClose, close_retained as close_retained_native, close_with_presentation,
+};
+#[cfg(test)]
+pub(super) use native_cleanup::{
+    after_presentation_close_commit, before_presentation_close_commit,
+    before_presentation_close_owner_drop,
+};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{
@@ -149,8 +154,14 @@ impl TerminalHandoff {
         subscribers: BTreeMap<ClientId, bool>,
         acknowledgement_deadline: Instant,
     ) -> Self {
-        Self { source: receipt.source.clone(), terminal: receipt.terminal.session.clone(),
-            issued: Some(receipt), generation, subscribers, acknowledgement_deadline }
+        Self {
+            source: receipt.source.clone(),
+            terminal: receipt.terminal.session.clone(),
+            issued: Some(receipt),
+            generation,
+            subscribers,
+            acknowledgement_deadline,
+        }
     }
 
     pub(super) fn issued(&self) -> Option<&crate::terminal_ipc::TerminalHandoffReceipt> {
@@ -225,15 +236,29 @@ fn issue_terminal_handoff(
     retained_binding: Option<crate::terminal_ipc::ChatSourceBinding>,
     terminal: crate::terminal_ipc::TerminalDescriptor,
 ) -> Result<crate::terminal_ipc::TerminalHandoffReceipt, ProtocolError> {
-    if !state.native_sources.validates(retained_binding.as_ref().unwrap_or(&source_binding))
-        || state.terminals.get(&terminal.session.id).is_none_or(|record|
-            record.handle.execution_instance() != terminal.execution_instance)
+    if !state
+        .native_sources
+        .validates(retained_binding.as_ref().unwrap_or(&source_binding))
+        || state
+            .terminals
+            .get(&terminal.session.id)
+            .is_none_or(|record| record.handle.execution_instance() != terminal.execution_instance)
     {
-        return Err(unavailable("The native backend or returned worker changed before handoff publication"));
+        return Err(unavailable(
+            "The native backend or returned worker changed before handoff publication",
+        ));
     }
-    let terminal_native_epoch = state.native_sources.retain_resource_epoch(terminal.session.id);
+    let terminal_native_epoch = state
+        .native_sources
+        .retain_resource_epoch(terminal.session.id);
     let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
-        operation: uuid::Uuid::new_v4(), source, source_execution_instance, source_binding, retained_binding, terminal_native_epoch, terminal,
+        operation: uuid::Uuid::new_v4(),
+        source,
+        source_execution_instance,
+        source_binding,
+        retained_binding,
+        terminal_native_epoch,
+        terminal,
     };
     handoff_budget::receipt(&receipt)?;
     state.remember_terminal_handoff(receipt.clone());
@@ -477,10 +502,18 @@ fn changed_from(
         }
         {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let observed = state.chats.get(&id).map(|r| (r.execution_instance, r.handle.confirmed_session_id(), r.handle.observed_backend_revision()));
+            let observed = state.chats.get(&id).map(|r| {
+                (
+                    r.execution_instance,
+                    r.handle.confirmed_session_id(),
+                    r.handle.observed_backend_revision(),
+                )
+            });
             if let Some((actual_instance, thread, revision)) = observed
                 && instance.is_none_or(|expected| expected == actual_instance)
-                && state.native_sources.observed(id, actual_instance, thread, revision)
+                && state
+                    .native_sources
+                    .observed(id, actual_instance, thread, revision)
             {
                 state.chats.get_mut(&id).expect("same lock").source_binding = None;
             }
@@ -514,8 +547,10 @@ fn changed_from(
             }
         }
     }
-    if let Some(instance)=instance {
-        if let Err(error)=super::session_locations::observe_chat_directory_thread(&host,id,instance,false) {
+    if let Some(instance) = instance {
+        if let Err(error) =
+            super::session_locations::observe_chat_directory_thread(&host, id, instance, false)
+        {
             tracing::warn!(%error,"cannot retain the owned provider's confirmed thread");
         }
     }
@@ -636,7 +671,12 @@ fn session_snapshot(record: &Record) -> ServerResponse {
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
-    ServerResponse::ChatAttached { session, snapshot, execution_instance: record.execution_instance, binding: record.source_binding.clone() }
+    ServerResponse::ChatAttached {
+        session,
+        snapshot,
+        execution_instance: record.execution_instance,
+        binding: record.source_binding.clone(),
+    }
 }
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
@@ -1096,8 +1136,8 @@ fn start_with_execution(
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
     let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
-    let binding_registry = super::session_locations::observer_registry(host)
-        .map_err(unavailable)?;
+    let binding_registry =
+        super::session_locations::observer_registry(host).map_err(unavailable)?;
     let operational_binding = binding_registry
         .as_ref()
         .map(|registry| {
@@ -1214,7 +1254,9 @@ fn start_with_execution(
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.native_sources.mutating(session.id);
-        if let Some(record) = state.chats.get_mut(&session.id) { record.source_binding = None; }
+        if let Some(record) = state.chats.get_mut(&session.id) {
+            record.source_binding = None;
+        }
     }
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
@@ -1695,42 +1737,74 @@ fn start_with_execution(
             .actor_identity()
             .map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
-        let approved=execution.as_ref().map(|context|context.directory_identity())
-            .transpose().map_err(unavailable)?.flatten();
-        if let Some(identity)=approved {
-            let directory=execution.as_ref().and_then(|context|context.directory_descriptor())
-                .ok_or_else(||unavailable("Native startup requires the approved directory descriptor"))?;
+        let approved = execution
+            .as_ref()
+            .map(|context| context.directory_identity())
+            .transpose()
+            .map_err(unavailable)?
+            .flatten();
+        if let Some(identity) = approved {
+            let directory = execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor())
+                .ok_or_else(|| {
+                    unavailable("Native startup requires the approved directory descriptor")
+                })?;
             if crate::agent_execution::DirectoryIdentity::from_metadata(
-                &directory.metadata().map_err(|error|unavailable(error.to_string()))?,
-            )!=identity {
-                let _=handle.close();
-                return Err(unavailable("The approved provider directory descriptor changed during startup"));
+                &directory
+                    .metadata()
+                    .map_err(|error| unavailable(error.to_string()))?,
+            ) != identity
+            {
+                let _ = handle.close();
+                return Err(unavailable(
+                    "The approved provider directory descriptor changed during startup",
+                ));
             }
         }
-        let observer_registry=match super::session_locations::observer_registry(host) {
-            Ok(registry)=>registry,
-            Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
-        };
-        let observer_registration=if let Some(registry)=&observer_registry {
-            let result=registry.lock().unwrap_or_else(|p|p.into_inner()).install_session_observer(
-                &crate::agent_execution::HostedSession::Chat(session.clone()),
-                execution_instance,Some(&previous_binding_source),
-                approved.map(|identity|(operational_directory.as_path(),identity)),None,
-            );
-            match result {
-                Ok(registration)=>Some(registration),
-                Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
+        let observer_registry = match super::session_locations::observer_registry(host) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                let _ = handle.close();
+                return Err(unavailable(reason));
             }
-        } else {None};
-        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        };
+        let observer_registration = if let Some(registry) = &observer_registry {
+            let result = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .install_session_observer(
+                    &crate::agent_execution::HostedSession::Chat(session.clone()),
+                    execution_instance,
+                    Some(&previous_binding_source),
+                    approved.map(|identity| (operational_directory.as_path(), identity)),
+                    None,
+                );
+            match result {
+                Ok(registration) => Some(registration),
+                Err(reason) => {
+                    let _ = handle.close();
+                    return Err(unavailable(reason));
+                }
+            }
+        } else {
+            None
+        };
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);
-            if let (Some(registry),Some(registration))=(&observer_registry,&observer_registration) {
-                if let Err(error)=registry.lock().unwrap_or_else(|p|p.into_inner()).restore_session_observer(registration) {
+            if let (Some(registry), Some(registration)) =
+                (&observer_registry, &observer_registration)
+            {
+                if let Err(error) = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .restore_session_observer(registration)
+                {
                     tracing::warn!(%error,"cannot restore cancelled native observer ownership");
                 }
             }
-            let _=handle.close();
+            let _ = handle.close();
             return Err(unavailable("Daemon shutdown cancelled chat start"));
         }
         let observation = Observation {
@@ -1776,10 +1850,12 @@ fn start_with_execution(
         let response = session_snapshot(&record);
         let installed_handle = record.handle.clone();
         state.issued_chat_ids.insert(id);
-        if let Some(registration)=&observer_registration {
-            state.publish_chat_observer(id,execution_instance,registration.stamp());
+        if let Some(registration) = &observer_registration {
+            state.publish_chat_observer(id, execution_instance, registration.stamp());
         }
-        state.native_sources.installed(id, record.execution_instance);
+        state
+            .native_sources
+            .installed(id, record.execution_instance);
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
@@ -1809,10 +1885,14 @@ fn start_with_execution(
 /// Attach a CLI view without stopping the server-owned thread or its native
 /// connection. Both descriptors retain the same daemon-owned session ID.
 pub(super) fn codex_terminal_view(
-    host: &SharedHost, client: ClientId, chat_id: TerminalId,
-    handle: &Handle, session: Session, recipe: crate::model::LaunchRecipe,
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: TerminalId,
+    handle: &Handle,
+    session: Session,
+    recipe: crate::model::LaunchRecipe,
 ) -> Result<ServerResponse, ProtocolError> {
-    codex_terminal_view_captured(host,client,chat_id,handle,session,recipe,None,||{})
+    codex_terminal_view_captured(host, client, chat_id, handle, session, recipe, None, || {})
 }
 
 pub(super) fn codex_terminal_view_with(
@@ -1822,21 +1902,41 @@ pub(super) fn codex_terminal_view_with(
     handle: &Handle,
     mut session: Session,
     recipe: crate::model::LaunchRecipe,
-    after_source:impl FnOnce(),
+    after_source: impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
-    codex_terminal_view_captured(host, client, chat_id, handle, session, recipe, None, after_source)
+    codex_terminal_view_captured(
+        host,
+        client,
+        chat_id,
+        handle,
+        session,
+        recipe,
+        None,
+        after_source,
+    )
 }
 
 fn codex_terminal_view_captured(
-    host: &SharedHost, client: ClientId, chat_id: TerminalId, handle: &Handle,
-    mut session: Session, recipe: crate::model::LaunchRecipe,
-    captured_intent: Option<crate::terminal_ipc::ChatSourceBinding>, after_source: impl FnOnce(),
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: TerminalId,
+    handle: &Handle,
+    mut session: Session,
+    recipe: crate::model::LaunchRecipe,
+    captured_intent: Option<crate::terminal_ipc::ChatSourceBinding>,
+    after_source: impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
     let (issued_source, source_instance, source_binding) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, chat_id)?;
-        if !record.handle.same_actor(handle) { return Err(unavailable("The original chat actor changed before terminal handoff")); }
-        let binding = record.source_binding.clone().ok_or_else(|| unavailable("This native backend has no authenticated source binding"))?;
+        if !record.handle.same_actor(handle) {
+            return Err(unavailable(
+                "The original chat actor changed before terminal handoff",
+            ));
+        }
+        let binding = record.source_binding.clone().ok_or_else(|| {
+            unavailable("This native backend has no authenticated source binding")
+        })?;
         (binding.source.clone(), record.execution_instance, binding)
     };
     let continuation = source_binding::continuation(host, &source_binding)?;
@@ -1865,18 +1965,39 @@ fn codex_terminal_view_captured(
                 ));
             }
             let descriptor = state.descriptor(client, terminal.id)?;
-            let receipt = record.handoff_receipt.as_ref().filter(|receipt|
-                receipt.terminal.execution_instance == descriptor.execution_instance
-                && receipt.source_execution_instance == record.execution_instance
-                && receipt.source_binding == original_intent).cloned();
-            let receipt = match receipt { Some(receipt) => receipt,
-                None => issue_terminal_handoff(&mut state, issued_source.clone(), source_instance, original_intent.clone(), (original_intent != source_binding).then_some(source_binding.clone()), descriptor)?, };
+            let receipt = record
+                .handoff_receipt
+                .as_ref()
+                .filter(|receipt| {
+                    receipt.terminal.execution_instance == descriptor.execution_instance
+                        && receipt.source_execution_instance == record.execution_instance
+                        && receipt.source_binding == original_intent
+                })
+                .cloned();
+            let receipt = match receipt {
+                Some(receipt) => receipt,
+                None => issue_terminal_handoff(
+                    &mut state,
+                    issued_source.clone(),
+                    source_instance,
+                    original_intent.clone(),
+                    (original_intent != source_binding).then_some(source_binding.clone()),
+                    descriptor,
+                )?,
+            };
             state.validate_terminal_handoff_receipt(&receipt)?;
-            state.chats.get_mut(&chat_id).expect("checked original actor").handoff_receipt = Some(receipt.clone());
+            state
+                .chats
+                .get_mut(&chat_id)
+                .expect("checked original actor")
+                .handoff_receipt = Some(receipt.clone());
             drop(state);
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
             return Ok(ServerResponse::ChatTerminal {
-                chat_id, session: receipt.terminal.session.clone(), receipt, snapshot,
+                chat_id,
+                session: receipt.terminal.session.clone(),
+                receipt,
+                snapshot,
             });
         }
         if record.returning_terminal {
@@ -1931,7 +2052,11 @@ fn codex_terminal_view_captured(
     recipe.working_directory = directory;
     if let Err(error) = handoff_budget::recipe(&recipe) {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(record) = state.chats.get_mut(&chat_id).filter(|record| record.handle.same_actor(handle)) {
+        if let Some(record) = state
+            .chats
+            .get_mut(&chat_id)
+            .filter(|record| record.handle.same_actor(handle))
+        {
             record.returning_terminal = false;
         }
         return Err(error);
@@ -2079,14 +2204,30 @@ fn codex_terminal_view_captured(
         // pairing must preserve a newer observation made during its RPC.
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
-        let receipt = issue_terminal_handoff(&mut state, issued_source.clone(), source_instance, original_intent.clone(), Some(retained_binding), descriptor.clone())?;
-        state.chats.get_mut(&chat_id).expect("checked original actor").handoff_receipt = Some(receipt.clone());
+        let receipt = issue_terminal_handoff(
+            &mut state,
+            issued_source.clone(),
+            source_instance,
+            original_intent.clone(),
+            Some(retained_binding),
+            descriptor.clone(),
+        )?;
+        state
+            .chats
+            .get_mut(&chat_id)
+            .expect("checked original actor")
+            .handoff_receipt = Some(receipt.clone());
         state.inventory_generation += 1;
         drop(state);
         let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
-        host.lock().unwrap_or_else(|p| p.into_inner()).validate_terminal_handoff_receipt(&receipt)?;
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .validate_terminal_handoff_receipt(&receipt)?;
         Ok(ServerResponse::ChatTerminal {
-            chat_id, session: descriptor.session.clone(), receipt, snapshot,
+            chat_id,
+            session: descriptor.session.clone(),
+            receipt,
+            snapshot,
         })
     })();
     if let Err(error) = result {
@@ -2632,7 +2773,12 @@ pub(super) fn close_captured(
 ) -> Result<ServerResponse, ProtocolError> {
     let request = ClientRequest::ChatClose { chat_id: source.id };
     super::agent_execution::interactive(host, client, request, |request| {
-        process_inner(host, client, request, Some((source, handle, execution_instance)))
+        process_inner(
+            host,
+            client,
+            request,
+            Some((source, handle, execution_instance)),
+        )
     })
 }
 
@@ -2685,19 +2831,20 @@ fn process_inner(
 ) -> Result<ServerResponse, ProtocolError> {
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
-    let transition =
-        match &request {
-            ClientRequest::ChatStart { session, .. }
-            | ClientRequest::ChatStartSelected { session, .. }
-            | ClientRequest::ChatAttach { session }
-            | ClientRequest::ChatRecoverAccount { source: session, .. }
-            | ClientRequest::ChatCloseSession { session } => Some(session.id),
-            ClientRequest::ChatClose { chat_id }
-            | ClientRequest::ChatReturnTerminal { chat_id, .. }
-            | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
-            _ => None,
+    let transition = match &request {
+        ClientRequest::ChatStart { session, .. }
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session }
+        | ClientRequest::ChatRecoverAccount {
+            source: session, ..
         }
-        .map(|id| restart::transition_gate(host, id));
+        | ClientRequest::ChatCloseSession { session } => Some(session.id),
+        ClientRequest::ChatClose { chat_id }
+        | ClientRequest::ChatReturnTerminal { chat_id, .. }
+        | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
+        _ => None,
+    }
+    .map(|id| restart::transition_gate(host, id));
     let _transition = match transition.as_ref().map(|gate| gate.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(poison))) => Some(poison.into_inner()),
@@ -2714,12 +2861,15 @@ fn process_inner(
     if let Some((source, handle, instance)) = captured_close {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
-        if instance.is_nil() || !matches!(&request,
+        if instance.is_nil()
+            || !matches!(&request,
             ClientRequest::ChatClose { chat_id } if *chat_id == source.id)
-            || !state.chats.get(&source.id).is_some_and(|record|
-                record.execution_instance == instance && record.handle.same_actor(handle)
+            || !state.chats.get(&source.id).is_some_and(|record| {
+                record.execution_instance == instance
+                    && record.handle.same_actor(handle)
                     && crate::agent_execution::HostedSession::Chat(record.session.clone())
-                        .same_process(&crate::agent_execution::HostedSession::Chat(source.clone())))
+                        .same_process(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            })
         {
             return Err(unavailable(
                 "The provider changed after its Agent binding failed; no replacement was stopped",
@@ -2896,7 +3046,11 @@ fn process_inner(
                 receipt.subscribers.entry(client).or_insert(false);
                 return Ok(ServerResponse::ChatAttached {
                     session: receipt.source.clone(),
-                    execution_instance: receipt.issued.as_ref().map(|r| r.source_execution_instance).unwrap_or_default(),
+                    execution_instance: receipt
+                        .issued
+                        .as_ref()
+                        .map(|r| r.source_execution_instance)
+                        .unwrap_or_default(),
                     binding: receipt.issued.as_ref().map(|r| r.source_binding.clone()),
                     snapshot: receipt.snapshot(),
                 });
@@ -3032,7 +3186,11 @@ fn process_inner(
                     ));
                 }
                 return Ok(ServerResponse::ChatSnapshot {
-                    execution_instance: receipt.issued.as_ref().map(|r| r.source_execution_instance).unwrap_or_default(),
+                    execution_instance: receipt
+                        .issued
+                        .as_ref()
+                        .map(|r| r.source_execution_instance)
+                        .unwrap_or_default(),
                     binding: receipt.issued.as_ref().map(|r| r.source_binding.clone()),
                     chat_id,
                     snapshot: (!after_generation
@@ -3050,7 +3208,8 @@ fn process_inner(
             drop(state);
             let response = handle.presentation(chat_id, after_generation).unwrap_or(
                 ServerResponse::ChatSnapshot {
-                    execution_instance: uuid::Uuid::nil(), binding: None,
+                    execution_instance: uuid::Uuid::nil(),
+                    binding: None,
                     chat_id,
                     snapshot: None,
                 },
@@ -3069,27 +3228,53 @@ fn process_inner(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id, expected } => {
-            if expected.source.id != chat_id { return Err(error("Captured backend belongs to another conversation")); }
+            if expected.source.id != chat_id {
+                return Err(error("Captured backend belongs to another conversation"));
+            }
             // Replay authenticates the original immutable operation, without
             // resolving a retired actor or learning a later backend.
             let replay = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                state.chat_handoffs.get(&chat_id).and_then(|h| h.issued.clone())
-                    .or_else(|| state.chats.get(&chat_id).and_then(|record| record.handoff_receipt.clone())
-                        .filter(|receipt| receipt.source_binding == expected))
+                state
+                    .chat_handoffs
+                    .get(&chat_id)
+                    .and_then(|h| h.issued.clone())
+                    .or_else(|| {
+                        state
+                            .chats
+                            .get(&chat_id)
+                            .and_then(|record| record.handoff_receipt.clone())
+                            .filter(|receipt| receipt.source_binding == expected)
+                    })
             };
             let admitted_binding = if let Some(receipt) = &replay {
-                if receipt.source_binding != expected { return Err(unavailable("This handoff belongs to another captured backend")); }
+                if receipt.source_binding != expected {
+                    return Err(unavailable(
+                        "This handoff belongs to another captured backend",
+                    ));
+                }
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 state.validate_terminal_handoff_receipt(receipt)?;
                 if let Some(record) = state.chats.get(&chat_id) {
                     let handle = attached(&state, client, chat_id)?.handle.clone();
-                    if record.handoff_receipt.as_ref() != Some(receipt) { return Err(unavailable("The exact retained pairing changed")); }
+                    if record.handoff_receipt.as_ref() != Some(receipt) {
+                        return Err(unavailable("The exact retained pairing changed"));
+                    }
                     drop(state);
-                    let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable"))?;
-                    return Ok(ServerResponse::ChatTerminal { chat_id, session: receipt.terminal.session.clone(), receipt: receipt.clone(), snapshot });
+                    let snapshot = handle.snapshot(None).ok_or_else(|| {
+                        unavailable("The exact retained transcript is unavailable")
+                    })?;
+                    return Ok(ServerResponse::ChatTerminal {
+                        chat_id,
+                        session: receipt.terminal.session.clone(),
+                        receipt: receipt.clone(),
+                        snapshot,
+                    });
                 }
-                receipt.retained_binding.clone().unwrap_or_else(|| expected.clone())
+                receipt
+                    .retained_binding
+                    .clone()
+                    .unwrap_or_else(|| expected.clone())
             } else {
                 source_binding::require(host, client, &expected)?
             };
@@ -3116,7 +3301,12 @@ fn process_inner(
                     ));
                 }
                 let record = attached(&state, client, chat_id)?;
-                (record.handle.clone(), record.session.clone(), admitted_binding.source.clone(), record.execution_instance)
+                (
+                    record.handle.clone(),
+                    record.session.clone(),
+                    admitted_binding.source.clone(),
+                    record.execution_instance,
+                )
             };
             session.launch.session_id = handle.confirmed_session_id();
             session.native_continuity = handle.native_continuity();
@@ -3133,7 +3323,16 @@ fn process_inner(
                         .iter()
                         .any(|arg| arg == "--remote" || arg.starts_with("--remote=")))
             {
-                return codex_terminal_view_captured(host, client, chat_id, &handle, session, recipe, Some(expected.clone()), || {});
+                return codex_terminal_view_captured(
+                    host,
+                    client,
+                    chat_id,
+                    &handle,
+                    session,
+                    recipe,
+                    Some(expected.clone()),
+                    || {},
+                );
             }
             if session.launch.provider == Provider::Codex && session.terminal.is_some() {
                 return Err(error(
@@ -3252,7 +3451,9 @@ fn process_inner(
                 // explicit recovery re-inserts a different actor under it; neither
                 // may donate its subscribers to this replacement terminal.
                 let retained = state.chats.get(&chat_id).is_some_and(|record| {
-                    record.returning_terminal && record.handle.same_actor(&handle) && record.execution_instance == source_instance
+                    record.returning_terminal
+                        && record.handle.same_actor(&handle)
+                        && record.execution_instance == source_instance
                 });
                 if !retained {
                     // The replacement has no receipt to commit and no source to be
@@ -3269,7 +3470,14 @@ fn process_inner(
                         "The chat was closed while returning to terminal; the replacement terminal was retired",
                     ));
                 }
-                let receipt = issue_terminal_handoff(&mut state, issued_source, source_instance, expected.clone(), (admitted_binding != expected).then_some(admitted_binding.clone()), descriptor.clone())?;
+                let receipt = issue_terminal_handoff(
+                    &mut state,
+                    issued_source,
+                    source_instance,
+                    expected.clone(),
+                    (admitted_binding != expected).then_some(admitted_binding.clone()),
+                    descriptor.clone(),
+                )?;
                 state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_restarts.remove(&chat_id);
@@ -3303,25 +3511,41 @@ fn process_inner(
             // ACK may be retried after retirement or a successor publication.
             // Its full operation authenticates only metadata that is STILL
             // exactly this receipt; it can never clear a newer same-ID slot.
-            let remove = state.chat_handoffs.get(&receipt.source.id)
+            let remove = state
+                .chat_handoffs
+                .get(&receipt.source.id)
                 .is_some_and(|pending| pending.issued.as_ref() == Some(&receipt));
-            if remove { state.chat_handoffs.remove(&receipt.source.id); }
+            if remove {
+                state.chat_handoffs.remove(&receipt.source.id);
+            }
             let mut changed = remove;
             if let Some(record) = state.chats.get_mut(&receipt.source.id)
-                && record.handoff_receipt.as_ref() == Some(&receipt) {
+                && record.handoff_receipt.as_ref() == Some(&receipt)
+            {
                 record.handoff_receipt = None;
                 changed = true;
             }
-            if changed { state.inventory_generation += 1; }
+            if changed {
+                state.inventory_generation += 1;
+            }
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatCommitTerminal { terminal_id } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if state.chat_handoffs.values().any(|pending|
-                pending.terminal.id == terminal_id && pending.issued.is_some())
-                || state.chats.values().any(|record| record.handoff_receipt.as_ref()
-                    .is_some_and(|receipt| receipt.terminal.session.id == terminal_id)) {
-                return Err(unavailable("This terminal handoff requires its full issued receipt acknowledgement; no operation was retired"));
+            if state
+                .chat_handoffs
+                .values()
+                .any(|pending| pending.terminal.id == terminal_id && pending.issued.is_some())
+                || state.chats.values().any(|record| {
+                    record
+                        .handoff_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.terminal.session.id == terminal_id)
+                })
+            {
+                return Err(unavailable(
+                    "This terminal handoff requires its full issued receipt acknowledgement; no operation was retired",
+                ));
             }
             // The authenticated envelope pins this receipt to the saved host.
             // Terminal retirement cannot invalidate a durable commit or its retry.
@@ -3808,20 +4032,42 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
 
 /// Check a paired managed presentation before the terminal worker itself can
 /// stop. This is read-only; the actor path repeats its checks after teardown.
-pub(super) fn preflight_for_terminal_close(host: &SharedHost, terminal_id: TerminalId,
-    expected: &crate::terminal::TerminalHandle) -> Result<(), ProtocolError> {
+pub(super) fn preflight_for_terminal_close(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+) -> Result<(), ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.chats.get(&terminal_id).filter(|record| {
-            (record.session.launch.provider == Provider::Codex || record.owns_execution_console())
-                && record.session.terminal.as_ref().is_some_and(|source| source.id == terminal_id)
-        }).map(|record| {
-            if !record.paired_terminal.as_ref().is_some_and(|handle| handle.same_worker(expected))
-                || !state.terminals.get(&terminal_id).is_some_and(|current| current.handle.same_worker(expected)) {
-                return Err(unavailable("The terminal worker no longer belongs to this provider pairing"));
-            }
-            Ok(record.session.clone())
-        }).transpose()?
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| {
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal_id)
+            })
+            .map(|record| {
+                if !record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|handle| handle.same_worker(expected))
+                    || !state
+                        .terminals
+                        .get(&terminal_id)
+                        .is_some_and(|current| current.handle.same_worker(expected))
+                {
+                    return Err(unavailable(
+                        "The terminal worker no longer belongs to this provider pairing",
+                    ));
+                }
+                Ok(record.session.clone())
+            })
+            .transpose()?
     };
     if let Some(source) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
@@ -4632,7 +4878,10 @@ for line in sys.stdin:
             process(
                 &host,
                 1,
-                ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) }
+                ClientRequest::ChatReturnTerminal {
+                    chat_id: session.id,
+                    expected: source_binding::fixture_binding(&host, session.id)
+                }
             )
             .is_err()
         );
@@ -4664,11 +4913,16 @@ for line in sys.stdin:
         )
         .unwrap();
         let ServerResponse::ChatTerminal {
-            session: terminal, receipt: full_receipt, ..
+            session: terminal,
+            receipt: full_receipt,
+            ..
         } = process(
             &host,
             1,
-            ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) },
+            ClientRequest::ChatReturnTerminal {
+                chat_id: session.id,
+                expected: source_binding::fixture_binding(&host, session.id),
+            },
         )
         .unwrap()
         else {
@@ -4690,7 +4944,10 @@ for line in sys.stdin:
             process(
                 &host,
                 2,
-                ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) }
+                ClientRequest::ChatReturnTerminal {
+                    chat_id: session.id,
+                    expected: source_binding::fixture_binding(&host, session.id)
+                }
             )
             .is_err()
         );
@@ -4765,7 +5022,10 @@ for line in sys.stdin:
         } = process(
             &host,
             2,
-            ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) },
+            ClientRequest::ChatReturnTerminal {
+                chat_id: session.id,
+                expected: source_binding::fixture_binding(&host, session.id),
+            },
         )
         .unwrap()
         else {
@@ -4918,12 +5178,25 @@ for line in sys.stdin:
             let mut state = host.lock().unwrap();
             state.register_client(1);
             let record = &state.chats[&saved.source.id];
-            (record.session.clone(), record.handle.clone(), record.execution_instance)
+            (
+                record.session.clone(),
+                record.handle.clone(),
+                record.execution_instance,
+            )
         };
         assert!(!previous.is_completed());
         for _ in 0..2 {
-            let response = process(&host, 1, ClientRequest::ChatAttach { session: session.clone() }).unwrap();
-            assert!(matches!(response, ServerResponse::ChatAttached { execution_instance, .. } if execution_instance == instance));
+            let response = process(
+                &host,
+                1,
+                ClientRequest::ChatAttach {
+                    session: session.clone(),
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(response, ServerResponse::ChatAttached { execution_instance, .. } if execution_instance == instance)
+            );
             let state = host.lock().unwrap();
             assert!(state.chats[&session.id].handle.same_actor(&previous));
             assert_eq!(state.chats[&session.id].execution_instance, instance);
@@ -4977,7 +5250,9 @@ for line in sys.stdin:
 
     #[test]
     fn failed_agent_bind_cleanup_does_not_close_a_same_id_restarted_actor() {
-        use crate::agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target};
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target,
+        };
         let (directory, host, saved) = upgrade_fixture();
         restore_upgrade(&host, &saved).unwrap();
         let (source, previous, instance) = {
@@ -4986,26 +5261,51 @@ for line in sys.stdin:
             state.register_client(0);
             let record = state.chats.get_mut(&saved.source.id).unwrap();
             record.subscribers.insert(0, false);
-            (record.session.clone(), record.handle.clone(), record.execution_instance)
+            (
+                record.session.clone(),
+                record.handle.clone(),
+                record.execution_instance,
+            )
         };
         // Fail a real binding write after the captured ChatAttached descriptor.
         // The barrier leaves the exact production cleanup helper suspended
         // while a supported completed-actor restart installs its successor.
-        let mut registry = super::super::model::Registry::at(&directory.path().join("binding.sqlite3")).unwrap();
-        registry.apply(&crate::workspace_model::ModelEdit::OpenProject {
-            repository: directory.path().to_owned(), name: "Binding fixture".into(),
-            kind: crate::model::ProjectKind::Folder,
-        }).unwrap();
-        let accepted = registry.submit_agent(&Origin::User, &Submit {
-            name: None,
-            destination: Destination::New(Spec {
-                provider: source.launch.provider, account: None,
-                target: Target { repository: directory.path().to_owned(), directory: directory.path().to_owned(), placement: None },
-                surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None,
-            }),
-            prompt: "Never submitted".into(), idempotency_key: "failed-bind".into(),
-        }, 1).unwrap();
-        registry.reserve_agent_launch(accepted.agent.id, &HostedSession::Chat(source.clone())).unwrap();
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("binding.sqlite3")).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: directory.path().to_owned(),
+                name: "Binding fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: source.launch.provider,
+                        account: None,
+                        target: Target {
+                            repository: directory.path().to_owned(),
+                            directory: directory.path().to_owned(),
+                            placement: None,
+                        },
+                        surface: Surface::Chat,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Never submitted".into(),
+                    idempotency_key: "failed-bind".into(),
+                },
+                1,
+            )
+            .unwrap();
+        registry
+            .reserve_agent_launch(accepted.agent.id, &HostedSession::Chat(source.clone()))
+            .unwrap();
         rusqlite::Connection::open(directory.path().join("binding.sqlite3")).unwrap().execute_batch("CREATE TRIGGER reject_fixture_binding BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture binding write refused'); END;").unwrap();
         let (failed_tx, failed_rx) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
@@ -5014,33 +5314,72 @@ for line in sys.stdin:
         let captured_source = source.clone();
         let captured_actor = previous.clone();
         let cleanup = thread::spawn(move || {
-            let binding = registry.bind_agent(accepted.agent.id, None, HostedSession::Chat(captured_source.clone()));
-            assert!(binding.unwrap_err().contains("fixture binding write refused"));
+            let binding = registry.bind_agent(
+                accepted.agent.id,
+                None,
+                HostedSession::Chat(captured_source.clone()),
+            );
+            assert!(
+                binding
+                    .unwrap_err()
+                    .contains("fixture binding write refused")
+            );
             failed_tx.send(()).unwrap();
             resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            closed_tx.send(close_captured(&closing_host, 0, &captured_source, &captured_actor, instance)).unwrap();
+            closed_tx
+                .send(close_captured(
+                    &closing_host,
+                    0,
+                    &captured_source,
+                    &captured_actor,
+                    instance,
+                ))
+                .unwrap();
         });
         failed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         previous.close().unwrap();
         assert!(previous.is_completed());
-        let ServerResponse::ChatAttached { session: restarted, .. } = process(
-            &host, 1, ClientRequest::ChatAttach { session: source.clone() },
-        ).unwrap() else { panic!("supported same-ID restart did not attach"); };
+        let ServerResponse::ChatAttached {
+            session: restarted, ..
+        } = process(
+            &host,
+            1,
+            ClientRequest::ChatAttach {
+                session: source.clone(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("supported same-ID restart did not attach");
+        };
         let replacement = {
             let state = host.lock().unwrap();
             let record = &state.chats[&source.id];
-            assert!(record.subscribers.contains_key(&0), "inherited attachment must not authorize a replacement close");
+            assert!(
+                record.subscribers.contains_key(&0),
+                "inherited attachment must not authorize a replacement close"
+            );
             assert_ne!(record.execution_instance, instance);
             record.handle.clone()
         };
         assert_eq!(restarted.id, source.id);
         assert!(!replacement.same_actor(&previous));
         resume_tx.send(()).unwrap();
-        let refusal = closed_rx.recv_timeout(Duration::from_secs(10)).expect("captured cleanup did not return before its fixture deadline").unwrap_err();
+        let refusal = closed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("captured cleanup did not return before its fixture deadline")
+            .unwrap_err();
         cleanup.join().unwrap();
-        assert!(refusal.message.contains("no replacement was stopped"), "{refusal:?}");
+        assert!(
+            refusal.message.contains("no replacement was stopped"),
+            "{refusal:?}"
+        );
         assert!(!replacement.is_completed());
-        assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&replacement));
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .handle
+                .same_actor(&replacement)
+        );
         // Even an identical descriptor and current actor reference cannot
         // reuse the previous installation's private execution instance.
         assert!(close_captured(&host, 0, &restarted, &replacement, instance).is_err());
@@ -5219,7 +5558,7 @@ done
                     console_recipe: None,
                     paired_terminal: None,
                     handoff_receipt: None,
-            source_binding: None,
+                    source_binding: None,
                     session: source.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -5290,7 +5629,10 @@ done
             Default::default(),
         )
         .unwrap();
-        let ServerResponse::ChatAttached { session, snapshot, .. } = response else {
+        let ServerResponse::ChatAttached {
+            session, snapshot, ..
+        } = response
+        else {
             panic!("Expected confirmed account attachment")
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
@@ -5545,7 +5887,7 @@ done
                     console_recipe: None,
                     paired_terminal: None,
                     handoff_receipt: None,
-            source_binding: None,
+                    source_binding: None,
                     session: session.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -5846,7 +6188,7 @@ done
                 console_recipe: None,
                 paired_terminal: None,
                 handoff_receipt: None,
-            source_binding: None,
+                source_binding: None,
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -5878,7 +6220,15 @@ done
             host.lock().unwrap().register_client(1);
             let ServerResponse::ChatTerminal {
                 session: terminal, ..
-            } = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id, expected: source_binding::fixture_binding(&host, chat_id) }).unwrap()
+            } = process(
+                &host,
+                1,
+                ClientRequest::ChatReturnTerminal {
+                    chat_id,
+                    expected: source_binding::fixture_binding(&host, chat_id),
+                },
+            )
+            .unwrap()
             else {
                 panic!("chat did not return to terminal")
             };
@@ -5985,7 +6335,7 @@ done
                     console_recipe: None,
                     paired_terminal: None,
                     handoff_receipt: None,
-            source_binding: None,
+                    source_binding: None,
                     session: Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,

@@ -17,16 +17,27 @@ pub(crate) struct BackendIdentity {
     conversation_revision: u64,
 }
 impl BackendIdentity {
-    pub(crate) fn conversation(&self) -> Option<String> { self.conversation.clone() }
+    pub(crate) fn conversation(&self) -> Option<String> {
+        self.conversation.clone()
+    }
     pub(crate) fn same_backend(&self, other: &Self) -> bool {
         self.helper == other.helper && self.actor == other.actor && self.process == other.process
     }
-    pub(crate) fn conversation_revision(&self) -> u64 { self.conversation_revision }
+    pub(crate) fn conversation_revision(&self) -> u64 {
+        self.conversation_revision
+    }
     pub(crate) fn first_confirmation(&self, other: &Self) -> bool {
-        self.same_backend(other) && self.conversation.is_none() && other.conversation.is_some()
+        self.same_backend(other)
+            && self.conversation.is_none()
+            && other.conversation.is_some()
             && self.conversation_revision.checked_add(1) == Some(other.conversation_revision)
     }
-    pub(crate) fn valid(&self) -> bool { !self.actor.is_nil() && self.process.pid > 0 && self.process.start > 0 && self.conversation_revision != u64::MAX }
+    pub(crate) fn valid(&self) -> bool {
+        !self.actor.is_nil()
+            && self.process.pid > 0
+            && self.process.start > 0
+            && self.conversation_revision != u64::MAX
+    }
 }
 
 #[derive(Clone)]
@@ -53,13 +64,15 @@ impl Handle {
     }
     #[cfg(test)]
     pub(crate) fn with_presentation_state_locked(&self, action: impl FnOnce()) {
-        self.local_actor().expect("fixture requires the actual Local owner")
+        self.local_actor()
+            .expect("fixture requires the actual Local owner")
             .with_presentation_state_locked(action);
     }
 
     #[cfg(test)]
     pub(crate) fn with_presentation_store_locked(&self, action: impl FnOnce()) {
-        self.local_actor().expect("fixture requires the actual Local owner")
+        self.local_actor()
+            .expect("fixture requires the actual Local owner")
             .with_presentation_store_locked(action);
     }
 
@@ -265,30 +278,46 @@ impl Handle {
                 let state: Option<super::remote_actor::Resident> =
                     remote.call("state", serde_json::json!([u64::MAX]))?;
                 let state = state.ok_or("Fresh retained backend evidence is unavailable")?;
-                if state.backend_confirmation_pending { return Err("Retained provider confirmation is still transitioning".into()); }
+                if state.backend_confirmation_pending {
+                    return Err("Retained provider confirmation is still transitioning".into());
+                }
                 Ok(BackendIdentity {
                     helper: Some(remote.identity().instance),
-                    actor: state.backend_instance.ok_or("Retained helper has no concrete backend incarnation evidence")?,
+                    actor: state
+                        .backend_instance
+                        .ok_or("Retained helper has no concrete backend incarnation evidence")?,
                     conversation: state.confirmed_session,
-                    conversation_revision: state.backend_conversation_revision.ok_or("Retained helper lacks exact conversation transition history")?,
-                    process: state.provider_process.ok_or(
-                        "Retained actor has no authenticated concrete backend identity")?,
+                    conversation_revision: state
+                        .backend_conversation_revision
+                        .ok_or("Retained helper lacks exact conversation transition history")?,
+                    process: state
+                        .provider_process
+                        .ok_or("Retained actor has no authenticated concrete backend identity")?,
                 })
             }
             Owner::Local(local) => {
                 let process = if let Some(process) = local.provider_process() {
                     process
                 } else {
-                    let record = local.native_holder_record().ok_or(
-                        "Native actor has no concrete backend identity")?;
+                    let record = local
+                        .native_holder_record()
+                        .ok_or("Native actor has no concrete backend identity")?;
                     let (recovery, _) = chat::native_holder::inspect(record, proof)?;
-                    recovery.server_process.ok_or(
-                        "Native holder has no authenticated concrete server identity")?
+                    recovery
+                        .server_process
+                        .ok_or("Native holder has no authenticated concrete server identity")?
                 };
                 let (conversation, conversation_revision) = local.backend_confirmation();
-                if conversation != local.confirmed_session_id() { return Err("Provider identity publication is still transitioning".into()); }
-                Ok(BackendIdentity { helper: None,
-                    actor: local.backend_instance(), process, conversation, conversation_revision })
+                if conversation != local.confirmed_session_id() {
+                    return Err("Provider identity publication is still transitioning".into());
+                }
+                Ok(BackendIdentity {
+                    helper: None,
+                    actor: local.backend_instance(),
+                    process,
+                    conversation,
+                    conversation_revision,
+                })
             }
         }
     }

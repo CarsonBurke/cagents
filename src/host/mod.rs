@@ -202,11 +202,18 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
 // This same admission path is used by the constructor-failure contract test.
 // No clients, provider restoration or helper adoption runs before it returns.
 fn initialize_model(host: &SharedHost, open: impl FnOnce() -> Result<model::Registry, String>) {
-    host.lock().unwrap_or_else(|p| p.into_inner()).expect_model();
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .expect_model();
     match open() {
-        Ok(registry) => host.lock().unwrap_or_else(|p| p.into_inner()).install_model(registry),
+        Ok(registry) => host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .install_model(registry),
         Err(error) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).model_open_failed();
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .model_open_failed();
             tracing::error!(%error, "the shared workspace model is unavailable; managed native owners were retained");
         }
     }
@@ -459,7 +466,9 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // These contexts may own a real helper before a Record or discovery
         // JSON exists. Snapshot only; explicit exact startup reconciliation
         // owns cleanup and never runs under HostLock or a renewed loop budget.
-        result = Err(format!("{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"));
+        result = Err(format!(
+            "{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"
+        ));
     }
     for (session, chat) in chats {
         // A committed upgrade transfers ownership, including when the final

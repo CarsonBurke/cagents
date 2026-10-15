@@ -53,7 +53,12 @@ fn model_unavailable(error: String) -> ProtocolError {
 // Only deliberately constructed diagnostic hosts may omit managed storage.
 // A real daemon records its opening attempt before it can adopt any owner.
 #[derive(Clone, Copy)]
-enum ModelAdmission { Unmanaged, Opening, Ready, Unavailable }
+enum ModelAdmission {
+    Unmanaged,
+    Opening,
+    Ready,
+    Unavailable,
+}
 
 pub(crate) type ClientId = u64;
 /// The lock every host user serializes on; see [`super::lock`].
@@ -344,11 +349,18 @@ struct PreparedUpgrade {
 impl HostState {
     /// Keep a bounded history after workers/actors retire. Live and pending
     /// owners retain their one exact receipt independently of history eviction.
-    pub(super) fn remember_terminal_handoff(&mut self, receipt: crate::terminal_ipc::TerminalHandoffReceipt) {
+    pub(super) fn remember_terminal_handoff(
+        &mut self,
+        receipt: crate::terminal_ipc::TerminalHandoffReceipt,
+    ) {
         const HISTORY: usize = 1024;
-        if self.handoff_receipts.contains_key(&receipt.operation) { return; }
+        if self.handoff_receipts.contains_key(&receipt.operation) {
+            return;
+        }
         while self.handoff_receipt_order.len() >= HISTORY {
-            if let Some(old) = self.handoff_receipt_order.pop_front() { self.handoff_receipts.remove(&old); }
+            if let Some(old) = self.handoff_receipt_order.pop_front() {
+                self.handoff_receipts.remove(&old);
+            }
         }
         self.handoff_receipt_order.push_back(receipt.operation);
         self.handoff_receipts.insert(receipt.operation, receipt);
@@ -356,18 +368,31 @@ impl HostState {
 
     /// Called under the same HostLock as a conditional source/membership edit.
     /// Neither public IDs nor a caller's descriptor can mint transition authority.
-    pub(super) fn validate_terminal_handoff_receipt(&self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt) -> Result<(), ProtocolError> {
+    pub(super) fn validate_terminal_handoff_receipt(
+        &self,
+        receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    ) -> Result<(), ProtocolError> {
         super::chat::source_binding::validate_receipt(self, receipt)?;
         let id = receipt.terminal.session.id;
         let instance = receipt.terminal.execution_instance;
-        if instance.is_nil() || self.published_terminal_workers.latest(id) != Some(instance)
-            || self.spawning.contains(&id) || self.chat_spawning.contains_key(&id)
-            || self.chats.get(&id).is_some_and(|record|
-                id != receipt.source.id || record.execution_instance != receipt.source_execution_instance)
-            || self.terminals.get(&id).is_some_and(|record| record.handle.execution_instance() != instance)
+        if instance.is_nil()
+            || self.published_terminal_workers.latest(id) != Some(instance)
+            || self.spawning.contains(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.chats.get(&id).is_some_and(|record| {
+                id != receipt.source.id
+                    || record.execution_instance != receipt.source_execution_instance
+            })
+            || self
+                .terminals
+                .get(&id)
+                .is_some_and(|record| record.handle.execution_instance() != instance)
         {
-            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
-                "The returned terminal was replaced or its exact publication history is unavailable", false));
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The returned terminal was replaced or its exact publication history is unavailable",
+                false,
+            ));
         }
 
         self.validate_issued_terminal_handoff(receipt)
@@ -375,14 +400,34 @@ impl HostState {
 
     /// Metadata-only ACK authenticates the immutable issued operation without
     /// requiring execution to remain live. It never grants teardown authority.
-    pub(super) fn validate_issued_terminal_handoff(&self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt) -> Result<(), ProtocolError> {
+    pub(super) fn validate_issued_terminal_handoff(
+        &self,
+        receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    ) -> Result<(), ProtocolError> {
         crate::terminal_ipc::validate_proof(receipt.source.proof.as_ref(), self.proof())?;
-        let issued = self.handoff_receipts.get(&receipt.operation)
-            .or_else(|| self.chat_handoffs.values().filter_map(|pending| pending.issued()).find(|old| old.operation == receipt.operation))
-            .or_else(|| self.chats.values().filter_map(|chat| chat.handoff_receipt.as_ref()).find(|old| old.operation == receipt.operation));
-        if issued == Some(receipt) { Ok(()) } else {
-            Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
-                "The exact host-issued terminal handoff is no longer retained; refresh the source without guessing a successor", false))
+        let issued = self
+            .handoff_receipts
+            .get(&receipt.operation)
+            .or_else(|| {
+                self.chat_handoffs
+                    .values()
+                    .filter_map(|pending| pending.issued())
+                    .find(|old| old.operation == receipt.operation)
+            })
+            .or_else(|| {
+                self.chats
+                    .values()
+                    .filter_map(|chat| chat.handoff_receipt.as_ref())
+                    .find(|old| old.operation == receipt.operation)
+            });
+        if issued == Some(receipt) {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The exact host-issued terminal handoff is no longer retained; refresh the source without guessing a successor",
+                false,
+            ))
         }
     }
 
@@ -514,11 +559,17 @@ impl HostState {
         self.model = Some(registry);
         self.model_admission = if self.execution_registry.is_some() {
             ModelAdmission::Ready
-        } else { ModelAdmission::Unavailable };
+        } else {
+            ModelAdmission::Unavailable
+        };
     }
 
-    pub(super) fn expect_model(&mut self) { self.model_admission = ModelAdmission::Opening; }
-    pub(super) fn model_open_failed(&mut self) { self.model_admission = ModelAdmission::Unavailable; }
+    pub(super) fn expect_model(&mut self) {
+        self.model_admission = ModelAdmission::Opening;
+    }
+    pub(super) fn model_open_failed(&mut self) {
+        self.model_admission = ModelAdmission::Unavailable;
+    }
 
     /// Resident admission state only; this never opens or probes a store.
     pub(super) fn managed_registry_unavailable(&self) -> bool {
@@ -531,9 +582,15 @@ impl HostState {
 
     /// In-memory publication of the exact durable observer registration. The
     /// caller installs this under the same HostLock as the matching Record.
-    pub(super) fn publish_chat_observer(&mut self,id:TerminalId,instance:uuid::Uuid,stamp:uuid::Uuid) {
-        self.chat_observer_stamps.retain(|id,_|self.chats.contains_key(id));
-        self.chat_observer_stamps.insert(id,(instance,stamp));
+    pub(super) fn publish_chat_observer(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+        stamp: uuid::Uuid,
+    ) {
+        self.chat_observer_stamps
+            .retain(|id, _| self.chats.contains_key(id));
+        self.chat_observer_stamps.insert(id, (instance, stamp));
     }
 
     /// How many hosted agents are working, and how many are waiting on the
@@ -1297,7 +1354,8 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
-        self.published_terminal_workers.observe(terminal_id, handle.execution_instance());
+        self.published_terminal_workers
+            .observe(terminal_id, handle.execution_instance());
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -1627,7 +1685,8 @@ impl HostState {
             return Err(ShutdownOutcome::AlreadyShuttingDown);
         }
         if !self.native_actor_startups.is_empty()
-            || crate::daemon::child_reaper::has_retained_ownership() {
+            || crate::daemon::child_reaper::has_retained_ownership()
+        {
             return Err(ShutdownOutcome::OwnershipUncertain);
         }
         if self.shutdown_capabilities.len() == MAX_SHUTDOWN_CAPABILITIES {
@@ -1689,7 +1748,8 @@ impl HostState {
             return Err("Daemon is already shutting down".into());
         }
         if !self.native_actor_startups.is_empty()
-            || crate::daemon::child_reaper::has_retained_ownership() {
+            || crate::daemon::child_reaper::has_retained_ownership()
+        {
             return Err("Original helper cleanup is still owned outside the session inventory; wait for exact cleanup or resolve retained ownership before upgrading".into());
         }
         let count = self.inventory_count();
@@ -1733,8 +1793,10 @@ impl HostState {
         // inventory and its indivisible shutdown admission fence. Only service
         // entries and quarantined cleanup credits are extra owners: a failed
         // startup publishes that fence before releasing its host reservation.
-        if !self.shutting_down && (!self.native_actor_startups.is_empty()
-            || crate::daemon::child_reaper::has_retained_ownership()) {
+        if !self.shutting_down
+            && (!self.native_actor_startups.is_empty()
+                || crate::daemon::child_reaper::has_retained_ownership())
+        {
             return ShutdownOutcome::OwnershipUncertain;
         }
         let count = self.inventory_count();
@@ -2196,7 +2258,9 @@ fn prepare_upgrade_with_carry_policy(
         let handle = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.descriptor(0, terminal.source.id)?.session != terminal.source {
-                return Err(upgrade_error("A carried terminal changed before its input could be verified"));
+                return Err(upgrade_error(
+                    "A carried terminal changed before its input could be verified",
+                ));
             }
             state.terminals[&terminal.source.id].handle.clone()
         };
@@ -6533,32 +6597,47 @@ for line in sys.stdin:
     }
 
     fn run_child_shutdown_fixture(name: &str, marker: &str) -> bool {
-        if std::env::var_os(marker).is_some() { return false; }
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
         let directory = tempfile::tempdir().unwrap();
         for entry in ["data", "config", "cache", "runtime"] {
             std::fs::create_dir(directory.path().join(entry)).unwrap();
         }
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture", "--test-threads=1"]).env_clear()
-            .env(marker, "1").env("PATH", "/usr/bin:/bin").env("HOME", directory.path())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env(marker, "1")
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", directory.path())
             .env("XDG_DATA_HOME", directory.path().join("data"))
             .env("XDG_CONFIG_HOME", directory.path().join("config"))
             .env("XDG_CACHE_HOME", directory.path().join("cache"))
             .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()).spawn().unwrap();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(25);
         loop {
-            if child.try_wait().unwrap().is_some() { break; }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             if Instant::now() >= deadline {
-                let _ = child.kill(); let _ = child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("isolated original-child shutdown fixture exceeded its deadline");
             }
             std::thread::sleep(Duration::from_millis(5));
         }
         let result = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&result.stdout);
-        assert!(result.status.success() && stdout.contains("1 passed"), "{stdout}\n{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         true
     }
 
@@ -6566,22 +6645,33 @@ for line in sys.stdin:
     fn retained_original_child_fences_empty_stop_and_upgrade_after_preflight() {
         const CHILD: &str = "CAGENTS_CHILD_SHUTDOWN_FIXTURE";
         const NAME: &str = "host::state::tests::retained_original_child_fences_empty_stop_and_upgrade_after_preflight";
-        if run_child_shutdown_fixture(NAME, CHILD) { return; }
+        if run_child_shutdown_fixture(NAME, CHILD) {
+            return;
+        }
         use crate::daemon::child_reaper;
         use std::os::fd::FromRawFd;
         fn original_child() -> (std::process::Child, std::fs::File, std::process::ChildStdin) {
             let mut child = std::process::Command::new("/bin/cat")
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null()).spawn().unwrap();
-            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as libc::c_int };
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let descriptor = unsafe {
+                libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as libc::c_int
+            };
             if descriptor < 0 {
                 let error = std::io::Error::last_os_error();
-                let _ = child.kill(); let _ = child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("fixture pidfd: {error}");
             }
             let stdin = child.stdin.take().unwrap();
             // SAFETY: pidfd_open returned a new owned descriptor above.
-            (child, unsafe { std::fs::File::from_raw_fd(descriptor) }, stdin)
+            (
+                child,
+                unsafe { std::fs::File::from_raw_fd(descriptor) },
+                stdin,
+            )
         }
         fn wait_reaped() {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -6596,20 +6686,55 @@ for line in sys.stdin:
         // The host's spawn reservation represents the not-yet-installed actor.
         let mut spawning = test_host();
         spawning.reserve_spawn(TerminalId::new()).unwrap();
-        let capability = spawning.shutdown_preflight(Instant::now()).unwrap().capability;
-        assert!(matches!(spawning.shutdown(ShutdownOperation::Confirm { capability }, Instant::now()), ShutdownOutcome::Accepted { live_terminals_before: 1, .. }));
+        let capability = spawning
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        assert!(matches!(
+            spawning.shutdown(ShutdownOperation::Confirm { capability }, Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 1,
+                ..
+            }
+        ));
         let mut state = test_host();
         let before_transfer = state.shutdown_preflight(Instant::now()).unwrap().capability;
         let (child, pidfd, stdin) = original_child();
-        reservation.retain(child, pidfd).unwrap_or_else(|(error, mut child, _, _)| {
-            let _ = child.kill(); let _ = child.wait(); panic!("fixture transfer: {error}");
-        });
+        reservation
+            .retain(child, pidfd)
+            .unwrap_or_else(|(error, mut child, _, _)| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture transfer: {error}");
+            });
         assert_eq!(state.inventory_count(), 0);
-        assert_eq!(state.shutdown_preflight(Instant::now()), Err(ShutdownOutcome::OwnershipUncertain));
-        assert_eq!(state.shutdown(empty_stop(), Instant::now()), ShutdownOutcome::OwnershipUncertain);
-        assert_eq!(state.shutdown(ShutdownOperation::Confirm { capability: before_transfer.clone() }, Instant::now()), ShutdownOutcome::OwnershipUncertain);
-        assert!(state.validate_upgrade_capability(&before_transfer, Instant::now()).unwrap_err().contains("Original helper cleanup"));
-        assert!(!state.shutting_down, "no uncertain stop may commit the shutdown fence");
+        assert_eq!(
+            state.shutdown_preflight(Instant::now()),
+            Err(ShutdownOutcome::OwnershipUncertain)
+        );
+        assert_eq!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: before_transfer.clone()
+                },
+                Instant::now()
+            ),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert!(
+            state
+                .validate_upgrade_capability(&before_transfer, Instant::now())
+                .unwrap_err()
+                .contains("Original helper cleanup")
+        );
+        assert!(
+            !state.shutting_down,
+            "no uncertain stop may commit the shutdown fence"
+        );
         drop(stdin);
         wait_reaped();
         state.shutdown_preflight(Instant::now()).unwrap();
@@ -6619,17 +6744,29 @@ for line in sys.stdin:
         let (child, pidfd, stdin) = original_child();
         reservation.preserve_suspended(child, Some(pidfd), "injected transfer failure");
         drop(stdin);
-        assert_eq!(state.shutdown(empty_stop(), Instant::now()), ShutdownOutcome::OwnershipUncertain);
+        assert_eq!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::OwnershipUncertain
+        );
         assert_eq!(child_reaper::retry_preserved().unwrap().retained, 0);
         wait_reaped();
-        assert!(matches!(state.shutdown(empty_stop(), Instant::now()), ShutdownOutcome::Accepted { live_terminals_before: 0, .. }));
+        assert!(matches!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn failed_startup_holder_queued_for_cleanup_is_not_an_empty_daemon() {
         const CHILD: &str = "CAGENTS_QUEUED_HOLDER_SHUTDOWN_FIXTURE";
-        const NAME: &str = "host::state::tests::failed_startup_holder_queued_for_cleanup_is_not_an_empty_daemon";
-        if run_child_shutdown_fixture(NAME, CHILD) { return; }
+        const NAME: &str =
+            "host::state::tests::failed_startup_holder_queued_for_cleanup_is_not_an_empty_daemon";
+        if run_child_shutdown_fixture(NAME, CHILD) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let invalid_transcript = directory.path().join("transcript-directory");
         std::fs::create_dir(&invalid_transcript).unwrap();
@@ -6643,43 +6780,100 @@ for line in sys.stdin:
             working_directory: directory.path().into(), environment: Default::default(), unset_environment: Default::default(),
         };
         let session = TerminalSession {
-            id: TerminalId::new(), launch: recipe.clone(), transcript_path: Some(invalid_transcript), resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
-            owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: Some(invalid_transcript),
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
         };
         TerminalHandle::with_blocked_holder_cleanup_for_test(|| {
-            assert!(!crate::daemon::child_reaper::has_retained_ownership(), "bounded latch jobs own no process");
+            assert!(
+                !crate::daemon::child_reaper::has_retained_ownership(),
+                "bounded latch jobs own no process"
+            );
             let error = spawn_terminal(&host, 1, session.clone(), Default::default()).unwrap_err();
-            assert!(error.message.contains("open transcript"), "failure must occur after creating the actual holder: {error:?}");
+            assert!(
+                error.message.contains("open transcript"),
+                "failure must occur after creating the actual holder: {error:?}"
+            );
             let deadline = Instant::now() + Duration::from_secs(2);
             let markers = loop {
-                let markers = ["holder", "root"].into_iter().map(|name| {
-                    std::fs::read_to_string(directory.path().join(name)).ok()?.parse::<i32>().ok()
-                }).collect::<Option<Vec<_>>>();
-                if let Some(markers) = markers { break markers; }
-                assert!(Instant::now() < deadline, "fixture child never wrote its owned process markers");
+                let markers = ["holder", "root"]
+                    .into_iter()
+                    .map(|name| {
+                        std::fs::read_to_string(directory.path().join(name))
+                            .ok()?
+                            .parse::<i32>()
+                            .ok()
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(markers) = markers {
+                    break markers;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture child never wrote its owned process markers"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             };
             for pid in markers {
-                assert!(crate::daemon::holder_registry::Process::read(pid).unwrap().is_current(), "the queued holder still owns its actual live child");
+                assert!(
+                    crate::daemon::holder_registry::Process::read(pid)
+                        .unwrap()
+                        .is_current(),
+                    "the queued holder still owns its actual live child"
+                );
             }
             let mut state = host.lock().unwrap();
             assert!(state.spawning.is_empty());
             assert!(state.terminals.is_empty());
             assert_eq!(state.inventory_count(), 0);
-            assert_eq!(state.shutdown_preflight(Instant::now()), Err(ShutdownOutcome::OwnershipUncertain));
-            assert_eq!(state.shutdown(empty_stop(), Instant::now()), ShutdownOutcome::OwnershipUncertain);
-            assert_eq!(state.shutdown(ShutdownOperation::Confirm { capability: capability.clone() }, Instant::now()), ShutdownOutcome::OwnershipUncertain);
-            assert!(state.validate_upgrade_capability(&capability, Instant::now()).is_err());
+            assert_eq!(
+                state.shutdown_preflight(Instant::now()),
+                Err(ShutdownOutcome::OwnershipUncertain)
+            );
+            assert_eq!(
+                state.shutdown(empty_stop(), Instant::now()),
+                ShutdownOutcome::OwnershipUncertain
+            );
+            assert_eq!(
+                state.shutdown(
+                    ShutdownOperation::Confirm {
+                        capability: capability.clone()
+                    },
+                    Instant::now()
+                ),
+                ShutdownOutcome::OwnershipUncertain
+            );
+            assert!(
+                state
+                    .validate_upgrade_capability(&capability, Instant::now())
+                    .is_err()
+            );
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while crate::daemon::child_reaper::has_retained_ownership() {
-            assert!(Instant::now() < deadline, "queued original child cleanup never completed");
+            assert!(
+                Instant::now() < deadline,
+                "queued original child cleanup never completed"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         let mut state = host.lock().unwrap();
         state.shutdown_preflight(Instant::now()).unwrap();
-        assert!(matches!(state.shutdown(empty_stop(), Instant::now()), ShutdownOutcome::Accepted { live_terminals_before: 0, .. }));
+        assert!(matches!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6857,7 +7051,7 @@ for line in sys.stdin:
                 console_recipe: None,
                 paired_terminal: None,
                 handoff_receipt: None,
-            source_binding: None,
+                source_binding: None,
                 session,
                 handle: handle.clone(),
                 source_process: None,

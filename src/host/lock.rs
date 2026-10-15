@@ -113,10 +113,16 @@ impl<T> HostMutex<T> {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return Err(TryLockError::WouldBlock),
         };
-        self.site.store(std::ptr::from_ref(Location::caller()).cast_mut(), Ordering::Relaxed);
+        self.site.store(
+            std::ptr::from_ref(Location::caller()).cast_mut(),
+            Ordering::Relaxed,
+        );
         self.acquisitions.fetch_add(1, Ordering::Relaxed);
         self.owner.store(current_thread(), Ordering::Relaxed);
-        Ok(HostGuard {guard, owner: &self.owner})
+        Ok(HostGuard {
+            guard,
+            owner: &self.owner,
+        })
     }
 
     /// The acquisition currently holding the lock, if any.

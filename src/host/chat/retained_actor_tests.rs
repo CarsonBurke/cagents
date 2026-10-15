@@ -382,8 +382,12 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         1,
         "adoption must never resend the accepted prompt"
     );
-    super::super::agent_execution::process(&successor, Authority::default(), crate::agent_execution::Operation::Close(accepted.agent.id))
-        .unwrap();
+    super::super::agent_execution::process(
+        &successor,
+        Authority::default(),
+        crate::agent_execution::Operation::Close(accepted.agent.id),
+    )
+    .unwrap();
     wait_until(
         || {
             !identity.record.holder.is_current()
@@ -764,7 +768,12 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             .count(),
         1
     );
-    super::super::agent_execution::process(&host, Authority::default(), crate::agent_execution::Operation::Close(receipt.agent)).unwrap();
+    super::super::agent_execution::process(
+        &host,
+        Authority::default(),
+        crate::agent_execution::Operation::Close(receipt.agent),
+    )
+    .unwrap();
     wait_until(
         || {
             !receipt.identity.record.holder.is_current()
@@ -1018,7 +1027,6 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     drop(lease);
 }
 
-
 /// Real helper/provider startup fails before discovery. A private test latch
 /// holds the actual LocalHandle while the public start has already returned Err.
 #[test]
@@ -1026,80 +1034,127 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
     const EXACT: &str = "host::chat::retained_actor_tests::failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup";
     const CHILD: &str = "CAGENTS_STARTUP_OWNER_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        use std::{io::Read, os::{fd::FromRawFd, unix::fs::OpenOptionsExt}};
+        use std::{
+            io::Read,
+            os::{fd::FromRawFd, unix::fs::OpenOptionsExt},
+        };
         const LOG_LIMIT: u64 = 4 * 1024 * 1024;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = directory.path();
-        for path in ["home/.claude", "run", "data", "config", "cache", "bin", "project", "hold"] {
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+            "hold",
+        ] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
-        fs::set_permissions(root.join("hold"),fs::Permissions::from_mode(0o700)).unwrap();
-        let private_log = |name| fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root.join(name)).unwrap();
+        fs::set_permissions(root.join("hold"), fs::Permissions::from_mode(0o700)).unwrap();
+        let private_log = |name| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root.join(name))
+                .unwrap()
+        };
         let stdout = private_log("fixture.stdout");
         let stderr = private_log("fixture.stderr");
         let reservation = crate::daemon::child_reaper::reserve().unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", EXACT, "--nocapture"])
-            .env_clear().env(CHILD,"1").env("CAGENTS_RETAINED_ACTOR_FIXTURE","1")
-            .env("CAGENTS_HOLDER_ROOT",root).env("CAGENTS_STARTUP_OWNER_HOLD",root.join("hold"))
-            .env("HOME",root.join("home")).env("CLAUDE_CONFIG_DIR",root.join("home/.claude"))
-            .env("XDG_RUNTIME_DIR",root.join("run")).env("XDG_DATA_HOME",root.join("data"))
-            .env("XDG_CONFIG_HOME",root.join("config")).env("XDG_CACHE_HOME",root.join("cache"))
-            .env("PATH",format!("{}:/usr/bin:/bin",root.join("bin").display()))
-            .stdout(stdout).stderr(stderr);
+            .env_clear()
+            .env(CHILD, "1")
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root)
+            .env("CAGENTS_STARTUP_OWNER_HOLD", root.join("hold"))
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .stdout(stdout)
+            .stderr(stderr);
         // This tiny empty-start fixture has bounded regular output files.
         // Apply the cap before exec so even a broken child cannot grow them
         // between the parent's polling ticks; it is not a product setting.
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(|| {
-                let cap = libc::rlimit {rlim_cur:LOG_LIMIT,rlim_max:LOG_LIMIT};
-                if libc::setrlimit(libc::RLIMIT_FSIZE,&cap)==-1 {return Err(std::io::Error::last_os_error());}
+                let cap = libc::rlimit {
+                    rlim_cur: LOG_LIMIT,
+                    rlim_max: LOG_LIMIT,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
         let mut child = command.spawn().unwrap();
         reservation.quarantine();
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open,child.id(),0) };
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
         if raw < 0 {
             let error = std::io::Error::last_os_error();
             let _ = child.kill();
-            reservation.preserve_suspended(child,None,"startup fixture pidfd capture failed");
+            reservation.preserve_suspended(child, None, "startup fixture pidfd capture failed");
             let _ = directory.keep(); // Preserve private evidence for uncertain fixture descendants.
             panic!("Cannot pin exact fixture child: {error}");
         }
         let pidfd = unsafe { std::fs::File::from_raw_fd(raw as i32) };
-        let deadline = Instant::now()+Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let read_log = |name| -> std::io::Result<String> {
                         let mut text = String::new();
-                        fs::File::open(root.join(name))?.take(LOG_LIMIT+1).read_to_string(&mut text)?;
-                        if text.len() as u64>LOG_LIMIT {return Err(std::io::Error::other("fixture log exceeded cap"));}
+                        fs::File::open(root.join(name))?
+                            .take(LOG_LIMIT + 1)
+                            .read_to_string(&mut text)?;
+                        if text.len() as u64 > LOG_LIMIT {
+                            return Err(std::io::Error::other("fixture log exceeded cap"));
+                        }
                         Ok(text)
                     };
                     let stdout = read_log("fixture.stdout");
                     let stderr = read_log("fixture.stderr");
-                    let exactly_one = stdout.as_ref().is_ok_and(|text|
-                        text.lines().any(|line|line=="running 1 test")
-                        && text.lines().any(|line|line==format!("test {EXACT} ... ok"))
-                        && text.lines().any(|line|line.starts_with("test result: ok. 1 passed; 0 failed;")));
+                    let exactly_one = stdout.as_ref().is_ok_and(|text| {
+                        text.lines().any(|line| line == "running 1 test")
+                            && text
+                                .lines()
+                                .any(|line| line == format!("test {EXACT} ... ok"))
+                            && text.lines().any(|line| {
+                                line.starts_with("test result: ok. 1 passed; 0 failed;")
+                            })
+                    });
                     if !status.success() || !exactly_one || stderr.is_err() {
-                        let stdout = stdout.map(|text|text.chars().take(4096).collect::<String>());
-                        let stderr = stderr.map(|text|text.chars().take(4096).collect::<String>());
+                        let stdout = stdout.map(|text| text.chars().take(4096).collect::<String>());
+                        let stderr = stderr.map(|text| text.chars().take(4096).collect::<String>());
                         let retained = directory.keep();
-                        panic!("isolated startup fixture did not prove exactly one passing test: {status}; retained={retained:?}; stdout={stdout:?}; stderr={stderr:?}");
+                        panic!(
+                            "isolated startup fixture did not prove exactly one passing test: {status}; retained={retained:?}; stdout={stdout:?}; stderr={stderr:?}"
+                        );
                     }
                     return;
                 }
-                Ok(None) if Instant::now()<deadline => thread::sleep(Duration::from_millis(20)),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
                 result => {
                     let _ = child.kill();
-                    if let Err((error,child,pidfd,reservation)) = reservation.retain(child,pidfd) {
-                        reservation.preserve_suspended(child,Some(pidfd),&error.to_string());
+                    if let Err((error, child, pidfd, reservation)) =
+                        reservation.retain(child, pidfd)
+                    {
+                        reservation.preserve_suspended(child, Some(pidfd), &error.to_string());
                     }
                     let _ = directory.keep();
                     panic!("Exact startup fixture did not settle before its deadline: {result:?}");
@@ -1109,68 +1164,158 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
     }
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
     install_provider(&root.join("bin/claude"));
-    let proof = HostSessionProof {host_session_id:HostSessionId::new("startup-owner-fixture"),
-        boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:HostIncarnation::new("first")};
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("startup-owner-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("first"),
+    };
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
-    let lease = crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
-    let capability = host.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
-    let source = chat::fresh_session(Provider::Claude,TerminalId::new(),root.join("project"),
-        &crate::account::Account::system(Provider::Claude)).unwrap();
-    let context = Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
-    struct Release {path:std::path::PathBuf,context:Arc<chat::protocol::ExecutionContext>}
-    impl Drop for Release {
-        fn drop(&mut self) {let _=fs::write(&self.path,b"release");let _=self.context.reconcile_cleanup();}
+    let capability = host
+        .lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap()
+        .capability;
+    let source = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let context =
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
+    struct Release {
+        path: std::path::PathBuf,
+        context: Arc<chat::protocol::ExecutionContext>,
     }
-    let release = Release {path:root.join("hold/release"),context:context.clone()};
-    let error = start_execution(&host,0,source.clone(),context.clone()).unwrap_err();
-    assert!(error.message.contains("Fixture refuses Attached"),"{error:?}");
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.path, b"release");
+            let _ = self.context.reconcile_cleanup();
+        }
+    }
+    let release = Release {
+        path: root.join("hold/release"),
+        context: context.clone(),
+    };
+    let error = start_execution(&host, 0, source.clone(), context.clone()).unwrap_err();
+    assert!(
+        error.message.contains("Fixture refuses Attached"),
+        "{error:?}"
+    );
     #[derive(serde::Deserialize)]
-    struct Evidence {source:Session,helper:crate::daemon::holder_registry::Process,provider:crate::daemon::holder_registry::Process}
-    let evidence: Evidence = serde_json::from_slice(&fs::read(root.join("hold/failed-startup.json")).unwrap()).unwrap();
-    assert_eq!(evidence.source.id,source.id);
+    struct Evidence {
+        source: Session,
+        helper: crate::daemon::holder_registry::Process,
+        provider: crate::daemon::holder_registry::Process,
+    }
+    let evidence: Evidence =
+        serde_json::from_slice(&fs::read(root.join("hold/failed-startup.json")).unwrap()).unwrap();
+    assert_eq!(evidence.source.id, source.id);
     assert!(evidence.helper.is_current() && evidence.provider.is_current());
-    assert_eq!(context.outcome(),chat::protocol::LaunchOutcome::Uncertain);
-    let native = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
-    let socket = crate::daemon::holder_registry::socket(&native,source.id);
+    assert_eq!(context.outcome(), chat::protocol::LaunchOutcome::Uncertain);
+    let native =
+        crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
+            .unwrap();
+    let socket = crate::daemon::holder_registry::socket(&native, source.id);
     assert!(!socket.exists() && !socket.with_extension("json").exists());
     {
         let state = host.lock().unwrap();
-        assert!(!state.chats.contains_key(&source.id) && !state.chat_spawning.contains_key(&source.id));
+        assert!(
+            !state.chats.contains_key(&source.id) && !state.chat_spawning.contains_key(&source.id)
+        );
         let pending = state.native_actor_startups.get(&source.id).unwrap();
-        assert!(Arc::ptr_eq(&pending.context,&context));
-        assert_eq!(pending.source,evidence.source);
+        assert!(Arc::ptr_eq(&pending.context, &context));
+        assert_eq!(pending.source, evidence.source);
     }
     let started = Instant::now();
     {
-        use crate::terminal_ipc::{ShutdownOperation,ShutdownOutcome};
+        use crate::terminal_ipc::{ShutdownOperation, ShutdownOutcome};
         let mut state = host.lock().unwrap();
-        assert!(state.spawning.is_empty() && state.chat_spawning.is_empty()
-            && state.chats.is_empty() && state.terminals.is_empty(),
-            "no published or spawning record masks the startup-only guard");
-        assert_eq!(state.shutdown_preflight(Instant::now()),Err(ShutdownOutcome::OwnershipUncertain));
-        assert_eq!(state.shutdown(ShutdownOperation::Stop {require_empty:true,expected_generation:None},Instant::now()),ShutdownOutcome::OwnershipUncertain);
-        assert_eq!(state.shutdown(ShutdownOperation::Confirm {capability:capability.clone()},Instant::now()),ShutdownOutcome::OwnershipUncertain);
-        assert!(state.allow_automatic_worktree_cleanup(0,&[]).unwrap_err().contains("native helper startup"));
+        assert!(
+            state.spawning.is_empty()
+                && state.chat_spawning.is_empty()
+                && state.chats.is_empty()
+                && state.terminals.is_empty(),
+            "no published or spawning record masks the startup-only guard"
+        );
+        assert_eq!(
+            state.shutdown_preflight(Instant::now()),
+            Err(ShutdownOutcome::OwnershipUncertain)
+        );
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Stop {
+                    require_empty: true,
+                    expected_generation: None
+                },
+                Instant::now()
+            ),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: capability.clone()
+                },
+                Instant::now()
+            ),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert!(
+            state
+                .allow_automatic_worktree_cleanup(0, &[])
+                .unwrap_err()
+                .contains("native helper startup")
+        );
         assert!(!state.shutting_down);
     }
-    assert!(super::super::state::prepare_upgrade(&host,capability,false).is_err());
-    assert!(super::super::finish_chat_shutdown(&host).unwrap_err().contains("native helper startup"));
-    assert!(started.elapsed()<Duration::from_secs(2),"pending-owner admission must not invoke its held cleanup RPC");
+    assert!(super::super::state::prepare_upgrade(&host, capability, false).is_err());
+    assert!(
+        super::super::finish_chat_shutdown(&host)
+            .unwrap_err()
+            .contains("native helper startup")
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "pending-owner admission must not invoke its held cleanup RPC"
+    );
     // A deliberate start retry invokes exact cleanup and may wait for the
     // latch then legitimately launch a successor. It is not a nonblocking
     // admission probe; only the shutdown/upgrade guards above claim that.
     let mut unrelated = evidence.source.clone();
-    unrelated.launch.recipe.arguments.push("--not-the-owned-startup".into());
-    assert!(retained_actor::reconcile_startup(&host,&unrelated).is_err());
-    assert!(Arc::ptr_eq(&host.lock().unwrap().native_actor_startups[&source.id].context,&context));
+    unrelated
+        .launch
+        .recipe
+        .arguments
+        .push("--not-the-owned-startup".into());
+    assert!(retained_actor::reconcile_startup(&host, &unrelated).is_err());
+    assert!(Arc::ptr_eq(
+        &host.lock().unwrap().native_actor_startups[&source.id].context,
+        &context
+    ));
     assert!(evidence.helper.is_current() && evidence.provider.is_current());
-    fs::write(&release.path,b"release").unwrap();
-    assert!(retained_actor::reconcile_startup(&host,&evidence.source).unwrap());
-    assert_eq!(context.outcome(),chat::protocol::LaunchOutcome::TeardownProved);
+    fs::write(&release.path, b"release").unwrap();
+    assert!(retained_actor::reconcile_startup(&host, &evidence.source).unwrap());
+    assert_eq!(
+        context.outcome(),
+        chat::protocol::LaunchOutcome::TeardownProved
+    );
     assert!(!evidence.helper.is_current() && !evidence.provider.is_current());
-    assert!(!host.lock().unwrap().native_actor_startups.contains_key(&source.id));
-    host.lock().unwrap().shutdown_preflight(Instant::now()).unwrap();
+    assert!(
+        !host
+            .lock()
+            .unwrap()
+            .native_actor_startups
+            .contains_key(&source.id)
+    );
+    host.lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap();
     assert!(!socket.exists() && !socket.with_extension("json").exists());
     drop(release);
     drop(lease);

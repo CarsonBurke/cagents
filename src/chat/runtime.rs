@@ -34,8 +34,8 @@ pub(crate) fn remove_actor_final_snapshot(
     remote_actor::final_snapshot::remove(record)
 }
 mod handle;
-pub use handle::Handle;
 pub(crate) use handle::BackendIdentity;
+pub use handle::Handle;
 pub(crate) use remote_actor::RestartState as RetainedRestartState;
 pub(crate) use remote_actor::{
     ActorIdentity, ActorInspection, InputIdentity, InputReceipt, InputState, OutboxEntry,
@@ -156,7 +156,6 @@ pub(crate) enum Update {
     /// A provider-confirmed identity changed after initial readiness. Scalar
     /// metadata only; the host reads its exact current actor under its fence.
     Identity,
-
 }
 
 #[derive(Clone)]
@@ -221,12 +220,26 @@ impl LocalHandle {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
         let completed = self.is_completed();
-        let owns_work = if self.0.history_only { false }
-            else if !completed { true }
-            else { self.0.failure.try_lock()
-                .map_err(|_| "Provider close metadata is busy or unavailable; retry close after it settles".to_owned())?.is_some() };
-        Ok(CloseIdentity {session_id: state.session_id.clone(),
-            native_continuity: state.native_continuity.clone(), owns_work, completed})
+        let owns_work = if self.0.history_only {
+            false
+        } else if !completed {
+            true
+        } else {
+            self.0
+                .failure
+                .try_lock()
+                .map_err(|_| {
+                    "Provider close metadata is busy or unavailable; retry close after it settles"
+                        .to_owned()
+                })?
+                .is_some()
+        };
+        Ok(CloseIdentity {
+            session_id: state.session_id.clone(),
+            native_continuity: state.native_continuity.clone(),
+            owns_work,
+            completed,
+        })
     }
 
     #[cfg(test)]
@@ -235,9 +248,15 @@ impl LocalHandle {
         action();
     }
 
-    pub(crate) fn backend_instance(&self) -> uuid::Uuid { self.0.backend_instance }
+    pub(crate) fn backend_instance(&self) -> uuid::Uuid {
+        self.0.backend_instance
+    }
     pub(crate) fn backend_confirmation(&self) -> (Option<String>, u64) {
-        let confirmed = self.0.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
+        let confirmed = self
+            .0
+            .backend_conversation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         (confirmed.thread.clone(), confirmed.revision)
     }
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
@@ -263,7 +282,8 @@ impl BackendConversation {
             _ => None,
         };
         if let Some(next) = next
-            && (next != self.thread || matches!(event, Event::Reset { .. })) {
+            && (next != self.thread || matches!(event, Event::Reset { .. }))
+        {
             self.revision = self.revision.saturating_add(1);
             self.thread = next;
         }
@@ -380,7 +400,10 @@ impl LocalHandle {
         holder: super::native_holder::Holder,
         reason: String,
     ) {
-        assert!(self.is_completed(), "fixture requires an already closed local actor");
+        assert!(
+            self.is_completed(),
+            "fixture requires an already closed local actor"
+        );
         assert!(self.0.worker.lock().unwrap().is_none());
         let mut retained = self.0.retained_native.lock().unwrap();
         assert!(retained.is_none());
@@ -1588,11 +1611,18 @@ impl LocalHandle {
         {
             let mut update = presentation.clone();
             update.metadata.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update, execution_instance: uuid::Uuid::nil(), binding: None })
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate {
+                chat_id,
+                update,
+                execution_instance: uuid::Uuid::nil(),
+                binding: None,
+            })
         } else {
             let mut snapshot = state.clone();
             snapshot.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                execution_instance: uuid::Uuid::nil(),
+                binding: None,
                 chat_id,
                 snapshot: Some(snapshot),
             })
@@ -3385,14 +3415,21 @@ impl Actor {
         // which can publish or fail. Capture all identities, not only the last
         // Session observed by a callback/UI snapshot.
         let backend_identity_changed = {
-            let mut history = self.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
+            let mut history = self
+                .backend_conversation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let previous = history.revision;
-            for event in &step.events { history.observe(event); }
+            for event in &step.events {
+                history.observe(event);
+            }
             previous != history.revision
         };
         // Revocation cannot depend on successful Store writes/frame I/O.
         // Fresh positive proof separately checks that confirmation is coherent.
-        if backend_identity_changed { (self.notify)(Update::Identity); }
+        if backend_identity_changed {
+            (self.notify)(Update::Identity);
+        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -3479,11 +3516,16 @@ impl Actor {
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         let identity_changed = if let Some(confirmed) = confirmed {
-            let mut retained=self.confirmed_session.lock().unwrap_or_else(|p| p.into_inner());
-            let changed=*retained!=confirmed;
-            *retained=confirmed;
+            let mut retained = self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let changed = *retained != confirmed;
+            *retained = confirmed;
             changed
-        } else {false};
+        } else {
+            false
+        };
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
         // its final outcome (which may arrive in a much later frame).
@@ -3511,7 +3553,9 @@ impl Actor {
                 let _ = reply.send(result);
             }
         }
-        if identity_changed || backend_identity_changed { (self.notify)(Update::Identity); }
+        if identity_changed || backend_identity_changed {
+            (self.notify)(Update::Identity);
+        }
         self.publish_activity();
         Ok(())
     }
@@ -4517,25 +4561,88 @@ mod tests {
     fn confirmed_identity_after_initial_ready_emits_a_scalar_identity_wake() {
         struct LateIdentity;
         impl Adapter for LateIdentity {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {writes:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
-            fn receive(&mut self,value:Value)->Result<Step,String> {Ok(Step {events:vec![Event::Session {id:value["identity"].as_str().unwrap().to_owned(),title:None}],..Default::default()})}
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![
+                        serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: value["identity"].as_str().unwrap().to_owned(),
+                        title: None,
+                    }],
+                    ..Default::default()
+                })
+            }
         }
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec::from(&crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()});
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let events=Arc::new(Mutex::new(Vec::new()));let observed=events.clone();
-        let handle=LocalHandle::start(spec,Box::new(LateIdentity),initial,store,None,move |update|observed.lock().unwrap().push(update)).unwrap();
-        until(&handle,|state|state.ready);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec::from(&crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(LateIdentity),
+            initial,
+            store,
+            None,
+            move |update| observed.lock().unwrap().push(update),
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
         assert!(handle.confirmed_session_id().is_none());
         handle.command(Command::Refresh).unwrap();
-        until(&handle,|state|state.session_id.is_some());
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while !events.lock().unwrap().iter().any(|update|matches!(update,Update::Identity)) {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Ready)).count(),1,"the provider never reinitializes just to publish its identity");
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Identity)).count(),1);
-        assert_eq!(handle.confirmed_session_id().as_deref(),Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        until(&handle, |state| state.session_id.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| matches!(update, Update::Identity))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Ready))
+                .count(),
+            1,
+            "the provider never reinitializes just to publish its identity"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Identity))
+                .count(),
+            1
+        );
+        assert_eq!(
+            handle.confirmed_session_id().as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
         handle.close().unwrap();
     }
 

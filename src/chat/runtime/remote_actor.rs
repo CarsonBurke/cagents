@@ -380,7 +380,9 @@ impl RemoteActor {
             || !proof.is_complete()
             || proof.boot_id != record.boot
         {
-            return Err("Retained retirement request has incompatible actor or attachment authority".into());
+            return Err(
+                "Retained retirement request has incompatible actor or attachment authority".into(),
+            );
         }
         final_snapshot::retirement_proved_for_record(record, proof)
     }
@@ -407,10 +409,12 @@ impl RemoteActor {
     pub fn try_close_identity(&self) -> Result<super::CloseIdentity, String> {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
-        Ok(super::CloseIdentity {session_id: state.session_id.clone(),
+        Ok(super::CloseIdentity {
+            session_id: state.session_id.clone(),
             native_continuity: state.native_continuity.clone(),
             owns_work: !self.0.preserved.load(Ordering::Acquire) && state.owns_work,
-            completed: state.completed})
+            completed: state.completed,
+        })
     }
     pub fn state(&self) -> Arc<Resident> {
         self.0
@@ -771,9 +775,11 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
-                        let identity_changed=state.confirmed_session != old.confirmed_session
-                            || state.backend_conversation_revision != old.backend_conversation_revision
-                            || state.backend_confirmation_pending != old.backend_confirmation_pending;
+                        let identity_changed = state.confirmed_session != old.confirmed_session
+                            || state.backend_conversation_revision
+                                != old.backend_conversation_revision
+                            || state.backend_confirmation_pending
+                                != old.backend_confirmation_pending;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -801,7 +807,9 @@ impl RemoteActor {
                                 outcome,
                             });
                         }
-                        if identity_changed { (actor.0.notify)(Update::Identity); }
+                        if identity_changed {
+                            (actor.0.notify)(Update::Identity);
+                        }
                         if ready {
                             (actor.0.notify)(Update::Ready);
                         }
@@ -2548,8 +2556,10 @@ fn hold_failed_startup_for_test(
     };
     let directory = PathBuf::from(directory);
     let metadata = std::fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
-    if !metadata.is_dir() || metadata.uid() != crate::daemon::current_uid()
-        || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err("Startup owner fixture requires its own private directory".into());
     }
     let helper = Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
@@ -2557,13 +2567,25 @@ fn hold_failed_startup_for_test(
         "source": source,
         "helper": helper,
         "provider": provider,
-    })).map_err(|error| error.to_string())?;
-    let mut marker = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+    }))
+    .map_err(|error| error.to_string())?;
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join("failed-startup.json")).map_err(|error| error.to_string())?;
-    marker.write_all(&bytes).and_then(|()| marker.sync_all()).map_err(|error| error.to_string())?;
+        .open(directory.join("failed-startup.json"))
+        .map_err(|error| error.to_string())?;
+    marker
+        .write_all(&bytes)
+        .and_then(|()| marker.sync_all())
+        .map_err(|error| error.to_string())?;
     let failure = "Fixture refuses Attached before publishing retained actor discovery".to_owned();
-    send(control, &Err::<Attached, _>(failure.clone()), Duration::from_secs(2))?;
+    send(
+        control,
+        &Err::<Attached, _>(failure.clone()),
+        Duration::from_secs(2),
+    )?;
     // The StartupAttempt cancellation is real, but cannot claim this retained
     // LocalHandle was cleaned while the test explicitly holds its owner.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -2692,11 +2714,19 @@ mod tests {
     }
     #[test]
     fn backend_binding_survives_lost_restart_reply_without_authorizing_same_handle_successor() {
-        let exact = thread::current().name().expect("named libtest contract").to_owned();
-        if backend_binding_test::isolated(&exact) { return; }
+        let exact = thread::current()
+            .name()
+            .expect("named libtest contract")
+            .to_owned();
+        if backend_binding_test::isolated(&exact) {
+            return;
+        }
         // Server::restart's orphan reconciliation is process-wide; only this
         // private child owns its provider descendants and becomes a subreaper.
-        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
         let fixture = resident_fixture();
         let source = fixture.server.source.clone();
         let mut remote = RemoteActor::fixture();
@@ -2725,7 +2755,8 @@ mod tests {
                 let (control, _) = match fixture.server.listener.accept() {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2)); continue;
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
@@ -2736,7 +2767,10 @@ mod tests {
                     continue;
                 }
                 if request.method == "fixture_finish" {
-                    assert_eq!(std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(), "spawn\n");
+                    assert_eq!(
+                        std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(),
+                        "spawn\n"
+                    );
                     send(&control, &Ok::<_, String>(Value::Null), TIMEOUT).unwrap();
                     return;
                 }
@@ -2748,13 +2782,19 @@ mod tests {
                     // Actual new backend is installed in Server, then the
                     // authenticated reply stream is lost before the host sees it.
                     drop(control);
-                } else { send(&control, &result, TIMEOUT).unwrap(); }
+                } else {
+                    send(&control, &result, TIMEOUT).unwrap();
+                }
             }
             panic!("fixture server did not receive its bounded completion");
         });
         let a = host.capture().unwrap();
-        let original = handle.backend_identity(&source.proof.clone().unwrap()).unwrap();
-        remote.call::<()>("fixture_complete_provider", Value::Null).unwrap();
+        let original = handle
+            .backend_identity(&source.proof.clone().unwrap())
+            .unwrap();
+        remote
+            .call::<()>("fixture_complete_provider", Value::Null)
+            .unwrap();
         host.begin_restart();
         let script = r#"printf 'spawn\n' >> spawns
 while IFS= read -r frame; do
@@ -2766,26 +2806,57 @@ while IFS= read -r frame; do
   esac
 done"#;
         let mut spec = ProcessSpec::from(&source.launch.recipe);
-        spec.program = "/bin/sh".into(); spec.arguments = vec!["-c".into(), script.into()];
+        spec.program = "/bin/sh".into();
+        spec.arguments = vec!["-c".into(), script.into()];
         let request = uuid::Uuid::new_v4();
-        assert!(handle.restart_remote(request, spec.clone(), source.clone(), BTreeMap::new()).is_err());
-        assert!(host.capture().is_err(), "fresh B process alone cannot resolve an ambiguous operation");
+        assert!(
+            handle
+                .restart_remote(request, spec.clone(), source.clone(), BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            host.capture().is_err(),
+            "fresh B process alone cannot resolve an ambiguous operation"
+        );
         assert!(!host.validates(&a));
-        assert!(host.return_refuses(a.clone()).contains("captured native backend changed"));
-        let receipt = handle.restart_remote(request, spec, source.clone(), BTreeMap::new()).unwrap();
-        assert!(matches!(receipt.state, restart::RestartState::Acknowledged(Ok(_))));
+        assert!(
+            host.return_refuses(a.clone())
+                .contains("captured native backend changed")
+        );
+        let receipt = handle
+            .restart_remote(request, spec, source.clone(), BTreeMap::new())
+            .unwrap();
+        assert!(matches!(
+            receipt.state,
+            restart::RestartState::Acknowledged(Ok(_))
+        ));
         let b = host.resolve();
-        assert_eq!(b.execution_instance, a.execution_instance, "retained Record/Handle did not change");
-        assert_ne!(b.backend, a.backend, "actual backend restart must change captured authority");
-        let replacement = handle.backend_identity(&source.proof.clone().unwrap()).unwrap();
+        assert_eq!(
+            b.execution_instance, a.execution_instance,
+            "retained Record/Handle did not change"
+        );
+        assert_ne!(
+            b.backend, a.backend,
+            "actual backend restart must change captured authority"
+        );
+        let replacement = handle
+            .backend_identity(&source.proof.clone().unwrap())
+            .unwrap();
         assert_ne!(replacement, original);
         assert!(!host.validates(&a));
-        remote.call::<()>("fixture_complete_provider", Value::Null).unwrap();
+        remote
+            .call::<()>("fixture_complete_provider", Value::Null)
+            .unwrap();
         host.retire();
-        assert!(!host.validates(&a), "B fully retiring never resurrects A consent");
+        assert!(
+            !host.validates(&a),
+            "B fully retiring never resurrects A consent"
+        );
         assert!(host.validates(&b));
         remote.call::<()>("fixture_finish", Value::Null).unwrap();
-        completed.recv_timeout(Duration::from_secs(5)).expect("server cleanup completion");
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server cleanup completion");
         // No caller-side raw pthread join: even finished Rust threads may be
         // in TLS destruction. The fixture no longer owns a backend at this edge.
         drop(worker);
@@ -3612,7 +3683,8 @@ done"#;
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
-        proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        proof.host_incarnation =
+            crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
         let _replacement_lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let replacement =
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();

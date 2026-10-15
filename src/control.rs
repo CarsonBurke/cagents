@@ -596,11 +596,17 @@ impl ControlClient {
     /// Metadata-only acknowledgement of the exact returned worker operation.
     #[cfg(feature = "ui")]
     pub(crate) fn commit_terminal_handoff_receipt(
-        &mut self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+        &mut self,
+        receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
     ) -> Result<(), ControlError> {
-        match self.request_strict(ClientRequest::ChatCommitTerminalReceipt { receipt: receipt.clone() })? {
+        match self.request_strict(ClientRequest::ChatCommitTerminalReceipt {
+            receipt: receipt.clone(),
+        })? {
             ServerResponse::Accepted => Ok(()),
-            response => Err(unexpected_response("an exact terminal handoff acknowledgement", &response)),
+            response => Err(unexpected_response(
+                "an exact terminal handoff acknowledgement",
+                &response,
+            )),
         }
     }
 
