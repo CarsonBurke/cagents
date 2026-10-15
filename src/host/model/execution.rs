@@ -1716,10 +1716,11 @@ mod tests {
         initial.launch.session_id = None;
         initial.launch.recipe.program = "codex".into();
         initial.launch.recipe.working_directory = directory.path().into();
-        let socket = directory.path().join("owned/control.sock");
+        let socket = directory.path().join(format!("cagents-codex-{}/control.sock", initial.id));
         initial.launch.recipe.arguments = vec!["--remote".into(), format!("unix://{}", socket.display())];
         initial.owned_codex_listener = Some(OwnedCodexListener { socket, allocator: initial.proof.clone().unwrap() });
         initial.native_continuity = NativeContinuity::ReconnectOnly;
+        assert!(initial.owns_codex_listener());
         let mut confirmed = initial.clone();
         confirmed.launch.session_id = Some("confirmed-original-thread".into());
         confirmed.native_continuity = NativeContinuity::Durable { provider_version: "0.157.1".into() };
