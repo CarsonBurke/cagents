@@ -36,6 +36,7 @@ pub(super) fn inventory(
     client: ClientId,
     project: &ProjectInstance,
 ) -> Result<Vec<SessionClose>, ProtocolError> {
+    reservation::require_no_startup_owners(host,project)?;
     let registry = super::agent_execution::registry(host).map_err(error)?;
     registry
         .lock()
@@ -490,6 +491,8 @@ mod tests {
             state.chats.insert(
                 id,
                 super::super::chat::Record {
+                    handoff_receipt: None,
+                    source_binding: None,
                     execution_instance: instance,
                     console_recipe: None,
                     paired_terminal: None,
@@ -1212,6 +1215,8 @@ mod tests {
             state.chats.insert(
                 id,
                 super::super::chat::Record {
+                    handoff_receipt: None,
+                    source_binding: None,
                     execution_instance: instance,
                     console_recipe: None,
                     paired_terminal: None,
