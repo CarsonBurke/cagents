@@ -4620,7 +4620,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // operation must not enumerate an arbitrarily large repository index.
         let mut listed = HashSet::new();
         for batch in bounded_pathspec_batches(paths) {
-            let mut arguments = vec![OsString::from("ls-files"), OsString::from("-z"), OsString::from("--")];
+            let mut arguments = vec![
+                OsString::from("ls-files"),
+                OsString::from("-z"),
+                OsString::from("--"),
+            ];
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let command = self.git_literal_read(worktree, arguments);
             let output = self.run_checked(&command, cancellation)?;
@@ -4648,7 +4652,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut listed = HashSet::new();
         let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
         for batch in bounded_pathspec_batches(&paths) {
-            let mut arguments = vec![OsString::from("ls-tree"), OsString::from("-r"), OsString::from("-z"), OsString::from(revision.as_str()), OsString::from("--")];
+            let mut arguments = vec![
+                OsString::from("ls-tree"),
+                OsString::from("-r"),
+                OsString::from("-z"),
+                OsString::from(revision.as_str()),
+                OsString::from("--"),
+            ];
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let command = self.git_literal_read(worktree, arguments);
             let output = self.run_checked(&command, cancellation)?;
@@ -6128,14 +6138,21 @@ fn bounded_pathspec_batches(paths: &[RepoPath]) -> impl Iterator<Item = &[RepoPa
     const BUDGET: usize = 32 * 1024;
     let mut remaining = paths;
     std::iter::from_fn(move || {
-        if remaining.is_empty() { return None; }
+        if remaining.is_empty() {
+            return None;
+        }
         let mut bytes = 0usize;
-        let count = remaining.iter().take_while(|path| {
-            let next = path.as_os_str().as_bytes().len() + 1 + std::mem::size_of::<usize>();
-            if bytes != 0 && bytes.saturating_add(next) > BUDGET { return false; }
-            bytes = bytes.saturating_add(next);
-            true
-        }).count();
+        let count = remaining
+            .iter()
+            .take_while(|path| {
+                let next = path.as_os_str().as_bytes().len() + 1 + std::mem::size_of::<usize>();
+                if bytes != 0 && bytes.saturating_add(next) > BUDGET {
+                    return false;
+                }
+                bytes = bytes.saturating_add(next);
+                true
+            })
+            .count();
         let (batch, rest) = remaining.split_at(count);
         remaining = rest;
         Some(batch)
@@ -6796,23 +6813,59 @@ mod tests {
             git(root, &["init", "-b", "main"]);
             fs::write(root.join("selected.txt"), "base").unwrap();
             git(root, &["add", "selected.txt"]);
-            let blob = String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
+            let blob =
+                String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
             let mut input = Vec::new();
-            // Over17MiB of index names, plus substantially larger ls-tree
-            // records, reproduced the default16MiB process-output failure.
+            // Over 17 MB of index names, plus substantially larger ls-tree
+            // records, reproduced the default 16 MiB process-output failure.
             for index in 0..250_000 {
                 input.extend_from_slice(format!("100644 {}\tgenerated_component_file_with_an_extraordinarily_long_name_{index:06}.txt\0", blob.trim()).as_bytes());
             }
             let service = service();
             let cancel = CancellationToken::new();
-            let command = service.git_mutation(root, ["update-index", "-z", "--index-info"]).stdin(input);
+            let command = service
+                .git_mutation(root, ["update-index", "-z", "--index-info"])
+                .stdin(input);
             service.run_checked(&command, &cancel).unwrap();
             git(root, &["commit", "--quiet", "-m", "large sparse fixture"]);
             fs::write(root.join("selected.txt"), "modified").unwrap();
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: vec![PathSelection {
+                                path: path("selected.txt"),
+                                old_path: None
+                            }]
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: vec![PathSelection {
+                                path: path("selected.txt"),
+                                old_path: None
+                            }]
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             let head = service.resolve_head(root, &cancel).unwrap().unwrap();
-            assert_eq!(service.head_tree_paths(root, &head, &[&path("selected.txt")], &cancel).unwrap(), vec![path("selected.txt")]);
+            assert_eq!(
+                service
+                    .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
+                    .unwrap(),
+                vec![path("selected.txt")]
+            );
         }
 
         #[test]
@@ -6900,7 +6953,9 @@ mod tests {
             // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
             let mut selection = Vec::with_capacity(40_000);
             for index in 0..40_000 {
-                let name = format!("generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt");
+                let name = format!(
+                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                );
                 fs::write(root.join(&name), "generated").unwrap();
                 selection.push(PathSelection {
                     path: path(&name),
@@ -6953,14 +7008,69 @@ mod tests {
             );
             // Exercise the >ARG_MAX tracked restore path as well as unlinking
             // untracked files: all three Git mutation operations use stdin.
-            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "generated").unwrap(); }
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            for entry in &selection {
+                fs::write(root.join(entry.path.as_os_str()), "generated").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             git(root, &["commit", "--quiet", "-m", "generated baseline"]);
-            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "modified").unwrap(); }
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.discard(&DiscardRequest {worktree: root.into(), tracked: selection.clone(), untracked: vec![], confirmed: true}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            for entry in &selection { assert_eq!(fs::read(root.join(entry.path.as_os_str())).unwrap(), b"generated"); }
+            for entry in &selection {
+                fs::write(root.join(entry.path.as_os_str()), "modified").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: selection.clone(),
+                            untracked: vec![],
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            for entry in &selection {
+                assert_eq!(
+                    fs::read(root.join(entry.path.as_os_str())).unwrap(),
+                    b"generated"
+                );
+            }
         }
 
         #[test]
