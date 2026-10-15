@@ -134,8 +134,8 @@ fn inspect(request: Request) -> Result<(), String> {
     }
     let registry=crate::instance::project_dirs().ok_or("Cannot locate the source archive registry")?
         .data_dir().join("workspace-model.sqlite3");
-    let saved=require_live_panes(saved,deadline,|database,card,session| {
-        crate::automations::archive::inspect_archived_pane(database,&registry,card,session).map(|receipt|receipt.is_some())
+    let saved=require_live_panes(saved,deadline,|database,card,kind| {
+        crate::automations::archive::inspect_completed_automation_pane(database,&registry,card,kind).map(|receipt|receipt.is_some())
     })?;
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => session.is_unstarted(),
@@ -197,13 +197,13 @@ fn check_deadline(deadline:Instant)->Result<(),String>{
 /// binding keeps the ordinary exact-live-owner requirements in force.
 fn require_live_panes(
     saved:Vec<(PathBuf,CardId,CardKind)>,deadline:Instant,
-    mut archive:impl FnMut(&Path,CardId,&Session)->Result<bool,String>,
+    mut archive:impl FnMut(&Path,CardId,&CardKind)->Result<bool,String>,
 )->Result<Vec<(CardId,CardKind)>,String>{
     let mut live=Vec::new();
     for (database,card,kind) in saved {
         check_deadline(deadline)?;
-        if let CardKind::Chat(session)=&kind && !session.is_unstarted() {
-            let qualified=archive(&database,card,session).map_err(|_|format!("Saved archive pane {card} has no qualified readable history. Recover or close that pane before updating; source windows remain usable"))?;
+        if matches!(&kind,CardKind::Chat(_)|CardKind::Terminal(_)) {
+            let qualified=archive(&database,card,&kind).map_err(|_|format!("Saved archive pane {card} has no qualified readable history. Recover or close that pane before updating; source windows remain usable"))?;
             check_deadline(deadline)?;
             if qualified {continue;}
         }
@@ -271,12 +271,17 @@ mod tests {
         let mut inspected=Vec::new();
         let remaining=require_live_panes(saved,Instant::now()+Duration::from_secs(1),|database,card,_|{inspected.push(database.to_owned());Ok(card==archived)}).unwrap();
         assert_eq!(remaining.iter().map(|(card,_)|*card).collect::<Vec<_>>(),vec![live,draft_id]);
-        assert_eq!(inspected,vec![PathBuf::from("/window/a"),PathBuf::from("/window/b")]);
+        assert_eq!(inspected,vec![PathBuf::from("/window/a"),PathBuf::from("/window/b"),PathBuf::from("/window/c")]);
         let saved=vec![(PathBuf::from("/window"),archived,CardKind::Chat(session()))];
         let error=require_live_panes(saved.clone(),Instant::now()+Duration::from_secs(1),|_,_,_|Err("private archive payload must not leak".into())).unwrap_err();
         assert!(error.contains(&archived.to_string()));assert!(!error.contains("private archive payload"));
         assert!(require_live_panes(saved.clone(),Instant::now(),|_,_,_|panic!("expired inspection must not open another database")).is_err());
         assert!(require_live_panes(saved,Instant::now()+Duration::from_secs(1),|_,_,_|Ok(true)).unwrap().is_empty(),"archives-only saved panes require no live source");
+        let terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(crate::model::TerminalId::new(),session().launch.recipe,None).session;
+        let terminal=CardKind::Terminal(terminal);
+        let saved=vec![(PathBuf::from("/closed-terminal"),archived,terminal.clone())];
+        assert!(require_live_panes(saved.clone(),Instant::now()+Duration::from_secs(1),|_,card,kind| {assert_eq!(card,archived);assert_eq!(kind,&terminal);Ok(true)}).unwrap().is_empty(),"cold terminal presentations require their typed archive receipt");
+        assert_eq!(require_live_panes(saved,Instant::now()+Duration::from_secs(1),|_,_,_|Ok(false)).unwrap(),vec![(archived,terminal)],"unclaimed ordinary terminals retain their live-owner contract");
     }
 
     pub(super) fn session() -> Session {
