@@ -1732,7 +1732,7 @@ struct ChangeGroupChrome {
 pub struct CommitRow {
     pub oid: Oid,
     pub parent: Option<Oid>,
-    pub message: String,
+    pub message: Arc<str>,
     pub mainline: Option<u32>,
     chrome: CommitRowChrome,
 }
@@ -1762,7 +1762,7 @@ impl CommitRow {
         Self {
             oid: commit.oid.clone(),
             parent: commit.parents.first().cloned(),
-            message: compose_commit_message(&commit.subject, &commit.body),
+            message: compose_commit_message(&commit.subject, &commit.body).into(),
             mainline: merge.then_some(1),
             chrome,
         }
@@ -3892,7 +3892,7 @@ pub enum SidebarAction {
     },
     HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
     SearchHistory { key: ActiveWorktreeKey, query: String },
-    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand },
+    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str> },
     HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
     CancelHistoryBranch,
     CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
@@ -6520,7 +6520,7 @@ struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRo
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command }
+        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }
     }
 }
 
@@ -17719,6 +17719,21 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn history_actions_pin_the_message_and_merge_parent_from_the_rendered_commit() {
+        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
+        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
+        let key = main_key();
+        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
+        let message = Arc::clone(&row.message);
+        drop(row);
+        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };
+        assert_eq!(oid, oid_of(3));
+        assert_eq!(mainline, Some(1));
+        assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");
+        assert!(Arc::ptr_eq(&captured, &message));
     }
 
     #[test]

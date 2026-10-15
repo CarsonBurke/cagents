@@ -14801,17 +14801,11 @@ impl Application for Cagents {
                         Self::source_control_history_task(self.history_ui.next_page_request(), key,
                             source.head_oid.as_deref().and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), 0, query, self.history_ui.page_cancellation())
                     }
-                    SidebarAction::HistoryCommand { key, oid, command } => {
+                    SidebarAction::HistoryCommand { key, oid, command, mainline, message } => {
                         if !self.source_control_is_bound(&key) { return Task::none(); }
-                        let mainline = self.sidebar_model.source_control.as_ref()
-                            .and_then(|source| source.history.iter().find(|row| row.oid == oid))
-                            .and_then(|row| row.mainline);
                         match command {
                             sidebar::HistoryCommand::CopySha => iced::clipboard::write(oid.as_str().to_owned()).map(cosmic::Action::App),
-                            sidebar::HistoryCommand::CopyMessage => {
-                                let message = self.sidebar_model.source_control.as_ref().and_then(|source| source.history.iter().find(|row| row.oid == oid)).map(|row| row.message.clone());
-                                message.map_or_else(Task::none, |message| iced::clipboard::write(message).map(cosmic::Action::App))
-                            }
+                            sidebar::HistoryCommand::CopyMessage => iced::clipboard::write(message.to_string()).map(cosmic::Action::App),
                             sidebar::HistoryCommand::NewWorktree => {
                                 let Some(project) = self.sidebar_model.project(key.project_id) else { return Task::none(); };
                                 self.open_worktree_dialog(key.project_id, project.repository.clone(), WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
