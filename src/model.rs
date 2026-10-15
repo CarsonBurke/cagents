@@ -275,8 +275,16 @@ impl LaunchRecipe {
 /// The configured shell for new terminals, otherwise the passwd entry's,
 /// `SHELL`, then `/bin/sh`.
 pub(crate) fn login_shell() -> Result<String, LoginShellError> {
-    if let Some(shell) = crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell) {
-        return if crate::settings::agents::executable_available(&shell) { Ok(shell) } else { Err(LoginShellError::ConfiguredUnavailable) };
+    if let Some(shell) = crate::settings::default_path()
+        .ok()
+        .and_then(|path| crate::settings::load(path).ok())
+        .and_then(|settings| settings.default_shell)
+    {
+        return if crate::settings::agents::executable_available(&shell) {
+            Ok(shell)
+        } else {
+            Err(LoginShellError::ConfiguredUnavailable)
+        };
     }
     choose_login_shell(
         passwd_shell(),

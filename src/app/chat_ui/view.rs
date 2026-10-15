@@ -269,7 +269,7 @@ fn queue_row<'a>(
     timing: QueueTiming,
     text: &'a str,
     attachments: &'a [Attachment],
-    attachment_labels: &'a HashMap<PathBuf,PathBuf>,
+    attachment_labels: &'a HashMap<PathBuf, PathBuf>,
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let marker = match timing {
@@ -290,8 +290,12 @@ fn queue_row<'a>(
         attachments
             .iter()
             .map(|attachment| {
-                let path=attachment_labels.get(&attachment.path).unwrap_or(&attachment.path);
-                path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+                let path = attachment_labels
+                    .get(&attachment.path)
+                    .unwrap_or(&attachment.path);
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -1387,15 +1391,31 @@ impl Runtime {
             transcript.push(self.failure_notice(error, None));
         }
         if snapshot.original_retry_pending || snapshot.original_retry_diagnostic.is_some() {
-            content.push(widget::row::with_children(vec![
-                widget::container(design::caption(snapshot.original_retry_diagnostic.clone().unwrap_or_else(||
-                    "Restoring the original prompt settings…".into())))
-                    .width(Length::Fill).into(),
-                if snapshot.original_retry_pending {
-                    icon(Icon::Refresh, "Refresh original restoration status", available,
-                        Action::Command(target, Command::Refresh))
-                } else {iced::widget::Space::new().into()},
-            ]).spacing(step::GAP_S).align_y(Alignment::Center).into());
+            content.push(
+                widget::row::with_children(vec![
+                    widget::container(design::caption(
+                        snapshot
+                            .original_retry_diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "Restoring the original prompt settings…".into()),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+                    if snapshot.original_retry_pending {
+                        icon(
+                            Icon::Refresh,
+                            "Refresh original restoration status",
+                            available,
+                            Action::Command(target, Command::Refresh),
+                        )
+                    } else {
+                        iced::widget::Space::new().into()
+                    },
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+            );
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -1660,12 +1680,18 @@ impl Runtime {
                     .into(),
             );
         }
-        if let Some(notice)=&self.recovery.notice {
+        if let Some(notice) = &self.recovery.notice {
             content.push(design::caption(notice.clone()).into());
         }
         if self.recovery.prepared_prompt.is_some() {
-            content.push(crate::ui_controls::button::secondary("Load branch prompt")
-                .on_press_maybe(self.recovery_composer_empty().then(||action(Action::LoadEditedPrompt(target)))).into());
+            content.push(
+                crate::ui_controls::button::secondary("Load branch prompt")
+                    .on_press_maybe(
+                        self.recovery_composer_empty()
+                            .then(|| action(Action::LoadEditedPrompt(target))),
+                    )
+                    .into(),
+            );
         }
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
@@ -1747,7 +1773,7 @@ impl Runtime {
         }
         let mut attachment_chips = Vec::new();
         for (index, attachment) in self.attachments.iter().enumerate() {
-            let display_path=self.attachment_display_path(attachment);
+            let display_path = self.attachment_display_path(attachment);
             let chip = widget::row::with_children(vec![
                 if let Some(handle) = self.thumbnails.handle(&attachment.path) {
                     iced::widget::image(handle.clone())
@@ -1761,7 +1787,11 @@ impl Runtime {
                 crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
                     "Pasted image".to_owned()
                 } else {
-                    display_path.file_name().unwrap_or(display_path.as_os_str()).to_string_lossy().into_owned()
+                    display_path
+                        .file_name()
+                        .unwrap_or(display_path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
                 })
                 .width(Length::Fill)
                 .into(),
@@ -2099,7 +2129,8 @@ impl Runtime {
                         design::muted_icon_color
                     }))
                     .on_press_maybe(
-                        (input_available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                        (input_available && has_draft)
+                            .then(|| action(Action::Submit(target, *mode))),
                     )
                     .into(),
             );
@@ -3079,7 +3110,13 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
-        if turn.running {self.snapshot.detail.starts_with("Retrying").then_some(&self.snapshot.detail).hash(&mut hasher);}
+        if turn.running {
+            self.snapshot
+                .detail
+                .starts_with("Retrying")
+                .then_some(&self.snapshot.detail)
+                .hash(&mut hasher);
+        }
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
         // own items and the group's status and duration.
@@ -3120,11 +3157,21 @@ impl Runtime {
             // Keep only the controls whose visible state changes. Draft text,
             // attachment work and qualified replay metadata are not item
             // revisions, but still change their enabled state or presence.
-            if matches!(item.content,ItemContent::Text {thinking:false,..}) {
-                let editable=self.edit_supported(item);
+            if matches!(
+                item.content,
+                ItemContent::Text {
+                    thinking: false,
+                    ..
+                }
+            ) {
+                let editable = self.edit_supported(item);
                 editable.hash(&mut hasher);
                 if editable {
-                    (self.can_edit_prompt(item),self.recovery_composer_empty(),self.session.launch.provider)
+                    (
+                        self.can_edit_prompt(item),
+                        self.recovery_composer_empty(),
+                        self.session.launch.provider,
+                    )
                         .hash(&mut hasher);
                 }
                 self.retry_for_assistant(item).hash(&mut hasher);
@@ -3515,38 +3562,83 @@ impl Runtime {
         )
     }
 
-    pub(super) fn failure_notice(&self,message:&str,anchor:Option<&str>)->Element<'static,Message> {
-        let notice=notice_entry(message,self.target);
-        let Some(user)=self.retry_user_for_error(message,anchor) else {return notice;};
-        widget::column::with_children(vec![notice,
+    pub(super) fn failure_notice(
+        &self,
+        message: &str,
+        anchor: Option<&str>,
+    ) -> Element<'static, Message> {
+        let notice = notice_entry(message, self.target);
+        let Some(user) = self.retry_user_for_error(message, anchor) else {
+            return notice;
+        };
+        widget::column::with_children(vec![
+            notice,
             crate::ui_controls::button::secondary("Retry")
-                .on_press(action(Action::RetryTurn(self.target,user))).into()])
-            .spacing(step::GAP_XS).into()
+                .on_press(action(Action::RetryTurn(self.target, user)))
+                .into(),
+        ])
+        .spacing(step::GAP_XS)
+        .into()
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        let is_text=matches!(item.content,ItemContent::Text {thinking:false,..});
-        let mut controls=vec![small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {Icon::Check} else {Icon::Copy},
-            if is_text {"Copy as Markdown"} else {"Copy this message"},
-            Action::Copy(self.target,item.id.clone(),CopyPart::Text))];
-        if is_text {
-            controls.push(small_icon(Icon::TextFile,"Copy as plain text",
-                Action::Copy(self.target,item.id.clone(),CopyPart::PlainText)));
-            if self.edit_supported(item) {
-                let enabled=self.can_edit_prompt(item);
-                controls.push(crate::ui_controls::icon_button(Icon::Edit,
-                    if !self.recovery_composer_empty() {"Send or clear your draft before editing this prompt"}
-                    else if self.session.launch.provider == Provider::Claude {"Edit and resend as a new turn"}
-                    else {"Edit and resend in a new branch"})
-                    .compact().on_press_maybe(enabled.then(||action(Action::EditPrompt(self.target,item.id.clone())))).into());
+        let is_text = matches!(
+            item.content,
+            ItemContent::Text {
+                thinking: false,
+                ..
             }
-            if let Some(user)=self.retry_for_assistant(item) {
-                controls.push(small_icon(Icon::Refresh,"Retry this turn",
-                    Action::RetryTurn(self.target,user)));
+        );
+        let mut controls = vec![small_icon(
+            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
+                Icon::Check
+            } else {
+                Icon::Copy
+            },
+            if is_text {
+                "Copy as Markdown"
+            } else {
+                "Copy this message"
+            },
+            Action::Copy(self.target, item.id.clone(), CopyPart::Text),
+        )];
+        if is_text {
+            controls.push(small_icon(
+                Icon::TextFile,
+                "Copy as plain text",
+                Action::Copy(self.target, item.id.clone(), CopyPart::PlainText),
+            ));
+            if self.edit_supported(item) {
+                let enabled = self.can_edit_prompt(item);
+                controls.push(
+                    crate::ui_controls::icon_button(
+                        Icon::Edit,
+                        if !self.recovery_composer_empty() {
+                            "Send or clear your draft before editing this prompt"
+                        } else if self.session.launch.provider == Provider::Claude {
+                            "Edit and resend as a new turn"
+                        } else {
+                            "Edit and resend in a new branch"
+                        },
+                    )
+                    .compact()
+                    .on_press_maybe(
+                        enabled.then(|| action(Action::EditPrompt(self.target, item.id.clone()))),
+                    )
+                    .into(),
+                );
+            }
+            if let Some(user) = self.retry_for_assistant(item) {
+                controls.push(small_icon(
+                    Icon::Refresh,
+                    "Retry this turn",
+                    Action::RetryTurn(self.target, user),
+                ));
             }
         }
-        widget::row::with_children(controls).spacing(step::GAP_XS).into()
+        widget::row::with_children(controls)
+            .spacing(step::GAP_XS)
+            .into()
     }
 
     /// A draft's first message while its conversation starts.
@@ -3586,8 +3678,10 @@ impl Runtime {
         for attachment in &queued.attachments {
             rows.push(
                 design::caption(
-                    self.attachment_display_path(attachment).file_name()
-                        .unwrap_or(self.attachment_display_path(attachment).as_os_str()).to_string_lossy(),
+                    self.attachment_display_path(attachment)
+                        .file_name()
+                        .unwrap_or(self.attachment_display_path(attachment).as_os_str())
+                        .to_string_lossy(),
                 )
                 .into(),
             );
@@ -4148,13 +4242,20 @@ pub(super) fn request_view_with_redirect<'a>(
     surface: RequestSurface,
     redirect: Option<bool>,
 ) -> Element<'a, Message> {
-    request_view_with_restore(target,request,answers,available,surface,redirect,false)
+    request_view_with_restore(
+        target, request, answers, available, surface, redirect, false,
+    )
 }
 
 pub(super) fn request_view_with_restore<'a>(
-    target:Target,request:&'a chat::Request,answers:&'a Answers,available:bool,
-    surface:RequestSurface,redirect:Option<bool>,restoring:bool,
-)->Element<'a,Message> {
+    target: Target,
+    request: &'a chat::Request,
+    answers: &'a Answers,
+    available: bool,
+    surface: RequestSurface,
+    redirect: Option<bool>,
+    restoring: bool,
+) -> Element<'a, Message> {
     let (question, context) = question_and_context(&request.description);
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
@@ -4190,7 +4291,13 @@ pub(super) fn request_view_with_restore<'a>(
         ));
     }
     for field in &request.fields {
-        rows.push(field_view(target, request, field, answers, available && !restoring));
+        rows.push(field_view(
+            target,
+            request,
+            field,
+            answers,
+            available && !restoring,
+        ));
     }
     rows.push(answers_view(target, request, available, surface, restoring));
     if let Some(has_text) = redirect.filter(|_| {
@@ -4466,11 +4573,12 @@ fn answers_view<'a>(
         answers
             .into_iter()
             .map(|choice| {
-                let message = (available && (!restoring || originals::cleanup_answer(&choice.id))).then_some(action(Action::Answer(
-                    target,
-                    request.id.clone(),
-                    choice.id.clone(),
-                )));
+                let message = (available && (!restoring || originals::cleanup_answer(&choice.id)))
+                    .then_some(action(Action::Answer(
+                        target,
+                        request.id.clone(),
+                        choice.id.clone(),
+                    )));
                 let label = if request.kind == chat::RequestKind::Approval {
                     match stake(choice) {
                         Stake::Once if !restoring => format!("{} (Enter)", choice.label),
@@ -6364,72 +6472,172 @@ mod tests {
 
     #[test]
     fn retained_prompt_edit_controls_follow_draft_and_attachment_work() {
-        use iced::advanced::{Layout,layout,widget::Tree};
-        let item=chat::Item {id:"turn/user".into(),role:chat::Role::User,started_at:None,at:None,
-            content:ItemContent::Text {text:"Original prompt".into(),thinking:false,phase:chat::Phase::Final}};
-        let (mut runtime,_handle)=frame_cost::live_runtime(&[item]);
-        let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut tree=Tree::empty();
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let item = chat::Item {
+            id: "turn/user".into(),
+            role: chat::Role::User,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "Original prompt".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::empty();
         for stage in 0..=12 {
             match stage {
-                1=>runtime.replace_draft(text_editor::Content::with_text("Unsent draft")),
-                2=>runtime.replace_draft(text_editor::Content::new()),
-                3=>runtime.attachments=vec![Attachment {path:"draft.png".into()}],
-                4=>runtime.attachments.clear(),
-                5=>runtime.pastes_pending=1,
-                6=>runtime.pastes_pending=0,
-                7=>runtime.image_pastes_saving=1,
-                8=>runtime.image_pastes_saving=0,
-                9=>runtime.attachment_chooser_pending=true,
-                10=>runtime.attachment_chooser_pending=false,
-                11=>Arc::make_mut(&mut runtime.snapshot).original_retry_pending=true,
-                12=>Arc::make_mut(&mut runtime.snapshot).original_retry_pending=false,
-                _=>{},
+                1 => runtime.replace_draft(text_editor::Content::with_text("Unsent draft")),
+                2 => runtime.replace_draft(text_editor::Content::new()),
+                3 => {
+                    runtime.attachments = vec![Attachment {
+                        path: "draft.png".into(),
+                    }]
+                }
+                4 => runtime.attachments.clear(),
+                5 => runtime.pastes_pending = 1,
+                6 => runtime.pastes_pending = 0,
+                7 => runtime.image_pastes_saving = 1,
+                8 => runtime.image_pastes_saving = 0,
+                9 => runtime.attachment_chooser_pending = true,
+                10 => runtime.attachment_chooser_pending = false,
+                11 => Arc::make_mut(&mut runtime.snapshot).original_retry_pending = true,
+                12 => Arc::make_mut(&mut runtime.snapshot).original_retry_pending = false,
+                _ => {}
             }
-            let mut element=runtime.find_turn_view_for_test();
+            let mut element = runtime.find_turn_view_for_test();
             tree.diff(element.as_widget_mut());
-            let node=element.as_widget_mut().layout(&mut tree,&renderer,
-                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
-            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
-            let edit=accessible.root().iter().chain(accessible.children()).find(|node|
-                node.node().label().is_some_and(|label|label.starts_with("Edit and resend")
-                    || label.starts_with("Send or clear your draft"))).expect("mounted edit control");
-            assert_eq!(edit.node().is_disabled(),stage%2==1,"retained control at stage {stage}");
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 1000.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let edit = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().label().is_some_and(|label| {
+                        label.starts_with("Edit and resend")
+                            || label.starts_with("Send or clear your draft")
+                    })
+                })
+                .expect("mounted edit control");
+            assert_eq!(
+                edit.node().is_disabled(),
+                stage % 2 == 1,
+                "retained control at stage {stage}"
+            );
         }
         // Equal branch counts are not equal capabilities for this exact item.
-        runtime.session.launch.provider=Provider::Codex;
-        let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.capabilities.branch=true;
-        snapshot.branch_points=vec![chat::BranchPoint {id:"turn".into(),label:"Original prompt".into()}];
-        for (point,expected) in [("turn",true),("other",false),("turn",true)] {
-            Arc::make_mut(&mut runtime.snapshot).branch_points[0].id=point.into();
-            let mut element=runtime.find_turn_view_for_test();tree.diff(element.as_widget_mut());
-            let node=element.as_widget_mut().layout(&mut tree,&renderer,
-                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
-            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
-            assert_eq!(accessible.root().iter().chain(accessible.children()).any(|node|
-                node.node().label()==Some("Edit and resend in a new branch")),expected);
+        runtime.session.launch.provider = Provider::Codex;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.capabilities.branch = true;
+        snapshot.branch_points = vec![chat::BranchPoint {
+            id: "turn".into(),
+            label: "Original prompt".into(),
+        }];
+        for (point, expected) in [("turn", true), ("other", false), ("turn", true)] {
+            Arc::make_mut(&mut runtime.snapshot).branch_points[0].id = point.into();
+            let mut element = runtime.find_turn_view_for_test();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 1000.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert_eq!(
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node.node().label() == Some("Edit and resend in a new branch")),
+                expected
+            );
         }
     }
 
     #[test]
     fn held_restoration_disables_grants_but_preserves_negative_controls_in_both_request_surfaces() {
-        use iced::advanced::{Layout,layout,widget::Tree};
-        let target=Target {card:CardId::new(),generation:1};
-        let request=chat::Request {id:"held-approval".into(),kind:chat::RequestKind::Approval,title:"Allow Bash?".into(),description:String::new(),fields:vec![],
-            actions:["allow","allow_session","deny"].into_iter().map(|id|chat::Choice {id:id.into(),label:id.into(),description:String::new()}).collect()};
-        let answers=Answers::default();let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
-        for surface in [RequestSurface::Transcript,RequestSurface::Permissions] {
-            let mut tree=Tree::empty();
-            for restoring in [false,true,false] {
-                let mut element=request_view_with_restore(target,&request,&answers,true,surface,Some(false),restoring);
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let request = chat::Request {
+            id: "held-approval".into(),
+            kind: chat::RequestKind::Approval,
+            title: "Allow Bash?".into(),
+            description: String::new(),
+            fields: vec![],
+            actions: ["allow", "allow_session", "deny"]
+                .into_iter()
+                .map(|id| chat::Choice {
+                    id: id.into(),
+                    label: id.into(),
+                    description: String::new(),
+                })
+                .collect(),
+        };
+        let answers = Answers::default();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
+            let mut tree = Tree::empty();
+            for restoring in [false, true, false] {
+                let mut element = request_view_with_restore(
+                    target,
+                    &request,
+                    &answers,
+                    true,
+                    surface,
+                    Some(false),
+                    restoring,
+                );
                 tree.diff(element.as_widget_mut());
-                let node=element.as_widget_mut().layout(&mut tree,&renderer,
-                    &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
-                let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
-                for (label,disabled) in [("allow",restoring),("allow_session",restoring),("deny",false)] {
-                    let control=accessible.root().iter().chain(accessible.children()).find(|node|
-                        node.node().label().is_some_and(|name|name==label || name.strip_suffix(" (Enter)")==Some(label) || name.strip_suffix(" (Esc)")==Some(label))).expect("mounted decision");
-                    assert_eq!(control.node().is_disabled(),disabled,"{label} while restoring={restoring}");
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 1000.0)),
+                );
+                let accessible = element.as_widget().a11y_nodes(
+                    Layout::new(&node),
+                    &tree,
+                    iced::mouse::Cursor::Unavailable,
+                );
+                for (label, disabled) in [
+                    ("allow", restoring),
+                    ("allow_session", restoring),
+                    ("deny", false),
+                ] {
+                    let control = accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .find(|node| {
+                            node.node().label().is_some_and(|name| {
+                                name == label
+                                    || name.strip_suffix(" (Enter)") == Some(label)
+                                    || name.strip_suffix(" (Esc)") == Some(label)
+                            })
+                        })
+                        .expect("mounted decision");
+                    assert_eq!(
+                        control.node().is_disabled(),
+                        disabled,
+                        "{label} while restoring={restoring}"
+                    );
                 }
             }
         }
@@ -6437,33 +6645,81 @@ mod tests {
 
     #[test]
     fn restoration_notice_and_cancel_controls_follow_pending_without_restarting_the_turn() {
-        use iced::advanced::{Layout,layout,widget::Tree};
-        let (mut runtime,_handle)=frame_cost::live_runtime(&[]);
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         runtime.replace_draft(text_editor::Content::with_text("my next independent draft"));
-        let snapshot=Arc::make_mut(&mut runtime.snapshot);
-        snapshot.busy=false;snapshot.error=Some("API Error: 529 Overloaded".into());
-        snapshot.turn_started_at=Some(1_000);snapshot.finished_at=Some(9_000);
-        let elapsed=runtime.turn_elapsed();
-        let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut tree=Tree::empty();let shortcuts=crate::settings::KeyboardShortcuts::default();
-        for pending in [false,true,false] {
-            let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=pending;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.error = Some("API Error: 529 Overloaded".into());
+        snapshot.turn_started_at = Some(1_000);
+        snapshot.finished_at = Some(9_000);
+        let elapsed = runtime.turn_elapsed();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::empty();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for pending in [false, true, false] {
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.original_retry_pending = pending;
             snapshot.original_retry_diagnostic=pending.then(||"Settings verification is pending. Refresh after the outstanding change settles.".into());
-            let mut element=runtime.view(None,false,true,&shortcuts,640.0,
-                Place {name:"fixture".into(),branch:None,channel:None},true,None,vec![]);
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                640.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
             tree.diff(element.as_widget_mut());
-            let node=element.as_widget_mut().layout(&mut tree,&renderer,
-                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
-            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
-            let nodes=accessible.root().iter().chain(accessible.children()).collect::<Vec<_>>();
-            let send=nodes.iter().find(|node|node.node().label().is_some_and(|label|label.starts_with("Send message"))).expect("send control");
-            assert_eq!(send.node().is_disabled(),pending);
-            assert_eq!(nodes.iter().any(|node|node.node().label()==Some("Cancel original prompt restoration (Esc)") && !node.node().is_disabled()),pending);
-            assert_eq!(nodes.iter().any(|node|node.node().label()==Some("Refresh original restoration status") && !node.node().is_disabled()),pending);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 1000.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let nodes = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .collect::<Vec<_>>();
+            let send = nodes
+                .iter()
+                .find(|node| {
+                    node.node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Send message"))
+                })
+                .expect("send control");
+            assert_eq!(send.node().is_disabled(), pending);
+            assert_eq!(
+                nodes.iter().any(|node| node.node().label()
+                    == Some("Cancel original prompt restoration (Esc)")
+                    && !node.node().is_disabled()),
+                pending
+            );
+            assert_eq!(
+                nodes.iter().any(|node| node.node().label()
+                    == Some("Refresh original restoration status")
+                    && !node.node().is_disabled()),
+                pending
+            );
             drop(element);
             assert!(!runtime.snapshot.busy);
-            assert_eq!(runtime.snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
-            assert_eq!(runtime.turn_elapsed(),elapsed);
+            assert_eq!(
+                runtime.snapshot.error.as_deref(),
+                Some("API Error: 529 Overloaded")
+            );
+            assert_eq!(runtime.turn_elapsed(), elapsed);
         }
     }
 
@@ -6490,7 +6746,7 @@ mod tests {
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         // This contract isolates reasoning. A provider with no branch point
         // has no Edit control whose availability also depends on busy state.
-        runtime.session.launch.provider=Provider::Codex;
+        runtime.session.launch.provider = Provider::Codex;
         let reasoning = runtime
             .turns
             .iter()
@@ -6532,7 +6788,7 @@ mod tests {
         // Even reasoning already followed by an answer keeps its busy
         // dependency; this change does not localize cross-item completion.
         let (mut history, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
-        history.session.launch.provider=Provider::Codex;
+        history.session.launch.provider = Provider::Codex;
         let idle = fingerprints(&history, true);
         Arc::make_mut(&mut history.snapshot).busy = true;
         for (turn, (idle, busy)) in history

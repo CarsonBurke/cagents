@@ -346,8 +346,18 @@ fn dispatch(
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let settings = crate::settings::default_path().map_err(|error| before(error.to_string())).and_then(|path| crate::settings::load(path).map_err(|error| before(error.to_string())))?;
-        let configuration = settings.agents.get(crate::settings::agents::provider_key(accepted.agent.spec.provider)).cloned().unwrap_or_default();
+        let settings = crate::settings::default_path()
+            .map_err(|error| before(error.to_string()))
+            .and_then(|path| {
+                crate::settings::load(path).map_err(|error| before(error.to_string()))
+            })?;
+        let configuration = settings
+            .agents
+            .get(crate::settings::agents::provider_key(
+                accepted.agent.spec.provider,
+            ))
+            .cloned()
+            .unwrap_or_default();
         let mut session = chat::fresh_session_configured(
             accepted.agent.spec.provider,
             TerminalId::new(),
@@ -359,7 +369,8 @@ fn dispatch(
                 effort: accepted.agent.spec.reasoning_effort.as_deref(),
                 permission_mode: accepted.agent.spec.permission_mode.as_deref(),
             },
-        ).map_err(before)?;
+        )
+        .map_err(before)?;
         let proof = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())

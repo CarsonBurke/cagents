@@ -1273,8 +1273,11 @@ impl Adapter for Omp {
                 let kind = text(event, "type");
                 if matches!(kind, "text_delta" | "thinking_delta") {
                     if self.retrying {
-                        self.retrying=false;
-                        step.events.push(Event::Status {busy:true,detail:"Working".into()});
+                        self.retrying = false;
+                        step.events.push(Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        });
                     }
                     step.events.push(Event::TextDelta {
                         id: format!(
@@ -1395,19 +1398,35 @@ impl Adapter for Omp {
                 });
             }
             "auto_retry_start" => {
-                self.busy=true;self.retrying=true;
-                let attempt=frame["attempt"].as_u64().unwrap_or(1);
-                let delay=frame["delayMs"].as_u64().map(|ms|format!(", in {} s",ms.div_ceil(1000))).unwrap_or_default();
-                let error:String=text(&frame,"errorMessage").chars().take(512).collect();
-                step.events.push(Event::Status {busy:true,detail:format!("Retrying (attempt {attempt}{delay}): {error}")});
+                self.busy = true;
+                self.retrying = true;
+                let attempt = frame["attempt"].as_u64().unwrap_or(1);
+                let delay = frame["delayMs"]
+                    .as_u64()
+                    .map(|ms| format!(", in {} s", ms.div_ceil(1000)))
+                    .unwrap_or_default();
+                let error: String = text(&frame, "errorMessage").chars().take(512).collect();
+                step.events.push(Event::Status {
+                    busy: true,
+                    detail: format!("Retrying (attempt {attempt}{delay}): {error}"),
+                });
             }
             "auto_retry_end" => {
-                self.retrying=false;
+                self.retrying = false;
                 if frame["success"] == false {
-                    self.busy=false;
-                    step.events.push(Event::Error {message:frame["finalError"].as_str().unwrap_or("Provider retries exhausted").into(),fatal:false});
+                    self.busy = false;
+                    step.events.push(Event::Error {
+                        message: frame["finalError"]
+                            .as_str()
+                            .unwrap_or("Provider retries exhausted")
+                            .into(),
+                        fatal: false,
+                    });
                 }
-                step.events.push(Event::Status {busy:self.busy,detail:if self.busy {"Working"} else {"Ready"}.into()});
+                step.events.push(Event::Status {
+                    busy: self.busy,
+                    detail: if self.busy { "Working" } else { "Ready" }.into(),
+                });
             }
             "agent_start" | "auto_compaction_start" => {
                 if text(&frame, "type") == "agent_start" {
@@ -1429,16 +1448,16 @@ impl Adapter for Omp {
                     }
                 }
                 self.busy = true;
-                if !(self.retrying && text(&frame,"type") == "agent_start") {
-                step.events.push(Event::Status {
-                    busy: true,
-                    detail: if text(&frame, "type") == "agent_start" {
-                        "Working"
-                    } else {
-                        "Compacting"
-                    }
-                    .into(),
-                });
+                if !(self.retrying && text(&frame, "type") == "agent_start") {
+                    step.events.push(Event::Status {
+                        busy: true,
+                        detail: if text(&frame, "type") == "agent_start" {
+                            "Working"
+                        } else {
+                            "Compacting"
+                        }
+                        .into(),
+                    });
                 }
             }
             "agent_end"
@@ -1463,7 +1482,7 @@ impl Adapter for Omp {
                     None
                 };
                 self.busy = false;
-                self.retrying=false;
+                self.retrying = false;
                 step = self.refresh();
                 if finished
                     && let Some(execution) = self
@@ -3002,19 +3021,40 @@ mod tests {
     }
     #[test]
     fn provider_retry_events_describe_backoff_and_resume() {
-        let mut adapter=Omp::default();
-        let waiting=adapter.receive(json!({"type":"auto_retry_start","attempt":2,"maxAttempts":3,
-            "delayMs":8000,"errorMessage":"529 Overloaded"})).unwrap();
+        let mut adapter = Omp::default();
+        let waiting = adapter
+            .receive(
+                json!({"type":"auto_retry_start","attempt":2,"maxAttempts":3,
+            "delayMs":8000,"errorMessage":"529 Overloaded"}),
+            )
+            .unwrap();
         assert!(waiting.events.iter().any(|event|matches!(event,Event::Status {busy:true,detail}
             if detail.contains("attempt 2") && detail.contains("8 s") && detail.contains("529 Overloaded"))));
-        let starting=adapter.receive(json!({"type":"agent_start"})).unwrap();
-        assert!(!starting.events.iter().any(|event|matches!(event,Event::Status {detail,..} if detail == "Working")));
-        let resumed=adapter.receive(json!({"type":"message_update","message":{"role":"assistant","timestamp":1},
-            "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"answer"}})).unwrap();
-        assert!(resumed.events.iter().any(|event|matches!(event,Event::Status {busy:true,detail} if detail == "Working")));
-        let failed=adapter.receive(json!({"type":"auto_retry_end","success":false,"finalError":"Overloaded"})).unwrap();
-        assert!(!adapter.retrying);assert!(!adapter.busy);
-        assert!(failed.events.iter().any(|event|matches!(event,Event::Error {fatal:false,message} if message == "Overloaded")));
+        let starting = adapter.receive(json!({"type":"agent_start"})).unwrap();
+        assert!(
+            !starting
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Status {detail,..} if detail == "Working"))
+        );
+        let resumed = adapter
+            .receive(
+                json!({"type":"message_update","message":{"role":"assistant","timestamp":1},
+            "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"answer"}}),
+            )
+            .unwrap();
+        assert!(
+            resumed.events.iter().any(
+                |event| matches!(event,Event::Status {busy:true,detail} if detail == "Working")
+            )
+        );
+        let failed = adapter
+            .receive(json!({"type":"auto_retry_end","success":false,"finalError":"Overloaded"}))
+            .unwrap();
+        assert!(!adapter.retrying);
+        assert!(!adapter.busy);
+        assert!(failed.events.iter().any(
+            |event| matches!(event,Event::Error {fatal:false,message} if message == "Overloaded")
+        ));
     }
-
 }

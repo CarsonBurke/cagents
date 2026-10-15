@@ -20,8 +20,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-mod execution;
 mod annotations;
+mod execution;
 mod store;
 mod websocket;
 use store::Store;
@@ -185,7 +185,16 @@ impl Handle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, session_id, None, Err("This actor has no typed provider launch scope".into()), notify)
+        Self::start_inner(
+            spec,
+            adapter,
+            initial,
+            store,
+            session_id,
+            None,
+            Err("This actor has no typed provider launch scope".into()),
+            notify,
+        )
     }
 
     pub(crate) fn start_owned(
@@ -224,8 +233,9 @@ impl Handle {
             .server_process
             .ok_or("Missing retained app-server process identity")?;
         spec.environment = recovery.execution_environment.0;
-        let account_scope = recovery.launch_account_scope
-            .ok_or_else(|| "The retained provider has no captured credential-directory scope".to_owned());
+        let account_scope = recovery.launch_account_scope.ok_or_else(|| {
+            "The retained provider has no captured credential-directory scope".to_owned()
+        });
         Self::start_inner(
             spec,
             adapter,
@@ -318,7 +328,9 @@ impl Handle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
-        let annotations=Arc::new(Mutex::new(annotations::Authority::new(launch_account_scope.clone())));
+        let annotations = Arc::new(Mutex::new(annotations::Authority::new(
+            launch_account_scope.clone(),
+        )));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -330,7 +342,7 @@ impl Handle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
-            annotations:annotations.clone(),
+            annotations: annotations.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -577,7 +589,9 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. }
+            Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::LoadOriginal { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -947,10 +961,18 @@ impl Handle {
     }
     /// Cache-only metadata lookup. The host must release its actor-map lock
     /// before calling; this neither sends provider work nor hydrates snapshots.
-    pub(crate) fn original_prompt(&self,user:Option<&str>,expected_session:Option<&str>,offset:usize,limit:usize)->Result<super::annotations::OriginalPage,super::annotations::OriginalError>{
-        let authority=self.0.annotations.lock().unwrap_or_else(|p|p.into_inner());
-        if expected_session.is_some_and(|expected|authority.session()!=Some(expected)){return Err(super::annotations::OriginalError::Changed);}
-        authority.original(user,offset,limit)
+    pub(crate) fn original_prompt(
+        &self,
+        user: Option<&str>,
+        expected_session: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<super::annotations::OriginalPage, super::annotations::OriginalError> {
+        let authority = self.0.annotations.lock().unwrap_or_else(|p| p.into_inner());
+        if expected_session.is_some_and(|expected| authority.session() != Some(expected)) {
+            return Err(super::annotations::OriginalError::Changed);
+        }
+        authority.original(user, offset, limit)
     }
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
@@ -1555,7 +1577,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
-    annotations:Arc<Mutex<annotations::Authority>>,
+    annotations: Arc<Mutex<annotations::Authority>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -1723,7 +1745,9 @@ impl Actor {
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
                     closing = Some(Instant::now());
-                    if let Some(discarded)=self.adapter.discard_undispatched()?{self.step(discarded)?;}
+                    if let Some(discarded) = self.adapter.discard_undispatched()? {
+                        self.step(discarded)?;
+                    }
                 }
                 let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
                 if busy && !interrupt_sent && self.pending.is_empty() {
@@ -1749,8 +1773,10 @@ impl Actor {
                 }
             }
             self.drain_commands(closing.is_some())?;
-            let maintenance=self.adapter.maintenance()?;
-            if !maintenance.writes.is_empty() || !maintenance.events.is_empty(){self.step(maintenance)?;}
+            let maintenance = self.adapter.maintenance()?;
+            if !maintenance.writes.is_empty() || !maintenance.events.is_empty() {
+                self.step(maintenance)?;
+            }
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -1877,10 +1903,19 @@ impl Actor {
             } else {
                 -1
             };
-            let timeout=if let Some(deadline)=self.adapter.maintenance_deadline(){
-                let until=deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
-                if timeout<0{until}else{timeout.min(until)}
-            }else{timeout};
+            let timeout = if let Some(deadline) = self.adapter.maintenance_deadline() {
+                let until = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32;
+                if timeout < 0 {
+                    until
+                } else {
+                    timeout.min(until)
+                }
+            } else {
+                timeout
+            };
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -2067,8 +2102,13 @@ impl Actor {
             } else {
                 None
             };
-            let mut command=command;
-            let starts_turn = matches!(&command, Command::Prompt { .. }|Command::PromptOriginal{..}|Command::PromptNamed{..});
+            let mut command = command;
+            let starts_turn = matches!(
+                &command,
+                Command::Prompt { .. }
+                    | Command::PromptOriginal { .. }
+                    | Command::PromptNamed { .. }
+            );
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2103,34 +2143,110 @@ impl Actor {
             }
             // Normalize actor-owned display hints before provider admission.
             // They never select a file, account, or provider identity.
-            let names=if let Command::PromptNamed{text,attachments,mode}=command{
-                let (attachments,names):(Vec<_>,Vec<_>)=attachments.into_iter().map(|attachment|(super::Attachment{path:attachment.path},attachment.display_path)).unzip();
-                command=Command::Prompt{text,attachments,mode};names
-            }else{Vec::new()};
-            let retry=if let Command::PromptOriginal{session_id,original,turn_generation}=&command{
-                let state=self.state.lock().unwrap_or_else(|p|p.into_inner());
-                let allowed=run.is_none() && state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty() && state.queued_messages.is_empty() && state.turn_generation==*turn_generation && state.session_id.as_deref()==Some(session_id.as_str()) && state.capabilities.original_retry && self.pending.is_empty() && self.output.is_empty();
+            let names = if let Command::PromptNamed {
+                text,
+                attachments,
+                mode,
+            } = command
+            {
+                let (attachments, names): (Vec<_>, Vec<_>) = attachments
+                    .into_iter()
+                    .map(|attachment| {
+                        (
+                            super::Attachment {
+                                path: attachment.path,
+                            },
+                            attachment.display_path,
+                        )
+                    })
+                    .unzip();
+                command = Command::Prompt {
+                    text,
+                    attachments,
+                    mode,
+                };
+                names
+            } else {
+                Vec::new()
+            };
+            let retry = if let Command::PromptOriginal {
+                session_id,
+                original,
+                turn_generation,
+            } = &command
+            {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let allowed = run.is_none()
+                    && state.ready
+                    && !state.busy
+                    && !state.waiting
+                    && !state.exited
+                    && state.requests.is_empty()
+                    && state.queued_messages.is_empty()
+                    && state.turn_generation == *turn_generation
+                    && state.session_id.as_deref() == Some(session_id.as_str())
+                    && state.capabilities.original_retry
+                    && self.pending.is_empty()
+                    && self.output.is_empty();
                 drop(state);
-                if !allowed{let _=reply.send(Err("The current idle original changed or exact Retry is unavailable".into()));continue;}
-                let settings=original.settings.clone();
-                let prepared=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare_retry(session_id,original);
-                match prepared{Ok((id,prompt))=>{command=prompt;Some((id,settings))},Err(error)=>{let _=reply.send(Err(format!("Exact original Retry is unavailable: {error:?}")));continue;}}
-            }else{None};
-            let is_retry=retry.is_some();
+                if !allowed {
+                    let _ = reply.send(Err(
+                        "The current idle original changed or exact Retry is unavailable".into(),
+                    ));
+                    continue;
+                }
+                let settings = original.settings.clone();
+                let prepared = self
+                    .annotations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .prepare_retry(session_id, original);
+                match prepared {
+                    Ok((id, prompt)) => {
+                        command = prompt;
+                        Some((id, settings))
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(format!(
+                            "Exact original Retry is unavailable: {error:?}"
+                        )));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let is_retry = retry.is_some();
             // Original capture is optional product metadata. A capture failure
             // leaves the ordinary command and picker paths intact, and cannot
             // prevent the user from sending work to the provider.
-            let original=if let Some((id,_))=&retry{Some(id.clone())}else if run.is_none() && self.adapter.supports_original_commands(&command){
-                match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare_named(&mut command,&self.working_directory,&names){
-                    Ok(id)=>id,
-                    Err(error)=>{tracing::warn!(?error,"original command capture unavailable");None},
+            let original = if let Some((id, _)) = &retry {
+                Some(id.clone())
+            } else if run.is_none() && self.adapter.supports_original_commands(&command) {
+                match self
+                    .annotations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .prepare_named(&mut command, &self.working_directory, &names)
+                {
+                    Ok(id) => id,
+                    Err(error) => {
+                        tracing::warn!(?error, "original command capture unavailable");
+                        None
+                    }
                 }
-            }else{None};
+            } else {
+                None
+            };
             self.adapter.original_command(original.clone());
-            let prepared = if let Some((_,settings))=&retry{self.adapter.retry_original(settings,command)}else{match run {
-                Some(run) => self.adapter.command_for_run(run, command),
-                None => self.adapter.command(command),
-            }};
+            let prepared = if let Some((_, settings)) = &retry {
+                self.adapter.retry_original(settings, command)
+            } else {
+                match run {
+                    Some(run) => self.adapter.command_for_run(run, command),
+                    None => self.adapter.command(command),
+                }
+            };
             match prepared {
                 Ok(step) => {
                     if login_recovery.is_some() {
@@ -2155,12 +2271,22 @@ impl Actor {
                 Err(message) => {
                     // Adapter refusal occurred before any Step was queued: it
                     // is safe to retire this never-dispatched intent.
-                    if let Some(id)=original && let Err(error)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).abandon(&id){tracing::warn!(%error,"original refusal cleanup unavailable");}
+                    if let Some(id) = original
+                        && let Err(error) = self
+                            .annotations
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .abandon(&id)
+                    {
+                        tracing::warn!(%error,"original refusal cleanup unavailable");
+                    }
                     self.adapter.original_command(None);
-                    if !is_retry{self.apply(Event::Error {
-                        message: message.clone(),
-                        fatal: false,
-                    });}
+                    if !is_retry {
+                        self.apply(Event::Error {
+                            message: message.clone(),
+                            fatal: false,
+                        });
+                    }
                     let _ = reply.send(Err(message));
                 }
             }
@@ -2255,7 +2381,11 @@ impl Actor {
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
-    fn apply_step(&mut self, mut step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+    fn apply_step(
+        &mut self,
+        mut step: Step,
+        confirmed: Option<Option<String>>,
+    ) -> Result<(), String> {
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -2267,18 +2397,37 @@ impl Actor {
         {
             context.verify_directory(&self.working_directory)?;
         }
-        let updates=self.adapter.take_approval_updates();
-        let warning=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).apply(confirmed.as_ref(),updates,&mut step.events);
-        if let Some(message)=warning{
+        let updates = self.adapter.take_approval_updates();
+        let warning = self
+            .annotations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .apply(confirmed.as_ref(), updates, &mut step.events);
+        if let Some(message) = warning {
             // Annotation infrastructure is not a provider failure. Keep it in
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
-        let originals=self.adapter.take_original_updates();
-        if let Some(message)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).originals(originals){tracing::warn!(%message,"original command metadata unavailable");}
-        let original_revision=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).revision();
-        let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
-        if state.original_revision!=original_revision{state.original_revision=original_revision;state.generation=state.generation.saturating_add(1);self.dirty=true;}
+        let originals = self.adapter.take_original_updates();
+        if let Some(message) = self
+            .annotations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .originals(originals)
+        {
+            tracing::warn!(%message,"original command metadata unavailable");
+        }
+        let original_revision = self
+            .annotations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revision();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.original_revision != original_revision {
+            state.original_revision = original_revision;
+            state.generation = state.generation.saturating_add(1);
+            self.dirty = true;
+        }
         drop(state);
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
@@ -3488,27 +3637,56 @@ mod tests {
         let selected = home.join(".claude");
         std::fs::create_dir_all(&selected).unwrap();
         let recipe = crate::model::LaunchRecipe {
-            program: "/bin/cat".into(), arguments: Vec::new(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
             working_directory: directory.path().into(),
             environment: BTreeMap::from([
                 ("HOME".into(), home.to_string_lossy().into_owned()),
-                ("CLAUDE_CONFIG_DIR".into(), directory.path().join("removed-override").to_string_lossy().into_owned()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory
+                        .path()
+                        .join("removed-override")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
             ]),
             unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
         };
         let spec = ProcessSpec::from(&recipe);
         let source = super::super::Session {
-            id: crate::model::TerminalId::new(), proof: None, terminal: None,
-            native_continuity: Default::default(), owned_codex_listener: None,
-            launch: super::super::Launch { provider: crate::agent::Provider::Claude, recipe, session_id: None },
+            id: crate::model::TerminalId::new(),
+            proof: None,
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: super::super::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: None,
+            },
         };
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start_owned(spec, adapter, initial, store, source, Default::default(), |_| {}).unwrap();
+        let handle = Handle::start_owned(
+            spec,
+            adapter,
+            initial,
+            store,
+            source,
+            Default::default(),
+            |_| {},
+        )
+        .unwrap();
         let captured = handle.launch_account_scope().unwrap().clone();
         assert_eq!(captured.canonical_home, selected.canonicalize().unwrap());
-        assert!(!handle.execution_environment().0.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(
+            !handle
+                .execution_environment()
+                .0
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
         handle.command(Command::Refresh).unwrap();
         assert_eq!(handle.launch_account_scope().unwrap(), &captured);
         std::fs::rename(&selected, home.join("old-claude")).unwrap();

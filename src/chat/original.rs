@@ -8,7 +8,7 @@ const ID_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OriginalText {
-    pub source_incarnation:Option<uuid::Uuid>,
+    pub source_incarnation: Option<uuid::Uuid>,
     pub session_id: String,
     pub original: OriginalPrompt,
     pub text: String,
@@ -23,7 +23,11 @@ pub(crate) fn validate_query(
     if limit < 4 || limit > ORIGINAL_PAGE_BYTES || offset > ORIGINAL_TEXT_BYTES {
         return Err(OriginalError::InvalidRange);
     }
-    if [user, session].into_iter().flatten().any(|id| id.is_empty() || id.len() > ID_BYTES) {
+    if [user, session]
+        .into_iter()
+        .flatten()
+        .any(|id| id.is_empty() || id.len() > ID_BYTES)
+    {
         return Err(OriginalError::InvalidRange);
     }
     // `None` may resolve latest exactly once. A continuation cannot silently
@@ -66,7 +70,7 @@ pub(crate) fn validate_page(
 /// Collects one original while fencing every later page to the first native
 /// user, confirmed session, settings, attachments, and declared byte length.
 pub(crate) struct Assembly {
-    source_incarnation:Option<uuid::Uuid>,
+    source_incarnation: Option<uuid::Uuid>,
     user: Option<String>,
     session: Option<String>,
     original: Option<OriginalPrompt>,
@@ -77,24 +81,43 @@ pub(crate) struct Assembly {
 impl Assembly {
     pub(crate) fn new(user: Option<&str>, session: Option<&str>) -> Result<Self, OriginalError> {
         validate_query(user, session, 0, ORIGINAL_PAGE_BYTES)?;
-        Ok(Self { source_incarnation:None,user: user.map(str::to_owned), session: session.map(str::to_owned),
-            original: None, text: String::new(), complete: false })
+        Ok(Self {
+            source_incarnation: None,
+            user: user.map(str::to_owned),
+            session: session.map(str::to_owned),
+            original: None,
+            text: String::new(),
+            complete: false,
+        })
     }
 
     pub(crate) fn query(&self) -> (Option<&str>, Option<&str>, usize, usize) {
-        (self.user.as_deref(), self.session.as_deref(), self.text.len(), ORIGINAL_PAGE_BYTES)
+        (
+            self.user.as_deref(),
+            self.session.as_deref(),
+            self.text.len(),
+            ORIGINAL_PAGE_BYTES,
+        )
     }
 
     pub(crate) fn push(&mut self, page: OriginalPage) -> Result<bool, OriginalError> {
-        if self.complete { return Err(OriginalError::Changed); }
-        let (user, session, offset, limit) = self.query();
-        validate_page(user, session, offset, limit, &page)?;
-        if self.original.as_ref().is_some_and(|original| original != &page.original) {
+        if self.complete {
             return Err(OriginalError::Changed);
         }
-        if self.original.is_some() && self.source_incarnation!=page.source_incarnation {return Err(OriginalError::Changed);}
+        let (user, session, offset, limit) = self.query();
+        validate_page(user, session, offset, limit, &page)?;
+        if self
+            .original
+            .as_ref()
+            .is_some_and(|original| original != &page.original)
+        {
+            return Err(OriginalError::Changed);
+        }
+        if self.original.is_some() && self.source_incarnation != page.source_incarnation {
+            return Err(OriginalError::Changed);
+        }
         if self.original.is_none() {
-            self.source_incarnation=page.source_incarnation;
+            self.source_incarnation = page.source_incarnation;
             self.user = Some(page.original.user_id.clone());
             self.session = Some(page.session_id.clone());
             self.original = Some(page.original);
@@ -105,9 +128,15 @@ impl Assembly {
     }
 
     pub(crate) fn finish(self) -> Result<OriginalText, OriginalError> {
-        if !self.complete { return Err(OriginalError::Changed); }
-        Ok(OriginalText {source_incarnation:self.source_incarnation, session_id: self.session.ok_or(OriginalError::Changed)?,
-            original: self.original.ok_or(OriginalError::Changed)?, text: self.text })
+        if !self.complete {
+            return Err(OriginalError::Changed);
+        }
+        Ok(OriginalText {
+            source_incarnation: self.source_incarnation,
+            session_id: self.session.ok_or(OriginalError::Changed)?,
+            original: self.original.ok_or(OriginalError::Changed)?,
+            text: self.text,
+        })
     }
 }
 
@@ -118,36 +147,78 @@ mod tests {
 
     #[test]
     fn assembly_pins_source_incarnation_even_when_other_original_metadata_matches() {
-        let first=uuid::Uuid::new_v4();let second=uuid::Uuid::new_v4();
-        for (initial,next,accepted) in [(None,None,true),(Some(first),Some(first),true),(Some(first),Some(second),false),(None,Some(first),false),(Some(first),None,false)] {
-            let mut reader=Assembly::new(None,None).unwrap();let mut begin=page(0,"ab",4);begin.source_incarnation=initial;
-            assert!(!reader.push(begin).unwrap());let mut end=page(2,"cd",4);end.source_incarnation=next;
-            if accepted {assert!(reader.push(end).unwrap());let value=reader.finish().unwrap();assert_eq!(value.source_incarnation,initial);assert_eq!(value.text,"abcd");}
-            else {assert_eq!(reader.push(end).unwrap_err(),OriginalError::Changed);}
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        for (initial, next, accepted) in [
+            (None, None, true),
+            (Some(first), Some(first), true),
+            (Some(first), Some(second), false),
+            (None, Some(first), false),
+            (Some(first), None, false),
+        ] {
+            let mut reader = Assembly::new(None, None).unwrap();
+            let mut begin = page(0, "ab", 4);
+            begin.source_incarnation = initial;
+            assert!(!reader.push(begin).unwrap());
+            let mut end = page(2, "cd", 4);
+            end.source_incarnation = next;
+            if accepted {
+                assert!(reader.push(end).unwrap());
+                let value = reader.finish().unwrap();
+                assert_eq!(value.source_incarnation, initial);
+                assert_eq!(value.text, "abcd");
+            } else {
+                assert_eq!(reader.push(end).unwrap_err(), OriginalError::Changed);
+            }
         }
     }
     #[test]
     fn accepted_input_with_unknown_settings_can_be_read_for_edit_without_granting_retry() {
-        let mut reader=Assembly::new(None,None).unwrap();
-        let mut captured=page(0,"accepted exact input",20);captured.original.settings.fast=Setting::Unknown;
-        assert!(reader.push(captured).unwrap());let value=reader.finish().unwrap();
-        assert_eq!(value.text,"accepted exact input");assert!(!value.original.settings.is_exact());
+        let mut reader = Assembly::new(None, None).unwrap();
+        let mut captured = page(0, "accepted exact input", 20);
+        captured.original.settings.fast = Setting::Unknown;
+        assert!(reader.push(captured).unwrap());
+        let value = reader.finish().unwrap();
+        assert_eq!(value.text, "accepted exact input");
+        assert!(!value.original.settings.is_exact());
     }
 
     fn page(offset: usize, text: &str, total: usize) -> OriginalPage {
-        OriginalPage {source_incarnation:None, session_id: "confirmed-session".into(), original: OriginalPrompt {
-            user_id: "native-user".into(), turn_id: "native-turn".into(), text_bytes: total,
-            attachments: vec![], settings: OriginalSettings { model: Setting::Value("native-model".into()),
-                reasoning: Setting::Value("low".into()), fast: Setting::Unsupported,
-                permission: Setting::Value("ask".into()) } },
-            offset, next_offset: offset + text.len(), text: text.into(), complete: offset + text.len() == total }
+        OriginalPage {
+            source_incarnation: None,
+            session_id: "confirmed-session".into(),
+            original: OriginalPrompt {
+                user_id: "native-user".into(),
+                turn_id: "native-turn".into(),
+                text_bytes: total,
+                attachments: vec![],
+                settings: OriginalSettings {
+                    model: Setting::Value("native-model".into()),
+                    reasoning: Setting::Value("low".into()),
+                    fast: Setting::Unsupported,
+                    permission: Setting::Value("ask".into()),
+                },
+            },
+            offset,
+            next_offset: offset + text.len(),
+            text: text.into(),
+            complete: offset + text.len() == total,
+        }
     }
 
     #[test]
     fn latest_is_resolved_once_and_all_continuations_pin_native_identity() {
         let mut reader = Assembly::new(None, None).unwrap();
         assert!(!reader.push(page(0, "operator ", 13)).unwrap());
-        assert_eq!(reader.query(), (Some("native-user"), Some("confirmed-session"), 9, ORIGINAL_PAGE_BYTES));
+        assert_eq!(
+            reader.query(),
+            (
+                Some("native-user"),
+                Some("confirmed-session"),
+                9,
+                ORIGINAL_PAGE_BYTES
+            )
+        );
         assert!(reader.push(page(9, "🦀", 13)).unwrap());
         let original = reader.finish().unwrap();
         assert_eq!(original.text, "operator 🦀");
@@ -156,9 +227,18 @@ mod tests {
 
     #[test]
     fn visible_alias_resolves_once_then_continuations_pin_the_canonical_user() {
-        let mut reader = Assembly::new(Some("native-user:input/0"), Some("confirmed-session")).unwrap();
+        let mut reader =
+            Assembly::new(Some("native-user:input/0"), Some("confirmed-session")).unwrap();
         assert!(!reader.push(page(0, "first", 9)).unwrap());
-        assert_eq!(reader.query(), (Some("native-user"), Some("confirmed-session"), 5, ORIGINAL_PAGE_BYTES));
+        assert_eq!(
+            reader.query(),
+            (
+                Some("native-user"),
+                Some("confirmed-session"),
+                5,
+                ORIGINAL_PAGE_BYTES
+            )
+        );
         let mut wrong = page(5, "last", 9);
         wrong.original.user_id = "native-user:input/0".into();
         assert_eq!(reader.push(wrong), Err(OriginalError::Changed));
@@ -177,8 +257,17 @@ mod tests {
                 1 => later.original.user_id = "replacement-user".into(),
                 2 => later.original.settings.model = Setting::Value("different-model".into()),
                 3 => later.original.turn_id = "different-turn".into(),
-                4 => later.original.attachments.push(crate::chat::annotations::OriginalAttachment {
-                    original_path: "image.png".into(), path: "private-capture.png".into(), bytes: 1, sha256: [1; 32] }),
+                4 => {
+                    later
+                        .original
+                        .attachments
+                        .push(crate::chat::annotations::OriginalAttachment {
+                            original_path: "image.png".into(),
+                            path: "private-capture.png".into(),
+                            bytes: 1,
+                            sha256: [1; 32],
+                        })
+                }
                 5 => later.next_offset -= 1,
                 _ => later.original.text_bytes += 1,
             }
@@ -192,31 +281,72 @@ mod tests {
         let mut reader = Assembly::new(None, None).unwrap();
         assert!(reader.push(page(0, "", 0)).unwrap());
         assert!(reader.finish().unwrap().text.is_empty());
-        assert_eq!(validate_query(None, None, 1, 1), Err(OriginalError::InvalidRange));
-        assert_eq!(validate_query(Some("u"), Some("s"), 1, 0), Err(OriginalError::InvalidRange));
-        assert_eq!(validate_page(None, None, 0, 4, &page(0, "", 1)), Err(OriginalError::Changed));
-        assert_eq!(validate_page(None, None, 0, 4, &page(0, "x", ORIGINAL_TEXT_BYTES + 1)), Err(OriginalError::TooLarge));
+        assert_eq!(
+            validate_query(None, None, 1, 1),
+            Err(OriginalError::InvalidRange)
+        );
+        assert_eq!(
+            validate_query(Some("u"), Some("s"), 1, 0),
+            Err(OriginalError::InvalidRange)
+        );
+        assert_eq!(
+            validate_page(None, None, 0, 4, &page(0, "", 1)),
+            Err(OriginalError::Changed)
+        );
+        assert_eq!(
+            validate_page(None, None, 0, 4, &page(0, "x", ORIGINAL_TEXT_BYTES + 1)),
+            Err(OriginalError::TooLarge)
+        );
         let mut unknown = page(0, "x", 1);
         unknown.original.settings.model = Setting::Unknown;
-        assert_eq!(validate_page(None, None, 0, 1, &unknown),Err(OriginalError::InvalidRange));
-        assert_eq!(validate_page(None, None, 0, 4, &unknown),Ok(()));
-        assert!(!unknown.original.settings.is_exact(),"accepted Unknown input remains Edit-only");
+        assert_eq!(
+            validate_page(None, None, 0, 1, &unknown),
+            Err(OriginalError::InvalidRange)
+        );
+        assert_eq!(validate_page(None, None, 0, 4, &unknown), Ok(()));
+        assert!(
+            !unknown.original.settings.is_exact(),
+            "accepted Unknown input remains Edit-only"
+        );
     }
 
     #[test]
     fn original_requests_and_qualified_errors_round_trip_on_the_matched_wire() {
-        use crate::{chat::Command, model::TerminalId, terminal_ipc::{ClientRequest, ServerResponse}};
+        use crate::{
+            chat::Command,
+            model::TerminalId,
+            terminal_ipc::{ClientRequest, ServerResponse},
+        };
         let chat_id = TerminalId::new();
-        let request = ClientRequest::ChatCommand { chat_id, command: Command::LoadOriginal {
-            user_id: Some("native-user".into()), expected_session: Some("confirmed-session".into()),
-            offset: 7, limit: ORIGINAL_PAGE_BYTES,
-        } };
-        assert_eq!(postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(), request);
-        for result in [Ok(page(0, "text", 4)), Err(OriginalError::Unavailable("No provider acceptance proof".into())),
-            Err(OriginalError::InvalidRange), Err(OriginalError::TooLarge), Err(OriginalError::Changed),
-            Err(OriginalError::Transport("The daemon changed".into()))] {
+        let request = ClientRequest::ChatCommand {
+            chat_id,
+            command: Command::LoadOriginal {
+                user_id: Some("native-user".into()),
+                expected_session: Some("confirmed-session".into()),
+                offset: 7,
+                limit: ORIGINAL_PAGE_BYTES,
+            },
+        };
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),
+            request
+        );
+        for result in [
+            Ok(page(0, "text", 4)),
+            Err(OriginalError::Unavailable(
+                "No provider acceptance proof".into(),
+            )),
+            Err(OriginalError::InvalidRange),
+            Err(OriginalError::TooLarge),
+            Err(OriginalError::Changed),
+            Err(OriginalError::Transport("The daemon changed".into())),
+        ] {
             let reply = ServerResponse::ChatOriginal { chat_id, result };
-            assert_eq!(postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap()).unwrap(), reply);
+            assert_eq!(
+                postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap())
+                    .unwrap(),
+                reply
+            );
         }
     }
 }

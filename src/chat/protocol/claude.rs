@@ -299,7 +299,7 @@ enum ReportTask {
 
 #[derive(Default)]
 struct Claude {
-    originals:original::Originals,
+    originals: original::Originals,
     annotation_updates: Vec<chat::annotations::ApprovalUpdate>,
     session_id: Option<String>,
     /// Whether this process was launched to resume `session_id`, as opposed
@@ -598,8 +598,10 @@ impl Claude {
             }
             content.push(block);
         }
-        let original=self.originals.staged.take();
-        let id = original.clone().unwrap_or_else(||uuid::Uuid::new_v4().to_string());
+        let original = self.originals.staged.take();
+        let id = original
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut frame = json!({"type":"user", "uuid":id, "parent_tool_use_id":null, "origin":{"kind":"human"}, "message":{"role":"user", "content":content}});
         if let Some(session) = &self.session_id {
             frame["session_id"] = json!(session);
@@ -678,7 +680,7 @@ impl Claude {
                 },
             );
         }
-        step.writes.extend(self.original_dispatch(frame,original)?);
+        step.writes.extend(self.original_dispatch(frame, original)?);
         if !self.busy && mode == PromptMode::Send {
             self.start_turn(&mut step);
             self.status(true, "Claude is working", &mut step);
@@ -775,13 +777,24 @@ impl Claude {
             ],
             events: vec![],
         };
-        if let Some(tool_id)=request["tool_use_id"].as_str().filter(|_|string(request,"tool_name")!="AskUserQuestion") {
-            self.annotation_updates.push(chat::annotations::ApprovalUpdate {
-                session_id:self.session_id.clone(),
-                key:chat::annotations::ApprovalKey{agent_id:None,item_id:tool_id.to_owned()},
-                request_id:id.clone(),
-                decision:if action=="deny"{chat::annotations::ApprovalDecision::Denied}else{chat::annotations::ApprovalDecision::Allowed},
-            });
+        if let Some(tool_id) = request["tool_use_id"]
+            .as_str()
+            .filter(|_| string(request, "tool_name") != "AskUserQuestion")
+        {
+            self.annotation_updates
+                .push(chat::annotations::ApprovalUpdate {
+                    session_id: self.session_id.clone(),
+                    key: chat::annotations::ApprovalKey {
+                        agent_id: None,
+                        item_id: tool_id.to_owned(),
+                    },
+                    request_id: id.clone(),
+                    decision: if action == "deny" {
+                        chat::annotations::ApprovalDecision::Denied
+                    } else {
+                        chat::annotations::ApprovalDecision::Allowed
+                    },
+                });
         }
         self.retire(id, &mut step);
         let tool_id = request["tool_use_id"].as_str().map(str::to_owned);
@@ -925,11 +938,16 @@ impl Claude {
         };
         let mut events = vec![Event::Request(event)];
         if !question && let Some(tool_id) = request["tool_use_id"].as_str() {
-            self.annotation_updates.push(chat::annotations::ApprovalUpdate {
-                session_id:self.session_id.clone(),
-                key:chat::annotations::ApprovalKey{agent_id:None,item_id:tool_id.to_owned()},
-                request_id:id.clone(),decision:chat::annotations::ApprovalDecision::Awaiting,
-            });
+            self.annotation_updates
+                .push(chat::annotations::ApprovalUpdate {
+                    session_id: self.session_id.clone(),
+                    key: chat::annotations::ApprovalKey {
+                        agent_id: None,
+                        item_id: tool_id.to_owned(),
+                    },
+                    request_id: id.clone(),
+                    decision: chat::annotations::ApprovalDecision::Awaiting,
+                });
             let mut item = self.tools.get(tool_id).cloned().unwrap_or_else(|| Item {
                 id: tool_id.to_owned(),
                 role: Role::Assistant,
@@ -1611,12 +1629,37 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn supports_original_commands(&self,command:&Command)->bool{self.ready&&!self.busy&&self.queued.is_empty()&&self.submissions.is_empty()&&matches!(command,Command::Prompt{mode:PromptMode::Send,..})}
-    fn original_command(&mut self,id:Option<String>){self.originals.staged=id;}
-    fn take_original_updates(&mut self)->Vec<chat::annotations::OriginalUpdate>{std::mem::take(&mut self.originals.updates)}
-    fn discard_undispatched(&mut self)->Result<Option<Step>,String>{self.original_abort(true)}
-    fn maintenance(&mut self)->Result<Step,String>{Ok(self.original_maintenance())}
-    fn maintenance_deadline(&self)->Option<std::time::Instant>{self.originals.waiting.as_ref().map(|pending|pending.deadline)}
+    fn supports_original_commands(&self, command: &Command) -> bool {
+        self.ready
+            && !self.busy
+            && self.queued.is_empty()
+            && self.submissions.is_empty()
+            && matches!(
+                command,
+                Command::Prompt {
+                    mode: PromptMode::Send,
+                    ..
+                }
+            )
+    }
+    fn original_command(&mut self, id: Option<String>) {
+        self.originals.staged = id;
+    }
+    fn take_original_updates(&mut self) -> Vec<chat::annotations::OriginalUpdate> {
+        std::mem::take(&mut self.originals.updates)
+    }
+    fn discard_undispatched(&mut self) -> Result<Option<Step>, String> {
+        self.original_abort(true)
+    }
+    fn maintenance(&mut self) -> Result<Step, String> {
+        Ok(self.original_maintenance())
+    }
+    fn maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.originals
+            .waiting
+            .as_ref()
+            .map(|pending| pending.deadline)
+    }
     fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
         std::mem::take(&mut self.annotation_updates)
     }
@@ -1767,7 +1810,15 @@ impl Adapter for Claude {
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
-        if matches!(&command,Command::SetModel{..}|Command::SetFastMode{..}|Command::SetPermissionMode{..}|Command::UpdatePermissionSettings{..}){self.originals.revision=self.originals.revision.wrapping_add(1);}
+        if matches!(
+            &command,
+            Command::SetModel { .. }
+                | Command::SetFastMode { .. }
+                | Command::SetPermissionMode { .. }
+                | Command::UpdatePermissionSettings { .. }
+        ) {
+            self.originals.revision = self.originals.revision.wrapping_add(1);
+        }
         if self.history_only {
             match command {
                 Command::LoadEarlier => {}
@@ -1778,215 +1829,230 @@ impl Adapter for Claude {
                 ),
             }
         }
-        let flush_before_control=!matches!(&command,Command::Prompt{..});
-        let result=(|| {match command {
-            Command::Prompt {
-                text,
-                attachments,
-                mode,
-            } => self.send_prompt(text, attachments, mode),
-            Command::RemoveQueued { id } => {
-                if !self.queued.iter().any(|message| message.id == id) {
-                    return Err("This Claude message is no longer queued".into());
-                }
-                self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
-            }
-            Command::StartQueued { .. }
-            | Command::SetInterruptMode { .. }
-            | Command::ListBranches
-            | Command::Branch { .. } => Err("This operation is not supported by Claude".into()),
-            Command::Answer {
-                request_id,
-                action,
-                answers,
-            } => self.answer(request_id, action, answers),
-            Command::StopSubagent { id } => {
-                // Claude Code stops an agent by its task, which is the agent
-                // ID. A task frame names the call that started it; an agent
-                // restored from history is known only by its launch.
-                let task = self
-                    .agent_task_calls
-                    .iter()
-                    .rev()
-                    .find(|(tool, _)| *tool == id)
-                    .map(|(_, task)| task)
-                    .or_else(|| {
-                        self.agent_calls
-                            .iter()
-                            .rev()
-                            .find(|(_, tool)| *tool == id)
-                            .map(|(agent, _)| agent)
-                    })
-                    .cloned()
-                    .ok_or("Claude has not reported a task for this subagent yet")?;
-                self.control(json!({"subtype":"stop_task", "task_id":task}))
-            }
-            Command::Interrupt => {
-                if let Some(mut aborted)=self.original_abort(false)?{
-                    if self.busy{
-                        let interrupt=self.control(json!({"subtype":"interrupt","_cagents_turn":self.attention_generation}))?;aborted.writes.extend(interrupt.writes);self.interruption=Some(false);
+        let flush_before_control = !matches!(&command, Command::Prompt { .. });
+        let result = (|| {
+            match command {
+                Command::Prompt {
+                    text,
+                    attachments,
+                    mode,
+                } => self.send_prompt(text, attachments, mode),
+                Command::RemoveQueued { id } => {
+                    if !self.queued.iter().any(|message| message.id == id) {
+                        return Err("This Claude message is no longer queued".into());
                     }
-                    return Ok(aborted);
+                    self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
                 }
-                if self.interruption.is_some() {
-                    return Err("Claude interruption is already pending for this turn".into());
+                Command::StartQueued { .. }
+                | Command::SetInterruptMode { .. }
+                | Command::ListBranches
+                | Command::Branch { .. } => Err("This operation is not supported by Claude".into()),
+                Command::Answer {
+                    request_id,
+                    action,
+                    answers,
+                } => self.answer(request_id, action, answers),
+                Command::StopSubagent { id } => {
+                    // Claude Code stops an agent by its task, which is the agent
+                    // ID. A task frame names the call that started it; an agent
+                    // restored from history is known only by its launch.
+                    let task = self
+                        .agent_task_calls
+                        .iter()
+                        .rev()
+                        .find(|(tool, _)| *tool == id)
+                        .map(|(_, task)| task)
+                        .or_else(|| {
+                            self.agent_calls
+                                .iter()
+                                .rev()
+                                .find(|(_, tool)| *tool == id)
+                                .map(|(agent, _)| agent)
+                        })
+                        .cloned()
+                        .ok_or("Claude has not reported a task for this subagent yet")?;
+                    self.control(json!({"subtype":"stop_task", "task_id":task}))
                 }
-                let step = self.control(
-                    json!({"subtype":"interrupt", "_cagents_turn": self.attention_generation}),
-                )?;
-                self.interruption = self.busy.then_some(false);
-                Ok(step)
-            }
-            Command::SetModel { model, reasoning } => {
-                if !self.ready {
-                    return Err("Claude is still initializing".into());
+                Command::Interrupt => {
+                    if let Some(mut aborted) = self.original_abort(false)? {
+                        if self.busy {
+                            let interrupt=self.control(json!({"subtype":"interrupt","_cagents_turn":self.attention_generation}))?;
+                            aborted.writes.extend(interrupt.writes);
+                            self.interruption = Some(false);
+                        }
+                        return Ok(aborted);
+                    }
+                    if self.interruption.is_some() {
+                        return Err("Claude interruption is already pending for this turn".into());
+                    }
+                    let step = self.control(
+                        json!({"subtype":"interrupt", "_cagents_turn": self.attention_generation}),
+                    )?;
+                    self.interruption = self.busy.then_some(false);
+                    Ok(step)
                 }
-                let advertised = self
-                    .models
-                    .iter()
-                    .find(|m| m.id == model)
-                    .ok_or("Model is not advertised by this Claude session")?;
-                if reasoning
-                    .as_ref()
-                    .is_some_and(|effort| !advertised.reasoning.contains(effort))
-                {
-                    return Err("Reasoning effort is not advertised for this Claude model".into());
-                }
-                self.control(
+                Command::SetModel { model, reasoning } => {
+                    if !self.ready {
+                        return Err("Claude is still initializing".into());
+                    }
+                    let advertised = self
+                        .models
+                        .iter()
+                        .find(|m| m.id == model)
+                        .ok_or("Model is not advertised by this Claude session")?;
+                    if reasoning
+                        .as_ref()
+                        .is_some_and(|effort| !advertised.reasoning.contains(effort))
+                    {
+                        return Err(
+                            "Reasoning effort is not advertised for this Claude model".into()
+                        );
+                    }
+                    self.control(
                     json!({"subtype":"set_model", "model":model, "_cagents_reasoning":reasoning}),
                 )
-            }
-            Command::SetFastMode { enabled } => {
-                if !self.ready || !self.capabilities().fast_mode {
-                    return Err("Fast mode is unavailable for this Claude session".into());
                 }
-                if self
-                    .controls
-                    .values()
-                    .any(|request| request["settings"].get("fastMode").is_some())
-                {
-                    return Err("Claude fast mode change is already pending".into());
-                }
-                self.control(
-                    json!({"subtype":"apply_flag_settings", "settings":{"fastMode":enabled}}),
-                )
-            }
-            Command::SetPermissionMode { mode } => {
-                if !MODES.contains(&mode.as_str()) {
-                    return Err("Unsupported Claude permission mode".into());
-                }
-                self.control(json!({"subtype":"set_permission_mode", "mode":mode}))
-            }
-            Command::DismissPermissionDenial { tool_use_id } => {
-                if tool_use_id.is_empty() || tool_use_id.len() > 4096 {
-                    return Err("Invalid Claude denied tool identifier".into());
-                }
-                if !self.dismissed_denials.contains(&tool_use_id) {
-                    self.dismissed_denials.push_back(tool_use_id.clone());
-                    if self.dismissed_denials.len() > chat::PermissionDenial::LIMIT {
-                        self.dismissed_denials.pop_front();
+                Command::SetFastMode { enabled } => {
+                    if !self.ready || !self.capabilities().fast_mode {
+                        return Err("Fast mode is unavailable for this Claude session".into());
                     }
+                    if self
+                        .controls
+                        .values()
+                        .any(|request| request["settings"].get("fastMode").is_some())
+                    {
+                        return Err("Claude fast mode change is already pending".into());
+                    }
+                    self.control(
+                        json!({"subtype":"apply_flag_settings", "settings":{"fastMode":enabled}}),
+                    )
                 }
-                Ok(Step {
-                    events: vec![Event::PermissionDenialDismissed { tool_use_id }],
-                    ..Step::default()
-                })
-            }
-            Command::RefreshPermissions => {
-                if self.controls.values().any(|request| {
-                    string(request, "subtype") == "get_settings"
-                        || request["_cagents_permissions"].as_bool() == Some(true)
-                }) {
-                    return Err(
-                        "Claude permission settings are already being refreshed or updated".into(),
-                    );
+                Command::SetPermissionMode { mode } => {
+                    if !MODES.contains(&mode.as_str()) {
+                        return Err("Unsupported Claude permission mode".into());
+                    }
+                    self.control(json!({"subtype":"set_permission_mode", "mode":mode}))
                 }
-                self.permissions = None;
-                self.control(json!({"subtype":"get_settings"}))
-            }
-            Command::UpdatePermissionSettings { update } => {
-                if self.controls.values().any(|request| {
-                    string(request, "subtype") == "get_settings"
-                        || request["_cagents_permissions"].as_bool() == Some(true)
-                }) {
-                    return Err(
-                        "Wait for Claude to confirm the previous permission settings change".into(),
-                    );
-                }
-                let settings = self
-                    .permissions
-                    .as_ref()
-                    .ok_or("Refresh Claude permission settings before changing them")?
-                    .update(&update)?;
-                self.control(json!({"subtype":"apply_flag_settings", "settings":settings, "_cagents_permissions":true, "_cagents_permission_update":update}))
-            }
-            Command::Compact => {
-                if !self.capabilities().compact {
-                    return Err("This Claude session does not advertise /compact".into());
-                }
-                self.send_prompt("/compact".into(), vec![], PromptMode::Send)
-            }
-            Command::Slash { command } => {
-                let name = command
-                    .trim()
-                    .trim_start_matches('/')
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("");
-                if !self.commands.iter().any(|c| c.name == name) {
-                    return Err("Slash command is not advertised by this Claude session".into());
-                }
-                self.send_prompt(
-                    format!("/{}", command.trim().trim_start_matches('/')),
-                    vec![],
-                    PromptMode::Send,
-                )
-            }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. } | Command::PromptOriginal { .. } | Command::PromptNamed { .. } => {
-                return Err("File changes are served by the transcript cache".into());
-            }
-            Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
-            Command::ResumeAfterLogin { .. } => {
-                return Err("Live login verification is available for Codex chats".into());
-            }
-            Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
-            Command::LoadEarlier => {
-                let Some(mut history) = self.history.take() else {
-                    return Err("Claude has no earlier persisted history".into());
-                };
-                let frames = history.page();
-                let has_earlier = history.offset > 0;
-                self.history = Some(history);
-                let mut step = Step::default();
-                // An earlier page replays launches whose agents settled long
-                // ago; which agents are still running is already known.
-                let running = self.background_agents.clone();
-                for frame in frames? {
-                    self.history_message(&frame, &mut step)?;
-                }
-                self.background_agents = running;
-                let items = step
-                    .events
-                    .into_iter()
-                    .filter_map(|e| {
-                        if let Event::Item(i) = e {
-                            Some(i)
-                        } else {
-                            None
+                Command::DismissPermissionDenial { tool_use_id } => {
+                    if tool_use_id.is_empty() || tool_use_id.len() > 4096 {
+                        return Err("Invalid Claude denied tool identifier".into());
+                    }
+                    if !self.dismissed_denials.contains(&tool_use_id) {
+                        self.dismissed_denials.push_back(tool_use_id.clone());
+                        if self.dismissed_denials.len() > chat::PermissionDenial::LIMIT {
+                            self.dismissed_denials.pop_front();
                         }
+                    }
+                    Ok(Step {
+                        events: vec![Event::PermissionDenialDismissed { tool_use_id }],
+                        ..Step::default()
                     })
-                    .collect();
-                Ok(Step {
-                    events: vec![Event::History {
-                        items: settled(items),
-                        has_earlier,
-                    }],
-                    ..Step::default()
-                })
+                }
+                Command::RefreshPermissions => {
+                    if self.controls.values().any(|request| {
+                        string(request, "subtype") == "get_settings"
+                            || request["_cagents_permissions"].as_bool() == Some(true)
+                    }) {
+                        return Err(
+                            "Claude permission settings are already being refreshed or updated"
+                                .into(),
+                        );
+                    }
+                    self.permissions = None;
+                    self.control(json!({"subtype":"get_settings"}))
+                }
+                Command::UpdatePermissionSettings { update } => {
+                    if self.controls.values().any(|request| {
+                        string(request, "subtype") == "get_settings"
+                            || request["_cagents_permissions"].as_bool() == Some(true)
+                    }) {
+                        return Err(
+                            "Wait for Claude to confirm the previous permission settings change"
+                                .into(),
+                        );
+                    }
+                    let settings = self
+                        .permissions
+                        .as_ref()
+                        .ok_or("Refresh Claude permission settings before changing them")?
+                        .update(&update)?;
+                    self.control(json!({"subtype":"apply_flag_settings", "settings":settings, "_cagents_permissions":true, "_cagents_permission_update":update}))
+                }
+                Command::Compact => {
+                    if !self.capabilities().compact {
+                        return Err("This Claude session does not advertise /compact".into());
+                    }
+                    self.send_prompt("/compact".into(), vec![], PromptMode::Send)
+                }
+                Command::Slash { command } => {
+                    let name = command
+                        .trim()
+                        .trim_start_matches('/')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    if !self.commands.iter().any(|c| c.name == name) {
+                        return Err("Slash command is not advertised by this Claude session".into());
+                    }
+                    self.send_prompt(
+                        format!("/{}", command.trim().trim_start_matches('/')),
+                        vec![],
+                        PromptMode::Send,
+                    )
+                }
+                Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::LoadOriginal { .. }
+                | Command::PromptOriginal { .. }
+                | Command::PromptNamed { .. } => {
+                    return Err("File changes are served by the transcript cache".into());
+                }
+                Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
+                Command::ResumeAfterLogin { .. } => {
+                    return Err("Live login verification is available for Codex chats".into());
+                }
+                Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
+                Command::LoadEarlier => {
+                    let Some(mut history) = self.history.take() else {
+                        return Err("Claude has no earlier persisted history".into());
+                    };
+                    let frames = history.page();
+                    let has_earlier = history.offset > 0;
+                    self.history = Some(history);
+                    let mut step = Step::default();
+                    // An earlier page replays launches whose agents settled long
+                    // ago; which agents are still running is already known.
+                    let running = self.background_agents.clone();
+                    for frame in frames? {
+                        self.history_message(&frame, &mut step)?;
+                    }
+                    self.background_agents = running;
+                    let items = step
+                        .events
+                        .into_iter()
+                        .filter_map(|e| {
+                            if let Event::Item(i) = e {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    Ok(Step {
+                        events: vec![Event::History {
+                            items: settled(items),
+                            has_earlier,
+                        }],
+                        ..Step::default()
+                    })
+                }
             }
-        }})();
-        result.map(|mut step:Step|{
-            if flush_before_control{let held=self.original_flush();step.writes.splice(0..0,held);}
+        })();
+        result.map(|mut step: Step| {
+            if flush_before_control {
+                let held = self.original_flush();
+                step.writes.splice(0..0, held);
+            }
             step
         })
     }
@@ -1994,10 +2060,12 @@ impl Adapter for Claude {
         let mut step = Step::default();
         // Backoff is a provider status, not assistant output. Keep it visible
         // until actual assistant content resumes, including streamed deltas.
-        if self.retrying && frame["parent_tool_use_id"].is_null()
+        if self.retrying
+            && frame["parent_tool_use_id"].is_null()
             && (string(&frame, "type") == "assistant"
                 || (string(&frame, "type") == "stream_event"
-                    && string(&frame["event"], "type") == "content_block_delta")) {
+                    && string(&frame["event"], "type") == "content_block_delta"))
+        {
             self.retrying = false;
             self.status(true, "Claude is working", &mut step);
         }
@@ -2037,14 +2105,18 @@ impl Adapter for Claude {
                 title: None,
             });
         }
-        if let Some(original)=self.original_control_response(&frame){step.writes.extend(original.writes);step.events.extend(original.events);return Ok(step);}
+        if let Some(original) = self.original_control_response(&frame) {
+            step.writes.extend(original.writes);
+            step.events.extend(original.events);
+            return Ok(step);
+        }
         match string(&frame, "type") {
             "control_request" => {
-                let permission=self.permission(frame)?;
+                let permission = self.permission(frame)?;
                 step.writes.extend(permission.writes);
                 step.events.extend(permission.events);
                 return Ok(step);
-            },
+            }
             "control_cancel_request" => {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
             }
@@ -2466,7 +2538,10 @@ impl Adapter for Claude {
                         {
                             self.queued.push(message.preview.clone());
                         }
-                    } else if matches!(state, "started" | "completed" | "cancelled" | "discarded" | "refused") {
+                    } else if matches!(
+                        state,
+                        "started" | "completed" | "cancelled" | "discarded" | "refused"
+                    ) {
                         if state == "started" && self.submissions.contains_key(id) {
                             self.start_turn(&mut step);
                             self.status(true, "Claude is working", &mut step);
@@ -2549,7 +2624,7 @@ impl Adapter for Claude {
             "keep_alive" => {}
             other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
-        self.original_observe(&frame,&step);
+        self.original_observe(&frame, &step);
         Ok(step)
     }
 }
@@ -3675,7 +3750,9 @@ impl Claude {
                 if parent.is_empty() {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
-                    if !self.retrying { self.status(true, "Claude is working", step); }
+                    if !self.retrying {
+                        self.status(true, "Claude is working", step);
+                    }
                 }
             }
             "content_block_start" => {
@@ -4153,20 +4230,36 @@ impl Claude {
             // error surface, and what the session is doing is the status
             // line's job.
             "api_retry" => {
-                let attempt = frame["attempt"].as_u64().or_else(|| frame["retry_attempt"].as_u64()).unwrap_or(1);
-                let delay = frame["retry_delay_ms"].as_u64()
+                let attempt = frame["attempt"]
+                    .as_u64()
+                    .or_else(|| frame["retry_attempt"].as_u64())
+                    .unwrap_or(1);
+                let delay = frame["retry_delay_ms"]
+                    .as_u64()
                     .or_else(|| frame["retry_after_ms"].as_u64())
                     .or_else(|| frame["delay_ms"].as_u64());
-                let error = frame["error"].as_str()
+                let error = frame["error"]
+                    .as_str()
                     .or_else(|| frame["error_message"].as_str())
                     .map(str::to_owned)
-                    .unwrap_or_else(|| frame.get("error_status").or_else(||frame.get("status_code"))
-                        .filter(|value|!value.is_null()).map(ToString::to_string)
-                        .unwrap_or_else(||"Transient provider error".into()));
+                    .unwrap_or_else(|| {
+                        frame
+                            .get("error_status")
+                            .or_else(|| frame.get("status_code"))
+                            .filter(|value| !value.is_null())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "Transient provider error".into())
+                    });
                 let error: String = error.chars().take(512).collect();
-                let delay = delay.map(|ms| format!(", in {} s", ms.div_ceil(1000))).unwrap_or_default();
+                let delay = delay
+                    .map(|ms| format!(", in {} s", ms.div_ceil(1000)))
+                    .unwrap_or_default();
                 self.retrying = true;
-                self.status(true, format!("Retrying (attempt {attempt}{delay}): {error}"), step);
+                self.status(
+                    true,
+                    format!("Retrying (attempt {attempt}{delay}): {error}"),
+                    step,
+                );
             }
             "informational"
             | "notification"
@@ -5149,9 +5242,24 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 }
 
 #[cfg(test)]
-pub(crate) fn annotation_test_adapter()->Box<dyn Adapter>{Box::new(Claude{ready:true,cwd:std::env::temp_dir(),..Claude::default()})}
+pub(crate) fn annotation_test_adapter() -> Box<dyn Adapter> {
+    Box::new(Claude {
+        ready: true,
+        cwd: std::env::temp_dir(),
+        ..Claude::default()
+    })
+}
 #[cfg(test)]
-pub(crate) fn annotation_test_async_adapter()->Box<dyn Adapter>{let mut adapter=Claude{ready:true,async_input:true,cwd:std::env::temp_dir(),..Claude::default()};adapter.originals.wait_timeout=Some(std::time::Duration::from_secs(10));Box::new(adapter)}
+pub(crate) fn annotation_test_async_adapter() -> Box<dyn Adapter> {
+    let mut adapter = Claude {
+        ready: true,
+        async_input: true,
+        cwd: std::env::temp_dir(),
+        ..Claude::default()
+    };
+    adapter.originals.wait_timeout = Some(std::time::Duration::from_secs(10));
+    Box::new(adapter)
+}
 
 #[cfg(test)]
 mod tests {
@@ -5640,15 +5748,25 @@ mod tests {
     #[test]
     fn provider_backoff_status_is_cleared_by_assistant_content() {
         let mut adapter = Claude::default();
-        let retry = adapter.receive(json!({"type":"system","subtype":"api_retry",
-            "attempt":2,"retry_delay_ms":8000,"error":"529 Overloaded"})).unwrap();
+        let retry = adapter
+            .receive(json!({"type":"system","subtype":"api_retry",
+            "attempt":2,"retry_delay_ms":8000,"error":"529 Overloaded"}))
+            .unwrap();
         assert!(retry.events.iter().any(|event| matches!(event,
             Event::Status { busy:true, detail } if detail.contains("attempt 2") && detail.contains("8 s") && detail.contains("529 Overloaded"))));
-        adapter.receive(stream(json!({"type":"message_start","message":{"id":"answer","usage":{}}}))).unwrap();
-        adapter.receive(stream(json!({"type":"content_block_start","index":0,
-            "content_block":{"type":"text","text":""}}))).unwrap();
-        let resumed = adapter.receive(stream(json!({"type":"content_block_delta","index":0,
-            "delta":{"type":"text_delta","text":"Answer"}}))).unwrap();
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"answer","usage":{}}}),
+            ))
+            .unwrap();
+        adapter
+            .receive(stream(json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"text","text":""}})))
+            .unwrap();
+        let resumed = adapter
+            .receive(stream(json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"Answer"}})))
+            .unwrap();
         assert!(!adapter.retrying);
         assert!(resumed.events.iter().any(|event| matches!(event,
             Event::Status { busy:true, detail } if detail == "Claude is working")));

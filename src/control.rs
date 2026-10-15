@@ -2838,13 +2838,25 @@ pub enum StopReport {
     Failed { error: String },
 }
 
-pub(crate) fn terminal_spawn_recipe(cwd: PathBuf, argv: Vec<String>) -> Result<LaunchRecipe, AppError> {
+pub(crate) fn terminal_spawn_recipe(
+    cwd: PathBuf,
+    argv: Vec<String>,
+) -> Result<LaunchRecipe, AppError> {
     if argv.is_empty() {
-        let mut recipe = LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
-        if let Some(shell) = crate::device::shell() { recipe.program = shell.to_owned(); }
+        let mut recipe =
+            LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
+        if let Some(shell) = crate::device::shell() {
+            recipe.program = shell.to_owned();
+        }
         Ok(recipe)
     } else {
-        Ok(LaunchRecipe { unset_environment: Default::default(), program: argv[0].clone(), arguments: argv[1..].to_vec(), working_directory: cwd, environment: BTreeMap::new() })
+        Ok(LaunchRecipe {
+            unset_environment: Default::default(),
+            program: argv[0].clone(),
+            arguments: argv[1..].to_vec(),
+            working_directory: cwd,
+            environment: BTreeMap::new(),
+        })
     }
 }
 

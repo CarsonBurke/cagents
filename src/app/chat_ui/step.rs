@@ -437,11 +437,15 @@ impl Runtime {
                 )
             })
             .unwrap_or_else(|| turn.summary.clone());
-        let retrying=turn.running && self.snapshot.detail.starts_with("Retrying");
-        let summary=if retrying {
-            summary.strip_suffix(" · working").map(|summary|format!("{summary} · {}",self.snapshot.detail))
+        let retrying = turn.running && self.snapshot.detail.starts_with("Retrying");
+        let summary = if retrying {
+            summary
+                .strip_suffix(" · working")
+                .map(|summary| format!("{summary} · {}", self.snapshot.detail))
                 .unwrap_or(summary)
-        } else {summary};
+        } else {
+            summary
+        };
         let key = turn.key.as_str();
         // Explicit reader choices override the configured default.
         let open = self
@@ -459,8 +463,15 @@ impl Runtime {
             .into(),
         ];
         let tone = match if retrying {
-            Some((widget::icon(Icon::AgentWaiting.handle()).size(design::COMPACT_ICON_SIZE).into(),None))
-        } else {turn.glyph().map(status_indicator)} {
+            Some((
+                widget::icon(Icon::AgentWaiting.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+                None,
+            ))
+        } else {
+            turn.glyph().map(status_indicator)
+        } {
             Some((indicator, tone)) => {
                 line.push(indicator);
                 tone
