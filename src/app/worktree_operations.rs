@@ -234,6 +234,10 @@ impl Cagents {
                         if source.repository() != request.repository {
                             return refused("the request names another repository".to_owned());
                         }
+                        let _source_lifetime = match source.link_token(&token) {
+                            Ok(lease) => lease,
+                            Err(error) => return refused(error.to_string()),
+                        };
                         match source.service() {
                             Ok(service) => service.create_worktree_journaled(&store, &request, generation, &token, &sender),
                             Err(error) => refused(error.to_string()),

@@ -180,26 +180,66 @@ fn sentence(message: &str) -> String {
 /// service; a later pathname lookup never supplies replacement authority.
 #[derive(Clone)]
 pub(super) struct WorktreeCreationSource {
+    id: OperationId,
+    lifetime: Arc<std::sync::Mutex<CreationSourceLifetime>>,
     authority: crate::repository::WorktreeAuthority,
     service: Arc<std::sync::Mutex<Option<Arc<ScopedCreationService>>>>,
+}
+
+#[derive(Default)]
+struct CreationSourceLifetime {
+    invalidated: bool,
+    readers: Vec<std::sync::Weak<CancellationToken>>,
 }
 
 type ScopedCreationService = RepositoryService<crate::repository::WorktreeExecutor<crate::repository::SystemProcessExecutor>>;
 
 impl std::fmt::Debug for WorktreeCreationSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("WorktreeCreationSource").field("authority", &self.authority).finish_non_exhaustive()
+        formatter.debug_struct("WorktreeCreationSource").field("id", &self.id).field("authority", &self.authority).finish_non_exhaustive()
     }
 }
 
 impl WorktreeCreationSource {
-    fn new(authority: crate::repository::WorktreeAuthority) -> Self {
-        Self { authority, service: Arc::new(std::sync::Mutex::new(None)) }
+    pub(super) fn new(authority: crate::repository::WorktreeAuthority) -> Self {
+        Self { id: OperationId::new(), lifetime: Arc::new(std::sync::Mutex::new(CreationSourceLifetime::default())), authority, service: Arc::new(std::sync::Mutex::new(None)) }
+    }
+
+    pub(super) fn id(&self) -> OperationId { self.id }
+
+    /// Publication/removal of a project generation invalidates every clone.
+    /// Pending workers retain their own cancellation owner until settlement.
+    pub(super) fn invalidate(&self) {
+        let mut lifetime = self.lifetime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifetime.invalidated = true;
+        for token in lifetime.readers.iter().filter_map(std::sync::Weak::upgrade) { token.cancel(); }
+        lifetime.readers.retain(|reader| reader.strong_count() != 0);
+    }
+
+    pub(super) fn is_available(&self) -> bool {
+        !self.lifetime.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).invalidated
+    }
+
+    /// Retain this guard through the actual blocking worker. The registry
+    /// contains weak owners, so completed operations do not accumulate tokens.
+    pub(super) fn link_token(&self, token: &CancellationToken) -> Result<Arc<CancellationToken>, RepositoryError> {
+        let mut lifetime = self.lifetime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifetime.invalidated {
+            token.cancel();
+            return Err(ValidationError::Io("The displayed project source changed. Reload the project before creating a worktree.".into()).into());
+        }
+        lifetime.readers.retain(|reader| reader.strong_count() != 0);
+        let retained = Arc::new(token.clone());
+        lifetime.readers.push(Arc::downgrade(&retained));
+        Ok(retained)
     }
 
     pub(super) fn repository(&self) -> &Path { self.authority.path() }
 
     pub(super) fn service(&self) -> Result<Arc<ScopedCreationService>, RepositoryError> {
+        if !self.is_available() {
+            return Err(ValidationError::Io("The displayed project source changed. Reload the project before creating a worktree.".into()).into());
+        }
         self.authority.validate()?;
         let mut cached = self.service.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(service) = &*cached { return Ok(service.clone()); }
@@ -413,10 +453,14 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 match source {
-                    Some(source) => source.service()
-                        .map_err(|error| WorktreeInputError::general(error.to_string()))?
-                        .resolve_worktree_request(&input, &token)
-                        .map_err(|error| WorktreeInputError::from_resolution(&error, &draft)),
+                    Some(source) => {
+                        let _source_lifetime = source.link_token(&token)
+                            .map_err(|error| WorktreeInputError::general(error.to_string()))?;
+                        source.service()
+                            .map_err(|error| WorktreeInputError::general(error.to_string()))?
+                            .resolve_worktree_request(&input, &token)
+                            .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
+                    },
                     None => RepositoryService::system("git")
                         .resolve_worktree_request(&input, &token)
                         .map_err(|error| WorktreeInputError::from_resolution(&error, &draft)),
@@ -1222,6 +1266,33 @@ mod tests {
         );
         dialog.edit(WorktreeField::Branch, "feature/one".into());
         assert_eq!(dialog.branch_preview(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn project_creation_source_invalidation_cancels_live_workers_and_keeps_clone_identity() {
+        const TEST: &str = "app::worktree_dialog::tests::project_creation_source_invalidation_cancels_live_workers_and_keeps_clone_identity";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        isolated_git(files.path(), &["init", "--template=", "-b", "main"]);
+        let source = WorktreeCreationSource::new(crate::repository::WorktreeAuthority::capture(files.path()).unwrap());
+        let clone = source.clone();
+        assert_eq!(source.id(), clone.id());
+        for _ in 0..64 { drop(source.link_token(&CancellationToken::new()).unwrap()); }
+        let token = CancellationToken::new();
+        let lease = source.link_token(&token).unwrap();
+        assert_eq!(source.lifetime.lock().unwrap().readers.len(), 1);
+        assert!(!token.is_cancelled());
+        clone.invalidate();
+        assert!(token.is_cancelled());
+        assert!(!source.is_available());
+        assert!(source.service().is_err());
+        let later = CancellationToken::new();
+        assert!(source.link_token(&later).is_err());
+        assert!(later.is_cancelled());
+        drop(lease);
+        clone.invalidate();
+        assert!(source.lifetime.lock().unwrap().readers.is_empty());
     }
 
     #[cfg(target_os = "linux")]
