@@ -383,9 +383,12 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                     // Creation, removal and rename can change the untracked
                     // count. Ordinary file writes retain the last complete count.
-                    change.untracked |= matches!(event.kind,
-                        EventKind::Create(_) | EventKind::Remove(_)
-                        | EventKind::Modify(notify::event::ModifyKind::Name(_)));
+                    change.untracked |= matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    );
                     // A removed/recreated ancestor needs new directory watches;
                     // simple file edits keep the existing tracked-path census.
                     change.membership |= worktree.directories.contains(path)
@@ -964,13 +967,20 @@ mod tests {
             EventKind::Remove(notify::event::RemoveKind::File),
             EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
         ] {
-            let change = project.change(&Event::new(kind).add_path(worktree.root.join("src/new.txt"))).unwrap();
+            let change = project
+                .change(&Event::new(kind).add_path(worktree.root.join("src/new.txt")))
+                .unwrap();
             assert!(change.untracked);
             assert_eq!(change.worktrees, BTreeSet::from([worktree.id]));
             assert!(!change.metadata);
             assert!(!change.topology);
         }
-        assert!(!project.change(&modified(worktree.root.join("src/main.rs"))).unwrap().untracked);
+        assert!(
+            !project
+                .change(&modified(worktree.root.join("src/main.rs")))
+                .unwrap()
+                .untracked
+        );
     }
 
     #[test]

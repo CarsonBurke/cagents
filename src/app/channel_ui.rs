@@ -895,10 +895,16 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
-                    if let Some(directory) = card_directory(card) { directories.push(directory); }
+                    if let Some(directory) = card_directory(card) {
+                        directories.push(directory);
+                    }
                     if let Some(next) = state.card_outcome(*id)
-                        && outcome.as_ref().is_none_or(|previous| sidebar::outcome_priority(next) > sidebar::outcome_priority(previous))
-                    { outcome = Some(next.clone()); }
+                        && outcome.as_ref().is_none_or(|previous| {
+                            sidebar::outcome_priority(next) > sidebar::outcome_priority(previous)
+                        })
+                    {
+                        outcome = Some(next.clone());
+                    }
 
                     if matches!(&card.kind, CardKind::Chat(_))
                         || matches!(&card.kind, CardKind::Terminal(session)
@@ -919,7 +925,11 @@ impl Cagents {
                     }
                 }
                 let worktree = sidebar::channel_worktree(&project.worktrees, directories);
-                let acknowledged_attention = state.attention_retained(sidebar::SelectionRow::Channel(channel.id)) && !unread && !sidebar::attention_state(activity, unread, outcome.as_ref()).is_some_and(sidebar::AttentionState::needs_attention);
+                let acknowledged_attention = state
+                    .attention_retained(sidebar::SelectionRow::Channel(channel.id))
+                    && !unread
+                    && !sidebar::attention_state(activity, unread, outcome.as_ref())
+                        .is_some_and(sidebar::AttentionState::needs_attention);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
                         && row.title == title

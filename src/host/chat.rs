@@ -448,7 +448,11 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     };
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
-            Update::Activity { state, generation, outcome } => ServerMessage::ChatActivity {
+            Update::Activity {
+                state,
+                generation,
+                outcome,
+            } => ServerMessage::ChatActivity {
                 chat_id: id,
                 state: *state,
                 generation: *generation,

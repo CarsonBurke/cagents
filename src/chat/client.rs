@@ -213,7 +213,12 @@ impl ActivityObservation {
         self.observe_outcome(generation, state, None)
     }
 
-    fn observe_outcome(&mut self, generation: u64, state: ActivityState, outcome: Option<crate::agent::ActivityOutcome>) -> bool {
+    fn observe_outcome(
+        &mut self,
+        generation: u64,
+        state: ActivityState,
+        outcome: Option<crate::agent::ActivityOutcome>,
+    ) -> bool {
         if generation < self.generation {
             return false;
         }
@@ -1231,7 +1236,12 @@ impl ClientHandle {
     /// Latest terminal outcome from the small activity stream, including for
     /// hidden chats whose transcript is intentionally not subscribed.
     pub fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
-        self.inner.activity.lock().unwrap_or_else(|p| p.into_inner()).outcome.clone()
+        self.inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome
+            .clone()
     }
 
     /// Drains what the provider reported about the account this chat runs

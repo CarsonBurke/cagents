@@ -201,10 +201,19 @@ impl Cagents {
             })
             .unwrap_or_default();
         let checkout = self.project_ui.checkout_roots.get(&repository).cloned();
-        let primary_checkout = self.project_ui.primary_checkout_roots.get(&repository).cloned();
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::device_service::request(Operation::ProjectNavigation { repository, kind, checkout, primary_checkout })
+                crate::device_service::request(Operation::ProjectNavigation {
+                    repository,
+                    kind,
+                    checkout,
+                    primary_checkout,
+                })
             })
             .await
             .map_err(|error| error.to_string())
@@ -685,7 +694,13 @@ impl Cagents {
                             _ => "Saved on device".into(),
                         });
                     }
-                    Ok(Reply::Project { path, key, kind, checkout, primary_checkout }) => {
+                    Ok(Reply::Project {
+                        path,
+                        key,
+                        kind,
+                        checkout,
+                        primary_checkout,
+                    }) => {
                         self.device_ui.path = path.display().to_string();
                         self.device_ui.notice =
                             Some(format!("Project opened on device: {}", path.display()));
@@ -699,7 +714,8 @@ impl Cagents {
                         self.device_ui.worktree_output.clear();
                         self.device_ui.panel = Panel::Files;
                         let edit = crate::workspace_model::ModelEdit::ReopenProject {
-                            checkout, primary_checkout,
+                            checkout,
+                            primary_checkout,
                             repository: key,
                             name: path
                                 .file_name()
@@ -1515,7 +1531,8 @@ mod tests {
             drop(app.update_device(Action::Loaded {
                 generation: app.device_ui.generation,
                 result: Ok(Reply::Project {
-                    checkout: None, primary_checkout: None,
+                    checkout: None,
+                    primary_checkout: None,
                     path: "/remote/other".into(),
                     key: "/remote/other/.git".into(),
                     kind: ProjectKind::Git,

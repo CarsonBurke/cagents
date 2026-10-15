@@ -47,11 +47,11 @@ mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
-use worktree_ui::card_directory;
 pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
+use worktree_ui::card_directory;
 
 use std::{
     borrow::Cow,
@@ -13883,7 +13883,8 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                let mut row = SidebarWorktree::from_repository(record, status.as_ref());
+                                let mut row =
+                                    SidebarWorktree::from_repository(record, status.as_ref());
                                 row.apply_operation(loaded.operations.get(&record.id).copied());
                                 existing.worktrees.push(row);
                             }
@@ -16739,7 +16740,13 @@ impl Application for Cagents {
                         })
                 {
                     worktree.apply_status(&prepared.0.status);
-                    worktree.apply_operation(prepared.0.operation.as_ref().map(|operation| operation.kind));
+                    worktree.apply_operation(
+                        prepared
+                            .0
+                            .operation
+                            .as_ref()
+                            .map(|operation| operation.kind),
+                    );
                 }
                 let (snapshot, mut next) = match result {
                     Ok(Some(prepared)) => {
@@ -17968,9 +17975,12 @@ fn load_repository(
             (worktree, status)
         })
         .collect::<Vec<_>>();
-    let operations = worktrees.iter().filter_map(|(record, _)| {
-        git_ui::worktree_operation(&record.path, None).map(|kind| (record.id, kind))
-    }).collect();
+    let operations = worktrees
+        .iter()
+        .filter_map(|(record, _)| {
+            git_ui::worktree_operation(&record.path, None).map(|kind| (record.id, kind))
+        })
+        .collect();
     let head_repositories = worktrees
         .iter()
         .filter_map(|(record, _)| {

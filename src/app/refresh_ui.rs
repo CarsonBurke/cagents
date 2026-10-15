@@ -367,22 +367,42 @@ impl Cagents {
                     .map(|project| project.kind)
             });
         let known_checkout = self.known_project_checkout(&canonical, project_id);
-        let expected_repository = known_checkout.as_ref().map(|(_, repository)| repository.clone());
-        let primary_checkout = self.project_ui.primary_checkout_roots.get(&canonical).cloned();
+        let expected_repository = known_checkout
+            .as_ref()
+            .map(|(_, repository)| repository.clone());
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&canonical)
+            .cloned();
         let path = known_checkout.map_or(path, |(checkout, _)| checkout);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let path = if kind != Some(ProjectKind::Folder) {
-                    expected_repository.as_ref().map_or_else(|| path.clone(), |repository| {
-                        crate::project_location::read_checkout(repository, Some(&path), primary_checkout.as_deref())
+                    expected_repository.as_ref().map_or_else(
+                        || path.clone(),
+                        |repository| {
+                            crate::project_location::read_checkout(
+                                repository,
+                                Some(&path),
+                                primary_checkout.as_deref(),
+                            )
                             .unwrap_or_else(|| repository.clone())
-                    })
-                } else { path };
+                        },
+                    )
+                } else {
+                    path
+                };
                 let loaded = load_project(&path, Some(project_id), cancellation, kind)?;
                 if let Some(expected) = expected_repository
                     && loaded.project.repository != expected
                 {
-                    return Err(format!("Checkout {} belongs to {}, expected {}", path.display(), loaded.project.repository.display(), expected.display()));
+                    return Err(format!(
+                        "Checkout {} belongs to {}, expected {}",
+                        path.display(),
+                        loaded.project.repository.display(),
+                        expected.display()
+                    ));
                 }
                 Ok(loaded)
             })

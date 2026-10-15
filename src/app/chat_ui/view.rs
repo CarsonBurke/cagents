@@ -1070,11 +1070,23 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
-        } else if let Some(outcome) = snapshot.outcome.as_ref().filter(|outcome| outcome.reason().is_some()) {
+        } else if let Some(outcome) = snapshot
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome.reason().is_some())
+        {
             (Some(Icon::Warning), outcome.label())
-        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Cancelled)) && (!snapshot.is_working() || snapshot.exited) {
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
             (Some(Icon::Cancel), "Cancelled")
-        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Succeeded)) && (!snapshot.is_working() || snapshot.exited) {
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Succeeded)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
             (Some(Icon::Check), "Finished")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
@@ -1326,7 +1338,8 @@ impl Runtime {
                 }
             }
             if !snapshot.has_later
-                && (snapshot.activity() == crate::agent::ActivityState::Idle || (snapshot.outcome.is_some() && snapshot.exited))
+                && (snapshot.activity() == crate::agent::ActivityState::Idle
+                    || (snapshot.outcome.is_some() && snapshot.exited))
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
@@ -1391,15 +1404,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -2867,7 +2877,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2957,14 +2972,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -4860,8 +4879,20 @@ mod tests {
         for (outcome, label, glyph) in [
             (ActivityOutcome::Succeeded, "Finished", Icon::Check),
             (ActivityOutcome::Cancelled, "Cancelled", Icon::Cancel),
-            (ActivityOutcome::Failed { reason: "Provider exited with code 3".into() }, "Failed", Icon::Warning),
-            (ActivityOutcome::Interrupted { reason: "Provider exited before its final result".into() }, "Interrupted", Icon::Warning),
+            (
+                ActivityOutcome::Failed {
+                    reason: "Provider exited with code 3".into(),
+                },
+                "Failed",
+                Icon::Warning,
+            ),
+            (
+                ActivityOutcome::Interrupted {
+                    reason: "Provider exited before its final result".into(),
+                },
+                "Interrupted",
+                Icon::Warning,
+            ),
         ] {
             let snapshot = Arc::make_mut(&mut runtime.snapshot);
             snapshot.finished_at = Some(42);
@@ -4871,7 +4902,14 @@ mod tests {
             next.generation += 1;
             _handle.replace_snapshot_for_test(next);
             runtime.refresh();
-            assert!(runtime.finished_stamp.as_ref().unwrap().1.starts_with(label));
+            assert!(
+                runtime
+                    .finished_stamp
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .starts_with(label)
+            );
             assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
     }
@@ -7382,8 +7420,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7633,10 +7677,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

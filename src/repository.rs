@@ -1131,7 +1131,10 @@ pub struct StashEntry {
 /// The HEAD state a rendered patch was prepared against. No commit is a real
 /// precondition for an unborn repository, rather than an absent guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitHeadGuard { Unborn, Commit(Oid) }
+pub enum GitHeadGuard {
+    Unborn,
+    Commit(Oid),
+}
 
 /// Commands share cancellation, ordering, failure output and refresh semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4140,15 +4143,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Git reports its metadata directory as the primary worktree for
     /// --separate-git-dir without core.worktree. Repair it only from a
     /// discovery that actually proved this checkout owns the common gitdir.
-    pub fn list_worktrees_for_repository(&self, repository: &RepositoryInfo, cancellation: &CancellationToken) -> Result<Vec<WorktreeRecord>, RepositoryError> {
+    pub fn list_worktrees_for_repository(
+        &self,
+        repository: &RepositoryInfo,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<WorktreeRecord>, RepositoryError> {
         let mut records = self.list_worktrees(&repository.common_dir, cancellation)?;
-        let primary = repository.worktree_root.as_ref().filter(|_| repository.git_dir == repository.common_dir && !repository.is_bare);
+        let primary = repository
+            .worktree_root
+            .as_ref()
+            .filter(|_| repository.git_dir == repository.common_dir && !repository.is_bare);
         records.retain_mut(|record| {
-            if record.bare || record.path != repository.common_dir { return true; }
-            let Some(primary) = primary else { return false; };
+            if record.bare || record.path != repository.common_dir {
+                return true;
+            }
+            let Some(primary) = primary else {
+                return false;
+            };
             record.path = primary.clone();
             record.id = stable_worktree_id(primary);
-            record.created_at_unix_ms = std::fs::metadata(primary).and_then(|metadata| metadata.created()).ok()
+            record.created_at_unix_ms = std::fs::metadata(primary)
+                .and_then(|metadata| metadata.created())
+                .ok()
                 .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|duration| i64::try_from(duration.as_millis()).ok());
             true
@@ -4314,7 +4330,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         if cache.control_metadata.is_none() {
             cache.control_metadata = Some(ControlMetadata {
-                operation: self.snapshot_operation_state(worktree, git_dir.as_deref(), cancellation)?,
+                operation: self.snapshot_operation_state(
+                    worktree,
+                    git_dir.as_deref(),
+                    cancellation,
+                )?,
                 stashes: self.stashes(worktree, cancellation)?,
                 last_fetch_unix_ms: git_dir
                     .as_ref()
@@ -4365,13 +4385,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Generated operation drafts follow Git's configured comment policy.
     /// Explicitly authored composer messages keep their separate cleanup rules.
-    fn snapshot_operation_state(&self, worktree: &Path, directory: Option<&Path>, cancellation: &CancellationToken) -> Result<Option<GitOperationState>, RepositoryError> {
+    fn snapshot_operation_state(
+        &self,
+        worktree: &Path,
+        directory: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
         let mut state = directory.and_then(Self::operation_state_from_git_dir);
         if let Some(message) = state.as_ref().and_then(|state| state.message.as_ref()) {
-            let command = self.git_read(worktree, ["stripspace", "--strip-comments"]).stdin(message.as_bytes().to_vec());
+            let command = self
+                .git_read(worktree, ["stripspace", "--strip-comments"])
+                .stdin(message.as_bytes().to_vec());
             let output = self.run_checked(&command, cancellation)?;
             if let Some(state) = state.as_mut() {
-                state.message = Some(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_owned()).filter(|message| !message.is_empty());
+                state.message = Some(
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim_end_matches('\n')
+                        .to_owned(),
+                )
+                .filter(|message| !message.is_empty());
             }
         }
         Ok(state)
@@ -4479,8 +4511,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<MutationOutcome, RepositoryError> {
         let _protection = crate::worktree_cleanup::protect(worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        if let GitOperation::ApplyPatch { expected_head: Some(expected), .. } = operation {
-            let expected = match expected { GitHeadGuard::Unborn => None, GitHeadGuard::Commit(oid) => Some(oid) };
+        if let GitOperation::ApplyPatch {
+            expected_head: Some(expected),
+            ..
+        } = operation
+        {
+            let expected = match expected {
+                GitHeadGuard::Unborn => None,
+                GitHeadGuard::Commit(oid) => Some(oid),
+            };
             if self.resolve_head(worktree, cancellation)?.as_ref() != expected {
                 return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "HEAD changed after this patch was prepared; reload the diff before applying it".into() } });
             }

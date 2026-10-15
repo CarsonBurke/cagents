@@ -634,19 +634,34 @@ fn read_local(
 
 /// Local metadata only. Loading/count refreshes must not spawn another Git
 /// command per worktree merely to discover merge/rebase state.
-pub(super) fn worktree_operation(worktree: &Path, known_git_dir: Option<&Path>) -> Option<crate::repository::GitOperationKind> {
+pub(super) fn worktree_operation(
+    worktree: &Path,
+    known_git_dir: Option<&Path>,
+) -> Option<crate::repository::GitOperationKind> {
     let git_dir = if let Some(directory) = known_git_dir {
         directory.to_path_buf()
     } else {
         let entry = worktree.join(".git");
-        if entry.is_dir() { entry } else {
+        if entry.is_dir() {
+            entry
+        } else {
             let content = std::fs::read_to_string(entry).ok()?;
-            let directory = PathBuf::from(content.trim_end_matches(['\r', '\n']).strip_prefix("gitdir: ")?);
-            if directory.is_absolute() { directory } else { worktree.join(directory) }
+            let directory = PathBuf::from(
+                content
+                    .trim_end_matches(['\r', '\n'])
+                    .strip_prefix("gitdir: ")?,
+            );
+            if directory.is_absolute() {
+                directory
+            } else {
+                worktree.join(directory)
+            }
         }
     };
-    RepositoryService::<crate::repository::SystemProcessExecutor>::operation_state_from_git_dir(&git_dir)
-        .map(|operation| operation.kind)
+    RepositoryService::<crate::repository::SystemProcessExecutor>::operation_state_from_git_dir(
+        &git_dir,
+    )
+    .map(|operation| operation.kind)
 }
 
 fn read_local_with_plan(
@@ -674,8 +689,13 @@ fn read_local_with_plan(
         // A membership edge replaces the cached full count in this same
         // coalesced status process. Tracked-only writes do not rescan untracked
         // trees; the bounded topology fallback repairs incomplete watch coverage.
-        let include_untracked = change.topology || change.membership || change.metadata || change.untracked;
-        let current = match git.status_with_untracked(&record.path, include_untracked, &cancellation) {
+        let include_untracked =
+            change.topology || change.membership || change.metadata || change.untracked;
+        let current = match git.status_with_untracked(
+            &record.path,
+            include_untracked,
+            &cancellation,
+        ) {
             Ok(current) => current,
             // Its own removal is often the event being read, and one absent
             // checkout must not fail its siblings.
@@ -688,8 +708,12 @@ fn read_local_with_plan(
                 continue;
             }
         };
-        let known_git_dir = previous_plan.and_then(|plan| plan.worktrees.iter()
-            .find(|worktree| worktree.id == record.id).map(|worktree| worktree.git_dir.as_path()));
+        let known_git_dir = previous_plan.and_then(|plan| {
+            plan.worktrees
+                .iter()
+                .find(|worktree| worktree.id == record.id)
+                .map(|worktree| worktree.git_dir.as_path())
+        });
         if let Some(operation) = worktree_operation(&record.path, known_git_dir) {
             snapshot.operations.insert(record.id, operation);
         } else {
@@ -737,17 +761,25 @@ fn read_local_with_plan(
             .any(|(record, _)| record.id == *id)
     });
     if change.topology || !vanished.is_empty() {
-        let retained: HashSet<_> = snapshot.worktrees.iter().map(|(record, _)| record.id).collect();
+        let retained: HashSet<_> = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect();
         snapshot.operations.retain(|id, _| retained.contains(id));
     }
-    let upstreams = snapshot.worktrees.iter().filter_map(|(record, status)| {
-        let upstream = match &status.as_ref()?.tracking {
-            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
-            crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
-            crate::repository::TrackingState::NoUpstream => None,
-        }?;
-        Some((record.id, upstream.clone()))
-    }).collect::<BTreeMap<_, _>>();
+    let upstreams = snapshot
+        .worktrees
+        .iter()
+        .filter_map(|(record, status)| {
+            let upstream = match &status.as_ref()?.tracking {
+                crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
+                crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
+                crate::repository::TrackingState::NoUpstream => None,
+            }?;
+            Some((record.id, upstream.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
@@ -1083,23 +1115,48 @@ mod tests {
         let snapshot = fixture(&root);
         let id = snapshot.worktrees[0].0.id;
         let project = ProjectId::new();
-        let change = git_watch::Change { worktrees: [id].into(), untracked: true, ..Default::default() };
+        let change = git_watch::Change {
+            worktrees: [id].into(),
+            untracked: true,
+            ..Default::default()
+        };
         fs::write(root.join("new.txt"), "new untracked file\n").unwrap();
-        let (snapshot, plan) = read_local(project, snapshot, change.clone(), CancellationToken::default()).unwrap();
-        assert!(plan.is_none(), "file entries do not re-enumerate watch membership");
+        let (snapshot, plan) = read_local(
+            project,
+            snapshot,
+            change.clone(),
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.is_none(),
+            "file entries do not re-enumerate watch membership"
+        );
         let status = snapshot.worktrees[0].1.as_ref().unwrap();
         assert!(!status.untracked_omitted);
         assert_eq!(status.dirty.untracked, 1);
         git(&root, &["add", "new.txt"]);
-        let (snapshot, _) = read_local(project, snapshot,
-            git_watch::Change { worktrees: [id].into(), metadata: true, ..Default::default() },
-            CancellationToken::default()).unwrap();
+        let (snapshot, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into(),
+                metadata: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
         let status = snapshot.worktrees[0].1.as_ref().unwrap();
         assert_eq!(status.dirty.staged, 1);
-        assert_eq!(status.dirty.untracked, 0, "index mutations must not double count newly staged files");
+        assert_eq!(
+            status.dirty.untracked, 0,
+            "index mutations must not double count newly staged files"
+        );
         git(&root, &["reset", "--", "new.txt"]);
         fs::remove_file(root.join("new.txt")).unwrap();
-        let (snapshot, _) = read_local(project, snapshot, change, CancellationToken::default()).unwrap();
+        let (snapshot, _) =
+            read_local(project, snapshot, change, CancellationToken::default()).unwrap();
         let status = snapshot.worktrees[0].1.as_ref().unwrap();
         assert!(!status.untracked_omitted);
         assert_eq!(status.dirty.untracked, 0);
@@ -1116,10 +1173,16 @@ mod tests {
         fs::write(worktree.join(".git"), "gitdir: ../admin with spaces \n").unwrap();
         assert_eq!(worktree_operation(&worktree, None), None);
         fs::write(admin.join("MERGE_HEAD"), "fixture-head\n").unwrap();
-        assert_eq!(worktree_operation(&worktree, None), Some(GitOperationKind::Merge));
+        assert_eq!(
+            worktree_operation(&worktree, None),
+            Some(GitOperationKind::Merge)
+        );
         fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
         fs::create_dir(admin.join("rebase-merge")).unwrap();
-        assert_eq!(worktree_operation(&worktree, Some(&admin)), Some(GitOperationKind::Rebase));
+        assert_eq!(
+            worktree_operation(&worktree, Some(&admin)),
+            Some(GitOperationKind::Rebase)
+        );
     }
 
     #[test]

@@ -3061,7 +3061,12 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository, kind, checkout, primary_checkout } => {
+        ResolvedProject::Open {
+            repository,
+            kind,
+            checkout,
+            primary_checkout,
+        } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
@@ -3190,8 +3195,20 @@ fn close_project(
 /// One project per line: verified checkout, name. Repository metadata remains
 /// the canonical identity in JSON; unknown legacy checkout paths are explicit.
 fn project_line(project: &ModelProject) -> String {
-    let path = project.checkout.as_deref().or(project.primary_checkout.as_deref()).or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path()));
-    format!("{}\t{}", path.map(|path|path.display().to_string()).unwrap_or_else(||"(checkout unavailable)".into()), project.name)
+    let path = project
+        .checkout
+        .as_deref()
+        .or(project.primary_checkout.as_deref())
+        .or_else(|| {
+            (project.kind == crate::model::ProjectKind::Folder)
+                .then_some(project.repository.as_path())
+        });
+    format!(
+        "{}\t{}",
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(checkout unavailable)".into()),
+        project.name
+    )
 }
 
 /// Runs a shared-channel verb against the daemon's registry.
@@ -3432,9 +3449,18 @@ fn resolve_project_location(
         return match crate::device_service::request(crate::device_service::Operation::Discover {
             path: from,
         }) {
-            Ok(crate::device_service::Reply::Project { key, kind, checkout, primary_checkout, .. }) => {
-                Ok(crate::project_location::ProjectLocation { key, kind, checkout, primary_checkout })
-            }
+            Ok(crate::device_service::Reply::Project {
+                key,
+                kind,
+                checkout,
+                primary_checkout,
+                ..
+            }) => Ok(crate::project_location::ProjectLocation {
+                key,
+                kind,
+                checkout,
+                primary_checkout,
+            }),
             Ok(_) => Err(AppError::new(
                 "repository",
                 "unexpected remote project response",
@@ -4139,37 +4165,80 @@ mod tests {
     /// the sidebar would fill with duplicates of the same repository.
     #[test]
     fn separate_git_directory_open_and_list_show_verified_checkout() {
-        let root=tempfile::tempdir().unwrap();
-        let checkout=root.path().join("checkout");
-        let metadata=root.path().join("metadata");
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let metadata = root.path().join("metadata");
         std::fs::create_dir(&checkout).unwrap();
-        git(&checkout,&["init","--quiet","--separate-git-dir",metadata.to_str().unwrap()]);
-        let checkout=checkout.canonicalize().unwrap();
-        let metadata=metadata.canonicalize().unwrap();
-        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),primary_checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
-        let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
-        let peer_proof=proof("session","boot","incarnation");
-        let served=project.clone();
-        let server=thread::spawn(move || {
-            let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
-            let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
-            let mut model=WorkspaceModel::default();model.projects.push(served);
-            write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
-            let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(listed.request,ClientRequest::ReadWorkspaceModel);
-            write_frame(&mut server_stream,&model_envelope(listed.request_id,peer_proof,model)).unwrap();
+        git(
+            &checkout,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                metadata.to_str().unwrap(),
+            ],
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let metadata = metadata.canonicalize().unwrap();
+        let project = ModelProject {
+            repository: metadata.clone(),
+            checkout: Some(checkout.clone()),
+            primary_checkout: Some(checkout.clone()),
+            kind: crate::model::ProjectKind::Git,
+            name: "checkout".into(),
+            ordinal: 1,
+        };
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let served = project.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                opened.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::ReopenProject {
+                        repository: served.repository.clone(),
+                        checkout: served.checkout.clone(),
+                        primary_checkout: served.primary_checkout.clone(),
+                        kind: served.kind,
+                        name: served.name.clone()
+                    }
+                }
+            );
+            let mut model = WorkspaceModel::default();
+            model.projects.push(served);
+            write_frame(
+                &mut server_stream,
+                &model_envelope(opened.request_id, peer_proof.clone(), model.clone()),
+            )
+            .unwrap();
+            let listed: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(listed.request, ClientRequest::ReadWorkspaceModel);
+            write_frame(
+                &mut server_stream,
+                &model_envelope(listed.request_id, peer_proof, model),
+            )
+            .unwrap();
         });
-        let resolved=ProjectCommand::Open{path:Some(checkout.clone())}.resolved().unwrap();
-        let mut client=ControlClient::from_stream(client_stream).unwrap();
-        let opened=project_output(&mut client,resolved).unwrap();
-        let listed=project_output(&mut client,ResolvedProject::List).unwrap();
+        let resolved = ProjectCommand::Open {
+            path: Some(checkout.clone()),
+        }
+        .resolved()
+        .unwrap();
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let opened = project_output(&mut client, resolved).unwrap();
+        let listed = project_output(&mut client, ResolvedProject::List).unwrap();
         server.join().unwrap();
-        assert_eq!(opened.human,format!("{}\tcheckout",checkout.display()));
-        assert_eq!(listed.human,opened.human);
-        assert_eq!(opened.data["project"]["repository"],json!(metadata));
-        assert_eq!(opened.data["project"]["checkout"],json!(checkout));
+        assert_eq!(opened.human, format!("{}\tcheckout", checkout.display()));
+        assert_eq!(listed.human, opened.human);
+        assert_eq!(opened.data["project"]["repository"], json!(metadata));
+        assert_eq!(opened.data["project"]["checkout"], json!(checkout));
         assert!(!opened.human.contains("metadata"));
     }
 
@@ -4366,7 +4435,10 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", checkout.path().canonicalize().unwrap().display()),
+            format!(
+                "{}\t{name}",
+                checkout.path().canonicalize().unwrap().display()
+            ),
             "one tab-separated line: repository, name"
         );
     }
