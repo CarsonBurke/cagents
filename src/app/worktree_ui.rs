@@ -114,7 +114,7 @@ impl OwnerPaths {
         self.watch.subscription(focused)
     }
 
-    fn canonical(&self, path: &Path) -> PathBuf {
+    pub(in crate::app) fn canonical(&self, path: &Path) -> PathBuf {
         self.cached.get(path).cloned().unwrap_or_else(|| path.into())
     }
 }
@@ -701,6 +701,20 @@ impl Cagents {
             })
             .collect();
         self.sidebar_state.set_worktrees_with_panes(worktrees);
+    }
+
+    /// The current explicit filing is authoritative for context handoffs;
+    /// an executable cwd cannot override a channel or a recorded worktree.
+    pub(super) fn context_card_worktree(&self, card: &CardState) -> Option<PathBuf> {
+        if let Some(channel)=self.durable.channels.iter().find(|channel|channel.cards.contains(&card.id)) {
+            return self.channel_scope_path(channel.id);
+        }
+        self.durable.card_scopes.get(&card.id).or_else(||self.worktree_owners.get(&card.id))
+            .cloned().or_else(||self.unchanneled_card_worktree(card).map(Path::to_owned))
+    }
+
+    pub(super) fn context_paths_match(&self, left: &Path, right: &Path) -> bool {
+        self.worktree_owner_paths.canonical(left)==self.worktree_owner_paths.canonical(right)
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {

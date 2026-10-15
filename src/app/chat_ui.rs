@@ -4067,15 +4067,18 @@ impl Cagents {
     }
 
     /// Stage prepared forge context after the owning scope and physical lease
-    /// have committed. This helper never selects a scope or sends a message.
+    /// have committed. This helper never selects a scope or sends to a provider.
     pub(super) fn finish_pr_agent_context(
-        &mut self, worktree: PathBuf, card: Option<CardId>, prompt: String, provider: Provider,
+        &mut self, worktree: PathBuf, card: Option<CardId>, prompt: String, provider: Provider, resolved_scope: Option<PathBuf>,
     ) -> Task<Message> {
+        // The prepared receipt carries this mapping across scope installation,
+        // which may prune the original alias from the ordinary owner cache.
+        let target_scope=resolved_scope.unwrap_or_else(||self.worktree_owner_paths.canonical(&worktree));
         let mut tasks = Vec::new();
         let card = if let Some(card) = card {
             let valid = self.workspace.card(card).is_some() && self.card_state(card).is_some_and(|state| {
-                state.existence.is_open() && matches!(&state.kind,CardKind::Chat(session)
-                    if self.card_worktree(state)==Some(worktree.as_path()) || session.launch.recipe.working_directory==worktree)
+                state.existence.is_open() && matches!(&state.kind,CardKind::Chat(_))
+                    && self.context_card_worktree(state).is_some_and(|owner|self.worktree_owner_paths.canonical(&owner)==target_scope)
             });
             if !valid {
                 self.status=Some(TransientNotice::warning("The selected conversation changed before review context was ready."));
@@ -4085,7 +4088,8 @@ impl Cagents {
         } else {
             // A new draft is filed in the already committed explicit worktree,
             // never in a focused shell's cwd or through a second navigation.
-            if self.durable.active_channel.is_some() || self.active_workspace.as_deref()!=Some(worktree.as_path())
+            if self.durable.active_channel.is_some() || !self.active_workspace.as_ref()
+                .is_some_and(|active|self.worktree_owner_paths.canonical(active)==target_scope)
                 || self.refuse_in_deleting_worktree(&worktree)
             { return Task::none(); }
             let account = self.default_account_for_directory(provider,&worktree);
@@ -12285,7 +12289,7 @@ mod tests {
         let mut app=crate::app::tests::context_inspector_test_app(false);
         let card=draft_chat(&mut app);
         write(&mut app,card,"Existing request");
-        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),Some(card),"Selected review context".into(),Provider::Claude));
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),Some(card),"Selected review context".into(),Provider::Claude,None));
         assert_eq!(chat_runtime(&app,card).composer.text(),"Existing request\n\nSelected review context");
         assert_eq!(chat_runtime(&app,card).session.launch.provider,Provider::Codex);
         assert!(!app.chat_start_pending(card));
@@ -12296,7 +12300,7 @@ mod tests {
         let mut app=crate::app::tests::context_inspector_test_app(false);
         drop(app.select_worktree(FIXTURE_DIRECTORY.into(),false));
         let generation=app.worktree_selection.generation_for_test();
-        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Review without sending".into(),Provider::Codex));
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Review without sending".into(),Provider::Codex,None));
         let card=app.workspace.focused().unwrap();
         assert_eq!(chat_runtime(&app,card).composer.text(),"Review without sending");
         assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,PathBuf::from(FIXTURE_DIRECTORY));
@@ -12310,9 +12314,57 @@ mod tests {
         let mut app=crate::app::tests::context_inspector_test_app(false);
         drop(app.select_worktree("/newer".into(),false));
         let before=app.durable.cards.len();
-        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Stale context".into(),Provider::Codex));
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Stale context".into(),Provider::Codex,None));
         assert_eq!(app.durable.cards.len(),before);
         assert_eq!(app.active_workspace.as_deref(),Some(Path::new("/newer")));
+    }
+
+    #[test]
+    fn prepared_pr_context_cwd_cannot_override_an_explicit_different_owner() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=draft_chat(&mut app);
+        write(&mut app,card,"Keep this draft");
+        app.durable_mut().card_scopes.insert(card,"/filed-elsewhere".into());
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),Some(card),"Wrong context".into(),Provider::Codex,None));
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Keep this draft");
+    }
+
+    #[test]
+    fn prepared_pr_context_rejects_a_channel_moved_to_another_project() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=draft_chat(&mut app);
+        write(&mut app,card,"Original channel draft");
+        let first=ProjectId::new();let second=ProjectId::new();
+        let other=PathBuf::from("/other-project");
+        app.sidebar_model.projects=[(first,PathBuf::from(FIXTURE_DIRECTORY)),(second,other.clone())].into_iter()
+            .map(|(id,path)|SidebarProject::new(id,RepositoryId::new(),"context owner".into(),path.clone(),
+                vec![SidebarWorktree::new(crate::model::WorktreeId::new(),path,None,false,false,None,None,None)],Vec::new())).collect();
+        let channel=crate::model::ChannelId::new();
+        app.durable_mut().channels.push(crate::model::ProjectChannel {id:channel,project_id:first,title:"moving".into(),ordinal:0,shared:false,
+            title_source:Default::default(),cards:vec![card],focused:Some(card)});
+        drop(app.select_channel(channel));
+        app.durable_mut().channels.iter_mut().find(|row|row.id==channel).unwrap().project_id=second;
+        drop(app.select_channel_then(channel,worktree_ui::selection::Intent::PrAgentContext {
+            worktree:FIXTURE_DIRECTORY.into(),card:Some(card),prompt:"Old project context".into(),provider:Provider::Codex,
+        }));
+        assert_eq!(app.active_workspace.as_ref(),Some(&other));
+        assert_eq!(app.durable.active_channel,Some(channel));
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Original channel draft");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_pr_context_uses_the_receipt_scope_for_an_explicit_alias_launch_directory() {
+        let directory=tempfile::tempdir().unwrap();
+        let physical=directory.path().join("physical");let alias=directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();std::os::unix::fs::symlink(&physical,&alias).unwrap();
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        drop(app.select_worktree(physical.clone(),false));
+        drop(app.finish_pr_agent_context(alias.clone(),None,"Alias context".into(),Provider::Codex,Some(physical)));
+        let card=app.workspace.focused().unwrap();
+        assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,alias);
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Alias context");
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]
