@@ -3539,7 +3539,11 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
         return Err(format!("`{}` is not a directory", directory.display()));
     }
     let output = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .args(["-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .current_dir(directory)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

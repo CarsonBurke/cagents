@@ -46,8 +46,11 @@ impl Fixture {
         }
         fixture
     }
-    fn output(&self,args:&[&str])->Output {
-        let mut child=Self::command(self.root.path(),Path::new(env!("CARGO_BIN_EXE_cagents"))).arg("--json").args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    fn output(&self,args:&[&str])->Output {self.output_with_env(args,&[])}
+    fn output_with_env(&self,args:&[&str],environment:&[(&str,&std::ffi::OsStr)])->Output {
+        let mut command=Self::command(self.root.path(),Path::new(env!("CARGO_BIN_EXE_cagents")));
+        for (key,value) in environment {command.env(key,value);}
+        let mut child=command.arg("--json").args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let deadline=Instant::now()+Duration::from_secs(35);
         while child.try_wait().unwrap().is_none() {if Instant::now()>=deadline {let _=child.kill();panic!("CLI timed out {args:?}: {:?}",child.wait_with_output());}thread::sleep(Duration::from_millis(10));}
         child.wait_with_output().unwrap()
@@ -176,4 +179,24 @@ fn optional_agent_uses_new_worktree_and_waits_for_setup() {
     fixture.cli(&["agent","close",data["agent"]["agent"]["id"].as_str().unwrap()]);
     fixture.cli(&["worktree","remove","with-agent","--force"]);
     assert!(!path.exists());
+}
+
+#[test]
+fn inherited_git_redirects_cannot_change_the_selected_worktree_project() {
+    let fixture=Fixture::new();
+    let unrelated=fixture.root.path().join("unrelated");fs::create_dir(&unrelated).unwrap();
+    fixture.git(&unrelated,&["init","-q","-b","main"]);
+    fs::write(unrelated.join("other"),"unrelated").unwrap();
+    fixture.git(&unrelated,&["add","other"]);fixture.git(&unrelated,&["commit","-qm","unrelated"]);
+    let git_dir=unrelated.join(".git");let index=git_dir.join("index");
+    let output=fixture.output_with_env(&["worktree","create","authority","--no-setup"],&[
+        ("GIT_DIR",git_dir.as_os_str()),("GIT_COMMON_DIR",git_dir.as_os_str()),
+        ("GIT_WORK_TREE",unrelated.as_os_str()),("GIT_INDEX_FILE",index.as_os_str()),
+    ]);
+    assert!(output.status.success(),"{output:?}");
+    let value:Value=serde_json::from_slice(&output.stdout).unwrap();
+    let path=Path::new(value["data"]["worktree"]["path"].as_str().unwrap());
+    assert_eq!(path,fixture.root.path().join("project/managed/authority"));
+    assert!(path.join("tracked").is_file());assert!(!path.join("other").exists());
+    assert!(!fixture.git(&unrelated,&["branch","--list","authority"]).contains("authority"));
 }
