@@ -14040,7 +14040,7 @@ impl Application for Cagents {
                     if self.format_on_save_enabled(card) {
                         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                             if runtime.take_auto_save_due(identity, *revision, *ticket) {
-                                return self.update_editor_features(editor_features::Action::Format { card, selection: false, save_after: true });
+                                return self.maybe_format_before_save(card).unwrap_or_else(Task::none);
                             }
                         }
                         return Task::none();

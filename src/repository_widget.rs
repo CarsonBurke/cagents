@@ -8885,7 +8885,7 @@ fn editable_document_view<'a>(
             } else { crate::design::body(signature.label.clone()).font(Font::MONOSPACE).into() };
             let mut rows = vec![label];
             if let Some(parameter) = active {
-                rows.push(crate::design::caption(format!("Parameter: {}{}", parameter.label, parameter.documentation.as_ref().map_or(String::new(), |doc| format!(" · {doc}")))).into());
+                rows.push(crate::design::caption(format!("Parameter: {}{}", parameter.label, parameter.documentation.as_ref().map_or(String::new(), |doc| format!(" · {doc}")))).font(Font { weight: iced::font::Weight::Bold, ..Font::MONOSPACE }).into());
             }
             error_rows.push(widget::column::with_children(rows).spacing(space::XS).into());
         }
