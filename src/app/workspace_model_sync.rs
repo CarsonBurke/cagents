@@ -769,7 +769,12 @@ impl Cagents {
         let card_id = CardId::from_uuid(agent.id.as_uuid());
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
-        if self.durable.cards.iter().any(|card| card.id == card_id) {
+        if self.durable.cards.iter().any(|card| card.id == card_id)
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.card_was_closed(card_id))
+        {
             return None;
         }
         let kind = match session {
@@ -1470,6 +1475,34 @@ mod tests {
                 .count(),
             1
         );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("closed-model.sqlite3");
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-model"))
+                .unwrap();
+        app.session = Some(runtime);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let committed = app
+            .session
+            .as_ref()
+            .unwrap()
+            .take_committed_closures(app.durable.id);
+        assert_eq!(
+            Arc::make_mut(&mut app.durable).retire_committed_cards(&committed),
+            1
+        );
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        app.session.as_mut().unwrap().shutdown();
+        let (reopened, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-model"))
+                .unwrap();
+        app.session = Some(reopened);
+        assert!(app.adopt_execution_agent(&agent).is_none());
         agent.id = crate::model::AgentId::new();
         agent.spec.surface = Surface::Terminal;
         assert!(

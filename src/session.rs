@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -418,6 +418,7 @@ struct QueueState {
     /// change costs one `Arc` bump on this lane rather than a second deep clone
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
+    committed_closures: BTreeMap<WorkspaceId, BTreeSet<CardId>>,
     conversions: VecDeque<ConversionCheckpoint>,
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
@@ -490,10 +491,13 @@ impl SessionRuntime {
             .map(|summary| store.load_workspace_restored(summary.id, None))
             .transpose()?
             .flatten();
-        let (restored, restore_warnings) = match restored {
+        let (restored, mut restore_warnings) = match restored {
             Some(restored) => (Some(restored.state), restored.warnings),
             None => (None, Vec::new()),
         };
+        if store.has_unknown_closed_claims() {
+            restore_warnings.push("A closed pane has a damaged saved session, so automatic terminal discovery is paused to preserve your closure. Existing panes and explicitly opened terminals remain available. Recover this window's saved state to restore automatic discovery.".into());
+        }
         let projects = store.list_projects()?;
         let worktrees = store.list_worktrees()?;
         let writes = PendingWrites::restored(
@@ -922,6 +926,24 @@ impl SessionRuntime {
         self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
+    /// Read narrow committed closure authority without querying SQLite.
+    pub fn card_was_closed(&self, id: CardId) -> bool {
+        self.operation_store.card_was_closed(id)
+    }
+    pub fn terminal_was_closed(&self, session: &TerminalSession) -> bool {
+        self.operation_store.terminal_was_closed(session)
+    }
+
+    /// Drain only closures whose exact snapshot transaction committed. The UI
+    /// may release their descriptors without risking resurrection after a crash.
+    pub fn take_committed_closures(&self, workspace: WorkspaceId) -> BTreeSet<CardId> {
+        let (lock, _) = &*self.queue;
+        lock.lock()
+            .ok()
+            .and_then(|mut state| state.committed_closures.remove(&workspace))
+            .unwrap_or_default()
+    }
+
     pub fn health_receiver(&self) -> async_channel::Receiver<SessionSaveHealthEvent> {
         self.health.clone()
     }
@@ -995,6 +1017,7 @@ impl Drop for SessionRuntime {
 #[derive(Debug)]
 struct PendingWrites {
     workspace: Option<Arc<WorkspaceState>>,
+    committed_closures: BTreeMap<WorkspaceId, BTreeSet<CardId>>,
     conversions: VecDeque<ConversionCheckpoint>,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
@@ -1416,9 +1439,20 @@ trait SessionStore {
     /// Housekeeping the writer lane runs after a flush lands. Storage with no
     /// write-ahead log of its own has nothing to do here.
     fn checkpoint_wal_if_large(&self) {}
+    fn compact_closed_cards(&self) {}
 }
 
 impl SessionStore for StateStore {
+    fn compact_closed_cards(&self) {
+        const HISTORY_GUARD_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        if let Err(error) = StateStore::compact_closed_cards(
+            self,
+            unix_millis().saturating_sub(HISTORY_GUARD_WINDOW_MS),
+        ) {
+            tracing::warn!(%error, "closed card history compaction deferred");
+        }
+    }
+
     fn recover_terminal_ownership(
         &self,
         state: &WorkspaceState,
@@ -1622,6 +1656,7 @@ impl PendingWrites {
     ) -> Self {
         Self {
             workspace: None,
+            committed_closures: BTreeMap::new(),
             conversions: VecDeque::new(),
             projects: HashMap::new(),
             worktrees: HashMap::new(),
@@ -1632,6 +1667,22 @@ impl PendingWrites {
             worktree_generations,
             quarantine: Quarantine::default(),
             chat_rebindings: HashMap::new(),
+        }
+    }
+
+    fn record_committed_closures(&mut self, snapshot: &WorkspaceState) {
+        let closed: BTreeSet<_> = snapshot
+            .cards
+            .iter()
+            .filter(|card| matches!(card.existence, crate::model::Existence::Closed { .. }))
+            .map(|card| card.id)
+            .collect();
+        if !closed.is_empty() {
+            self.chat_rebindings.retain(|id, _| !closed.contains(id));
+            self.committed_closures
+                .entry(snapshot.id)
+                .or_default()
+                .extend(closed);
         }
     }
 
@@ -1866,6 +1917,7 @@ impl PendingWrites {
                             Ok(commit) => {
                                 self.workspace_generation = commit.generation;
                                 self.card_generations = commit.card_generations;
+                                self.record_committed_closures(&snapshot);
                                 // An explicit Retry may have rearmed this old
                                 // refused snapshot while the repair was queued.
                                 // Retire only that offer, preserving a newer
@@ -1942,6 +1994,7 @@ impl PendingWrites {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
+                            self.record_committed_closures(&snapshot);
                             self.quarantine.snapshot_landed(&snapshot);
                         }
                         Err(error) if error.refuses_content() => {
@@ -2360,6 +2413,21 @@ fn persistence_loop(
         let mut failure = None;
         if should_persist {
             let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut rebases_remaining);
+            let committed = std::mem::take(&mut writes.committed_closures);
+            if !committed.is_empty() {
+                if let Ok(mut state) = lock.lock() {
+                    for (workspace, cards) in committed {
+                        state
+                            .committed_closures
+                            .entry(workspace)
+                            .or_default()
+                            .extend(cards);
+                    }
+                }
+                // Wake the UI for committed closures even if another write in
+                // this batch failed; the receipt names only landed snapshots.
+                health.publish(health.health.clone());
+            }
             record_flush_errors(&last_error, &errors);
             health.quarantine(writes.quarantined());
             if writes.is_settled() {
@@ -2367,6 +2435,7 @@ fn persistence_loop(
                 // Commits accumulate in the WAL, which SQLite never shrinks on
                 // its own; this costs one `stat` per flush and only does real
                 // work once the sidecar has grown past its threshold.
+                store.compact_closed_cards();
                 store.checkpoint_wal_if_large();
                 due = None;
                 retry_delay = config.retry_initial;
@@ -2913,6 +2982,59 @@ mod tests {
                 }),
             }],
         }
+    }
+
+    #[test]
+    fn closed_card_descriptors_retire_only_after_the_writer_commit_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            BootId::new("close-receipt"),
+        )
+        .unwrap();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(runtime.take_committed_closures(state.id).is_empty());
+        let id = state.cards[0].id;
+        state.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        let committed = runtime.take_committed_closures(state.id);
+        assert!(committed.contains(&id));
+        assert_eq!(state.retire_committed_cards(&committed), 1);
+        assert!(state.cards.is_empty());
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(runtime.take_committed_closures(state.id).is_empty());
+        let mut resurrected = workspace();
+        resurrected.id = state.id;
+        resurrected.cards[0].id = id;
+        assert!(
+            runtime
+                .operation_store
+                .save_workspace(
+                    &resurrected,
+                    SnapshotBase {
+                        workspace: runtime
+                            .operation_store
+                            .stored_generations(state.id)
+                            .unwrap()
+                            .workspace,
+                        cards: &BTreeMap::new()
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resurrected")
+        );
+        runtime.shutdown();
     }
 
     #[test]

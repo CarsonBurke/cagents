@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -16226,6 +16229,14 @@ impl Application for Cagents {
                 }
             }),
             Message::SessionSaveHealthChanged(event) => {
+                if let Some(session) = &self.session {
+                    let committed = session.take_committed_closures(self.durable.id);
+                    if !committed.is_empty()
+                        && Arc::make_mut(&mut self.durable).retire_committed_cards(&committed) > 0
+                    {
+                        self.persist();
+                    }
+                }
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
@@ -17764,6 +17775,76 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closed_pane_is_retired_from_ui_state_after_its_durable_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("ui-retirement"),
+        )
+        .unwrap();
+        let store = session.operation_store();
+        let mut app = context_inspector_test_app(false);
+        app.session = Some(session);
+        drop(app.open_utility_card(CardKind::Settings));
+        let id = app.workspace.focused().unwrap();
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        drop(app.close_card_unasked(id));
+        assert!(
+            app.durable.cards.iter().any(|card| card.id == id),
+            "descriptor stays until its tombstone commits"
+        );
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let event = app
+            .session
+            .as_ref()
+            .unwrap()
+            .health_receiver()
+            .recv_blocking()
+            .unwrap();
+        drop(app.update(Message::SessionSaveHealthChanged(event)));
+        assert!(!app.durable.cards.iter().any(|card| card.id == id));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let base = store.stored_generations(app.durable.id).unwrap();
+        let mut stale = app.durable.as_ref().clone();
+        stale.cards.push(CardState {
+            id,
+            generation: 0,
+            title: "stale pane".into(),
+            width_fraction: 1.0,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: CardKind::Settings,
+        });
+        assert!(
+            store
+                .save_workspace(
+                    &stale,
+                    crate::persistence::SnapshotBase {
+                        workspace: base.workspace,
+                        cards: &base.cards
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be resurrected")
+        );
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
