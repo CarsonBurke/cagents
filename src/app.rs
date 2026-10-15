@@ -24030,6 +24030,17 @@ mod tests {
         app.workspace.add_card(WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(), 1, true).unwrap();
         app.editor_features.jump_origins.insert(target, from);
         app.complete_cross_card_jump(target);
+        // A pending transaction makes the target unavailable, without
+        // consuming the history position. Cancelling it permits the same Back.
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
+            let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
+            let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "origin.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+            runtime.begin_workspace_edit(313, &plan).unwrap();
+            assert!(runtime.is_saving());
+        }
+        assert!(app.navigate_cross_card_location(target, false).is_none());
+        assert_eq!(app.workspace.focused(), Some(target));
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) { runtime.cancel_workspace_edit(313); }
         drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
         assert_eq!(app.workspace.focused(), Some(origin));
         assert_eq!(app.capture_editor_location(origin).unwrap().anchor, origin_anchor);

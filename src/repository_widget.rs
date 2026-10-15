@@ -3175,6 +3175,7 @@ impl RepositoryRuntime {
     /// Window-local navigation captures native byte positions and viewport
     /// without copying the document or touching its undo history.
     pub fn editor_navigation_anchor(&self) -> Option<crate::model::EditorNavigation> {
+        if !matches!(&self.document, DocumentState::Editable(_)) { return None; }
         self.navigation()?.editor
     }
 
