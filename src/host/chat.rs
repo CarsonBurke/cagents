@@ -1195,6 +1195,7 @@ fn start_with_execution(
     drop(retired);
     let result = (|| {
         let mut pending_fresh = None;
+        let mut stopped_source_terminal = false;
         if let Some(handle) = source_handle {
             let (current_process, current_recipe, _, _, current_fresh, current_execution) =
                 resolve_source(
@@ -1248,6 +1249,7 @@ fn start_with_execution(
                     pending_fresh = Some((handle.clone(), frozen));
                 } else {
                     stop_source(&handle, &mut frozen)?;
+                    stopped_source_terminal = true;
                 }
             }
         }
@@ -1379,6 +1381,14 @@ fn start_with_execution(
                 // The still-uncommitted pidfd guard resumes the source on drop.
                 return Err(failure);
             }
+            stopped_source_terminal = true;
+        }
+        if remote && stopped_source_terminal {
+            // Claude conversion positively closed this source PTY. It is a
+            // historical source alias, not a live CLI view owned by the new
+            // helper. Real execution consoles acquire their own exact pair.
+            session.terminal = None;
+            handle.update_native_source(session.clone(), None, None).map_err(unavailable)?;
         }
         // A helper commit is fallible RPC and must run outside HostState.
         // Keep its exact context in native_actor_startups on any uncertainty.
