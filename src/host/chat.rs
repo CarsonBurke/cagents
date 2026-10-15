@@ -27,6 +27,8 @@ use crate::{
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native, close_with_presentation};
 #[cfg(test)]
 pub(super) use native_cleanup::{before_presentation_close_commit, before_presentation_close_owner_drop, after_presentation_close_commit};
+#[cfg(test)]
+pub(super) use native_cleanup::before_presentation_provider_close;
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{

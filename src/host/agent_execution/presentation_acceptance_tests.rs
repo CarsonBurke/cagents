@@ -1,0 +1,376 @@
+// These are owning HOST contracts, not native application evidence. The Codex
+// peer is a private real app-server process; no Actor.child is injected. The
+// ended-pane seed models a legacy database without historical generation proof.
+
+struct LocalCodexPresentationFixture {
+    host: SharedHost,
+    path: std::path::PathBuf,
+    agent: Agent,
+    run: Run,
+    pane: crate::workspace_model::views::Pane,
+    handle: chat::runtime::Handle,
+    owner: crate::daemon::holder_registry::Record,
+    pair: crate::terminal::TerminalHandle,
+    pair_source: crate::model::TerminalSession,
+    proof: HostSessionProof,
+    malformed_receipt: Arc<std::sync::Mutex<Option<(u64, u64)>>>,
+    _lease: crate::daemon::HostLease,
+    _notifications: crate::host::notifications::Broker,
+}
+
+impl LocalCodexPresentationFixture {
+    fn start() -> Self {
+        let (host, mut request, path) = fixture();
+        let root = path.parent().unwrap();
+        let program = root.join("bin/codex");
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let marker = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root.join("combined-close-owner.json")).unwrap();
+            serde_json::to_writer(marker, &serde_json::json!({"root": root.canonicalize().unwrap(), "uid": std::fs::metadata(root).unwrap().uid()})).unwrap();
+        }
+        std::fs::write(&program, include_str!("../../../tests/fixtures/combined-close-codex.py")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proof = host.lock().unwrap().proof().clone();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let notifications = crate::host::notifications::Broker::start(&host,
+            crate::notifications::Application::Cagents).unwrap();
+        host.lock().unwrap().notifications = Some(notifications.handle());
+        host.lock().unwrap().enable_holder_recovery();
+        let Destination::New(spec) = &mut request.destination else { unreachable!() };
+        spec.provider = Provider::Codex;
+        spec.model = Some("fixture-model".into());
+        spec.reasoning_effort = Some("low".into());
+        let accepted = submit(&host, &Authority::default(), request).unwrap();
+        let run = settled(&host, accepted.run.id);
+        assert_eq!(run.state, State::Succeeded, "{run:?}");
+        assert_eq!(run.result.text, "LOCAL_CODEX_CLOSE_RESULT");
+        let store = registry(&host).unwrap();
+        let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+        let HostedSession::Chat(original) = agent.session.as_ref().unwrap() else { unreachable!() };
+        let (handle, hosted) = {
+            let state = host.lock().unwrap();
+            let record = &state.chats[&original.id];
+            (record.handle.clone(), record.session.clone())
+        };
+        assert!(handle.actor_identity().is_none(), "this is the actual Local facade, not Remote");
+        assert!(handle.provider_process().is_none(), "OwnedUnixWebSocket server is owned by native_holder, not Actor.child");
+        let owner = handle.native_holder_record().expect("actual owned native server").clone();
+        assert!(!chat::runtime::Handle::is_remote_record(&owner));
+        let (recovery, exited) = chat::native_holder::inspect(&owner, &proof).unwrap();
+        assert!(!exited);
+        assert_eq!(recovery.server_process.as_ref(), Some(&owner.root));
+        let log: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(root.join("codex-processes.jsonl")).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(log["pid"].as_i64(), Some(i64::from(owner.root.pid)));
+        assert_eq!(log["start"].as_u64(), Some(owner.root.start));
+
+        let recipe = crate::model::LaunchRecipe {program: "/bin/cat".into(), arguments: vec![],
+            working_directory: root.join("project"), environment: Default::default(), unset_environment: Default::default()};
+        // This is the real production pairing publisher after its matched-CLI
+        // recipe boundary, not a manually assigned HostState/Agent pair.
+        create_console_from_recipe(&host, &store, agent.id, &hosted, &handle, None, recipe)
+            .unwrap_or_else(|error| match error {ConsoleError::Known(message) | ConsoleError::Uncertain(message) => panic!("pairing failed: {message}")});
+        let agent = store.lock().unwrap().agent(agent.id).unwrap();
+        let pair_source = agent.console.as_ref().unwrap().clone();
+        let pair = host.lock().unwrap().terminals[&pair_source.id].handle.clone();
+        let (published, instance) = {
+            let state = host.lock().unwrap();
+            let record = &state.chats[&original.id];
+            assert!(record.paired_terminal.as_ref().is_some_and(|owned| owned.same_worker(&pair)));
+            (record.session.clone(), record.execution_instance)
+        };
+        assert!(published.terminal.is_some());
+        let HostedSession::Chat(retained) = agent.session.as_ref().unwrap() else { unreachable!() };
+        assert!(retained.terminal.is_none(), "bind_agent_console retains the exact earlier Agent source");
+        assert_ne!(&published, retained, "fixture must exercise the genuine fresh-pair alias gap");
+        assert!(!host.lock().unwrap().upgrade_chats.contains_key(&retained.id));
+        let (paired_recovery, _) = chat::native_holder::inspect(&owner, &proof).unwrap();
+        assert!(paired_recovery.source == *retained || paired_recovery.previous_sources.contains(retained));
+        assert_eq!(paired_recovery.paired_holder.as_ref(), pair.holder_identity());
+        assert!(!instance.is_nil());
+
+        let mut ended = pair_source.clone();
+        ended.continuity = crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+            code: Some(0), signal: None, occurred_at_unix_ms: 1}};
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy Local Codex presentation".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(ended), scope: None};
+        store.lock().unwrap().apply(&ModelEdit::SeedView {scope: agent.placement.clone(),
+            panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        Self {host, path, agent, run, pane, handle, owner, pair, pair_source, proof,
+            malformed_receipt: Arc::new(std::sync::Mutex::new(None)),
+            _lease: lease, _notifications: notifications}
+    }
+
+    fn inspect(&self) -> crate::agent_execution::PresentationCloseTarget {
+        let Reply::PresentationClose(Some(target)) = process(&self.host, Authority::default(),
+            Operation::InspectPresentationClose(self.agent.id)).unwrap() else { panic!("missing current close target") };
+        assert_eq!(target.backend, crate::agent_execution::PresentationCloseBackend::Process {
+            pid: self.owner.root.pid, start: self.owner.root.start});
+        assert_eq!(target.observation.agent, self.agent);
+        assert_eq!(target.observation.pane, self.pane);
+        target
+    }
+
+    fn rpc_counts(&self) -> (usize, usize) {
+        let root = self.path.parent().unwrap();
+        let spawns = std::fs::read_to_string(root.join("codex-processes.jsonl")).unwrap().lines().count();
+        let turns = std::fs::read_to_string(root.join("codex-rpc.jsonl")).unwrap().lines()
+            .filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"] == "turn/start").count();
+        (spawns, turns)
+    }
+
+    fn receipt_path(&self) -> std::path::PathBuf {
+        crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap()
+            .join(format!("{}-{}-{}.closed", self.owner.terminal, self.owner.holder.pid, self.owner.holder.start))
+    }
+}
+
+impl Drop for LocalCodexPresentationFixture {
+    fn drop(&mut self) {
+        // Only a malformed file with this fixture's content is removable here.
+        // The failure test additionally checks its original inode before unlink.
+        let receipt = self.receipt_path();
+        use std::os::unix::fs::MetadataExt;
+        let owned = *self.malformed_receipt.lock().unwrap();
+        if let (Some(expected), Ok(metadata)) = (owned, std::fs::symlink_metadata(&receipt))
+            && !metadata.file_type().is_symlink()
+            && (metadata.dev(), metadata.ino()) == expected
+            && std::fs::read(&receipt).ok().as_deref() == Some(b"owned combined-close transient failure") {
+            let _ = std::fs::remove_file(receipt);
+        }
+        let _ = self.handle.close_for_resume();
+        let _ = self.pair.close_with_receipt(&self.pair_source, &self.proof);
+    }
+}
+
+#[test]
+fn combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pair_alias() {
+    if isolated("combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pair_alias").is_some() { return; }
+    let fixture = LocalCodexPresentationFixture::start();
+    let store = registry(&fixture.host).unwrap();
+    let before = store.lock().unwrap().model().unwrap();
+    let counts = fixture.rpc_counts();
+    assert_eq!(counts, (1, 1));
+    assert!(close(&fixture.host, &Authority::default(), fixture.agent.id).unwrap_err().contains("historical generation proof"));
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert!(fixture.owner.root.is_current()); assert!(!fixture.pair.is_completed());
+    assert_eq!(fixture.rpc_counts(), counts);
+    let target = fixture.inspect();
+    let mut wrong_instance = target.clone();
+    wrong_instance.actor_instance = Some(uuid::Uuid::new_v4());
+    assert!(process(&fixture.host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: wrong_instance}).is_err());
+    assert!(fixture.owner.root.is_current()); assert!(!fixture.pair.is_completed());
+    assert_eq!(fixture.rpc_counts(), counts);
+    let Reply::Closed(closed) = process(&fixture.host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: target}).unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    assert!(!fixture.owner.root.is_current()); assert!(!fixture.owner.holder.is_current());
+    assert!(crate::terminal::holder::cleanup::confirmed_owner(fixture.pair.holder_identity().unwrap(), &fixture.proof).unwrap());
+    let HostedSession::Chat(source) = fixture.agent.session.as_ref().unwrap() else { unreachable!() };
+    let receipt = chat::native_holder::closed_source(source, &fixture.proof).unwrap().unwrap();
+    assert_eq!(receipt.0, fixture.owner); assert!(receipt.1);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, fixture.agent.id).unwrap().is_none());
+    assert!(!fixture.host.lock().unwrap().native_closing.contains_key(&source.id));
+    assert_eq!(fixture.rpc_counts(), counts);
+    assert_eq!(close(&fixture.host, &Authority::default(), fixture.agent.id).unwrap(), closed);
+    assert_eq!(fixture.rpc_counts(), counts);
+}
+
+#[test]
+fn combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_respawn() {
+    if isolated("combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_respawn").is_some() { return; }
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::io::Write;
+    let fixture = LocalCodexPresentationFixture::start();
+    let target = fixture.inspect();
+    let store = registry(&fixture.host).unwrap();
+    let before = store.lock().unwrap().model().unwrap();
+    let counts = fixture.rpc_counts();
+    let path = fixture.receipt_path();
+    let injected = path.clone();
+    let (identity, original) = std::sync::mpsc::channel();
+    let owned_receipt = fixture.malformed_receipt.clone();
+    crate::host::chat::before_presentation_provider_close(move || {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(injected).unwrap();
+        file.write_all(b"owned combined-close transient failure").unwrap();
+        file.sync_all().unwrap();
+        let metadata = file.metadata().unwrap();
+        *owned_receipt.lock().unwrap() = Some((metadata.dev(), metadata.ino()));
+        identity.send((metadata.dev(), metadata.ino())).unwrap();
+    });
+    let error = process(&fixture.host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: target}).unwrap_err();
+    assert!(!error.is_empty());
+    let (device, inode) = original.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(fixture.owner.root.is_current(), "uncertain local teardown must retain the exact native server");
+    assert!(!fixture.pair.is_completed());
+    let HostedSession::Chat(source) = fixture.agent.session.as_ref().unwrap() else { unreachable!() };
+    assert!(fixture.host.lock().unwrap().native_closing.contains_key(&source.id));
+    assert!(fixture.host.lock().unwrap().chats[&source.id].handle.same_actor(&fixture.handle));
+    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), fixture.agent);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(fixture.rpc_counts(), counts);
+    // This is reconciliation uncertainty, not an assertion that the local
+    // reducer is untouched/usable. Remove only our exact malformed inode.
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    assert!(!metadata.file_type().is_symlink());
+    assert_eq!((metadata.dev(), metadata.ino()), (device, inode));
+    assert_eq!(std::fs::read(&path).unwrap(), b"owned combined-close transient failure");
+    std::fs::remove_file(&path).unwrap();
+    *fixture.malformed_receipt.lock().unwrap() = None;
+    let fresh = fixture.inspect();
+    let Reply::Closed(closed) = process(&fixture.host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: fresh}).unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    assert!(!fixture.owner.root.is_current());
+    assert_eq!(fixture.rpc_counts(), counts);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, fixture.agent.id).unwrap().is_none());
+}
+
+// Real Server-only cleanup/receipt contract. The sleep owner is deliberately
+// not claimed as Codex decoder or native UI qualification.
+#[test]
+fn combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation() {
+    if isolated("combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation").is_some() { return; }
+    use crate::daemon::holder_registry::{self as holders, Kind};
+    use chat::protocol::{ExecutionContext, ProcessSpec, TransportSpec};
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else { unreachable!() };
+    spec.provider = Provider::Codex;
+    let store = registry(&host).unwrap();
+    let accepted = store.lock().unwrap().submit_agent(&Origin::User, &request, now()).unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let mut original_proof = current_proof.clone();
+    original_proof.host_incarnation = HostIncarnation::new("before-holder-adoption");
+    let directory = path.parent().unwrap();
+    let id = TerminalId::new();
+    let mut original = chat::fresh_session(Provider::Codex, id, directory.to_owned(),
+        &Account::system(Provider::Codex)).unwrap();
+    original.proof = Some(original_proof.clone());
+    original.claim_owned_codex_listener(&directory.join("tmp"), &original_proof);
+    let socket = original.owned_codex_listener.as_ref().unwrap().socket.clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &original_proof).unwrap();
+    let context = Arc::new(ExecutionContext::new(Some(Arc::new(std::fs::File::open(directory).unwrap()))));
+    let process = ProcessSpec {execution: Some(context.clone()), messages: None,
+        transport: TransportSpec::OwnedUnixWebSocket {socket}, program: "/bin/sleep".into(),
+        arguments: vec!["60".into()], working_directory: directory.to_owned(),
+        environment: Default::default(), unset_environment: Default::default()};
+    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    context.installed();
+    let owner = holders::evidence(&holders::socket(&holders::directory(Kind::Native).unwrap(), id),
+        Kind::Native).unwrap().unwrap();
+    holder.confirm(uuid::Uuid::new_v4().to_string(), chat::protocol::ServerIdentity {
+        user_agent: "cagents/0.157.1 (Linux)".into(), canonical_home: directory.to_owned(),
+        reported_home: directory.display().to_string()}, owner.root.clone()).unwrap();
+    holder.preserve();
+    store.lock().unwrap().bind_agent(accepted.agent.id, None, HostedSession::Chat(original.clone())).unwrap();
+    drop(lease);
+    let _lease = crate::daemon::HostLease::acquire(&paths, &current_proof).unwrap();
+    let (adopted, recovery) = chat::native_holder::adopt(&owner, &original, &current_proof).unwrap();
+    let detached = adopted.preserve();
+    assert_ne!(recovery.source.proof, original.proof);
+    assert!(recovery.previous_sources.contains(&original));
+    let current = HostedSession::Chat(recovery.source.clone());
+    store.lock().unwrap().adopt_authenticated_agent_session(
+        &recovery.previous_sources.iter().cloned().map(HostedSession::Chat).collect::<Vec<_>>(), &current).unwrap();
+    let (agent, scope, pane) = {
+        let mut store = store.lock().unwrap();
+        let mut recipe = recovery.source.launch.recipe.clone();
+        recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {id, launch: recipe,
+            owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            transcript_path: None, resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+                code: Some(0), signal: None, occurred_at_unix_ms: 1}}};
+        let agent = store.bind_agent_console(accepted.agent.id, &current, terminal.clone()).unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy adopted console".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(terminal), scope: None};
+        store.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        (agent, scope, pane)
+    };
+
+
+    assert!(!host.lock().unwrap().chats.contains_key(&id), "this must take NativeOwner::Server, not Actor");
+    let before_agent = store.lock().unwrap().agent(agent.id).unwrap();
+    let before_run = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    let Reply::PresentationClose(Some(target)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else {panic!("missing server target")};
+    assert_eq!(target.actor_instance, None);
+    let database = path.clone();
+    crate::host::chat::before_presentation_close_commit(move || {
+        let db = rusqlite::Connection::open(database).unwrap();
+        db.execute("UPDATE shared_views SET revision=revision+1", []).unwrap();
+    });
+    let error = process(&host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: target}).unwrap_err();
+    assert!(error.contains("view revision changed"), "{error}");
+    assert!(!owner.root.is_current()); assert!(!owner.holder.is_current());
+    assert!(host.lock().unwrap().native_closing.contains_key(&id));
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), before_agent);
+    assert_eq!(store.lock().unwrap().agent_run(accepted.run.id).unwrap(), before_run);
+    let Reply::PresentationClose(Some(old_target)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else {panic!("missing proved server target")};
+    let receipt_path = holders::directory(Kind::Native).unwrap().join(format!(
+        "{}-{}-{}.closed", id, owner.holder.pid, owner.holder.start));
+    let receipt_bytes = std::fs::read(&receipt_path).unwrap();
+    assert_eq!(chat::native_holder::closed_source_proof(&recovery.source, &current_proof).unwrap(), Some(current_proof.clone()));
+    // Drop only the old daemon lease; the fresh HostState below has no RAM
+    // pending owner. Genuine durable exact receipt remains the only authority.
+    drop(_lease);
+    let mut next_proof = current_proof.clone();
+    next_proof.host_incarnation = HostIncarnation::new("server-cold-retry");
+    let _next_lease = crate::daemon::HostLease::acquire(&paths, &next_proof).unwrap();
+    let mut state = HostState::new(next_proof.clone());
+    state.install_model(Registry::at(&path).unwrap());
+    let next = Arc::new(crate::host::state::HostLock::new(state));
+    assert!(process(&next, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: old_target}).is_err());
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), before_agent);
+    assert!(next.lock().unwrap().native_closing.is_empty());
+    // Temporarily move the genuine receipt out of discovery. Absence alone
+    // must refuse, and restoring its exact inode is not proof fabrication.
+    let hidden = receipt_path.with_extension("owned-test-backup");
+    assert!(!hidden.exists());
+    std::fs::rename(&receipt_path, &hidden).unwrap();
+    let missing = process(&next, Authority::default(), Operation::InspectPresentationClose(agent.id));
+    std::fs::rename(&hidden, &receipt_path).unwrap();
+    assert!(missing.is_err(), "no owner process and no receipt cannot grant teardown authority");
+    assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+    assert_eq!(chat::native_holder::closed_source_proof(&recovery.source, &next_proof).unwrap(), Some(current_proof.clone()));
+    let Reply::PresentationClose(Some(fresh)) = process(&next, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else {panic!("missing cold server target")};
+    assert_eq!(fresh.backend, crate::agent_execution::PresentationCloseBackend::RetiredOwner);
+    assert_eq!(fresh.actor_instance, None);
+    assert_eq!(fresh.observation.pane, pane);
+    assert_eq!(fresh.observation.agent, before_agent);
+    assert_eq!(fresh.host, next_proof);
+    let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = provider_calls.clone();
+    crate::host::chat::before_presentation_provider_close(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let Reply::Closed(closed) = process(&next, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: fresh}).unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    let after_run = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    assert_eq!(after_run.state, State::Cancelled);
+    assert_eq!(after_run.result, before_run.result);
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, agent.id).unwrap().is_none());
+    assert!(next.lock().unwrap().native_closing.is_empty());
+    assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0,
+        "cold receipt-only retry must not invoke the actual provider-close site");
+    assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes, "fresh lease must never rewrite the original saved proof");
+    assert_eq!(close(&next, &Authority::default(), agent.id).unwrap(), closed);
+    drop(detached); // No provider call; already-proved cleanup was consumed.
+}
