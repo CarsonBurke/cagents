@@ -886,7 +886,10 @@ fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_rece
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let policy = fixture.root.join(".git/late-policy");
     fs::create_dir(&policy).unwrap();
-    run_git(&fixture.root, &["config", "core.hooksPath", policy.to_str().unwrap()]);
+    run_git(
+        &fixture.root,
+        &["config", "core.hooksPath", policy.to_str().unwrap()],
+    );
     let hook = policy.join("reference-transaction");
     fs::write(&hook, r#"#!/bin/sh
 set -eu
@@ -905,30 +908,56 @@ fi
     let root = fixture.root.clone();
     let synchronized = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let synchronized_hook = synchronized.clone();
-    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| *hook = Some(Box::new(move |phase| {
-        if phase != "before_lease_observation" { return; }
-        let operation = fs::read_dir(root.join(".git")).unwrap().map(Result::unwrap)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")).unwrap().path();
-        fs::write(operation.join("release-late-child"), b"release").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let observer = fs::File::open(operation.join("lease")).unwrap();
-        loop {
-            // SAFETY: independent descriptor pins the original lease inode.
-            if unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { break; }
-            assert!(Instant::now() < deadline, "owned child must retire before first real observation");
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(operation.join("late-child-retired").exists());
-        synchronized_hook.store(true, std::sync::atomic::Ordering::SeqCst);
-    })));
+    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move |phase| {
+            if phase != "before_lease_observation" {
+                return;
+            }
+            let operation = fs::read_dir(root.join(".git"))
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("cagents-pr-checkout-")
+                })
+                .unwrap()
+                .path();
+            fs::write(operation.join("release-late-child"), b"release").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let observer = fs::File::open(operation.join("lease")).unwrap();
+            loop {
+                // SAFETY: independent descriptor pins the original lease inode.
+                if unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned child must retire before first real observation"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(operation.join("late-child-retired").exists());
+            synchronized_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        }))
+    });
     let result = fixture.apply(&plan);
     effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| *hook = None);
     let failure = result.unwrap_err();
     assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
     assert!(synchronized.load(std::sync::atomic::Ordering::SeqCst));
     assert!(failure.detail.contains("after its last policy hook"));
-    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), new.as_str());
-    assert!(String::from_utf8(fs::read(fixture.root.join(".git/config")).unwrap()).unwrap().contains("changed-by-child"));
+    assert_eq!(
+        git_text(&fixture.root, &["rev-parse", "HEAD"]),
+        new.as_str()
+    );
+    assert!(
+        String::from_utf8(fs::read(fixture.root.join(".git/config")).unwrap())
+            .unwrap()
+            .contains("changed-by-child")
+    );
 }
 
 #[test]
@@ -937,8 +966,15 @@ fn packed_nested_branches_repair_absent_tracking_and_can_fast_forward() {
         let fixture = Fixture::new(false);
         run_git(&fixture.root, &["branch", "-m", "nested/feature"]);
         run_git(&fixture.root, &["push", "origin", "nested/feature"]);
-        run_git(&fixture.bare, &["symbolic-ref", "HEAD", "refs/heads/nested/feature"]);
-        let expected = if advance { fixture.advance(|root| fs::write(root.join("file"), "nested new\n").unwrap()) } else { fixture.original.clone() };
+        run_git(
+            &fixture.bare,
+            &["symbolic-ref", "HEAD", "refs/heads/nested/feature"],
+        );
+        let expected = if advance {
+            fixture.advance(|root| fs::write(root.join("file"), "nested new\n").unwrap())
+        } else {
+            fixture.original.clone()
+        };
         run_git(&fixture.root, &["pack-refs", "--all", "--prune"]);
         assert!(!fixture.root.join(".git/refs/heads/nested").exists());
         let mut request = fixture.request(expected.clone());
@@ -946,8 +982,14 @@ fn packed_nested_branches_repair_absent_tracking_and_can_fast_forward() {
         request.head_branch = request.branch.clone();
         let verified = fixture.apply(&fixture.prepare(&request)).unwrap();
         assert_eq!(verified.head(), &expected);
-        assert_eq!(verified.upstream(), Some("refs/remotes/origin/nested/feature"));
-        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), expected.as_str());
+        assert_eq!(
+            verified.upstream(),
+            Some("refs/remotes/origin/nested/feature")
+        );
+        assert_eq!(
+            git_text(&fixture.root, &["rev-parse", "HEAD"]),
+            expected.as_str()
+        );
     }
 }
 

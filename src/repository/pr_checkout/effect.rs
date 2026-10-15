@@ -93,27 +93,39 @@ pub(super) fn lock_at(root: &fs_safety::Root, relative: &Path) -> Result<GitFile
             let mut current = root.try_clone().map_err(|error| error.to_string())?;
             let directory = relative.parent().ok_or("Branch reference has no parent")?;
             for component in directory.components() {
-                let std::path::Component::Normal(name) = component else { return Err("Invalid branch reference namespace".into()); };
+                let std::path::Component::Normal(name) = component else {
+                    return Err("Invalid branch reference namespace".into());
+                };
                 let child = Path::new(name).join(".cagents-parent-probe");
                 match fs_safety::open_parent_beneath(&current, &child) {
                     Ok((next, _)) => current = next,
                     Err(error) if error.is_not_found() => {
                         use std::os::unix::ffi::OsStrExt;
-                        let name = std::ffi::CString::new(name.as_bytes()).map_err(|error| error.to_string())?;
-                        let held = current.retained_directory().map_err(|error| error.to_string())?;
+                        let name = std::ffi::CString::new(name.as_bytes())
+                            .map_err(|error| error.to_string())?;
+                        let held = current
+                            .retained_directory()
+                            .map_err(|error| error.to_string())?;
                         // SAFETY: held owns the parent descriptor, name is one
                         // validated NUL-terminated component; mode respects
                         // the caller's umask, like an ordinary Git directory.
                         if unsafe { libc::mkdirat(held.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
                             let error = io::Error::last_os_error();
-                            if error.kind() != io::ErrorKind::AlreadyExists { return Err(error.to_string()); }
+                            if error.kind() != io::ErrorKind::AlreadyExists {
+                                return Err(error.to_string());
+                            }
                         }
-                        current = fs_safety::open_parent_beneath(&current, &child).map_err(|error| error.to_string())?.0;
+                        current = fs_safety::open_parent_beneath(&current, &child)
+                            .map_err(|error| error.to_string())?
+                            .0;
                     }
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            let name = relative.file_name().ok_or("Branch reference has no name")?.to_owned();
+            let name = relative
+                .file_name()
+                .ok_or("Branch reference has no name")?
+                .to_owned();
             (current, name)
         }
         Err(error) => return Err(error.to_string()),
@@ -756,15 +768,27 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     // The prior native proof may precede the last owned policy child's
     // effects. Re-read only after all inherited leases have truly retired,
     // including children that exited before the first observer flock.
-    let final_state = service.prepare_existing_pr_checkout(&plan.request, &CancellationToken::default());
+    let final_state =
+        service.prepare_existing_pr_checkout(&plan.request, &CancellationToken::default());
     if !matches!(&final_state, Ok(current) if current == &expected_final) {
         let detail = match final_state {
-            Ok(_) => "The checkout changed after its last policy hook; refresh it before opening".to_owned(),
-            Err(error) => format!("The checkout could not be verified after its last policy hook: {error}"),
+            Ok(_) => "The checkout changed after its last policy hook; refresh it before opening"
+                .to_owned(),
+            Err(error) => {
+                format!("The checkout could not be verified after its last policy hook: {error}")
+            }
         };
-        let detail = format!("{detail}. Operation evidence: {}", retained_directory.display());
+        let detail = format!(
+            "{detail}. Operation evidence: {}",
+            retained_directory.display()
+        );
         private.keep();
-        return Err(PrCheckoutFailure { kind: PrCheckoutFailureKind::PartialOrUnknown, detail, path: plan.path().to_owned(), retained_ref: Some(private_ref) });
+        return Err(PrCheckoutFailure {
+            kind: PrCheckoutFailureKind::PartialOrUnknown,
+            detail,
+            path: plan.path().to_owned(),
+            retained_ref: Some(private_ref),
+        });
     }
     if let Err(detail) = pinned.check(plan) {
         let detail = format!(
