@@ -7940,6 +7940,7 @@ fn virtual_changes<'a>(
             .into(),
     ]);
     let key = key.clone();
+    let callback_key = key.clone();
     let epoch = state.change_scroll_epoch;
     let scroll: Element<'a, SidebarAction> = widget::scrollable(content)
         .id(stable_id(format!(
@@ -7947,7 +7948,7 @@ fn virtual_changes<'a>(
             key.worktree_id, state.change_scroll_epoch
         )))
         .on_scroll(move |viewport| SidebarAction::ChangeViewport {
-            key: key.clone(),
+            key: callback_key.clone(),
             scope,
             epoch,
             first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize,
@@ -7963,9 +7964,7 @@ fn virtual_changes<'a>(
         .into();
     // A scrollable ID only identifies operations; it does not reset State.
     // Replace the native child Tree when layout coordinates are reset.
-    cosmic::iced::widget::keyed::Column::with_children([(epoch, scroll)])
-        .width(Length::Fill)
-        .into()
+    RowInteraction::change_scroll(scroll, key, scope, epoch)
 }
 
 /// The tree/flat switch for a list of changed files, as one action that
@@ -10311,11 +10310,13 @@ mod row_interaction {
     }
 
     type ChangeTarget = (SidebarAction, Option<super::PathSelection>);
+    type ChangeScrollTarget = (super::ActiveWorktreeKey, super::ChangeTreeScope, u64);
 
     enum Kind {
         /// Only virtual Changes rows opt into semantic reconciliation. The
         /// native scrollable remains outside this subtree and keeps its offset.
         ChangeTarget(Box<ChangeTarget>),
+        ChangeScroll(Box<ChangeScrollTarget>),
         Selectable {
             row: super::SelectionRow,
             /// This row is in the explicit multi-selection.
@@ -10350,6 +10351,7 @@ mod row_interaction {
     #[derive(Default)]
     struct State {
         change_target: Option<Box<ChangeTarget>>,
+        change_scroll_target: Option<Box<ChangeScrollTarget>>,
         modifiers: keyboard::Modifiers,
         selection_bounds: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
@@ -10403,6 +10405,18 @@ mod row_interaction {
     }
 
     impl<'a> RowInteraction<'a> {
+        pub(super) fn change_scroll(
+            content: Element<'a, SidebarAction>,
+            key: super::ActiveWorktreeKey,
+            scope: super::ChangeTreeScope,
+            epoch: u64,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::ChangeScroll(Box::new((key, scope, epoch))),
+            })
+        }
+
         pub(super) fn change_target(
             content: Element<'a, SidebarAction>,
             action: SidebarAction,
@@ -10622,6 +10636,10 @@ mod row_interaction {
 
         fn state(&self) -> tree::State {
             tree::State::new(State {
+                change_scroll_target: match &self.kind {
+                    Kind::ChangeScroll(target) => Some(target.clone()),
+                    _ => None,
+                },
                 change_target: match &self.kind {
                     Kind::ChangeTarget(target) => Some(target.clone()),
                     _ => None,
@@ -10642,6 +10660,20 @@ mod row_interaction {
         }
 
         fn diff(&mut self, tree: &mut Tree) {
+            if let Kind::ChangeScroll(target) = &self.kind {
+                let state = tree.state.downcast_mut::<State>();
+                if state.change_scroll_target.as_deref() != Some(target.as_ref()) {
+                    // The pinned keyed Column keeps positional children when
+                    // their count is unchanged. Explicitly replace native
+                    // scroll state when its model coordinates or owner change.
+                    *state = State {
+                        change_scroll_target: Some(target.clone()),
+                        ..State::default()
+                    };
+                    tree.children = self.children.iter().map(Tree::new).collect();
+                    return;
+                }
+            }
             if let Kind::ChangeTarget(target) = &self.kind {
                 let state = tree.state.downcast_mut::<State>();
                 if state.change_target.as_deref() != Some(target.as_ref()) {
@@ -16442,10 +16474,32 @@ pub(crate) mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
         assert_eq!(before.0, Some(640.0));
         drop(element);
+        let epoch = state.change_scroll_epoch;
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope,
+            epoch,
+            first_row: (640.0 / PANEL_ROW_HEIGHT) as usize,
+        });
+        assert!(state.change_first_rows[&scope] > 0);
+        element = change_group_view(&state, &source, group, false);
+        tree.diff(&mut element);
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut unchanged = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut unchanged);
+        assert_eq!(unchanged.0, Some(640.0), "ordinary rebuilds retain scrolling");
+        assert_eq!(state.change_scroll_epoch, epoch);
+        drop(element);
         state.apply(&SidebarAction::SetChangeListMode {
             key: source.key.clone(),
             mode: FileListMode::Flat,
         });
+        assert_ne!(state.change_scroll_epoch, epoch);
+        assert!(!state.change_first_rows.contains_key(&scope));
         element = change_group_view(&state, &source, group, false);
         tree.diff(&mut element);
         node = element
