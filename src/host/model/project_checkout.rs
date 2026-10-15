@@ -79,6 +79,11 @@ mod tests {
             }.canonicalized().unwrap();
             registry.apply(&edit).unwrap();
         }
+        let invalid = ModelEdit::ReopenProject {
+            repository: metadata.canonicalize().unwrap(), checkout: Some(linked.clone()),
+            primary_checkout: Some(linked.clone()), name: "project".into(), kind: ProjectKind::Git,
+        }.canonicalized();
+        assert!(invalid.is_err(), "a linked checkout cannot claim the primary row");
         let before = registry.model().unwrap();
         assert_eq!(before.projects.len(), 1);
         assert_eq!(before.projects[0].checkout, Some(linked.canonicalize().unwrap()));
