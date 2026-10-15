@@ -107,6 +107,7 @@ mod tests {
         let host = Arc::new(HostLock::new(state));
         let blocker = rusqlite::Connection::open(path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer_registry = host.lock().unwrap().workspace_registry.clone().unwrap();
         let edit_host = host.clone();
         let repository = directory.path().to_owned();
         let (started, ready) = mpsc::channel();
@@ -117,7 +118,13 @@ mod tests {
             })
         });
         ready.recv_timeout(Duration::from_secs(1)).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        // Observe the writer owning its independent connection while SQLite
+        // is blocked, rather than guessing that its thread ran after a sleep.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while writer_registry.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "workspace writer did not enter its SQLite transaction");
+            thread::sleep(Duration::from_millis(1));
+        }
         let (acquired, receipt) = mpsc::channel();
         let reader_host = host.clone();
         let reader = thread::spawn(move || {
