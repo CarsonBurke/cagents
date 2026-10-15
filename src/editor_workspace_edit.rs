@@ -193,6 +193,9 @@ fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(us
                 published.push(document); continue;
             },
             Ok(SaveOutcome::Conflict { .. }) => format!("{} changed on disk", document.relative.display()),
+            // Workspace replacement never requests deletion. Refuse an
+            // unexpected outcome through the same earlier-write rollback.
+            Ok(SaveOutcome::Absent { .. }) => format!("{} unexpectedly became absent during publication", document.relative.display()),
             Err(error) => format!("{}: {error}", document.relative.display()),
         };
         let mut unrestored = Vec::new();
