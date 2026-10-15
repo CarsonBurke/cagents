@@ -1932,10 +1932,16 @@ impl Cagents {
                 let current: WorktreeSafetySnapshot = serde_json::from_str(&snapshot).map_err(|error| error.to_string())?;
                 if current != confirmed { return Err("The worktree changed after confirmation; review its current files and commits".into()); }
                 let consented_agents = consented_agents.ok_or("Active agent consent must be checked again")?;
-                if busy_worktree_agents(&request.repository, &request.path)? != consented_agents {
-                    return Err("Working agents changed after confirmation; review their interruption again".into());
+                // The owning daemon compares execution instance/revision and
+                // closes conditionally at the actors. A separate census then
+                // unconditional close could interrupt an unconfirmed new turn.
+                let reply = worktree_control_request(crate::worktree_control::Operation::CloseSessions {
+                    repository: request.repository.clone(), path: request.path.clone(), agents: consented_agents,
+                })?;
+                match reply {
+                    crate::worktree_control::Reply::SessionsClosed { path } if path == request.path => Ok(()),
+                    _ => Err("Unexpected guarded worktree session close response".into()),
                 }
-                close_worktree_sessions(&request)
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::ProjectUi(Action::DeletionSessionsClosed { target, started_at, result })
         })
@@ -3284,7 +3290,7 @@ mod tests {
         drop(app.open_worktree_delete_dialog(target));
         // No current-window card exists for this detached daemon agent.
         assert!(app.durable.cards.is_empty());
-        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent { session: TerminalId::new(), turn_generation: Some(3) }];
+        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) }];
         confirm_deletion_fixture(&mut app);
         assert!(!app.project_ui.is_deleting(linked.id));
         drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
@@ -3302,12 +3308,12 @@ mod tests {
             let target = app.project_target(project, Some(linked.id)).unwrap();
             drop(app.open_worktree_delete_dialog(target));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
-            let original = BusyAgent { session: TerminalId::new(), turn_generation: Some(3) };
+            let original = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) };
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
             confirm_deletion_fixture(&mut app);
             drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
             drop(app.handle_project_action(Action::ConfirmDelete));
-            let changed = BusyAgent { session: if replacement { TerminalId::new() } else { original.session }, turn_generation: Some(4) };
+            let changed = BusyAgent { session: if replacement { TerminalId::new() } else { original.session }, instance: original.instance, close_revision: Some(2), turn_generation: Some(4) };
             drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), vec![changed])) }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
@@ -3317,7 +3323,7 @@ mod tests {
     #[test]
     fn malformed_or_duplicate_busy_census_is_never_treated_as_idle() {
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
-        let agent = BusyAgent { session: TerminalId::new(), turn_generation: Some(1) };
+        let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) };
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent] }).is_err());
     }
 

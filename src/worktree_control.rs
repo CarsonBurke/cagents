@@ -23,6 +23,7 @@ pub enum Operation {
     },
     Inspect { repository:PathBuf, path:PathBuf },
     BusySessions { repository:PathBuf, path:PathBuf },
+    CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent> },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
@@ -36,6 +37,7 @@ impl Operation {
             | Self::List { repository }
             | Self::Remove { repository, .. }
             | Self::BusySessions { repository, .. }
+            | Self::CloseSessions { repository, .. }
             | Self::Inspect { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
@@ -51,6 +53,8 @@ impl Operation {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BusyAgent {
     pub session: crate::model::TerminalId,
+    pub instance: uuid::Uuid,
+    pub close_revision: Option<u64>,
     pub turn_generation: Option<u64>,
 }
 
@@ -77,6 +81,7 @@ pub enum Reply {
     Removed { path: PathBuf, branch_deleted: Option<String>, warnings:Vec<String>, branch_error:Option<String> },
     StaleLock {unlocked:bool},
     BusySessions { agents:Vec<BusyAgent> },
+    SessionsClosed { path:PathBuf },
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
