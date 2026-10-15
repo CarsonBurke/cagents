@@ -16,20 +16,16 @@ pub(super) struct Prompt {
 }
 
 impl Prompt {
-    pub(super) fn from_original(value:chat::original::OriginalText)->Option<Self> {
-        use chat::annotations::Setting;
-        if value.text.len()!=value.original.text_bytes || !value.original.settings.is_exact() {return None;}
+    /// Edit is a new intent. Accepted original input proves text and the full
+    /// attachment set; unknown historical settings do not replace current
+    /// composer policy or grant exact Retry eligibility.
+    pub(super) fn from_original(value:chat::original::OriginalText,current:&Snapshot)->Option<Self> {
+        if value.text.len()!=value.original.text_bytes {return None;}
         let original=value.original;
-        let model=match original.settings.model {
-            Setting::Value(model)=>Some((model,match original.settings.reasoning {Setting::Value(reasoning)=>Some(reasoning),Setting::Unsupported=>None,_=>return None})),
-            Setting::Unsupported=>None,_=>return None,
-        };
-        let fast=match original.settings.fast {Setting::Value(value)=>Some(value),Setting::Unsupported=>None,_=>return None};
-        let permission=match original.settings.permission {Setting::Value(value)=>Some(value),Setting::Unsupported=>None,_=>return None};
         let attachment_labels=original.attachments.iter().map(|attachment|(attachment.path.clone(),attachment.original_path.clone())).collect();
         let attachments=original.attachments.into_iter().map(|attachment|Attachment {path:attachment.path}).collect();
         Some(Self {user_id:Some(original.user_id),prior_user_id:None,text:value.text,attachments,attachment_labels,account_hint:None,origin_backend:true,
-            settings:Settings {model,fast,permission,exact:true}})
+            settings:Settings::capture(current)})
     }
 }
 

@@ -79,7 +79,7 @@ impl State {
             && page.text.len()<=4 && page.next_offset<=page.original.text_bytes
             && page.complete==(page.next_offset==page.original.text_bytes)
             && page.original.text_bytes<=chat::annotations::ORIGINAL_TEXT_BYTES
-            && !page.original.user_id.is_empty() && page.original.settings.is_exact();
+            && !page.original.user_id.is_empty();
         if valid {self.metadata=Some(page.original);}
         valid
     }
@@ -184,6 +184,7 @@ impl Runtime {
     pub(super) fn original_metadata_bytes(&self)->usize {self.recovery.originals.metadata_bytes()}
     pub(super) fn original_retry_user(&self)->Option<&str> {
         (self.snapshot.capabilities.original_retry
+            && self.recovery.originals.metadata.as_ref().is_some_and(|original|original.settings.is_exact())
             && self.recovery.originals.context.as_ref()==Context::current(self).as_ref()
             && !self.recovery.originals.loading()).then(||self.recovery.originals.current_user()).flatten()
     }
@@ -282,7 +283,7 @@ impl Cagents {
             }
             (Purpose::Edit {branch},Value::Text(original))=>{
                 if original.session_id!=context.session || !runtime.recovery_available() {return Task::none();}
-                let Some(mut prompt)=turn_actions::Prompt::from_original(original) else {return Task::none();};
+                let Some(mut prompt)=turn_actions::Prompt::from_original(original,&runtime.snapshot) else {return Task::none();};
                 prompt.account_hint=runtime.recovery.originals.account_hint.clone();
                 self.finish_original_edit(target,prompt,branch,context.session)
             }
@@ -376,18 +377,40 @@ mod tests {
         assert!(runtime.recovery_available());
     }
     #[test]
-    fn metadata_rejects_wrong_session_inexact_settings_and_partial_shape() {
+    fn metadata_rejects_wrong_session_and_partial_shape() {
         let runtime=runtime();let context=Context::current(&runtime).unwrap();
-        for change in 0..4 {
+        for change in 0..3 {
             let mut state=State::default();let mut page=page(&context,"native-user","accepted prompt");
             match change {
                 0=>page.session_id="other-session".into(),
-                1=>page.original.settings.model=chat::annotations::Setting::Default,
-                2=>page.next_offset+=1,
+                1=>page.next_offset+=1,
                 _=>page.complete=true,
             }
             assert!(!state.metadata(&context,page));assert!(state.metadata.is_none());
         }
+    }
+    #[test]
+    fn accepted_unknown_settings_allow_edit_without_replacing_current_policy_or_enabling_retry() {
+        let mut runtime=runtime();let context=Context::current(&runtime).unwrap();
+        let mut original=original("native-user","accepted text with complete images");
+        original.settings=chat::annotations::OriginalSettings::unknown();
+        original.attachments.push(chat::annotations::OriginalAttachment {original_path:"/user/diagram.png".into(),
+            path:"/private/immutable/diagram.png".into(),bytes:40,sha256:[9;32]});
+        let mut metadata=page(&context,"native-user","accepted text with complete images");metadata.original=original.clone();
+        assert!(runtime.recovery.originals.metadata(&context,metadata));
+        runtime.recovery.originals.context=Some(context);
+        assert!(runtime.original_retry_user().is_none(),"accepted input alone does not prove exact restorable policy");
+        Arc::make_mut(&mut runtime.snapshot).selected_model=Some("current-model".into());
+        Arc::make_mut(&mut runtime.snapshot).permission_mode=Some("current-policy".into());
+        let before=runtime.snapshot.clone();
+        let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:"confirmed-session".into(),
+            original,text:"accepted text with complete images".into()},&runtime.snapshot).unwrap();
+        runtime.load_recovery_prompt(prompt,"Editing starts a new turn.");
+        assert_eq!(runtime.composer.text(),"accepted text with complete images");
+        assert_eq!(runtime.attachments[0].path,PathBuf::from("/private/immutable/diagram.png"));
+        assert_eq!(runtime.attachment_display_path(&runtime.attachments[0]),Path::new("/user/diagram.png"));
+        assert_eq!(runtime.snapshot.selected_model,before.selected_model);assert_eq!(runtime.snapshot.permission_mode,before.permission_mode);
+        assert!(runtime.recovery.commands.is_empty(),"Edit never restores historical settings");
     }
     #[test]
     fn hidden_eviction_and_connection_replacement_reject_old_attempts() {
@@ -405,7 +428,7 @@ mod tests {
         original.attachments.push(chat::annotations::OriginalAttachment {original_path:"/pictures/architecture.png".into(),
             path:"/private/capture/00000000-0000-4000-8000-000000000000.png".into(),bytes:50,sha256:[3;32]});
         let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:"confirmed-session".into(),original,
-            text:"accepted original".into()}).unwrap();
+            text:"accepted original".into()},&runtime().snapshot).unwrap();
         let mut runtime=runtime();runtime.load_recovery_prompt(prompt,"Editing starts a new turn.");
         let attachment=&runtime.attachments[0];
         assert_eq!(attachment.path,PathBuf::from("/private/capture/00000000-0000-4000-8000-000000000000.png"));
@@ -433,7 +456,7 @@ mod tests {
         let context=Context::current(&runtime).unwrap();
         let original=original("native-user","private accepted original");
         let mut prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:context.session.clone(),
-            original:original.clone(),text:"private accepted original".into()}).unwrap();
+            original:original.clone(),text:"private accepted original".into()},&runtime.snapshot).unwrap();
         prompt.account_hint=Some(first.clone());
         let prompt=Arc::new(prompt);let weak=Arc::downgrade(&prompt);
         runtime.recovery.prepared_prompt=Some(prompt);
