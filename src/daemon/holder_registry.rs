@@ -179,16 +179,22 @@ impl Record {
         if !self.holder.is_current() {
             return Err(io::Error::other("holder process identity changed"));
         }
-        let children = fs::read_to_string(format!(
-            "/proc/{}/task/{}/children",
-            self.holder.pid, self.holder.pid
-        ))?;
+        // Linux records children on the thread that created them, even though
+        // their stat parent is the process leader. Inspect every live thread.
+        let mut children = std::collections::BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
+            let task = task?;
+            let raw = match fs::read_to_string(task.path().join("children")) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            children.extend(raw.split_whitespace().filter_map(|pid| pid.parse::<i32>().ok()));
+        }
         let zombies = children
-            .split_whitespace()
+            .into_iter()
             .filter(|pid| {
-                pid.parse::<i32>()
-                    .ok()
-                    .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
                     .and_then(|stat| {
                         stat.rsplit_once(')').map(|(_, fields)| {
                             let mut fields = fields.split_whitespace();
