@@ -298,4 +298,35 @@ pub(super) mod tests {
         assert!(app.source_control_mutations.contains_key(&key.canonical_path), "current actor retains positive admission");
     }
 
+    #[test]
+    fn publish_form_cannot_transfer_old_draft_to_same_key_new_actor() {
+        if !WorktreeAuthority::supported() { return; }
+        let temporary = tempfile::tempdir().unwrap();
+        init(temporary.path(), "original\n");
+        let (mut app, key) = app_for(temporary.path());
+        let original = app.refresh_ui.source_binding.as_ref().unwrap().id;
+        let branch = crate::repository::ValidatedBranchName::parse("main").unwrap();
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(original, SidebarAction::OpenPublish {
+            key: key.clone(), branch: branch.clone(), remotes: vec!["origin".into()],
+        }))));
+        let old_submit = app.sidebar_state.publish_draft().unwrap().push_action().unwrap();
+        let mut next = Binding::new(key.clone());
+        next.initialize().unwrap();
+        let current = next.id;
+        app.refresh_ui.source_binding = Some(next);
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(current);
+        // A rebuilt panel must not give an existing form permission for its
+        // freshly captured owner merely by wrapping its old draft in that ID.
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(current, old_submit))));
+        assert!(app.source_control_mutations.is_empty());
+        assert!(app.sidebar_state.publish_draft().is_some());
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(current, SidebarAction::CancelPublish))));
+        assert!(app.sidebar_state.publish_draft().is_none());
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(current, SidebarAction::OpenPublish {
+            key, branch, remotes: vec!["origin".into()],
+        }))));
+        assert_eq!(app.refresh_ui.publish_binding, Some(current));
+        assert!(app.sidebar_state.publish_draft().is_some());
+    }
+
 }
