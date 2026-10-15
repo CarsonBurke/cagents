@@ -1592,6 +1592,36 @@ pub struct FrameCodec {
     payload_length: Option<usize>,
     payload_read: usize,
     maximum: usize,
+    memory_id: u64,
+    small_reads: u8,
+    small_writes: u8,
+}
+
+// A codec moves from handshake into a reader thread. Pointer identity would
+// leave a phantom owner at its former stack address in memory census traces.
+fn next_memory_codec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// Normal interactive frames keep a reusable quarter-mebibyte allocation. A
+// one-off transcript/image transfer must not permanently multiply its peak
+// capacity across every attached chat. Eight consecutive frames at least four
+// times smaller retire an outlier; interleaved snapshots/acknowledgements keep
+// hot capacity. Hidden chat transports explicitly release their spare buffers.
+const FRAME_REUSE_FLOOR: usize = 256 * 1024;
+
+fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
+    buffer.clear();
+    if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
+        *small_frames = small_frames.saturating_add(1);
+        if *small_frames >= 8 {
+            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            *small_frames = 0;
+        }
+    } else {
+        *small_frames = 0;
+    }
 }
 
 impl FrameCodec {
@@ -1604,7 +1634,30 @@ impl FrameCodec {
             payload_length: None,
             payload_read: 0,
             maximum,
+            memory_id: next_memory_codec_id(),
+            small_reads: 0,
+            small_writes: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities_for_test(&self) -> (usize, usize) {
+        (self.read_buffer.capacity(), self.write_buffer.capacity())
+    }
+
+    /// Release outlier scratch when a connection becomes hidden or idle.
+    /// A timed-out partial frame remains intact until it is decoded.
+    pub fn release_spare(&mut self) {
+        if self.payload_length.is_none() && self.prefix_read == 0 {
+            self.read_buffer.clear();
+            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            self.small_reads = 0;
+        }
+        self.write_buffer.clear();
+        self.write_buffer.shrink_to(FRAME_REUSE_FLOOR);
+        self.small_writes = 0;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
     }
 
     pub fn read<T: DeserializeOwned>(
@@ -1664,6 +1717,8 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
+        recycle_frame_buffer(&mut self.read_buffer, length, &mut self.small_reads);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
     }
 
@@ -1683,7 +1738,20 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        recycle_frame_buffer(
+            &mut self.write_buffer,
+            payload_length,
+            &mut self.small_writes,
+        );
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
+    }
+}
+
+impl Drop for FrameCodec {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            released = true, read_capacity = 0usize, write_capacity = 0usize);
     }
 }
 
@@ -1869,6 +1937,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frame_codec_sheds_oversized_capacity_after_small_frame_without_losing_reuse() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        let mut frames = Vec::new();
+        codec.write(&mut frames, &large).unwrap();
+        assert!(codec.write_buffer.capacity() >= large.len());
+        for _ in 0..8 {
+            codec.write(&mut frames, &"small").unwrap();
+        }
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
+        let reused = codec.write_buffer.capacity();
+        codec.write(&mut Vec::new(), &"small").unwrap();
+        assert_eq!(codec.write_buffer.capacity(), reused);
+        let mut reader = Cursor::new(frames);
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), Some(large));
+        assert!(codec.read_buffer.capacity() >= 3 * 1024 * 1024);
+        for _ in 0..8 {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some("small")
+            );
+        }
+        assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn alternating_large_frames_and_acknowledgements_keep_hot_capacity_until_hidden() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        codec.write(&mut Vec::new(), &large).unwrap();
+        let hot = codec.write_buffer.capacity();
+        for _ in 0..8 {
+            codec.write(&mut Vec::new(), &"ack").unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+            codec.write(&mut Vec::new(), &large).unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+        }
+        codec.release_spare();
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
         struct TimeoutReader {
             bytes: Vec<u8>,
@@ -1909,12 +2019,14 @@ mod tests {
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         // A writer on the same connection must not overwrite a partial read.
         codec.write(&mut Vec::new(), &"outbound").unwrap();
         assert!(matches!(
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         assert_eq!(
             codec.read::<String>(&mut reader).unwrap(),
             Some("a split payload".into())

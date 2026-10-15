@@ -113,13 +113,13 @@ fn kind_glyph(content: &ItemContent) -> Icon {
 /// rather than floating above it. `copy` puts a copy control on that same
 /// header, which is where a reader looks for it and the only way to take a
 /// command's output without dragging a selection through a scrolling box.
-pub(super) fn code_surface<'a>(
-    text: &'a str,
-    caption: Option<&'a str>,
+pub(super) fn code_surface(
+    text: &str,
+    caption: Option<&str>,
     limit: Option<f32>,
     copy: Option<Action>,
     target: Target,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let body = widget::container(selectable_prose::plain(
         text,
         design::TEXT_BODY,
@@ -199,11 +199,11 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
-fn change_view(change: &FileChange) -> Element<'_, Message> {
+fn change_view(change: &FileChange) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            design::body(change.path.as_str())
+            design::body(change.path.clone())
                 .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
                 .into(),
@@ -221,7 +221,7 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
         .into()
 }
 
-fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Message> {
+fn search_result_view(result: &SearchResult, target: Target) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     let title = if result.title.is_empty() {
         result.url.as_str()
@@ -270,14 +270,14 @@ fn search_result_view(result: &SearchResult, target: Target) -> Element<'_, Mess
 }
 
 impl Runtime {
-    fn tool_code_surface<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    fn tool_code_surface(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         part: CopyPart,
-        caption: &'a str,
+        caption: &str,
         limit: Option<f32>,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let block = match part {
             CopyPart::Input => cached.tool_input.as_ref(),
             CopyPart::Change(index) => cached.patches.get(index),
@@ -303,12 +303,12 @@ impl Runtime {
                 }
             );
         code_frame(
-            match limit {
-                Some(height) if !follows => {
-                    block.view_from_start(self.syntax_theme, height, target, self.find.as_deref())
-                }
-                limit => block.view(self.syntax_theme, limit, target, self.find.as_deref()),
-            },
+            block.view_logical_with_reader(self.syntax_theme, limit.map(|height| (height, follows)), target,
+                self.find.as_deref(), selectable_prose::Logical {
+                    identity: selection::logical_identity(&item.id, &match part {
+                        CopyPart::Input => vec![4], CopyPart::Change(index) => vec![6, index as u32], _ => vec![5],
+                    }), start: 0,
+                }, self.scroll_memory.clone(), self.selected_subagent.clone()),
             Some(caption.to_owned()),
             Some(copy),
         )
@@ -329,7 +329,7 @@ impl Runtime {
     pub(super) fn step_strip<'a>(
         &self,
         turn: &turn::Turn,
-        steps: impl FnOnce() -> Vec<Element<'a, Message>>,
+        steps: impl FnOnce() -> Vec<virtualized::Row<'a>>,
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
@@ -412,10 +412,7 @@ impl Runtime {
                         }
                     }))
                     .into(),
-                widget::column::with_children(rows)
-                    .spacing(GAP_XS)
-                    .width(Length::Fill)
-                    .into(),
+                virtualized::column(rows, Default::default()),
             ])
             .spacing(RAIL_INSET)
             .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
@@ -428,12 +425,12 @@ impl Runtime {
     }
 
     /// One step: a summary line that discloses its own detail.
-    pub(super) fn step_view<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_view(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let open = self.expanded.contains(&item.id);
         let header = self.step_header(item, cached, open);
         if !open {
@@ -562,13 +559,13 @@ impl Runtime {
     /// steps that follow it.
     const OUTPUT_HEIGHT: f32 = 320.0;
 
-    pub(super) fn step_detail<'a>(
-        &'a self,
-        item: &'a chat::Item,
-        cached: &'a CachedItem,
+    pub(super) fn step_detail(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    ) -> Element<'static, Message> {
+        let mut rows: Vec<Element<'static, Message>> = Vec::new();
         // Messages a coordinating step collected read as messages, ahead of
         // the command and output they were printed in.
         if let Some(coordinated) = cached

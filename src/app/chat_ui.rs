@@ -8,7 +8,7 @@ use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
 use base64::Engine as _;
-use cosmic::widget::{markdown, text_editor};
+use cosmic::widget::text_editor;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,6 +24,7 @@ mod fold;
 mod hover;
 mod images;
 mod layout;
+mod markdown;
 mod markdown_source;
 mod monospace;
 mod permissions;
@@ -37,6 +38,7 @@ mod thumbnails;
 mod tool_text;
 mod turn;
 mod view;
+mod virtualized;
 
 pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
@@ -732,6 +734,9 @@ impl ChangeToken {
     /// The item's body when the only change since this token was taken is bytes
     /// appended to it, so the cached parse can be extended instead of redone.
     fn appended<'a>(&self, previous: &str, content: &'a ItemContent) -> Option<&'a str> {
+        self.appended_known(previous, content, false)
+    }
+    fn appended_known<'a>(&self, previous: &str, content: &'a ItemContent, proven: bool) -> Option<&'a str> {
         let ItemContent::Text {
             text,
             thinking,
@@ -744,6 +749,7 @@ impl ChangeToken {
             return None;
         }
         // `get` also rejects a rewrite that left the old length mid-character.
+        if proven { return Some(text.as_str()); }
         let parsed = text.get(..self.body)?;
         (parsed == previous).then_some(text.as_str())
     }
@@ -981,6 +987,8 @@ struct CachedItem {
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
+    reader_memory: scroll::Memory,
+    reader_context: Option<String>,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
     /// palette is the runtime's, applied when the block is highlighted, so a
@@ -1005,6 +1013,25 @@ struct CachedItem {
     coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
+    /// Approximate exposed presentation storage. Opaque Markdown/parser
+    /// allocations and widget/shaping trees are intentionally not estimated.
+    fn retained_bytes(&self) -> usize {
+        self.source.retained_capacity()
+            + self
+                .blocks
+                .values()
+                .map(prose::CodeBlock::retained_span_bytes)
+                .sum::<usize>()
+            + self.preview.retained_bytes()
+            + self
+                .tool_input
+                .iter()
+                .chain(self.tool_output.iter())
+                .chain(self.patches.iter())
+                .map(tool_text::ToolText::retained_bytes)
+                .sum::<usize>()
+    }
+
     fn next_revision() -> u64 {
         static REVISION: AtomicU64 = AtomicU64::new(1);
         REVISION.fetch_add(1, Ordering::Relaxed)
@@ -1026,6 +1053,8 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
+        let reader_memory = previous.as_ref().map(|cached| cached.reader_memory.clone()).unwrap_or_default();
+        let reader_context = previous.as_ref().and_then(|cached| cached.reader_context.clone());
         let (
             image,
             image_source,
@@ -1104,6 +1133,7 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
+            reader_memory, reader_context,
             blocks: HashMap::new(),
             open: None,
             detail: None,
@@ -1194,7 +1224,7 @@ impl CachedItem {
     /// exception is text that turned out to be something else than it was
     /// first handed over as, which is parsed again from the top.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
-        match self.source.advance(body, growing) {
+        match self.source.advance_append(body, growing) {
             markdown_source::Step::Append(text) => self.markdown.push_str(&text),
             markdown_source::Step::Restart(text) => {
                 self.markdown = markdown::Content::parse(&text);
@@ -1241,6 +1271,9 @@ impl CachedItem {
         for_each_fence(
             self.markdown.items().iter().chain(coordinated),
             &mut |language, code| {
+                // Above the syntax budget, raw bounded visible chunks are
+                // prepared by prose. Do not hash/copy the full growing fence.
+                if code.len() > Self::HIGHLIGHT_LIMIT { return; }
                 let key = fence_key(language.unwrap_or_default(), code);
                 last = Some(key);
                 if blocks.contains_key(&key) {
@@ -1292,6 +1325,7 @@ impl CachedItem {
     /// The fence whose info string is `language` and whose text is `code`,
     /// where the cache holds it.
     fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
+        if code.len() > Self::HIGHLIGHT_LIMIT { return None; }
         self.blocks
             .get(&fence_key(language.unwrap_or_default(), code))
     }
@@ -1510,6 +1544,11 @@ pub(super) struct Runtime {
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
+    presentation_revision: u64,
+    presentation_evicted: bool,
+    /// Small tail identity survives body eviction so rehydrating an unchanged
+    /// publication does not invent an unread message while scrolled back.
+    last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
     /// The palette the cache's code blocks are highlighted in.
@@ -1518,6 +1557,8 @@ pub(super) struct Runtime {
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
     selected_subagent: Option<String>,
+    observed_scroll: scroll::Observations,
+    scroll_memory: scroll::Memory,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -1585,6 +1626,8 @@ pub(super) struct Runtime {
     /// the walk goes past the newest message.
     history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
+    selection_bookmarks: std::cell::RefCell<HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>>,
+    selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -1608,6 +1651,13 @@ pub(super) struct Runtime {
     completion: completion::State,
     suggestion_dismissed: Option<(Option<String>, u64)>,
 }
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+            released = true, resident_bytes = 0usize, cache_entries = 0usize, exposed_presentation_bytes = 0usize);
+    }
+}
+
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
 pub(super) const COMPACT_COMMAND: &str = "compact";
@@ -2106,10 +2156,15 @@ impl Runtime {
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
+            presentation_revision: 0,
+            presentation_evicted: false,
+            last_presented_tail: None,
             preview_request: None,
             syntax_theme,
             turns: Vec::new(),
             selected_subagent: None,
+            observed_scroll: Default::default(),
+            scroll_memory: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2145,6 +2200,8 @@ impl Runtime {
             history: Vec::new(),
             history_cursor: None,
             history_stash: None,
+            selection_bookmarks: Default::default(),
+            selection_document: Default::default(),
             scroll: view::Scroll::default(),
             subagent_scroll: HashMap::new(),
             page_request: None,
@@ -2163,12 +2220,18 @@ impl Runtime {
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.cache.clear();
+        self.presentation_evicted = false;
+        self.last_presented_tail = None;
         self.turns.clear();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
         self.page_request = None;
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
+        self.observed_scroll.borrow_mut().clear();
+        self.scroll_memory.clear();
+        self.selection_document.get_mut().take();
+        self.selection_bookmarks.get_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
@@ -2240,6 +2303,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    pub(super) fn local_history_account_home(&self) -> Option<&crate::account::HomeIdentity> {
+        self.handle().and_then(|handle| handle.account_home())
+    }
+    pub(super) fn local_history_is_read_only(&self) -> bool {
+        self.handle().map_or(self.snapshot.exited || self.snapshot.read_only_reason.is_some(),
+            |handle| handle.local_history_is_read_only())
+    }
+    pub(super) fn has_local_history_handle(&self) -> bool {
+        self.handle().is_some()
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {
@@ -2266,139 +2340,56 @@ impl Runtime {
             .or_else(chat::now_ms)
     }
 
+    fn parent_scroll(&self) -> view::Scroll {
+        self.observed_scroll.borrow().get(&None).copied().unwrap_or(self.scroll)
+    }
     fn active_scroll(&self) -> view::Scroll {
-        match self.selected_subagent.as_ref() {
-            Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
-            None => self.scroll,
+        self.observed_scroll.borrow().get(&self.selected_subagent).copied().unwrap_or_else(|| {
+            match self.selected_subagent.as_ref() {
+                Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
+                None => self.scroll,
+            }
+        })
+    }
+    pub(super) fn memory_diagnostics(&self) -> crate::inspector::ChatMemory {
+        fn payload(item: &chat::Item) -> usize {
+            match &item.content {
+                ItemContent::Text { text, .. } => text.len(),
+                ItemContent::Command { output, .. } => output.len(),
+                ItemContent::Tool { input, output, .. } => input.len() + output.len(),
+                ItemContent::Changes { changes, .. } => changes.iter().map(|change| change.diff.len()).sum(),
+                ItemContent::Delivery { body, .. } => body.len(),
+                _ => 0,
+            }
+        }
+        crate::inspector::ChatMemory {
+            source_bytes: self.snapshot.items.iter().chain(self.snapshot.subagents.iter().flat_map(|agent| &agent.items))
+                .map(|item| payload(item)).sum(),
+            presentation_bytes: self.cache.values().map(CachedItem::retained_bytes).sum(),
+            selection_bytes: self.selection_document.borrow().as_ref().map_or(0, |(_, catalog)| catalog.retained_plain_bytes()),
+            prepared_items: self.cache.len(),
         }
     }
-    fn refresh(&mut self) {
-        self.refresh_session();
-        if !self.visible.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(handle) = self.handle() else {
-            return;
-        };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
-        if self.page_request.is_some_and(|(_, generation)| {
-            snapshot.generation > generation && !snapshot.history_loading
-        }) && self
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.page.is_none())
-        {
-            self.page_request = None;
-            self.earlier_asked = None;
-            self.later_asked = None;
-        }
-        if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
-        {
-            return;
-        }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
-            self.finished_stamp = snapshot.finished_at.and_then(|at| {
-                let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
-                let full = format!(
-                    "{:04}-{:02}-{:02} {}",
-                    time.year + 1900,
-                    time.month + 1,
-                    time.day,
-                    time.clock()
-                );
-                Some((at, format!("Finished at {}", time.clock()), full))
-            });
-        }
-        self.subagent_scroll
-            .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
-        self.settle_recalls(&snapshot);
-        self.taken_back.retain(|id| {
-            snapshot
-                .queued_messages
-                .iter()
-                .any(|message| &message.id == id)
-        });
-        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
-                });
-        }
-        if !self.scroll.at_bottom()
-            && !snapshot.has_later
-            && self.page_request.is_none()
-            && !snapshot.history_loading
-            && snapshot.items.last().is_some_and(|item| {
-                self.cache
-                    .get(&item.id)
-                    .is_none_or(|cached| cached.token != ChangeToken::of(&item.content))
-            })
-        {
-            self.unseen_activity = true;
-        }
-        // Restored and paged conversations carry their own prompt history.
-        // Preserve a recalled index while the reader is walking it.
-        if self.history_cursor.is_none() {
-            self.history = snapshot
-                .items
-                .iter()
-                .filter_map(|item| match (&item.role, &item.content) {
-                    (chat::Role::User, ItemContent::Text { text, .. })
-                        if !text.trim().is_empty() =>
-                    {
-                        Some(text.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-        }
-        let live_ids: HashSet<&str> = snapshot
-            .items
-            .iter()
-            .chain(
-                snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter()),
-            )
-            .map(|item| item.id.as_str())
-            .collect();
-        if self
-            .selected_subagent
-            .as_ref()
-            .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
-        {
-            self.selected_subagent = None;
-        }
-        self.cache.retain(|id, _| live_ids.contains(id.as_str()));
-        // Keep disclosure choices across page eviction, with a bounded budget.
-        // Question anchors only describe the currently loaded window.
-        if self.expanded.len() > 4096 {
-            self.expanded.retain(|id| live_ids.contains(id.as_str()));
-        }
-        self.asked_after.retain(|id| live_ids.contains(id.as_str()));
+
+    fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
+        let mut presentation_changed = false;
         // Each transcript has its own streaming lifecycle: a child can keep
         // running after the parent finishes. Only its newest item can grow;
         // older items release their parser and highlighter continuation.
-        let newest = snapshot.items.len().wrapping_sub(1);
-        let items = snapshot
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (item, snapshot.busy && index == newest))
-            .chain(snapshot.subagents.iter().flat_map(|agent| {
-                let newest = agent.items.len().wrapping_sub(1);
-                agent.items.iter().enumerate().map(move |(index, item)| {
-                    (
-                        item,
-                        agent.status == chat::ToolStatus::Running && index == newest,
-                    )
-                })
-            }));
-        for (item, growing) in items {
+        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy),
+            |agent| (agent.items.as_slice(), agent.status == chat::ToolStatus::Running));
+        let newest = items.len().wrapping_sub(1);
+        for (index, item) in items.iter().enumerate() {
+            let growing = busy && index == newest;
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
+            let append_proven = self.cache.get(&item.id).and_then(|cached| cached.item.as_ref())
+                .filter(|previous| !Arc::ptr_eq(previous, item))
+                .is_some_and(|previous| self.handle().is_some_and(|handle| handle.known_append(previous, item)));
             if let Some(cached) = self.cache.get_mut(&item.id) {
+                cached.reader_memory = self.scroll_memory.clone();
+                cached.reader_context.clone_from(&self.selected_subagent);
                 if matches!(item.content, ItemContent::Image { .. }) {
                     // Snapshot items are immutable. A retained Arc makes the
                     // common unchanged-item check constant-time; compare image
@@ -2417,15 +2408,18 @@ impl Runtime {
                 if unchanged {
                     cached.item = Some(item.clone());
                     if !growing {
+                        let previous_revision = cached.revision;
                         cached.settle(&item.content, self.syntax_theme);
+                        presentation_changed |= cached.revision != previous_revision;
                     }
                     continue;
                 }
                 if let Some(previous) = cached.item.as_ref()
                     && let ItemContent::Text { text, .. } = &previous.content
-                    && let Some(body) = cached.token.appended(text, &item.content)
+                    && let Some(body) = cached.token.appended_known(text, &item.content, append_proven)
                 {
                     cached.extend(body, growing, self.syntax_theme);
+                    presentation_changed = true;
                     cached.token = token;
                     cached.item = Some(item.clone());
                     continue;
@@ -2445,8 +2439,151 @@ impl Runtime {
                 cached.image_item = Some(item.clone());
             }
             cached.item = Some(item.clone());
+            cached.reader_memory = self.scroll_memory.clone();
+            cached.reader_context.clone_from(&self.selected_subagent);
             self.cache.insert(item.id.clone(), cached);
+            presentation_changed = true;
         }
+        if presentation_changed { self.presentation_revision = self.presentation_revision.wrapping_add(1); }
+    }
+
+    fn refresh(&mut self) {
+        self.refresh_session();
+        if !self.visible.load(Ordering::Relaxed) {
+            if let Some((snapshot, clock)) = self
+                .handle()
+                .and_then(|handle| handle.hidden_snapshot_with_clock())
+            {
+                self.install_snapshot(snapshot, clock);
+            }
+            return;
+        }
+        let Some(handle) = self.handle() else {
+            return;
+        };
+        let Some((snapshot, source_clock)) = handle.resident_snapshot_with_clock() else {
+            return;
+        };
+        self.install_snapshot(snapshot, source_clock);
+    }
+
+    /// Install an authoritative hydrated publication without replacing reader
+    /// interaction state. Archived conversations use the same presentation path.
+    pub(super) fn install_snapshot(
+        &mut self,
+        mut snapshot: Arc<Snapshot>,
+        source_clock: Option<chat::client::SourceClock>,
+    ) {
+        if !self.visible.load(Ordering::Relaxed) {
+            self.release_transcript_presentation();
+            Arc::make_mut(&mut snapshot).evict_transcript();
+            self.snapshot = snapshot;
+            self.source_clock = source_clock;
+            return;
+        }
+        if self.page_request.is_some_and(|(_, generation)| {
+            snapshot.generation > generation && !snapshot.history_loading
+        }) && self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.page.is_none())
+        {
+            self.page_request = None;
+            self.earlier_asked = None;
+            self.later_asked = None;
+        }
+        let selected_items = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id))
+            .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
+        if !self.presentation_evicted && self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
+            && selected_items.iter().all(|item| self.cache.contains_key(&item.id))
+        {
+            return;
+        }
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+            self.finished_stamp = snapshot.finished_at.and_then(|at| {
+                let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
+                let full = format!(
+                    "{:04}-{:02}-{:02} {}",
+                    time.year + 1900,
+                    time.month + 1,
+                    time.day,
+                    time.clock()
+                );
+                Some((at, format!("Finished at {}", time.clock()), full))
+            });
+        }
+        self.subagent_scroll
+            .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
+        self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.selection_bookmarks.get_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.scroll_memory.retain_children(&snapshot.subagents);
+        self.settle_recalls(&snapshot);
+        self.taken_back.retain(|id| {
+            snapshot
+                .queued_messages
+                .iter()
+                .any(|message| &message.id == id)
+        });
+        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
+            Arc::make_mut(&mut snapshot).permission_mode =
+                self.snapshot.permission_mode.clone().or_else(|| {
+                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                });
+        }
+        if !self.parent_scroll().at_bottom()
+            && !snapshot.has_later
+            && self.page_request.is_none()
+            && !snapshot.history_loading
+            && snapshot.items.last().is_some_and(|item| {
+                let token = ChangeToken::of(&item.content);
+                self.cache.get(&item.id).map_or_else(
+                    || {
+                        self.last_presented_tail
+                            .as_ref()
+                            .is_none_or(|(id, previous)| id != &item.id || *previous != token)
+                    },
+                    |cached| cached.token != token,
+                )
+            })
+        {
+            self.unseen_activity = true;
+        }
+        // Restored and paged conversations carry their own prompt history.
+        // Preserve a recalled index while the reader is walking it.
+        if self.history_cursor.is_none() {
+            let mut count = 0;
+            for text in snapshot.items.iter().filter_map(|item| match (&item.role, &item.content) {
+                (chat::Role::User, ItemContent::Text { text, .. }) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            }) {
+                if let Some(previous) = self.history.get_mut(count) {
+                    if previous != text { previous.clone_from(text); }
+                } else { self.history.push(text.clone()); }
+                count += 1;
+            }
+            self.history.truncate(count);
+        }
+        if self.selected_subagent.as_ref().is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id)) {
+            self.selected_subagent = None;
+        }
+        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let previous_selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let same_ids = |old: &[Arc<chat::Item>], new: &[Arc<chat::Item>]| old.len() == new.len()
+            && old.iter().zip(new).all(|(old, new)| old.id == new.id);
+        if !same_ids(&self.snapshot.items, &snapshot.items)
+            || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
+            self.cache.retain(|id, _| selected.map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice()).iter().any(|item| &item.id == id));
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        }
+        // Rare disclosure-budget pruning can inspect all raw identities;
+        // ordinary streaming refreshes need no newly allocated ID HashSet.
+        if self.expanded.len() > 4096 {
+            let live_ids: HashSet<_> = snapshot.items.iter().chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
+                .map(|item| item.id.as_str()).collect();
+            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        }
+        self.asked_after.retain(|id| snapshot.items.iter().any(|item| &item.id == id));
+        self.prepare_transcript_cache(&snapshot);
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
         for item in snapshot.items.iter() {
@@ -2507,26 +2644,23 @@ impl Runtime {
         // late; that costs a step its group, never the disclosure state of one.
         self.asked
             .retain(|id| snapshot.requests.iter().any(|request| &request.id == id));
+        let mut grouping_dirty = false;
         for request in &snapshot.requests {
             if self.asked.insert(request.id.clone())
                 && let Some(last) = snapshot.items.last()
             {
-                self.asked_after.insert(last.id.clone());
+                grouping_dirty |= self.asked_after.insert(last.id.clone());
             }
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
-        let turns = turn::group(&snapshot.items, &self.asked_after, |item| {
-            cache.get(&item.id)?.coordination.as_deref()
+        let turns = (grouping_dirty || !turn::same_structure(&self.snapshot.items, &snapshot.items)).then(|| {
+            turn::group(&snapshot.items, &self.asked_after, |item| cache.get(&item.id)?.coordination.as_deref())
         });
-        carry_step_disclosures(
-            &mut self.opened,
-            &mut self.find_disclosure,
-            &self.turns,
-            &self.snapshot.items,
-            &turns,
-            &snapshot.items,
-        );
+        if let Some(turns) = &turns {
+            carry_step_disclosures(&mut self.opened, &mut self.find_disclosure,
+                &self.turns, &self.snapshot.items, turns, &snapshot.items);
+        }
         let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
         if self
             .snapshot
@@ -2540,15 +2674,17 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && current_anchor == turns.last().map(|turn| turn.key.as_str())
+            && current_anchor == turns.as_deref().unwrap_or(&self.turns).last().map(|turn| turn.key.as_str())
         {
             let provider = self.session.launch.provider;
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
         }
-        self.turns = turns;
-        reconcile_disclosure(&mut self.opened, &self.turns);
+        if let Some(turns) = turns {
+            self.turns = turns;
+            reconcile_disclosure(&mut self.opened, &self.turns);
+        }
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
@@ -2558,7 +2694,13 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
+        self.last_presented_tail = snapshot
+            .items
+            .last()
+            .map(|item| (item.id.clone(), ChangeToken::of(&item.content)));
         self.snapshot = snapshot;
+        self.presentation_evicted = false;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id, resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
         images::sync(self);
         self.refresh_find();
     }
@@ -2621,21 +2763,78 @@ impl Runtime {
             });
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
-        self.visible.store(visible, Ordering::Relaxed);
+        let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
         images::sync(self);
-        self.present()
+        let result = self.present();
+        if visible {
+            if changed {
+                self.refresh();
+            }
+        } else if result.is_ok()
+            && self.handle().is_some()
+            && (changed
+                || !self.cache.is_empty()
+                || !self.snapshot.items.is_empty()
+                || self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .any(|child| !child.items.is_empty()))
+        {
+            self.release_transcript_presentation();
+        } else if !visible && self.handle().is_some()
+            && (!self.cache.is_empty() || self.selection_document.borrow().is_some()) {
+            // An unreachable daemon cannot restore its body yet. Keep that
+            // last readable publication, but shed render-ready amplification.
+            self.release_transcript_caches();
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+                resident_bytes = self.snapshot.transcript_bytes(), cache_entries = 0usize,
+                exposed_presentation_bytes = 0usize);
+        }
+        result
     }
+    fn release_transcript_caches(&mut self) {
+        self.cache = HashMap::new();
+        self.selection_document.get_mut().take();
+        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        self.presentation_evicted = true;
+    }
+
+    /// Explicit account/history deletion invalidates both the visible reader
+    /// and its private offline fallback. Ordinary archive/move never calls it.
+    pub(super) fn revoke_local_history(&mut self) {
+        if let Some(handle) = self.handle() { handle.revoke_local_history(); }
+        self.release_transcript_presentation();
+        self.history = Vec::new();
+        self.history_cursor = None;
+    }
+
+    /// Evict disposable body/presentation owners while keeping the small
+    /// interaction state needed by either a live or archived rehydration.
+    pub(super) fn release_transcript_presentation(&mut self) {
+        let bytes = self.snapshot.transcript_bytes();
+        let cache_entries = self.cache.len();
+        self.release_transcript_caches();
+        Arc::make_mut(&mut self.snapshot).evict_transcript();
+        if self.history_cursor.is_none() {
+            self.history = Vec::new();
+        }
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+            resident_bytes = 0usize, cache_entries = 0usize, evicted_bytes = bytes,
+            evicted_cache_entries = cache_entries, exposed_presentation_bytes = 0usize);
+    }
+
     /// Tells the connection whether to keep the card's snapshot current.
     ///
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     fn present(&self) -> Result<(), String> {
-        let visible = self.visible.load(Ordering::Relaxed)
-            || self.queued.is_some()
-            || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        let retain_body = self.visible.load(Ordering::Relaxed);
+        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        self.handle().map_or(Ok(()), |handle| {
+            handle.set_interest(interested, retain_body)
+        })
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -5397,6 +5596,8 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         let selection = None;
+        let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            && self.workspace_surfaces_visible();
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -5425,7 +5626,15 @@ impl Cagents {
                                 let _ = sender.try_send((target, wake));
                             },
                         )
-                        .map(Arc::new)
+                        .map(|handle| {
+                            // Background restorations must not queue full bodies
+                            // in Ready messages while the UI processes other panes.
+                            // Ready rechecks actual visibility before rendering.
+                            if !initially_visible {
+                                let _ = handle.set_visible(false);
+                            }
+                            Arc::new(handle)
+                        })
                     },
                 )))
             })
@@ -5725,13 +5934,9 @@ impl Cagents {
             (QueuedStep::Prompt, Err(error)) => {
                 // The conversation is new, so a message of the reader's in
                 // it can only be this one.
-                let arrived = runtime.handle().is_some_and(|handle| {
-                    handle
-                        .snapshot()
-                        .items
-                        .iter()
-                        .any(|item| item.role == chat::Role::User)
-                });
+                let arrived = runtime
+                    .handle()
+                    .is_some_and(|handle| handle.has_observed_user_item());
                 if !arrived {
                     return self.revert_chat_draft(target, Some(error));
                 }
@@ -5849,8 +6054,8 @@ impl Cagents {
         match page {
             HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
             HistoryNavigation::NewerEdge
-                if runtime.scroll.at_bottom()
-                    && !runtime.scroll.at_top()
+                if runtime.parent_scroll().at_bottom()
+                    && !runtime.parent_scroll().at_top()
                     && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
@@ -5859,8 +6064,8 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.scroll.at_top()
-                    && !runtime.scroll.at_bottom()
+                if runtime.parent_scroll().at_top()
+                    && !runtime.parent_scroll().at_bottom()
                     && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
@@ -5948,9 +6153,9 @@ impl Cagents {
         if let Some(page) = page {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
-                view::Page::Earlier => runtime.earlier_asked = Some(runtime.scroll.content()),
+                view::Page::Earlier => runtime.earlier_asked = Some(runtime.parent_scroll().content()),
                 view::Page::Newer | view::Page::Latest => {
-                    runtime.later_asked = Some(runtime.scroll.content())
+                    runtime.later_asked = Some(runtime.parent_scroll().content())
                 }
             }
         }
@@ -6579,7 +6784,8 @@ impl Cagents {
                         };
                         handle.take_observed();
                         let visible = self.workspace.visibility(target.card)
-                            == Some(VisibilityClass::Visible);
+                            == Some(VisibilityClass::Visible)
+                            && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
@@ -8042,14 +8248,19 @@ impl Cagents {
             }
             Action::SelectSubagent(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.selected_subagent = id.filter(|id| {
+                    let selected = id.filter(|id| {
                         runtime
                             .snapshot
                             .subagents
                             .iter()
                             .any(|agent| &agent.id == id)
                     });
+                    if runtime.selected_subagent != selected { runtime.cache.clear(); }
+                    runtime.selected_subagent = selected;
                     runtime.deferred_page = None;
+                    runtime.selection_document.get_mut().take();
+                    let snapshot = runtime.snapshot.clone();
+                    runtime.prepare_transcript_cache(&snapshot);
                     images::sync(runtime);
                 }
             }
@@ -10279,6 +10490,38 @@ mod tests {
     }
 
     #[test]
+    fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("lazy-child-cache"));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let children = (0..5).map(|index| chat::Subagent {
+            id: format!("child-{index}"), kind: "fixture".into(), description: "Lazy child".into(),
+            status: chat::ToolStatus::Running, background: true, model: None, waiting: false, detail: String::new(),
+            items: vec![Arc::new(chat::Item { id: format!("body-{index}"), role: chat::Role::Assistant,
+                content: text(&"source ".repeat(20000)), started_at: None, at: None })],
+        }).collect();
+        handle.publish_snapshot_for_test(Snapshot { generation: 20, ready: true, subagents: children,
+            items: vec![Arc::new(chat::Item { id: "body-2".into(), role: chat::Role::Assistant,
+                content: text("Parent source"), started_at: None, at: None })], ..Snapshot::default() });
+        let runtime = app.chat_runtime_mut(target).unwrap(); runtime.visible.store(true, Ordering::Relaxed); runtime.refresh();
+        assert_eq!(runtime.cache.len(), 1, "only parent source is prepared before child selection");
+        assert!(runtime.cache["body-2"].markdown.items().len() > 0);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-2".into()))));
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(chat_runtime(&app, card).cache.contains_key("body-2"));
+        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text.len() > 10000), "identical parent/child provider IDs cannot reuse the wrong scope");
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-3".into()))));
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(chat_runtime(&app, card).cache.contains_key("body-3"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text == "Parent source"));
+    }
+
+    #[test]
     fn streaming_children_keep_only_their_newest_fence_live_after_parent_completion() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("streaming-children"));
@@ -10331,6 +10574,7 @@ mod tests {
             runtime.visible.store(true, Ordering::Relaxed);
             runtime.refresh();
         };
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("running-child".into());
         publish(&mut app, &snapshot);
         let runtime = chat_runtime(&app, card);
         assert!(
@@ -10338,7 +10582,7 @@ mod tests {
             "an idle parent must not retire its running child's fence"
         );
         assert!(runtime.cache["parent"].open.is_none());
-        assert!(runtime.cache["finished"].open.is_none());
+        assert!(!runtime.cache.contains_key("finished"), "hidden child presentation is not prepared");
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
@@ -10469,6 +10713,7 @@ mod tests {
                 runtime.visible.store(true, Ordering::Relaxed);
                 runtime.refresh();
             };
+            app.chat_runtime_mut(target).unwrap().selected_subagent = Some("child".into());
             publish(&mut app, &snapshot);
             assert!(
                 chat_runtime(&app, card).cache["unfinished"]
@@ -13162,6 +13407,185 @@ mod tests {
     }
 
     #[test]
+    fn parked_hidden_eof_reveal_restores_cached_history_without_losing_draft_or_scroll() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        show_chat_snapshot_for_test(&mut app, card, Snapshot {
+            generation: 19, session_id: Some(KNOWN_THREAD.into()), ready: true,
+            items: vec![Arc::new(chat::Item { id: "parked-body".into(), role: chat::Role::Assistant,
+                content: text("History from before the connection ended"), started_at: None, at: None })],
+            ..Default::default()
+        });
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("Unsent while parked"));
+        runtime.scroll = view::Scroll::new(120.0, 800.0, 400.0);
+        let saved_scroll = runtime.scroll;
+        let handle = runtime.handle().unwrap().clone();
+        runtime.set_visible(false).unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat"); };
+        app.chat_ui.parked.insert(card, runtime);
+        // The client test separately drives real Unix socket EOF. Here its
+        // disconnected publication enters the actual parked-runtime handler.
+        handle.disconnect_for_test();
+        drop(app.handle_chat_action(Action::Wake(target, Wake::Disconnected("fixture EOF".into()))));
+        let mut runtime = app.chat_ui.parked.remove(&card).unwrap();
+        assert!(runtime.disconnected);
+        runtime.set_visible(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.resident_snapshot_with_clock().is_none() {
+            assert!(std::time::Instant::now() < deadline, "parked view did not rehydrate");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        runtime.refresh();
+        assert_eq!(runtime.snapshot.generation, 19);
+        assert!(runtime.snapshot.transcript_bytes() > 0);
+        assert!(runtime.snapshot.read_only_reason.is_some());
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent while parked");
+        assert_eq!(runtime.scroll, saved_scroll);
+        assert!(runtime.disconnected, "cached text never grants send authority");
+        runtime.revoke_local_history();
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert!(runtime.cache.is_empty());
+    }
+
+    #[test]
+    fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let snapshot = || Snapshot {
+            generation: 17,
+            session_id: Some(KNOWN_THREAD.into()),
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: "parent".into(),
+                role: chat::Role::Assistant,
+                content: text(&format!(
+                    "```rust\n{}\n```",
+                    "let value = 123;\n".repeat(4096)
+                )),
+                started_at: None,
+                at: None,
+            })],
+            subagents: vec![chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(chat::Item {
+                    id: "child-item".into(),
+                    role: chat::Role::Assistant,
+                    content: text(&"child words\n".repeat(4096)),
+                    started_at: None,
+                    at: None,
+                })],
+            }],
+            ..Snapshot::default()
+        };
+        let first = snapshot();
+        let parent = Arc::downgrade(&first.items[0]);
+        let child = Arc::downgrade(&first.subagents[0].items[0]);
+        show_chat_snapshot_for_test(&mut app, card, first);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let handle = runtime.handle().unwrap().clone();
+        runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
+        runtime.selected_subagent = Some("child".into());
+        let plain: Arc<str> = Arc::from("Rendered selected child words\n".repeat(4096));
+        let weak_plain = Arc::downgrade(&plain);
+        let mut document = selection::Catalog::builder();
+        document.plain("child-item", &[0], plain);
+        let document = document.finish();
+        let weak_document = Arc::downgrade(&document);
+        let (anchor, end) = document.endpoints().unwrap();
+        let bookmark = std::rc::Rc::new(std::cell::RefCell::new(selection::Bookmark {
+            anchor: Some(anchor), end: Some(end),
+            anchor_prefix: document.fingerprint(anchor), end_prefix: document.fingerprint(end),
+        }));
+        runtime.selection_document.get_mut().replace((99, document));
+        runtime.selection_bookmarks.get_mut().insert(Some("child".into()), bookmark.clone());
+        runtime.scroll = view::Scroll::new(200.0, 1000.0, 400.0);
+        runtime
+            .subagent_scroll
+            .insert("child".into(), view::Scroll::new(75.0, 900.0, 400.0));
+        runtime.expanded.insert("parent".into());
+        let scroll = runtime.scroll;
+        let child_scroll = runtime.subagent_scroll.clone();
+        let turns = runtime
+            .turns
+            .iter()
+            .map(|turn| turn.key.clone())
+            .collect::<Vec<_>>();
+        runtime.unseen_activity = false;
+        assert!(!runtime.cache.is_empty());
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.cache.is_empty());
+        assert!(runtime.selection_document.borrow().is_none());
+        assert!(weak_document.upgrade().is_none(), "the logical selection catalog must be released");
+        assert!(weak_plain.upgrade().is_none(), "selection must not retain hidden rendered text");
+        assert!(std::rc::Rc::ptr_eq(&runtime.selection_bookmarks.borrow()[&Some("child".into())], &bookmark));
+        assert_eq!(bookmark.borrow().anchor, Some(anchor));
+        assert_eq!(bookmark.borrow().end, Some(end));
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while parent.upgrade().is_some() || child.upgrade().is_some() {
+            assert!(std::time::Instant::now() < deadline, "offline spill must release queued raw owners");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            parent.upgrade().is_none(),
+            "client, runtime and presentation must all release the parent body"
+        );
+        assert!(
+            child.upgrade().is_none(),
+            "unselected child bodies must be released too"
+        );
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert_eq!(runtime.scroll, scroll);
+        assert_eq!(runtime.subagent_scroll, child_scroll);
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+        runtime.set_visible(true).unwrap();
+        assert!(runtime.cache.is_empty(), "reveal waits for an authoritative body");
+        // The daemon answers the unconditional read at the same generation.
+        handle.replace_snapshot_for_test(snapshot());
+        runtime.refresh();
+        assert!(runtime.snapshot.transcript_bytes() > 0);
+        assert!(!runtime.cache.is_empty());
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert_eq!(runtime.scroll, scroll);
+        assert_eq!(runtime.subagent_scroll, child_scroll);
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+        assert!(runtime.expanded.contains("parent"));
+        assert_eq!(
+            runtime
+                .turns
+                .iter()
+                .map(|turn| turn.key.clone())
+                .collect::<Vec<_>>(),
+            turns
+        );
+        assert!(
+            !runtime.unseen_activity,
+            "unchanged rehydration must not invent new activity"
+        );
+        let mut changed = snapshot();
+        changed.generation += 1;
+        Arc::make_mut(&mut changed.items[0]).content = text("new live tail");
+        handle.replace_snapshot_for_test(changed);
+        runtime.refresh();
+        assert!(
+            runtime.unseen_activity,
+            "new tail content still signals unread activity"
+        );
+    }
+
+    #[test]
     fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -15564,11 +15988,31 @@ mod tests {
 
         handle.replace_snapshot_for_test(Snapshot {
             ready: true,
+            items: vec![
+                chat::Item {
+                    id: "provider-introduction".into(),
+                    role: chat::Role::Assistant,
+                    content: text(&"hidden body".repeat(64 * 1024)),
+                    started_at: None,
+                    at: None,
+                }
+                .into(),
+            ],
             ..Snapshot::default()
         });
+        assert_eq!(
+            handle.snapshot().transcript_bytes(),
+            0,
+            "control polling does not retain hidden history"
+        );
         let target = chat_runtime(&app, card).target;
         let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
         assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        assert!(
+            chat_runtime(&app, card).snapshot.ready,
+            "hidden runtime receives ready metadata"
+        );
+        assert_eq!(chat_runtime(&app, card).snapshot.transcript_bytes(), 0);
         settle(&mut app, card, Ok(()));
         assert!(
             !handle.is_visible_for_test(),
@@ -15631,6 +16075,7 @@ mod tests {
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, None);
         answer_start(&mut app, target, Ok(handle.clone()));
+        let _ = app.chat_runtime_mut(target).unwrap().set_visible(false);
         handle.replace_snapshot_for_test(Snapshot {
             ready: true,
             items: vec![
@@ -15645,6 +16090,14 @@ mod tests {
             ],
             ..Snapshot::default()
         });
+        assert!(
+            handle.snapshot().items.is_empty(),
+            "the hidden body was actually evicted"
+        );
+        assert!(
+            handle.has_observed_user_item(),
+            "receipt evidence retains no prompt text"
+        );
         settle(
             &mut app,
             card,

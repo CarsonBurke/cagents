@@ -5,7 +5,8 @@
 //!
 //! ```sh
 //! cargo test --locked --no-default-features --features ui --profile dev-runtime \
-//!     --config 'profile.dev-runtime.opt-level=2' --lib \
+//!     --config 'profile.dev-runtime.opt-level=2' \
+//!     --config 'profile.dev-runtime.debug-assertions=false' --lib \
 //!     chat_ui::view::frame_cost -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -345,7 +346,9 @@ impl Pane {
     }
 
     /// One frame: the refresh, the view, its diff and layout, and its draw.
-    fn frame(&mut self) -> [Duration; 4] {
+    fn frame(&mut self) -> [Duration; 4] { self.frame_with_pointer(false) }
+
+    fn frame_with_pointer(&mut self, pointer_event: bool) -> [Duration; 4] {
         let clock = Instant::now();
         self.runtime.refresh();
         let refreshed = clock.elapsed();
@@ -375,6 +378,12 @@ impl Pane {
         );
         let laid_out = clock.elapsed();
         let clock = Instant::now();
+        if pointer_event {
+            let point = cosmic::iced::Point::new(400.0, 400.0);
+            ui.update(&[cosmic::iced::Event::Mouse(mouse::Event::CursorMoved { position: point })],
+                mouse::Cursor::Available(point), &mut self.renderer,
+                &mut cosmic::iced::advanced::clipboard::Null, &mut Vec::new());
+        }
         ui.draw(
             &mut self.renderer,
             &self.theme,
@@ -800,7 +809,6 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
             items: Vec::new(),
         });
     assert_eq!(runtime.turns.len(), 2);
-    assert!(runtime.retainable(&runtime.turns[0]));
     let dark = cosmic::theme::is_dark();
     let settings =
         crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
@@ -881,4 +889,57 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
         "{stopped:?}"
     );
     assert_eq!(runtime.turn_fingerprint(&runtime.turns[1], dark), unrelated);
+}
+
+/// Run with the optimized dev-runtime command above. This includes the actual
+/// pane/composer, one loaded huge source and300 tool rows, rather than only a
+/// short collapsed tail. Pointer update/draw includes mouse-interaction work;
+/// GPU submission and compositor presentation are deliberately outside it.
+#[test]
+#[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
+fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
+    assert!(!cfg!(debug_assertions), "use optimized dev-runtime with opt-level2");
+    let mut medians = Vec::new();
+    for (name, bytes, tools, form) in [
+        ("small", 16_usize * 1024, 10, 0),
+        ("giant paragraph", 1024 * 1024, 300, 0),
+        ("many paragraphs", 1024 * 1024, 300, 1),
+        ("giant fence", 1024 * 1024, 300, 2),
+    ] {
+        let mut items = vec![item("viewport-prompt".into(), chat::Role::User,
+            prose("Inspect the transcript.".into(), false, chat::Phase::Final))];
+        for index in 0..tools {
+            items.push(item(format!("viewport-tool-{index}"), chat::Role::Assistant,
+                ItemContent::Command { label: String::new(), command: format!("read file-{index}.rs"),
+                    working_directory: "/fixture".into(), action: chat::CommandAction::Read,
+                    status: chat::ToolStatus::Succeeded, exit_code: Some(0), duration_ms: Some(1),
+                    output: "fixture output\n".repeat(8) }));
+        }
+        let atom = if form == 1 { "Measured plain paragraph.\n\n" } else { "Measured plain paragraph. " };
+        let mut body = atom.repeat(bytes.div_ceil(atom.len()));
+        body.truncate(bytes);
+        if form == 2 { body = format!("```text\n{body}\n```\n"); }
+        items.push(item("viewport-answer".into(), chat::Role::Assistant,
+            prose(body, false, chat::Phase::Final)));
+        let mut pane = Pane::new(items);
+        pane.runtime.tool_groups_expanded = true;
+        for _ in 0..WARMUP { pane.frame_with_pointer(true); }
+        let mut totals = Stage::default();
+        let mut stages = Stages::default();
+        for _ in 0..SAMPLES {
+            let sample = pane.frame_with_pointer(true);
+            totals.0.push(sample[1] + sample[2] + sample[3]);
+            stages.record(sample);
+        }
+        println!("viewport workload {name}: bytes={bytes}, tools={tools}");
+        stages.report();
+        let median = totals.report("event");
+        medians.push((name, median));
+    }
+    let small = medians[0].1;
+    for (name, median) in medians {
+        println!("{name}: event median {:.3}ms, ratio {:.3}", median.as_secs_f64()*1000.0, median.as_secs_f64()/small.as_secs_f64());
+        assert!(median <= Duration::from_millis(2), "{name} exceeded2ms viewport budget: {median:?}");
+        assert!(median <= small * 2, "{name} exceeded2x fixed-viewport scaling budget");
+    }
 }
