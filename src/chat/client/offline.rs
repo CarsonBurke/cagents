@@ -261,7 +261,8 @@ impl State {
             self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             self.trace();
             let result = file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string()).and_then(|_| {
-                serde_json::from_reader::<_, Snapshot>(BufReader::with_capacity(BUFFER, file.take(ipc::MAX_FRAME_BYTES as u64 + 1)))
+                let checked = CheckedReader { state: self, epoch, request, file: file.take(ipc::MAX_FRAME_BYTES as u64 + 1) };
+                serde_json::from_reader::<_, Snapshot>(BufReader::with_capacity(BUFFER, checked))
                     .map(|snapshot| (Arc::new(snapshot), record_epoch, clock)).map_err(|e| e.to_string())
             });
             self.buffer_bytes.store(0, Ordering::Release);
@@ -332,6 +333,22 @@ struct CheckedWriter<'a> {
     state: &'a State,
     epoch: u64,
     file: &'a mut File,
+}
+struct CheckedReader<'a> {
+    state: &'a State,
+    epoch: u64,
+    request: u64,
+    file: std::io::Take<File>,
+}
+impl Read for CheckedReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let data = self.state.data.lock().unwrap_or_else(|p| p.into_inner());
+        if data.revoked || data.epoch != self.epoch || data.request != self.request || !data.requested_show {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Cached view read was revoked or replaced"));
+        }
+        drop(data);
+        self.file.read(bytes)
+    }
 }
 impl Write for CheckedWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
