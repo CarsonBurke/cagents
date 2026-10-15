@@ -2064,6 +2064,10 @@ where
                 use std::os::unix::process::CommandExt;
                 let mut command =
                     Command::new(bin.join(crate::companion::Product::Cli.file_name()));
+                // Carry implicit stop/environment policy into the matched CLI.
+                // An older owner that lacks this flag must refuse parsing
+                // rather than recover/start services before handling the read.
+                if no_start && !cli.no_start { command.arg("--no-start"); }
                 command.args(&arguments[1..]);
                 crate::install_guard::sanitize_child_environment(&mut command);
                 let error = command.exec();
