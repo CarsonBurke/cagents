@@ -357,18 +357,39 @@ mod tests {
     }
     #[test]
     fn cleanup_context_capacity_stays_charged_until_guard_destructor_finishes() {
-        struct Guard { started: std::sync::mpsc::Sender<()>, release: Arc<std::sync::Barrier> }
-        impl Drop for Guard { fn drop(&mut self) { self.started.send(()).unwrap(); self.release.wait(); } }
+        struct Guard {
+            started: std::sync::mpsc::Sender<()>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.wait();
+            }
+        }
         let budget = Arc::new(Mutex::new(ContextUsage::default()));
-        let (started, signal) = std::sync::mpsc::channel(); let release = Arc::new(std::sync::Barrier::new(2));
-        let context = RecoveryContext::from_budget(Guard { started, release: release.clone() }, 128, budget.clone()).unwrap();
+        let (started, signal) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let context = RecoveryContext::from_budget(
+            Guard {
+                started,
+                release: release.clone(),
+            },
+            128,
+            budget.clone(),
+        )
+        .unwrap();
         let cleanup = std::thread::spawn(move || drop(context));
-        signal.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        signal
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(RecoveryContext::from_budget((), 1, budget.clone()).is_err());
         assert_eq!(budget.lock().unwrap().descriptors, 128);
-        release.wait(); cleanup.join().unwrap();
+        release.wait();
+        cleanup.join().unwrap();
         let replacement = RecoveryContext::from_budget((), 128, budget.clone()).unwrap();
-        drop(replacement); assert_eq!(budget.lock().unwrap().descriptors, 0);
+        drop(replacement);
+        assert_eq!(budget.lock().unwrap().descriptors, 0);
     }
 
     #[test]
