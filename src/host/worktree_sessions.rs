@@ -434,6 +434,64 @@ mod tests {
         let handle=chat::runtime::Handle::start(spec,Box::new(History),initial,store,None,|_|{}).unwrap();
         super::super::chat::Record { execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,session,handle,source_process:None,subscribers:BTreeMap::new(),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false }
     }
+    fn live_record(directory:PathBuf)->super::super::chat::Record {
+        struct Live;
+        impl chat::protocol::Adapter for Live {
+            fn initialize(&mut self)->Result<chat::protocol::Step,String>{Ok(Default::default())}
+            fn command(&mut self,_:chat::Command)->Result<chat::protocol::Step,String>{Ok(Default::default())}
+            fn receive(&mut self,_:serde_json::Value)->Result<chat::protocol::Step,String>{Ok(Default::default())}
+        }
+        let session=starting_session(directory.clone());
+        let context=std::sync::Arc::new(chat::protocol::ExecutionContext::new(Some(std::sync::Arc::new(std::fs::File::open(&directory).unwrap()))));
+        context.observe_provider_directory(&directory).unwrap();
+        let spec=chat::protocol::ProcessSpec {execution:Some(context),messages:None,unset_environment:Default::default(),transport:chat::protocol::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory,environment:BTreeMap::new()};
+        let mut initial=chat::protocol::Step {events:vec![chat::Event::Ready(true),chat::Event::TurnStarted],..Default::default()};
+        let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let handle=chat::runtime::Handle::start(spec,Box::new(Live),initial,store,None,|_|{}).unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+        while !handle.close_observation().ready {assert!(std::time::Instant::now()<deadline);std::thread::yield_now();}
+        super::super::chat::Record {execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,session,handle,source_process:None,subscribers:BTreeMap::new(),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false}
+    }
+    fn repository_fixture()->tempfile::TempDir {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        assert!(std::process::Command::new("git").args(["init","--quiet"]).arg(root.path()).status().unwrap().success());
+        root
+    }
+    #[test]
+    fn stopped_actor_cannot_retire_a_same_id_replacement_after_gate_release() {
+        let root=repository_fixture();let host=host();let record=live_record(root.path().into());
+        let id=record.session.id;let original=record.handle.clone();host.lock().unwrap().chats.insert(id,record);
+        let actors=census(&host,root.path()).unwrap();
+        let consent=SessionStopConsent {sessions:session_identities(&actors)};
+        let mut wrong=consent.clone();wrong.sessions[0].instance=uuid::Uuid::new_v4();
+        assert!(prepare_stop(&host,root.path(),root.path(),&wrong).is_err());
+        assert!(!original.close_observation().closing);
+        let mut pending=prepare_stop(&host,root.path(),root.path(),&consent).unwrap();
+        pending.cleanup().unwrap();
+        assert!(original.is_completed());
+        assert!(host.lock().unwrap().chats.contains_key(&id),"cleanup alone must not remove the record before source-matched retirement");
+        let mut replacement=live_record(root.path().into());replacement.session.id=id;let next=replacement.handle.clone();
+        host.lock().unwrap().chats.insert(id,replacement);
+        assert!(pending.commit(&host).is_err(),"replacement must refuse before touching durable retirement");
+        assert!(host.lock().unwrap().chats.get(&id).unwrap().handle.same_actor(&next));
+        assert!(!next.close_observation().closing,"the new owner must remain live");
+        next.close_until(std::time::Instant::now()+std::time::Duration::from_secs(5)).unwrap();
+    }
+    #[test]
+    fn stop_cleanup_timeout_preserves_the_exact_record_for_retry() {
+        let root=repository_fixture();let host=host();let record=live_record(root.path().into());
+        let id=record.session.id;let original=record.handle.clone();host.lock().unwrap().chats.insert(id,record);
+        let consent=SessionStopConsent {sessions:session_identities(&census(&host,root.path()).unwrap())};
+        let mut pending=prepare_stop(&host,root.path(),root.path(),&consent).unwrap();
+        pending.deadline=std::time::Instant::now();
+        assert!(pending.cleanup().is_err(),"an expired cleanup budget must not become success");
+        assert!(host.lock().unwrap().chats.get(&id).unwrap().handle.same_actor(&original));
+        original.close_until(std::time::Instant::now()+std::time::Duration::from_secs(5)).unwrap();
+        assert!(original.is_completed());
+        let retry=prepare_stop(&host,root.path(),root.path(),&consent);
+        assert!(retry.is_ok(),"completed source-matched cleanup must remain retryable without discarding its record");
+    }
+
     #[test]
     fn unscoped_history_is_preserved_without_blocking_unrelated_live_census() {
         let selected=tempfile::tempdir_in("/var/tmp").unwrap();

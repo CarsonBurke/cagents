@@ -328,9 +328,9 @@ impl TerminalSessionStop {
         if !self.handle.join_worker_until(deadline,true) {
             return Err("Terminal stop cleanup exceeded its deadline; its exact owner remains retained".into());
         }
-        if !self.handle.is_completed() {
-            return Err("Terminal stop cleanup has not been confirmed".into());
-        }
+        // A retained holder can supply independent family-cleanup proof even
+        // when the worker could not publish a confirmed root exit. Let that
+        // exact owner reconcile before requiring completed=true.
         self.handle.release_completed_holder_until(deadline)
 
     }
