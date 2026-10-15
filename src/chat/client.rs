@@ -1672,7 +1672,7 @@ mod tests {
             if mismatch == "none" {
                 let handle = match outcome {
                     Ok(handle) => handle,
-                    Err(error) => panic!("{error}"),
+                    Err(error) => panic!("{}", error.message),
                 };
                 assert_eq!(
                     handle.session().launch.recipe.program,

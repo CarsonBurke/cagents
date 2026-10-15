@@ -13568,7 +13568,7 @@ mod tests {
 
     #[test]
     fn settings_configured_draft_restores_typed_choices_and_discards_them_on_issued_adoption() {
-        use crate::persistence::{SaveLane, StateStore};
+        use crate::persistence::{SnapshotBase, StateStore};
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("configured-drafts.sqlite3");
         let boot = crate::model::BootId::new("configured-draft-ui");
@@ -13604,8 +13604,15 @@ mod tests {
         assert_eq!(expected.permission_mode.as_deref(), Some("manual"));
         assert_eq!(expected.account, Account::system(Provider::Claude).id());
         assert!(expected.automatic);
-        let mut lane = SaveLane::default();
-        lane.save(&store, &saved).unwrap();
+        store
+            .save_workspace(
+                &saved,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
         let reopened = StateStore::open(&database, boot).unwrap();
         let restored = reopened.load_workspace(saved.id, None).unwrap().unwrap();
         assert_eq!(restored.configured_chat_drafts[&card], expected);
@@ -13891,7 +13898,7 @@ mod tests {
             panic!("actual start worker refusal")
         };
         assert!(
-            matches!(ready.0.lock().unwrap().as_ref().unwrap(), Err(error) if error.to_string().contains("Agents"))
+            matches!(ready.0.lock().unwrap().as_ref().unwrap(), Err(error) if error.message.contains("Agents"))
         );
         drop(app.update(message));
         assert_eq!(app.durable.cards.len(), before);
