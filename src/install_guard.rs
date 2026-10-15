@@ -21,6 +21,9 @@ use std::{
 
 use crate::instance::UiUpdateGuard;
 
+mod companions;
+pub(crate) use companions::preflight_editor_companions;
+
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
@@ -206,6 +209,15 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
+        // A standalone installer has not supplied a verified destination
+        // protocol. Keep its source windows usable until private editors close;
+        // the reviewed application updater can qualify compatible editors.
+        if arguments
+            .iter()
+            .any(|argument| argument == "--restart-daemon")
+        {
+            preflight_editor_companions(None)?;
+        }
         guard.prepare_and_close_windows(Duration::from_secs(45))?
     };
     let fd = script.as_raw_fd();
@@ -575,8 +587,32 @@ fn restore_window_daemon(bin: &Path, launch: &crate::instance::LaunchFence) -> i
         .stderr(Stdio::inherit());
     sanitize_child_environment(&mut command);
     launch.inherit(&mut command)?;
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_daemon_start(&mut command, daemon_start_timeout()?)
+}
+
+/// The matched CLI already budgets sequential restoration from the checkpoint.
+/// Its caller must not impose a shorter deadline and dispose of the successor.
+pub(crate) fn daemon_start_timeout() -> io::Result<Duration> {
+    crate::upgrade::handoff::startup_timeout()
+        .map(|timeout| timeout + Duration::from_secs(30))
+        .map_err(io::Error::other)
+}
+
+/// A daemon-start command is a handoff, not a disposable download helper.
+/// On timeout its daemon may already hold the inventory lease while restoring
+/// conversations. Never signal either process or its group: leave the exact
+/// successor and its checkpoint available for a later readiness check.
+pub(crate) fn wait_daemon_start(command: &mut Command, timeout: Duration) -> io::Result<()> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    wait_daemon_start_child(child, timeout)
+}
+
+fn wait_daemon_start_child(mut child: std::process::Child, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return if status.success() {
@@ -588,11 +624,14 @@ fn restore_window_daemon(bin: &Path, launch: &crate::instance::LaunchFence) -> i
             };
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = thread::Builder::new()
+                .name("cagents-startup-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "matched daemon recovery timed out",
+                "The matched terminal service is still starting; its process and recovery state were retained. Check `cagents daemon status` before retrying",
             ));
         }
         thread::sleep(Duration::from_millis(25));
@@ -624,6 +663,32 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_timeout_keeps_the_successor_and_its_descendants_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let evidence = directory.path().join("successor-ready");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 0.15; printf ready > \"$1\"", "startup-fixture"])
+            .arg(&evidence)
+            .process_group(0);
+        let error = wait_daemon_start(&mut command, Duration::from_millis(10)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !evidence.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(evidence).unwrap(), "ready");
+    }
+
+    #[test]
+    fn failed_startup_is_reported_without_a_timeout() {
+        let error =
+            wait_daemon_start(&mut Command::new("/bin/false"), Duration::from_secs(2)).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
     #[test]
     fn repeated_staging_keeps_the_running_version_even_when_current_is_newer() {
         let root = tempfile::tempdir().unwrap();

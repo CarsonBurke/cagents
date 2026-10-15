@@ -476,7 +476,7 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
-fn editor_executable(
+pub(crate) fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
 ) -> io::Result<Option<PathBuf>> {

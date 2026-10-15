@@ -995,6 +995,15 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
+    let before_close = observe_impact(
+        &staged.identity,
+        confirmed
+            .daemon
+            .as_ref()
+            .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+    )?;
+    validate_before_close(&confirmed, &before_close)?;
     let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
     let install_result = (|| {
         Installation::detect()?;
@@ -1011,6 +1020,7 @@ fn perform_update(
             ));
         }
         if let Some(daemon) = current.daemon {
+            crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
             let mut client = crate::control::ControlClient::connect(&socket)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1043,6 +1053,66 @@ fn perform_update(
         .map_err(UpdateError::from);
     install_result?;
     reopen_result
+}
+
+/// Revalidate before the first irreversible window close, rather than finding
+/// a migration blocker only after every source pane is no longer usable.
+fn validate_before_close(
+    confirmed: &impact::Preview,
+    current: &impact::Preview,
+) -> Result<(), UpdateError> {
+    if !confirmed.preserves_consent(current)
+        || current
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| !daemon.ready())
+    {
+        return Err(invalid(
+            "Session migration or ownership changed; the existing windows were kept open. Review the update again",
+        ));
+    }
+    Ok(())
+}
+
+/// Probe only a fixed, owned companion beside an authenticated editor process.
+/// No daemon startup command or inherited installer authority is passed.
+pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> {
+    let before = fs::symlink_metadata(executable)?;
+    if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.mode() & 0o022 != 0
+    {
+        return Err(invalid("Ceditor's companion is not an owned executable"));
+    }
+    let mut command = Command::new(executable);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command.args(["--json", "daemon", "protocol-version"]);
+    let mut output = bounded_command(
+        &mut command,
+        "editor companion protocol check",
+        SMALL_ASSET_LIMIT,
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )?;
+    let after = fs::symlink_metadata(executable)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.uid() != after.uid()
+        || before.mode() != after.mode()
+    {
+        return Err(invalid("Ceditor's companion changed during preflight"));
+    }
+    let envelope: serde_json::Value = serde_json::from_reader(&mut output)?;
+    envelope
+        .get("data")
+        .and_then(|data| data.get("protocol_version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| invalid("Ceditor's companion did not report a valid protocol"))
 }
 
 fn observe_impact(
@@ -1674,6 +1744,55 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn preclose_gate_refuses_changed_migration_before_window_shutdown() {
+        let confirmed = impact::Preview {
+            candidate: impact::Candidate {
+                version: "next".into(),
+                protocol: 77,
+                digest: "verified".into(),
+            },
+            replaces_daemon: false,
+            daemon: None,
+        };
+        assert!(validate_before_close(&confirmed, &confirmed).is_ok());
+        let mut changed = confirmed.clone();
+        changed.candidate.digest = "replaced".into();
+        assert!(validate_before_close(&confirmed, &changed).is_err());
+        let mut blocked = confirmed;
+        blocked.daemon = Some(impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("source"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("owner"),
+                },
+                token: "token".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 1,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions: vec![],
+            blockers: vec!["saved pane needs migration".into()],
+        });
+        assert!(validate_before_close(&blocked, &blocked).is_err());
+    }
+
+    #[test]
+    fn editor_protocol_probe_is_informational_and_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("cagents");
+        fs::write(&executable, "#!/bin/sh\n[ \"$*\" = '--json daemon protocol-version' ] || exit 42\nprintf '%s\\n' '{\"data\":{\"protocol_version\":56}}'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(companion_protocol(&executable).unwrap(), 56);
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(companion_protocol(&executable).is_err());
+    }
 
     #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {

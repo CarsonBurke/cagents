@@ -1309,6 +1309,18 @@ pub(crate) mod handoff {
             assert!(store.startup_timeout().is_ok());
             save(
                 &serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION,
+                    "terminals": [],
+                    "chats": vec![serde_json::json!({}); 100],
+                }))
+                .unwrap(),
+            );
+            assert_eq!(
+                store.startup_timeout().unwrap(),
+                std::time::Duration::from_secs(3005)
+            );
+            save(
+                &serde_json::to_vec(&serde_json::json!({
                     "version": VERSION + 1,
                     "terminals": [],
                     "chats": [],
