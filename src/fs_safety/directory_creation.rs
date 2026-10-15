@@ -489,6 +489,18 @@ fn native_acl_absent(root:&Root)->io::Result<bool> {
     if error.raw_os_error()==Some(libc::ENOENT){Ok(true)}else{Err(error)}
 }
 
+/// A real producer failure fixture for carrier consumer tests. It goes through
+/// the same mkdir/preparation/error-retention path; no authority is fabricated.
+#[cfg(test)]
+pub(crate) fn fixture_directory_preparation_failure(root: &Root) -> DirectoryCreateError {
+    let namespace = DirectoryNamespace::acquire(root).expect("protected failure fixture root");
+    let target = temporary_name().expect("fixture target name");
+    create_with_preparation_hook(&namespace,root,Path::new(&target),0o700,
+        |parent,name| std::fs::write(parent.path.join(name).join("directory"),b"retained fixture artifact").expect("fixture interference"),
+        |_,_| panic!("fixture must fail before publication"),
+        |_,_| panic!("fixture must not publish")).unwrap_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

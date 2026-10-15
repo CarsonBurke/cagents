@@ -424,6 +424,9 @@ pub use directory_creation::{
     create_directory_in_namespace,
 };
 
+#[cfg(test)]
+pub(crate) use directory_creation::fixture_directory_preparation_failure;
+
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
 /// its mutable worktree name.
