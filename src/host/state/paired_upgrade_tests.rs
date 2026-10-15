@@ -415,18 +415,35 @@ fn run_pair(mode: &str) {
         let mut checkpoint = store.load().unwrap().unwrap();
         checkpoint.terminals[0].source.resume_hint =
             crate::model::agent_recovery::hint_from_launch(&expected_execution);
-        assert_ne!(checkpoint.terminals[0].source.resume_hint,
-            checkpoint.chats[0].source.terminal.as_ref().unwrap().resume_hint);
+        assert_ne!(
+            checkpoint.terminals[0].source.resume_hint,
+            checkpoint.chats[0]
+                .source
+                .terminal
+                .as_ref()
+                .unwrap()
+                .resume_hint
+        );
         store.save(&checkpoint).unwrap();
         for mutation in 0..5 {
             let mut changed = checkpoint.clone();
             match mutation {
-                0 => changed.terminals[0].source.launch.arguments.push("different".into()),
+                0 => changed.terminals[0]
+                    .source
+                    .launch
+                    .arguments
+                    .push("different".into()),
                 1 => changed.terminals[0].source.launch.working_directory = "/different".into(),
                 2 => {
-                    changed.terminals[0].source.launch.environment.insert("CODEX_HOME".into(), "/different".into());
+                    changed.terminals[0]
+                        .source
+                        .launch
+                        .environment
+                        .insert("CODEX_HOME".into(), "/different".into());
                 }
-                3 => changed.terminals[0].source.resume_hint = Some("unqualified observation".into()),
+                3 => {
+                    changed.terminals[0].source.resume_hint = Some("unqualified observation".into())
+                }
                 _ => {
                     let mut wrong = expected_execution.clone();
                     wrong.arguments.extend(["--model".into(), "another".into()]);
@@ -434,7 +451,10 @@ fn run_pair(mode: &str) {
                         crate::model::agent_recovery::hint_from_launch(&wrong);
                 }
             }
-            assert!(changed.validate().is_err(), "old encoding cannot change pair identity or execution");
+            assert!(
+                changed.validate().is_err(),
+                "old encoding cannot change pair identity or execution"
+            );
         }
     }
     let proc_root = cwd.join("empty-proc");
@@ -446,11 +466,17 @@ fn run_pair(mode: &str) {
             Store::open(&store_path).unwrap(),
             &proc_root,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let resolved = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         let attached = super::super::chat::process(
-            &replacement, 1, ClientRequest::ChatAttach { session: source.clone() },
-        ).unwrap();
+            &replacement,
+            1,
+            ClientRequest::ChatAttach {
+                session: source.clone(),
+            },
+        )
+        .unwrap();
         let ServerResponse::ChatAttached { session, .. } = attached else {
             panic!("upgraded pair did not attach through the public dispatcher")
         };
@@ -465,10 +491,16 @@ fn run_pair(mode: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(process) = current_terminal.observe_agent_process() {
-                assert_eq!(crate::model::agent_recovery::resume_recipe(&process.recovery).as_ref(), Some(&expected_execution));
+                assert_eq!(
+                    crate::model::agent_recovery::resume_recipe(&process.recovery).as_ref(),
+                    Some(&expected_execution)
+                );
                 break;
             }
-            assert!(Instant::now() < deadline, "restored CLI execution was not observed");
+            assert!(
+                Instant::now() < deadline,
+                "restored CLI execution was not observed"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -477,14 +509,25 @@ fn run_pair(mode: &str) {
             if snapshot.ready && !snapshot.history_loading {
                 break snapshot;
             }
-            assert!(Instant::now() < deadline, "restored paired history did not load");
+            assert!(
+                Instant::now() < deadline,
+                "restored paired history did not load"
+            );
             thread::sleep(Duration::from_millis(10));
         };
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
             crate::chat::ItemContent::Text { text, .. } if text == "existing paired answer")));
         if generation == 1 {
-            let capability = replacement.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
-            prepare_upgrade_with_policy(&replacement, capability, false, None, || Store::open(&store_path)).unwrap();
+            let capability = replacement
+                .lock()
+                .unwrap()
+                .shutdown_preflight(Instant::now())
+                .unwrap()
+                .capability;
+            prepare_upgrade_with_policy(&replacement, capability, false, None, || {
+                Store::open(&store_path)
+            })
+            .unwrap();
             finish_upgrade(&replacement).unwrap();
             assert!(current_terminal.is_completed());
             assert!(current_actor.is_completed());
@@ -529,7 +572,11 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
     if isolated_with_environment(&[("CODEX_API_KEY", "synthetic-inherited-fixture-key")]) {
         return;
     }
-    let root = tempfile::Builder::new().prefix("paired-holder-").tempdir().unwrap().keep();
+    let root = tempfile::Builder::new()
+        .prefix("paired-holder-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let executable = executable(&root);
     let home = root.join("codex-home");
     fs::create_dir(&home).unwrap();
@@ -578,14 +625,20 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         execution_environment: None,
         execution_recipe: Some(effective.clone()),
     };
-    let mut handle = TerminalHandle::spawn(issued.clone(), TerminalConfig {
-        execution_recipe: Some(effective.clone()),
-        holder_recovery: Some(recovery),
-        initially_visible: false,
-        ..Default::default()
-    }, |_| {}).unwrap();
+    let mut handle = TerminalHandle::spawn(
+        issued.clone(),
+        TerminalConfig {
+            execution_recipe: Some(effective.clone()),
+            holder_recovery: Some(recovery),
+            initially_visible: false,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
     let original = handle.holder_identity().unwrap().clone();
-    let socket = crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), issued.id);
+    let socket =
+        crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), issued.id);
     for generation in 0..=2 {
         assert_eq!(handle.holder_identity(), Some(&original));
         handle.reveal().unwrap();
@@ -593,16 +646,32 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         loop {
             let snapshot = handle.snapshot();
             handle.acknowledge_redraw(snapshot.generation);
-            if snapshot.lines.iter().any(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect::<String>().contains("effective-recipe-ready")) {
+            if snapshot.lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("effective-recipe-ready")
+            }) {
                 break;
             }
-            assert!(Instant::now() < deadline, "exact execution/unset environment did not become ready");
+            assert!(
+                Instant::now() < deadline,
+                "exact execution/unset environment did not become ready"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         assert!(original.root.is_current());
         if generation == 2 {
             handle.shutdown().unwrap();
-            assert!(crate::terminal::holder::discover(&crate::terminal::holder::directory().unwrap(), &boot).unwrap().is_empty());
+            assert!(
+                crate::terminal::holder::discover(
+                    &crate::terminal::holder::directory().unwrap(),
+                    &boot
+                )
+                .unwrap()
+                .is_empty()
+            );
             break;
         }
         handle.carry(socket.clone()).unwrap();
@@ -610,7 +679,8 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         drop(lease.take());
         proof = make_proof(generation + 1);
         lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
-        let (mut recovery, _) = crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
+        let (mut recovery, _) =
+            crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
         assert_eq!(recovery.execution_recipe.as_ref(), Some(&effective));
         assert_eq!(recovery.source.launch, issued.launch);
         assert_eq!(recovery.source.resume_hint, issued.resume_hint);
@@ -618,22 +688,35 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         recovery.source.continuity = continuity(&proof);
         let mut changed = recovery.clone();
         changed.execution_recipe = None;
-        assert!(TerminalHandle::spawn(changed.source.clone(), TerminalConfig {
-            execution_recipe: Some(effective.clone()),
-            holder_recovery: Some(changed),
-            adoption: Some(socket.clone()),
-            initially_visible: false,
-            ..Default::default()
-        }, |_| {}).is_err(), "an older/mismatched context must not be adopted");
+        assert!(
+            TerminalHandle::spawn(
+                changed.source.clone(),
+                TerminalConfig {
+                    execution_recipe: Some(effective.clone()),
+                    holder_recovery: Some(changed),
+                    adoption: Some(socket.clone()),
+                    initially_visible: false,
+                    ..Default::default()
+                },
+                |_| {}
+            )
+            .is_err(),
+            "an older/mismatched context must not be adopted"
+        );
         let (retained, _) = crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
         assert_eq!(retained.execution_recipe.as_ref(), Some(&effective));
         assert!(original.root.is_current());
-        handle = TerminalHandle::spawn(recovery.source.clone(), TerminalConfig {
-            execution_recipe: recovery.execution_recipe.clone(),
-            holder_recovery: Some(recovery),
-            adoption: Some(socket.clone()),
-            initially_visible: false,
-            ..Default::default()
-        }, |_| {}).unwrap();
+        handle = TerminalHandle::spawn(
+            recovery.source.clone(),
+            TerminalConfig {
+                execution_recipe: recovery.execution_recipe.clone(),
+                holder_recovery: Some(recovery),
+                adoption: Some(socket.clone()),
+                initially_visible: false,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
     }
 }

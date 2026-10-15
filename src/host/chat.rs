@@ -1155,9 +1155,13 @@ fn start_with_execution(
             let current = state.descriptor(client, session.id)?.session;
             session.terminal = Some(if restart_launch.is_some() {
                 restored_terminal_source(
-                    session.terminal.as_ref().ok_or_else(|| error("Upgrade pair source is missing"))?,
+                    session
+                        .terminal
+                        .as_ref()
+                        .ok_or_else(|| error("Upgrade pair source is missing"))?,
                     &current,
-                ).map_err(error)?
+                )
+                .map_err(error)?
             } else {
                 current
             });
@@ -1194,7 +1198,10 @@ fn start_with_execution(
                     source_transient.as_ref().map(|environment| &environment.0),
                 )?;
             if source_process.as_ref() != Some(&current_process)
-                || &current_recipe != resolved_restart_recipe.as_ref().unwrap_or(&session.launch.recipe)
+                || &current_recipe
+                    != resolved_restart_recipe
+                        .as_ref()
+                        .unwrap_or(&session.launch.recipe)
                 || current_fresh != source_fresh
                 || current_execution != source_execution
             {
@@ -2813,7 +2820,10 @@ pub(super) fn restored_terminal_source(
     owner.continuity = issued.continuity.clone();
     owner.resume_hint = issued.resume_hint.clone();
     if owner != *issued
-        || current.continuity.live_proof().is_none_or(|proof| !proof.is_complete())
+        || current
+            .continuity
+            .live_proof()
+            .is_none_or(|proof| !proof.is_complete())
     {
         return Err("The exact paired terminal owner changed during upgrade".into());
     }
@@ -3260,11 +3270,24 @@ mod tests {
                 match mutation {
                     0 => changed.recovery.program = "/other/codex".into(),
                     1 => changed.recovery.working_directory = "/other".into(),
-                    2 => changed.recovery.arguments.extend(["--model".into(), "other".into()]),
-                    3 => { changed.recovery.unset_environment.insert("CODEX_API_KEY".into()); },
-                    _ => changed.recovery.arguments.extend(["--remote".into(), "unix:///other".into()]),
+                    2 => changed
+                        .recovery
+                        .arguments
+                        .extend(["--model".into(), "other".into()]),
+                    3 => {
+                        changed
+                            .recovery
+                            .unset_environment
+                            .insert("CODEX_API_KEY".into());
+                    }
+                    _ => changed
+                        .recovery
+                        .arguments
+                        .extend(["--remote".into(), "unix:///other".into()]),
                 }
-                assert!(paired_upgrade_recipe(&changed, &changed, &launch, Some(SELECTED)).is_err());
+                assert!(
+                    paired_upgrade_recipe(&changed, &changed, &launch, Some(SELECTED)).is_err()
+                );
             }
         }
     }
@@ -3282,8 +3305,11 @@ mod tests {
             host_incarnation: proof.host_incarnation,
         };
         let mut issued = crate::terminal_ipc::TerminalDescriptor::relaunchable(
-            TerminalId::new(), LaunchRecipe::shell("/project".into()).unwrap(), None,
-        ).session;
+            TerminalId::new(),
+            LaunchRecipe::shell("/project".into()).unwrap(),
+            None,
+        )
+        .session;
         issued.continuity = continuity(proof("old"));
         issued.resume_hint = Some("original issued observation".into());
         let mut current = issued.clone();
@@ -3300,8 +3326,18 @@ mod tests {
                 1 => changed.launch.program = "/another".into(),
                 2 => changed.launch.arguments.push("another".into()),
                 3 => changed.launch.working_directory = "/another".into(),
-                4 => { changed.launch.environment.insert("CODEX_HOME".into(), "/another".into()); },
-                5 => { changed.launch.unset_environment.insert("CODEX_API_KEY".into()); },
+                4 => {
+                    changed
+                        .launch
+                        .environment
+                        .insert("CODEX_HOME".into(), "/another".into());
+                }
+                5 => {
+                    changed
+                        .launch
+                        .unset_environment
+                        .insert("CODEX_API_KEY".into());
+                }
                 6 => changed.transcript_path = Some("/another".into()),
                 7 => changed.recovery_origin = Some(TerminalId::new()),
                 _ => changed.predecessor = Some(TerminalId::new()),
@@ -3309,7 +3345,8 @@ mod tests {
             assert!(restored_terminal_source(&issued, &changed).is_err());
         }
         current.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-            recipe: current.launch.clone(), last_exit: None,
+            recipe: current.launch.clone(),
+            last_exit: None,
         };
         assert!(restored_terminal_source(&issued, &current).is_err());
     }

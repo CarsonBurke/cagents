@@ -2084,7 +2084,8 @@ fn prepare_upgrade_with_carry_policy(
             source = super::chat::restored_terminal_source(
                 chat.source.terminal.as_ref().expect("validated pair"),
                 &source,
-            ).map_err(upgrade_error)?;
+            )
+            .map_err(upgrade_error)?;
             recipe
         } else {
             source.resume_hint = snapshot.hint.clone();
@@ -2825,7 +2826,11 @@ fn restore_upgrade_from(
             let pair = checkpoint.chats.iter().find(|chat| {
                 chat.launch.provider == crate::agent::Provider::Codex
                     && chat.source.id == terminal.source.id
-                    && chat.source.terminal.as_ref().is_some_and(|source| source.id == terminal.source.id)
+                    && chat
+                        .source
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal.source.id)
             });
             let mut session = if let Some(chat) = pair {
                 crate::upgrade::handoff::paired_terminal_source(chat, terminal)?
@@ -2851,12 +2856,22 @@ fn restore_upgrade_from(
             };
             let descriptor = if pair.is_some() {
                 start_terminal_view_owned(
-                    host, 0, session, terminal.options.clone(), None, paired,
-                    None, None, None, Some(terminal.recipe.clone()),
-                ).map(|(descriptor, _)| descriptor)
+                    host,
+                    0,
+                    session,
+                    terminal.options.clone(),
+                    None,
+                    paired,
+                    None,
+                    None,
+                    None,
+                    Some(terminal.recipe.clone()),
+                )
+                .map(|(descriptor, _)| descriptor)
             } else {
                 spawn_terminal_view(host, 0, session, terminal.options.clone(), None, paired)
-            }.map_err(|error| error.message)?;
+            }
+            .map_err(|error| error.message)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
@@ -3490,7 +3505,9 @@ fn start_terminal_view(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
-    let execution_recipe = previous.as_ref().and_then(|previous| previous.execution_recipe.clone());
+    let execution_recipe = previous
+        .as_ref()
+        .and_then(|previous| previous.execution_recipe.clone());
     start_terminal_view_owned(
         shared,
         client_id,
@@ -3525,7 +3542,10 @@ fn start_terminal_view_owned(
     if let Some(recipe) = &execution_recipe {
         if crate::upgrade::exact_conversation(recipe).is_none()
             || (adoption.is_some()
-                && previous.as_ref().and_then(|previous| previous.execution_recipe.as_ref()) != Some(recipe))
+                && previous
+                    .as_ref()
+                    .and_then(|previous| previous.execution_recipe.as_ref())
+                    != Some(recipe))
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
@@ -3538,7 +3558,10 @@ fn start_terminal_view_owned(
         validate_launch(&effective)?;
     }
     if let Some(environment) = &mut execution_environment {
-        execution_recipe.as_ref().unwrap_or(&session.launch).remove_unset_environment(&mut environment.0);
+        execution_recipe
+            .as_ref()
+            .unwrap_or(&session.launch)
+            .remove_unset_environment(&mut environment.0);
     }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
@@ -3747,11 +3770,18 @@ fn start_terminal_view_owned(
                 return Err(error);
             }
         }
-        let issued_hint = execution_recipe.as_ref().map(|_| session.resume_hint.clone());
-        let mut descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
+        let issued_hint = execution_recipe
+            .as_ref()
+            .map(|_| session.resume_hint.clone());
+        let mut descriptor =
+            state.finish_spawn(client_id, session, handle, options.initially_visible);
         if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
-            state.terminals.get_mut(&terminal_id).expect("finished spawn")
-                .session.resume_hint = hint.clone();
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished spawn")
+                .session
+                .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
         if descriptor.is_ok() && pending_pane.is_some() {

@@ -703,7 +703,11 @@ pub(crate) mod handoff {
                 // it for review without ever executing it.
                 let pair = self.chats.iter().find(|chat| {
                     chat.launch.provider == crate::agent::Provider::Codex
-                        && chat.source.terminal.as_ref().is_some_and(|source| source.id == terminal.source.id)
+                        && chat
+                            .source
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|source| source.id == terminal.source.id)
                 });
                 let recipe_matches = if let Some(chat) = pair {
                     paired_terminal_source(chat, terminal).is_ok()
@@ -872,13 +876,21 @@ pub(crate) mod handoff {
         terminal: &Terminal,
     ) -> Result<TerminalSession, String> {
         validate_chat_source(&chat.source, &chat.launch)?;
-        let original = chat.source.terminal.as_ref().ok_or("Upgrade pair is missing")?;
+        let original = chat
+            .source
+            .terminal
+            .as_ref()
+            .ok_or("Upgrade pair is missing")?;
         if chat.launch.provider != crate::agent::Provider::Codex
             || chat.launch.terminal_recipe().as_ref() != Some(&terminal.recipe)
             || (terminal.source.resume_hint != original.resume_hint
-                && terminal.source.resume_hint.as_deref()
+                && terminal
+                    .source
+                    .resume_hint
+                    .as_deref()
                     .and_then(crate::model::agent_recovery::recipe_from_hint)
-                    .as_ref() != Some(&terminal.recipe))
+                    .as_ref()
+                    != Some(&terminal.recipe))
         {
             return Err("Paired Codex execution does not match its confirmed source".into());
         }

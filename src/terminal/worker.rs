@@ -1569,7 +1569,11 @@ impl Worker {
             })
             .map_err(|error| format!("register working directory effect: {error}"))?;
 
-        let execution = config.execution_recipe.as_ref().unwrap_or(&session.launch).clone();
+        let execution = config
+            .execution_recipe
+            .as_ref()
+            .unwrap_or(&session.launch)
+            .clone();
         let mut command = match &config.execution_environment {
             Some(environment) => {
                 let mut command = CommandBuilder::new(&execution.program);
