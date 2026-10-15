@@ -178,6 +178,7 @@ struct Remote {
     installed: AtomicBool,
     preserved: AtomicBool,
     close_job: Mutex<Option<Arc<CloseJob>>>,
+    session_stop_job: Mutex<Option<Arc<CloseJob>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
 }
@@ -328,6 +329,7 @@ impl RemoteActor {
             installed: AtomicBool::new(true),
             preserved: AtomicBool::new(false),
             close_job: Mutex::new(None),
+            session_stop_job: Mutex::new(None),
             worker: Mutex::new(None),
             startup: Mutex::new(None),
         }))
@@ -674,6 +676,7 @@ impl RemoteActor {
             installed: AtomicBool::new(false),
             preserved: AtomicBool::new(false),
             close_job: Mutex::new(None),
+            session_stop_job: Mutex::new(None),
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
         }));
@@ -1148,6 +1151,39 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
         Ok(())
     }
+    /// Keep one exact fence request owned while its caller's budget expires.
+    /// A lost response never causes cleanup or a replacement actor close.
+    pub fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+        if actor_id != self.0.identity.instance {
+            return Err("The provider actor was replaced; its replacement was preserved".into());
+        }
+        let remaining=deadline.checked_duration_since(Instant::now()).ok_or("Session stop budget expired; its exact owner is retained")?;
+        let job={
+            let mut pending=match self.0.session_stop_job.try_lock() {
+                Ok(pending)=>pending,
+                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Session stop admission is already pending; retain the exact owner".into()),
+            };
+            if let Some(job)=pending.as_ref().filter(|job|job.result.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_none_or(Result::is_ok)).cloned() {job}
+            else {
+                let job=Arc::new(CloseJob {result:Mutex::new(None),done:std::sync::Condvar::new()});
+                let completion=job.clone();let actor=self.clone();
+                let millis=u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX).min(32_000);
+                thread::Builder::new().name("cagents-session-stop".into()).spawn(move|| {
+                    let result=actor.call::<()>("fence_session_stop",json!([actor_id,millis]));
+                    *completion.result.lock().unwrap_or_else(|p|p.into_inner())=Some(result);
+                    completion.done.notify_all();
+                }).map_err(|error|error.to_string())?;
+                *pending=Some(job.clone());job
+            }
+        };
+        let mut result=job.result.lock().unwrap_or_else(|p|p.into_inner());
+        loop {
+            if let Some(result)=result.as_ref() {return result.clone();}
+            let remaining=deadline.checked_duration_since(Instant::now()).ok_or("Session stop acknowledgement is pending; the exact helper and request remain retained")?;
+            result=job.done.wait_timeout(result,remaining).unwrap_or_else(|p|p.into_inner()).0;
+        }
+    }
     pub fn close_until(&self, deadline: Instant) -> Result<(), String> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -1353,6 +1389,7 @@ struct Server {
     _directory: Option<Arc<File>>,
     mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     closed_snapshot: Option<Arc<Snapshot>>,
+    session_stopping: bool,
 }
 impl Server {
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
@@ -1501,6 +1538,7 @@ impl Server {
             _directory: directory,
             mailbox_seal,
             closed_snapshot: None,
+            session_stopping: false,
         })
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
@@ -1722,6 +1760,7 @@ impl Server {
         match request.method.as_str() {
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
+                if self.session_stopping {return Err("This actor lifetime is stopping; provider replacement is refused".into());}
                 let request = decode!(restart::Request);
                 value!(self.restart(request)?)
             }
@@ -1821,6 +1860,7 @@ impl Server {
                 if let Some(receipt) = journal.input(&identity)? {
                     return value!(receipt);
                 }
+                if self.session_stopping {return Err("This actor lifetime is stopping; new provider input is refused".into());}
                 if self.pending.len() >= 65 {
                     return Err("Retained actor input completion capacity reached".into());
                 }
@@ -1976,6 +2016,19 @@ impl Server {
                 self.source = source;
                 self.execution_console = console;
                 self.paired_holder = pair;
+                Ok(Value::Null)
+            }
+            "fence_session_stop" => {
+                let (actor_id,millis)=decode!((uuid::Uuid,u64));
+                if actor_id!=self.identity.instance || self.actor.close_observation().actor_id!=actor_id {
+                    return Err("The provider actor was replaced; its replacement was preserved".into());
+                }
+                // Helper ownership survives daemon/proxy replacement. Retain
+                // explicit actor-lifetime intent even if its ACK is lost, and
+                // never allow a provider restart to escape that consent fence.
+                self.session_stopping=true;
+                self.changed.fetch_add(1,Ordering::Release);
+                self.actor.fence_session_stop_until(actor_id,Instant::now()+Duration::from_millis(millis.min(32_000)))?;
                 Ok(Value::Null)
             }
             "close_until" => {
@@ -2424,6 +2477,7 @@ mod tests {
                 _directory: None,
                 mailbox_seal: None,
                 closed_snapshot: None,
+            session_stopping: false,
             },
             _root: root,
         }
@@ -2677,6 +2731,66 @@ done"#;
         assert!(started.elapsed()<Duration::from_secs(1));
         assert!(finished.try_recv().is_err(),"frontend detach is not OS-thread or retained-provider cleanup proof");
         release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn exact_session_stop_fence_survives_attachment_and_blocks_new_input_and_restart() {
+        let mut fixture=resident_fixture();
+        let server=&mut fixture.server;
+        let invoke=|server:&mut Server,method:&str,args:Value| {
+            server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args})
+        };
+        let actor_id=server.identity.instance;
+        assert!(invoke(server,"fence_session_stop",json!([uuid::Uuid::new_v4(),1000])).is_err());
+        assert!(!server.session_stopping);
+        assert!(!server.actor.0.stop.load(Ordering::Acquire));
+        invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap();
+        assert!(server.actor.0.stop.load(Ordering::Acquire),"ACK must follow the actual actor command fence");
+        let old_epoch=server.epoch;
+        let source=server.source.clone();
+        invoke(server,"attach",json!([source])).unwrap();
+        assert_ne!(server.epoch,old_epoch);
+        assert!(server.session_stopping,"reattachment cannot reopen admission");
+        let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
+        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:*blake3::hash(&serde_json::to_vec(&payload).unwrap()).as_bytes()};
+        assert!(invoke(server,"input",json!([identity,payload])).unwrap_err().contains("stopping"));
+        assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1,"refused admission must not consume an input identity");
+        assert!(invoke(server,"restart",Value::Null).unwrap_err().contains("stopping"));
+        // Read/ACK pathways remain available for two-phase durable cleanup.
+        assert!(invoke(server,"outbox_unacked",Value::Null).is_ok());
+        assert!(invoke(server,"input_receipts",json!([Vec::<InputIdentity>::new()])).is_ok());
+    }
+
+    #[test]
+    fn remote_session_stop_deadline_keeps_one_exact_request_without_cleanup_claim() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket=root.path().join("stop.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let mut actor=RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+        let actor_id=actor.identity().instance;
+        assert!(actor.fence_session_stop_until(uuid::Uuid::new_v4(),Instant::now()+Duration::from_secs(1)).is_err());
+        assert!(actor.0.session_stop_job.lock().unwrap().is_none());
+        let (entered,started)=crossbeam_channel::bounded(1);
+        let (release,wait)=crossbeam_channel::bounded(1);
+        let peer=thread::spawn(move|| {
+            let (control,_)=listener.accept().unwrap();
+            let request:Invocation=receive(&control,TIMEOUT).unwrap();
+            assert_eq!(request.method,"fence_session_stop");
+            let (actual,_):(uuid::Uuid,u64)=serde_json::from_value(request.args).unwrap();assert_eq!(actual,actor_id);
+            entered.send(()).unwrap();wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            send(&control,&Ok::<_,String>(Value::Null),TIMEOUT).unwrap();
+        });
+        assert!(actor.fence_session_stop_until(actor_id,Instant::now()+Duration::from_millis(20)).is_err());
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first=actor.0.session_stop_job.lock().unwrap().as_ref().unwrap().clone();
+        assert!(actor.fence_session_stop_until(actor_id,Instant::now()+Duration::from_millis(10)).is_err());
+        assert!(Arc::ptr_eq(&first,actor.0.session_stop_job.lock().unwrap().as_ref().unwrap()));
+        assert!(!actor.state().completed);assert!(actor.owns_work());
+        release.send(()).unwrap();
+        actor.fence_session_stop_until(actor_id,Instant::now()+Duration::from_secs(1)).unwrap();
+        assert!(!actor.state().completed,"fencing alone never proves provider cleanup");
+        assert!(actor.owns_work());peer.join().unwrap();
     }
 
     #[test]

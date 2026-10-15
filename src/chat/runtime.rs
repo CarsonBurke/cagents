@@ -80,6 +80,7 @@ enum ActorCommand {
     CloseIfRevision {
         revision: u64,
     },
+    StopSession { actor_id: uuid::Uuid },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
         run: Option<crate::model::RunId>,
@@ -1012,6 +1013,39 @@ impl LocalHandle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+    }
+
+    /// Fence one actor lifetime after explicit consent to stop all its work.
+    /// Cleanup is separate and must run outside global control admission.
+    pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+        let observed = self.close_observation();
+        if observed.actor_id != actor_id {
+            return Err("The provider actor was replaced; its replacement was preserved".into());
+        }
+        if observed.completed || self.0.stop.load(Ordering::Acquire) {
+            return if observed.owns_work && self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
+                Err("Retained provider ownership must be reattached before session stop".into())
+            } else { Ok(()) };
+        }
+        if self.0.draining.load(Ordering::Acquire) {
+            return Err("Provider ownership is changing; refresh before stopping it".into());
+        }
+        if Instant::now() >= deadline {return Err("Session stop budget expired; no cleanup is confirmed".into());}
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0.commands.try_send((ActorCommand::StopSession {actor_id}, reply))
+            .map_err(|error| format!("Session stop could not be admitted: {error}"))?;
+        match self.0.wake.try_lock() {
+            Ok(mut wake) => { let _ = wake.write(&[1]); },
+            Err(std::sync::TryLockError::Poisoned(p)) => { let _ = p.into_inner().write(&[1]); },
+            Err(std::sync::TryLockError::WouldBlock) => {},
+        }
+        response.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "Session stop acknowledgement is unconfirmed; its exact owner is retained for retry".to_string())?
+    }
+
+    pub(crate) fn stop_session_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
+        self.fence_session_stop_until(actor_id, deadline)?;
+        self.close_until(deadline)
     }
 
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
@@ -2833,6 +2867,17 @@ impl Actor {
                     } else {
                         "Provider work changed before conditional close".into()
                     }));
+                    continue;
+                }
+                ActorCommand::StopSession {actor_id} => {
+                    let close = self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                    let result = if close.actor_id != actor_id {
+                        Err("The provider actor was replaced; its replacement was preserved".into())
+                    } else {
+                        self.stop.store(true, Ordering::Release);
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
