@@ -3817,7 +3817,9 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         confirmed: bool,
     },
-    UndoDiscard { key: ActiveWorktreeKey },
+    UndoDiscard {
+        key: ActiveWorktreeKey,
+    },
     CancelGitMutation {
         key: ActiveWorktreeKey,
     },
@@ -7141,11 +7143,24 @@ fn source_control_notices<'a>(
             }
         }
     }
-    if source.undo_discard_until_unix_ms.is_some_and(|until| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() <= u128::from(until)) {
-        notices = notices.push(widget::row::with_children(vec![
-            design::caption("Changes discarded. Backups kept.").into(),
-            widget::button::text("Undo discard").on_press(SidebarAction::UndoDiscard { key: source.key.clone() }).into(),
-        ]).spacing(space::XS));
+    if source.undo_discard_until_unix_ms.is_some_and(|until| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            <= u128::from(until)
+    }) {
+        notices = notices.push(
+            widget::row::with_children(vec![
+                design::caption("Changes discarded. Backups kept.").into(),
+                widget::button::text("Undo discard")
+                    .on_press(SidebarAction::UndoDiscard {
+                        key: source.key.clone(),
+                    })
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
     }
     if let Some(operation) = &source.operation {
         notices = notices.push(design::caption(format!(

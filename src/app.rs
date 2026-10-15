@@ -3984,8 +3984,16 @@ pub enum Message {
             crate::repository::ConflictMarkerVersion,
         >,
     },
-    SourceControlDiscarded { key: ActiveWorktreeKey, operation: uuid::Uuid, label: &'static str, result: Result<crate::repository::RecoverableDiscard, String> },
-    SourceControlDiscardExpired { worktree: PathBuf, expires_unix_ms: u64 },
+    SourceControlDiscarded {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        label: &'static str,
+        result: Result<crate::repository::RecoverableDiscard, String>,
+    },
+    SourceControlDiscardExpired {
+        worktree: PathBuf,
+        expires_unix_ms: u64,
+    },
     /// A finished stage, unstage, discard, commit, or push.
     ///
     /// `report` is `None` when the mutation did everything it was asked to do.
@@ -11306,20 +11314,28 @@ impl Cagents {
         self.queued_git_task(key, operation, request)
     }
 
-    fn expire_discard_recovery(&mut self, worktree: PathBuf, expires_unix_ms: u64) -> Task<Message> {
-        let Some(recovery) = self.discard_recoveries.get(&worktree)
+    fn expire_discard_recovery(
+        &mut self,
+        worktree: PathBuf,
+        expires_unix_ms: u64,
+    ) -> Task<Message> {
+        let Some(recovery) = self
+            .discard_recoveries
+            .get(&worktree)
             .filter(|recovery| recovery.expires_unix_ms == expires_unix_ms)
-        else { return Task::none(); };
+        else {
+            return Task::none();
+        };
         // A newer receipt owns its own timer. If the wall clock moved
         // backwards, re-arm this one-shot rather than polling idle UI.
         if recovery.can_undo() {
             return Self::discard_expiration_task(worktree, expires_unix_ms);
         }
         self.discard_recoveries.remove(&worktree);
-        if let Some(source) = self.sidebar_model.source_control.as_mut()
-            .filter(|source| source.key.canonical_path == worktree
-                && source.undo_discard_until_unix_ms == Some(expires_unix_ms))
-        {
+        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| {
+            source.key.canonical_path == worktree
+                && source.undo_discard_until_unix_ms == Some(expires_unix_ms)
+        }) {
             source.undo_discard_until_unix_ms = None;
         }
         Task::none()
@@ -11332,9 +11348,15 @@ impl Cagents {
                 .unwrap_or_default()
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
-            let remaining = expires_unix_ms.saturating_sub(now).saturating_add(1).min(60_001);
+            let remaining = expires_unix_ms
+                .saturating_sub(now)
+                .saturating_add(1)
+                .min(60_001);
             tokio::time::sleep(Duration::from_millis(remaining)).await;
-            Message::SourceControlDiscardExpired { worktree, expires_unix_ms }
+            Message::SourceControlDiscardExpired {
+                worktree,
+                expires_unix_ms,
+            }
         })
     }
 
@@ -11408,18 +11430,63 @@ impl Cagents {
 
         let request = match request {
             QueuedGitMutation::Discard(request) => {
-                let cancellation = self.source_control_mutations.get(&key.canonical_path).filter(|mutation| mutation.id == operation).map(|mutation| mutation.cancellation.clone()).unwrap_or_default();
+                let cancellation = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .map(|mutation| mutation.cancellation.clone())
+                    .unwrap_or_default();
                 return cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").discard_recoverable(&request, &cancellation).map_err(|error| error.to_string())).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    Message::SourceControlDiscarded { key, operation, label: "Discard", result }
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .discard_recoverable(&request, &cancellation)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::SourceControlDiscarded {
+                        key,
+                        operation,
+                        label: "Discard",
+                        result,
+                    }
                 });
             }
-            QueuedGitMutation::Operation(crate::repository::GitOperation::ApplyPatch { patch, cached: false, reverse: true, expected_head }) => {
-                let cancellation = self.source_control_mutations.get(&key.canonical_path).filter(|mutation| mutation.id == operation).map(|mutation| mutation.cancellation.clone()).unwrap_or_default();
+            QueuedGitMutation::Operation(crate::repository::GitOperation::ApplyPatch {
+                patch,
+                cached: false,
+                reverse: true,
+                expected_head,
+            }) => {
+                let cancellation = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .map(|mutation| mutation.cancellation.clone())
+                    .unwrap_or_default();
                 let worktree = key.canonical_path.clone();
                 return cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").apply_patch_recoverable(&worktree, &patch, true, expected_head.as_ref(), &cancellation).map_err(|error| error.to_string())).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    Message::SourceControlDiscarded { key, operation, label: "Revert hunk", result }
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .apply_patch_recoverable(
+                                &worktree,
+                                &patch,
+                                true,
+                                expected_head.as_ref(),
+                                &cancellation,
+                            )
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::SourceControlDiscarded {
+                        key,
+                        operation,
+                        label: "Revert hunk",
+                        result,
+                    }
                 });
             }
             request => request,
@@ -11451,7 +11518,10 @@ impl Cagents {
                 QueuedGitMutation::Discard(request) => {
                     ("Discard", service.discard(&request, cancellation))
                 }
-                QueuedGitMutation::UndoDiscard(recovery) => ("Undo discard", service.undo_discard(&recovery, cancellation)),
+                QueuedGitMutation::UndoDiscard(recovery) => (
+                    "Undo discard",
+                    service.undo_discard(&recovery, cancellation),
+                ),
                 QueuedGitMutation::Operation(operation) => (
                     operation.label(),
                     service.git_operation(&worktree, &operation, cancellation),
@@ -16755,8 +16825,12 @@ impl Application for Cagents {
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }
-                self.discard_recoveries.retain(|_, recovery| recovery.can_undo());
-                next.undo_discard_until_unix_ms = self.discard_recoveries.get(&next.key.canonical_path).map(|recovery| recovery.expires_unix_ms);
+                self.discard_recoveries
+                    .retain(|_, recovery| recovery.can_undo());
+                next.undo_discard_until_unix_ms = self
+                    .discard_recoveries
+                    .get(&next.key.canonical_path)
+                    .map(|recovery| recovery.expires_unix_ms);
                 self.sidebar_model.source_control = Some(next);
                 match snapshot {
                     Some(snapshot) => self.refresh_branch_changes(&snapshot),
@@ -16860,26 +16934,63 @@ impl Application for Cagents {
                 }
                 task
             }
-            Message::SourceControlDiscardExpired { worktree, expires_unix_ms } => self.expire_discard_recovery(worktree, expires_unix_ms),
-            Message::SourceControlDiscarded { key, operation, label, result } => {
-                if !self.source_control_mutations.get(&key.canonical_path).is_some_and(|mutation| mutation.id == operation) { return Task::none(); }
-                self.discard_recoveries.retain(|_, recovery| recovery.can_undo());
+            Message::SourceControlDiscardExpired {
+                worktree,
+                expires_unix_ms,
+            } => self.expire_discard_recovery(worktree, expires_unix_ms),
+            Message::SourceControlDiscarded {
+                key,
+                operation,
+                label,
+                result,
+            } => {
+                if !self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    return Task::none();
+                }
+                self.discard_recoveries
+                    .retain(|_, recovery| recovery.can_undo());
                 let mut expires = None;
                 let report = match result {
                     Ok(result) => {
                         if result.recovery.can_undo() {
                             expires = Some(result.recovery.expires_unix_ms);
-                            if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key.canonical_path == key.canonical_path) { source.undo_discard_until_unix_ms = Some(result.recovery.expires_unix_ms); }
-                            self.discard_recoveries.insert(key.canonical_path.clone(), Arc::new(result.recovery));
+                            if let Some(source) =
+                                self.sidebar_model.source_control.as_mut().filter(|source| {
+                                    source.key.canonical_path == key.canonical_path
+                                })
+                            {
+                                source.undo_discard_until_unix_ms =
+                                    Some(result.recovery.expires_unix_ms);
+                            }
+                            self.discard_recoveries
+                                .insert(key.canonical_path.clone(), Arc::new(result.recovery));
                         }
                         mutation_report(label, Ok(result.outcome))
                     }
                     Err(error) => Some(format!("{label} could not run: {error}")),
                 };
                 let refresh_key = key.clone();
-                let task = self.update(Message::SourceControlMutated { key, operation, report, committed: false });
-                if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == refresh_key) {
-                    source.undo_discard_until_unix_ms = self.discard_recoveries.get(&refresh_key.canonical_path).filter(|recovery| recovery.can_undo()).map(|recovery| recovery.expires_unix_ms);
+                let task = self.update(Message::SourceControlMutated {
+                    key,
+                    operation,
+                    report,
+                    committed: false,
+                });
+                if let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_mut()
+                    .filter(|source| source.key == refresh_key)
+                {
+                    source.undo_discard_until_unix_ms = self
+                        .discard_recoveries
+                        .get(&refresh_key.canonical_path)
+                        .filter(|recovery| recovery.can_undo())
+                        .map(|recovery| recovery.expires_unix_ms);
                 }
                 let expiration = expires.map_or_else(Task::none, |until| {
                     Self::discard_expiration_task(refresh_key.canonical_path, until)
@@ -28352,25 +28463,94 @@ mod tests {
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
         let path = crate::repository::RepoPath::parse("discarded.txt").unwrap();
-        let request = crate::repository::DiscardRequest { worktree: key.canonical_path.clone(), tracked: Vec::new(), untracked: vec![path.clone()], confirmed: true };
+        let request = crate::repository::DiscardRequest {
+            worktree: key.canonical_path.clone(),
+            tracked: Vec::new(),
+            untracked: vec![path.clone()],
+            confirmed: true,
+        };
         drop(app.enqueue_git_mutation(key.clone(), super::QueuedGitMutation::Discard(request)));
         let operation = app.source_control_mutations[&key.canonical_path].id;
         let recovery = crate::repository::DiscardRecovery {
-            worktree: key.canonical_path.clone(), worktree_identity: (0, 0), directories: std::collections::BTreeMap::new(), expires_unix_ms: u64::MAX,
-            entries: vec![crate::repository::DiscardRecoveryEntry { path: path.clone(), before: crate::repository::SavedEntry::Absent, after: crate::repository::SavedEntry::Absent, after_version: None, trash: None }],
+            worktree: key.canonical_path.clone(),
+            worktree_identity: (0, 0),
+            directories: std::collections::BTreeMap::new(),
+            expires_unix_ms: u64::MAX,
+            entries: vec![crate::repository::DiscardRecoveryEntry {
+                path: path.clone(),
+                before: crate::repository::SavedEntry::Absent,
+                after: crate::repository::SavedEntry::Absent,
+                after_version: None,
+                trash: None,
+            }],
         };
-        drop(app.update(Message::SourceControlDiscarded { key: key.clone(), operation, label: "Discard", result: Ok(crate::repository::RecoverableDiscard { outcome: crate::repository::MutationOutcome::PartiallyApplied { paths: vec![path], failures: vec![crate::repository::MutationFailure::Rejected { reason: "another path refused".into() }] }, recovery }) }));
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().undo_discard_until_unix_ms, Some(u64::MAX));
-        assert!(app.sidebar_model.source_control.as_ref().unwrap().error.as_ref().unwrap().contains("another path refused"));
+        drop(app.update(Message::SourceControlDiscarded {
+            key: key.clone(),
+            operation,
+            label: "Discard",
+            result: Ok(crate::repository::RecoverableDiscard {
+                outcome: crate::repository::MutationOutcome::PartiallyApplied {
+                    paths: vec![path],
+                    failures: vec![crate::repository::MutationFailure::Rejected {
+                        reason: "another path refused".into(),
+                    }],
+                },
+                recovery,
+            }),
+        }));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("another path refused")
+        );
         // A new binding placeholder has none of the previous panel's state.
         app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
-        let snapshot = crate::repository::RepositorySnapshot { operation: None, stashes: Vec::new(), last_fetch_unix_ms: None, status: crate::repository::StatusSnapshot::default(), files: crate::repository::WorkingFiles::default(), remotes: Vec::new(), local_refs: Vec::new(), remote_refs: Vec::new(), remote_heads: Vec::new() };
+        let snapshot = crate::repository::RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
+            status: crate::repository::StatusSnapshot::default(),
+            files: crate::repository::WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+        };
         let model = SourceControlModel::ready(key.clone(), &snapshot);
-        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: app.refresh_ui.source_generation, result: Ok(Some(Box::new((snapshot, model)))) }));
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().undo_discard_until_unix_ms, Some(u64::MAX));
-        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard { key: key.clone() })));
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: app.refresh_ui.source_generation,
+            result: Ok(Some(Box::new((snapshot, model)))),
+        }));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::UndoDiscard {
+            key: key.clone(),
+        })));
         assert!(!app.discard_recoveries.contains_key(&key.canonical_path));
-        assert!(matches!(app.source_control_mutations[&key.canonical_path].request, Some(super::QueuedGitMutation::UndoDiscard(_))));
+        assert!(matches!(
+            app.source_control_mutations[&key.canonical_path].request,
+            Some(super::QueuedGitMutation::UndoDiscard(_))
+        ));
     }
 
     #[test]
@@ -28380,39 +28560,85 @@ mod tests {
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         let other = key.canonical_path.join("other-worktree");
-        let receipt = |worktree: PathBuf, until| Arc::new(crate::repository::DiscardRecovery {
-            worktree, worktree_identity: (0, 0), directories: std::collections::BTreeMap::new(),
-            expires_unix_ms: until,
-            entries: vec![crate::repository::DiscardRecoveryEntry {
-                path: crate::repository::RepoPath::parse("saved.txt").unwrap(),
-                before: crate::repository::SavedEntry::Absent,
-                after: crate::repository::SavedEntry::Absent,
-                after_version: None, trash: None,
-            }],
-        });
-        app.discard_recoveries.insert(key.canonical_path.clone(), receipt(key.canonical_path.clone(), u64::MAX));
-        app.discard_recoveries.insert(other.clone(), receipt(other.clone(), u64::MAX));
-        app.sidebar_model.source_control.as_mut().unwrap().undo_discard_until_unix_ms = Some(u64::MAX);
+        let receipt = |worktree: PathBuf, until| {
+            Arc::new(crate::repository::DiscardRecovery {
+                worktree,
+                worktree_identity: (0, 0),
+                directories: std::collections::BTreeMap::new(),
+                expires_unix_ms: until,
+                entries: vec![crate::repository::DiscardRecoveryEntry {
+                    path: crate::repository::RepoPath::parse("saved.txt").unwrap(),
+                    before: crate::repository::SavedEntry::Absent,
+                    after: crate::repository::SavedEntry::Absent,
+                    after_version: None,
+                    trash: None,
+                }],
+            })
+        };
+        app.discard_recoveries.insert(
+            key.canonical_path.clone(),
+            receipt(key.canonical_path.clone(), u64::MAX),
+        );
+        app.discard_recoveries
+            .insert(other.clone(), receipt(other.clone(), u64::MAX));
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .undo_discard_until_unix_ms = Some(u64::MAX);
         // An old task must not consume a later receipt for the same checkout.
         drop(app.expire_discard_recovery(key.canonical_path.clone(), 0));
-        assert_eq!(app.discard_recoveries[&key.canonical_path].expires_unix_ms, u64::MAX);
+        assert_eq!(
+            app.discard_recoveries[&key.canonical_path].expires_unix_ms,
+            u64::MAX
+        );
         // An early wake (e.g. a wall-clock correction) preserves valid Undo.
         drop(app.expire_discard_recovery(key.canonical_path.clone(), u64::MAX));
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().undo_discard_until_unix_ms, Some(u64::MAX));
-        app.discard_recoveries.insert(key.canonical_path.clone(), receipt(key.canonical_path.clone(), 0));
-        app.sidebar_model.source_control.as_mut().unwrap().undo_discard_until_unix_ms = Some(0);
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
+        app.discard_recoveries.insert(
+            key.canonical_path.clone(),
+            receipt(key.canonical_path.clone(), 0),
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .undo_discard_until_unix_ms = Some(0);
         drop(app.expire_discard_recovery(key.canonical_path.clone(), 0));
         assert!(!app.discard_recoveries.contains_key(&key.canonical_path));
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().undo_discard_until_unix_ms, None);
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            None
+        );
         assert!(app.discard_recoveries.contains_key(&other));
         // Expiry in a background checkout cannot clear the rebound panel.
-        app.discard_recoveries.insert(key.canonical_path.clone(), receipt(key.canonical_path.clone(), 0));
+        app.discard_recoveries.insert(
+            key.canonical_path.clone(),
+            receipt(key.canonical_path.clone(), 0),
+        );
         let source = app.sidebar_model.source_control.as_mut().unwrap();
         source.key.canonical_path = other.clone();
         source.undo_discard_until_unix_ms = Some(u64::MAX);
         drop(app.expire_discard_recovery(key.canonical_path, 0));
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().undo_discard_until_unix_ms, Some(u64::MAX));
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .undo_discard_until_unix_ms,
+            Some(u64::MAX)
+        );
         assert!(app.discard_recoveries.contains_key(&other));
     }
-
 }

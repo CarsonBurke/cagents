@@ -51,7 +51,9 @@ mod stash_mutations;
 
 #[path = "repository_recovery.rs"]
 mod recovery;
-pub use recovery::{DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt};
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt,
+};
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
@@ -5770,8 +5772,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ///
     /// Confirmation is required. Selected directories are refused; directories
     /// emptied by removed files are pruned below the worktree root.
-    pub fn discard(&self, request: &DiscardRequest, cancellation: &CancellationToken) -> Result<MutationOutcome, RepositoryError> {
-        self.discard_recoverable(request, cancellation).map(|result| result.outcome)
+    pub fn discard(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recoverable(request, cancellation)
+            .map(|result| result.outcome)
     }
 
     fn discard_mutation(
@@ -5806,8 +5813,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
 
-        if let Err(reason) = recovery::verify_captured_versions(captured_root, captured_versions, cancellation) {
-            return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason } });
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
         }
         let mut applied = Vec::new();
         if !tracked.is_empty() {
@@ -5895,11 +5906,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 match recovery::trash_untracked(&root, path) {
                     Ok(receipt) => {
                         if let Some(receipt) = receipt {
-                            if let Some(reason) = receipt.warning.as_ref() { failures.push(MutationFailure::Path { path: path.clone(), reason: reason.clone() }); }
+                            if let Some(reason) = receipt.warning.as_ref() {
+                                failures.push(MutationFailure::Path {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
                             trashed.push(receipt);
                         }
                         applied.push(path.clone());
-                    },
+                    }
                     Err(failure) => failures.push(failure),
                 }
             }
@@ -7839,7 +7855,11 @@ mod tests {
             command: &CommandSpec,
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
-            if command.arguments.iter().any(|argument| argument == "hash-object") {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "hash-object")
+            {
                 return SystemProcessExecutor.execute(command, _cancellation);
             }
             self.commands.lock().unwrap().push(command.clone());
@@ -10245,7 +10265,10 @@ mod tests {
             }
         );
         assert!(!worktree.path().join("keep/file.txt").exists());
-        assert!(!worktree.path().join("keep").exists(), "discard prunes the newly empty parent");
+        assert!(
+            !worktree.path().join("keep").exists(),
+            "discard prunes the newly empty parent"
+        );
     }
 
     #[cfg(unix)]
@@ -10352,8 +10375,11 @@ mod tests {
         // deletion the loop above was racing really happens, rather than being
         // refused every time.
         if let Ok(metadata) = fs::symlink_metadata(&active) {
-            if metadata.file_type().is_symlink() { fs::remove_file(&active).unwrap(); }
-            else { fs::remove_dir_all(&active).unwrap(); }
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(&active).unwrap();
+            } else {
+                fs::remove_dir_all(&active).unwrap();
+            }
         }
         fs::create_dir_all(&parked_directory).unwrap();
         fs::rename(&parked_directory, &active).unwrap();
