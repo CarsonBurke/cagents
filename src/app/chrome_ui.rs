@@ -3,7 +3,10 @@ use crate::interaction::tooltip;
 
 /// Shape once when cached chrome changes, with the same font and size as the tab.
 pub(super) fn measure_tab_title(title: &str) -> f32 {
-    use iced::{Pixels, Size, advanced::text::{self, Paragraph as _}};
+    use iced::{
+        Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: title,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
@@ -18,7 +21,6 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     });
     paragraph.min_bounds().width
 }
-
 
 #[derive(Debug, Default)]
 pub(super) struct State {
@@ -64,7 +66,9 @@ mod tests {
     fn tab_fixture(count: usize, width: f32) -> Cagents {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.context_inspector_open = false;
-        let cards = (0..count).map(|_| super::super::tests::terminal_card_state()).collect();
+        let cards = (0..count)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
         Arc::make_mut(&mut app.durable).cards = cards;
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(width);
@@ -76,56 +80,129 @@ mod tests {
     fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
         let mut app = tab_fixture(30, 900.0);
         let (available, width) = app.tab_strip_geometry();
-        assert!(4.0 * (width + crate::tab_strip::SPACING)
-            + 2.0 * crate::tab_strip::EDGE_INSET <= available + 0.1);
+        assert!(
+            4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
+                <= available + 0.1
+        );
         let id = app.durable.cards[0].id;
-        app.chrome_ui.user_titles.insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
+        app.chrome_ui
+            .user_titles
+            .insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
         app.workspace.resize_viewport(1600.0);
         drop(app.sync_chrome());
         let (_, width) = app.tab_strip_geometry();
-        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 112.0);
+        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
     }
 
     #[test]
     fn plus_and_pane_list_stay_visible_when_thirty_tabs_overflow() {
-        use iced::advanced::{Layout, layout, widget::{Operation, Tree, operation::Focusable}};
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
         use iced::{Rectangle, Size};
         struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
         impl Operation for Bounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
             fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
-                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
             }
-            fn scrollable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: Rectangle,
-                _: iced::Vector, _: &mut dyn iced::advanced::widget::operation::Scrollable) {
-                if id == Some(&widget::Id::new("workspace.tabs")) { self.1 = Some(bounds); }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.1 = Some(bounds);
+                }
             }
-            fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
-                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
             }
         }
         let renderer = super::super::tests::headless_renderer();
-        for width in [900.0, 1600.0] {
+        for width in [640.0, 900.0, 1600.0] {
             let app = tab_fixture(30, width);
-            let mut element = app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut element =
+                app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
             let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(&mut tree, &renderer,
-                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)),
+            );
             let mut bounds = Bounds(HashMap::new(), None);
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
-            if width == 900.0 {
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width <= 900.0 {
                 let viewport = bounds.1.expect("native tab viewport");
-                let visible = app.workspace.order().filter(|id| {
-                    let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
-                    tab.x >= viewport.x && tab.x + tab.width <= viewport.x + viewport.width + 0.1
-                }).count();
-                assert!(visible >= 4, "only {visible} complete tabs fit in {viewport:?}");
+                let visible = app
+                    .workspace
+                    .order()
+                    .filter(|id| {
+                        let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                        tab.x >= viewport.x
+                            && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                    })
+                    .count();
+                assert!(
+                    visible >= 4,
+                    "only {visible} complete tabs fit in {viewport:?}"
+                );
             }
             for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
                 let rect = bounds.0.get(id).unwrap_or_else(|| panic!("missing {id}"));
-                assert!(rect.width > 0.0 && rect.x >= 0.0 && rect.x + rect.width <= width + 0.1,
-                    "{id} outside {width}px header: {rect:?}");
+                assert!(
+                    rect.width > 0.0 && rect.x >= 0.0 && rect.x + rect.width <= width + 0.1,
+                    "{id} outside {width}px header: {rect:?}"
+                );
             }
+        }
+    }
+
+    #[test]
+    fn new_terminal_after_worktree_move_keeps_existing_numbers_distinct() {
+        let mut app = tab_fixture(3, 1600.0);
+        let moved = PathBuf::from("/moved-worktree");
+        for card in &app.durable.cards {
+            app.worktree_owners.insert(card.id, moved.clone());
+        }
+        let card = super::super::tests::terminal_card_state();
+        let added = card.id;
+        app.worktree_owners.insert(added, moved);
+        Arc::make_mut(&mut app.durable).cards.insert(0, card);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(app.card_chrome[&added].title.ends_with("(4)"));
+    }
+
+    #[test]
+    fn reported_terminal_titles_keep_osc_precedence_over_launch_fallbacks() {
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        if let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind {
+            session.launch.working_directory = PathBuf::from("/repo/alpha");
+        }
+        for reported in ["alpha", "Terminal", "/repo/alpha"] {
+            app.apply_reported_title(id, reported.into());
+            drop(app.sync_chrome());
+            assert_eq!(app.card_chrome[&id].title, format!("{reported} (1)"));
+            assert!(app.core.window.header_title.starts_with(reported));
         }
     }
 
@@ -135,6 +212,13 @@ mod tests {
         let survivor = app.durable.cards[2].id;
         let before = app.card_chrome[&survivor].title.clone();
         assert!(before.ends_with("(3)"), "{before}");
+        assert!(
+            app.card_chrome[&survivor]
+                .compact_title
+                .as_deref()
+                .unwrap()
+                .starts_with("3 ")
+        );
         Arc::make_mut(&mut app.durable).cards.remove(0);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.sync_chrome());
@@ -853,8 +937,12 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -1630,10 +1718,13 @@ impl Cagents {
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             let total = self.workspace.cards().len();
-            let current = self.workspace.focused()
+            let current = self
+                .workspace
+                .focused()
                 .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
                 .map_or(0, |index| index + 1);
-            2.0 * ICON_CONTROL_SIZE + 2.0 * space::XXS
+            2.0 * ICON_CONTROL_SIZE
+                + 2.0 * space::XXS
                 + (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
                     .max(design::PANE_NAVIGATOR_MIN_WIDTH)
         } else {
@@ -1677,15 +1768,18 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        let available = (self.workspace.viewport_width() - self.workspace_header_width()
-            - design::PRIMARY_CONTROL_SIZE - space::XXS).max(0.0);
+        let available = (self.workspace.viewport_width()
+            - self.workspace_header_width()
+            - design::PRIMARY_CONTROL_SIZE
+            - space::XXS)
+            .max(0.0);
         // Reordering uses one shared width. Derive that width from the titles
         // instead of giving every agent the same eight-character title budget.
         let desired = self
             .workspace
             .order()
             .filter_map(|id| self.card_chrome.get(&id))
-            .map(|chrome| chrome.title_width + 112.0)
+            .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
         let width = if self.workspace.viewport_width() > 0.0
@@ -1694,9 +1788,15 @@ impl Cagents {
             // Four short titles remain reachable even beside the sidebar;
             // the pinned pane list carries the complete title and status.
             let visible = self.workspace.order().count().clamp(1, 4) as f32;
-            let fitting = (available / visible - crate::tab_strip::SPACING
-                - 2.0 * crate::tab_strip::EDGE_INSET / visible).max(56.0);
-            if visible < 4.0 { desired.min(fitting) } else { fitting.min(112.0) }
+            let fitting = (available / visible
+                - crate::tab_strip::SPACING
+                - 2.0 * crate::tab_strip::EDGE_INSET / visible)
+                .max(56.0);
+            if visible < 4.0 {
+                desired.min(fitting)
+            } else {
+                fitting.min(112.0)
+            }
         } else {
             desired
         };
@@ -1722,8 +1822,8 @@ impl Cagents {
             return Task::none();
         }
         let pitch = width + crate::tab_strip::SPACING;
-        let content = self.workspace.order().count() as f32 * pitch
-            + 2.0 * crate::tab_strip::EDGE_INSET;
+        let content =
+            self.workspace.order().count() as f32 * pitch + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
             // Everything fits; any offset at all would be wrong.
@@ -1788,7 +1888,10 @@ impl Cagents {
         let tabs = widget::row::with_children(vec![
             widget::container(tabs).width(Length::Fill).into(),
             self.new_tab_control(),
-        ]).spacing(space::XXS).align_y(Alignment::Center).width(Length::Fill);
+        ])
+        .spacing(space::XXS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
         let header = self.native_header(
             tabs.into(),
             Some(actions.into()),
@@ -1982,20 +2085,41 @@ impl Cagents {
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
-        let title_control = widget::button::custom(
-            widget::row::with_children(vec![
-                self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-                design::body(title)
+        let compact = width < design::TAB_MIN_WIDTH;
+        let suffix = (!compact)
+            .then(|| chrome.and_then(|chrome| chrome.terminal_ordinal_suffix.as_deref()))
+            .flatten();
+        let visible_title = if compact {
+            chrome
+                .and_then(|chrome| chrome.compact_title.as_deref())
+                .unwrap_or(title)
+        } else {
+            suffix
+                .and_then(|suffix| title.strip_suffix(suffix))
+                .unwrap_or(title)
+        };
+        let mut title_children = vec![
+            self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
+            design::body(visible_title)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(suffix) = suffix {
+            title_children.push(
+                design::caption(suffix.trim())
                     .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
                     .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
+            );
+        }
+        let title_control = widget::button::custom(
+            widget::row::with_children(title_children)
+                .spacing(if compact { space::XS } else { space::S })
+                .align_y(Alignment::Center)
+                .height(Length::Fill),
         )
         .id(focus_id)
         .name(chrome.map_or_else(
@@ -2040,7 +2164,9 @@ impl Cagents {
             }
             _ => None,
         };
-        if let Some((label, busy)) = status {
+        if let Some((label, busy)) = status
+            && (!compact || self.sidebar_state.card_attention(id).is_none())
+        {
             let indicator: Element<'_, Message> = if busy {
                 crate::ui_controls::activity_spinner(
                     design::TAB_STATUS_ICON_SIZE as f32,
@@ -2055,32 +2181,16 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if self.sidebar_state.has_card_update(id) {
-            children.push(tooltip(
-                Icon::Attention
-                    .handle()
-                    .icon()
-                    .size(design::TAB_STATUS_ICON_SIZE),
-                "Needs attention",
-            ));
-        } else if let Some(activity) = self.sidebar_state.card_activity(id) {
-            match activity.state {
-                crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner(
-                        design::TAB_STATUS_ICON_SIZE as f32,
-                        design::warning_color,
-                    ),
-                    "Working",
-                )),
-                crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    Icon::Warning,
-                    "Waiting for input",
-                    sidebar::BadgeTone::Warning,
-                )),
-                _ => {}
-            }
+        if let Some(indicator) = sidebar::outcome_indicator(
+            self.sidebar_state
+                .card_activity(id)
+                .map(|activity| activity.state),
+            self.sidebar_state.has_card_update(id),
+            self.sidebar_state.card_outcome(id),
+        ) {
+            children.push(indicator);
         }
-        if focused && self.chat_switch_available(id) {
+        if focused && !compact && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);
             let ready = blocker.is_none();
             children.push(command(
@@ -2094,7 +2204,7 @@ impl Cagents {
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if focused || self.chrome_ui.hovered_tab == Some(id) {
+        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
             children.push(command(
                 Icon::Close,
                 {
@@ -2128,7 +2238,10 @@ impl Cagents {
                     .width(Length::Fill),
             )
             .padding([0.0, space::XS])
-            .id(chrome.map_or_else(|| card_control_id(id, "tab"), |chrome| chrome.tab_id.clone()))
+            .id(chrome.map_or_else(
+                || card_control_id(id, "tab"),
+                |chrome| chrome.tab_id.clone(),
+            ))
             .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {

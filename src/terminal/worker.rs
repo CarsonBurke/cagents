@@ -2751,12 +2751,18 @@ impl Worker {
     /// OSC titles win. Shells that do not publish one still expose the
     /// foreground command through the PTY owner's existing observation timer.
     fn publish_fallback_title(&mut self) {
-        if self.terminal.title().is_some_and(|title| !title.trim().is_empty()) {
+        if self
+            .terminal
+            .title()
+            .is_some_and(|title| !title.trim().is_empty())
+        {
             return;
         }
         let group = self.foreground_group();
         let title = foreground_process_title(group, &self.launch);
-        if self.foreground_group() != group { return; }
+        if self.foreground_group() != group {
+            return;
+        }
         if title != self.display_title {
             self.display_title = title.clone();
             self.emit(TerminalEvent::TitleChanged(title));
@@ -3007,14 +3013,23 @@ fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -
     if let Some(group) = group.filter(|group| *group > 0) {
         // The group comes from this PTY's tcgetpgrp, never an untrusted title.
         // Two bounded reads avoid a process-tree scan for ordinary shells.
-        process = std::fs::read_to_string(format!("/proc/{group}/comm")).ok()
+        process = std::fs::read_to_string(format!("/proc/{group}/comm"))
+            .ok()
             .and_then(|name| crate::names::normalize_card_name(name.trim()));
         directory = std::fs::read_link(format!("/proc/{group}/cwd")).ok();
     }
-    let process = process.unwrap_or_else(|| std::path::Path::new(&launch.program)
-        .file_name().unwrap_or_default().to_string_lossy().into_owned());
+    let process = process.unwrap_or_else(|| {
+        std::path::Path::new(&launch.program)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
     let directory = directory.as_deref().unwrap_or(&launch.working_directory);
-    let basename = directory.file_name().unwrap_or(directory.as_os_str()).to_string_lossy();
+    let basename = directory
+        .file_name()
+        .unwrap_or(directory.as_os_str())
+        .to_string_lossy();
     format!("{process} · {basename}")
 }
 
@@ -3898,7 +3913,10 @@ mod tests {
     fn fallback_process_title_uses_launch_when_foreground_is_unavailable() {
         let mut launch = LaunchRecipe::shell(PathBuf::from("/repo/alpha")).unwrap();
         launch.program = "/usr/bin/fish".into();
-        assert_eq!(super::foreground_process_title(None, &launch), "fish · alpha");
+        assert_eq!(
+            super::foreground_process_title(None, &launch),
+            "fish · alpha"
+        );
     }
 
     #[test]

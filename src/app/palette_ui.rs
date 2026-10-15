@@ -205,14 +205,27 @@ impl Cagents {
     }
 
     fn pane_attention_label(&self, card: CardId) -> &'static str {
-        if self.sidebar_state.has_card_update(card) {
-            "Unread"
-        } else {
-            match self.sidebar_state.card_activity(card).map(|activity| activity.state) {
-                Some(crate::agent::ActivityState::Working) => "Working",
-                Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
-                _ => "Idle",
+        use sidebar::AttentionState;
+        let unread = self.sidebar_state.has_card_update(card);
+        match self.sidebar_state.card_attention(card) {
+            Some(AttentionState::Working) if unread => "Working · Unread",
+            Some(AttentionState::Working) => "Working",
+            Some(AttentionState::Waiting) => "Waiting for input",
+            Some(AttentionState::Failed) => self
+                .sidebar_state
+                .card_outcome(card)
+                .map_or("Failed", crate::agent::ActivityOutcome::label),
+            Some(AttentionState::Cancelled) => "Cancelled",
+            Some(AttentionState::Unread)
+                if matches!(
+                    self.sidebar_state.card_outcome(card),
+                    Some(crate::agent::ActivityOutcome::Cancelled)
+                ) =>
+            {
+                "Cancelled · Unread"
             }
+            Some(AttentionState::Unread) => "Unread",
+            None => "Idle",
         }
     }
 
@@ -236,11 +249,11 @@ impl Cagents {
             entries.clear();
         }
         if !self.palette.panes_only {
-        entries.push((
-            "Resume conversation".into(),
-            "Search saved native chats".into(),
-            Message::ResumeConversation(resume_ui::Action::Open),
-        ));
+            entries.push((
+                "Resume conversation".into(),
+                "Search saved native chats".into(),
+                Message::ResumeConversation(resume_ui::Action::Open),
+            ));
         }
         for id in self.workspace.order() {
             if let Some(card) = self.card_state(id) {
@@ -255,28 +268,28 @@ impl Cagents {
             }
         }
         if !self.palette.panes_only {
-        for project in &self.sidebar_model.projects {
-            for channel in &project.channels {
-                entries.push((
-                    format!("Open channel: {} · {}", channel.title, project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenChannel {
-                        channel_id: channel.id,
-                    }),
-                ));
+            for project in &self.sidebar_model.projects {
+                for channel in &project.channels {
+                    entries.push((
+                        format!("Open channel: {} · {}", channel.title, project.name),
+                        String::new(),
+                        Message::Sidebar(SidebarAction::OpenChannel {
+                            channel_id: channel.id,
+                        }),
+                    ));
+                }
+                for worktree in &project.worktrees {
+                    entries.push((
+                        format!("Open workspace: {} · {}", worktree.label(), project.name),
+                        String::new(),
+                        Message::Sidebar(SidebarAction::OpenWorktree {
+                            project_id: project.id,
+                            worktree_id: worktree.id,
+                            path: worktree.path.clone(),
+                        }),
+                    ));
+                }
             }
-            for worktree in &project.worktrees {
-                entries.push((
-                    format!("Open workspace: {} · {}", worktree.label(), project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenWorktree {
-                        project_id: project.id,
-                        worktree_id: worktree.id,
-                        path: worktree.path.clone(),
-                    }),
-                ));
-            }
-        }
         }
         let query = self
             .palette
@@ -307,26 +320,48 @@ impl Cagents {
             );
         }
         let query = self.palette.query.as_ref()?;
-        let input =
-            crate::ui_controls::field::search(
-                if self.palette.panes_only { "Search open panes" } else { "Search commands, panes and workspaces" }, query)
-                .id(widget::Id::new("palette.query"))
-                .on_input(|query| Message::Palette(Action::Query(query)));
+        let input = crate::ui_controls::field::search(
+            if self.palette.panes_only {
+                "Search open panes"
+            } else {
+                "Search commands, panes and workspaces"
+            },
+            query,
+        )
+        .id(widget::Id::new("palette.query"))
+        .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
             .map(|(index, (label, chord, message))| {
-                let pane = match &message { Message::FocusCard(card) => Some(*card), _ => None };
+                let pane = match &message {
+                    Message::FocusCard(card) => Some(*card),
+                    _ => None,
+                };
                 let mut children = Vec::new();
                 if let Some(card) = pane {
-                    children.push(self.card_icon(card).icon().size(design::ROW_ICON_SIZE).into());
+                    children.push(
+                        self.card_icon(card)
+                            .icon()
+                            .size(design::ROW_ICON_SIZE)
+                            .into(),
+                    );
+                    if let Some(indicator) = sidebar::outcome_indicator(
+                        self.sidebar_state
+                            .card_activity(card)
+                            .map(|activity| activity.state),
+                        self.sidebar_state.has_card_update(card),
+                        self.sidebar_state.card_outcome(card),
+                    ) {
+                        children.push(indicator);
+                    }
                 }
                 children.push(design::body(label).width(Length::Fill).into());
                 children.push(design::caption(chord).into());
                 let row = widget::row::with_children(children)
-                .spacing(space::M)
-                .align_y(Alignment::Center);
+                    .spacing(space::M)
+                    .align_y(Alignment::Center);
                 let button = if index == self.palette.selected {
                     widget::button::custom(row).class(cosmic::theme::Button::Suggested)
                 } else {
@@ -339,16 +374,31 @@ impl Cagents {
                     .into();
                 if self.palette.panes_only {
                     if let Some(card) = pane {
-                        return widget::row::with_children(vec![focus,
-                            super::chrome_ui::command(Icon::Close, "Close pane", widget::Id::new(format!("pane-list.close.{card}")), Some(Message::Palette(Action::ClosePane(card))))
-                        ]).align_y(Alignment::Center).into();
+                        return widget::row::with_children(vec![
+                            focus,
+                            super::chrome_ui::command(
+                                Icon::Close,
+                                "Close pane",
+                                widget::Id::new(format!("pane-list.close.{card}")),
+                                Some(Message::Palette(Action::ClosePane(card))),
+                            ),
+                        ])
+                        .align_y(Alignment::Center)
+                        .into();
                     }
                 }
                 focus
             })
             .collect();
         let rows = if rows.is_empty() {
-            widget::column::with_children(vec![design::caption(if self.palette.panes_only { "No matching panes" } else { "No matching commands" }).into()])
+            widget::column::with_children(vec![
+                design::caption(if self.palette.panes_only {
+                    "No matching panes"
+                } else {
+                    "No matching commands"
+                })
+                .into(),
+            ])
         } else {
             widget::column::with_children(rows)
         };
@@ -686,13 +736,63 @@ impl ShortcutDraft {
 mod tests {
 
     #[test]
+    fn pane_list_uses_shared_attention_ranking_and_preserves_unread_work() {
+        use crate::agent::{Activity, ActivityOutcome, ActivityState, Provider};
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.set_card_activity(
+            card,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Working,
+            },
+        );
+        app.sidebar_state.observe_card_update(card);
+        assert_eq!(app.pane_attention_label(card), "Working · Unread");
+        app.sidebar_state.set_card_outcome(
+            card,
+            Some(ActivityOutcome::Failed {
+                reason: "exit3".into(),
+            }),
+        );
+        assert_eq!(app.pane_attention_label(card), "Failed");
+        app.sidebar_state.set_card_outcome(
+            card,
+            Some(ActivityOutcome::Interrupted {
+                reason: "no final result".into(),
+            }),
+        );
+        assert_eq!(app.pane_attention_label(card), "Interrupted");
+        app.sidebar_state.set_card_activity(
+            card,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Waiting,
+            },
+        );
+        assert_eq!(app.pane_attention_label(card), "Waiting for input");
+        app.sidebar_state.set_card_activity(
+            card,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Idle,
+            },
+        );
+        app.sidebar_state
+            .set_card_outcome(card, Some(ActivityOutcome::Cancelled));
+        assert_eq!(app.pane_attention_label(card), "Cancelled · Unread");
+    }
+
+    #[test]
     fn pane_list_filters_selects_and_focuses_the_chosen_pane() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let cards: Vec<_> = (1..=20).map(|index| {
-            let mut card = crate::app::tests::terminal_card_state();
-            card.title = format!("Pane {index}");
-            card
-        }).collect();
+        let cards: Vec<_> = (1..=20)
+            .map(|index| {
+                let mut card = crate::app::tests::terminal_card_state();
+                card.title = format!("Pane {index}");
+                card
+            })
+            .collect();
         let chosen = cards[13].id;
         Arc::make_mut(&mut app.durable).cards = cards;
         app.workspace = Cagents::rebuild_workspace(&app.durable);
