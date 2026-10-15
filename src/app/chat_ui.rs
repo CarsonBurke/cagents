@@ -4672,6 +4672,8 @@ impl Cagents {
         self.notices
             .resolve_target("daemon-interrupted-turns", card);
         self.notices.resolve_target("daemon-chat-reconnect", card);
+        self.notices.resolve_target("workspace-session-visibility", card);
+        self.notices.resolve_target("workspace-browser-visibility", card);
         self.cancel_chat_reconnect(card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
@@ -5277,12 +5279,8 @@ impl Cagents {
             let key = "daemon-interrupted-turns";
             // A second transport loss must retain earlier chats that have not
             // received a successful user command or been dismissed yet.
-            let mut targets = self
-                .notices
-                .entries
-                .iter()
-                .filter(|entry| entry.notice.key.as_deref() == Some(key))
-                .flat_map(|entry| entry.notice.targets.iter().copied())
+            let mut targets = self.notices.condition_targets(key)
+                .into_iter()
                 .chain(batch.interrupted)
                 .collect::<Vec<_>>();
             targets.sort();
@@ -5291,12 +5289,8 @@ impl Cagents {
         }
         if !batch.failed.is_empty() {
             let key = "daemon-chat-reconnect";
-            let mut targets = self
-                .notices
-                .entries
-                .iter()
-                .filter(|entry| entry.notice.key.as_deref() == Some(key))
-                .flat_map(|entry| entry.notice.targets.iter().copied())
+            let mut targets = self.notices.condition_targets(key)
+                .into_iter()
                 .chain(batch.failed)
                 .collect::<Vec<_>>();
             targets.sort();
@@ -5310,10 +5304,10 @@ impl Cagents {
             );
         }
         if batch.reconnected > 0 {
-            self.status = Some(
+            self.notices.record(
                 TransientNotice::success(format!(
-                    "Daemon reconnected {} chats.",
-                    batch.reconnected
+                    "Daemon reconnected {} {}.",
+                    batch.reconnected, if batch.reconnected == 1 { "chat" } else { "chats" }
                 ))
                 .key("daemon-connectivity"),
             );
@@ -13024,6 +13018,39 @@ mod tests {
     }
 
     #[test]
+    fn mixed_reconnect_batch_has_one_counted_visible_summary_including_visibility_failure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let interrupted = live_chat(&mut app, Some(KNOWN_THREAD));
+        let failed = live_chat(&mut app, Some(KNOWN_THREAD));
+        let healthy = live_chat(&mut app, Some(KNOWN_THREAD));
+        for card in [interrupted, failed, healthy] {
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target).unwrap().disconnected = true;
+            app.begin_chat_reconnect(target);
+        }
+        // The same failed view must not be double-counted when its visibility
+        // update and its attachment both fail in this recovery episode.
+        app.notices.workspace_visibility_result(vec![(failed, "terminal worker has closed".into())]);
+        app.finish_chat_reconnect(interrupted, true, Some(&crate::agent::ActivityOutcome::Interrupted {
+            reason: "Fixture interrupted turn".into(),
+        }));
+        app.finish_chat_reconnect(failed, false, None);
+        app.finish_chat_reconnect(healthy, true, None);
+        assert!(app.chat_ui.reconnecting.is_none());
+        assert_eq!(app.notices.len(), 1);
+        let notice = &app.notices.recent().next().unwrap().notice;
+        assert_eq!(notice.key.as_deref(), Some("daemon-session-recovery"));
+        assert!(notice.message.contains("Daemon reconnected 2 chats."));
+        assert!(notice.message.contains("1 chat has interrupted turns."));
+        assert!(notice.message.contains("1 session view needs reconnection."));
+        assert_eq!(notice.targets.len(), 2);
+        assert!(notice.targets.contains(&interrupted));
+        assert!(notice.targets.contains(&failed));
+        assert!(notice.details.as_ref().unwrap().contains("worker has closed"));
+        assert!(!notice.message.contains("could not update workspace visibility"));
+    }
+
+    #[test]
     fn reconnect_batches_retain_unresolved_interruption_targets_across_later_failures() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let first = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -13045,13 +13072,7 @@ mod tests {
         );
         let key = "daemon-interrupted-turns";
         assert_eq!(
-            app.notices
-                .entries
-                .iter()
-                .find(|entry| entry.notice.key.as_deref() == Some(key))
-                .unwrap()
-                .notice
-                .targets,
+            app.notices.condition(key).unwrap().targets,
             vec![first]
         );
         app.begin_chat_reconnect(chat_runtime(&app, second).target);
@@ -13068,33 +13089,16 @@ mod tests {
             "wait for every affected chat"
         );
         app.finish_chat_reconnect(failed, false, None);
-        let warning = app
-            .notices
-            .entries
-            .iter()
-            .find(|entry| entry.notice.key.as_deref() == Some(key))
-            .unwrap();
-        assert_eq!(warning.notice.targets.len(), 2);
-        assert!(warning.notice.targets.contains(&first));
-        assert!(warning.notice.targets.contains(&second));
+        let warning = app.notices.condition(key).unwrap();
+        assert_eq!(warning.targets.len(), 2);
+        assert!(warning.targets.contains(&first));
+        assert!(warning.targets.contains(&second));
         assert!(
-            app.notices
-                .entries
-                .iter()
-                .any(
-                    |entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect")
-                        && entry.notice.targets == vec![failed]
-                )
+            app.notices.condition_targets("daemon-chat-reconnect") == vec![failed]
         );
         app.notices.resolve_target(key, first);
         assert_eq!(
-            app.notices
-                .entries
-                .iter()
-                .find(|entry| entry.notice.key.as_deref() == Some(key))
-                .unwrap()
-                .notice
-                .targets,
+            app.notices.condition(key).unwrap().targets,
             vec![second]
         );
     }
@@ -13115,14 +13119,7 @@ mod tests {
         for (index, succeeded) in [(0, false), (1, true), (2, false)] {
             app.begin_chat_reconnect(chat_runtime(&app, cards[index]).target);
             app.finish_chat_reconnect(cards[index], succeeded, None);
-            let targets = &app
-                .notices
-                .entries
-                .iter()
-                .find(|entry| entry.notice.key.as_deref() == Some(key))
-                .unwrap()
-                .notice
-                .targets;
+            let targets = &app.notices.condition(key).unwrap().targets;
             assert!(
                 targets.contains(&cards[0]),
                 "another chat's success/failure cannot erase this failure"
@@ -13132,21 +13129,12 @@ mod tests {
         assert!(app.chat_ui.reconnecting.is_none());
         app.finish_chat_reconnect(cards[0], true, None);
         assert_eq!(
-            app.notices
-                .entries
-                .iter()
-                .find(|entry| entry.notice.key.as_deref() == Some(key))
-                .unwrap()
-                .notice
-                .targets,
+            app.notices.condition(key).unwrap().targets,
             vec![cards[2]]
         );
         app.chat_discard(cards[2]);
         assert!(
-            !app.notices
-                .entries
-                .iter()
-                .any(|entry| entry.notice.key.as_deref() == Some(key))
+            app.notices.condition(key).is_none()
         );
     }
 
@@ -13175,9 +13163,7 @@ mod tests {
                 app.begin_chat_reconnect(target);
                 app.finish_chat_reconnect(card, true, outcome.as_ref());
                 assert_eq!(
-                    app.notices.entries.iter().any(
-                        |entry| entry.notice.key.as_deref() == Some("daemon-interrupted-turns")
-                    ),
+                    app.notices.condition("daemon-interrupted-turns").is_some(),
                     matches!(
                         outcome,
                         Some(crate::agent::ActivityOutcome::Interrupted { .. })
@@ -13273,7 +13259,7 @@ mod tests {
             Err(chat::StartFailure::retry("fixture: executable unavailable")),
         );
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
-        app.notices.entries.clear();
+        app.notices.clear();
         card
     }
 
@@ -13541,7 +13527,7 @@ mod tests {
             "a conversation that may still run is reported"
         );
         assert!(!app.chat_ui.transition_pending());
-        app.notices.entries.clear();
+        app.notices.clear();
         close_chat(&mut app, card);
         assert!(
             app.chat_ui.retiring.is_empty(),
@@ -13644,7 +13630,7 @@ mod tests {
             target,
             Wake::Disconnected("fixture: daemon went away".into()),
         )));
-        app.notices.entries.clear();
+        app.notices.clear();
         close_chat(&mut app, card);
         assert!(
             app.chat_ui.retiring.is_empty(),
@@ -14701,7 +14687,7 @@ mod tests {
         )));
         assert!(terminal_cards(&app).is_empty());
         assert!(!errors(&app).is_empty(), "the refusal says why");
-        app.notices.entries.clear();
+        app.notices.clear();
         // The queued close retains ownership until the daemon proves cleanup.
         assert_eq!(app.workspace.pending_close(), None);
         let _ = app.update(Message::CommitClose(card));
@@ -15086,7 +15072,7 @@ mod tests {
         assert!(app.chat_ui.abandoned.is_empty());
         assert!(app.chat_ui.retiring.is_empty());
         app.workspace.cancel_close(other).unwrap();
-        app.notices.entries.clear();
+        app.notices.clear();
         app.status = None;
         close_chat(&mut app, card);
     }
@@ -16070,7 +16056,7 @@ mod tests {
             app.card_state_mut(card).unwrap().title = "Title edited while committing".into();
             app.persist();
             if close_before_ack {
-                app.notices.entries.clear();
+                app.notices.clear();
                 close_chat(&mut app, card);
                 let reply = account_commit_reply(task);
                 let _ = app.update(reply);
