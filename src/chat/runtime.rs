@@ -634,6 +634,7 @@ impl LocalHandle {
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
+                    waiting_fingerprint: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     started: Instant::now(),
@@ -2348,6 +2349,7 @@ struct Actor {
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
+    waiting_fingerprint: Option<String>,
     last_present: Instant,
     first_frame: bool,
     started: Instant,
@@ -3317,6 +3319,13 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
+        let frame_context = {
+            let state = self.state.lock().unwrap_or_else(|p|p.into_inner());
+            super::notification::FrameContext::capture(&state)
+        };
+        // Project once before storage or callbacks; both successful reduction
+        // and direct semantic fallback consume this SAME immutable queue.
+        let mut frame_contents = frame_context.project(&step.events);
         // A presentation-cache failure cannot erase a provider's already
         // decoded final outcome later in this same frame. Keep processing
         // bounded semantic proof, then return the original cache error.
@@ -3351,6 +3360,10 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
+            if matches!(&event, Event::Item(_) | Event::TextDelta { .. }) {
+                let mut state = self.state.lock().unwrap_or_else(|p|p.into_inner());
+                Arc::make_mut(&mut state.notification_preview).observe(&event);
+            }
             // Clone only small semantic fields, never transcript/tool data.
             let authority = matches!(
                 &event,
@@ -3381,12 +3394,14 @@ impl Actor {
                 Some(events) if events.is_empty() => self.touch(),
                 Some(events) => {
                     for event in events {
-                        self.apply(event);
+                        let content = matches!(&event,Event::TurnFinished {..}).then(||frame_contents.pop_front()).flatten();
+                        self.apply_with_attention(event, content);
                     }
                 }
                 None => {
                     if let Some(event) = authority {
-                        self.apply(event);
+                        let content = matches!(&event,Event::TurnFinished {..}).then(||frame_contents.pop_front()).flatten();
+                        self.apply_with_attention(event, content);
                     }
                 }
             }
@@ -3443,7 +3458,14 @@ impl Actor {
             None => Ok(()),
         }
     }
+    fn publish_current_attention(&self,evidence:crate::notifications::Evidence) {
+        let content=self.state.lock().unwrap_or_else(|p|p.into_inner()).notification_content(evidence.kind);
+        (self.notify)(Update::AttentionContext { evidence,content:Some(content) });
+    }
     fn apply(&mut self, event: Event) {
+        self.apply_with_attention(event,None);
+    }
+    fn apply_with_attention(&mut self,event:Event,content:Option<crate::notifications::Content>) {
         if matches!(&event, Event::PastTurnFinished { .. }) {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::PastAttention(evidence));
@@ -3486,7 +3508,7 @@ impl Actor {
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
         ) {
             if let Some(evidence) = self.attention.apply(&event) {
-                (self.notify)(Update::Attention(evidence));
+                (self.notify)(Update::AttentionContext { evidence,content });
             }
             if matches!(event, Event::TurnSettled) {
                 return;
@@ -3557,6 +3579,9 @@ impl Actor {
         let activity = state.activity();
         let outcome = state.outcome.clone();
         let generation = state.generation;
+        let waiting_fingerprint=if activity==ActivityState::Waiting {state.waiting_fingerprint()}else{None};
+        let waiting_changed=waiting_fingerprint!=self.waiting_fingerprint;
+        self.waiting_fingerprint=waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
         drop(state);
@@ -3568,12 +3593,12 @@ impl Actor {
             if let Some((run, update)) = self.execution.activity(activity) {
                 (self.notify)(Update::Execution { run, update });
             }
-            if activity == ActivityState::Waiting && baselined {
-                (self.notify)(Update::Attention(crate::notifications::Evidence {
-                    key: format!("{}:waiting:{generation}", self.attention.key),
-                    kind: crate::notifications::Kind::Waiting,
-                }));
-            }
+        }
+        if activity==ActivityState::Waiting && baselined && (activity_changed || waiting_changed) {
+            self.publish_current_attention(crate::notifications::Evidence {
+                key:format!("{}:waiting:{generation}",self.attention.key),
+                kind:crate::notifications::Kind::Waiting,
+            });
         }
         // Outcomes can change without an activity transition (e.g. idle death).
         if activity_changed || outcome_changed {
@@ -3832,6 +3857,7 @@ fn recover_history_error(
 }
 
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
+    Arc::make_mut(&mut state.notification_preview).observe(&event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -4668,7 +4694,7 @@ mod tests {
         let evidence = updates
             .iter()
             .filter_map(|update| match update {
-                Update::Attention(evidence) => Some(evidence),
+                Update::Attention(evidence) | Update::AttentionContext {evidence,..} => Some(evidence),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4678,6 +4704,9 @@ mod tests {
             "known success must not be replaced by a cache-error failure alert"
         );
         assert_eq!(evidence[0].kind, crate::notifications::Kind::Succeeded);
+        let contexts=updates.iter().filter_map(|update|match update {Update::AttentionContext {content:Some(content),..}=>Some(content),_=>None}).collect::<Vec<_>>();
+        assert_eq!(contexts.len(),1,"the direct semantic fallback preserves one immutable context");
+        assert_eq!(contexts[0].preview,"Exact final response","a failed cache must not fall back to partial or current-turn text");
         assert!(
             handle.failure().is_some(),
             "the transcript I/O failure remains visible independently of provider success"
