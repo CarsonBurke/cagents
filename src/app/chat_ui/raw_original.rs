@@ -534,6 +534,27 @@ mod tests {
         assert!(runtime.raw_original.loaded_leaves(&part.item_id).is_empty(),"old epoch cannot be exposed while replacement is pending");
         assert!(runtime.raw_original.loaded_leaves("unknown alias").is_empty());
     }
+    #[tokio::test]
+    async fn both_loaded_fields_keep_render_order_and_current_geometry_ownership() {
+        let input="{ \"input\": \"exact original\" }";let command="{ \"command\": \"full original call\" }";
+        let(mut runtime,input_part)=runtime_fixture(input);let mut command_part=input_part.clone();
+        command_part.field=RawSourceField::CommandCall;command_part.source_len=command.len();
+        command_part.metadata.representation=RawRepresentation::CommandMetadataJson;
+        Arc::make_mut(&mut runtime.snapshot).raw_source_parts.push(command_part.clone());sync(&mut runtime);
+        // Install in the opposite order; HashMap insertion is not display order.
+        for (part,text) in [(command_part,command),(input_part.clone(),input)] {
+            toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+            let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+            complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        }
+        let leaves=runtime.raw_original.loaded_leaves(&input_part.item_id);
+        assert_eq!(leaves.iter().map(Leaf::path).collect::<Vec<_>>(),vec![[10,0],[10,1]]);
+        assert_eq!(leaves.iter().map(|leaf|leaf.text.as_ref()).collect::<Vec<_>>(),vec![input,command]);
+        assert!(runtime.raw_original.item_matches(&input_part.item_id,|view|view.text.as_ref()==command));
+        assert!(!runtime.raw_original.item_matches("unrelated opaque alias",|_|true));
+        toggle(&mut runtime,&input_part.item_id,RawSourceField::CommandCall,false);
+        assert!(!runtime.raw_original.item_matches(&input_part.item_id,|view|view.text.as_ref()==command),"collapsed reader cannot resume another pending navigation");
+    }
     #[test]
     fn raw_prefix_checkpoints_follow_exact_display_bytes_including_utf8_and_newlines() {
         let text="λ\r\n".repeat(3000);let values=prefixes(&text);
