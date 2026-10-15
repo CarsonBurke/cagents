@@ -3559,31 +3559,37 @@ fn process_inner(
                 recipe,
                 last_exit: None,
             };
-            let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(host, chat_id, &continuation, terminal.clone())? {
+            let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(
+                host,
+                chat_id,
+                &continuation,
+                terminal.clone(),
+            )? {
                 Some(published) => published,
                 None => {
-                // Teardown is proved, so the terminal takes over the chat's lineage
-                // and whatever agents it started, unless another of its sessions runs.
-                if let Ok(registry) = super::agent_execution::registry(host) {
-                    registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .succeed(
-                            terminal_id,
-                            chat_id,
-                            session
-                                .terminal
-                                .as_ref()
-                                .and_then(|terminal| terminal.recovery_origin),
-                            |members| {
-                                host.lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .any_other_live(members, chat_id)
-                            },
-                        )
-                        .map_err(unavailable)?;
-                }
-                    let attempt = source_binding::mark_return_attempt(host, chat_id, &continuation)?;
+                    // Teardown is proved, so the terminal takes over the chat's lineage
+                    // and whatever agents it started, unless another of its sessions runs.
+                    if let Ok(registry) = super::agent_execution::registry(host) {
+                        registry
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .succeed(
+                                terminal_id,
+                                chat_id,
+                                session
+                                    .terminal
+                                    .as_ref()
+                                    .and_then(|terminal| terminal.recovery_origin),
+                                |members| {
+                                    host.lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .any_other_live(members, chat_id)
+                                },
+                            )
+                            .map_err(unavailable)?;
+                    }
+                    let attempt =
+                        source_binding::mark_return_attempt(host, chat_id, &continuation)?;
                     let published = super::state::spawn_terminal_view_owned_at_directory_attempt(
                         host, client, terminal,
                         crate::terminal_ipc::TerminalSpawnOptions { initially_visible: false, ..Default::default() },
@@ -3593,7 +3599,13 @@ fn process_inner(
                             unavailable("Terminal start failure belongs to another exact attempt; original custody retained")
                         } else { failure.error }
                     })?;
-                    source_binding::remember_return_worker(host, chat_id, &continuation, published.0.clone(), published.1.clone())?;
+                    source_binding::remember_return_worker(
+                        host,
+                        chat_id,
+                        &continuation,
+                        published.0.clone(),
+                        published.1.clone(),
+                    )?;
                     published
                 }
             };
@@ -3730,9 +3742,15 @@ fn process_inner(
                 result
             };
             super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-            if bound_close::close_unattempted(host, &source).map_err(unavailable)?.is_some() {
-                let snapshot = handle.snapshot(None).ok_or_else(|| unavailable(
-                    "The exact original owner closed, but its final transcript is unavailable"))?;
+            if bound_close::close_unattempted(host, &source)
+                .map_err(unavailable)?
+                .is_some()
+            {
+                let snapshot = handle.snapshot(None).ok_or_else(|| {
+                    unavailable(
+                        "The exact original owner closed, but its final transcript is unavailable",
+                    )
+                })?;
                 return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
             }
             handle.close_for_resume().map_err(unavailable)?;
@@ -3755,7 +3773,11 @@ fn process_inner(
                 (retained, state.native_closing.contains_key(&chat_id))
             };
             let closed_receipt = if retained.native_continuity.retains_provider() {
-                let proof = host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone();
+                let proof = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
                 // Receipt discovery reads the registry/filesystem. Keep the
                 // lifecycle claim, but release global HostState before I/O.
                 chat::native_holder::closed_source(&retained, &proof)

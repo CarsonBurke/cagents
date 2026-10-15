@@ -439,7 +439,8 @@ pub(super) fn restore(
     state.publish_chat_observer(id, identity.instance, observer_registration.stamp());
     state
         .native_sources
-        .install_reserved(publication, record.execution_instance).map_err(|error| error.message)?;
+        .install_reserved(publication, record.execution_instance)
+        .map_err(|error| error.message)?;
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);

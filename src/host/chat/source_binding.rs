@@ -48,68 +48,132 @@ struct ReturnTarget {
     reservation: Reservation,
     source: crate::model::TerminalSession,
     attempt: Option<crate::terminal::TerminalStartAttempt>,
-    published: Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>,
+    published: Option<(
+        crate::terminal_ipc::TerminalDescriptor,
+        crate::terminal::TerminalHandle,
+    )>,
 }
 impl History {
     fn ensure(&mut self, id: TerminalId) -> Result<(), ProtocolError> {
-        if self.entries.contains_key(&id) { return Ok(()); }
+        if self.entries.contains_key(&id) {
+            return Ok(());
+        }
         if self.entries.len() >= CAPACITY {
             let position = self.order.iter().position(|candidate| {
                 self.entries.get(candidate).is_some_and(|entry| {
                     entry.pending_handoff.is_none() && Arc::strong_count(&entry.pin) == 1
                 })
             }).ok_or_else(|| unavailable("Native history capacity is reserved by exact pending operations; no provider was changed"))?;
-            let old = self.order.remove(position).expect("selected bounded history entry");
+            let old = self
+                .order
+                .remove(position)
+                .expect("selected bounded history entry");
             self.entries.remove(&old);
         }
         self.order.push_back(id);
-        self.entries.insert(id, Entry {
-            pin: Arc::new(()), instance: uuid::Uuid::nil(), resource_epoch: uuid::Uuid::new_v4(),
-            unresolved: false, pending_handoff: None, learned_from: None, known: None,
-        });
+        self.entries.insert(
+            id,
+            Entry {
+                pin: Arc::new(()),
+                instance: uuid::Uuid::nil(),
+                resource_epoch: uuid::Uuid::new_v4(),
+                unresolved: false,
+                pending_handoff: None,
+                learned_from: None,
+                known: None,
+            },
+        );
         Ok(())
     }
     fn pin_existing(&self, id: TerminalId) -> Result<Reservation, ProtocolError> {
-        let entry = self.entries.get(&id).ok_or_else(|| unavailable("Native publication history is unknown or evicted"))?;
-        Ok(Reservation { id, pin: entry.pin.clone() })
+        let entry = self
+            .entries
+            .get(&id)
+            .ok_or_else(|| unavailable("Native publication history is unknown or evicted"))?;
+        Ok(Reservation {
+            id,
+            pin: entry.pin.clone(),
+        })
     }
     fn matches_reservation(&self, reservation: &Reservation) -> bool {
-        self.entries.get(&reservation.id).is_some_and(|entry| Arc::ptr_eq(&entry.pin, &reservation.pin))
+        self.entries
+            .get(&reservation.id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.pin, &reservation.pin))
     }
     /// Reserve before any provider mutation. A second operation cannot replace
     /// an exact in-flight slot or its retained ambiguous handoff phase.
-    pub(in crate::host) fn mutating(&mut self, id: TerminalId) -> Result<Reservation, ProtocolError> {
+    pub(in crate::host) fn mutating(
+        &mut self,
+        id: TerminalId,
+    ) -> Result<Reservation, ProtocolError> {
         self.ensure(id)?;
         let entry = &self.entries[&id];
         if entry.pending_handoff.is_some() || Arc::strong_count(&entry.pin) != 1 {
-            return Err(unavailable("An exact native operation already reserves this resource; no provider was changed"));
+            return Err(unavailable(
+                "An exact native operation already reserves this resource; no provider was changed",
+            ));
         }
         let reservation = self.pin_existing(id)?;
         self.mutating_reserved(&reservation)?;
         Ok(reservation)
     }
-    pub(in crate::host) fn mutating_reserved(&mut self, reservation: &Reservation) -> Result<(), ProtocolError> {
-        if !self.matches_reservation(reservation) { return Err(unavailable("The exact native publication reservation changed")); }
+    pub(in crate::host) fn mutating_reserved(
+        &mut self,
+        reservation: &Reservation,
+    ) -> Result<(), ProtocolError> {
+        if !self.matches_reservation(reservation) {
+            return Err(unavailable(
+                "The exact native publication reservation changed",
+            ));
+        }
         let entry = self.entries.get_mut(&reservation.id).expect("same lock");
-        if entry.pending_handoff.is_some() { return Err(unavailable("A retained handoff still owns this native resource")); }
+        if entry.pending_handoff.is_some() {
+            return Err(unavailable(
+                "A retained handoff still owns this native resource",
+            ));
+        }
         entry.resource_epoch = uuid::Uuid::new_v4();
-        entry.known = None; entry.learned_from = None; entry.unresolved = true;
+        entry.known = None;
+        entry.learned_from = None;
+        entry.unresolved = true;
         Ok(())
     }
-    pub(in crate::host) fn install_reserved(&mut self, reservation: &Reservation, instance: uuid::Uuid) -> Result<(), ProtocolError> {
-        if !self.matches_reservation(reservation) { return Err(unavailable("The native publication reservation changed before installation")); }
+    pub(in crate::host) fn install_reserved(
+        &mut self,
+        reservation: &Reservation,
+        instance: uuid::Uuid,
+    ) -> Result<(), ProtocolError> {
+        if !self.matches_reservation(reservation) {
+            return Err(unavailable(
+                "The native publication reservation changed before installation",
+            ));
+        }
         let entry = self.entries.get_mut(&reservation.id).expect("same lock");
-        if entry.pending_handoff.is_some() { return Err(unavailable("A pending exact handoff cannot be overwritten by native installation")); }
-        entry.instance = instance; entry.resource_epoch = uuid::Uuid::new_v4();
-        entry.unresolved = false; entry.learned_from = None; entry.known = None;
+        if entry.pending_handoff.is_some() {
+            return Err(unavailable(
+                "A pending exact handoff cannot be overwritten by native installation",
+            ));
+        }
+        entry.instance = instance;
+        entry.resource_epoch = uuid::Uuid::new_v4();
+        entry.unresolved = false;
+        entry.learned_from = None;
+        entry.known = None;
         Ok(())
     }
     #[cfg(test)]
-    pub(in crate::host) fn installed(&mut self, id: TerminalId, instance: uuid::Uuid) -> Result<(), ProtocolError> {
+    pub(in crate::host) fn installed(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+    ) -> Result<(), ProtocolError> {
         let reservation = self.mutating(id)?;
         self.install_reserved(&reservation, instance)
     }
-    pub(super) fn retain_resource_epoch(&mut self, id: TerminalId) -> Result<uuid::Uuid, ProtocolError> {
+    pub(super) fn retain_resource_epoch(
+        &mut self,
+        id: TerminalId,
+    ) -> Result<uuid::Uuid, ProtocolError> {
         self.ensure(id)?;
         Ok(self.entries[&id].resource_epoch)
     }
@@ -118,7 +182,11 @@ impl History {
     }
     #[cfg(test)]
     pub(in crate::host) fn pin_capacity_for_test(&mut self) -> Vec<Reservation> {
-        let mut reservations = self.entries.keys().map(|id| self.pin_existing(*id).unwrap()).collect::<Vec<_>>();
+        let mut reservations = self
+            .entries
+            .keys()
+            .map(|id| self.pin_existing(*id).unwrap())
+            .collect::<Vec<_>>();
         while self.entries.len() < CAPACITY {
             reservations.push(self.mutating(TerminalId::new()).unwrap());
         }
@@ -129,13 +197,24 @@ impl History {
         self.lose_next_return_start_reply = true;
     }
     #[cfg(test)]
-    pub(in crate::host) fn return_attempt_for_test(&self, id: TerminalId) -> Option<crate::terminal::TerminalStartAttempt> {
-        self.entries.get(&id)?.pending_handoff.as_ref()?.returned.as_ref()?.attempt.clone()
+    pub(in crate::host) fn return_attempt_for_test(
+        &self,
+        id: TerminalId,
+    ) -> Option<crate::terminal::TerminalStartAttempt> {
+        self.entries
+            .get(&id)?
+            .pending_handoff
+            .as_ref()?
+            .returned
+            .as_ref()?
+            .attempt
+            .clone()
     }
     #[cfg(test)]
     pub(in crate::host) fn pressure_for_test(&mut self) {
         for _ in 0..CAPACITY * 2 {
-            self.installed(TerminalId::new(), uuid::Uuid::new_v4()).unwrap();
+            self.installed(TerminalId::new(), uuid::Uuid::new_v4())
+                .unwrap();
         }
         assert!(self.entries.len() <= CAPACITY);
     }
@@ -340,7 +419,12 @@ pub(super) fn restarting(
         .map(|r| r.execution_instance)
         .ok_or_else(|| unavailable("Native actor changed before backend restart"))?;
     let reservation = state.native_sources.mutating(id)?;
-    state.native_sources.entries.get_mut(&id).expect("reserved").instance = instance;
+    state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .expect("reserved")
+        .instance = instance;
     state.chats.get_mut(&id).expect("same lock").source_binding = None;
     Ok(reservation)
 }
@@ -424,7 +508,10 @@ pub(super) fn continuation(
         .clone();
     Ok(Continuation {
         publication: state.native_sources.pin_existing(binding.source.id)?,
-        returned: entry.pending_handoff.as_ref().and_then(|pending| pending.returned.clone()),
+        returned: entry
+            .pending_handoff
+            .as_ref()
+            .and_then(|pending| pending.returned.clone()),
         instance: binding.execution_instance,
         witness,
         handle,
@@ -590,8 +677,13 @@ pub(super) fn claim_continuation(
 ) -> Result<(), ProtocolError> {
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.native_sources.matches_reservation(&continuation.publication) {
-            return Err(unavailable("The exact source publication reservation changed before its claim"));
+        if !state
+            .native_sources
+            .matches_reservation(&continuation.publication)
+        {
+            return Err(unavailable(
+                "The exact source publication reservation changed before its claim",
+            ));
         }
         let original_pair = state
             .chats
@@ -642,8 +734,12 @@ pub(super) fn claim_continuation(
     }
     let already_closed = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.native_sources.entries[&binding.source.id].pending_handoff.as_ref()
-            .filter(|pending| pending.intent == *intent && pending.admitted == *binding && pending.backend_closed)
+        state.native_sources.entries[&binding.source.id]
+            .pending_handoff
+            .as_ref()
+            .filter(|pending| {
+                pending.intent == *intent && pending.admitted == *binding && pending.backend_closed
+            })
             .and_then(|pending| pending.token)
     };
     if let Some(token) = already_closed {
@@ -762,16 +858,35 @@ pub(super) fn close_continuation(
         .ok_or_else(|| unavailable("The exact handoff claim is unconfirmed"))?;
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
-            .filter(|pending| pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle))
+        let pending = state
+            .native_sources
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.pending_handoff.as_ref())
+            .filter(|pending| {
+                pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle)
+            })
             .ok_or_else(|| unavailable("The exact close operation is unavailable"))?;
-        if pending.backend_closed { return Ok(()); }
+        if pending.backend_closed {
+            return Ok(());
+        }
     }
-    continuation.handle.close_backend_source(&continuation.witness, claim).map_err(unavailable)?;
+    continuation
+        .handle
+        .close_backend_source(&continuation.witness, claim)
+        .map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
-        .filter(|pending| pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle))
-        .ok_or_else(|| unavailable("The positive closed owner lost its exact retained operation"))?;
+    let pending = state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| {
+            pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle)
+        })
+        .ok_or_else(|| {
+            unavailable("The positive closed owner lost its exact retained operation")
+        })?;
     pending.backend_closed = true;
     Ok(())
 }
@@ -806,34 +921,67 @@ fn clear_continuation(
 /// Reserve the exact future target before returning/claim/close. An ambiguous
 /// operation keeps this same ID and slot through retry; no latest-ID discovery.
 pub(super) fn reserve_return_target(
-    host: &SharedHost, continuation: &mut Continuation, source: crate::model::TerminalSession,
+    host: &SharedHost,
+    continuation: &mut Continuation,
+    source: crate::model::TerminalSession,
 ) -> Result<crate::model::TerminalSession, ProtocolError> {
-    if let Some(target) = &continuation.returned { return Ok(target.source.clone()); }
+    if let Some(target) = &continuation.returned {
+        return Ok(target.source.clone());
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.native_sources.ensure(source.id)?;
     let reservation = state.native_sources.pin_existing(source.id)?;
-    continuation.returned = Some(ReturnTarget { reservation, source: source.clone(), attempt: None, published: None });
+    continuation.returned = Some(ReturnTarget {
+        reservation,
+        source: source.clone(),
+        attempt: None,
+        published: None,
+    });
     Ok(source)
 }
 /// Unknown after an actual spawn attempt never means no provider. Reconcile
 /// only the original owner's typed ticket, retaining it on every uncertainty.
 pub(super) fn prepare_return_attempt(
-    host: &SharedHost, id: TerminalId, continuation: &Continuation, source: crate::model::TerminalSession,
-) -> Result<Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>, ProtocolError> {
+    host: &SharedHost,
+    id: TerminalId,
+    continuation: &Continuation,
+    source: crate::model::TerminalSession,
+) -> Result<
+    Option<(
+        crate::terminal_ipc::TerminalDescriptor,
+        crate::terminal::TerminalHandle,
+    )>,
+    ProtocolError,
+> {
     use crate::terminal::TerminalStartDisposition as Disposition;
     let (attempt, published) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
-            .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+        let pending = state
+            .native_sources
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.pending_handoff.as_ref())
+            .filter(|pending| {
+                pending.backend_closed
+                    && pending.token == continuation.claim
+                    && pending.owner.same_actor(&continuation.handle)
+            })
             .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
-        let target = pending.returned.as_ref().filter(|target| target.source.id == source.id)
+        let target = pending
+            .returned
+            .as_ref()
+            .filter(|target| target.source.id == source.id)
             .ok_or_else(|| unavailable("The exact attempted return target changed"))?;
         (target.attempt.clone(), target.published.clone())
     };
-    if published.is_some() { return Ok(published); }
+    if published.is_some() {
+        return Ok(published);
+    }
     if let Some(attempt) = &attempt {
         if attempt.terminal_id() != source.id || attempt.session() != &source {
-            return Err(unavailable("The retained terminal attempt does not match the exact return recipe"));
+            return Err(unavailable(
+                "The retained terminal attempt does not match the exact return recipe",
+            ));
         }
         let disposition = match attempt.disposition() {
             Disposition::Unknown => attempt.retry_cleanup(), // off HostLock, bounded existing queue only
@@ -841,20 +989,50 @@ pub(super) fn prepare_return_attempt(
         };
         match disposition {
             Disposition::Published => {
-                let published = attempt.published().ok_or_else(|| unavailable("The exact published return worker is busy; no replacement was started"))?;
-                remember_return_worker(host, id, continuation, published.0.clone(), published.1.clone())?;
+                let published = attempt.published().ok_or_else(|| {
+                    unavailable(
+                        "The exact published return worker is busy; no replacement was started",
+                    )
+                })?;
+                remember_return_worker(
+                    host,
+                    id,
+                    continuation,
+                    published.0.clone(),
+                    published.1.clone(),
+                )?;
                 return Ok(Some(published));
             }
-            Disposition::Pending | Disposition::Unknown => return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")),
+            Disposition::Pending | Disposition::Unknown => {
+                return Err(unavailable(
+                    "The exact previous terminal start is unconfirmed; no second resume process was started",
+                ));
+            }
             Disposition::NoProvider | Disposition::FamilySettled => {}
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
-        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
-        .ok_or_else(|| unavailable("The exact closed source operation changed during start reconciliation"))?;
-    let target = pending.returned.as_mut().filter(|target| target.source.id == source.id
-        && target.attempt.as_ref().map(|attempt| attempt.id()) == attempt.as_ref().map(|attempt| attempt.id()))
+    let pending = state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| {
+            pending.backend_closed
+                && pending.token == continuation.claim
+                && pending.owner.same_actor(&continuation.handle)
+        })
+        .ok_or_else(|| {
+            unavailable("The exact closed source operation changed during start reconciliation")
+        })?;
+    let target = pending
+        .returned
+        .as_mut()
+        .filter(|target| {
+            target.source.id == source.id
+                && target.attempt.as_ref().map(|attempt| attempt.id())
+                    == attempt.as_ref().map(|attempt| attempt.id())
+        })
         .ok_or_else(|| unavailable("The exact terminal start attempt was replaced"))?;
     // Only the original owner's positive NoProvider/family receipt above may
     // release an attempted ticket. Keep the same privately reserved target ID.
@@ -862,53 +1040,133 @@ pub(super) fn prepare_return_attempt(
     target.source = source;
     Ok(None)
 }
-pub(super) fn mark_return_attempt(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<crate::terminal::TerminalStartAttempt, ProtocolError> {
+pub(super) fn mark_return_attempt(
+    host: &SharedHost,
+    id: TerminalId,
+    continuation: &Continuation,
+) -> Result<crate::terminal::TerminalStartAttempt, ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     #[cfg(test)]
     let lose_start_reply = std::mem::take(&mut state.native_sources.lose_next_return_start_reply);
-    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
-        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+    let pending = state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| {
+            pending.backend_closed
+                && pending.token == continuation.claim
+                && pending.owner.same_actor(&continuation.handle)
+        })
         .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
-    let target = pending.returned.as_mut().ok_or_else(|| unavailable("The exact return target was not reserved"))?;
-    if target.attempt.is_some() { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
+    let target = pending
+        .returned
+        .as_mut()
+        .ok_or_else(|| unavailable("The exact return target was not reserved"))?;
+    if target.attempt.is_some() {
+        return Err(unavailable(
+            "The exact previous terminal start is unconfirmed; no second resume process was started",
+        ));
+    }
     let attempt = crate::terminal::TerminalStartAttempt::new(target.source.clone());
     #[cfg(test)]
-    if lose_start_reply { attempt.lose_worker_start_reply_for_test(); }
+    if lose_start_reply {
+        attempt.lose_worker_start_reply_for_test();
+    }
     target.attempt = Some(attempt.clone());
     Ok(attempt)
 }
 pub(super) fn remember_return_worker(
-    host: &SharedHost, id: TerminalId, continuation: &Continuation,
-    descriptor: crate::terminal_ipc::TerminalDescriptor, worker: crate::terminal::TerminalHandle,
+    host: &SharedHost,
+    id: TerminalId,
+    continuation: &Continuation,
+    descriptor: crate::terminal_ipc::TerminalDescriptor,
+    worker: crate::terminal::TerminalHandle,
 ) -> Result<(), ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.terminals.get(&descriptor.session.id).is_none_or(|record| !record.handle.same_worker(&worker)) {
-        return Err(unavailable("The exact returned worker changed before retention"));
+    if state
+        .terminals
+        .get(&descriptor.session.id)
+        .is_none_or(|record| !record.handle.same_worker(&worker))
+    {
+        return Err(unavailable(
+            "The exact returned worker changed before retention",
+        ));
     }
-    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
-        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+    let pending = state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| {
+            pending.backend_closed
+                && pending.token == continuation.claim
+                && pending.owner.same_actor(&continuation.handle)
+        })
         .ok_or_else(|| unavailable("The exact returned operation changed"))?;
-    let target = pending.returned.as_mut().filter(|target| target.source.id == descriptor.session.id)
+    let target = pending
+        .returned
+        .as_mut()
+        .filter(|target| target.source.id == descriptor.session.id)
         .ok_or_else(|| unavailable("The returned worker belongs to another attempted target"))?;
-    if target.attempt.as_ref().is_none_or(|attempt| attempt.worker_instance() != Some(worker.execution_instance())
-        || attempt.published().is_none_or(|(issued, actual)| issued != descriptor || !actual.same_worker(&worker))) {
-        return Err(unavailable("The returned worker has no matching exact successful start ticket"));
+    if target.attempt.as_ref().is_none_or(|attempt| {
+        attempt.worker_instance() != Some(worker.execution_instance())
+            || attempt
+                .published()
+                .is_none_or(|(issued, actual)| issued != descriptor || !actual.same_worker(&worker))
+    }) {
+        return Err(unavailable(
+            "The returned worker has no matching exact successful start ticket",
+        ));
     }
     target.published = Some((descriptor, worker));
     Ok(())
 }
 pub(super) fn finish_closed_return(
-    state: &mut HostState, id: TerminalId, continuation: &Continuation, receipt: &TerminalHandoffReceipt,
+    state: &mut HostState,
+    id: TerminalId,
+    continuation: &Continuation,
+    receipt: &TerminalHandoffReceipt,
 ) -> Result<(), ProtocolError> {
     state.validate_issued_terminal_handoff(receipt)?;
-    let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
-        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
-        .ok_or_else(|| unavailable("The exact closed return operation changed before publication"))?;
-    let target = pending.returned.as_ref().ok_or_else(|| unavailable("The exact returned resource reservation is unavailable"))?;
-    if !state.native_sources.matches_reservation(&target.reservation)
-        || target.published.as_ref().is_none_or(|(descriptor, worker)| descriptor != &receipt.terminal || worker.execution_instance() != receipt.terminal.execution_instance)
-    { return Err(unavailable("The exact returned worker receipt does not match its reserved operation")); }
-    state.native_sources.entries.get_mut(&id).expect("same lock").pending_handoff = None;
+    let pending = state
+        .native_sources
+        .entries
+        .get(&id)
+        .and_then(|entry| entry.pending_handoff.as_ref())
+        .filter(|pending| {
+            pending.backend_closed
+                && pending.token == continuation.claim
+                && pending.owner.same_actor(&continuation.handle)
+        })
+        .ok_or_else(|| {
+            unavailable("The exact closed return operation changed before publication")
+        })?;
+    let target = pending
+        .returned
+        .as_ref()
+        .ok_or_else(|| unavailable("The exact returned resource reservation is unavailable"))?;
+    if !state
+        .native_sources
+        .matches_reservation(&target.reservation)
+        || target
+            .published
+            .as_ref()
+            .is_none_or(|(descriptor, worker)| {
+                descriptor != &receipt.terminal
+                    || worker.execution_instance() != receipt.terminal.execution_instance
+            })
+    {
+        return Err(unavailable(
+            "The exact returned worker receipt does not match its reserved operation",
+        ));
+    }
+    state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .expect("same lock")
+        .pending_handoff = None;
     Ok(())
 }
 
@@ -922,62 +1180,127 @@ pub(in crate::host) struct PendingClose {
     closed: bool,
 }
 impl PendingClose {
-    pub(in crate::host) fn admitted(&self) -> &Session { &self.admitted.source }
-    pub(in crate::host) fn binding(&self) -> &ChatSourceBinding { &self.admitted }
-    pub(in crate::host) fn owner(&self) -> &Handle { &self.continuation.handle }
-    pub(in crate::host) fn witness(&self) -> &chat::runtime::BackendIdentity { &self.continuation.witness }
-    pub(in crate::host) fn claim_token(&self) -> Option<uuid::Uuid> { self.continuation.claim }
-    pub(in crate::host) fn close_original(&mut self, host: &SharedHost) -> Result<(), ProtocolError> {
+    pub(in crate::host) fn admitted(&self) -> &Session {
+        &self.admitted.source
+    }
+    pub(in crate::host) fn binding(&self) -> &ChatSourceBinding {
+        &self.admitted
+    }
+    pub(in crate::host) fn owner(&self) -> &Handle {
+        &self.continuation.handle
+    }
+    pub(in crate::host) fn witness(&self) -> &chat::runtime::BackendIdentity {
+        &self.continuation.witness
+    }
+    pub(in crate::host) fn claim_token(&self) -> Option<uuid::Uuid> {
+        self.continuation.claim
+    }
+    pub(in crate::host) fn close_original(
+        &mut self,
+        host: &SharedHost,
+    ) -> Result<(), ProtocolError> {
         claim_continuation(host, &self.intent, &self.admitted, &mut self.continuation)?;
         close_continuation(host, self.admitted.source.id, &self.continuation)?;
         self.closed = true;
         Ok(())
     }
 }
-pub(in crate::host) fn capture_pending_close(host: &SharedHost, source: &Session) -> Result<Option<PendingClose>, ProtocolError> {
+pub(in crate::host) fn capture_pending_close(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<PendingClose>, ProtocolError> {
     let captured = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(entry) = state.native_sources.entries.get(&source.id) else { return Ok(None); };
-        let Some(pending) = &entry.pending_handoff else { return Ok(None); };
+        let Some(entry) = state.native_sources.entries.get(&source.id) else {
+            return Ok(None);
+        };
+        let Some(pending) = &entry.pending_handoff else {
+            return Ok(None);
+        };
         validate_proof(source.proof.as_ref(), state.proof())?;
-        if pending.original_pair.is_some() || pending.created_pair.is_some()
-            || pending.returned.as_ref().is_some_and(|target| target.attempt.is_some() || target.published.is_some()) {
-            return Err(unavailable("This handoff retains attempted or paired terminal ownership; exact cleanup disposition is still required"));
+        if pending.original_pair.is_some()
+            || pending.created_pair.is_some()
+            || pending
+                .returned
+                .as_ref()
+                .is_some_and(|target| target.attempt.is_some() || target.published.is_some())
+        {
+            return Err(unavailable(
+                "This handoff retains attempted or paired terminal ownership; exact cleanup disposition is still required",
+            ));
         }
         if (source != &pending.intent.source && source != &pending.admitted.source)
-            || state.chats.get(&source.id).is_none_or(|record| record.execution_instance != entry.instance || !record.handle.same_actor(&pending.owner)) {
-            return Err(unavailable("The close does not name the exact retained handoff source"));
+            || state.chats.get(&source.id).is_none_or(|record| {
+                record.execution_instance != entry.instance
+                    || !record.handle.same_actor(&pending.owner)
+            })
+        {
+            return Err(unavailable(
+                "The close does not name the exact retained handoff source",
+            ));
         }
         (pending.intent.clone(), pending.admitted.clone())
     };
     let continuation = continuation(host, &captured.1)?;
-    Ok(Some(PendingClose { intent: captured.0, admitted: captured.1, continuation, closed: false }))
+    Ok(Some(PendingClose {
+        intent: captured.0,
+        admitted: captured.1,
+        continuation,
+        closed: false,
+    }))
 }
 
 /// Requires the companion bound-close producer's sealed positive actual owner
 /// receipt. Generic Accepted/completion/absence cannot call this CAS.
 pub(in crate::host) fn release_pending_close(
-    host: &SharedHost, pending: &PendingClose, proof: &super::bound_close::ClosedPending,
+    host: &SharedHost,
+    pending: &PendingClose,
+    proof: &super::bound_close::ClosedPending,
 ) -> Result<(), ProtocolError> {
     if !pending.closed || pending.claim_token().is_none() || !proof.authenticates(pending) {
-        return Err(unavailable("The exact pending close has no authenticated positive owner disposition"));
+        return Err(unavailable(
+            "The exact pending close has no authenticated positive owner disposition",
+        ));
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let id = pending.admitted.source.id;
-    if !state.native_sources.matches_reservation(&pending.continuation.publication)
-        || state.chats.get(&id).is_some_and(|record| record.execution_instance != pending.admitted.execution_instance || !record.handle.same_actor(pending.owner())) {
-        return Err(unavailable("The source changed before exact pending close retirement"));
+    if !state
+        .native_sources
+        .matches_reservation(&pending.continuation.publication)
+        || state.chats.get(&id).is_some_and(|record| {
+            record.execution_instance != pending.admitted.execution_instance
+                || !record.handle.same_actor(pending.owner())
+        })
+    {
+        return Err(unavailable(
+            "The source changed before exact pending close retirement",
+        ));
     }
-    let entry = state.native_sources.entries.get_mut(&id).expect("reserved exact slot");
+    let entry = state
+        .native_sources
+        .entries
+        .get_mut(&id)
+        .expect("reserved exact slot");
     let matches = entry.pending_handoff.as_ref().is_some_and(|current| {
         entry.instance == pending.admitted.execution_instance
-            && current.intent == pending.intent && current.admitted == pending.admitted
-            && current.witness == *pending.witness() && current.owner.same_actor(pending.owner())
-            && current.token == pending.claim_token() && current.backend_closed
-            && current.original_pair.is_none() && current.created_pair.is_none()
-            && current.returned.as_ref().is_none_or(|target| target.attempt.is_none() && target.published.is_none())
+            && current.intent == pending.intent
+            && current.admitted == pending.admitted
+            && current.witness == *pending.witness()
+            && current.owner.same_actor(pending.owner())
+            && current.token == pending.claim_token()
+            && current.backend_closed
+            && current.original_pair.is_none()
+            && current.created_pair.is_none()
+            && current
+                .returned
+                .as_ref()
+                .is_none_or(|target| target.attempt.is_none() && target.published.is_none())
     });
-    if !matches { return Err(unavailable("The exact pending phase changed; cleanup authority was retained")); }
+    if !matches {
+        return Err(unavailable(
+            "The exact pending phase changed; cleanup authority was retained",
+        ));
+    }
     entry.pending_handoff = None;
     entry.known = None;
     entry.learned_from = None;
@@ -1347,17 +1670,32 @@ mod tests {
             reservations.push(history.mutating(TerminalId::new()).unwrap());
         }
         let attempted = TerminalId::new();
-        assert!(history.mutating(attempted).unwrap_err().message.contains("capacity is reserved"));
-        assert!(!history.entries.contains_key(&attempted), "refused admission cannot publish a new resource");
+        assert!(
+            history
+                .mutating(attempted)
+                .unwrap_err()
+                .message
+                .contains("capacity is reserved")
+        );
+        assert!(
+            !history.entries.contains_key(&attempted),
+            "refused admission cannot publish a new resource"
+        );
         let original = reservations[0].id;
         let epoch = history.resource_epoch(original).unwrap();
-        assert!(history.installed(original, uuid::Uuid::new_v4()).is_err(), "same-ID installation cannot overwrite an in-flight reservation");
+        assert!(
+            history.installed(original, uuid::Uuid::new_v4()).is_err(),
+            "same-ID installation cannot overwrite an in-flight reservation"
+        );
         assert_eq!(history.resource_epoch(original), Some(epoch));
         assert_eq!(history.entries.len(), CAPACITY);
         drop(reservations.remove(0));
         let accepted = history.mutating(attempted).unwrap();
         assert_eq!(accepted.id, attempted);
-        assert!(!history.entries.contains_key(&original), "only released completed/unknown history may be evicted");
+        assert!(
+            !history.entries.contains_key(&original),
+            "only released completed/unknown history may be evicted"
+        );
         assert_eq!(history.entries.len(), CAPACITY);
     }
 
@@ -1365,7 +1703,9 @@ mod tests {
     fn owned_native_confirmation_error_revokes_previous_binding_before_frame_application() {
         use std::os::unix::fs::PermissionsExt;
         const EXACT: &str = "host::chat::source_binding::tests::owned_native_confirmation_error_revokes_previous_binding_before_frame_application";
-        if chat::runtime::isolated_backend_contract(EXACT) { return; }
+        if chat::runtime::isolated_backend_contract(EXACT) {
+            return;
+        }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let program = directory.path().join("codex");
         // A real child owns the endpoint and speaks framed WebSocket. It only
@@ -1426,60 +1766,131 @@ finally:
         source.launch.recipe.program = program.to_string_lossy().into_owned();
         source.launch.recipe.working_directory = directory.path().into();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
-        struct NativeFrames { identity: chat::protocol::ServerIdentity }
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        struct NativeFrames {
+            identity: chat::protocol::ServerIdentity,
+        }
         impl Adapter for NativeFrames {
             fn initialize(&mut self) -> Result<Step, String> {
-                Ok(Step { writes: vec![serde_json::json!({"thread":"first"})], ..Step::default() })
+                Ok(Step {
+                    writes: vec![serde_json::json!({"thread":"first"})],
+                    ..Step::default()
+                })
             }
             fn command(&mut self, command: chat::Command) -> Result<Step, String> {
-                let chat::Command::SetModel { model, .. } = command else { return Err("unexpected fixture command".into()); };
-                Ok(Step { writes: vec![serde_json::json!({"thread":model})], ..Step::default() })
+                let chat::Command::SetModel { model, .. } = command else {
+                    return Err("unexpected fixture command".into());
+                };
+                Ok(Step {
+                    writes: vec![serde_json::json!({"thread":model})],
+                    ..Step::default()
+                })
             }
             fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
-                let id = value["thread"].as_str().ok_or("missing fixture thread")?.to_owned();
-                Ok(Step { events: vec![chat::Event::Session { id, title: None }, chat::Event::Ready(true)], ..Step::default() })
+                let id = value["thread"]
+                    .as_str()
+                    .ok_or("missing fixture thread")?
+                    .to_owned();
+                Ok(Step {
+                    events: vec![
+                        chat::Event::Session { id, title: None },
+                        chat::Event::Ready(true),
+                    ],
+                    ..Step::default()
+                })
             }
-            fn server_identity(&self) -> Option<&chat::protocol::ServerIdentity> { Some(&self.identity) }
+            fn server_identity(&self) -> Option<&chat::protocol::ServerIdentity> {
+                Some(&self.identity)
+            }
         }
         let mut spec = ProcessSpec::from(&source.launch.recipe);
         spec.transport = chat::protocol::TransportSpec::OwnedUnixWebSocket {
             socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
         };
-        let mut adapter: Box<dyn Adapter> = Box::new(NativeFrames { identity: chat::native_holder::fixture_identity() });
+        let mut adapter: Box<dyn Adapter> = Box::new(NativeFrames {
+            identity: chat::native_holder::fixture_identity(),
+        });
         let mut initial = adapter.initialize().unwrap();
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let instance = uuid::Uuid::new_v4();
         let notifications: Arc<Mutex<Option<Weak<HostLock>>>> = Default::default();
         let notified = notifications.clone();
         let id = source.id;
-        let handle = Handle::start_owned(spec, adapter, initial, store, source.clone(), Default::default(), move |update| {
-            let host = notified.lock().unwrap().clone();
-            if let Some(host) = host { changed_owned(&host, id, instance, update); }
-        }).unwrap();
+        let handle = Handle::start_owned(
+            spec,
+            adapter,
+            initial,
+            store,
+            source.clone(),
+            Default::default(),
+            move |update| {
+                let host = notified.lock().unwrap().clone();
+                if let Some(host) = host {
+                    changed_owned(&host, id, instance, update);
+                }
+            },
+        )
+        .unwrap();
         let owner = Owner(handle.clone());
         let fixture = BackendFixture::new(source.clone(), handle.clone(), instance);
         *notifications.lock().unwrap() = Some(Arc::downgrade(&fixture.host));
         let deadline = Instant::now() + Duration::from_secs(5);
         while handle.confirmed_session_id().as_deref() != Some("first")
-            || !matches!(handle.native_continuity(), chat::NativeContinuity::Durable { .. }) {
-            assert!(Instant::now() < deadline, "owned native server did not confirm first conversation");
+            || !matches!(
+                handle.native_continuity(),
+                chat::NativeContinuity::Durable { .. }
+            )
+        {
+            assert!(
+                Instant::now() < deadline,
+                "owned native server did not confirm first conversation"
+            );
             thread::sleep(Duration::from_millis(2));
         }
-        assert!(matches!(handle.native_continuity(), chat::NativeContinuity::Durable { .. }));
+        assert!(matches!(
+            handle.native_continuity(),
+            chat::NativeContinuity::Durable { .. }
+        ));
         let binding = fixture.capture().unwrap();
         assert!(fixture.validates(&binding));
-        handle.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap();
+        handle
+            .command(chat::Command::SetModel {
+                model: "second".into(),
+                reasoning: None,
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = handle.snapshot(None).unwrap();
-            if snapshot.error.as_deref().is_some_and(|error| error.contains("cannot change conversations")) { break; }
-            assert!(Instant::now() < deadline, "actual durable holder refusal missing: {:?}", snapshot.error);
+            if snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot change conversations"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual durable holder refusal missing: {:?}",
+                snapshot.error
+            );
             thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(handle.confirmed_session_id().as_deref(), Some("first"), "failed confirmation never positively publishes second thread");
-        assert!(!fixture.validates(&binding), "actual early Identity callback must revoke first binding despite failed holder.confirm, without any refresh/read");
-        assert!(fixture.host.lock().unwrap().chats[&id].source_binding.is_none());
+        assert_eq!(
+            handle.confirmed_session_id().as_deref(),
+            Some("first"),
+            "failed confirmation never positively publishes second thread"
+        );
+        assert!(
+            !fixture.validates(&binding),
+            "actual early Identity callback must revoke first binding despite failed holder.confirm, without any refresh/read"
+        );
+        assert!(
+            fixture.host.lock().unwrap().chats[&id]
+                .source_binding
+                .is_none()
+        );
         let _ = owner.0.close();
     }
 
@@ -1605,7 +2016,8 @@ finally:
         for _ in 0..CAPACITY {
             state
                 .native_sources
-                .installed(TerminalId::new(), uuid::Uuid::new_v4()).unwrap();
+                .installed(TerminalId::new(), uuid::Uuid::new_v4())
+                .unwrap();
         }
         assert!(!state.native_sources.validates(&resolved));
         assert!(state.native_sources.entries.len() <= CAPACITY);
@@ -2177,7 +2589,8 @@ finally:
                 retained_binding: None,
                 terminal_native_epoch: state
                     .native_sources
-                    .retain_resource_epoch(terminal.session.id).unwrap(),
+                    .retain_resource_epoch(terminal.session.id)
+                    .unwrap(),
                 terminal: terminal.clone(),
             };
             state.remember_terminal_handoff(receipt.clone());
@@ -2190,7 +2603,10 @@ finally:
         {
             let mut state = fixture.host.lock().unwrap();
             let instance = uuid::Uuid::new_v4();
-            state.native_sources.installed(native_source.id, instance).unwrap();
+            state
+                .native_sources
+                .installed(native_source.id, instance)
+                .unwrap();
             state.chats.insert(
                 native_source.id,
                 Record {
@@ -2238,7 +2654,10 @@ finally:
         {
             let mut state = fixture.host.lock().unwrap();
             state.observe_terminal_worker_for_test(pending_id, pending.terminal.execution_instance);
-            pending.terminal_native_epoch = state.native_sources.retain_resource_epoch(pending_id).unwrap();
+            pending.terminal_native_epoch = state
+                .native_sources
+                .retain_resource_epoch(pending_id)
+                .unwrap();
             state.remember_terminal_handoff(pending.clone());
             state.validate_terminal_handoff_receipt(&pending).unwrap();
             state.native_sources.mutating(pending_id).unwrap(); // actual production pre-creation seam
@@ -2247,7 +2666,8 @@ finally:
             for _ in 0..CAPACITY {
                 state
                     .native_sources
-                    .retain_resource_epoch(TerminalId::new()).unwrap();
+                    .retain_resource_epoch(TerminalId::new())
+                    .unwrap();
             }
             assert_eq!(state.native_sources.resource_epoch(pending_id), None);
             assert!(
@@ -2307,7 +2727,8 @@ finally:
                 retained_binding: None,
                 terminal_native_epoch: state
                     .native_sources
-                    .retain_resource_epoch(terminal.session.id).unwrap(),
+                    .retain_resource_epoch(terminal.session.id)
+                    .unwrap(),
                 terminal,
             };
             state.remember_terminal_handoff(receipt.clone());

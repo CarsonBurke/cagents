@@ -47,22 +47,31 @@ fn digest(source: &TerminalSession) -> Result<[u8; 32], String> {
 /// Keep the digest rather than another copy of the issued recipe/environment.
 #[derive(Clone)]
 pub(crate) struct SourceReceipt {
-    digest: [u8;32],
+    digest: [u8; 32],
     proof: HostSessionProof,
 }
 
 impl SourceReceipt {
-    pub(crate) fn capture(source: &TerminalSession) -> Result<Self,String> {
-        Ok(Self {digest:digest(source)?, proof:source.continuity.live_proof()
-            .ok_or("Terminal close source has no ownership proof")?})
+    pub(crate) fn capture(source: &TerminalSession) -> Result<Self, String> {
+        Ok(Self {
+            digest: digest(source)?,
+            proof: source
+                .continuity
+                .live_proof()
+                .ok_or("Terminal close source has no ownership proof")?,
+        })
     }
 
-    pub(crate) fn confirmed(&self, expected: &Record) -> Result<bool,String> {
-        confirmed_receipt(expected,&self.proof,Some(self.digest))
+    pub(crate) fn confirmed(&self, expected: &Record) -> Result<bool, String> {
+        confirmed_receipt(expected, &self.proof, Some(self.digest))
     }
 }
 
-pub(crate) fn publish(record: &Record, recovery: &Recovery, _family: &crate::daemon::owned_children::ReapedFamily) -> Result<(), String> {
+pub(crate) fn publish(
+    record: &Record,
+    recovery: &Recovery,
+    _family: &crate::daemon::owned_children::ReapedFamily,
+) -> Result<(), String> {
     if record.root.is_current() {
         return Err("Terminal root has not been reaped".into());
     }
@@ -142,10 +151,17 @@ pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Re
 /// The census caller must independently validate its bounded private inventory
 /// and revalidate it after this check; a filename or parsed Record alone is not
 /// cleanup proof. The verifier rereads the canonical receipt under our lease.
-pub(crate) fn retired_for_census(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+pub(crate) fn retired_for_census(
+    expected: &Record,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
     authorize(proof)?;
-    let Some(receipt) = read_receipt(expected)? else { return Ok(false); };
-    if !strong_receipt_matches(&receipt, expected) { return Ok(false); }
+    let Some(receipt) = read_receipt(expected)? else {
+        return Ok(false);
+    };
+    if !strong_receipt_matches(&receipt, expected) {
+        return Ok(false);
+    }
     let directory = super::directory()?;
     if super::evidence(&super::socket(&directory, expected.terminal))?.as_ref() == Some(expected) {
         return Ok(false);
@@ -158,7 +174,8 @@ pub(crate) fn retired_for_census(expected: &Record, proof: &HostSessionProof) ->
 }
 
 fn strong_receipt_matches(receipt: &Receipt, expected: &Record) -> bool {
-    receipt.family_reaped && receipt.record == *expected
+    receipt.family_reaped
+        && receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
         && receipt.record.version == 5
         && receipt.record.application == crate::instance::APPLICATION_ID
@@ -174,7 +191,9 @@ fn confirmed_receipt(
     if super::evidence(&super::socket(&directory, expected.terminal))?.is_some() {
         return Ok(false);
     }
-    let Some(receipt) = read_receipt(expected)? else { return Ok(false); };
+    let Some(receipt) = read_receipt(expected)? else {
+        return Ok(false);
+    };
     Ok(strong_receipt_matches(&receipt, expected)
         && receipt.record.boot == proof.boot_id
         && holder_exited(&receipt.record.holder)?

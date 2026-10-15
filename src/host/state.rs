@@ -3653,19 +3653,34 @@ pub(super) fn spawn_terminal_view_owned_at_directory_attempt(
     context: Arc<crate::chat::protocol::ExecutionContext>,
     attempt: &crate::terminal::TerminalStartAttempt,
 ) -> Result<(TerminalDescriptor, TerminalHandle), TerminalStartFailure> {
-    let failed = |error| TerminalStartFailure { error, attempt: attempt.clone() };
-    let run = attempt.begin(&session).map_err(|message| failed(ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable, message, false,
-    )))?;
+    let failed = |error| TerminalStartFailure {
+        error,
+        attempt: attempt.clone(),
+    };
+    let run = attempt.begin(&session).map_err(|message| {
+        failed(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            message,
+            false,
+        ))
+    })?;
     let result = (|| {
         let directory = terminal_start_directory(&context)?;
         let (descriptor, handle) = start_terminal_view_owned_attempt(
-            shared, client_id, session, options, execution_environment, paired,
-            None, None, None, Some(directory), Some(&run),
+            shared,
+            client_id,
+            session,
+            options,
+            execution_environment,
+            paired,
+            None,
+            None,
+            None,
+            Some(directory),
+            Some(&run),
         )?;
-        run.publish(descriptor.clone(), handle.clone()).map_err(|message| ProtocolError::new(
-            ProtocolErrorCode::Internal, message, false,
-        ))?;
+        run.publish(descriptor.clone(), handle.clone())
+            .map_err(|message| ProtocolError::new(ProtocolErrorCode::Internal, message, false))?;
         Ok((descriptor, handle))
     })();
     drop(run);
@@ -3768,8 +3783,17 @@ fn start_terminal_view_owned(
     execution_directory: Option<Arc<std::fs::File>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     start_terminal_view_owned_attempt(
-        shared, client_id, session, options, execution_environment, paired,
-        adoption, previous, pending_pane, execution_directory, None,
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+        pending_pane,
+        execution_directory,
+        None,
     )
 }
 

@@ -112,7 +112,10 @@ pub(super) fn restore(
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        let publication = state.native_sources.mutating(source.id).map_err(|error| error.message)?;
+        let publication = state
+            .native_sources
+            .mutating(source.id)
+            .map_err(|error| error.message)?;
         state.chat_spawning.insert(source.id, source.clone());
         state.inventory_generation += 1;
         (state.proof().clone(), publication)
@@ -460,7 +463,8 @@ fn restore_authenticated(
     state.publish_chat_observer(id, execution_instance, observer_registration.stamp());
     state
         .native_sources
-        .install_reserved(publication, record.execution_instance).map_err(|error| error.message)?;
+        .install_reserved(publication, record.execution_instance)
+        .map_err(|error| error.message)?;
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

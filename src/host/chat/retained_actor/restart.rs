@@ -142,8 +142,12 @@ pub(in crate::host) fn restart_completed(
         }
     }
     let _publication = if !prepared.settled {
-        Some(super::super::source_binding::restarting(host, source.id, &handle)?)
-    } else { None };
+        Some(super::super::source_binding::restarting(
+            host, source.id, &handle,
+        )?)
+    } else {
+        None
+    };
     let receipt = handle
         .restart_remote(
             request,
