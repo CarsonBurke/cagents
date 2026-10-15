@@ -43,6 +43,7 @@ pub enum ActivityOutcome {
     Succeeded,
     Cancelled,
     Failed { reason: String },
+    Interrupted { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
