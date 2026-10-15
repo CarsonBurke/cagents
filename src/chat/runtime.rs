@@ -3715,7 +3715,7 @@ mod tests {
             fn command(&mut self,command:Command)->Result<Step,String> {
                 let events=match command {
                     Command::Prompt{..}=>Vec::new(),
-                    Command::Refresh=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
+                    Command::SetFastMode{..}=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
                     Command::SetModel{..}=>vec![Event::TurnStarted],
                     Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],
                     _=>return Err("Unexpected consent fixture command".into()),
@@ -3742,7 +3742,7 @@ mod tests {
         assert_eq!(admitted.activity,ActivityState::Working);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
         assert!(!handle.close_observation().closing);
-        handle.command(Command::Refresh).unwrap();
+        handle.command(Command::SetFastMode{enabled:true}).unwrap();
         assert_eq!(handle.close_observation().close_revision,admitted.close_revision,"ordinary stream updates preserve consent for the same work");
         handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
         let autonomous=handle.close_observation();
