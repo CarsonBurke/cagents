@@ -49,3 +49,8 @@ shell effects; callers still verify configuration/trust before explicit setup.
 Copies preserve source access ACLs as well as mode bits and remove inherited
 access ACLs when the source has none. An ACL-copy error prevents publication of
 the temporary copy; the created worktree is retained for inspection.
+
+The copy restores the source group and replaces inherited ACL identities while
+its temporary file is still private, before applying source mode bits. This
+also avoids granting a setgid destination's different group access to secrets.
+If the source group cannot be preserved, setup stops and keeps the worktree.
