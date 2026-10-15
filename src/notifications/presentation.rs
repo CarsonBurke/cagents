@@ -29,6 +29,10 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         },
         Kind::ReviewRequested => "Review requested",
         Kind::MessageReceived => "Messages waiting",
+        Kind::AutomationPaused => "Automation paused",
+        Kind::AutomationBlocked => "Automation blocked",
+        Kind::AutomationSkipped => "Automation occurrence skipped",
+        Kind::AutomationProposed => "Scheduled work needs approval",
     };
     let inbox = matches!(event.target, Target::SessionInbox(_));
     let context = if inbox {
@@ -68,11 +72,14 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         action: match event.target {
             Target::PullRequest(_) => "Open review",
             Target::SessionInbox(_) => "Open terminal",
+            Target::Automation { .. } => "Open automation",
+            Target::AutomationProposal { .. } => "Review proposal",
             _ => "Open conversation",
         },
         needs_input: matches!(
             event.evidence.kind,
             Kind::Waiting | Kind::ReviewRequested | Kind::MessageReceived
+                | Kind::AutomationPaused | Kind::AutomationBlocked | Kind::AutomationProposed
         ),
     }
 }
@@ -257,6 +264,34 @@ mod tests {
         assert!(rich.body.ends_with("May I edit the login handler?"));
         assert_eq!(rich.action, "Open conversation");
         assert!(rich.needs_input);
+    }
+
+    #[test]
+    fn scheduled_work_keeps_its_own_labels_and_open_actions() {
+        use crate::notifications::{Event, Evidence, Kind, Target};
+        for (kind, label, needs_input) in [
+            (Kind::AutomationPaused, "Automation paused", true),
+            (Kind::AutomationBlocked, "Automation blocked", true),
+            (Kind::AutomationSkipped, "Automation occurrence skipped", false),
+            (Kind::AutomationProposed, "Scheduled work needs approval", true),
+        ] {
+            let mut event = Event::session(crate::model::TerminalId::new(), crate::agent::Provider::Claude,
+                "/project".into(), Evidence { key: "original-scheduler-event".into(), kind });
+            event.provider = None;
+            event.directory = None;
+            event.target = if kind == Kind::AutomationProposed {
+                Target::AutomationProposal { id: uuid::Uuid::new_v4(), name: "Original schedule".into(),
+                    project: "Original project".into(), requester: "Original requester".into() }
+            } else {
+                Target::Automation { id: uuid::Uuid::new_v4(), name: "Original schedule".into(), reason: "Original reason".into() }
+            };
+            event.validate().unwrap();
+            let shown = message(&event, false);
+            assert!(shown.body.starts_with(label));
+            assert!(shown.title.contains("Original"));
+            assert_eq!(shown.action, if kind == Kind::AutomationProposed { "Review proposal" } else { "Open automation" });
+            assert_eq!(shown.needs_input, needs_input);
+        }
     }
 
     #[test]
