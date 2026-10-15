@@ -319,7 +319,7 @@ mod tests {
         let mut draft = crate::app::tests::terminal_card_state();
         let id = draft.id;
         draft.kind = CardKind::Chat(
-            chat::fresh_session_deferred_policy(
+            crate::chat::fresh_session_deferred_policy(
                 crate::agent::Provider::Codex,
                 TerminalId::new(),
                 nested.clone(),
