@@ -704,31 +704,49 @@ struct ControlMetadata {
     last_fetch_unix_ms: Option<u64>,
 }
 
-/// Resolve administrative metadata locally, including linked worktree gitfiles.
-fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
-    let path = worktree.join(".git");
-    if path.is_dir() {
-        return Some(path);
+/// Read a small Git control file without waiting for FIFO/device producers or
+/// following a replaced final symlink. Missing optional files are distinct from
+/// malformed or unreadable metadata; a failed prepass must not certify a cache.
+fn read_git_metadata_file(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata is not a regular file"));
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(4097)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > 4096 {
-        return None;
+    file.take(limit.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata exceeds its size limit"));
     }
-    let value = bytes.strip_prefix(b"gitdir: ")?;
-    let value = value.strip_suffix(b"\n").unwrap_or(value);
-    let value = value.strip_suffix(b"\r").unwrap_or(value);
-    use std::os::unix::ffi::OsStrExt;
-    let directory = Path::new(OsStr::from_bytes(value));
-    Some(if directory.is_absolute() {
-        directory.to_owned()
-    } else {
-        worktree.join(directory)
-    })
+    Ok(Some(bytes))
+}
+
+/// Resolve administrative metadata locally, including linked worktree gitfiles.
+fn local_git_dir(worktree: &Path) -> io::Result<Option<PathBuf>> {
+    let path = worktree.join(".git");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(Some(path)),
+        Ok(_) => {},
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let Some(bytes) = read_git_metadata_file(&path, 4096)? else { return Ok(None); };
+    let value = bytes.strip_prefix(b"gitdir: ")
+        .map(trim_one_line_ending).filter(|path| !path.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid .git locator"))?;
+    let directory = bytes_to_path(value);
+    Ok(Some(if directory.is_absolute() { directory } else { worktree.join(directory) }))
+}
+
+struct SnapshotAdmin {
+    git_dir: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+    fingerprint: BTreeMap<PathBuf, Option<FileIdentity>>,
 }
 
 type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
@@ -787,33 +805,17 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
 
 /// Filesystem-only metadata observations keep the missed-event fallback
 /// authoritative without extra Git commands on an unchanged snapshot.
-fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileIdentity>> {
-    let read_path = |path: &Path| -> Option<Vec<u8>> {
-        let mut bytes = Vec::new();
-        fs::File::open(path)
-            .ok()?
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        (bytes.len() <= 4096).then_some(bytes)
+fn snapshot_admin_fingerprint(worktree: &Path, cancellation: &CancellationToken) -> io::Result<SnapshotAdmin> {
+    let cancelled = || io::Error::new(io::ErrorKind::Interrupted, "Git metadata observation cancelled");
+    if cancellation.is_cancelled() { return Err(cancelled()); }
+    let Some(git_dir) = local_git_dir(worktree)? else {
+        return Ok(SnapshotAdmin { git_dir: None, common_dir: None, fingerprint: BTreeMap::new() });
     };
-    let marker = worktree.join(".git");
-    let git_dir = if marker.is_dir() {
-        marker.clone()
-    } else {
-        let Some(bytes) = read_path(&marker) else {
-            return BTreeMap::new();
-        };
-        let Some(relative) = bytes.strip_prefix(b"gitdir: ") else {
-            return BTreeMap::new();
-        };
-        worktree.join(bytes_to_path(trim_one_line_ending(relative)))
+    let git_dir = fs::canonicalize(&git_dir)?;
+    let common = match read_git_metadata_file(&git_dir.join("commondir"), 4096)? {
+        Some(bytes) => fs::canonicalize(git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))?,
+        None => git_dir.clone(),
     };
-    let git_dir = fs::canonicalize(&git_dir).unwrap_or(git_dir);
-    let common = read_path(&git_dir.join("commondir"))
-        .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
-        .and_then(|path| fs::canonicalize(path).ok())
-        .unwrap_or_else(|| git_dir.clone());
     let mut paths = BTreeMap::new();
     for root in [&git_dir, &common] {
         // Lock creation/removal changes directory times without changing Git
@@ -866,6 +868,7 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
     }
     let mut pending = vec![common.join("refs"), git_dir.join("refs")];
     while let Some(path) = pending.pop() {
+        if cancellation.is_cancelled() { return Err(cancelled()); }
         if paths.contains_key(&path) {
             continue;
         }
@@ -878,6 +881,7 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
         paths.insert(path.clone(), identity);
         if let Ok(entries) = fs::read_dir(&path) {
             for entry in entries.flatten() {
+                if cancellation.is_cancelled() { return Err(cancelled()); }
                 if entry
                     .path()
                     .extension()
@@ -899,7 +903,7 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
             }
         }
     }
-    paths
+    Ok(SnapshotAdmin { git_dir: Some(git_dir), common_dir: Some(common), fingerprint: paths })
 }
 
 /// Replacement objects can change the bytes behind an unchanged object id.
@@ -4519,7 +4523,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
-        let admin = snapshot_admin_fingerprint(worktree);
+        let observation = snapshot_admin_fingerprint(worktree, cancellation).map_err(|error| {
+            cache.invalidate(true);
+            if cancellation.is_cancelled() {
+                RepositoryError::from(process_failure(&CommandSpec::new(&self.git),
+                    ProcessFailureKind::Cancelled, "Git metadata observation cancelled", false))
+            } else {
+                RepositoryError::from(ValidationError::Io(format!("Cannot observe Git metadata for {}: {error}", worktree.display())))
+            }
+        })?;
+        let git_dir = observation.git_dir;
+        let common_dir = observation.common_dir;
+        let admin = observation.fingerprint;
         if !cache.admin.is_empty() && cache.admin != admin {
             if snapshot_count_admin_changed(&cache.admin, &admin) {
                 cache.numstats.clear();
@@ -4548,7 +4563,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cache.numstat_attributes.clear();
             cache.dirty = true;
         }
-        let git_dir = local_git_dir(worktree);
         if !cache.fsmonitor_checked {
             let mut command = self.git_read(
                 worktree,
@@ -4654,17 +4668,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // cheap. A bounded dependency graph degrades to complete reads.
             let policy = cache.numstat_policy.as_mut().unwrap();
             let mut dependencies = policy.attributes.clone();
-            if let Some(directory) = &git_dir {
-                let common = fs::File::open(directory.join("commondir"))
-                    .ok()
-                    .and_then(|file| {
-                        let mut bytes = Vec::new();
-                        file.take(4097).read_to_end(&mut bytes).ok()?;
-                        (bytes.len() <= 4096)
-                            .then(|| directory.join(bytes_to_path(trim_one_line_ending(&bytes))))
-                    })
-                    .unwrap_or_else(|| directory.clone());
-                dependencies.push(common.join("info/attributes"));
+            if let Some(directory) = &common_dir {
+                dependencies.push(directory.join("info/attributes"));
             }
             for entry in &status.entries {
                 for path in std::iter::once(&entry.path).chain(entry.old_path.iter()) {
@@ -9023,33 +9028,33 @@ mod tests {
         let gitdir = directory.path().join(".git");
         fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
         fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let first = snapshot_admin_fingerprint(directory.path());
+        let first = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
         fs::write(gitdir.join("index.lock"), "temporary").unwrap();
         fs::remove_file(gitdir.join("index.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
         fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
         fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
         fs::write(
             gitdir.join("config"),
             "[remote \"origin\"]\nurl = example\n",
         )
         .unwrap();
-        let configured = snapshot_admin_fingerprint(directory.path());
+        let configured = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
         assert_ne!(first, configured);
         fs::write(gitdir.join("index"), "new-index").unwrap();
-        let indexed = snapshot_admin_fingerprint(directory.path());
+        let indexed = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
         assert_ne!(configured, indexed);
         fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
         fs::File::open(gitdir.join("refs/heads/feature"))
             .unwrap()
             .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
             .unwrap();
-        let created = snapshot_admin_fingerprint(directory.path());
+        let created = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
         assert_ne!(indexed, created);
         fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
-        assert_ne!(created, snapshot_admin_fingerprint(directory.path()));
+        assert_ne!(created, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
     }
 
     #[test]
@@ -9355,6 +9360,75 @@ mod tests {
                     path.display()
                 );
             }
+        }
+
+        #[test]
+        fn snapshot_metadata_prepass_rejects_special_locators_and_owns_cancellation() {
+            const CHILD: &str = "CAGENTS_TEST_METADATA_LOCATOR_CHILD";
+            const TEST: &str = "repository::tests::git_contracts::snapshot_metadata_prepass_rejects_special_locators_and_owns_cancellation";
+            if std::env::var_os(CHILD).is_none() {
+                let evidence = tempfile::tempdir().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", TEST, "--nocapture"]).env(CHILD, evidence.path());
+                assert_numstat_child(command, evidence);
+                return;
+            }
+            let evidence = PathBuf::from(std::env::var_os(CHILD).unwrap());
+            let fifo = |path: &Path| {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: this is a NUL-terminated owned fixture path.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            };
+            for case in ["gitfile-fifo", "commondir-fifo", "gitfile-symlink", "gitfile-oversize"] {
+                let root = evidence.join(case);
+                fs::create_dir_all(&root).unwrap();
+                let marker = root.join(".git");
+                match case {
+                    "gitfile-fifo" => fifo(&marker),
+                    "commondir-fifo" => {
+                        fs::create_dir(&marker).unwrap();
+                        fifo(&marker.join("commondir"));
+                    }
+                    "gitfile-symlink" => {
+                        let target = root.join("locator");
+                        fs::write(&target, "gitdir: metadata\n").unwrap();
+                        std::os::unix::fs::symlink(target, &marker).unwrap();
+                    }
+                    _ => fs::write(&marker, vec![b'x'; 4097]).unwrap(),
+                }
+                let executor = Arc::new(FakeExecutor::default());
+                let git = RepositoryService::new("git", executor.clone());
+                let mut cache = SnapshotCache::default();
+                assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &CancellationToken::default(), &mut cache).is_err(), "{case}");
+                assert!(cache.dirty, "failed metadata never certifies an unchanged cache");
+                assert!(executor.commands.lock().unwrap().is_empty(), "invalid prepass must fail before Git: {case}");
+                let cancel = CancellationToken::default();
+                cancel.cancel();
+                let failure = git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap_err();
+                assert!(matches!(failure, RepositoryError::Process(ProcessFailure { kind: ProcessFailureKind::Cancelled, started: false, .. })), "{case}: {failure:?}");
+                assert!(executor.commands.lock().unwrap().is_empty());
+            }
+            let root = evidence.join("recovery");
+            fs::create_dir_all(root.join(".git")).unwrap();
+            let mut outputs = cached_snapshot_outputs(b"", b"");
+            let mut recovered = cached_snapshot_outputs(b"", b"");
+            recovered.drain(2..4);
+            outputs.extend(recovered);
+            outputs.push(success(&snapshot_status(b"")));
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let git = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::default();
+            let mut cache = SnapshotCache::default();
+            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+            let before = executor.commands.lock().unwrap().len();
+            let marker = root.join(".git/commondir");
+            fifo(&marker);
+            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).is_err());
+            assert_eq!(executor.commands.lock().unwrap().len(), before);
+            fs::remove_file(marker).unwrap();
+            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some(),
+                "restoring identical metadata must publish after a failed prepass");
+            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
         }
 
         #[test]
