@@ -1649,7 +1649,7 @@ mod tests {
                     Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(terminal);
                     app.setup_ui.expected_runs.insert(path.clone(), old);
                     app.refresh_worktree_setup_rows();
-                    assert_eq!(app.setup_ui.expected_run(&path), Some(old));
+                    assert_eq!(app.setup_ui.current_run(&path), Some(old));
                     assert!(app.setup_ui.terminals.contains_key(&path));
                     let creation = OperationId::new();
                     let skip = summary == "skipped";
@@ -1702,7 +1702,7 @@ mod tests {
                     }
                     for _ in 0..2 {
                         app.refresh_worktree_setup_rows();
-                        assert_eq!(app.setup_ui.expected_run(&path), None);
+                        assert_eq!(app.setup_ui.current_run(&path), None);
                         assert!(!app.setup_ui.terminals.contains_key(&path));
                         let status = app.setup_ui.statuses.get(&path).unwrap();
                         match summary {
