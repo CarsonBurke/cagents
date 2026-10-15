@@ -647,8 +647,8 @@ mod tests {
                     .unwrap();
                 transaction
                     .execute(
-                        "INSERT INTO sqlite_wal_contract VALUES(?1, ?2, zeroblob(8192))",
-                        params![lane, turn],
+                        "INSERT INTO sqlite_wal_contract VALUES(?1, ?2, ?3)",
+                        params![lane, turn, vec![(lane * 32 + turn) as u8; 8192]],
                     )
                     .unwrap();
                 transaction.commit().unwrap();
@@ -723,6 +723,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == channel)
         );
+        let mut statement = reopened
+            .db
+            .prepare("SELECT lane, turn, payload FROM sqlite_wal_contract ORDER BY lane, turn")
+            .unwrap();
+        let rows: Vec<(i64, i64, Vec<u8>)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 64);
+        for (index, (lane, turn, payload)) in rows.into_iter().enumerate() {
+            assert_eq!((lane, turn), ((index / 32) as i64, (index % 32) as i64));
+            assert_eq!(payload, vec![index as u8; 8192]);
+        }
         let version: u32 = reopened
             .db
             .pragma_query_value(None, "user_version", |row| row.get(0))
