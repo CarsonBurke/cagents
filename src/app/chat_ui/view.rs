@@ -1118,6 +1118,20 @@ impl Runtime {
         }
     }
 
+    fn turn_elapsed(&self) -> Option<String> {
+        self.turn_elapsed_at(self.source_clock.map(chat::client::SourceClock::now))
+    }
+
+    fn turn_elapsed_at(&self, source_now: Option<u64>) -> Option<String> {
+        let start = self.snapshot.turn_started_at?;
+        let end = if self.snapshot.is_working() && !self.snapshot.exited {
+            source_now?
+        } else {
+            self.snapshot.finished_at?
+        };
+        Some(format_duration(end.saturating_sub(start)))
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -2186,6 +2200,11 @@ impl Runtime {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             );
+        }
+        // This footer is outside retained turn bodies, so prose-only work
+        // advances without rebuilding its Markdown every second.
+        if let Some(elapsed) = self.turn_elapsed() {
+            status.push(design::caption(elapsed).into());
         }
         if let Some(channel) = &place.channel {
             status.push(
@@ -4632,6 +4651,168 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_turn_timer_survives_paging_and_stops_at_actual_finish() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            generation: 1,
+            turn_generation: 1,
+            turn_started_at: Some(1_000),
+            sampled_at: Some(2_000),
+            has_earlier: true,
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(3_000)).as_deref(),
+            Some("2.0s")
+        );
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(5_000)).as_deref(),
+            Some("4.0s")
+        );
+        snapshot.generation += 1;
+        snapshot.items.clear();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(6_000)).as_deref(),
+            Some("5.0s")
+        );
+        snapshot.busy = false;
+        snapshot.finished_at = Some(7_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(99_000)).as_deref(),
+            Some("6.0s")
+        );
+        snapshot.turn_generation += 1;
+        snapshot.turn_started_at = Some(8_000);
+        snapshot.finished_at = None;
+        snapshot.busy = true;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(10_000)).as_deref(),
+            Some("2.0s")
+        );
+        snapshot.turn_started_at = None;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert!(
+            runtime.turn_elapsed_at(Some(20_000)).is_none(),
+            "a missing source start is not replaced by attachment time"
+        );
+    }
+
+    #[test]
+    fn resident_turn_timer_uses_delegated_work_without_restarting() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let mut snapshot = Snapshot {
+            ready: true,
+            generation: 1,
+            turn_generation: 1,
+            turn_started_at: Some(1_000),
+            sampled_at: Some(6_000),
+            subagents: vec![native_child_fixture()],
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(snapshot.is_working());
+        assert_eq!(
+            runtime.turn_elapsed_at(Some(7_000)).as_deref(),
+            Some("6.0s")
+        );
+        assert!(
+            runtime.turn_elapsed_at(None).is_none(),
+            "live timing requires the daemon clock, not local wall time"
+        );
+        snapshot.exited = true;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert!(
+            runtime.turn_elapsed_at(Some(99_000)).is_none(),
+            "an exited observer cannot keep timing a last-reported running child"
+        );
+        snapshot.exited = false;
+        snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
+        snapshot.finished_at = Some(8_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.turn_elapsed_at(None).as_deref(), Some("7.0s"));
+    }
+
+    #[test]
+    fn prose_only_finished_timer_is_mounted_in_the_footer() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        handle.replace_snapshot_for_test(Snapshot {
+            ready: true,
+            generation: 1,
+            turn_generation: 1,
+            turn_started_at: Some(1_000),
+            finished_at: Some(4_000),
+            sampled_at: Some(4_000),
+            ..Snapshot::default()
+        });
+        runtime.refresh();
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            956.0,
+            Place {
+                name: "fixture".into(),
+                branch: None,
+                channel: None,
+            },
+            true,
+            None,
+            Vec::new(),
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(956.0, 700.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        assert!(
+            texts.0.iter().any(|text| text == "3.0s"),
+            "the footer timer needs no tool row or retained answer body: {:?}",
+            texts.0
+        );
+    }
 
     #[test]
     fn recorded_message_timestamp_format_uses_message_metadata() {

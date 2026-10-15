@@ -3814,6 +3814,17 @@ mod tests {
             "queued or autonomous turns get a new source timestamp"
         );
         assert_eq!(state.generation, 0, "publication generation is independent");
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "reset".into(),
+            },
+        );
+        assert!(
+            state.turn_started_at.is_none(),
+            "reset cannot retain the previous clock"
+        );
     }
 
     /// Readiness is what a sender waits on, so it ends with the provider.

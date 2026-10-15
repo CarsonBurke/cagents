@@ -71,6 +71,7 @@ pub(super) struct Turn {
     /// How the group's last resolved step went, so a collapsed strip reports
     /// the state the work reached.
     pub(super) outcome: Option<ToolStatus>,
+    outcomes: [usize; 4],
     /// Earliest first observation in the group, when this stretch of work began.
     started_at: Option<u64>,
     /// Latest observation in the group. An earlier item can finish after later
@@ -102,6 +103,7 @@ impl Turn {
             prose: Vec::new(),
             running: false,
             outcome: None,
+            outcomes: [0; 4],
             started_at: item.and_then(|item| item.started_at.or(item.at)),
             ended_at: item.and_then(|item| item.at),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
@@ -123,7 +125,11 @@ impl Turn {
         if self.running {
             return Some(ToolStatus::Running);
         }
-        self.outcome
+        if self.outcomes[1] > 0 && self.outcomes[1] != self.outcomes.iter().sum::<usize>() {
+            None
+        } else {
+            self.outcome
+        }
     }
 
     /// How long this stretch of work has taken, in milliseconds.
@@ -193,11 +199,32 @@ impl Turn {
             self.summary.push_str(" · working");
             return;
         }
+        if self.steps.len() > 1 {
+            let [ok, failed, denied, stopped] = self.outcomes;
+            let mut outcomes = Vec::new();
+            if ok > 0 {
+                outcomes.push(format!("{ok} ok"));
+            }
+            if failed > 0 {
+                outcomes.push(format!("{failed} failed"));
+            }
+            if denied > 0 {
+                outcomes.push(format!("{denied} denied"));
+            }
+            if stopped > 0 {
+                outcomes.push(format!("{stopped} stopped"));
+            }
+            if !outcomes.is_empty() {
+                self.summary.push_str(" · ");
+                self.summary.push_str(&outcomes.join(" · "));
+            }
+            return;
+        }
         match self.outcome {
             Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
             Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
             Some(ToolStatus::Stopped) => self.summary.push_str(" · stopped"),
-            Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => {}
+            Some(ToolStatus::Running | ToolStatus::Succeeded) | None => {}
         }
     }
 
@@ -234,7 +261,16 @@ impl Turn {
             // retry recovered from is not how the stretch of work ended, and
             // ranking it highest meant one grep with no matches painted an
             // error icon on the group for the rest of the session.
-            Some(status) => self.outcome = Some(status),
+            Some(status) => {
+                self.outcomes[match status {
+                    ToolStatus::Succeeded => 0,
+                    ToolStatus::Failed => 1,
+                    ToolStatus::Denied => 2,
+                    ToolStatus::Stopped => 3,
+                    ToolStatus::Running => unreachable!(),
+                }] += 1;
+                self.outcome = Some(status);
+            }
             None => {}
         }
     }
@@ -437,11 +473,7 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             ..
         } => {
             if *action == chat::CommandAction::Run {
-                first_line(if label.trim().is_empty() {
-                    command
-                } else {
-                    label
-                })
+                first_line(command)
             } else if label.is_empty() {
                 first_line(command)
             } else if label == command {
@@ -656,6 +688,49 @@ mod tests {
             started_at: None,
             at: None,
         }
+    }
+
+    #[test]
+    fn mixed_outcomes_count_steps_without_error_glyph() {
+        let items = (0..5)
+            .map(|index| {
+                command(
+                    &format!("tool-{index}"),
+                    if index == 4 {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let turns = group(&items, &unasked(), plain);
+        assert!(turns[0].summary.ends_with("4 ok · 1 failed"));
+        assert_eq!(turns[0].glyph(), None);
+        let failed = vec![
+            command("a", ToolStatus::Failed),
+            command("b", ToolStatus::Failed),
+        ];
+        let turns = group(&failed, &unasked(), plain);
+        assert!(turns[0].summary.ends_with("2 failed"));
+        assert_eq!(turns[0].glyph(), Some(ToolStatus::Failed));
+        let denied = vec![
+            command("a", ToolStatus::Succeeded),
+            command("b", ToolStatus::Denied),
+        ];
+        let turns = group(&denied, &unasked(), plain);
+        assert!(turns[0].summary.ends_with("1 ok · 1 denied"));
+        assert_ne!(turns[0].glyph(), Some(ToolStatus::Failed));
+    }
+
+    #[test]
+    fn bash_primary_label_is_the_command_even_with_a_model_description() {
+        let mut item = command("test", ToolStatus::Succeeded);
+        if let ItemContent::Command { label, command, .. } = &mut item.content {
+            *label = "Run tests for module 295".into();
+            *command = "cargo test --lib module_295".into();
+        }
+        assert_eq!(step_label(&item.content), "cargo test --lib module_295");
     }
 
     fn stamped(item: Item, at: u64) -> Item {
@@ -881,7 +956,7 @@ mod tests {
             Some(ToolStatus::Succeeded),
             "a failure a later step recovered from is not how the work ended"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands");
+        assert_eq!(turns[0].summary, "Ran 2 commands · 1 ok · 1 failed");
         let items = vec![
             text("u1", Role::User, Phase::Final, false),
             command("c1", ToolStatus::Succeeded),
@@ -893,7 +968,7 @@ mod tests {
             Some(ToolStatus::Failed),
             "a group that ended on a failure still reports it"
         );
-        assert_eq!(turns[0].summary, "Ran 2 commands · failed");
+        assert_eq!(turns[0].summary, "Ran 2 commands · 1 ok · 1 failed");
     }
 
     #[test]
@@ -1284,8 +1359,12 @@ mod tests {
             (CommandAction::Search, "Search TODO", "Searched TODO"),
             (CommandAction::List, "**/*.rs", "Listed **/*.rs"),
             (CommandAction::List, "List src", "Listed src"),
-            // A shell command's label is the provider's own description.
-            (CommandAction::Run, "Read the logs", "Ran Read the logs"),
+            // Shell commands lead with the command; the description is secondary.
+            (
+                CommandAction::Run,
+                "Read the logs",
+                "Ran sed -n 1,20p src/app.rs",
+            ),
             // Only the stored verb is taken off, and never the whole label.
             (CommandAction::Read, "Search.md", "Read Search.md"),
             (CommandAction::Read, "Read ", "Read Read "),

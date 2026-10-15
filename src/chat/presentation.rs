@@ -258,7 +258,9 @@ mod tests {
             )],
         };
         let full_bytes = postcard::to_stdvec(&*installed).unwrap().len();
-        let delta_bytes = postcard::to_stdvec(&update).unwrap().len();
+        let encoded = postcard::to_stdvec(&update).unwrap();
+        let delta_bytes = encoded.len();
+        let update: Presentation = postcard::from_bytes(&encoded).unwrap();
         assert!(full_bytes > 2 * 1024 * 1024);
         assert!(delta_bytes < 4096);
         installed = std::sync::Arc::new(update.apply(&installed).unwrap());
