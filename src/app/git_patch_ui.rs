@@ -1,7 +1,22 @@
-//! Worker-built partial changes use the same mutation queue as whole files.
+//! Opaque prepared changes retain their source through the ordered Git queue.
 
 use super::*;
 use crate::{git_patch, repository_widget::DiffMutationRequest};
+
+/// A preparing action reserves its queue position before its worker starts.
+/// The reducer publishes its result once; neither a later result nor a newer
+/// row can replace the source held by the opaque preparation.
+#[derive(Clone, Debug)]
+pub(super) struct Pending {
+    card: CardId,
+    buffer_only: bool,
+    result: Arc<std::sync::OnceLock<Result<Option<Arc<repository_widget::PreparedDiffMutation>>, String>>>,
+}
+
+impl Pending {
+    fn new(card: CardId, buffer_only: bool) -> Self { Self { card, buffer_only, result: Arc::new(std::sync::OnceLock::new()) } }
+    pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.result, &other.result) }
+}
 
 impl Cagents {
     pub(super) fn start_diff_patch(
@@ -10,97 +25,161 @@ impl Cagents {
         kind: git_patch::Kind,
         request: Option<Arc<DiffMutationRequest>>,
     ) -> Task<Message> {
-        if self.modal_is_open() {
-            return Task::none();
-        }
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
-            return Task::none();
-        };
-        let Some(source) = self
-            .sidebar_model
-            .source_control
-            .as_ref()
-            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
-        else {
-            return Task::none();
-        };
-        let Some(capture) = runtime.capture_diff_mutation(card, kind, request.as_deref()) else {
-            return Task::none();
-        };
+        if self.modal_is_open() { return Task::none(); }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
+        let Some(source) = self.sidebar_model.source_control.as_ref()
+            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree) else { return Task::none(); };
+        let Some(capture) = runtime.capture_diff_mutation(card, kind, request.as_deref()) else { return Task::none(); };
         let key = source.key.clone();
-        let identity = capture.identity.clone();
-        let buffer_revision = capture.buffer_revision;
-        cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || capture.build().map(|(_, _, patch)| patch))
-                    .await
-                    .map_err(|error| format!("Could not prepare the selected changes: {error}"));
-            Message::DiffPatchPrepared {
-                key,
-                identity,
-                buffer_revision,
-                result,
-            }
-        })
+        let pending = Pending::new(card, capture.applies_to_buffer());
+        // A genuine native buffer Revert never writes Git or disk and remains
+        // available on hosts without strong Git mutation authority.
+        let reservation = if pending.buffer_only { Task::none() }
+            else { self.enqueue_git_mutation(key.clone(), QueuedGitMutation::PreparedDiff(pending.clone())) };
+        let admitted = pending.buffer_only || self.source_control_mutations.get(&key.canonical_path).is_some_and(|active| {
+            active.request.as_ref().is_some_and(|request| request.owns_diff_preparation(&pending))
+                || active.pending.iter().any(|request| request.owns_diff_preparation(&pending))
+        });
+        if !admitted { return reservation; }
+        let prepare = cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || capture.prepare()).await
+                .map_err(|error| format!("Could not prepare the selected changes: {error}"));
+            Message::DiffPatchPrepared { key, pending, result }
+        });
+        Task::batch([reservation, prepare])
     }
 
     pub(super) fn finish_diff_patch(
         &mut self,
         key: ActiveWorktreeKey,
-        identity: repository_widget::AsyncIdentity,
-        buffer_revision: Option<u64>,
-        result: Result<Option<git_patch::Patch>, String>,
+        pending: Pending,
+        result: Result<Option<repository_widget::PreparedDiffMutation>, String>,
     ) -> Task<Message> {
-        if !self.sidebar_model.contains_worktree(&key) {
-            return Task::none();
+        if pending.buffer_only {
+            if pending.result.set(result.map(|prepared| prepared.map(Arc::new))).is_err() { return Task::none(); }
+            return self.apply_prepared_buffer_diff(pending);
         }
-        if self.modal_is_open() {
-            self.status = Some(TransientNotice::warning(
-                "Close the dialog and retry the selected change.",
-            ));
-            return Task::none();
-        }
-        let mut patch = match result {
-            Ok(Some(patch)) => patch,
-            Ok(None) => {
-                self.status = Some(TransientNotice::warning(
-                    "The selected range contains no applicable changed lines.",
-                ));
-                return Task::none();
-            }
-            Err(error) => {
-                self.status = Some(TransientNotice::warning(error));
+        let Some(active) = self.source_control_mutations.get(&key.canonical_path) else { return Task::none(); };
+        let current = active.request.as_ref().is_some_and(|request| request.owns_diff_preparation(&pending));
+        if !current && !active.pending.iter().any(|request| request.owns_diff_preparation(&pending)) { return Task::none(); }
+        if pending.result.set(result.map(|prepared| prepared.map(Arc::new))).is_err() { return Task::none(); }
+        let operation = active.id;
+        if current { self.queued_git_task(key, operation, QueuedGitMutation::PreparedDiff(pending)) }
+        else { Task::none() }
+    }
+
+    fn apply_prepared_buffer_diff(&mut self, pending: Pending) -> Task<Message> {
+        let Some(result) = pending.result.get() else { return Task::none(); };
+        let prepared = match result {
+            Ok(Some(prepared)) if prepared.applies_to_buffer() => prepared,
+            other => {
+                self.status = Some(TransientNotice::warning(match other {
+                    Err(error) => error.clone(), _ => "The original buffer change is no longer available.".into(),
+                }));
                 return Task::none();
             }
         };
-        if let Some(revision) = buffer_revision {
-            let Some(present) = patch.working_present else {
-                return Task::none();
-            };
-            let change = patch.buffer_change.take();
-            let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&identity.card) else {
-                return Task::none();
-            };
-            if let Err(error) = runtime.apply_diff_buffer_revert_with_presence(
-                &identity,
-                revision,
-                change,
-                present,
-                patch.working_mode,
-            ) {
-                self.status = Some(TransientNotice::warning(error));
-                return Task::none();
-            }
-            return self.drain_lsp_intents(identity.card);
+        if self.modal_is_open() { return Task::none(); }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&pending.card) else { return Task::none(); };
+        match prepared.as_ref().clone().apply(runtime) {
+            Ok(None) => self.drain_lsp_intents(pending.card),
+            Ok(Some(_)) => { self.status = Some(TransientNotice::warning("A buffer-only action cannot change Git state.")); Task::none() }
+            Err(error) => { self.status = Some(TransientNotice::warning(error)); Task::none() }
         }
-        self.update(Message::Sidebar(SidebarAction::GitOperation {
-            key,
-            operation: crate::repository::GitOperation::ApplyPatch {
-                patch: patch.patch,
-                cached: patch.cached,
-                reverse: patch.reverse,
-                expected_head: patch.expected_head,
-            },
-        }))
+    }
+
+    pub(super) fn apply_prepared_diff_at_turn(
+        &mut self,
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        pending: Pending,
+    ) -> Task<Message> {
+        let Some(result) = pending.result.get() else { return Task::none(); };
+        let complete = |report| Message::SourceControlMutated { key: key.clone(), operation, report, committed: false };
+        let prepared = match result {
+            Ok(Some(prepared)) if !prepared.applies_to_buffer() => prepared,
+            Ok(Some(_)) => return self.update(complete(Some("The prepared action changed its effect type.".into()))),
+            Ok(None) => return self.update(complete(Some("The selected range contains no applicable changed lines.".into()))),
+            Err(error) => return self.update(complete(Some(error.clone()))),
+        };
+        if self.modal_is_open() {
+            return self.update(complete(Some("Close the dialog and retry the selected change.".into())));
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&pending.card) else {
+            return self.update(complete(Some("The original diff is no longer available.".into())));
+        };
+        // This opaque check includes the model Arc, document/buffer revision,
+        // annotations, basis, mode, layout and exact selection at this turn.
+        match prepared.as_ref().clone().apply(runtime) {
+            Ok(Some(effect)) => self.queued_git_task(key, operation, QueuedGitMutation::Operation(effect)),
+            Ok(None) => {
+                let released = self.update(complete(None));
+                Task::batch([released, self.drain_lsp_intents(pending.card)])
+            }
+            Err(error) => self.update(complete(Some(error))),
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (Cagents, CardId, ActiveWorktreeKey) {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let runtime = repository_widget::RepositoryRuntime::selected_diff_fixture(card);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let source = app.sidebar_model.source_control.as_mut().unwrap();
+        source.key.canonical_path = runtime.descriptor.worktree.clone();
+        let key = source.key.clone();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        (app, card, key)
+    }
+
+    #[test]
+    fn delayed_preparation_reserves_turn_and_refuses_changed_diff_before_git() {
+        let (mut app, card, key) = fixture();
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).unwrap().prepare().unwrap();
+        // Admission of the actual app action reserves before its worker runs.
+        // Hold that task, then change the live rendered coordinates.
+        let held = app.start_diff_patch(card, git_patch::Kind::Stage, None);
+        let active = app.source_control_mutations.get(&key.canonical_path).unwrap();
+        let Some(QueuedGitMutation::PreparedDiff(pending)) = active.request.as_ref() else { panic!("preparation must own the turn") };
+        let pending = pending.clone();
+        drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Unstage(Vec::new())));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].pending.len(), 1);
+        let CardRuntime::Repository(runtime) = app.cards.get_mut(&card).unwrap() else { panic!() };
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        // Do not execute the queued successor: this test proves preparation
+        // refuses before it can lower to any Git operation.
+        app.source_control_mutations.get_mut(&key.canonical_path).unwrap().pending.clear();
+        drop(app.finish_diff_patch(key.clone(), pending.clone(), Ok(Some(prepared.clone()))));
+        assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
+        assert!(app.notices.recent().any(|entry| entry.notice.message.contains("changed"))
+            || app.status.as_ref().is_some_and(|notice| notice.message.contains("changed")));
+        // A replay cannot reclaim a completed slot or submit a new operation.
+        drop(app.finish_diff_patch(key.clone(), pending, Ok(Some(prepared))));
+        assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
+        drop(held);
+    }
+
+    #[test]
+    fn unchanged_buffer_preparation_applies_once_and_keeps_one_undo() {
+        let (mut app, card, key) = fixture();
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, None).unwrap().prepare().unwrap();
+        assert!(prepared.applies_to_buffer());
+        let pending = Pending::new(card, true);
+        drop(app.finish_diff_patch(key.clone(), pending.clone(), Ok(Some(prepared.clone()))));
+        let CardRuntime::Repository(runtime) = app.cards.get_mut(&card).unwrap() else { panic!() };
+        assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
+        drop(app.finish_diff_patch(key, pending, Ok(Some(prepared))));
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
 }

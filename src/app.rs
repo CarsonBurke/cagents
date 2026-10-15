@@ -6657,9 +6657,8 @@ pub enum Message {
     ChatClose(chat_ui::closing::Action),
     DiffPatchPrepared {
         key: ActiveWorktreeKey,
-        identity: repository_widget::AsyncIdentity,
-        buffer_revision: Option<u64>,
-        result: Result<Option<crate::git_patch::Patch>, String>,
+        pending: git_patch_ui::Pending,
+        result: Result<Option<repository_widget::PreparedDiffMutation>, String>,
     },
     Device(device_ui::Action),
     ReviewFilePanelToggle {
@@ -7602,6 +7601,7 @@ impl WorkspaceDestination {
 #[derive(Debug, Clone)]
 enum QueuedGitMutation {
     Stage(Vec<crate::repository::PathSelection>),
+    PreparedDiff(git_patch_ui::Pending),
     /// Resolve an uncapped group only after all earlier worktree commands.
     Area {
         area: crate::repository::ChangeArea,
@@ -7622,12 +7622,16 @@ enum QueuedGitMutation {
 }
 
 impl QueuedGitMutation {
+    fn owns_diff_preparation(&self, pending: &git_patch_ui::Pending) -> bool {
+        matches!(self, Self::PreparedDiff(current) if current.same(pending))
+    }
+
     fn kind(&self) -> MutationKind {
         match self {
             Self::Stage(_) | Self::StageApproved { .. } => MutationKind::Stage,
             Self::Unstage(_) => MutationKind::Unstage,
             Self::Discard(_) => MutationKind::Discard,
-            Self::Operation(_) | Self::UndoDiscard(_) => MutationKind::Other,
+            Self::Operation(_) | Self::UndoDiscard(_) | Self::PreparedDiff(_) => MutationKind::Other,
             Self::Area { command, .. } => match command {
                 sidebar::ChangeGroupCommand::Stage => MutationKind::Stage,
                 sidebar::ChangeGroupCommand::Unstage => MutationKind::Unstage,
@@ -14903,12 +14907,13 @@ impl Cagents {
     }
 
     fn queued_git_task(
-        &self,
+        &mut self,
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
         request: QueuedGitMutation,
     ) -> Task<Message> {
         let request = match request {
+            QueuedGitMutation::PreparedDiff(pending) => return self.apply_prepared_diff_at_turn(key, operation, pending),
             QueuedGitMutation::Area { area, command, .. } => {
                 return self.queued_group_task(key, operation, area, command);
             }
@@ -15063,8 +15068,8 @@ impl Cagents {
                 QueuedGitMutation::Discard(request) => {
                     ("Discard", service.discard(&request, cancellation))
                 }
-                QueuedGitMutation::Area { .. } => {
-                    unreachable!("group tasks are dispatched before ordinary mutations")
+                QueuedGitMutation::Area { .. } | QueuedGitMutation::PreparedDiff(_) => {
+                    unreachable!("group and prepared tasks are dispatched before ordinary mutations")
                 }
                 QueuedGitMutation::UndoDiscard(recovery) => (
                     "Undo discard",
@@ -18321,12 +18326,7 @@ impl Application for Cagents {
                 kind,
                 request,
             }) => self.start_diff_patch(card, kind, Some(request)),
-            Message::DiffPatchPrepared {
-                key,
-                identity,
-                buffer_revision,
-                result,
-            } => self.finish_diff_patch(key, identity, buffer_revision, result),
+            Message::DiffPatchPrepared { key, pending, result } => self.finish_diff_patch(key, pending, result),
 
             Message::Repository(RepositoryAction::RevertFile { card }) => {
                 if self.modal_is_open() {
