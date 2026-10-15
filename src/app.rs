@@ -18088,7 +18088,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::model::WorktreeId;
+    use crate::{agent::Provider, model::WorktreeId};
     use cosmic::iced::futures::StreamExt;
 
     #[test]
@@ -25837,7 +25837,7 @@ mod tests {
         );
         let row = &app.sidebar_model.projects[0].channels[0];
         assert_eq!(row.worktree, Some((linked, "feature/login".into())));
-        assert!(row.tooltip.contains("feature/login"));
+        assert!(row.tooltip_for_test().contains("feature/login"));
         for id in &ids {
             app.observe_agent_update_for_card(*id);
         }
