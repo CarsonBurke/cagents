@@ -453,4 +453,39 @@ mod tests {
         assert!(!owner.0.is_completed(), "known-thread or old unknown refusal has no teardown effects");
     }
 
+    #[test]
+    fn typed_handoff_ack_authenticates_the_full_operation_and_never_clears_a_successor() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor(&source);
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        let binding = fixture.capture().unwrap();
+        // Metadata-only issuer fixture: it deliberately grants NO terminal
+        // teardown or source-transition authority; ACK must not require either.
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), source.launch.recipe.clone(), None);
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let a = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(),
+            source_execution_instance: binding.execution_instance, source_binding: binding,
+            retained_binding: None, terminal: descriptor };
+        let mut b = a.clone();
+        b.operation = uuid::Uuid::new_v4();
+        b.terminal.execution_instance = uuid::Uuid::new_v4();
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.remember_terminal_handoff(a.clone());
+            state.remember_terminal_handoff(b.clone());
+            state.chat_handoffs.insert(source.id, TerminalHandoff::from_receipt(b.clone(), 0, BTreeMap::new(), Instant::now() + ACKNOWLEDGEMENT_GRACE));
+        }
+        let mut forged = b.clone(); forged.terminal.execution_instance = a.terminal.execution_instance;
+        assert!(process_inner(&fixture.host, 1, ClientRequest::ChatCommitTerminalReceipt { receipt: forged }, None).is_err());
+        assert!(process_inner(&fixture.host, 1, ClientRequest::ChatCommitTerminal { terminal_id: a.terminal.session.id }, None).is_err());
+        process_inner(&fixture.host, 1, ClientRequest::ChatCommitTerminalReceipt { receipt: a }, None).unwrap();
+        assert_eq!(fixture.host.lock().unwrap().chat_handoffs[&source.id].issued.as_ref(), Some(&b));
+        for _ in 0..2 {
+            process_inner(&fixture.host, 1, ClientRequest::ChatCommitTerminalReceipt { receipt: b.clone() }, None).unwrap();
+            assert!(!fixture.host.lock().unwrap().chat_handoffs.contains_key(&source.id));
+        }
+        assert!(!owner.0.is_completed(), "metadata ACK never stops any provider or terminal");
+    }
+
 }

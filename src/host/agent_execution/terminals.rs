@@ -95,6 +95,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatStartSelected { .. }
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
+        | R::ChatCommitTerminalReceipt { .. }
         | R::ChatPrepareResume { .. } => Access::Refused,
     }
 }

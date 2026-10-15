@@ -3280,8 +3280,32 @@ fn process_inner(
                 snapshot,
             })
         }
+        ClientRequest::ChatCommitTerminalReceipt { receipt } => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.validate_issued_terminal_handoff(&receipt)?;
+            // ACK may be retried after retirement or a successor publication.
+            // Its full operation authenticates only metadata that is STILL
+            // exactly this receipt; it can never clear a newer same-ID slot.
+            let remove = state.chat_handoffs.get(&receipt.source.id)
+                .is_some_and(|pending| pending.issued.as_ref() == Some(&receipt));
+            if remove { state.chat_handoffs.remove(&receipt.source.id); }
+            let mut changed = remove;
+            if let Some(record) = state.chats.get_mut(&receipt.source.id)
+                && record.handoff_receipt.as_ref() == Some(&receipt) {
+                record.handoff_receipt = None;
+                changed = true;
+            }
+            if changed { state.inventory_generation += 1; }
+            Ok(ServerResponse::Accepted)
+        }
         ClientRequest::ChatCommitTerminal { terminal_id } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.chat_handoffs.values().any(|pending|
+                pending.terminal.id == terminal_id && pending.issued.is_some())
+                || state.chats.values().any(|record| record.handoff_receipt.as_ref()
+                    .is_some_and(|receipt| receipt.terminal.session.id == terminal_id)) {
+                return Err(unavailable("This terminal handoff requires its full issued receipt acknowledgement; no operation was retired"));
+            }
             // The authenticated envelope pins this receipt to the saved host.
             // Terminal retirement cannot invalidate a durable commit or its retry.
             // The GUI must flush replacement of all of its source references first.
@@ -4623,7 +4647,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let ServerResponse::ChatTerminal {
-            session: terminal, ..
+            session: terminal, receipt: full_receipt, ..
         } = process(
             &host,
             1,
@@ -4784,8 +4808,8 @@ for line in sys.stdin:
                 process(
                     &host,
                     2,
-                    ClientRequest::ChatCommitTerminal {
-                        terminal_id: terminal.id,
+                    ClientRequest::ChatCommitTerminalReceipt {
+                        receipt: full_receipt.clone(),
                     }
                 )
                 .unwrap(),

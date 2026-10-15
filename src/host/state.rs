@@ -370,6 +370,13 @@ impl HostState {
                 "The returned terminal was replaced or its exact publication history is unavailable", false));
         }
 
+        self.validate_issued_terminal_handoff(receipt)
+    }
+
+    /// Metadata-only ACK authenticates the immutable issued operation without
+    /// requiring execution to remain live. It never grants teardown authority.
+    pub(super) fn validate_issued_terminal_handoff(&self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt) -> Result<(), ProtocolError> {
+        crate::terminal_ipc::validate_proof(receipt.source.proof.as_ref(), self.proof())?;
         let issued = self.handoff_receipts.get(&receipt.operation)
             .or_else(|| self.chat_handoffs.values().filter_map(|pending| pending.issued()).find(|old| old.operation == receipt.operation))
             .or_else(|| self.chats.values().filter_map(|chat| chat.handoff_receipt.as_ref()).find(|old| old.operation == receipt.operation));

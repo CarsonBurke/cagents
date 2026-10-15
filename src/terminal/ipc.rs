@@ -486,6 +486,11 @@ pub enum ClientRequest {
     ChatCloseSession {
         session: crate::chat::Session,
     },
+    /// Retire only this exact host-issued handoff after its full durable save.
+    /// Future matched protocol allocation; never use the legacy ID-only ACK.
+    ChatCommitTerminalReceipt {
+        receipt: TerminalHandoffReceipt,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2148,6 +2153,10 @@ mod tests {
         let mut bytes = Vec::new(); write_frame(&mut bytes, &request).unwrap();
         let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
         assert_eq!(decoded, request);
+        let ack = ClientRequest::ChatCommitTerminalReceipt { receipt: receipt.clone() };
+        let mut bytes = Vec::new(); write_frame(&mut bytes, &ack).unwrap();
+        let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, ack);
         let response = ServerResponse::ChatTerminal { chat_id: source.id, session: terminal.session.clone(), receipt, snapshot: Default::default() };
         let mut bytes = Vec::new(); write_frame(&mut bytes, &response).unwrap();
         let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();

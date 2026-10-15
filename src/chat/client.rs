@@ -1543,6 +1543,46 @@ fn acknowledge_terminal_handoffs_on(
         .collect()
 }
 
+/// Retire metadata only after saving each COMPLETE host-issued receipt.
+/// Missing/replaced daemons cannot retire an unknown operation: keep the
+/// durable receipt so the caller can report or reconcile it explicitly.
+pub fn acknowledge_terminal_handoff_receipts(
+    receipts: &[crate::terminal_ipc::TerminalHandoffReceipt],
+) -> Vec<Result<(), String>> {
+    if receipts.is_empty() { return Vec::new(); }
+    let socket = match ipc::daemon_socket_path() {
+        Ok(socket) => socket,
+        Err(error) => return vec![Err(error.to_string()); receipts.len()],
+    };
+    acknowledge_terminal_handoff_receipts_on(crate::control::ControlClient::connect(&socket), receipts)
+}
+
+fn acknowledge_terminal_handoff_receipts_on(
+    connection: Result<crate::control::ControlClient, crate::control::ControlError>,
+    receipts: &[crate::terminal_ipc::TerminalHandoffReceipt],
+) -> Vec<Result<(), String>> {
+    let mut client = match connection {
+        Ok(client) => client,
+        Err(error) => return vec![Err(error.to_string()); receipts.len()],
+    };
+    let mut connection_failure = None;
+    receipts.iter().map(|receipt| {
+        if receipt.source.proof.as_ref() != Some(client.proof()) {
+            return Err("The exact daemon that issued this terminal handoff is unavailable; its receipt was retained".into());
+        }
+        if let Some(error) = &connection_failure { return Err(error.clone()); }
+        match client.commit_terminal_handoff_receipt(receipt) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !matches!(error, crate::control::ControlError::Remote { .. }) {
+                    connection_failure = Some(error.to_string());
+                }
+                Err(error.to_string())
+            }
+        }
+    }).collect()
+}
+
 /// Running and starting daemon chats, including detached sessions. Never starts a daemon.
 pub fn inventory() -> Result<Vec<Session>, String> {
     let socket = ipc::daemon_socket_path().map_err(|e| e.to_string())?;
@@ -1788,6 +1828,40 @@ mod tests {
                 },
             },
         );
+    }
+
+    #[test]
+    fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
+        let terminal = handoff_terminal();
+        let source = Session { id: TerminalId::new(), proof: Some(handoff_proof()),
+            launch: super::Launch { provider: crate::agent::Provider::Omp, recipe: terminal.launch.clone(), session_id: Some("original".into()) },
+            terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let binding = crate::terminal_ipc::ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch, None);
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let a = crate::terminal_ipc::TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
+            source_execution_instance: binding.execution_instance, source_binding: binding, retained_binding: None, terminal: descriptor };
+        let mut b = a.clone(); b.operation = uuid::Uuid::new_v4(); b.terminal.execution_instance = uuid::Uuid::new_v4();
+        let receipts = vec![a, b];
+        let expected = receipts.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            for (index, expected) in expected.into_iter().enumerate() {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(request.request, ClientRequest::ChatCommitTerminalReceipt { receipt: expected });
+                let message = if index == 0 { ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                    crate::terminal_ipc::ProtocolErrorCode::InvalidRequest, "exact receipt refused", false)) }
+                    else { ServerMessage::Response { response: ServerResponse::Accepted } };
+                handoff_reply(&mut server, &mut codec, Some(request.request_id), &handoff_proof(), message);
+            }
+        });
+        let result = acknowledge_terminal_handoff_receipts_on(crate::control::ControlClient::from_stream(client), &receipts);
+        worker.join().unwrap();
+        assert!(result[0].as_ref().unwrap_err().contains("exact receipt refused"));
+        assert!(result[1].is_ok());
+        assert!(acknowledge_terminal_handoff_receipts_on(Err(crate::control::ControlError::ConnectionClosed), &receipts).iter().all(Result::is_err));
     }
 
     #[test]

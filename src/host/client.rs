@@ -730,6 +730,7 @@ pub(super) fn process_request(
         | ClientRequest::ChatCloseSession { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
+        | ClientRequest::ChatCommitTerminalReceipt { .. }
         | ClientRequest::ChatList) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),

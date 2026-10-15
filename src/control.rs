@@ -593,6 +593,17 @@ impl ControlClient {
         }
     }
 
+    /// Metadata-only acknowledgement of the exact returned worker operation.
+    #[cfg(feature = "ui")]
+    pub(crate) fn commit_terminal_handoff_receipt(
+        &mut self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::ChatCommitTerminalReceipt { receipt: receipt.clone() })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("an exact terminal handoff acknowledgement", &response)),
+        }
+    }
+
     /// Acts for the agent session `authority` was issued to, which may then
     /// change only the terminals it controls. Without a token the connection
     /// keeps acting for the user.
