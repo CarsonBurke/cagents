@@ -21383,7 +21383,9 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
         let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![], author: identity.clone(), committer: identity, subject: "Same commit".into(), body: "Same body".into() });
-        let original = source_control();
+        let mut original = source_control();
+        original.history = vec![row.clone()];
+        assert!(original.history_command_available(&row.oid, row.mainline, &row.message, HistoryCommand::Revert));
         fn make<'a>(source: &'a SourceControlModel, row: &'a CommitRow) -> Element<'a, SidebarAction> {
             history_context_controls(cosmic::iced::widget::Space::new().width(240).height(32).into(), source, row, false, Arc::new(source.key.clone()), Arc::new(std::array::from_fn(|_| None)))
         }
@@ -21393,6 +21395,7 @@ pub(crate) mod tests {
         for path_only in [false, true] {
             let mut changed = original.clone();
             changed.key = if path_only { ActiveWorktreeKey { canonical_path: "/replacement/main".into(), ..original.key.clone() } } else { fix_key() };
+            assert!(changed.history_command_available(&row.oid, row.mainline, &row.message, HistoryCommand::Revert), "the replacement target would otherwise admit its own action");
             let mut element = make(&original, &row);
             let widget = element.as_widget_mut();
             let mut tree = Tree::new(&*widget);
