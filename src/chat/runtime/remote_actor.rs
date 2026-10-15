@@ -1492,6 +1492,9 @@ struct Server {
     mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     closed_snapshot: Option<Arc<Snapshot>>,
     session_stopping: bool,
+    // A successful ownership handoff fences authorizing commands from the old
+    // attachment. A newly authenticated attach may own the still-live actor.
+    attachment_preserved: bool,
 }
 impl Server {
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
@@ -1641,6 +1644,7 @@ impl Server {
             mailbox_seal,
             closed_snapshot: None,
             session_stopping: false,
+            attachment_preserved: false,
         })
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
@@ -1838,6 +1842,7 @@ impl Server {
                 );
             }
             self.epoch = uuid::Uuid::new_v4();
+            self.attachment_preserved = false;
             self.proof = request.proof;
             if self.closed_snapshot.is_some() {
                 self.publish_close()?;
@@ -1858,6 +1863,12 @@ impl Server {
             ($expression:expr) => {
                 serde_json::to_value($expression).map_err(|error| error.to_string())
             };
+        }
+        if self.attachment_preserved && matches!(request.method.as_str(),
+            "restart" | "fence_session_stop" | "close" | "close_until" |
+            "close_if_revision" | "close_if_idle" | "relocate_directory"
+        ) {
+            return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
             "execution_environment" => value!(self.environment.clone()),
@@ -1978,6 +1989,9 @@ impl Server {
                         "This actor lifetime is stopping; new provider input is refused".into(),
                     );
                 }
+                if self.attachment_preserved {
+                    return Err("This attachment preserved provider ownership; new provider input is refused".into());
+                }
                 if self.pending.len() >= 65 {
                     return Err("Retained actor input completion capacity reached".into());
                 }
@@ -2090,6 +2104,13 @@ impl Server {
             "preserve" => {
                 if !self.installed {
                     return Err("Cannot preserve an uninstalled actor".into());
+                }
+                if self.session_stopping {
+                    return Err("This actor lifetime is stopping; ownership cannot be preserved for a successor".into());
+                }
+                if !self.attachment_preserved {
+                    self.attachment_preserved = true;
+                    self.changed.fetch_add(1, Ordering::Release);
                 }
                 Ok(Value::Null)
             }
@@ -2603,6 +2624,7 @@ mod tests {
                 mailbox_seal: None,
                 closed_snapshot: None,
                 session_stopping: false,
+                attachment_preserved: false,
             },
             _root: root,
         }
@@ -3013,6 +3035,47 @@ done"#;
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn retained_preservation_and_session_stop_have_one_attachment_winner() {
+        for preserve_first in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let invoke = |server: &mut Server, method: &str, args: Value| {
+                server.invoke(Invocation { proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args })
+            };
+            let actor_id = server.identity.instance;
+            if preserve_first {
+                invoke(server,"preserve",Value::Null).unwrap();
+                invoke(server,"preserve",Value::Null).unwrap(); // Lost-ACK retry is idempotent.
+                assert!(server.attachment_preserved);
+                assert!(invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap_err().contains("preserved"));
+                assert!(!server.session_stopping);
+                assert!(!server.actor.0.stop.load(Ordering::Acquire));
+                assert!(invoke(server,"restart",Value::Null).unwrap_err().contains("preserved"));
+                assert!(invoke(server,"close_until",json!([1000])).unwrap_err().contains("preserved"));
+                let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
+                let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&payload).unwrap())};
+                assert!(invoke(server,"input",json!([identity,payload])).unwrap_err().contains("preserved"));
+                assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1);
+                assert!(invoke(server,"outbox_unacked",Value::Null).is_ok());
+                assert!(invoke(server,"input_receipts",json!([Vec::<InputIdentity>::new()])).is_ok());
+                let epoch=server.epoch; let source=server.source.clone();
+                invoke(server,"attach",json!([source])).unwrap();
+                assert_ne!(server.epoch,epoch);
+                assert!(!server.attachment_preserved);
+                invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap();
+            } else {
+                invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap();
+                assert!(invoke(server,"preserve",Value::Null).unwrap_err().contains("stopping"));
+                assert!(!server.attachment_preserved);
+                let source=server.source.clone();
+                invoke(server,"attach",json!([source])).unwrap();
+                assert!(server.session_stopping);
+                assert!(invoke(server,"preserve",Value::Null).unwrap_err().contains("stopping"));
+            }
+        }
     }
 
     #[test]
