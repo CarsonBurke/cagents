@@ -559,6 +559,7 @@ impl Registry {
         let automation = read_automation(&tx, firing.automation).ok();
         if notify == Some(true)
             && let Some(automation) = automation
+            && current_skip_notice_group(&tx, &automation, &firing)?
         {
             // Legacy settled history is a baseline, not new attention. The
             // exact new helper's notice intent survives interrupted cleanup.
@@ -2198,6 +2199,33 @@ fn skip_notification_group(tx: &Transaction<'_>, firing: &Firing) -> Result<Uuid
     id.map(|id| id.parse::<Uuid>().map_err(|error| error.to_string()))
         .transpose()
         .map(|id| id.unwrap_or(firing.id))
+}
+
+/// Cleanup may finish after a newer occurrence pauses or blocks. History and
+/// helper retirement remain valid, but only the current skip group may replace
+/// the automation's attention. Wall-clock retirement order confers no authority.
+fn current_skip_notice_group(
+    tx: &Transaction<'_>,
+    automation: &Automation,
+    firing: &Firing,
+) -> Result<bool, String> {
+    if automation.blocked.is_some()
+        || automation.execution_revision != firing.revision
+        || (!automation.enabled
+            && matches!(firing.trigger, crate::automations::Trigger::Scheduled { .. }))
+    {
+        return Ok(false);
+    }
+    let latest: String = tx.query_row(
+        "SELECT record FROM automation_firings WHERE automation=?1 ORDER BY rowid DESC LIMIT 1",
+        [firing.automation.to_string()], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let latest: Firing = decode(&latest)?;
+    Ok(latest.state == FiringState::Skipped
+        && latest.agent.is_none()
+        && latest.run.is_none()
+        && !latest.release_pending
+        && skip_notification_group(tx, &latest)? == skip_notification_group(tx, firing)?)
 }
 
 fn skipped_reason(firing: &Firing) -> &'static str {
@@ -5256,5 +5284,160 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn late_precheck_retirement_cannot_replace_newer_pause_or_block_attention() {
+        use crate::automations::{Precheck, SkipReason, Trigger};
+        use crate::host::automations::precheck::Outcome;
+        for blocked in [false, true] {
+            for already_delivered in [false, true] {
+                let (mut registry, _directory, mut definition) = fixture();
+                definition.precheck = Some(Precheck {
+                    command: "exit 3".into(),
+                    timeout_seconds: 1,
+                });
+                let created = registry
+                    .create_automation(definition, 100, test_identity())
+                    .unwrap();
+                let enabled = registry
+                    .set_automation_enabled(
+                        created.id,
+                        1,
+                        Some(Occurrence {
+                            due_ms: 60_000,
+                            local: "first".into(),
+                        }),
+                        true,
+                        200,
+                    )
+                    .unwrap();
+                let first = enabled.next.clone().unwrap();
+                let claim = registry
+                    .claim_automation(
+                        created.id,
+                        enabled.execution_revision,
+                        Some(&first),
+                        Trigger::Scheduled {
+                            occurrence: first.clone(),
+                        },
+                        Some(Occurrence {
+                            due_ms: 120_000,
+                            local: "second".into(),
+                        }),
+                        false,
+                        first.due_ms,
+                    )
+                    .unwrap();
+                registry
+                    .finish_automation_precheck(
+                        claim.firing.id,
+                        Outcome::Stopped {
+                            state: FiringState::Skipped,
+                            skip: Some(SkipReason::PrecheckExit),
+                            diagnostic: "predicate declined".into(),
+                        },
+                        first.due_ms + 1,
+                    )
+                    .unwrap();
+                if blocked {
+                    let second = registry.automation(created.id).unwrap().next.unwrap();
+                    let newer = registry
+                        .claim_automation(
+                            created.id,
+                            enabled.execution_revision,
+                            Some(&second),
+                            Trigger::Scheduled {
+                                occurrence: second.clone(),
+                            },
+                            Some(Occurrence {
+                                due_ms: 180_000,
+                                local: "third".into(),
+                            }),
+                            false,
+                            second.due_ms,
+                        )
+                        .unwrap();
+                    registry
+                        .interrupt_automation_precheck(
+                            newer.firing.id,
+                            "newer cleanup uncertain".into(),
+                            second.due_ms + 1,
+                        )
+                        .unwrap();
+                } else {
+                    registry
+                        .set_automation_enabled(
+                            created.id,
+                            enabled.revision,
+                            None,
+                            false,
+                            120_000,
+                        )
+                        .unwrap();
+                }
+                let attention = registry.automation_notifications().unwrap();
+                assert_eq!(attention.len(), 1);
+                assert_eq!(
+                    attention[0].evidence.kind,
+                    if blocked {
+                        crate::notifications::Kind::AutomationBlocked
+                    } else {
+                        crate::notifications::Kind::AutomationPaused
+                    }
+                );
+                let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+                let journal_directory = tempfile::tempdir().unwrap();
+                let journal = journal_directory.path().join("notifications.sqlite3");
+                let delivered_before = if already_delivered {
+                    let (count, notices) =
+                        crate::host::notifications::transfer_scheduler_events_for_test(
+                            &registry, &journal,
+                        )
+                        .unwrap();
+                    assert_eq!(count, 1);
+                    Some(notices)
+                } else {
+                    None
+                };
+                {
+                    let mut registry = registry.lock().unwrap();
+                    registry
+                        .coalesce_retired_automation_precheck(
+                            claim.firing.id,
+                            claim.firing.revision,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        registry.automation_firing(claim.firing.id).unwrap().state,
+                        FiringState::Skipped
+                    );
+                    assert!(
+                        !registry
+                            .pending_automation_precheck_retirements(None)
+                            .unwrap()
+                            .iter()
+                            .any(|(id, _)| *id == claim.firing.id),
+                        "suppressing obsolete attention still commits exact helper retirement"
+                    );
+                    if !already_delivered {
+                        assert_eq!(registry.automation_notifications().unwrap(), attention);
+                    }
+                }
+                let (count, notices) =
+                    crate::host::notifications::transfer_scheduler_events_for_test(
+                        &registry, &journal,
+                    )
+                    .unwrap();
+                assert_eq!(count, usize::from(!already_delivered));
+                assert_eq!(notices.len(), 1);
+                assert_eq!(notices[0].event.evidence.kind, attention[0].evidence.kind);
+                if let Some(before) = delivered_before {
+                    assert_eq!(
+                        notices, before,
+                        "late cleanup cannot replace a delivered newer notice or its UUID"
+                    );
+                }
+            }
+        }
     }
 }
