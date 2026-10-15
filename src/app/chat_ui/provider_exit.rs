@@ -830,6 +830,31 @@ mod tests {
             "CAGENTS_TEST_DIAGNOSTIC_HANDLER_CASE",
         )
     }
+    // App dispatch batches even a Task::none(), which has a real empty
+    // stream. Assert the actual runtime effects, never the stream container.
+    fn assert_no_actions(task: Task<Message>) {
+        use iced::futures::{FutureExt as _, StreamExt as _};
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            assert!(stream.next().now_or_never().expect("no deferred work is permitted").is_none(),
+                "the refused or completed handler must emit no runtime effect");
+        }
+    }
+    fn assert_recent_copy_action(task: Task<Message>, expected: Option<&str>) {
+        use iced::futures::{FutureExt as _, StreamExt as _};
+        let Some(expected) = expected else {
+            assert_no_actions(task);
+            return;
+        };
+        let mut stream = iced::runtime::task::into_stream(task).expect("actual clipboard task");
+        match stream.next().now_or_never().expect("recent copy is synchronous") {
+            Some(iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, target })) => {
+                assert_eq!(contents, expected);
+                assert_eq!(target, iced::runtime::clipboard::Kind::Standard);
+            }
+            _ => panic!("current recent output must produce its actual clipboard write"),
+        }
+        assert!(stream.next().now_or_never().expect("recent copy has no deferred work").is_none());
+    }
     fn wait_capacity(expected: usize) {
         let until = Instant::now() + Duration::from_secs(5);
         while chat::client::diagnostic_resource_usage().reserved_layout_capacity != expected
@@ -915,7 +940,7 @@ mod tests {
     fn install(app: &mut Cagents, target: Target, handle: &Arc<ClientHandle>, body: &[u8]) {
         let (request, completion) = held_read(app, target, handle, body, false);
         let task = app.handle_chat_ui(Action::ProviderExitLoaded(target, request, completion));
-        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_no_actions(task);
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert_eq!(
             runtime
@@ -1044,10 +1069,8 @@ mod tests {
                 ));
                 app.status = None;
                 let task = app.handle_chat_ui(Action::CopyProviderExitRecent(target));
-                assert_eq!(
-                    iced::runtime::task::into_stream(task).is_some(),
-                    mutation == 0
-                );
+                assert_recent_copy_action(task,
+                    (mutation == 0).then_some("Provider exited with status 3\n\nrecent tail"));
                 assert_eq!(app.status.is_some(), mutation == 0);
             }
         }
@@ -1080,7 +1103,7 @@ mod tests {
                         .is_none()
                 );
                 let task = app.handle_chat_ui(Action::ToggleProviderExit(target));
-                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_no_actions(task);
                 if supersede {
                     app.chat_ui.copy_intents.next();
                 }
@@ -1139,7 +1162,7 @@ mod tests {
             );
             app.status = None;
             let task = app.handle_chat_ui(completed);
-            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_no_actions(task);
             assert!(app.status.is_none());
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(
@@ -1201,7 +1224,7 @@ mod tests {
                     );
                     app.status = None;
                     let task = app.handle_chat_ui(completed);
-                    assert!(iced::runtime::task::into_stream(task).is_none());
+                    assert_no_actions(task);
                     assert!(app.status.is_none());
                     let state = &app.chat_runtime_mut(target).unwrap().provider_exit_output;
                     assert!(
@@ -1241,7 +1264,7 @@ mod tests {
             request.clone(),
             completion,
         ));
-        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_no_actions(task);
         assert!(
             app.chat_runtime_mut(target)
                 .unwrap()
@@ -1290,7 +1313,7 @@ mod tests {
                 assert_eq!(old.id, new.id, "replacement restarts the local counter");
                 assert!(!old.job.same_job(&new.job));
                 let task = app.handle_chat_ui(old_action);
-                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_no_actions(task);
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 assert!(runtime.provider_exit_output.owns(&new));
                 assert!(runtime.provider_exit_expanded);
@@ -1299,7 +1322,7 @@ mod tests {
                 let task = app.handle_chat_ui(Action::ProviderExitLoaded(
                     target, new, current_completion,
                 ));
-                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_no_actions(task);
                 assert_eq!(app.chat_runtime_mut(target).unwrap()
                     .provider_exit_output.ready.as_ref().unwrap().output.as_str(),
                     std::str::from_utf8(body).unwrap());
@@ -1335,7 +1358,7 @@ mod tests {
             };
             drop(effects);
             assert_eq!(chat::client::diagnostic_resource_usage().reserved_layout_capacity,formatted,"held actual acknowledgement retains formatted owner");
-            let task=app.handle_chat_ui(ack);assert!(iced::runtime::task::into_stream(task).is_none());
+            let task=app.handle_chat_ui(ack);assert_no_actions(task);
             wait_capacity(resident);
             app.chat_runtime_mut(target).unwrap().provider_exit_output.clear();wait_capacity(0);
         });
