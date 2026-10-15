@@ -383,6 +383,11 @@ impl Cagents {
     }
 
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
+        if self.focused_repository_is_saving()
+            || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+        {
+            return None;
+        }
         if !self.card_state(card).is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
             || self.shared_views.requested_transfers.values().any(|pending| *pending == card)
             || self.shared_views.pending.iter().any(|(_, _, change)| matches!(change, Change::Transfer { id, .. } if *id == card))
@@ -408,6 +413,14 @@ impl Cagents {
         let destination = self.workspace_model.channel(channel)?;
         self.pane_move_destination_allowed(&source.scope, repository, destination)
             .then(|| (source.scope.clone(), source.revision))
+    }
+
+    pub(super) fn pane_has_move_destination(&self, card: CardId) -> bool {
+        self.pane_transfer_source(card).is_some_and(|(source, repository)| {
+            self.workspace_model.channels.iter().any(|channel| {
+                self.pane_move_destination_allowed(&source.scope, repository, channel)
+            })
+        })
     }
 
     /// Authoritative channel metadata includes destinations this window has
@@ -1429,6 +1442,37 @@ mod tests {
         Arc::make_mut(&mut app.durable).active_channel = Some(source);
         drop(app.reconcile_shared_views());
         (app, source, destination, pane)
+    }
+
+    #[test]
+    fn active_repository_save_blocks_channel_commands_picker_and_direct_moves() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.pane_has_move_destination(pane.id));
+        let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(pane.id);
+        let kind = CardKind::Repository(runtime.descriptor.clone());
+        app.card_state_mut(pane.id).unwrap().kind = kind.clone();
+        app.workspace_model.views.iter_mut().flat_map(|view| &mut view.panes)
+            .find(|candidate| candidate.id == pane.id).unwrap().kind = kind;
+        app.cards.insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        assert!(app.focused_repository_is_saving());
+        assert!(!app.pane_has_move_destination(pane.id));
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        drop(app.move_pane_to_channel(pane.id, destination));
+        drop(app.update(Message::MovePaneToChannel { card: pane.id, channel: destination }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+        assert!(!app.palette.is_open());
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert_eq!(app.durable.active_channel, Some(source));
+        assert!(app.durable.channels.iter().find(|channel| channel.id == source)
+            .unwrap().cards.contains(&pane.id));
     }
 
     #[test]

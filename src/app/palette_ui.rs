@@ -50,7 +50,7 @@ impl Cagents {
                     .chain(self.reveal_palette_selection())
             }
             Action::MovePane(card) => {
-                if self.workspace_inputs_blocked() || self.pane_move_destinations(card).is_empty() {
+                if self.workspace_inputs_blocked() || !self.pane_has_move_destination(card) {
                     return Task::none();
                 }
                 let task = self.update_palette(Action::Open);

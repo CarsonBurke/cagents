@@ -2625,6 +2625,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::MovePaneToChannel { .. }
+            | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
