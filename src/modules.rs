@@ -49,19 +49,19 @@ pub mod document_render;
 #[cfg(feature = "ui")]
 pub mod editor;
 #[cfg(feature = "ui")]
-pub mod editor_locations;
-#[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
-pub(crate) mod editor_workspace_edit;
+pub(crate) mod editor_indent;
+#[cfg(feature = "ui")]
+pub mod editor_locations;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_navigation;
-#[cfg(feature = "ui")]
-pub(crate) mod editor_indent;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_reload;
 #[cfg(feature = "ui")]
 pub mod editor_search;
+#[cfg(feature = "ui")]
+pub(crate) mod editor_workspace_edit;
 #[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
@@ -70,9 +70,8 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
-pub mod fs_safety;
-pub mod recovery_authority;
 pub mod filesystem_recovery_context;
+pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub mod git_patch;
 #[cfg(feature = "ui")]
@@ -111,6 +110,7 @@ pub mod project_location;
 pub mod project_search;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]

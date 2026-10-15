@@ -8,7 +8,9 @@
 //! trusted. Unknown entries are retained, never removed
 //! using a diagnostic spelling or a guessed Git temporary filename.
 use super::*;
-use crate::{filesystem_recovery_context::FilesystemRecoveryContext, recovery_authority::RecoverySlot};
+use crate::{
+    filesystem_recovery_context::FilesystemRecoveryContext, recovery_authority::RecoverySlot,
+};
 use std::os::unix::fs::FileExt;
 
 /// Create and retain the actual output inode before giving it to Git. Git
@@ -42,10 +44,16 @@ struct Holding {
     context: FilesystemRecoveryContext,
 }
 
-fn remember_directory_error(recovery: &DiscardRecovery, error: fs_safety::RecoveryDirectoryError) -> String {
+fn remember_directory_error(
+    recovery: &DiscardRecovery,
+    error: fs_safety::RecoveryDirectoryError,
+) -> String {
     match error {
         fs_safety::RecoveryDirectoryError::Rejected(error) => error.to_string(),
-        fs_safety::RecoveryDirectoryError::Retained { cause, recovery: authority } => {
+        fs_safety::RecoveryDirectoryError::Retained {
+            cause,
+            recovery: authority,
+        } => {
             recovery.live_recovery.retain(authority);
             cause.to_string()
         }
@@ -53,28 +61,45 @@ fn remember_directory_error(recovery: &DiscardRecovery, error: fs_safety::Recove
 }
 impl Holding {
     fn create(
-        parent: &fs_safety::Root, recovery: &DiscardRecovery,
-        cancellation: &CancellationToken, context: &FilesystemRecoveryContext,
+        parent: &fs_safety::Root,
+        recovery: &DiscardRecovery,
+        cancellation: &CancellationToken,
+        context: &FilesystemRecoveryContext,
     ) -> Result<Self, String> {
         let original_parent = parent.try_clone().map_err(|error| error.to_string())?;
         let admission = context.reserve_directory()?;
         let name = OsString::from(format!(".cagents-undo-{}", Uuid::new_v4()));
         let directory = fs_safety::prepare_recovery_directory_with_owner(
-            admission, &name, || cancellation.is_cancelled(), original_parent,
-        ).map_err(|error| remember_directory_error(recovery, error))?;
+            admission,
+            &name,
+            || cancellation.is_cancelled(),
+            original_parent,
+        )
+        .map_err(|error| remember_directory_error(recovery, error))?;
         let (publication, context, slot, parent, _private_metadata) = directory.into_parts();
         // SAME pre-effect admission and parent survive factory errors; success
         // uses its already enrolled original700 inode without cloning/reopening.
-        Ok(Self { publication, parent, slot: Some(slot), files: vec![], context })
+        Ok(Self {
+            publication,
+            parent,
+            slot: Some(slot),
+            files: vec![],
+            context,
+        })
     }
-    fn root(&self) -> &fs_safety::Root { self.publication.directory() }
+    fn root(&self) -> &fs_safety::Root {
+        self.publication.directory()
+    }
     fn validate(&self) -> Result<(), String> {
-        self.context.validate_payload_root(self.root()).map_err(|error| error.to_string())
+        self.context
+            .validate_payload_root(self.root())
+            .map_err(|error| error.to_string())
     }
 
     fn open(&mut self, name: &Path) -> Result<Arc<fs::File>, String> {
-        let file =
-            Arc::new(fs_safety::open_beneath(self.root(), name).map_err(|error| error.to_string())?);
+        let file = Arc::new(
+            fs_safety::open_beneath(self.root(), name).map_err(|error| error.to_string())?,
+        );
         // Arc clones do not allocate another FD. Keep the actual opened inode
         // before any verification can fail, including a wrong Git output name.
         self.files.push(file.clone());
@@ -99,12 +124,20 @@ impl Holding {
     fn retry(&mut self) -> Result<(), String> {
         if !self.publication.is_removed() {
             self.validate()?;
-            self.publication.resolve_recovery().map_err(|error| error.to_string())?;
-            self.publication.cleanup_empty().map_err(|error| error.to_string())?;
+            self.publication
+                .resolve_recovery()
+                .map_err(|error| error.to_string())?;
+            self.publication
+                .cleanup_empty()
+                .map_err(|error| error.to_string())?;
         } else {
-            self.context.placement().validate().map_err(|error| error.to_string())?;
+            self.context
+                .placement()
+                .validate()
+                .map_err(|error| error.to_string())?;
         }
-        fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
+        fs_safety::sync_directory(self.context.placement().directory())
+            .map_err(|error| error.to_string())?;
         fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
     }
 }
@@ -352,7 +385,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut holding = Holding::create(parent, recovery, cancellation, context)?;
         let result =
             self.publish_saved_entry(source, &mut holding, recovery, entry, name, cancellation);
-        if !holding.publication.is_removed() || result.as_ref().is_ok_and(|warning| warning.is_some()) {
+        if !holding.publication.is_removed()
+            || result.as_ref().is_ok_and(|warning| warning.is_some())
+        {
             holding.retain(recovery);
         }
         result
@@ -517,15 +552,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let rollback = if !moved {
                 Ok(())
             } else if let Some(proof) = &acquired {
-                holding.validate().and_then(|()| proof.same_identity(holding, previous)).and_then(|()| {
-                    fs_safety::rename_new_between(
-                        holding.root(),
-                        previous.as_os_str(),
-                        &holding.parent,
-                        name,
-                    )
-                    .map_err(|error| error.to_string())
-                })
+                holding
+                    .validate()
+                    .and_then(|()| proof.same_identity(holding, previous))
+                    .and_then(|()| {
+                        fs_safety::rename_new_between(
+                            holding.root(),
+                            previous.as_os_str(),
+                            &holding.parent,
+                            name,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
             } else {
                 Err("The acquired entry has no authenticated proof; it remains in the held directory".into())
             };
@@ -554,7 +592,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .publication
                 .cleanup_empty()
                 .map_err(|error| error.to_string())?;
-            fs_safety::sync_directory(holding.context.placement().directory()).map_err(|error| error.to_string())?;
+            fs_safety::sync_directory(holding.context.placement().directory())
+                .map_err(|error| error.to_string())?;
             fs_safety::sync_directory(&holding.parent).map_err(|error| error.to_string())
         })();
         Ok(cleanup.err().map(|error| {
@@ -594,15 +633,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = fs_safety::Root::open(directory.path()).unwrap();
         let metadata = root.metadata().unwrap();
-        let recovery = DiscardRecovery { worktree: directory.path().to_owned(),
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
             worktree_identity: (metadata.dev(), metadata.ino()),
-            live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(),
-            entries: vec![], expires_unix_ms: u64::MAX };
+            live_recovery: LiveDiscardRecovery::default(),
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
         let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         assert!(Holding::create(&root, &recovery, &cancellation, &context).is_err());
-        assert!(context.placement().directory().read_dir().unwrap().next().is_none());
+        assert!(
+            context
+                .placement()
+                .directory()
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
         assert!(!recovery.live_recovery.needs_resolution());
     }
 
@@ -612,33 +663,68 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let root = fs_safety::Root::open(directory.path()).unwrap();
         let metadata = root.metadata().unwrap();
-        let recovery = DiscardRecovery { worktree: directory.path().to_owned(),
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
             worktree_identity: (metadata.dev(), metadata.ino()),
-            live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(),
-            entries: vec![], expires_unix_ms: u64::MAX };
-        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false).unwrap();
+            live_recovery: LiveDiscardRecovery::default(),
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
+        let protection =
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false)
+                .unwrap();
         let fixture = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
-        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        let context = FilesystemRecoveryContext::new(
+            &root,
+            Arc::new(Some(protection)),
+            fixture.placement().clone(),
+        )
+        .unwrap();
         drop(fixture);
         let outside = context.placement().directory().path().to_owned();
         let error = fs_safety::fixture_recovery_directory_preparation_failure(
-            context.reserve_directory().unwrap(), root.try_clone().unwrap(),
+            context.reserve_directory().unwrap(),
+            root.try_clone().unwrap(),
         );
         let _message = remember_directory_error(&recovery, error);
         assert!(recovery.live_recovery.needs_resolution());
         drop(context);
         let service = RepositoryService::system("git");
-        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
-        assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
-        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
-        let staging = fs::read_dir(&outside).unwrap().next().unwrap().unwrap().path();
-        assert_eq!(fs::read(staging.join("directory")).unwrap(), b"retained fixture artifact");
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        assert!(
+            service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .is_err()
+        );
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        let staging = fs::read_dir(&outside)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read(staging.join("directory")).unwrap(),
+            b"retained fixture artifact"
+        );
         fs::remove_file(staging.join("directory")).unwrap();
-        let result = service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
+        let result = service
+            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+            .unwrap();
         assert_eq!(result.remaining_paths, 0);
         assert!(!recovery.live_recovery.needs_resolution());
         assert!(!staging.exists());
-        drop(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).unwrap());
+        drop(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -651,15 +737,24 @@ mod tests {
         let relocated = directory.path().join("moved-holding");
         fs::rename(&original, &relocated).unwrap();
         holding.context.placement().validate().unwrap();
-        assert!(holding.validate().is_err(), "actual H ancestry, not just safe outside parent, must be fenced");
+        assert!(
+            holding.validate().is_err(),
+            "actual H ancestry, not just safe outside parent, must be fenced"
+        );
         let private = holding.root().try_clone().unwrap();
         holding.retain(&recovery);
         let service = RepositoryService::system("git");
-        assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
+        assert!(
+            service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .is_err()
+        );
         assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
         assert!(private.read_dir().unwrap().next().is_none());
         fs::rename(&relocated, &original).unwrap();
-        service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
+        service
+            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+            .unwrap();
         assert!(!recovery.live_recovery.needs_resolution());
         assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
     }
@@ -670,10 +765,26 @@ mod tests {
         fs::write(directory.path().join("current"), b"newer source").unwrap();
         let root = fs_safety::Root::open(directory.path()).unwrap();
         let metadata = root.metadata().unwrap();
-        let recovery = DiscardRecovery { worktree: directory.path().to_owned(), worktree_identity: (metadata.dev(),metadata.ino()), live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(), entries: vec![], expires_unix_ms: u64::MAX };
-        let error = RepositoryService::system("git").undo_discard(&recovery, &CancellationToken::new()).unwrap_err();
-        assert!(error.to_string().contains("original protected outside-checkout recovery context"));
-        assert_eq!(fs::read(directory.path().join("current")).unwrap(), b"newer source");
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
+        let error = RepositoryService::system("git")
+            .undo_discard(&recovery, &CancellationToken::new())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original protected outside-checkout recovery context")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("current")).unwrap(),
+            b"newer source"
+        );
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
@@ -684,9 +795,29 @@ mod tests {
         let metadata = root.metadata().unwrap();
         let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
         let outside = context.placement().directory().path().to_owned();
-        let recovery = DiscardRecovery { worktree: directory.path().to_owned(), worktree_identity: (metadata.dev(),metadata.ino()), live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(), entries: vec![DiscardRecoveryEntry { path: RepoPath::parse("nested/file").unwrap(), before: SavedEntry::Absent, after: SavedEntry::Absent, after_version: None, trash: None }], expires_unix_ms: u64::MAX };
-        let error = RepositoryService::system("git").with_recovery_context(context).undo_discard(&recovery, &CancellationToken::new()).unwrap_err();
-        assert!(error.to_string().contains("original retained Git metadata authority"));
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            directories: BTreeMap::new(),
+            entries: vec![DiscardRecoveryEntry {
+                path: RepoPath::parse("nested/file").unwrap(),
+                before: SavedEntry::Absent,
+                after: SavedEntry::Absent,
+                after_version: None,
+                trash: None,
+            }],
+            expires_unix_ms: u64::MAX,
+        };
+        let error = RepositoryService::system("git")
+            .with_recovery_context(context)
+            .undo_discard(&recovery, &CancellationToken::new())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original retained Git metadata authority")
+        );
         assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
         // The service has dropped its context, whose test lease may remove the
         // empty outside fixture directory; no holding/payload was created.
@@ -709,9 +840,15 @@ mod tests {
                 .unwrap();
         assert!(protection.protects_root(&root).unwrap());
         let fixture = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
-        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        let context = FilesystemRecoveryContext::new(
+            &root,
+            Arc::new(Some(protection)),
+            fixture.placement().clone(),
+        )
+        .unwrap();
         drop(fixture);
-        let holding = Holding::create(&root, &recovery, &CancellationToken::new(), &context).unwrap();
+        let holding =
+            Holding::create(&root, &recovery, &CancellationToken::new(), &context).unwrap();
         let private = holding.root().try_clone().unwrap();
         fs::write(private.path().join("unresolved"), b"preserve").unwrap();
         holding.retain(&recovery);
@@ -834,8 +971,12 @@ mod tests {
             (unlinked.dev(), unlinked.ino()),
             (proof.metadata.dev(), proof.metadata.ino())
         );
-        fs_safety::symlink_within(holding.root(), Path::new("foreign-target"), path.as_os_str())
-            .unwrap();
+        fs_safety::symlink_within(
+            holding.root(),
+            Path::new("foreign-target"),
+            path.as_os_str(),
+        )
+        .unwrap();
         assert!(proof.same_identity(&holding, path).is_err());
         assert_eq!(
             fs_safety::read_link_beneath(holding.root(), path).unwrap(),

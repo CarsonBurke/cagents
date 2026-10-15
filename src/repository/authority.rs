@@ -450,11 +450,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let authority = match &self.authority {
             Some(authority) if authority.path() == worktree => authority.clone(),
             Some(_) => {
-                return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into());
+                return Err(
+                    ValidationError::InvalidWorktree(worktree.display().to_string()).into(),
+                );
             }
             None => return Err(ValidationError::Io(
-                "Undo requires the original retained Git metadata authority; no path was undone".into()
-            ).into()),
+                "Undo requires the original retained Git metadata authority; no path was undone"
+                    .into(),
+            )
+            .into()),
         };
         authority.validate()?;
         let expected = expected_root.metadata().map_err(metadata_error)?;

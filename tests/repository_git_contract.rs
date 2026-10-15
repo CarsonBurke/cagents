@@ -148,7 +148,12 @@ impl Fixture {
 
     #[cfg(target_os = "linux")]
     fn recovery_service(&self) -> RepositoryService<IsolatedExecutor> {
-        self.service().with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&self.work()).unwrap()).unwrap().with_recovery_context(self.recovery_context())
+        self.service()
+            .with_worktree_authority(
+                cagents::repository::WorktreeAuthority::capture(&self.work()).unwrap(),
+            )
+            .unwrap()
+            .with_recovery_context(self.recovery_context())
     }
 
     /// Runs a raw `git` command and requires success, so a broken fixture fails
@@ -5624,7 +5629,11 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
 #[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
-    if recovery_context::run_isolated_case("recoverable_discard_restores_contents_modes_and_deleted_paths") { return; }
+    if recovery_context::run_isolated_case(
+        "recoverable_discard_restores_contents_modes_and_deleted_paths",
+    ) {
+        return;
+    }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Some(fixture) = Fixture::new() else {
         return;
@@ -5726,7 +5735,10 @@ fn recoverable_discard_restores_contents_modes_and_deleted_paths() {
 #[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_refuses_newer_files_independently() {
-    if recovery_context::run_isolated_case("recoverable_discard_refuses_newer_files_independently") { return; }
+    if recovery_context::run_isolated_case("recoverable_discard_refuses_newer_files_independently")
+    {
+        return;
+    }
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -5787,7 +5799,11 @@ fn recoverable_discard_refuses_newer_files_independently() {
 #[cfg(target_os = "linux")]
 #[test]
 fn recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash() {
-    if recovery_context::run_isolated_case("recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash") { return; }
+    if recovery_context::run_isolated_case(
+        "recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash",
+    ) {
+        return;
+    }
     use std::os::unix::fs::symlink;
     let Some(fixture) = Fixture::new() else {
         return;
@@ -5848,7 +5864,9 @@ fn recoverable_discard_preserves_literal_symlinks_and_protects_changed_trash() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_replaced_worktree_root() {
-    if recovery_context::run_isolated_case("undo_discard_refuses_a_replaced_worktree_root") { return; }
+    if recovery_context::run_isolated_case("undo_discard_refuses_a_replaced_worktree_root") {
+        return;
+    }
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -5872,7 +5890,10 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
     let original = fixture.root.path().join("original-work");
     fs::rename(fixture.work(), &original).unwrap();
     fs::create_dir(fixture.work()).unwrap();
-    assert!(service.undo_discard(&result.recovery, &cancel).is_err(), "the original named-root authority must refuse its replacement before effects");
+    assert!(
+        service.undo_discard(&result.recovery, &cancel).is_err(),
+        "the original named-root authority must refuse its replacement before effects"
+    );
     assert!(!fixture.work().join("f.txt").exists());
     assert_eq!(fs::read(original.join("f.txt")).unwrap(), b"base\n");
 }
@@ -5881,15 +5902,32 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
 #[test]
 fn undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode() {
     use std::os::unix::fs::MetadataExt;
-    if recovery_context::run_isolated_case("undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode") { return; }
-    let Some(fixture) = Fixture::new() else { return; };
+    if recovery_context::run_isolated_case(
+        "undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode",
+    ) {
+        return;
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.write("tracked", b"base");
     fixture.git_in_work(&["add", "."]);
     fixture.commit("original base");
     fixture.write("tracked", b"saved work");
     let service = fixture.recovery_service();
     let cancel = CancellationToken::new();
-    let recovery = service.discard_recoverable(&DiscardRequest { worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked"))], untracked: vec![], confirmed: true }, &cancel).unwrap().recovery;
+    let recovery = service
+        .discard_recoverable(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: vec![PathSelection::new(path("tracked"))],
+                untracked: vec![],
+                confirmed: true,
+            },
+            &cancel,
+        )
+        .unwrap()
+        .recovery;
     let foreign = fixture.root.path().join("foreign");
     fixture.run(fixture.root.path(), &["init", "-b", "main", "foreign"]);
     fs::write(foreign.join("tracked"), b"foreign base").unwrap();
@@ -5899,10 +5937,14 @@ fn undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode() 
     fs::write(foreign.join("tracked"), b"foreign work").unwrap();
     fixture.run(&foreign, &["add", "."]);
     let before = fs::metadata(fixture.work()).unwrap();
-    fs::rename(fixture.work().join(".git"), fixture.root.path().join("original-metadata")).unwrap();
+    fs::rename(
+        fixture.work().join(".git"),
+        fixture.root.path().join("original-metadata"),
+    )
+    .unwrap();
     fs::rename(foreign.join(".git"), fixture.work().join(".git")).unwrap();
     let after = fs::metadata(fixture.work()).unwrap();
-    assert_eq!((before.dev(),before.ino()), (after.dev(),after.ino()));
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     assert!(service.undo_discard(&recovery, &cancel).is_err());
     assert_eq!(fs::read(fixture.work().join("tracked")).unwrap(), b"base");
     assert_eq!(fs::read(foreign.join("tracked")).unwrap(), b"foreign work");
@@ -5914,7 +5956,11 @@ fn undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode() 
 #[cfg(target_os = "linux")]
 #[test]
 fn worktree_patch_recovery_handles_new_deleted_and_renamed_files() {
-    if recovery_context::run_isolated_case("worktree_patch_recovery_handles_new_deleted_and_renamed_files") { return; }
+    if recovery_context::run_isolated_case(
+        "worktree_patch_recovery_handles_new_deleted_and_renamed_files",
+    ) {
+        return;
+    }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for kind in ["new", "deleted", "renamed"] {
         let Some(fixture) = Fixture::new() else {
@@ -6121,7 +6167,11 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
-    if recovery_context::run_isolated_case("undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it") { return; }
+    if recovery_context::run_isolated_case(
+        "undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it",
+    ) {
+        return;
+    }
     struct SubstituteUnpacked {
         changed: std::sync::atomic::AtomicBool,
     }
@@ -6188,7 +6238,10 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     let context = fixture.recovery_context();
     let outside = context.placement().directory().path().to_owned();
     let result = RepositoryService::new("git", executor.clone())
-        .with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap()).unwrap()
+        .with_worktree_authority(
+            cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap(),
+        )
+        .unwrap()
         .with_recovery_context(context)
         .undo_discard(&receipt, &cancel)
         .unwrap();
@@ -6301,7 +6354,11 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery() {
-    if recovery_context::run_isolated_case("undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery") { return; }
+    if recovery_context::run_isolated_case(
+        "undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery",
+    ) {
+        return;
+    }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, Ordering};
     struct ChangeParentMode {
@@ -6359,7 +6416,10 @@ fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_per
         changed: AtomicBool::new(false),
     });
     let service = RepositoryService::new("git", executor.clone())
-        .with_worktree_authority(cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap()).unwrap()
+        .with_worktree_authority(
+            cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap(),
+        )
+        .unwrap()
         .with_recovery_context(fixture.recovery_context());
     let first = service.undo_discard(&receipt, &cancel).unwrap();
     let MutationOutcome::PartiallyApplied { paths, failures } = first else {

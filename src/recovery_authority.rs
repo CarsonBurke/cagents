@@ -1,15 +1,26 @@
 //! Bounded live authority for filesystem recovery across isolated build lanes. Descriptions are diagnostic
 //! spellings; only the producer's retained descriptors authorize retry.
-use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 // Each admitted producer may retain at most sixteen descriptors. Reserving
 // before any effect bounds unresolved work without a global authority registry.
 const MAX_RECOVERIES: usize = 32;
 pub(crate) const MAX_RECOVERY_DESCRIPTORS: usize = 16;
-struct Budget { used: AtomicUsize, limit: usize }
+struct Budget {
+    used: AtomicUsize,
+    limit: usize,
+}
 fn budget() -> Arc<Budget> {
     static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
-    Arc::clone(BUDGET.get_or_init(|| Arc::new(Budget { used: AtomicUsize::new(0), limit: MAX_RECOVERIES })))
+    Arc::clone(BUDGET.get_or_init(|| {
+        Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MAX_RECOVERIES,
+        })
+    }))
 }
 
 /// Shared already-acquired cleanup guards have their own measured FD budget,
@@ -18,7 +29,10 @@ fn budget() -> Arc<Budget> {
 const MAX_RECOVERY_CONTEXTS: usize = 32;
 const MAX_RECOVERY_CONTEXT_DESCRIPTORS: usize = 128;
 #[derive(Default)]
-struct ContextUsage { contexts: usize, descriptors: usize }
+struct ContextUsage {
+    contexts: usize,
+    descriptors: usize,
+}
 fn context_budget() -> Arc<Mutex<ContextUsage>> {
     static BUDGET: OnceLock<Arc<Mutex<ContextUsage>>> = OnceLock::new();
     Arc::clone(BUDGET.get_or_init(|| Arc::new(Mutex::new(ContextUsage::default()))))
@@ -31,8 +45,12 @@ struct ContextInner {
 }
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        let mut used = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        used.contexts -= 1; used.descriptors -= self.descriptors;
+        let mut used = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        used.contexts -= 1;
+        used.descriptors -= self.descriptors;
     }
 }
 /// Pre-effect ownership of an exact cleanup lease. No path-based reacquisition
@@ -40,22 +58,42 @@ impl Drop for ContextInner {
 #[derive(Clone)]
 pub(crate) struct RecoveryContext(Arc<ContextInner>);
 impl RecoveryContext {
-    pub(crate) fn with_guard(guard: impl Send + Sync + 'static, descriptors: usize) -> Result<Self, String> {
+    pub(crate) fn with_guard(
+        guard: impl Send + Sync + 'static,
+        descriptors: usize,
+    ) -> Result<Self, String> {
         Self::from_budget(guard, descriptors, context_budget())
     }
-    fn from_budget(guard: impl Send + Sync + 'static, descriptors: usize, budget: Arc<Mutex<ContextUsage>>) -> Result<Self, String> {
-        let mut used = budget.lock().map_err(|_| "Recovery cleanup-lease budget is unavailable".to_owned())?;
-        let total = used.descriptors.checked_add(descriptors).ok_or("Recovery cleanup-lease descriptor budget is exhausted")?;
+    fn from_budget(
+        guard: impl Send + Sync + 'static,
+        descriptors: usize,
+        budget: Arc<Mutex<ContextUsage>>,
+    ) -> Result<Self, String> {
+        let mut used = budget
+            .lock()
+            .map_err(|_| "Recovery cleanup-lease budget is unavailable".to_owned())?;
+        let total = used
+            .descriptors
+            .checked_add(descriptors)
+            .ok_or("Recovery cleanup-lease descriptor budget is exhausted")?;
         if used.contexts >= MAX_RECOVERY_CONTEXTS || total > MAX_RECOVERY_CONTEXT_DESCRIPTORS {
             return Err("Recovery cleanup-lease capacity is exhausted. Resolve earlier recovery before changing files.".into());
         }
-        used.contexts += 1; used.descriptors = total; drop(used);
-        Ok(Self(Arc::new(ContextInner { _guard: Box::new(guard), descriptors, budget })))
+        used.contexts += 1;
+        used.descriptors = total;
+        drop(used);
+        Ok(Self(Arc::new(ContextInner {
+            _guard: Box::new(guard),
+            descriptors,
+            budget,
+        })))
     }
     /// Reserve before producer effects. The resulting unresolved leaf owns
     /// this exact pre-acquired context until success or its final owner drop.
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
-        let mut slot = RecoverySlot::reserve()?; slot.context = Some(self.clone()); Ok(slot)
+        let mut slot = RecoverySlot::reserve()?;
+        slot.context = Some(self.clone());
+        Ok(slot)
     }
 }
 
@@ -69,12 +107,24 @@ pub(crate) struct RecoverySlot {
     creation_guard: Option<Arc<dyn Send + Sync>>,
 }
 impl RecoverySlot {
-    pub(crate) fn reserve() -> Result<Self, String> { Self::from_budget(budget()) }
+    pub(crate) fn reserve() -> Result<Self, String> {
+        Self::from_budget(budget())
+    }
     fn from_budget(budget: Arc<Budget>) -> Result<Self, String> {
-        budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |used| (used < budget.limit).then_some(used + 1))
-            .map_err(|_| "Recovery capacity is exhausted. Resolve an earlier recovery before changing files.".to_owned())?;
-        Ok(Self { budget, context: None, creation_guard: None })
+        budget
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < budget.limit).then_some(used + 1)
+            })
+            .map_err(|_| {
+                "Recovery capacity is exhausted. Resolve an earlier recovery before changing files."
+                    .to_owned()
+            })?;
+        Ok(Self {
+            budget,
+            context: None,
+            creation_guard: None,
+        })
     }
     pub(crate) fn with_creation_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
         // Only fresh pre-effect slots enter this constructor. The same guard
@@ -83,10 +133,19 @@ impl RecoverySlot {
         self.creation_guard = Some(guard);
         self
     }
-    pub(crate) fn retain(self, description: String, retry: impl FnMut() -> Result<(), String> + Send + 'static) -> RecoveryAuthority {
+    pub(crate) fn retain(
+        self,
+        description: String,
+        retry: impl FnMut() -> Result<(), String> + Send + 'static,
+    ) -> RecoveryAuthority {
         RecoveryAuthority(Arc::new(RecoveryInner {
-            description: description.chars().take(2048).collect(), resolved: AtomicBool::new(false), leaves: None,
-            work: Mutex::new(RecoveryWork { retry: Some(Box::new(retry)), slot: Some(self) }),
+            description: description.chars().take(2048).collect(),
+            resolved: AtomicBool::new(false),
+            leaves: None,
+            work: Mutex::new(RecoveryWork {
+                retry: Some(Box::new(retry)),
+                slot: Some(self),
+            }),
         }))
     }
 }
@@ -105,7 +164,9 @@ struct RecoveryWork {
     slot: Option<RecoverySlot>,
 }
 struct RecoveryInner {
-    description: String, resolved: AtomicBool, work: Mutex<RecoveryWork>,
+    description: String,
+    resolved: AtomicBool,
+    work: Mutex<RecoveryWork>,
     // A group retains only reserved leaves, never another unreserved group.
     leaves: Option<Vec<RecoveryAuthority>>,
 }
@@ -118,34 +179,71 @@ impl RecoveryAuthority {
     /// Join existing bounded payloads without reserving a new slot after an
     /// effect. Nested cleanup errors must not discard an earlier authority.
     pub(crate) fn combine(self, other: Self) -> Self {
-        if self == other { return self; }
+        if self == other {
+            return self;
+        }
         let mut leaves = Vec::new();
         for authority in [&self, &other] {
-            let candidates = authority.0.leaves.as_deref().unwrap_or_else(|| std::slice::from_ref(authority));
+            let candidates = authority
+                .0
+                .leaves
+                .as_deref()
+                .unwrap_or_else(|| std::slice::from_ref(authority));
             for leaf in candidates {
                 if !leaf.is_resolved() && !leaves.contains(leaf) {
                     leaves.push(leaf.clone());
                 }
             }
         }
-        if leaves.is_empty() { return self; }
-        if leaves.len() == 1 { return leaves.pop().unwrap(); }
+        if leaves.is_empty() {
+            return self;
+        }
+        if leaves.len() == 1 {
+            return leaves.pop().unwrap();
+        }
         // Every unresolved leaf owns a pre-effect reservation. Production's
         // single shared budget bounds this flat list by MAX_RECOVERIES, even
         // when callers repeatedly combine overlapping groups.
-        let description = leaves.iter().map(Self::description).collect::<Vec<_>>().join("; ").chars().take(2048).collect();
+        let description = leaves
+            .iter()
+            .map(Self::description)
+            .collect::<Vec<_>>()
+            .join("; ")
+            .chars()
+            .take(2048)
+            .collect();
         let retries = leaves.clone();
-        Self(Arc::new(RecoveryInner { description, resolved: AtomicBool::new(false), leaves: Some(leaves), work: Mutex::new(RecoveryWork {
-            retry: Some(Box::new(move || { for leaf in &retries { leaf.retry()?; } Ok(()) })), slot: None,
-        }) }))
+        Self(Arc::new(RecoveryInner {
+            description,
+            resolved: AtomicBool::new(false),
+            leaves: Some(leaves),
+            work: Mutex::new(RecoveryWork {
+                retry: Some(Box::new(move || {
+                    for leaf in &retries {
+                        leaf.retry()?;
+                    }
+                    Ok(())
+                })),
+                slot: None,
+            }),
+        }))
     }
-    pub fn description(&self) -> &str { &self.0.description }
-    pub fn is_resolved(&self) -> bool { self.0.resolved.load(Ordering::Acquire) }
+    pub fn description(&self) -> &str {
+        &self.0.description
+    }
+    pub fn is_resolved(&self) -> bool {
+        self.0.resolved.load(Ordering::Acquire)
+    }
     /// Blocking worker only. The producer revalidates retained authority and
     /// must refuse foreign names/no-clobber collisions on every retry.
     pub(crate) fn retry(&self) -> Result<(), String> {
-        let mut work = self.0.work.lock().map_err(|_| "Editor recovery previously failed unexpectedly; its retained authority was kept.".to_owned())?;
-        if let Some(retry) = work.retry.as_mut() { retry()?; }
+        let mut work = self.0.work.lock().map_err(|_| {
+            "Editor recovery previously failed unexpectedly; its retained authority was kept."
+                .to_owned()
+        })?;
+        if let Some(retry) = work.retry.as_mut() {
+            retry()?;
+        }
         work.retry = None;
         work.slot = None;
         self.0.resolved.store(true, Ordering::Release);
@@ -154,10 +252,17 @@ impl RecoveryAuthority {
 }
 impl std::fmt::Debug for RecoveryAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecoveryAuthority").field("description", &self.description()).field("resolved", &self.is_resolved()).finish()
+        f.debug_struct("RecoveryAuthority")
+            .field("description", &self.description())
+            .field("resolved", &self.is_resolved())
+            .finish()
     }
 }
-impl PartialEq for RecoveryAuthority { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) } }
+impl PartialEq for RecoveryAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 impl Eq for RecoveryAuthority {}
 
 #[cfg(test)]
@@ -165,45 +270,74 @@ mod tests {
     use super::*;
     #[test]
     fn editor_recovery_budget_and_clones_keep_one_payload_until_actual_resolution() {
-        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 });
+        let budget = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 1,
+        });
         let slot = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap();
         assert!(RecoverySlot::from_budget(Arc::clone(&budget)).is_err());
-        let attempts = Arc::new(AtomicUsize::new(0)); let count = Arc::clone(&attempts);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
         let authority = slot.retain("diagnostic spelling only".into(), move || {
-            if count.fetch_add(1, Ordering::AcqRel) == 0 { Err("foreign destination was preserved".into()) } else { Ok(()) }
+            if count.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err("foreign destination was preserved".into())
+            } else {
+                Ok(())
+            }
         });
-        let clone = authority.clone(); assert_eq!(authority, clone);
-        assert!(authority.retry().is_err()); assert!(!clone.is_resolved());
+        let clone = authority.clone();
+        assert_eq!(authority, clone);
+        assert!(authority.retry().is_err());
+        assert!(!clone.is_resolved());
         assert!(RecoverySlot::from_budget(Arc::clone(&budget)).is_err());
-        clone.retry().unwrap(); assert!(authority.is_resolved());
+        clone.retry().unwrap();
+        assert!(authority.is_resolved());
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
-        authority.retry().unwrap(); assert_eq!(attempts.load(Ordering::Acquire), 2);
+        authority.retry().unwrap();
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
     }
     #[test]
     fn same_slot_creation_guard_survives_failed_retry_until_producer_resolution() {
-        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 });
-        let guard = Arc::new(()); let weak = Arc::downgrade(&guard);
-        let attempts = Arc::new(AtomicUsize::new(0)); let captured = attempts.clone();
-        let authority = RecoverySlot::from_budget(budget.clone()).unwrap()
+        let budget = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 1,
+        });
+        let guard = Arc::new(());
+        let weak = Arc::downgrade(&guard);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let captured = attempts.clone();
+        let authority = RecoverySlot::from_budget(budget.clone())
+            .unwrap()
             .with_creation_guard(guard)
             .retain("original admitted creation".into(), move || {
-                if captured.fetch_add(1, Ordering::AcqRel) == 0 { Err("retained operation is still unresolved".into()) }
-                else { Ok(()) }
+                if captured.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err("retained operation is still unresolved".into())
+                } else {
+                    Ok(())
+                }
             });
         assert!(weak.upgrade().is_some());
         assert!(authority.retry().is_err());
         assert!(weak.upgrade().is_some());
         assert!(RecoverySlot::from_budget(budget.clone()).is_err());
         authority.retry().unwrap();
-        assert!(authority.is_resolved()); assert!(weak.upgrade().is_none());
+        assert!(authority.is_resolved());
+        assert!(weak.upgrade().is_none());
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn recovery_combine_flattens_and_deduplicates_repeated_overlapping_groups() {
-        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 2 });
-        let a = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap().retain("a".into(), || Ok(()));
-        let b = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap().retain("b".into(), || Ok(()));
+        let budget = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 2,
+        });
+        let a = RecoverySlot::from_budget(Arc::clone(&budget))
+            .unwrap()
+            .retain("a".into(), || Ok(()));
+        let b = RecoverySlot::from_budget(Arc::clone(&budget))
+            .unwrap()
+            .retain("b".into(), || Ok(()));
         let mut combined = a.clone().combine(b.clone());
         for _ in 0..10_000 {
             combined = combined.combine(a.clone()).combine(b.clone());
@@ -221,26 +355,47 @@ mod tests {
     #[test]
     fn cleanup_context_is_shared_bounded_and_survives_parent_drop_until_resolution() {
         struct Guard(Arc<AtomicUsize>);
-        impl Drop for Guard { fn drop(&mut self) { self.0.fetch_add(1, Ordering::AcqRel); } }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         let budget = Arc::new(Mutex::new(ContextUsage::default()));
         let drops = Arc::new(AtomicUsize::new(0));
-        let context = RecoveryContext::from_budget(Guard(drops.clone()), 3, budget.clone()).unwrap();
+        let context =
+            RecoveryContext::from_budget(Guard(drops.clone()), 3, budget.clone()).unwrap();
         let a = context.reserve().unwrap().retain("a".into(), || Ok(()));
         let b = context.reserve().unwrap().retain("b".into(), || Ok(()));
         drop(context);
-        assert_eq!(budget.lock().unwrap().descriptors, 3); assert_eq!(drops.load(Ordering::Acquire), 0);
-        a.retry().unwrap(); assert_eq!(drops.load(Ordering::Acquire), 0);
-        b.retry().unwrap(); assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(budget.lock().unwrap().descriptors, 3);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        a.retry().unwrap();
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        b.retry().unwrap();
+        assert_eq!(drops.load(Ordering::Acquire), 1);
         assert_eq!(budget.lock().unwrap().descriptors, 0);
         assert!(RecoveryContext::from_budget((), 129, budget).is_err());
     }
 
     #[test]
     fn editor_recovery_last_owner_drop_releases_budget_without_running_effects() {
-        let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 });
-        let count = Arc::new(AtomicUsize::new(0)); let captured = Arc::clone(&count);
-        let authority = RecoverySlot::from_budget(Arc::clone(&budget)).unwrap().retain("retained".into(), move || { captured.fetch_add(1, Ordering::AcqRel); Ok(()) });
-        let clone = authority.clone(); drop(authority); assert_eq!(budget.used.load(Ordering::Acquire), 1);
-        drop(clone); assert_eq!(budget.used.load(Ordering::Acquire), 0); assert_eq!(count.load(Ordering::Acquire), 0);
+        let budget = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 1,
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&count);
+        let authority = RecoverySlot::from_budget(Arc::clone(&budget))
+            .unwrap()
+            .retain("retained".into(), move || {
+                captured.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            });
+        let clone = authority.clone();
+        drop(authority);
+        assert_eq!(budget.used.load(Ordering::Acquire), 1);
+        drop(clone);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 }

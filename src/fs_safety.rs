@@ -177,7 +177,9 @@ pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
     // SAFETY: the directory is retained, the ONLY lookup is this static NUL-
     // terminated parent literal, and openat returns a fresh owned descriptor.
     let descriptor = unsafe { libc::openat(root.descriptor(), c"..".as_ptr(), flags) };
-    if descriptor < 0 { return Err(io::Error::last_os_error()); }
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(Root {
         directory: unsafe { OwnedFd::from_raw_fd(descriptor) },
         path: root.path().join(".."),
@@ -185,7 +187,10 @@ pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
 }
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn retained_parent_directory(_root: &Root) -> io::Result<Root> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Retained parent observation is unavailable on this platform."))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Retained parent observation is unavailable on this platform.",
+    ))
 }
 
 /// Why a path could not be resolved beneath a root.
@@ -450,14 +455,20 @@ pub use directory_creation::{
 pub(crate) use directory_creation::fixture_directory_preparation_failure;
 #[path = "fs_safety/recovery_placement.rs"]
 mod recovery_placement;
-pub use recovery_placement::{RecoveryDirectoryStamp, RecoveryPlacement, RecoveryRegistrationLease, RecoveryRegistryCheck, recovery_directory_stamp};
+pub use recovery_placement::{
+    RecoveryDirectoryStamp, RecoveryPlacement, RecoveryRegistrationLease, RecoveryRegistryCheck,
+    recovery_directory_stamp,
+};
 
 #[path = "fs_safety/recovery_cache.rs"]
 mod recovery_cache;
 pub use recovery_cache::RecoveryParentCandidates;
-pub(crate) use recovery_cache::{RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory, prepare_recovery_directory_with_owner};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
+pub(crate) use recovery_cache::{
+    RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory,
+    prepare_recovery_directory_with_owner,
+};
 
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
@@ -1861,16 +1872,51 @@ mod retained_parent_tests {
         std::fs::create_dir(directory.path().join("child")).unwrap();
         let child = Root::open(&directory.path().join("child")).unwrap();
         let expected = Root::open(directory.path()).unwrap();
-        assert!(open_at(child.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).is_err(), "confined public component lookup still rejects parent traversal");
+        assert!(
+            open_at(
+                child.descriptor(),
+                OsStr::new(".."),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            )
+            .is_err(),
+            "confined public component lookup still rejects parent traversal"
+        );
         let parent = retained_parent_directory(&child).unwrap();
-        assert_eq!((parent.metadata().unwrap().dev(), parent.metadata().unwrap().ino()), (expected.metadata().unwrap().dev(), expected.metadata().unwrap().ino()));
+        assert_eq!(
+            (
+                parent.metadata().unwrap().dev(),
+                parent.metadata().unwrap().ino()
+            ),
+            (
+                expected.metadata().unwrap().dev(),
+                expected.metadata().unwrap().ino()
+            )
+        );
         let moved_parent_path = directory.path().join("actual-parent");
         std::fs::create_dir(&moved_parent_path).unwrap();
         let moved_parent = Root::open(&moved_parent_path).unwrap();
-        std::fs::rename(directory.path().join("child"), moved_parent_path.join("held-child")).unwrap();
+        std::fs::rename(
+            directory.path().join("child"),
+            moved_parent_path.join("held-child"),
+        )
+        .unwrap();
         std::fs::create_dir(directory.path().join("child")).unwrap();
         let after = retained_parent_directory(&child).unwrap();
-        assert_eq!((after.metadata().unwrap().dev(), after.metadata().unwrap().ino()), (moved_parent.metadata().unwrap().dev(), moved_parent.metadata().unwrap().ino()), "the parent is observed from the original held child, not its replacement name");
-        assert_ne!(after.metadata().unwrap().ino(), expected.metadata().unwrap().ino(), "reopening the old child name would choose the wrong parent");
+        assert_eq!(
+            (
+                after.metadata().unwrap().dev(),
+                after.metadata().unwrap().ino()
+            ),
+            (
+                moved_parent.metadata().unwrap().dev(),
+                moved_parent.metadata().unwrap().ino()
+            ),
+            "the parent is observed from the original held child, not its replacement name"
+        );
+        assert_ne!(
+            after.metadata().unwrap().ino(),
+            expected.metadata().unwrap().ino(),
+            "reopening the old child name would choose the wrong parent"
+        );
     }
 }

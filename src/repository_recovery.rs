@@ -633,7 +633,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 },
             });
         }
-        context.validate_for_source(&root).map_err(|error| ValidationError::Io(error.to_string()))?;
+        context
+            .validate_for_source(&root)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let source = self.recovery_source_authority(&recovery.worktree, &root)?;
         let mut paths = Vec::new();
         let mut failures = Vec::new();
@@ -743,7 +745,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             &recovery.directories,
             created_directories,
         )?;
-        created_directories.context.validate_for_source(root).map_err(|error| error.to_string())?;
+        created_directories
+            .context
+            .validate_for_source(root)
+            .map_err(|error| error.to_string())?;
         if let Some(trash) = &entry.trash {
             return restore_trashed_entry(trash, &parent, &name, cancellation, || {});
         }
@@ -874,7 +879,10 @@ fn recovery_mode_transition(
 
 impl OwnedRecoveryDirectory {
     fn install_temporary(&mut self) -> Result<(), String> {
-        self.context.placement().validate().map_err(|error| error.to_string())?;
+        self.context
+            .placement()
+            .validate()
+            .map_err(|error| error.to_string())?;
         if self.temporary_installed {
             return Ok(());
         }
@@ -1106,7 +1114,10 @@ fn recovery_parent(
                         preparation.diagnostic_path().display()
                     );
                     created.live.retain(slot.retain(description, move || {
-                        retry_context.placement().validate().map_err(|error| error.to_string())?;
+                        retry_context
+                            .placement()
+                            .validate()
+                            .map_err(|error| error.to_string())?;
                         preparation
                             .retry_cleanup()
                             .map_err(|error| error.to_string())?;
@@ -2178,7 +2189,8 @@ mod directory_frontier_tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
             let read_capture = |path: &std::path::Path| {
-                let mut reader = std::io::Read::take(fs::File::open(path).unwrap(), 1024 * 1024 + 1);
+                let mut reader =
+                    std::io::Read::take(fs::File::open(path).unwrap(), 1024 * 1024 + 1);
                 let mut text = String::new();
                 std::io::Read::read_to_string(&mut reader, &mut text).unwrap();
                 assert!(text.len() <= 1024 * 1024);
