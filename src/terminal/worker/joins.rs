@@ -70,6 +70,7 @@ fn service() -> Result<&'static Service, String> {
                     match escalate_owned_root(owner) {
                         Escalation::Done => false,
                         Escalation::Contended => {schedule(observed_at+Duration::from_millis(5));true},
+                        Escalation::SignalUnconfirmed => {schedule(observed_at+Duration::from_millis(250));true},
                         // A provisional handoff may fail and reopen. Keep its
                         // ticket parked until ownership changes or actual join.
                         Escalation::Handoff => true,
@@ -154,7 +155,7 @@ pub(super) fn ownership_changed() {
     if let Some(Ok(service))=SERVICE.get() {let _=service.changed.try_send(());}
 }
 
-enum Escalation {Done,Contended,Handoff}
+enum Escalation {Done,Contended,Handoff,SignalUnconfirmed}
 // A contended fence or provisional handoff keeps its ticket until ownership
 // changes. Only an actual signal admission retires escalation responsibility.
 fn escalate_owned_root(published: &PublishedState) -> Escalation {
@@ -164,8 +165,30 @@ fn escalate_owned_root(published: &PublishedState) -> Escalation {
         Err(std::sync::TryLockError::WouldBlock) => return Escalation::Contended,
     };
     if order.handoff {return Escalation::Handoff;}
-    if let Some(pidfd) = published.shutdown_pidfd.get() {
-        let _ = close_processes::signal(pidfd, libc::SIGKILL);
+    if let Some(pidfd) = published.shutdown_pidfd.get()
+        && let Err(error) = close_processes::signal(pidfd, libc::SIGKILL)
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        if published.join_signal_error.set(()).is_ok() {
+            tracing::warn!(%error,"Original terminal root escalation remains unconfirmed; its bounded cleanup owner will retry");
+        }
+        return Escalation::SignalUnconfirmed;
     }
     Escalation::Done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn uncertain_pidfd_signal_retains_escalation_responsibility() {
+        let owner=PublishedState::new(true,Arc::new(|_|{}));
+        owner.shutdown_pidfd.set(File::open("/dev/null").unwrap()).unwrap();
+        assert!(matches!(escalate_owned_root(&owner),Escalation::SignalUnconfirmed));
+        assert!(owner.join_signal_error.get().is_some());
+        assert!(matches!(escalate_owned_root(&owner),Escalation::SignalUnconfirmed));
+        assert_eq!(owner.worker_join.load(Ordering::Acquire),0,"signal uncertainty cannot invent actual join completion");
+    }
 }
