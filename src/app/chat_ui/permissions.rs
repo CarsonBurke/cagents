@@ -203,12 +203,14 @@ impl Runtime {
             .filter(|request| request.kind == chat::RequestKind::Approval)
             .collect();
         for request in approvals {
-            content.push(view::request_view(
+            content.push(view::request_view_with_redirect(
                 target,
                 request,
                 &self.answers,
                 enabled,
                 view::RequestSurface::Permissions,
+                (self.session.launch.provider == Provider::Claude)
+                    .then(|| !self.composer.text().trim().is_empty()),
             ));
         }
         for denial in snapshot.permission_denials.iter().rev() {

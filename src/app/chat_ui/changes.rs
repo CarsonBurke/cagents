@@ -185,7 +185,6 @@ fn kind(kind: &chat::ChangeKind) -> &'static str {
     }
 }
 
-
 fn totals(additions: Option<u64>, deletions: Option<u64>) -> String {
     match (additions, deletions) {
         (Some(added), Some(deleted)) => format!("+{added} −{deleted}"),
@@ -200,6 +199,7 @@ fn patch_label(patch: &chat::FileChangePatch, index: usize) -> String {
         chat::ToolStatus::Succeeded => "",
         chat::ToolStatus::Denied => " · Denied",
         chat::ToolStatus::Stopped => " · Stopped",
+        chat::ToolStatus::AwaitingApproval => " · Awaiting approval",
     };
     let history = if patch.imported {
         " · Earlier history"
