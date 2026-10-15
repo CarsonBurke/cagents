@@ -1576,7 +1576,6 @@ pub(super) fn codex_terminal_view(
             unpaired.launch.session_id = handle
                 .confirmed_session_id()
                 .or_else(|| session.launch.session_id.clone());
-            chat::protocol::align_resume_identity(&mut unpaired.launch).map_err(unavailable)?;
             unpaired.native_continuity = handle.native_continuity();
             unpaired.terminal = None;
             handle
@@ -1659,7 +1658,6 @@ pub(super) fn codex_terminal_view(
         .or_else(|| session.launch.session_id.clone());
     before.native_continuity = handle.native_continuity();
     let result = (|| {
-        chat::protocol::align_resume_identity(&mut before.launch).map_err(unavailable)?;
         {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if !state
