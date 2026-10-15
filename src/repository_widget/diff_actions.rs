@@ -231,6 +231,7 @@ impl RepositoryRuntime {
                 })
             }
             DiffCommand::OpenInEditor { row, side } => {
+                if self.is_saving() { return Task::none(); }
                 let Some(line) = model
                     .new_line_at_row(self.diff_mode, row)
                     .or_else(|| Selection::new(self.diff_mode, side, row).line_reference(model))
@@ -506,7 +507,7 @@ impl<'a> RowContext<'a> {
         let row = self.row;
         let unified = runtime.diff_mode == DiffMode::Inline;
         let editable = matches!(runtime.document, DocumentState::Editable(_));
-        let can_open = editable || !runtime.blocks_navigation();
+        let can_open = !runtime.is_saving() && (editable || !runtime.blocks_navigation());
         let changed = runtime
             .selected_diff_range()
             .and_then(|range| {

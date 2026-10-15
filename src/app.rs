@@ -2636,6 +2636,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::ToggleContextInspector
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
+            | Message::Repository(RepositoryAction::OpenWorkingFileLocation { .. })
+            | Message::Repository(RepositoryAction::DiffCommand { command:crate::diff_interaction::Command::OpenInEditor { .. },.. })
             | Message::Sidebar(
                 SidebarAction::OpenRepositoryPicker
                     | SidebarAction::OpenRepository { .. }
@@ -24998,6 +25000,30 @@ mod tests {
             );
             assert_eq!(app.workspace.focused(), Some(pane));
         }
+    }
+
+    #[test]
+    fn diff_working_location_keeps_focus_and_card_count_during_an_active_save() {
+        let (mut app,_) = pull_request_test_app(&[]);
+        let saving = app.workspace.focused().unwrap();
+        let (origin,task) = app.add_pull_requests_card(PathBuf::from("/repo"));
+        drop(task);
+        let (runtime,identity) = RepositoryRuntime::diff_snapshot_fixture(origin,"source.rs","old\n","new\n");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else { panic!("review card") };
+        pane.runtime = runtime;
+        let (saving_runtime,_) = RepositoryRuntime::post_persist_failure_fixture(saving);
+        app.cards.insert(saving,CardRuntime::Repository(Box::new(saving_runtime)));
+        let update = app.workspace.focus(saving).unwrap();
+        drop(app.apply_viewport(update,false,false));
+        assert!(app.focused_repository_is_saving());
+        let count = app.cards.len();
+        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity,line:0 })));
+        assert_eq!(app.workspace.focused(),Some(saving));
+        assert_eq!(app.cards.len(),count);
+        assert!(workspace_navigation_blocked_during_save(&Message::Repository(RepositoryAction::DiffCommand {
+            card:origin,generation:0,revision:0,mode:crate::diff_view::DiffMode::Inline,sources:[(0,0);2],
+            command:crate::diff_interaction::Command::OpenInEditor { row:0,side:crate::diff_interaction::Side::New },
+        })));
     }
 
     #[test]

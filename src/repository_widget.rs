@@ -6616,7 +6616,7 @@ impl RepositoryRuntime {
         &self,
         identity: &AsyncIdentity,
     ) -> Option<RepositoryView> {
-        (self.accepts_selected(identity) && self.shows_diff()).then(|| self.descriptor.clone())
+        (!self.is_saving() && self.accepts_selected(identity) && self.shows_diff()).then(|| self.descriptor.clone())
     }
 
     /// Open a repository-relative location, even before the directory listing
