@@ -4672,8 +4672,10 @@ impl Cagents {
         self.notices
             .resolve_target("daemon-interrupted-turns", card);
         self.notices.resolve_target("daemon-chat-reconnect", card);
-        self.notices.resolve_target("workspace-session-visibility", card);
-        self.notices.resolve_target("workspace-browser-visibility", card);
+        self.notices
+            .resolve_target("workspace-session-visibility", card);
+        self.notices
+            .resolve_target("workspace-browser-visibility", card);
         self.cancel_chat_reconnect(card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
@@ -5279,7 +5281,9 @@ impl Cagents {
             let key = "daemon-interrupted-turns";
             // A second transport loss must retain earlier chats that have not
             // received a successful user command or been dismissed yet.
-            let mut targets = self.notices.condition_targets(key)
+            let mut targets = self
+                .notices
+                .condition_targets(key)
                 .into_iter()
                 .chain(batch.interrupted)
                 .collect::<Vec<_>>();
@@ -5289,7 +5293,9 @@ impl Cagents {
         }
         if !batch.failed.is_empty() {
             let key = "daemon-chat-reconnect";
-            let mut targets = self.notices.condition_targets(key)
+            let mut targets = self
+                .notices
+                .condition_targets(key)
                 .into_iter()
                 .chain(batch.failed)
                 .collect::<Vec<_>>();
@@ -5307,7 +5313,12 @@ impl Cagents {
             self.notices.record(
                 TransientNotice::success(format!(
                     "Daemon reconnected {} {}.",
-                    batch.reconnected, if batch.reconnected == 1 { "chat" } else { "chats" }
+                    batch.reconnected,
+                    if batch.reconnected == 1 {
+                        "chat"
+                    } else {
+                        "chats"
+                    }
                 ))
                 .key("daemon-connectivity"),
             );
@@ -13030,10 +13041,15 @@ mod tests {
         }
         // The same failed view must not be double-counted when its visibility
         // update and its attachment both fail in this recovery episode.
-        app.notices.workspace_visibility_result(vec![(failed, "terminal worker has closed".into())]);
-        app.finish_chat_reconnect(interrupted, true, Some(&crate::agent::ActivityOutcome::Interrupted {
-            reason: "Fixture interrupted turn".into(),
-        }));
+        app.notices
+            .workspace_visibility_result(vec![(failed, "terminal worker has closed".into())]);
+        app.finish_chat_reconnect(
+            interrupted,
+            true,
+            Some(&crate::agent::ActivityOutcome::Interrupted {
+                reason: "Fixture interrupted turn".into(),
+            }),
+        );
         app.finish_chat_reconnect(failed, false, None);
         app.finish_chat_reconnect(healthy, true, None);
         assert!(app.chat_ui.reconnecting.is_none());
@@ -13042,12 +13058,26 @@ mod tests {
         assert_eq!(notice.key.as_deref(), Some("daemon-session-recovery"));
         assert!(notice.message.contains("Daemon reconnected 2 chats."));
         assert!(notice.message.contains("1 chat has interrupted turns."));
-        assert!(notice.message.contains("1 session view needs reconnection."));
+        assert!(
+            notice
+                .message
+                .contains("1 session view needs reconnection.")
+        );
         assert_eq!(notice.targets.len(), 2);
         assert!(notice.targets.contains(&interrupted));
         assert!(notice.targets.contains(&failed));
-        assert!(notice.details.as_ref().unwrap().contains("worker has closed"));
-        assert!(!notice.message.contains("could not update workspace visibility"));
+        assert!(
+            notice
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("worker has closed")
+        );
+        assert!(
+            !notice
+                .message
+                .contains("could not update workspace visibility")
+        );
     }
 
     #[test]
@@ -13071,10 +13101,7 @@ mod tests {
             }),
         );
         let key = "daemon-interrupted-turns";
-        assert_eq!(
-            app.notices.condition(key).unwrap().targets,
-            vec![first]
-        );
+        assert_eq!(app.notices.condition(key).unwrap().targets, vec![first]);
         app.begin_chat_reconnect(chat_runtime(&app, second).target);
         app.begin_chat_reconnect(chat_runtime(&app, failed).target);
         app.finish_chat_reconnect(
@@ -13093,14 +13120,9 @@ mod tests {
         assert_eq!(warning.targets.len(), 2);
         assert!(warning.targets.contains(&first));
         assert!(warning.targets.contains(&second));
-        assert!(
-            app.notices.condition_targets("daemon-chat-reconnect") == vec![failed]
-        );
+        assert!(app.notices.condition_targets("daemon-chat-reconnect") == vec![failed]);
         app.notices.resolve_target(key, first);
-        assert_eq!(
-            app.notices.condition(key).unwrap().targets,
-            vec![second]
-        );
+        assert_eq!(app.notices.condition(key).unwrap().targets, vec![second]);
     }
 
     #[test]
@@ -13128,14 +13150,9 @@ mod tests {
         }
         assert!(app.chat_ui.reconnecting.is_none());
         app.finish_chat_reconnect(cards[0], true, None);
-        assert_eq!(
-            app.notices.condition(key).unwrap().targets,
-            vec![cards[2]]
-        );
+        assert_eq!(app.notices.condition(key).unwrap().targets, vec![cards[2]]);
         app.chat_discard(cards[2]);
-        assert!(
-            app.notices.condition(key).is_none()
-        );
+        assert!(app.notices.condition(key).is_none());
     }
 
     #[test]

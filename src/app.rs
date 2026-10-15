@@ -347,7 +347,10 @@ impl NoticeLog {
 
     fn has_expiring_notices(&self) -> bool {
         self.entries.iter().any(|entry| entry.expires_at.is_some())
-            || self.daemon_conditions.values().any(|(_, expiry)| expiry.is_some())
+            || self
+                .daemon_conditions
+                .values()
+                .any(|(_, expiry)| expiry.is_some())
     }
 
     fn record(&mut self, notice: TransientNotice) {
@@ -419,8 +422,13 @@ impl NoticeLog {
     }
 
     fn is_daemon_condition(key: &str) -> bool {
-        matches!(key, "daemon-connectivity" | "daemon-interrupted-turns"
-            | "daemon-chat-reconnect" | "workspace-session-visibility")
+        matches!(
+            key,
+            "daemon-connectivity"
+                | "daemon-interrupted-turns"
+                | "daemon-chat-reconnect"
+                | "workspace-session-visibility"
+        )
     }
 
     fn condition(&self, key: &str) -> Option<&TransientNotice> {
@@ -428,7 +436,8 @@ impl NoticeLog {
     }
 
     fn condition_targets(&self, key: &str) -> Vec<CardId> {
-        self.condition(key).map_or_else(Vec::new, |notice| notice.targets.clone())
+        self.condition(key)
+            .map_or_else(Vec::new, |notice| notice.targets.clone())
     }
 
     fn workspace_visibility_result(&mut self, failures: Vec<(CardId, String)>) {
@@ -437,9 +446,17 @@ impl NoticeLog {
             self.resolve(key);
         } else {
             let targets = failures.iter().map(|(card, _)| *card).collect::<Vec<_>>();
-            let details = failures.into_iter().map(|(_, error)| error).collect::<Vec<_>>().join("\n");
-            self.record(TransientNotice::warning("Some session views could not update.")
-                .key(key).details(details).targets(targets));
+            let details = failures
+                .into_iter()
+                .map(|(_, error)| error)
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.record(
+                TransientNotice::warning("Some session views could not update.")
+                    .key(key)
+                    .details(details)
+                    .targets(targets),
+            );
         }
     }
 
@@ -448,7 +465,8 @@ impl NoticeLog {
         self.daemon_conditions
             .retain(|_, (_, expiry)| expiry.is_none_or(|expiry| expiry > now));
         if self.daemon_conditions.is_empty() {
-            self.entries.retain(|entry| entry.notice.key.as_deref() != Some(KEY));
+            self.entries
+                .retain(|entry| entry.notice.key.as_deref() != Some(KEY));
             return;
         }
         let interrupted = self.condition_targets("daemon-interrupted-turns");
@@ -467,15 +485,28 @@ impl NoticeLog {
             parts.push(notice.message.clone());
         }
         if !interrupted.is_empty() {
-            let (noun, verb) = if interrupted.len() == 1 { ("chat", "has") } else { ("chats", "have") };
-            parts.push(format!("{} {noun} {verb} interrupted turns.", interrupted.len()));
+            let (noun, verb) = if interrupted.len() == 1 {
+                ("chat", "has")
+            } else {
+                ("chats", "have")
+            };
+            parts.push(format!(
+                "{} {noun} {verb} interrupted turns.",
+                interrupted.len()
+            ));
         }
         if !failed.is_empty() {
-            let (noun, verb) = if failed.len() == 1 { ("session view", "needs") } else { ("session views", "need") };
+            let (noun, verb) = if failed.len() == 1 {
+                ("session view", "needs")
+            } else {
+                ("session views", "need")
+            };
             parts.push(format!("{} {noun} {verb} reconnection.", failed.len()));
         }
         let mut notice = if interrupted.is_empty() && failed.is_empty() {
-            let Some(notice) = self.condition("daemon-connectivity") else { return; };
+            let Some(notice) = self.condition("daemon-connectivity") else {
+                return;
+            };
             notice.clone()
         } else {
             parts.push("Open an affected session to continue.".into());
@@ -483,16 +514,31 @@ impl NoticeLog {
         };
         let mut conditions = self.daemon_conditions.iter().collect::<Vec<_>>();
         conditions.sort_by(|(first, _), (second, _)| first.cmp(second));
-        notice.details = Some(conditions.into_iter().map(|(_, (condition, _))| {
-            condition.details.as_ref().map_or_else(|| condition.message.clone(), |details| format!("{}\n{details}", condition.message))
-        }).collect::<Vec<_>>().join("\n\n"));
+        notice.details = Some(
+            conditions
+                .into_iter()
+                .map(|(_, (condition, _))| {
+                    condition.details.as_ref().map_or_else(
+                        || condition.message.clone(),
+                        |details| format!("{}\n{details}", condition.message),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
         notice.key = Some(KEY.into());
         let expires_at = if notice.severity == NoticeSeverity::Success {
-            self.daemon_conditions.get("daemon-connectivity").and_then(|(_, expiry)| *expiry)
+            self.daemon_conditions
+                .get("daemon-connectivity")
+                .and_then(|(_, expiry)| *expiry)
         } else {
             None
         };
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.notice.key.as_deref() == Some(KEY)) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.notice.key.as_deref() == Some(KEY))
+        {
             // A poll changing neither targets nor details must not replace the
             // user's open Details panel or its focused/dismissable identity.
             entry.notice = notice;
@@ -500,7 +546,11 @@ impl NoticeLog {
             return;
         }
         self.record_at(notice, now);
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.notice.key.as_deref() == Some(KEY)) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.notice.key.as_deref() == Some(KEY))
+        {
             entry.expires_at = expires_at;
         }
     }
@@ -11302,20 +11352,38 @@ impl Cagents {
             .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
             .map(|card| card.id)
             .collect::<HashSet<_>>();
-        let targets = self.cards.keys().map(|id| (*id, workspace_visible && visible_cards.contains(id))).collect();
+        let targets = self
+            .cards
+            .keys()
+            .map(|id| (*id, workspace_visible && visible_cards.contains(id)))
+            .collect();
         self.set_workspace_surface_targets_visible(targets);
     }
 
     fn workspace_visibility_retry_targets(&self) -> Vec<(CardId, bool)> {
-        let mut targets = self.notices.condition_targets("workspace-session-visibility");
-        targets.extend(self.notices.entries.iter()
-            .filter(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility"))
-            .flat_map(|entry| entry.notice.targets.iter().copied()));
+        let mut targets = self
+            .notices
+            .condition_targets("workspace-session-visibility");
+        targets.extend(
+            self.notices
+                .entries
+                .iter()
+                .filter(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility"))
+                .flat_map(|entry| entry.notice.targets.iter().copied()),
+        );
         targets.sort();
         targets.dedup();
         let workspace_visible = self.workspace_surfaces_visible();
-        targets.into_iter().map(|id| (id, workspace_visible
-            && self.workspace.visibility(id) == Some(VisibilityClass::Visible))).collect()
+        targets
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    workspace_visible
+                        && self.workspace.visibility(id) == Some(VisibilityClass::Visible),
+                )
+            })
+            .collect()
     }
 
     fn set_workspace_surface_targets_visible(&mut self, targets: Vec<(CardId, bool)>) {
@@ -11323,7 +11391,9 @@ impl Cagents {
         #[cfg(feature = "integrated-browser")]
         let mut browser_failures = Vec::new();
         for (id, visible) in targets {
-            let Some(runtime) = self.cards.get_mut(&id) else { continue; };
+            let Some(runtime) = self.cards.get_mut(&id) else {
+                continue;
+            };
             let result = match runtime {
                 CardRuntime::Terminal(surface) => if visible {
                     surface.reveal()
@@ -11357,10 +11427,23 @@ impl Cagents {
         if browser_failures.is_empty() {
             self.notices.resolve("workspace-browser-visibility");
         } else {
-            let targets = browser_failures.iter().map(|(card, _)| *card).collect::<Vec<_>>();
-            let details = browser_failures.into_iter().map(|(_, error)| error).collect::<Vec<_>>().join("\n");
-            self.notices.record(TransientNotice::warning("Some browser views could not update. Open an affected browser to retry.")
-                .key("workspace-browser-visibility").details(details).targets(targets));
+            let targets = browser_failures
+                .iter()
+                .map(|(card, _)| *card)
+                .collect::<Vec<_>>();
+            let details = browser_failures
+                .into_iter()
+                .map(|(_, error)| error)
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.notices.record(
+                TransientNotice::warning(
+                    "Some browser views could not update. Open an affected browser to retry.",
+                )
+                .key("workspace-browser-visibility")
+                .details(details)
+                .targets(targets),
+            );
         }
     }
 
@@ -13352,11 +13435,15 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        let retry_workspace_visibility = matches!(&message,
-            Message::TerminalStarted { .. } | Message::RetainedTerminalAttached { .. }
-            | Message::RestoredAgentAttached { .. } | Message::ChatUi(chat_ui::Action::Ready(..))
-            | Message::LifecycleSweep | Message::Viewport { .. })
-            || matches!(&message, Message::DaemonHealth(health) if !health.unavailable());
+        let retry_workspace_visibility = matches!(
+            &message,
+            Message::TerminalStarted { .. }
+                | Message::RetainedTerminalAttached { .. }
+                | Message::RestoredAgentAttached { .. }
+                | Message::ChatUi(chat_ui::Action::Ready(..))
+                | Message::LifecycleSweep
+                | Message::Viewport { .. }
+        ) || matches!(&message, Message::DaemonHealth(health) if !health.unavailable());
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -16689,8 +16776,13 @@ impl Application for Cagents {
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
         if retry_workspace_visibility
-            && (self.notices.condition("workspace-session-visibility").is_some()
-                || self.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")))
+            && (self
+                .notices
+                .condition("workspace-session-visibility")
+                .is_some()
+                || self.notices.entries.iter().any(|entry| {
+                    entry.notice.key.as_deref() == Some("workspace-browser-visibility")
+                }))
         {
             // Transport health and attachment completion are reasons to retry,
             // not proof that this particular view accepted its update.
@@ -16760,8 +16852,7 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
-            if self.notices.has_expiring_notices()
-            {
+            if self.notices.has_expiring_notices() {
                 iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
             } else {
                 Subscription::none()
@@ -20184,27 +20275,48 @@ mod tests {
         let mut log = NoticeLog::default();
         let first = CardId::new();
         let second = CardId::new();
-        log.record(TransientNotice::warning("Chat retry exhausted")
-            .key("daemon-chat-reconnect").targets([second]));
-        log.record(TransientNotice::warning("Interrupted turn")
-            .key("daemon-interrupted-turns").targets([first]));
+        log.record(
+            TransientNotice::warning("Chat retry exhausted")
+                .key("daemon-chat-reconnect")
+                .targets([second]),
+        );
+        log.record(
+            TransientNotice::warning("Interrupted turn")
+                .key("daemon-interrupted-turns")
+                .targets([first]),
+        );
         log.workspace_visibility_result(vec![(first, "terminal worker has closed".into())]);
         log.workspace_visibility_result(vec![(first, "terminal command queue is full".into())]);
-        assert_eq!(log.len(), 1, "one visible summary, separate owned conditions");
+        assert_eq!(
+            log.len(),
+            1,
+            "one visible summary, separate owned conditions"
+        );
         let notice = &log.recent().next().unwrap().notice;
         assert!(notice.message.contains("1 chat has interrupted turns"));
         assert!(notice.message.contains("2 session views need reconnection"));
         assert!(!notice.message.contains("terminal"));
         assert!(notice.details.as_ref().unwrap().contains("queue is full"));
-        assert!(!notice.details.as_ref().unwrap().contains("worker has closed"));
+        assert!(
+            !notice
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("worker has closed")
+        );
 
         // A responsive daemon does not mean an affected view accepted its
         // update; a failed reapply continues the same owned condition.
-        log.record(TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"));
+        log.record(
+            TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"),
+        );
         log.resolve("daemon-connectivity");
         log.workspace_visibility_result(vec![(first, "terminal worker has closed".into())]);
         assert_eq!(log.len(), 1);
-        assert_eq!(log.condition_targets("workspace-session-visibility"), [first]);
+        assert_eq!(
+            log.condition_targets("workspace-session-visibility"),
+            [first]
+        );
         log.workspace_visibility_result(Vec::new());
         assert!(log.condition("workspace-session-visibility").is_none());
         assert_eq!(log.condition_targets("daemon-chat-reconnect"), [second]);
@@ -20224,9 +20336,14 @@ mod tests {
         log.dismiss(id);
         assert!(log.is_empty());
         assert!(log.condition("workspace-session-visibility").is_none());
-        log.record(TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"));
+        log.record(
+            TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"),
+        );
         assert_eq!(log.len(), 1);
-        assert_eq!(log.recent().next().unwrap().notice.severity, NoticeSeverity::Success);
+        assert_eq!(
+            log.recent().next().unwrap().notice.severity,
+            NoticeSeverity::Success
+        );
     }
 
     #[test]
@@ -20234,15 +20351,27 @@ mod tests {
         let mut log = NoticeLog::default();
         let past = Instant::now() - Duration::from_secs(10);
         let card = CardId::new();
-        log.record_at(TransientNotice::success("Daemon reconnected 1 chat.")
-            .key("daemon-connectivity"), past);
-        log.record_at(TransientNotice::warning("Interrupted")
-            .key("daemon-interrupted-turns").targets([card]), past);
+        log.record_at(
+            TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"),
+            past,
+        );
+        log.record_at(
+            TransientNotice::warning("Interrupted")
+                .key("daemon-interrupted-turns")
+                .targets([card]),
+            past,
+        );
         assert_eq!(log.len(), 1);
         assert!(log.recent().next().unwrap().expires_at.is_none());
-        assert!(log.has_expiring_notices(), "the hidden success still needs its expiry subscription");
+        assert!(
+            log.has_expiring_notices(),
+            "the hidden success still needs its expiry subscription"
+        );
         log.resolve_target("daemon-interrupted-turns", card);
-        assert!(log.is_empty(), "resolving the warning cannot revive an expired success");
+        assert!(
+            log.is_empty(),
+            "resolving the warning cannot revive an expired success"
+        );
         assert!(!log.has_expiring_notices());
     }
 
@@ -20273,26 +20402,63 @@ mod tests {
         app.workspace.resize_viewport(1600.0);
         let handle = BrowserHandle::fixture();
         handle.mailbox.mark_engine_gone();
-        app.cards.insert(card, CardRuntime::Browser(BrowserRuntime {
-            handle, ime: None, lifecycle: BrowserLifecycle::Visible,
-            address: BrowserAddress::location(&url), address_focused: false,
-            address_error: false, progress_phase: 0.0, load_state: None,
-        }));
+        app.cards.insert(
+            card,
+            CardRuntime::Browser(BrowserRuntime {
+                handle,
+                ime: None,
+                lifecycle: BrowserLifecycle::Visible,
+                address: BrowserAddress::location(&url),
+                address_focused: false,
+                address_error: false,
+                progress_phase: 0.0,
+                load_state: None,
+            }),
+        );
         app.set_workspace_surfaces_visible(true);
-        assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")));
-        assert!(app.notices.condition("workspace-session-visibility").is_none());
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility"))
+        );
+        assert!(
+            app.notices
+                .condition("workspace-session-visibility")
+                .is_none()
+        );
         let interrupted = CardId::new();
-        app.notices.record(TransientNotice::warning("Interrupted")
-            .key("daemon-interrupted-turns").targets([interrupted]));
-        let Some(CardRuntime::Browser(browser)) = app.cards.get_mut(&card) else { panic!("browser runtime"); };
+        app.notices.record(
+            TransientNotice::warning("Interrupted")
+                .key("daemon-interrupted-turns")
+                .targets([interrupted]),
+        );
+        let Some(CardRuntime::Browser(browser)) = app.cards.get_mut(&card) else {
+            panic!("browser runtime");
+        };
         browser.handle = BrowserHandle::fixture();
         // The real application's healthy-event footer must call the replacement
         // BrowserHandle, not merely drop the warning on a global health signal.
-        drop(app.update(Message::DaemonHealth(crate::daemon_health::State::Responsive)));
-        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")));
-        assert_eq!(app.notices.condition_targets("daemon-interrupted-turns"), [interrupted]);
-        let Some(CardRuntime::Browser(browser)) = app.cards.get(&card) else { panic!("browser runtime"); };
-        assert!(browser.handle.mailbox.drain_coalesced().residency.is_some(), "actual browser mailbox accepted the visibility reapply");
+        drop(app.update(Message::DaemonHealth(
+            crate::daemon_health::State::Responsive,
+        )));
+        assert!(
+            !app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility"))
+        );
+        assert_eq!(
+            app.notices.condition_targets("daemon-interrupted-turns"),
+            [interrupted]
+        );
+        let Some(CardRuntime::Browser(browser)) = app.cards.get(&card) else {
+            panic!("browser runtime");
+        };
+        assert!(
+            browser.handle.mailbox.drain_coalesced().residency.is_some(),
+            "actual browser mailbox accepted the visibility reapply"
+        );
     }
 
     #[test]
@@ -20300,12 +20466,18 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         let affected = CardId::new();
         let browser = CardId::new();
-        for _ in 0..1000 { app.cards.insert(CardId::new(), CardRuntime::Loading); }
+        for _ in 0..1000 {
+            app.cards.insert(CardId::new(), CardRuntime::Loading);
+        }
         app.cards.insert(affected, CardRuntime::Loading);
         app.cards.insert(browser, CardRuntime::Loading);
-        app.notices.workspace_visibility_result(vec![(affected, "closed".into())]);
-        app.notices.record(TransientNotice::warning("Browser failed")
-            .key("workspace-browser-visibility").targets([browser]));
+        app.notices
+            .workspace_visibility_result(vec![(affected, "closed".into())]);
+        app.notices.record(
+            TransientNotice::warning("Browser failed")
+                .key("workspace-browser-visibility")
+                .targets([browser]),
+        );
         let targets = app.workspace_visibility_retry_targets();
         assert_eq!(targets.len(), 2);
         assert!(targets.iter().any(|(id, _)| *id == affected));
@@ -20317,12 +20489,22 @@ mod tests {
         let mut log = NoticeLog::default();
         let now = Instant::now();
         for index in 0..NOTICE_LOG_CAPACITY {
-            log.record_at(TransientNotice::error(format!("Unresolved error {index}")), now);
+            log.record_at(
+                TransientNotice::error(format!("Unresolved error {index}")),
+                now,
+            );
         }
-        log.record_at(TransientNotice::success("Daemon reconnected 1 chat.")
-            .key("daemon-connectivity"), now);
+        log.record_at(
+            TransientNotice::success("Daemon reconnected 1 chat.").key("daemon-connectivity"),
+            now,
+        );
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        assert!(log.entries.iter().all(|entry| entry.notice.severity == NoticeSeverity::Error && entry.expires_at.is_none()));
+        assert!(
+            log.entries
+                .iter()
+                .all(|entry| entry.notice.severity == NoticeSeverity::Error
+                    && entry.expires_at.is_none())
+        );
         log.expire(now + Duration::from_secs(7));
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
     }
@@ -20342,13 +20524,19 @@ mod tests {
     fn success_notice_flood_preserves_unresolved_errors_and_warnings() {
         let mut log = NoticeLog::default();
         let now = Instant::now();
-        log.record_at(TransientNotice::error("Still disconnected").key("error"), now);
+        log.record_at(
+            TransientNotice::error("Still disconnected").key("error"),
+            now,
+        );
         log.record_at(
             TransientNotice::warning("Turn interrupted").key("warning"),
             now,
         );
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
-            log.record_at(TransientNotice::success(format!("Information {index}")), now);
+            log.record_at(
+                TransientNotice::success(format!("Information {index}")),
+                now,
+            );
             assert!(log.len() <= NOTICE_LOG_CAPACITY);
         }
         log.expire(now + Duration::from_secs(7));
