@@ -266,6 +266,10 @@ impl Cagents {
                 .project_ui
                 .modal_target(role)
                 .map(|target| target.request),
+            Modal::DirtyClose => self
+                .dirty_repository_close
+                .as_ref()
+                .map(|dialog| Instance::Operation(dialog.request)),
             Modal::Worktree => self
                 .worktree_dialog
                 .as_ref()
@@ -768,7 +772,7 @@ mod tests {
         }
     }
 
-    fn emitted_reset_cancel(app: &Cagents) -> Message {
+    fn emitted_dialog_decision(app: &Cagents, focus: widget::Id, expected: fn(&Message) -> bool) -> Message {
         use iced::advanced::{
             Layout, Shell, clipboard, layout,
             widget::{Tree, operation},
@@ -786,7 +790,7 @@ mod tests {
             &mut tree,
             Layout::new(&node),
             &renderer,
-            &mut operation::focusable::focus::<()>(widget::Id::new("dialog.reset-settings.cancel")),
+            &mut operation::focusable::focus::<()>(focus),
         );
         let mut messages = Vec::new();
         dialog.as_widget_mut().update(
@@ -808,8 +812,58 @@ mod tests {
             &bounds,
         );
         messages.into_iter().find(|message| matches!(message,
-            Message::ModalSurface { message, .. } if matches!(&**message, Message::CancelResetSettings)))
-            .expect("actual Cancel widget publishes its surface-bound decision")
+            Message::ModalSurface { message, .. } if expected(message)))
+            .expect("actual widget publishes its surface-bound decision")
+    }
+
+    fn emitted_reset_cancel(app: &Cagents) -> Message {
+        emitted_dialog_decision(app, widget::Id::new("dialog.reset-settings.cancel"),
+            |message| matches!(message, Message::CancelResetSettings))
+    }
+
+    #[test]
+    fn dirty_close_step_and_same_card_replacement_reject_held_cancel_decisions() {
+        for same_card in [false, true] {
+            let mut app = app();
+            let first = app.workspace.focused().unwrap();
+            let second = CardId::new();
+            let mut second_state = app.card_state(first).unwrap().clone();
+            second_state.id = second;
+            Arc::make_mut(&mut app.durable).cards.push(second_state);
+            for card in [first, second] {
+                app.cards.insert(card, CardRuntime::Repository(Box::new(
+                    RepositoryRuntime::dirty_fixture(card))));
+            }
+            drop(app.begin_dirty_close(DirtyCloseIntent::Application(window::Id::unique()),
+                VecDeque::from([first, second])));
+            drop(app.finish_modal_update(Task::none()));
+            let old = app.modal_surface_target(Modal::DirtyClose);
+            let held = emitted_dialog_decision(&app,
+                dirty_close_control_id(first, DirtyCloseControl::Cancel),
+                |message| matches!(message, Message::CancelRepositoryClose));
+            if same_card {
+                // Replacement happens atomically before a stack reconciliation.
+                drop(app.begin_dirty_close(DirtyCloseIntent::Card(first), VecDeque::from([first])));
+            } else {
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else { panic!() };
+                assert!(runtime.abandon_unsaved_changes());
+                drop(app.advance_dirty_close());
+            }
+            let current = app.modal_surface_target(Modal::DirtyClose);
+            assert_ne!(old.instance, current.instance);
+            assert_eq!(old.revision, current.revision, "the instance fence must work before reconciliation");
+            let card = if same_card { first } else { second };
+            let task = app.update(held);
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.dirty_repository_close.as_ref().unwrap().card, card);
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()));
+            drop(app.finish_modal_update(Task::none()));
+            let cancel = emitted_dialog_decision(&app,
+                dirty_close_control_id(card, DirtyCloseControl::Cancel),
+                |message| matches!(message, Message::CancelRepositoryClose));
+            drop(app.update(cancel));
+            assert!(app.dirty_repository_close.is_none(), "current Cancel still works");
+        }
     }
 
     #[test]
@@ -897,6 +951,7 @@ mod tests {
         app.settings_reset_confirm = true;
         // A repository runtime can disappear when another close finishes.
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card: CardId::new(),
             restore_card: None,
             focused: DirtyCloseControl::Cancel,
@@ -1228,6 +1283,7 @@ mod tests {
             )),
         );
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             restore_card: None,
             focused: DirtyCloseControl::Cancel,

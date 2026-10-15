@@ -4405,6 +4405,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
+    request: crate::model::OperationId,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -4417,6 +4418,7 @@ impl DirtyRepositoryClose {
         while let Some(card) = self.remaining.pop_front() {
             if unresolved(card) {
                 self.card = card;
+                self.request = crate::model::OperationId::new();
                 return Some(card);
             }
         }
@@ -11801,6 +11803,7 @@ impl Cagents {
         let restore_card = self.workspace.focused();
         let focused = DirtyCloseControl::Cancel;
         self.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: cards,
             intent,
@@ -18504,6 +18507,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -20476,6 +20480,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -20539,6 +20544,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),
