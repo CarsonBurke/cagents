@@ -2758,12 +2758,60 @@ fn conflict_label(conflict: ConflictKind) -> String {
     .to_owned()
 }
 
-/// A widget-identity fragment for a repository path.
-///
-/// The lossy display alone could collide between two paths that differ only in
-/// undecodable bytes, so the byte length disambiguates them.
+/// A reversible widget identity for a byte-exact repository path. Lossy
+/// display plus length cannot distinguish same-length invalid UTF-8 names.
 fn path_key(path: &RepoPath) -> String {
-    format!("{}#{}", path.display(), path.as_bytes().len())
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(path.as_bytes().len() + 8);
+    for &byte in path.as_bytes() {
+        if (b' '..=b'~').contains(&byte) && !matches!(byte, b'%' | b'#') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    encoded.push('#');
+    encoded.push_str(&path.as_bytes().len().to_string());
+    encoded
+}
+
+fn path_from_key(key: &str) -> Option<RepoPath> {
+    let (encoded, expected) = key.rsplit_once('#')?;
+    let expected = expected.parse::<usize>().ok()?;
+    if expected > encoded.len() { return None; }
+    let mut decoded = Vec::with_capacity(expected);
+    let mut input = encoded.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        decoded.push(if byte == b'%' {
+            let digit = |value: u8| match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'A'..=b'F' => Some(value - b'A' + 10),
+                _ => None,
+            };
+            digit(input.next()?)? * 16 + digit(input.next()?)?
+        } else if (b' '..=b'~').contains(&byte) && byte != b'#' { byte }
+        else { return None; });
+    }
+    (decoded.len() == expected).then(|| RepoPath::from_bytes(&decoded).ok()).flatten()
+}
+
+/// Resolve actual native row focus without scanning a large change group or
+/// retaining a second path/ID inventory. The current model verifies identity.
+pub fn change_row_from_focus_id(source: &SourceControlModel, key: &ActiveWorktreeKey, id: &Id) -> Option<ChangeSelectionRow> {
+    if &source.key != key { return None; }
+    let cosmic::iced::id::Internal::Custom(_, name) = &id.0 else { return None; };
+    let prefix = format!("sidebar.panel.change.open.{}.", key.worktree_id);
+    let (area, path) = name.strip_prefix(&prefix)?.split_once('.')?;
+    let area = match area {
+        "Conflict" => ChangeArea::Conflict, "Staged" => ChangeArea::Staged,
+        "Unstaged" => ChangeArea::Unstaged, "Untracked" => ChangeArea::Untracked,
+        _ => return None,
+    };
+    let path = path_from_key(path)?;
+    source.group(area)?.visible_path(&path)?;
+    Some(ChangeSelectionRow { area, path })
 }
 
 /// Formats a commit time in the offset the commit itself recorded, so a commit
@@ -18283,5 +18331,43 @@ mod change_command_revision_tests {
         let current = state.change_selection_revision();
         state.apply(&SidebarAction::ClearChangeSelection { key: source.key.clone() });
         assert_ne!(state.change_selection_revision(), current);
+    }
+}
+
+#[cfg(test)]
+mod change_focus_identity_tests {
+    use super::*;
+
+    #[test]
+    fn native_change_focus_resolves_only_the_exact_current_worktree_row() {
+        let model = super::tests::panel_model();
+        let state = super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        for row in change_selection_order(source, &state) {
+            let id = change_row_focus_id(&source.key, &row);
+            assert_eq!(change_row_from_focus_id(source, &source.key, &id), Some(row));
+        }
+        let absent = ChangeSelectionRow { area: ChangeArea::Untracked, path: RepoPath::parse("absent.txt").unwrap() };
+        assert!(change_row_from_focus_id(source, &source.key, &change_row_focus_id(&source.key, &absent)).is_none());
+        let mut wrong_key = source.key.clone();
+        wrong_key.worktree_id = WorktreeId::new();
+        assert!(change_row_from_focus_id(source, &wrong_key, &Id::unique()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_non_utf8_paths_have_distinct_reversible_widget_identities() {
+        let first = RepoPath::from_bytes(b"src/name-\xff.rs").unwrap();
+        let second = RepoPath::from_bytes(b"src/name-\xfe.rs").unwrap();
+        assert_eq!(first.display().to_string(), second.display().to_string());
+        assert_eq!(first.as_bytes().len(), second.as_bytes().len());
+        assert_ne!(path_key(&first), path_key(&second));
+        for bytes in [first.as_bytes(), second.as_bytes(), b"src/percent%23#hash.rs", "src/café\nline.rs".as_bytes()] {
+            let path = RepoPath::from_bytes(bytes).unwrap();
+            assert_eq!(path_from_key(&path_key(&path)), Some(path));
+        }
+        for invalid in ["bad%#4", "bad%GG#4", "bad#99", "bad%00#4"] {
+            assert!(path_from_key(invalid).is_none());
+        }
     }
 }
