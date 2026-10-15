@@ -3934,6 +3934,36 @@ mod tests {
     }
 
     #[test]
+    fn expanded_native_selection_is_available_and_old_word_copy_cannot_act_on_a_line() {
+        for click in [false, true] {
+            let mut app = settings_focus_fixture();
+            let card = app.workspace.focused().unwrap();
+            let runtime = RepositoryRuntime::word_selection_fixture(card);
+            assert_eq!(runtime.selected_text().as_deref(), Some("xylophone"));
+            app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            assert!(app.command_available(Command::EditorCopy));
+            assert!(app.command_available(Command::EditorCut));
+            drop(app.update_palette(Action::Open));
+            let entries = app.palette_entries();
+            let index = entries.iter().position(|entry| entry_command(&entry.2) == Some(Command::EditorCopy)).unwrap();
+            let message = entries[index].2.clone();
+            app.select_palette_entry(index, &entries);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+            let before = runtime.command_target(card);
+            drop(runtime.update(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::SelectLine }));
+            assert_eq!(runtime.selected_text().as_deref(), Some("play the xylophone"));
+            assert_ne!(before, runtime.command_target(card));
+            assert!(app.command_available(Command::EditorCopy));
+            assert!(app.command_available(Command::EditorCut));
+            let recents = app.settings.palette_recents.clone();
+            drop(app.update_palette(if click { Action::Run(app.palette.generation, MessageBox(Box::new(message))) } else { Action::Submit }));
+            assert!(app.palette.query.is_some());
+            assert_eq!(app.settings.palette_recents, recents);
+        }
+    }
+
+    #[test]
     fn destructive_surface_result_refuses_a_new_selected_file_under_the_same_card() {
         for click in [false, true] {
             let mut app = settings_focus_fixture();

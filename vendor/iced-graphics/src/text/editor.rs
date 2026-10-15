@@ -37,6 +37,14 @@ impl Editor {
         buffer_from_editor(&self.internal().editor)
     }
 
+    /// Returns the expanded source extent of normal, word or line selection.
+    pub fn selection_bounds(&self) -> Option<(Position, Position)> {
+        self.internal().editor.selection_bounds().map(|(start, end)| (
+            Position { line: start.line, column: start.index },
+            Position { line: end.line, column: end.index },
+        ))
+    }
+
     /// Creates a [`Weak`] reference to the [`Editor`].
     ///
     /// This is useful to avoid cloning the [`Editor`] when

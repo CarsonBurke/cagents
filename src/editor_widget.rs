@@ -1326,6 +1326,12 @@ where
         });
     }
 
+    /// Expanded native byte bounds, including word and line selections.
+    /// This reads positions without allocating or serializing selected text.
+    pub fn selection_bounds(&self) -> Option<(Position, Position)> {
+        self.0.borrow().editor.selection_bounds()
+    }
+
     /// Returns the current cursor position of the [`Content`].
     pub fn cursor(&self) -> Cursor {
         self.0.borrow().editor.cursor()

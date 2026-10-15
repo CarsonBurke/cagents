@@ -299,6 +299,7 @@ pub struct AsyncIdentity {
 pub struct RepositoryCommandTarget {
     identity: AsyncIdentity,
     editor_revision: Option<u64>,
+    editor_selection: Option<((usize, usize), (usize, usize))>,
     cursor: Option<(usize, usize, Option<(usize, usize)>)>,
     surface: SourceSurface,
     basis: DiffBasis,
@@ -315,7 +316,7 @@ impl std::fmt::Debug for RepositoryCommandTarget {
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
+        self.identity == other.identity && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
         }
     }
@@ -2616,11 +2617,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else {
             return history;
         };
-        let selected = document
-            .content
-            .cursor()
-            .selection
-            .is_some_and(|anchor| anchor != document.content.cursor().position);
+        let selected = document.content.selection_bounds().is_some_and(|(start, end)| start != end);
         let writable = !self.search_mode && document.active_save.is_none();
         history
             | (u8::from(writable && selected) << 2)
@@ -3122,6 +3119,15 @@ impl RepositoryRuntime {
         runtime.selected.as_mut().expect("selected fixture file").path = path.clone();
         let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
         document.source = path;
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn word_selection_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = Self::lsp_open_fixture(card, "play the xylophone\nnext\n");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line: 0, column: 12 }, selection: None });
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::SelectWord }));
         runtime
     }
 
@@ -4338,6 +4344,10 @@ impl RepositoryRuntime {
         };
         RepositoryCommandTarget {
             identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
+            editor_selection: match &self.document {
+                DocumentState::Editable(document) => document.content.selection_bounds().map(|(start, end)| ((start.line, start.column), (end.line, end.column))),
+                _ => None,
+            },
             editor_revision, cursor, surface: self.source_surface, basis: self.diff_basis.clone(), mode: self.diff_mode,
             layout_revision: self.diff_layout_revision, selection: self.diff_interaction.selection,
             model: if self.shows_diff() { self.current_diff_model_snapshot() } else { None },
