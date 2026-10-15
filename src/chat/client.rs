@@ -680,6 +680,17 @@ impl ClientHandle {
         )
     }
 
+    pub fn restart_helper(source: Session, generation: u64,
+        wake: impl Fn(Wake) + Send + Sync + 'static) -> Result<Self, StartFailure> {
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+        let prepared = client.restart_chat_helper(source.clone(), generation).map_err(|error| error.to_string())?;
+        if !super::is_helper_recovery(&source, &prepared) {
+            return Err("The helper restart changed the saved conversation".into());
+        }
+        Self::connect(prepared, Intent::Start, None, false, None, wake)
+    }
+
     pub fn recover_account(
         source: Session,
         replacement: Session,

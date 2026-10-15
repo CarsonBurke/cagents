@@ -168,6 +168,7 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    UpdateHelperInstructions(Target),
     SignIn(Target, Account),
     ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
@@ -347,7 +348,7 @@ impl Action {
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) => Some(target.card),
+            Self::Reconnect(target) | Self::ResumeAfterSignIn(target) | Self::UpdateHelperInstructions(target) => Some(target.card),
             Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
                 Some(*card)
             }
@@ -362,6 +363,7 @@ impl Action {
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
+            | Self::UpdateHelperInstructions(target)
             | Self::SignIn(target, _)
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
@@ -398,6 +400,7 @@ impl Action {
 }
 
 struct AccountRecovery {
+    helper: bool,
     source: chat::Session,
     committed: bool,
     /// Only a composer submission that has never reached a provider can be
@@ -3872,6 +3875,7 @@ impl Cagents {
                 session: replacement.clone(),
                 upgrade_committed: false,
                 recovery: Some(AccountRecovery {
+                    helper: false,
                     source: source.clone(),
                     committed: false,
                     submit,
@@ -6041,7 +6045,7 @@ impl Cagents {
                     Err(error) => {
                         if let Ok(mut reply) = ready.0.lock() {
                             *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The account change was not saved: {error}. The original conversation is retained."
+                                "The session change was not saved: {error}. The original conversation is retained."
                             ))));
                         }
                     }
@@ -6070,6 +6074,7 @@ impl Cagents {
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
                     recovery.as_ref().is_some_and(|recovery| recovery.committed);
+                let helper_recovery = recovery.as_ref().is_some_and(|recovery| recovery.helper);
                 let account_source = recovery.map(|recovery| recovery.source);
                 let upgrade_source = result
                     .as_ref()
@@ -6160,7 +6165,8 @@ impl Cagents {
                         }
                         if let Some(source) = &account_source {
                             let replacement = handle.session();
-                            if !chat::is_account_recovery(source, &replacement)
+                            if !(if helper_recovery { chat::is_helper_recovery(source, &replacement) }
+                                else { chat::is_account_recovery(source, &replacement) })
                                 || handle.snapshot().session_id != source.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6170,6 +6176,7 @@ impl Cagents {
                             }
                             if !account_committed {
                                 attempt.recovery = Some(AccountRecovery {
+                    helper: helper_recovery,
                                     source: source.clone(),
                                     committed: false,
                                     submit: automatic_submit,
@@ -6182,11 +6189,11 @@ impl Cagents {
                                     .as_ref()
                                     .ok_or_else(|| "Session storage is unavailable".to_owned())
                                     .and_then(|writer| {
-                                        writer.rebind_chat_account(
-                                            target.card,
-                                            source.clone(),
-                                            replacement,
-                                        )
+                                        if helper_recovery {
+                                            writer.rebind_chat_helper(target.card, source.clone(), replacement)
+                                        } else {
+                                            writer.rebind_chat_account(target.card, source.clone(), replacement)
+                                        }
                                     });
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
@@ -6660,6 +6667,14 @@ impl Cagents {
             Action::SignIn(target, account) => return self.sign_in_chat(target, account),
             Action::ResumeAfterSignIn(target) => {
                 return self.resume_after_sign_in(target);
+            }
+            Action::UpdateHelperInstructions(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+                if !runtime.snapshot.native_helper.as_ref().is_some_and(|helper| helper.outdated) {
+                    return Task::none();
+                }
+                runtime.error = Some("Automatic helper updates are unavailable for this session. Explicitly end or close it, then reopen the saved provider conversation where supported. This action keeps your session and unsent draft open.".into());
+                return Task::none();
             }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -16482,6 +16497,30 @@ mod tests {
         assert!(!chat_runtime(&app, card).changes.open);
         assert!(chat_runtime(&app, card).branch_picker);
     }
+    #[test]
+    fn helper_update_instructions_preserve_busy_and_idle_owners_and_the_unsent_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        app.chat_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("unsent helper-update draft"));
+        let mut snapshot = handle.snapshot().as_ref().clone();
+        snapshot.native_helper = Some(chat::NativeHelper { version: "older".into(), outdated: true });
+        snapshot.busy = true;
+        snapshot.ready = true;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::UpdateHelperInstructions(target)));
+        assert!(chat_runtime(&app, card).error.as_deref().is_some_and(|error| error.contains("Explicitly end or close")));
+        assert!(app.chat_ui.attempt(card).is_none(), "a running provider must not be closed");
+        assert_eq!(chat_runtime(&app, card).composer.text(), "unsent helper-update draft");
+        snapshot.busy = false;
+        handle.replace_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert!(app.chat_ui.attempt(card).is_none(), "observed idle is not backend quiescence and must not trigger teardown");
+        drop(app.handle_chat_ui(Action::UpdateHelperInstructions(target)));
+        assert!(app.chat_ui.attempt(card).is_none(), "the idle owner also remains intact");
+        assert_eq!(chat_runtime(&app, card).composer.text(), "unsent helper-update draft");
+    }
+
     #[test]
     fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

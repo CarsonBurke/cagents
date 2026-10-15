@@ -37,9 +37,37 @@ impl Process {
     }
 }
 
+/// Behavioural identity is separate from the wire protocol: additive fields
+/// keep existing durable helpers adoptable while exposing upgrades to users.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BuildIdentity {
+    pub version: String,
+    pub commit: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl BuildIdentity {
+    pub(crate) fn current(kind: Kind) -> Self {
+        Self {
+            version: crate::VERSION.into(),
+            commit: crate::VERSION
+                .split("+local.")
+                .nth(1)
+                .and_then(|metadata| metadata.split('.').next())
+                .map(str::to_owned),
+            capabilities: match kind {
+                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Terminal => Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub version: u32,
+    #[serde(default)]
+    pub build: Option<BuildIdentity>,
     /// Older terminal records predate native holders. Their existing private
     /// directory and absent kind continue to identify them as terminals.
     #[serde(default)]
@@ -135,10 +163,64 @@ pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream>
 }
 
 impl Record {
+    pub(crate) fn is_outdated(&self) -> bool {
+        self.build.as_ref().is_none_or(|build| {
+            build.version != crate::VERSION
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "event-driven-orphan-reaping"))
+        })
+    }
+
+    /// A diagnostic snapshot, never process-control authority. Verify the
+    /// holder's start identity both before and after scanning its direct children.
+    pub(crate) fn zombie_children(&self) -> io::Result<usize> {
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        // Linux records children on the thread that created them, even though
+        // their stat parent is the process leader. Inspect every live thread.
+        let mut children = std::collections::BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
+            let task = task?;
+            let raw = match fs::read_to_string(task.path().join("children")) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            children.extend(
+                raw.split_whitespace()
+                    .filter_map(|pid| pid.parse::<i32>().ok()),
+            );
+        }
+        let zombies = children
+            .into_iter()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(')').map(|(_, fields)| {
+                            let mut fields = fields.split_whitespace();
+                            fields.next() == Some("Z")
+                                && fields.next().and_then(|parent| parent.parse::<i32>().ok())
+                                    == Some(self.holder.pid)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        Ok(zombies)
+    }
+
     fn supported_version(&self) -> bool {
         match self.kind {
             Kind::Terminal => matches!(self.version, 3 | 4),
-            Kind::Native => self.version == 3,
+            Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
 
@@ -257,6 +339,49 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     Ok(Some(record))
 }
 
+/// Read-only runtime evidence for diagnostics. Unlike recovery discovery this
+/// never creates directories, removes stale files, or contacts a helper.
+pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    crate::secure_file::reject_symlink_components(&directory)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe holder directory",
+        ));
+    }
+    let boot = crate::daemon::read_boot_id()?;
+    let mut records = Vec::new();
+    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+        if index >= 8192 {
+            return Err(io::Error::other("holder discovery limit exceeded"));
+        }
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let record = read(&path)?;
+        if record.kind == kind
+            && record.supported_version()
+            && record.application == crate::instance::APPLICATION_ID
+            && record.boot == boot
+            && record.path(&directory) == path
+            && record.holder.is_current()
+        {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     crate::secure_file::prepare_private_directory(directory).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
@@ -308,6 +433,7 @@ mod tests {
         let process = Process::read(std::process::id() as i32).unwrap();
         Record {
             version: 3,
+            build: Some(BuildIdentity::current(Kind::Terminal)),
             kind: Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot: crate::daemon::read_boot_id().unwrap(),
@@ -531,5 +657,51 @@ mod tests {
         assert!(evidence(&socket(directory.path(), native.terminal), Kind::Terminal).is_err());
         assert!(native.path(directory.path()).exists());
         assert!(terminal.path(directory.path()).exists());
+    }
+    #[test]
+    fn legacy_native_record_remains_adoptable_and_is_outdated() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["version"] = serde_json::json!(2);
+        value["kind"] = serde_json::json!("Native");
+        value.as_object_mut().unwrap().remove("build");
+        let legacy: Record = serde_json::from_value(value).unwrap();
+        assert!(legacy.supported_version());
+        assert!(legacy.is_outdated());
+        let mut current = legacy;
+        current.version = 4;
+        current.build = Some(BuildIdentity::current(Kind::Native));
+        assert!(!current.is_outdated());
+        current.build.as_mut().unwrap().capabilities.clear();
+        assert!(current.is_outdated());
+    }
+
+    #[test]
+    fn zombie_count_observes_children_without_consuming_status() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id(),
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if unsafe { status.si_pid() } != 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(record().zombie_children().unwrap() >= 1);
+        assert!(
+            child.wait().unwrap().success(),
+            "diagnostics consumed the exit status"
+        );
     }
 }

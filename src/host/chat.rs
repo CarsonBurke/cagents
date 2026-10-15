@@ -1963,6 +1963,37 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatRestartHelper { source, generation } => {
+            let handle = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(source.proof.as_ref(), state.proof())?;
+                let record = attached(&state, client, source.id)?;
+                let mut observed = record.session.clone();
+                observed.launch.session_id = record.handle.confirmed_session_id();
+                observed.native_continuity = record.handle.native_continuity();
+                if observed != source || !source.has_valid_native_continuity()
+                    || source.launch.session_id.is_none()
+                    || !matches!(source.native_continuity, chat::NativeContinuity::Durable { .. })
+                    || record.returning_terminal || state.chat_handoffs.contains_key(&source.id)
+                    || state.chat_spawning.contains_key(&source.id) {
+                    return Err(error("The helper's exact conversation changed; reconnect before restarting it"));
+                }
+                if !record.handle.native_helper_outdated() {
+                    return Err(error("This conversation already uses the current helper"));
+                }
+                let handle = record.handle.clone();
+                state.chat_spawning.insert(source.id, source.clone());
+                handle
+            };
+            let _reservation = AccountSwitchReservation { host: host.clone(), source: source.clone() };
+            // The actor checks this fence after every admitted command. A busy
+            // provider is retained even when the client supplied an old idle
+            // snapshot or another client started a turn in the meantime.
+            handle.close_if_idle_for_resume(generation).map_err(|message|
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true))?;
+            process_inner(host, client, ClientRequest::ChatClose { chat_id: source.id })?;
+            process_inner(host, client, ClientRequest::ChatPrepareResume { source })
+        }
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()

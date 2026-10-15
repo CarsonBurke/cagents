@@ -1267,6 +1267,17 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
+    /// Commit a provider-confirmed helper replacement without allowing a
+    /// conversation, account or execution-settings change.
+    pub fn rebind_chat_helper(&self, card_id: CardId, source: &crate::chat::Session,
+        replacement: &crate::chat::Session) -> Result<()> {
+        if !crate::chat::is_helper_recovery(source, replacement)
+            || !replacement.proof.as_ref().is_some_and(HostSessionProof::is_complete) {
+            return Err(StoreError::InvalidState("Helper restart changed the saved conversation".into()));
+        }
+        self.rebind_chat_descriptor(card_id, source, replacement)
+    }
+
     /// Commit a provider-confirmed descriptor transition from authenticated daemon
     /// upgrade lineage. Ordinary snapshots cannot authorize this transition.
     pub fn rebind_chat_upgrade(
@@ -6854,6 +6865,40 @@ mod tests {
             reopened.load_card(card, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
         );
+    }
+
+    #[test]
+    fn helper_restart_rebinds_only_the_exact_saved_thread_and_launch() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("helper.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Codex);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(lane.save(&store, &workspace).is_err());
+        for changed in 0..5 {
+            let mut refused = replacement.clone();
+            match changed {
+                0 => refused.launch.session_id = Some("another-thread".into()),
+                1 => refused.proof = None,
+                2 => refused.launch.recipe.arguments.push("--different-option".into()),
+                3 => { refused.launch.recipe.environment.insert("CODEX_HOME".into(), "/another-account".into()); },
+                _ => refused.launch.recipe.working_directory = "/another-repository".into(),
+            }
+            assert!(store.rebind_chat_helper(card, &source, &refused).is_err());
+        }
+        let mut stale = source.clone();
+        stale.proof.as_mut().unwrap().host_incarnation = "stale".into();
+        assert!(store.rebind_chat_helper(card, &stale, &replacement).is_err());
+        store.rebind_chat_helper(card, &source, &replacement).unwrap();
+        store.rebind_chat_helper(card, &source, &replacement).unwrap();
+        assert_eq!(store.load_card(card, None).unwrap().unwrap().kind, CardKind::Chat(replacement));
     }
 
     #[test]

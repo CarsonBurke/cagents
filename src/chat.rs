@@ -527,6 +527,22 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     original == candidate
 }
 
+/// An explicit helper rollover changes runtime ownership and its private
+/// listener, while retaining the exact external thread and execution settings.
+/// Callers must also obtain the daemon's confirmed idle-close receipt.
+pub fn is_helper_recovery(source: &Session, replacement: &Session) -> bool {
+    if source.id == replacement.id || source.launch.provider != replacement.launch.provider
+        || !source.launch.session_id.as_ref().is_some_and(|id| !id.is_empty())
+        || source.launch.session_id != replacement.launch.session_id || replacement.terminal.is_some() {
+        return false;
+    }
+    let mut original = source.clone();
+    let mut candidate = replacement.clone();
+    original.reset_owned_codex_listener();
+    candidate.reset_owned_codex_listener();
+    original.launch == candidate.launch
+}
+
 /// The narrow descriptor change an authenticated daemon upgrade may commit.
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
@@ -857,8 +873,18 @@ impl PromptSuggestion {
     }
 }
 
+/// Build information for the process that owns this native provider. Older
+/// helpers remain usable until the reader requests an idle rollover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeHelper {
+    pub version: String,
+    pub outdated: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub native_helper: Option<NativeHelper>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.

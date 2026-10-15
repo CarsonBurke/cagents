@@ -283,7 +283,16 @@ impl Handle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let native_helper = native_holder.as_ref().map(|holder| {
+            let record = holder.record();
+            super::NativeHelper {
+                version: record.build.as_ref().map(|build| build.version.clone())
+                    .unwrap_or_else(|| format!("legacy protocol {}", record.version)),
+                outdated: record.is_outdated(),
+            }
+        });
         let state = Arc::new(Mutex::new(Snapshot {
+            native_helper,
             session_id,
             ..Snapshot::default()
         }));
@@ -618,6 +627,11 @@ impl Handle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+    }
+
+    pub(crate) fn native_helper_outdated(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).native_helper.as_ref()
+            .is_some_and(|helper| helper.outdated)
     }
 
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
@@ -1965,14 +1979,16 @@ impl Actor {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let idle = state.generation == generation
                         && self.update_readiness(&state) == UpdateReadiness::Idle;
-                    if idle {
-                        self.stop.store(true, Ordering::Release);
-                    }
-                    let _ = reply.send(if idle {
-                        Ok(())
+                    // A scalar idle observation cannot fence autonomous
+                    // backend/subagent work beginning after the final read.
+                    // Preserve this live owner until a provider implements an
+                    // actual conditional-close barrier or the user explicitly
+                    // stops the complete session.
+                    let _ = reply.send(Err(if idle {
+                        "This live provider cannot prove safe automatic replacement. Its session remains open; end it explicitly when you are finished.".into()
                     } else {
-                        Err("Provider state changed before conditional idle close".into())
-                    });
+                        "Provider state changed before conditional idle close".into()
+                    }));
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
