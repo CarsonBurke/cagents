@@ -2299,7 +2299,7 @@ fn is_save_press(event: &keyboard::Event) -> bool {
 }
 
 #[cfg(feature = "integrated-browser")]
-fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
+pub(crate) fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     use keyboard::{Key, key::Named};
     let keyboard::Event::KeyPressed {
         key,
