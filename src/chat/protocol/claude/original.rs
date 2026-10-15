@@ -36,6 +36,14 @@ pub(super) struct Originals {
     latest_started: Option<String>,
 }
 impl Claude {
+    pub(super) fn original_settings_changed(&mut self) {
+        self.originals.revision = self.originals.revision.wrapping_add(1);
+        // A setter ACK may only acknowledge the requested overlay. Until
+        // the provider reports its effective connection policy again, never
+        // combine an older init policy with a fresh model read.
+        self.originals.policy = None;
+        self.originals.init = None;
+    }
     pub(super) fn original_frame_budget(&self, frame: &Value) -> Result<(), String> {
         if let Some(waiting) = &self.originals.waiting
             && encoded_len(frame)? > MAX_PAYLOAD.saturating_sub(waiting.bytes)

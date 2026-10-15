@@ -1815,12 +1815,7 @@ impl Adapter for Claude {
                 | Command::SetPermissionMode { .. }
                 | Command::UpdatePermissionSettings { .. }
         ) {
-            self.originals.revision = self.originals.revision.wrapping_add(1);
-            // A setter ACK may only acknowledge the requested overlay. Until
-            // the provider reports the effective connection policy again,
-            // never combine an older init policy with a fresh model read.
-            self.originals.policy = None;
-            self.originals.init = None;
+            self.original_settings_changed();
         }
         if self.history_only {
             match command {
