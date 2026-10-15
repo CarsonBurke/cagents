@@ -533,10 +533,13 @@ fn ensure_account_homes_unused_inner(
             for pane in panes {
                 check_deadline()?;
                 match pane.kind {
-                    crate::model::CardKind::Chat(session) => paths.extend(selected_recipe(
-                        session.launch.provider,
-                        &session.launch.recipe,
-                    )),
+                    crate::model::CardKind::Chat(session) => {
+                        if conservative_pending || session.is_unstarted() {
+                            paths.extend(selected_recipe(session.launch.provider, &session.launch.recipe));
+                        }
+                        // Started panes are qualified by the deletion permit
+                        // against exact captured current/durable ownership.
+                    }
                     crate::model::CardKind::Terminal(session) => {
                         for provider in crate::account::Account::PROVIDERS {
                             paths.extend(selected_recipe(provider, &session.launch));

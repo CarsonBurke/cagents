@@ -144,7 +144,12 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
             .filter_map(|record| record.handle.holder_identity().cloned())
             .collect::<Vec<_>>();
         let scopes = state.chats.values().map(|record| {
-            (record.session.clone(), record.handle.launch_account_scope().cloned().map_err(str::to_owned))
+            let projected = record.handle.confirmed_session_id().map(|thread| {
+                let mut session = record.session.clone();
+                session.launch.session_id = Some(thread);
+                session
+            });
+            (record.session.clone(), projected, record.handle.launch_account_scope().cloned().map_err(str::to_owned))
         }).collect::<Vec<_>>();
         let pending = state.native_closing.values().map(|close| close.source().clone())
             .chain(state.chat_spawning.values().cloned())
@@ -160,15 +165,36 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
         pending.extend(upgrade.unattached_sources()?.into_iter().map(|chat| chat.source));
         check_time(deadline)?;
     }
+    let mut saved = Vec::new();
+    let mut after_view = None;
+    loop {
+        check_time(deadline)?;
+        let page = lock_registry(&registry, deadline)?.account_view_page(after_view.as_deref())?;
+        let Some((key, panes)) = page else { break; };
+        after_view = Some(key);
+        for pane in panes {
+            if let crate::model::CardKind::Chat(source) = pane.kind
+                && !source.is_unstarted()
+            {
+                if saved.len() >= 8192 { return Err("Saved account ownership census exceeds its pane bound".into()); }
+                saved.push(source);
+            }
+        }
+    }
     // Include completed/unsubscribed records too: generic completion or Stop
     // is not final retirement. Explicit management close removes the record.
-    for (source, scope) in current_scopes {
+    for (source, projected, scope) in current_scopes {
         match scope {
             Ok(scope) => {
                 if overlaps(home, account, &scope, namespaces)? {
                     return Err("A hosted conversation still owns this physical account; explicitly close it before deleting files".into());
                 }
                 discharge_pending(&mut pending, &mut failures, &source)?;
+                saved.retain(|candidate| candidate != &source);
+                if let Some(projected) = projected {
+                    discharge_pending(&mut pending, &mut failures, &projected)?;
+                    saved.retain(|candidate| candidate != &projected);
+                }
             }
             // A retained exact owner may supply its authenticated captured
             // scope below. A public recipe cannot discharge this uncertainty.
@@ -240,6 +266,11 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
                 // live access. It supplies no physical/session purge authority.
                 for directory in &mut evidence { directory.allow(owner.owner(), true); }
                 discharge_pending(&mut pending, &mut failures, owner.source())?;
+                if let Ok(scope) = owner.scope()
+                    && !overlaps(home, account, scope, namespaces)?
+                {
+                    saved.retain(|candidate| candidate != owner.source());
+                }
             } else {
                 let scope = owner.scope().map_err(|_| {
                     "An unretired actor has unknown account ownership; explicitly close it before deleting account files"
@@ -254,11 +285,15 @@ fn complete_census(host: &SharedHost, account: &Account, home: &Home, namespaces
                 // live discovery record. Unknown/unregistered files still fail.
                 for directory in &mut evidence { directory.allow(owner.owner(), false); }
                 discharge_pending(&mut pending, &mut failures, owner.source())?;
+                saved.retain(|candidate| candidate != owner.source());
             }
         }
     }
     if !pending.is_empty() || !failures.is_empty() {
         return Err("A pending or retained conversation has no exact foreign ownership or final retirement; resolve it before deleting files".into());
+    }
+    if !saved.is_empty() {
+        return Err("An open saved conversation has affected or unresolved physical account ownership; close its pane before deleting files".into());
     }
     for directory in &evidence { directory.finish(deadline)?; }
     crate::host::client::ensure_account_homes_unused_until(host, vec![account.clone()], deadline)
@@ -673,13 +708,35 @@ mod tests {
         assert!(super::super::ensure_captured_scope(&host,Some(&foreign_scope)).is_err(),"failed census retains its namespace guard until reservation drop");
         drop(missing_permit);drop(missing_reservation);
         super::super::ensure_captured_scope(&host,Some(&foreign_scope)).unwrap();
+        let channel=crate::model::ChannelId::new();
+        let view_scope=crate::workspace_model::views::Scope::Channel(channel);
+        let pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:"foreign captured account".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,scope:None,kind:crate::model::CardKind::Chat(foreign_source.clone())};
+        {
+            let mut registry=registry.lock().unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::OpenProject {repository:root.clone(),name:"fixture".into(),kind:crate::model::ProjectKind::Folder}).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::CreateChannel {id:channel,repository:root.clone(),title:"fixture".into(),title_source:Default::default()}).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::SeedView {scope:view_scope.clone(),panes:vec![pane.clone()],closed:vec![]}).unwrap();
+        }
         host.lock().unwrap().chat_spawning.insert(foreign_source.id,foreign_source.clone());
-        permit.authorize_scope(&scope).unwrap();
+        permit.authorize_scope(&scope).unwrap(); // Includes the actual saved view naming issued A, with authenticated startup B.
         host.lock().unwrap().chat_spawning.remove(&foreign_source.id);
         let mut unknown_source=foreign_source.clone();unknown_source.id=crate::model::TerminalId::new();
         host.lock().unwrap().chat_spawning.insert(unknown_source.id,unknown_source.clone());
         assert!(permit.verify().is_err(),"a recipe claiming a foreign home is not authenticated pending ownership");
         host.lock().unwrap().chat_spawning.remove(&unknown_source.id);
+        let mut unknown_pane=pane.clone();unknown_pane.kind=crate::model::CardKind::Chat(unknown_source);
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope.clone(),expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:pane.clone(),pane:unknown_pane.clone()}}).unwrap();
+        }
+        assert!(permit.verify().is_err(),"an unmatched saved descriptor cannot inherit another actor's foreign scope");
+        {
+            let mut registry=registry.lock().unwrap();
+            let revision=registry.view_revision(&view_scope).unwrap();
+            registry.apply(&crate::workspace_model::ModelEdit::ChangeView {scope:view_scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:crate::workspace_model::views::Change::Update {before:unknown_pane,pane}}).unwrap();
+        }
+        permit.authorize_scope(&scope).unwrap();
         // A stale registration/path and a released lease independently revoke
         // the borrowed permit; no deletion has occurred in this fixture.
         let retained=root.join("retained-home");std::fs::rename(&path,&retained).unwrap();
