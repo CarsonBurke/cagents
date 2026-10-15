@@ -2397,9 +2397,10 @@ impl Runtime {
                 let proven_from_cache=current.and_then(|cached|cached.item.as_ref()).is_some_and(|previous|
                     previous.role==item.role && ChangeToken::of(&previous.content).shape==ChangeToken::of(&item.content).shape
                     && handle.as_ref().is_some_and(|handle|handle.known_append(previous,item)));
-                let small_append = proven_from_cache && current.is_some_and(|cached| !cached.preparing)
-                    && CachedItem::prose(&item.content).is_some_and(|body|body.len()<=64*1024);
-                if pending || (!exact && !small_append) {
+                // Bytes alone do not bound rich-block parsing or thousands
+                // of tiny fences. Every changed prose publication goes to the
+                // worker; the last proven prefix remains visible meanwhile.
+                if pending || !exact {
                     let replaced=self.preparation.stage(item,growing,self.syntax_theme,|old,new|handle.as_ref().is_some_and(|handle|handle.known_append(old,new)));
                     if replaced && !exact && !proven_from_cache {
                         self.cache.insert(item.id.clone(),CachedItem::preparing(item,self.syntax_theme));
