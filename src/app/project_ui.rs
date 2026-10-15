@@ -86,6 +86,11 @@ impl State {
         self.reopening.values().any(|path| path == repository)
     }
 
+    /// Exact opening identity for confirmation and the shared modal owner.
+    pub(super) fn removal_request(&self) -> Option<crate::model::OperationId> {
+        self.remove_dialog.as_ref().map(|removal| removal.request)
+    }
+
     pub fn modal_open(&self) -> bool {
         self.dialog.is_some()
             || self.remove_dialog.is_some()
@@ -179,6 +184,7 @@ impl State {
 
 #[derive(Debug, Clone)]
 struct ProjectRemoval {
+    request: crate::model::OperationId,
     project: ProjectId,
     repository: PathBuf,
     kind: ProjectKind,
@@ -331,7 +337,7 @@ pub enum Action {
         request: u64,
         result: Result<(), String>,
     },
-    ConfirmRemove,
+    ConfirmRemove(crate::model::OperationId),
     RemovedProject {
         repository: PathBuf,
         result: Result<crate::workspace_model::WorkspaceModel, String>,
@@ -385,7 +391,7 @@ impl Action {
                 | Self::OpenCleanupPolicy(_)
                 | Self::CleanupPolicyChanged(..)
                 | Self::SaveCleanupPolicy(_)
-                | Self::ConfirmRemove
+                | Self::ConfirmRemove(_)
                 | Self::RetryDelete(_)
                 | Self::Dismiss
         )
@@ -1304,8 +1310,9 @@ impl Cagents {
             Action::ConfirmDelete(_)
             | Action::DeleteBranchChanged(..)
             | Action::BusyAgentsConfirmed(..) => !self.worktree_delete_dialog_on_top(),
-            Action::ConfirmRemove => {
-                !self.project_ui.force_branches.is_empty()
+            Action::ConfirmRemove(request) => {
+                self.project_ui.removal_request() != Some(*request)
+                    || !self.project_ui.force_branches.is_empty()
                     || self.project_ui.cleanup_dialog.is_some()
                     || self.project_ui.dialog.is_some()
             }
@@ -1656,6 +1663,7 @@ impl Cagents {
                         self.project_ui.dialog = None;
                         self.project_ui.cleanup_dialog = None;
                         self.project_ui.remove_dialog = Some(ProjectRemoval {
+                            request: crate::model::OperationId::new(),
                             project: project_id,
                             repository: project.repository.clone(),
                             kind: project.kind,
@@ -1743,7 +1751,7 @@ impl Cagents {
                 }
                 return self.project_dialog_closed();
             }
-            Action::ConfirmRemove => {
+            Action::ConfirmRemove(_) => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
                     return Task::none();
                 };
@@ -2940,7 +2948,7 @@ impl Cagents {
                             .on_press(Message::ProjectUi(Action::Dismiss)),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
-                            .on_press(Message::ProjectUi(Action::ConfirmRemove)),
+                            .on_press(Message::ProjectUi(Action::ConfirmRemove(removal.request))),
                     ),
                 ])
                 .spacing(space::M),
@@ -4658,6 +4666,28 @@ mod tests {
             Vec::new(),
         ));
         (app, directory, project)
+    }
+
+    #[test]
+    fn replaced_project_removal_refuses_the_old_confirmation_before_closing_sessions() {
+        let repository = PathBuf::from("/request-repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let open = || Action::Command { project_id: project, worktree_id: None, command: ProjectCommand::Remove };
+        drop(app.handle_project_action(open()));
+        let old = app.project_ui.removal_request().unwrap();
+        drop(app.handle_project_action(open()));
+        let current = app.project_ui.removal_request().unwrap();
+        assert_ne!(old, current);
+        drop(app.handle_project_action(Action::ConfirmRemove(old)));
+        assert_eq!(app.project_ui.removal_request(), Some(current));
+        assert!(app.project_ui.removing.is_empty());
+        assert!(app.project_ui.close_started.is_empty());
+        let close = app.handle_project_action(Action::ConfirmRemove(current));
+        assert!(app.project_ui.removal_request().is_none());
+        assert!(app.project_ui.removing.contains_key(&repository));
+        drop(close); // The production close worker is deliberately unpolled.
     }
 
     #[test]

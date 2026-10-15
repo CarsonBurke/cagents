@@ -2585,7 +2585,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                         | project_ui::Action::OpenCleanupPolicy(_)
                         | project_ui::Action::CleanupPolicyChanged(..)
                         | project_ui::Action::SaveCleanupPolicy(_)
-                        | project_ui::Action::ConfirmRemove
+                        | project_ui::Action::ConfirmRemove(_)
                         | project_ui::Action::RetryDelete(_)
                         | project_ui::Action::Dismiss
                 )
