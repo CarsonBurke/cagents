@@ -1357,20 +1357,40 @@ fn create_console_from_recipe(
     restart: Option<(&Agent, &chat::Session)>,
     recipe: crate::model::LaunchRecipe,
 ) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
-    {
+    // Initial console creation shares the lifecycle fence used by public
+    // terminal close. Restart publication already owns that same claim.
+    let transition = restart.is_none().then(|| super::chat::presentation_close::transition_gate(host, session.id));
+    let _transition = match transition.as_ref().map(|gate| gate.try_lock()) {
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(std::sync::TryLockError::Poisoned(poison))) => Some(poison.into_inner()),
+        Some(Err(std::sync::TryLockError::WouldBlock)) => return Err(
+            "The provider has a lifecycle transition in progress; no console was started".into()),
+        None => None,
+    };
+    let admitted_identity = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get_mut(&session.id)
-            .filter(|record| record.handle.same_actor(handle))
-            .ok_or("The provider changed before opening its console")?;
+            .filter(|record| record.handle.same_actor(handle)
+                && record.session.id == session.id
+                && record.session.proof == session.proof
+                && record.session.launch.provider == session.launch.provider
+                && record.session.launch.recipe == session.launch.recipe
+                && record.session.terminal == session.terminal)
+            .ok_or("The exact provider source changed before opening its console")?;
+        let identity = handle.try_close_identity()?;
+        if session.launch.session_id.as_ref().is_some_and(|thread| identity.confirmed_session_id.as_ref() != Some(thread)) {
+            return Err("The confirmed provider conversation changed before opening its console".into());
+        }
         record.console_recipe = Some(recipe.clone());
-    }
+        identity
+    };
     let mut retained_before = session.clone();
-    retained_before.launch.session_id = handle.confirmed_session_id();
+    retained_before.launch.session_id = admitted_identity.confirmed_session_id;
     // Published source argv is immutable; the thin console has its own exact
     // launch. Retained helper aliases must never be rewritten into resume argv.
-    retained_before.native_continuity = handle.native_continuity();
+    retained_before.native_continuity = admitted_identity.native_continuity;
     let terminal = crate::model::TerminalSession {
         id: session.id,
         launch: recipe.clone(),
@@ -1450,9 +1470,10 @@ fn create_console_from_recipe(
                     .get(&session.id)
                     .filter(|record| record.handle.same_actor(handle))
                     .ok_or("The restarted provider changed before its pair was saved")?;
+                let identity = handle.try_close_identity()?;
                 let mut current = record.session.clone();
-                current.launch.session_id = handle.confirmed_session_id();
-                current.native_continuity = handle.native_continuity();
+                current.launch.session_id = identity.confirmed_session_id;
+                current.native_continuity = identity.native_continuity;
                 current
             };
             Some(chat::RestartReceipt::confirm(source.clone(), current)?)

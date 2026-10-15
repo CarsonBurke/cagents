@@ -1377,6 +1377,8 @@ pub(super) fn process_admitted(
                     false,
                 ));
             }
+            let transition = super::chat::presentation_close::transition_gate(host, session.id);
+            let _transition = claim_terminal_transition(&transition)?;
             let (handle, paired) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 let handle = match state.terminals.get(&session.id) {
@@ -1407,11 +1409,14 @@ pub(super) fn process_admitted(
                         return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
                             "The completed terminal no longer identifies its native conversation", false));
                     }
-                    Ok(record.handle.clone())
+                    Ok((record.handle.clone(), record.session.clone()))
                 }).transpose()?;
                 (handle, paired)
             };
-            if paired.as_ref().is_some_and(|handle| handle.owns_work()) && !allow_active {
+            if let Some((_, source)) = &paired {
+                super::agent_execution::preflight_retirement(host, source).map_err(|message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true))?;
+            }
+            if paired.as_ref().is_some_and(|(handle, _)| handle.owns_work()) && !allow_active {
                 return Ok((
                     ServerResponse::TerminalCloseChecked {
                         terminal_id: session.id,
@@ -1421,8 +1426,8 @@ pub(super) fn process_admitted(
                     false,
                 ));
             }
-            if let Some(paired) = paired {
-                super::chat::close_terminal_actor(host, session.id, &paired)?;
+            if let Some((paired, _)) = paired {
+                super::chat::close_terminal_actor_under_transition(host, session.id, &paired, None)?;
             }
             if let Some(handle) = &handle {
                 handle.shutdown().map_err(send_error)?;
@@ -1450,17 +1455,21 @@ pub(super) fn process_admitted(
             terminal_id,
             allow_active,
         } => {
+            let transition = super::chat::presentation_close::transition_gate(host, terminal_id);
+            let _transition = claim_terminal_transition(&transition)?;
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
-            super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
+            let paired = super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .close_terminal_attention(terminal_id, Some(&handle));
-                super::chat::close_for_terminal(host, terminal_id)?;
+                if let Some(paired) = paired {
+                    super::chat::close_terminal_actor_under_transition(host, terminal_id, &paired, None)?;
+                }
             }
             Ok((
                 ServerResponse::TerminalCloseChecked {
@@ -1523,6 +1532,18 @@ pub(super) fn process_admitted(
     }
 }
 
+fn claim_terminal_transition(transition: &std::sync::Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, ProtocolError> {
+    match transition.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poison)) => Ok(poison.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The paired conversation has a lifecycle transition in progress; no terminal was closed",
+            true,
+        )),
+    }
+}
+
 /// process_request holds shared control admission. Retain both exact owners
 /// under HostState, perform teardown outside it, then retire only the
 /// retained worker. A concurrent successor with the same durable ID remains
@@ -1544,6 +1565,8 @@ fn close_terminal_source_checked(
             false,
         )
     };
+    let transition = super::chat::presentation_close::transition_gate(host, source.id);
+    let _transition = claim_terminal_transition(&transition)?;
     let (handle, paired) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let current = state.descriptor(client_id, source.id)?;
@@ -1578,19 +1601,22 @@ fn close_terminal_source_checked(
                 {
                     return Err(changed());
                 }
-                Ok(record.handle.clone())
+                Ok((record.handle.clone(), record.session.clone()))
             })
             .transpose()?;
         (handle, paired)
     };
-    let outcome = if !allow_active && paired.as_ref().is_some_and(|actor| actor.owns_work()) {
+    if let Some((_, source)) = &paired {
+        super::agent_execution::preflight_retirement(host, source).map_err(|message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true))?;
+    }
+    let outcome = if !allow_active && paired.as_ref().is_some_and(|(actor, _)| actor.owns_work()) {
         crate::terminal_ipc::TerminalCloseResult::Active
     } else {
         handle.close_checked(allow_active)
     };
     if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
-        if let Some(paired) = paired {
-            super::chat::close_terminal_actor_until(host, source.id, &paired, deadline)?;
+        if let Some((paired, _)) = paired {
+            super::chat::close_terminal_actor_under_transition(host, source.id, &paired, Some(deadline))?;
         }
         let retired = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

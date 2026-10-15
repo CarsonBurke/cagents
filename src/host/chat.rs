@@ -4574,12 +4574,13 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
 }
 
 /// Check a paired managed presentation before the terminal worker itself can
-/// stop. This is read-only; the actor path repeats its checks after teardown.
+/// stop. The caller holds the common chat transition across this capture,
+/// worker cleanup and exact actor cleanup; the result must not be recaptured.
 pub(super) fn preflight_for_terminal_close(
     host: &SharedHost,
     terminal_id: TerminalId,
     expected: &crate::terminal::TerminalHandle,
-) -> Result<(), ProtocolError> {
+) -> Result<Option<Handle>, ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -4608,14 +4609,14 @@ pub(super) fn preflight_for_terminal_close(
                         "The terminal worker no longer belongs to this provider pairing",
                     ));
                 }
-                Ok(record.session.clone())
+                Ok((record.session.clone(), record.handle.clone()))
             })
             .transpose()?
     };
-    if let Some(source) = source {
+    if let Some((source, actor)) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-    }
-    Ok(())
+        Ok(Some(actor))
+    } else { Ok(None) }
 }
 
 /// A terminal card restored after a GUI restart has no parked UI runtime, but
@@ -4624,6 +4625,13 @@ pub(super) fn close_for_terminal(
     host: &SharedHost,
     terminal_id: TerminalId,
 ) -> Result<(), ProtocolError> {
+    let transition = restart::transition_gate(host, terminal_id);
+    let _transition = match transition.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Err(unavailable(
+            "The paired conversation has a lifecycle transition in progress; no terminal was closed")),
+    };
     let handle = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -4655,7 +4663,7 @@ pub(super) fn close_for_terminal(
             .transpose()?
     };
     if let Some(handle) = handle {
-        close_terminal_actor(host, terminal_id, &handle)?;
+        close_terminal_actor_under_transition(host, terminal_id, &handle, None)?;
     }
     Ok(())
 }
@@ -4686,6 +4694,14 @@ fn close_terminal_actor_inner(
         Err(std::sync::TryLockError::WouldBlock) => return Err(unavailable(
             "The paired conversation is restarting; its owner was retained. Retry close after that transition finishes")),
     };
+    close_terminal_actor_under_transition(host, terminal_id, handle, deadline)
+}
+
+/// The caller already owns this chat's transition from before pair capture.
+/// Retaining that guard is necessary: a logical Handle may restart its backend.
+pub(super) fn close_terminal_actor_under_transition(
+    host: &SharedHost, terminal_id: TerminalId, handle: &Handle, deadline: Option<Instant>,
+) -> Result<(), ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.chats.get(&terminal_id).filter(|record| record.handle.same_actor(handle))
