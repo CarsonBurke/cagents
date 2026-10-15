@@ -24,6 +24,8 @@ pub(super) enum Modal {
     #[cfg(feature = "integrated-browser")]
     BrowserImport,
     Paste,
+    Clipboard,
+    EditorFeatures(editor_features::DialogKind),
     Image,
     Device,
     AutomationDraft,
@@ -289,6 +291,8 @@ impl Cagents {
                 .worktree_dialog
                 .as_ref()
                 .map(|dialog| Instance::Operation(dialog.request())),
+            Modal::Clipboard => self.terminal_clipboard_modal_request().map(Instance::Operation),
+            Modal::EditorFeatures(kind) => self.editor_features.modal_dialog().filter(|(current, _)| *current == kind).map(|(_, ticket)| Instance::Counter(ticket)),
             Modal::ChatClose => self
                 .chat_ui
                 .close_dialog
@@ -313,6 +317,7 @@ impl Cagents {
     pub(super) fn admit_modal_surface_message(&self, message: Message) -> Option<Message> {
         match message {
             Message::ModalSurface { target, message } => (!self.update_prepared
+                && (target.modal != Modal::Clipboard || self.terminal_clipboard_backing_current())
                 && self.top_modal() == Some(target.modal)
                 && self.modal_instance(target.modal) == target.instance
                 && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
@@ -349,6 +354,7 @@ impl Cagents {
         active!(Resume, self.resume_ui.open);
         active!(Clone, self.chrome_ui.clone_repository.is_some());
         active!(Worktree, self.worktree_dialog.is_some());
+        if let Some((kind, _)) = self.editor_features.modal_dialog() { result.push(Modal::EditorFeatures(kind)); }
         active!(Channel, self.channel_ui.modal_open());
         result.extend(self.project_ui.modal_roles().map(Modal::Project));
         active!(Selection, self.sidebar_selection_ui.dialog.is_some());
@@ -371,6 +377,7 @@ impl Cagents {
         #[cfg(feature = "integrated-browser")]
         active!(BrowserImport, self.browser_import.open());
         active!(Paste, self.terminal_paste.is_some());
+        active!(Clipboard, self.terminal_clipboard_backing_current());
         active!(Image, self.chat_ui.image_viewer.is_some());
         active!(Device, self.device_ui.open);
         active!(AutomationDraft, self.automation_ui.draft_dialog_open());
@@ -392,6 +399,9 @@ impl Cagents {
     }
     pub(super) fn reconcile_modal_backing_state(&mut self) {
         self.reconcile_chat_close_backing_state();
+        if self.terminal_clipboard.is_some() && !self.terminal_clipboard_backing_current() {
+            self.terminal_clipboard = None;
+        }
         if self.dirty_repository_close.as_ref().is_some_and(|close| {
             !matches!(
                 self.cards.get(&close.card),
@@ -481,6 +491,9 @@ impl Cagents {
             #[cfg(feature = "integrated-browser")]
             Modal::BrowserImport => widget::Id::new("browser-import.cancel"),
             Modal::Paste => widget::Id::new("terminal-paste-cancel"),
+            Modal::Clipboard => widget::Id::new("terminal-clipboard-deny"),
+            Modal::EditorFeatures(editor_features::DialogKind::Preview) => widget::Id::new("editor-preview.cancel"),
+            Modal::EditorFeatures(editor_features::DialogKind::Publication) => widget::Id::new("editor-publication.hide"),
             Modal::Image => widget::Id::new("image-viewer.close"),
             Modal::Device => widget::Id::new("device.close"),
             Modal::AutomationDraft => crate::automation_ui::draft_dialog_focus_id(),
@@ -503,6 +516,14 @@ impl Cagents {
                 Modal::SettingsReset => self.close_settings_reset(),
                 Modal::TerminalClose => self.cancel_terminal_close(),
                 Modal::ChatClose => self.cancel_chat_close(),
+                Modal::Clipboard => self.cancel_terminal_clipboard(),
+                Modal::EditorFeatures(kind) => self.update_editor_features(match kind {
+                    editor_features::DialogKind::Preview => editor_features::Action::CancelPreview,
+                    editor_features::DialogKind::Publication => {
+                        let Some((_, ticket)) = self.editor_features.modal_dialog() else { return Task::none(); };
+                        editor_features::Action::HidePublication(ticket)
+                    }
+                }),
                 Modal::Update => self.update_update_ui(update_ui::Action::CancelApply),
                 #[cfg(feature = "integrated-browser")]
                 Modal::BrowserImport => self.cancel_browser_import(),

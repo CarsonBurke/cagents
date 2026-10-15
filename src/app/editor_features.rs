@@ -22,6 +22,7 @@ pub enum Action {
     PreviewRepository { ticket: u64, action: RepositoryAction },
     ApplyPreview,
     CancelPreview,
+    HidePublication(u64),
     Published { ticket: u64, result: Result<workspace::PublicationReport, String> },
 }
 
@@ -88,6 +89,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn dialog_key(app: &Cagents, focus: &'static str, key: keyboard::key::Named, expected: fn(&Message) -> bool) -> Message {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}};
+        let renderer = super::super::tests::headless_renderer();
+        let mut dialog = app.dialog().expect("actual registered editor dialog");
+        let mut tree = Tree::new(&dialog);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(1200.0, 900.0));
+        let node = dialog.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+        dialog.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut operation::focusable::focus::<()>(widget::Id::new(focus)));
+        let mut messages = Vec::new();
+        dialog.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key), modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        }), Layout::new(&node), iced::mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        messages.into_iter().find(|message| matches!(message, Message::ModalSurface { message, .. } if expected(message)))
+            .expect("real editor control or dialog keyboard observer output")
+    }
+
+    #[tokio::test]
+    async fn hide_progress_button_and_escape_keep_the_real_publication_and_frozen_buffers() {
+        for escape in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let original = "fn old() {}\n";
+            for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+            let mut app = app();
+            let card = buffer(&mut app, root.path(), "a.rs", original);
+            let plan = plan(&app, root.path(), &["a.rs", "b.rs"]);
+            let operation = operation(&app, card);
+            let task = app.publish_editor_workspace_edit(90, operation, plan);
+            drop(app.finish_modal_update(Task::none()));
+            assert_eq!(app.top_modal(), Some(modal_ui::Modal::EditorFeatures(DialogKind::Publication)));
+            let hide = if escape {
+                dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Escape, |message| matches!(message, Message::RoutedKeyEvent { .. }))
+            } else {
+                dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter, |message| matches!(message, Message::EditorFeatures(Action::HidePublication(90))))
+            };
+            drop(app.update(hide));
+            assert!(app.editor_features.publishing());
+            assert!(!app.editor_features.modal_open());
+            assert!(app.dialog().is_none());
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+            assert_eq!(text(&app, card), original);
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), original);
+            assert!(app.editor_feature_action_blocked(&Action::Rename(card)));
+            assert!(app.window_close_transient_blocker().is_some());
+            assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("editor-publication:90")));
+            // Poll the original real publisher only now. Hide did not replace,
+            // cancel or fabricate its Published completion.
+            finish(&mut app, task).await;
+            assert!(!app.editor_features.publishing());
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+            assert_eq!(text(&app, card), "fn renamed() {}\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), "fn renamed() {}\n");
+            assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("editor-publication:90")));
+            assert!(app.notices.entries.iter().any(|entry| entry.notice.message == "Workspace edit applied"));
+        }
+    }
+
+    #[test]
+    fn hidden_publication_failure_unfreezes_buffers_without_closing_or_refocusing_an_upper_dialog() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        std::fs::write(root.path().join("a.rs"), original).unwrap();
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", original);
+        let plan = plan(&app, root.path(), &["a.rs"]);
+        let operation = operation(&app, card);
+        let _unpolled = app.publish_editor_workspace_edit(81, operation, plan);
+        drop(app.finish_modal_update(Task::none()));
+        let hide = dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter, |message| matches!(message, Message::EditorFeatures(Action::HidePublication(81))));
+        drop(app.update(hide));
+        app.settings_reset_confirm = true;
+        let opening = app.finish_modal_update(Task::none());
+        let cancel = widget::Id::new("dialog.reset-settings.cancel");
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), opening), Some(cancel.clone()));
+        let completion = app.update(Message::EditorFeatures(Action::Published { ticket: 81, result: Err("fixture publication conflict".into()) }));
+        assert!(!app.editor_features.publishing());
+        assert!(app.settings_reset_confirm);
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert_eq!(text(&app, card), original);
+        assert_eq!(std::fs::read_to_string(root.path().join("a.rs")).unwrap(), original);
+        assert!(app.notices.entries.iter().any(|entry| entry.notice.message.contains("fixture publication conflict")));
+        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("editor-publication:81")));
+        // Apply to an actual upper dialog tree which starts with known focus;
+        // the lower completion must not emit a workspace focus operation.
+        let preserve = Task::batch([iced::widget::operation::focus(cancel.clone()).map(cosmic::Action::App), completion]);
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), preserve), Some(cancel));
     }
 
     fn text(app: &Cagents, card: CardId) -> String {
@@ -535,8 +625,9 @@ mod tests {
     #[test]
     fn save_and_close_may_format_only_the_buffer_named_by_its_confirmation() {
         let mut app = app();
-        let card = CardId::new();
-        app.dirty_repository_close = Some(DirtyRepositoryClose { card, remaining: VecDeque::new(), intent: DirtyCloseIntent::Card(card), focused: DirtyCloseControl::Save, restore_card: Some(card) });
+        let root = tempfile::tempdir().unwrap();
+        let card = buffer(&mut app, root.path(), "dirty.rs", "fn old() {}\n");
+        app.dirty_repository_close = Some(DirtyRepositoryClose { request: crate::model::OperationId::new(), card, remaining: VecDeque::new(), intent: DirtyCloseIntent::Card(card), focused: DirtyCloseControl::Save, restore_card: Some(card) });
         assert!(app.modal_is_open());
         assert!(!app.editor_feature_action_blocked(&Action::Format { card, selection: false, save_after: true }));
         assert!(app.editor_feature_action_blocked(&Action::Format { card: CardId::new(), selection: false, save_after: true }));
@@ -549,7 +640,7 @@ mod tests {
         let mut app = app();
         let card = CardId::new();
         let operation = operation(&app, card);
-        app.editor_features.publication = Some(Publication { ticket: 8, operation, cards: Vec::new(), server_lease: None });
+        app.editor_features.publication = Some(Publication { hidden: false, ticket: 8, operation, cards: Vec::new(), server_lease: None });
         assert!(app.window_close_transient_blocker().is_some());
         let window = window::Id::unique();
         drop(app.update(Message::WindowCloseRequested(window)));
@@ -622,7 +713,11 @@ struct Preview {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DialogKind { Preview, Publication }
+
 struct Publication {
+    hidden: bool,
     ticket: u64,
     operation: Operation,
     cards: Vec<CardId>,
@@ -647,7 +742,13 @@ pub(super) struct State {
 }
 
 impl State {
-    pub fn modal_open(&self) -> bool { self.preview.is_some() || self.publication.is_some() }
+    pub(super) fn modal_dialog(&self) -> Option<(DialogKind, u64)> {
+        if let Some(publication) = self.publication.as_ref().filter(|publication| !publication.hidden) {
+            return Some((DialogKind::Publication, publication.ticket));
+        }
+        self.preview.as_ref().map(|preview| (DialogKind::Preview, preview.ticket))
+    }
+    pub fn modal_open(&self) -> bool { self.modal_dialog().is_some() }
     pub fn publishing(&self) -> bool { self.publication.is_some() }
     fn next(&mut self) -> u64 { self.next_ticket = self.next_ticket.wrapping_add(1).max(1); self.next_ticket }
 }
@@ -721,7 +822,12 @@ impl Cagents {
 
     pub(super) fn editor_feature_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if !is_escape_press(event) { return None; }
-        if self.editor_features.modal_open() { return Some(self.update_editor_features(Action::CancelPreview)); }
+        if let Some((kind, ticket)) = self.editor_features.modal_dialog() {
+            return Some(self.update_editor_features(match kind {
+                DialogKind::Preview => Action::CancelPreview,
+                DialogKind::Publication => Action::HidePublication(ticket),
+            }));
+        }
         let card = self.workspace.focused()?;
         if self.editor_features.choice_requests.contains_key(&card) { return Some(self.update_editor_features(Action::Dismiss(card))); }
         self.editor_features.renames.contains_key(&card).then(|| self.update_editor_features(Action::CancelRename(card)))
@@ -897,6 +1003,15 @@ impl Cagents {
     }
 
     fn editor_feature_action_blocked(&self, action: &Action) -> bool {
+        let role = match action {
+            Action::ApplyPreview | Action::CancelPreview | Action::SelectPreviewFile(_) | Action::AnnotationsPage(_) => Some(DialogKind::Preview),
+            Action::HidePublication(_) => Some(DialogKind::Publication),
+            Action::PreviewRepository { action, .. } if !repository_action_allowed_while_modal(action) => Some(DialogKind::Preview),
+            _ => None,
+        };
+        if let Some(role) = role {
+            return self.update_prepared || self.top_modal() != Some(modal_ui::Modal::EditorFeatures(role));
+        }
         let user_action = matches!(action,
             Action::Rename(_) | Action::RenameDraft(..) | Action::SubmitRename(..) | Action::Format { .. }
             | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..));
@@ -906,7 +1021,7 @@ impl Cagents {
         // Its format phase must not be refused by that same dialog's hold.
         let close_save = matches!(action, Action::Format { card, save_after: true, .. }
             if self.dirty_repository_close.as_ref().is_some_and(|close| close.card == *card));
-        self.modal_is_open() && !close_save
+        (self.update_prepared || self.modal_is_open() || self.editor_features.publishing()) && !close_save
     }
 
     pub(super) fn update_editor_features(&mut self, action: Action) -> Task<Message> {
@@ -1064,10 +1179,10 @@ impl Cagents {
                         }
                         let preview = operation.kind == LspEditKind::Rename || plan.documents.len() > 1;
                         if preview {
-                            if self.editor_features.modal_open() { self.reject_server_edit(&operation, "Another workspace edit is already open"); return Task::none(); }
+                            if self.editor_features.modal_open() || self.editor_features.publishing() { self.reject_server_edit(&operation, "Another workspace edit is already open"); return Task::none(); }
                             let diff_ticket = self.editor_features.next();
                             self.editor_features.preview = Some(Preview { ticket, diff_ticket, operation, plan, selected: 0, annotation_page: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
-                            self.update_editor_features(Action::SelectPreviewFile(0))
+                            Task::batch([self.select_editor_preview_file(0), self.modal_focus(widget::Id::new("editor-preview.cancel"))])
                         } else { self.publish_editor_workspace_edit(ticket, operation, plan) }
                     }
                 }
@@ -1078,25 +1193,7 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::SelectPreviewFile(index) => {
-                let diff_ticket = self.editor_features.next();
-                let Some(preview) = self.editor_features.preview.as_mut() else { return Task::none(); };
-                let Some(document) = preview.plan.documents.get(index) else { return Task::none(); };
-                preview.selected = index;
-                preview.runtime = None;
-                preview.error = None;
-                preview.cancellation.cancel();
-                preview.cancellation = crate::repository::CancellationToken::new();
-                let cancellation = preview.cancellation.clone();
-                preview.diff_ticket = diff_ticket;
-                let ticket = preview.diff_ticket;
-                let document = document.clone();
-                let theme = self.settings.editor_syntax_theme;
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::diff_view::build_document_diff(document.before, &document.after, &document.relative, theme, &cancellation).map(Arc::new)).await.map_err(|error| error.to_string());
-                    Message::EditorFeatures(Action::PreviewDiff { ticket, index, result })
-                })
-            }
+            Action::SelectPreviewFile(index) => self.select_editor_preview_file(index),
             Action::PreviewDiff { ticket, index, result } => {
                 let Some(preview) = self.editor_features.preview.as_mut().filter(|preview| preview.diff_ticket == ticket && preview.selected == index) else { return Task::none(); };
                 match result {
@@ -1128,21 +1225,29 @@ impl Cagents {
                     preview.cancellation.cancel();
                     self.reject_server_edit(&preview.operation, "The user canceled the preview");
                 }
-                Task::none()
+                self.modal_restore_focus(self.modal_restore_fallback())
+            }
+            Action::HidePublication(ticket) => {
+                let Some(publication) = self.editor_features.publication.as_mut().filter(|publication| publication.ticket == ticket && !publication.hidden) else { return Task::none(); };
+                publication.hidden = true;
+                self.notices.record(TransientNotice::warning("Applying workspace edit… Work continues after progress is hidden.").key(format!("editor-publication:{ticket}")));
+                self.modal_restore_focus(self.modal_restore_fallback())
             }
             Action::Published { ticket, result } => {
                 let Some(mut publication) = self.editor_features.publication.take() else { return Task::none(); };
                 if publication.ticket != ticket { self.editor_features.publication = Some(publication); return Task::none(); }
+                self.notices.resolve(&format!("editor-publication:{ticket}"));
                 let report = match result {
                     Err(error) => {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
                         if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                         self.feature_failure(publication.operation.card, error);
-                        return self.save_after_feature(&publication.operation);
+                        return Task::batch([self.save_after_feature(&publication.operation), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
                 };
-                if !report.durability_warnings.is_empty() { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
+                let has_warnings = !report.durability_warnings.is_empty();
+                if has_warnings { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
                 let mut tasks = Vec::new();
                 let mut failure = None;
                 for card in publication.cards {
@@ -1161,10 +1266,34 @@ impl Cagents {
                     if let Some(lease) = publication.server_lease.take() { lease.respond(true, None); }
                     if let Some(command) = publication.operation.command.clone() { self.execute_editor_feature_command(&publication.operation, command); }
                     tasks.push(self.save_after_feature(&publication.operation));
+                    if publication.hidden && !has_warnings {
+                        self.notices.record(TransientNotice::success("Workspace edit applied"));
+                    }
                 }
+                tasks.push(self.modal_restore_focus(self.modal_restore_fallback()));
                 Task::batch(tasks)
             }
         }
+    }
+
+    fn select_editor_preview_file(&mut self, index: usize) -> Task<Message> {
+                let diff_ticket = self.editor_features.next();
+                let Some(preview) = self.editor_features.preview.as_mut() else { return Task::none(); };
+                let Some(document) = preview.plan.documents.get(index) else { return Task::none(); };
+                preview.selected = index;
+                preview.runtime = None;
+                preview.error = None;
+                preview.cancellation.cancel();
+                preview.cancellation = crate::repository::CancellationToken::new();
+                let cancellation = preview.cancellation.clone();
+                preview.diff_ticket = diff_ticket;
+                let ticket = preview.diff_ticket;
+                let document = document.clone();
+                let theme = self.settings.editor_syntax_theme;
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || crate::diff_view::build_document_diff(document.before, &document.after, &document.relative, theme, &cancellation).map(Arc::new)).await.map_err(|error| error.to_string());
+                    Message::EditorFeatures(Action::PreviewDiff { ticket, index, result })
+                })
     }
 
     fn reject_server_edit(&mut self, operation: &Operation, reason: &str) {
@@ -1172,7 +1301,7 @@ impl Cagents {
     }
 
     fn prepare_editor_workspace_edit(&mut self, mut operation: Operation, edit: LspWorkspaceEdit) -> Task<Message> {
-        if !self.editor_features.preparing.is_empty() || self.editor_features.modal_open() {
+        if !self.editor_features.preparing.is_empty() || self.editor_features.modal_open() || self.editor_features.publishing() {
             self.reject_server_edit(&operation, "Finish the current workspace edit first");
             self.feature_failure(operation.card, "Finish the current workspace edit first");
             return Task::none();
@@ -1264,16 +1393,23 @@ impl Cagents {
             self.feature_failure(operation.card, error);
             return Task::none();
         }
-        self.editor_features.publication = Some(Publication { ticket, operation, cards, server_lease });
-        cosmic::task::future(async move {
+        self.editor_features.publication = Some(Publication { hidden: false, ticket, operation, cards, server_lease });
+        let publication = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::EditorFeatures(Action::Published { ticket, result })
-        })
+        });
+        Task::batch([publication, self.modal_focus(widget::Id::new("editor-publication.hide"))])
     }
 
     pub(super) fn editor_feature_dialog(&self) -> Option<Element<'_, Message>> {
-        if self.editor_features.publication.is_some() {
-            return Some(dialog_ui::overlay(dialog_ui::surface(design::body("Applying workspace edit…"), 480.0), None, 1.0));
+        if let Some(publication) = self.editor_features.publication.as_ref().filter(|publication| !publication.hidden) {
+            let hide = Message::EditorFeatures(Action::HidePublication(publication.ticket));
+            return Some(dialog_ui::overlay(dialog_ui::surface(widget::column::with_children(vec![
+                design::title("Applying workspace edit…").into(),
+                design::body("Changes are being written. Hiding progress keeps the operation running.").into(),
+                dialog_ui::confirmation_controls(vec![crate::ui_controls::button::secondary("Hide progress")
+                    .id(widget::Id::new("editor-publication.hide")).on_press(hide.clone()).into()]),
+            ]).spacing(space::M), 480.0), Some(hide), 1.0));
         }
         let preview = self.editor_features.preview.as_ref()?;
         let files = widget::column::with_children(preview.plan.documents.iter().enumerate().map(|(index, document)| {
@@ -1306,8 +1442,8 @@ impl Cagents {
         }
         rows.push(widget::row::with_children(vec![widget::scrollable(files).width(260).height(Length::Fill).into(), widget::container(diff).width(Length::Fill).height(Length::Fill).into()]).spacing(space::M).height(if annotations.is_empty() { 480 } else { 360 }).into());
         rows.push(dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel").on_press(Message::EditorFeatures(Action::CancelPreview)),
-            crate::ui_controls::button::primary("Apply changes").on_press(Message::EditorFeatures(Action::ApplyPreview)),
+            crate::ui_controls::button::secondary("Cancel").id(widget::Id::new("editor-preview.cancel")).on_press(Message::EditorFeatures(Action::CancelPreview)),
+            crate::ui_controls::button::primary("Apply changes").id(widget::Id::new("editor-preview.apply")).on_press(Message::EditorFeatures(Action::ApplyPreview)),
         ));
         let surface = widget::column::with_children(rows).spacing(space::M);
         Some(dialog_ui::overlay(dialog_ui::surface(surface, 1100.0), Some(Message::EditorFeatures(Action::CancelPreview)), 1.0))
