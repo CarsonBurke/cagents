@@ -49,7 +49,7 @@ struct Evidence {
 }
 impl Drop for Evidence {
     fn drop(&mut self) {
-        if !self.success {
+        if !self.success || thread::panicking() {
             if let Some(directory)=self.directory.take() {
                 eprintln!("late-decision failure evidence retained: {}",directory.keep().display());
             }
@@ -104,6 +104,7 @@ impl ReservedReaper {
             let mut slot=lock.lock().unwrap_or_else(|error|error.into_inner());
             while slot.0.is_none()&&!slot.1 {slot=wake.wait(slot).unwrap_or_else(|error|error.into_inner());}
             let Some(mut child)=slot.0.take() else{return;};drop(slot);
+            let mut reported=false;
             loop {
                 match child.try_wait() {
                     Ok(Some(status))=>{
@@ -111,7 +112,9 @@ impl ReservedReaper {
                         break;
                     }
                     Ok(None)=>{},
-                    Err(error)=>eprintln!("original controller reap remains unresolved: {error}; evidence {}",evidence.display()),
+                    Err(error)=>{
+                        if !reported {eprintln!("original controller reap remains unresolved: {error}; evidence {}",evidence.display());reported=true;}
+                    },
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -133,7 +136,10 @@ impl Drop for ReservedReaper {
             let (lock,wake)=&*self.state;
             lock.lock().unwrap_or_else(|error|error.into_inner()).1=true;
             wake.notify_one();
-            if worker.join().is_err(){eprintln!("empty reserved child reaper panicked");}
+            if worker.join().is_err(){
+                eprintln!("empty reserved child reaper panicked");
+                if !thread::panicking(){panic!("reserved child reaper failed");}
+            }
         }
     }
 }
