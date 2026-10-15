@@ -8617,8 +8617,9 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command disables the actions
-/// in place, because a second mutation against the same index would race the first.
+/// have nothing to unstage from. Stage and unstage intents are serialized by
+/// the worktree mutation queue; discard waits until the current command ends
+/// before presenting its explicit confirmation.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
