@@ -4,6 +4,8 @@
 use super::{KeyAction, KeyInput, KeyModifiers, ReviewInputBarrier, TerminalSendError, TerminalSurface, map_iced_modifiers};
 use crate::model::{HostSessionProof, TerminalId};
 use cosmic::iced::keyboard;
+use crossbeam_channel::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 const MAX_KEYS: usize = 512;
 #[derive(Default)]
@@ -18,12 +20,44 @@ struct OwnedKey {
     physical: keyboard::key::Physical,
     surface: TerminalSurface,
     proof: HostSessionProof,
+    epoch: u64,
+    press: super::super::hosted::KeyAdmission,
+    cleanup: Option<(Receiver<bool>, Instant)>,
     input: KeyInput,
     orphaned: bool,
     released: bool,
     failed: bool,
 }
 impl OwnedInput {
+    fn reap_completed(&mut self) -> bool {
+        let mut pending = false;
+        let mut index = 0;
+        while index < self.keys.len() {
+            let Some((completion, deadline)) = self.keys[index].cleanup.as_ref() else { index += 1; continue; };
+            match completion.try_recv() {
+                Ok(true) => {
+                    let key = self.keys.swap_remove(index);
+                    if !key.released { self.awaiting_up.push(key.physical); }
+                }
+                Ok(false) | Err(TryRecvError::Disconnected) => {
+                    self.keys[index].cleanup = None;
+                    self.keys[index].failed = true;
+                    self.failure("original terminal key cleanup was not acknowledged on its socket attachment; delivery is unknown".into());
+                    index += 1;
+                }
+                Err(TryRecvError::Empty) => {
+                    if Instant::now() >= *deadline {
+                        if !self.keys[index].failed {
+                            self.keys[index].failed = true;
+                            self.failure("original terminal key cleanup acknowledgement timed out; delivery is unknown".into());
+                        }
+                    } else { pending = true; }
+                    index += 1;
+                }
+            }
+        }
+        pending
+    }
     fn failure(&mut self, reason: String) {
         tracing::warn!(%reason, "terminal key cleanup could not be confirmed by the UI transport");
         if self.failures.len() < 8 && !self.failures.contains(&reason) {
@@ -43,6 +77,14 @@ impl ReviewInputBarrier {
     }
     pub(super) fn press(&self, physical: keyboard::key::Physical, surface: &TerminalSurface, input: KeyInput) -> Result<(), TerminalSendError> {
         let mut owned = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        // A fresh physical cycle also proves an earlier synthetic-up hold
+        // ended outside this window, including while its ACK was pending.
+        if input.action == KeyAction::Press {
+            for key in &mut owned.keys {
+                if key.physical == physical && key.orphaned { key.released = true; }
+            }
+        }
+        owned.reap_completed();
         owned.modifiers = input.modifiers;
         // Window blur can hide the old physical up entirely. A genuine new
         // down proves that hold ended; a repeat cannot establish a new cycle.
@@ -50,24 +92,25 @@ impl ReviewInputBarrier {
             owned.awaiting_up.retain(|key| *key != physical);
         }
         if owned.native_review.is_some() || owned.awaiting_up.contains(&physical) { return Err(TerminalSendError::Full); }
-        if let Some(key) = owned.keys.iter_mut().find(|key| key.physical == physical && !(key.failed && key.released)) {
-            if key.orphaned || key.released || key.failed || !key.surface.same_attachment(surface) || surface.host_proof().as_ref() != Some(&key.proof) {
+        if let Some(key) = owned.keys.iter_mut().find(|key| key.physical == physical && !key.released && !key.failed) {
+            if key.orphaned || key.released || key.failed || !key.surface.same_attachment(surface) || surface.host_proof().as_ref() != Some(&key.proof) || surface.cleanup_epoch() != Some(key.epoch) {
                 return Err(TerminalSendError::Full);
             }
             // Repeats may change layout text, but cleanup keeps the original
             // admitted key and unshifted identity. Current modifiers are global.
-            surface.key(input)?;
+            surface.repeat_key(input, key.proof.clone(), key.epoch, key.press.clone())?;
             return Ok(());
         }
         // An intercepted or refused down cannot be revived as a raw repeat.
         if input.action == KeyAction::Repeat { return Err(TerminalSendError::Full); }
-        if owned.keys.iter().any(|key| !key.failed && (key.orphaned || key.released) && key.surface.same_attachment(surface)) {
+        if owned.keys.iter().any(|key| !key.failed && key.cleanup.is_none() && (key.orphaned || key.released) && key.surface.same_attachment(surface)) {
             return Err(TerminalSendError::Full);
         }
         if owned.keys.len() + owned.awaiting_up.len() >= MAX_KEYS { return Err(TerminalSendError::Full); }
         let proof = surface.host_proof().filter(|proof| proof.is_complete()).ok_or(TerminalSendError::Closed)?;
-        surface.key(input.clone())?;
-        owned.keys.push(OwnedKey { physical, surface: surface.clone(), proof, input, orphaned: false, released: false, failed: false });
+        let epoch = surface.cleanup_epoch().ok_or(TerminalSendError::Closed)?;
+        let completion = surface.tracked_key(input.clone(), proof.clone(), epoch)?;
+        owned.keys.push(OwnedKey { physical, surface: surface.clone(), proof, epoch, press: completion, cleanup: None, input, orphaned: false, released: false, failed: false });
         Ok(())
     }
     pub(super) fn owns_raw_key(&self, physical: keyboard::key::Physical, surface: &TerminalSurface) -> bool {
@@ -103,13 +146,13 @@ impl ReviewInputBarrier {
     /// input. Return true only for transport backpressure that needs a redraw.
     pub(crate) fn flush_owned_keys(&self) -> bool {
         let mut owned = self.1.lock().unwrap_or_else(|e| e.into_inner());
-        if owned.native_review.is_some() { return false; }
-        let mut pending = false;
+        let mut pending = owned.reap_completed();
+        if owned.native_review.is_some() { return pending; }
         let mut index = 0;
         while index < owned.keys.len() {
-            if owned.keys[index].failed || !(owned.keys[index].orphaned || owned.keys[index].released) { index += 1; continue; }
+            if owned.keys[index].failed || owned.keys[index].cleanup.is_some() || !(owned.keys[index].orphaned || owned.keys[index].released) { index += 1; continue; }
             let key = &owned.keys[index];
-            if key.surface.host_proof().as_ref() != Some(&key.proof) {
+            if key.surface.host_proof().as_ref() != Some(&key.proof) || key.surface.cleanup_epoch() != Some(key.epoch) {
                 owned.keys[index].failed = true;
                 owned.failure("original terminal attachment changed before key cleanup; delivery is unknown".into());
                 index += 1;
@@ -119,10 +162,13 @@ impl ReviewInputBarrier {
             input.action = KeyAction::Release;
             input.text = None;
             input.modifiers = owned.modifiers;
-            match key.surface.key(input) {
-                Ok(()) => {
-                    let key = owned.keys.swap_remove(index);
-                    if !key.released { owned.awaiting_up.push(key.physical); }
+            match key.surface.cleanup_key(input, key.proof.clone(), key.epoch, key.press.clone()) {
+                Ok(completion) => {
+                    // Keep the last original Surface alive through the actual
+                    // daemon response. Enqueue success alone cannot retire it.
+                    owned.keys[index].cleanup = Some((completion, Instant::now() + Duration::from_secs(5)));
+                    pending = true;
+                    index += 1;
                 }
                 Err(TerminalSendError::Full) => { pending = true; index += 1; }
                 Err(error) => {

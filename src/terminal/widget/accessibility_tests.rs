@@ -20,7 +20,7 @@ use iced_accessibility::{
 };
 use std::{
     os::unix::net::UnixListener,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
 };
 
@@ -34,7 +34,11 @@ enum Message {
 }
 struct Peer {
     _directory: tempfile::TempDir,
-    handle: HostedTerminalHandle,
+    handle: Option<HostedTerminalHandle>,
+    release_ready: Arc<AtomicBool>,
+    release_accept: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
+    connections: Arc<AtomicUsize>,
     requests: crossbeam_channel::Receiver<ClientRequest>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
@@ -67,12 +71,22 @@ impl Peer {
         let (tx, requests) = crossbeam_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let release_ready = Arc::new(AtomicBool::new(true));
+        let release_accept = Arc::new(AtomicBool::new(true));
+        let reconnect = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let ready = release_ready.clone();
+        let accepted = release_accept.clone();
+        let reconnecting = reconnect.clone();
+        let connected_count = connections.clone();
         let worker = thread::spawn(move || {
+            loop {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopping.load(Ordering::Relaxed) { return; }
                         assert!(Instant::now() < deadline, "hosted client did not connect");
                         thread::sleep(Duration::from_millis(1));
                     }
@@ -83,8 +97,11 @@ impl Peer {
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
             let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            connected_count.fetch_add(1, Ordering::AcqRel);
             let mut connected = false;
+            let mut retry = false;
             while !stopping.load(Ordering::Relaxed) {
+                if reconnecting.swap(false, Ordering::AcqRel) { retry = true; break; }
                 let request: ClientEnvelope = match codec.read(&mut stream) {
                     Ok(Some(request)) => request,
                     Ok(None) => break,
@@ -108,8 +125,18 @@ impl Peer {
                         resumed: vec![descriptor],
                     }
                 } else {
+                    let release = matches!(&request.request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release);
                     tx.send(request.request).unwrap();
-                    ServerResponse::Accepted
+                    if release {
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while !ready.load(Ordering::Acquire) && !stopping.load(Ordering::Relaxed) {
+                            assert!(Instant::now() < deadline, "release ACK gate timed out");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    if release && !accepted.load(Ordering::Acquire) {
+                        ServerResponse::Snapshot { terminal_id: id, snapshot: None }
+                    } else { ServerResponse::Accepted }
                 };
                 if write_frame(
                     &mut stream,
@@ -125,19 +152,23 @@ impl Peer {
                     break;
                 }
             }
+            if !retry { break; }
+            }
         });
         handle.wait_until_attached(Duration::from_secs(3)).unwrap();
         Self {
             _directory: directory,
-            handle,
+            handle: Some(handle),
+            release_ready, release_accept, reconnect, connections,
             requests,
             stop,
             worker: Some(worker),
         }
     }
+    fn handle(&self) -> &HostedTerminalHandle { self.handle.as_ref().unwrap() }
     fn fence(&self) -> Vec<ClientRequest> {
         let marker = b"accessibility-test-fence".to_vec();
-        self.handle.input(marker.clone()).unwrap();
+        self.handle().input(marker.clone()).unwrap();
         let mut requests = Vec::new();
         loop {
             let request = self
@@ -154,7 +185,7 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        let _ = self.handle.shutdown();
+        if let Some(handle) = &self.handle { let _ = handle.shutdown(); }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             worker.join().unwrap();
@@ -180,7 +211,7 @@ fn widget(
     focused: bool,
     suppressed: bool,
 ) -> TerminalWidget<Message> {
-    let mut widget = TerminalWidget::new(peer.handle.clone())
+    let mut widget = TerminalWidget::new(peer.handle().clone())
         .id(Id::new(name.to_owned()))
         .model_focused(focused)
         .review_boundary(
@@ -886,22 +917,22 @@ fn unmounted_owned_key_waits_for_review_exit_and_releases_only_the_original_atta
     native_focus(&mut terminal, &mut tree, &renderer);
     dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
     assert_eq!(old.fence().iter().filter(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
-    barrier.note_review(old.handle.terminal_id(), true);
+    barrier.note_review(old.handle().terminal_id(), true);
     drop(tree);
     assert!(!barrier.flush_owned_keys(), "Review suppresses original cleanup input");
     assert!(!old.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
     let up = raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
     let Event::Keyboard(up) = up else { unreachable!() };
     barrier.observe_key_event(&up);
-    barrier.note_review(old.handle.terminal_id(), false);
-    assert!(!barrier.flush_owned_keys());
+    barrier.note_review(old.handle().terminal_id(), false);
+    assert!(barrier.flush_owned_keys());
     let requests = old.fence();
     let keys: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
     assert_eq!(keys.len(), 1, "{requests:?}");
     assert_eq!(keys[0].key, TerminalKey::Character('a'));
     assert_eq!(keys[0].action, KeyAction::Release);
     assert!(keys[0].modifiers.control && keys[0].modifiers.shift);
-    assert!(!barrier.flush_owned_keys());
+    settle_cleanup(&barrier);
     assert!(!old.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
     assert!(!new.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })), "cleanup cannot retarget another attachment");
 }
@@ -978,6 +1009,89 @@ fn repeat_keeps_original_release_identity_and_window_blur_ends_review_before_cle
     assert_eq!(keys[0].unshifted_codepoint, Some('a'));
     assert_eq!(keys[0].action, KeyAction::Release);
     assert!(keys[0].modifiers.shift);
-    assert!(!barrier.flush_owned_keys());
+    settle_cleanup(&barrier);
     assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+}
+
+
+fn settle_cleanup(barrier: &ReviewInputBarrier) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while barrier.flush_owned_keys() {
+        assert!(Instant::now() < deadline, "original transport cleanup did not settle");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+fn wait_peer_finished(peer: &Peer) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !peer.worker.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < deadline, "original socket attachment did not retire");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+#[test]
+fn last_attachment_is_retained_until_actual_cleanup_response_and_unknown_completion_is_kept() {
+    for accepted in [true, false] {
+        let mut peer = Peer::new();
+        peer.release_ready.store(false, Ordering::Release);
+        peer.release_accept.store(accepted, Ordering::Release);
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut terminal = widget(&peer, "last-owner", barrier.clone(), true, false);
+        terminal.on_shortcut = None;
+        let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+        native_focus(&mut terminal, &mut tree, &renderer);
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
+        assert!(peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)));
+        // The ledger now owns the LAST actual HostedTerminalHandle, not merely
+        // a clone alongside the test peer or still-mounted TerminalWidget.
+        drop(peer.handle.take());
+        drop(tree);
+        drop(terminal);
+        assert!(barrier.flush_owned_keys());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let request = peer.requests.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("original release must reach the real private socket");
+            if matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release) { break; }
+        }
+        assert!(!peer.worker.as_ref().unwrap().is_finished(), "pending cleanup retains its original transport through dispatch");
+        peer.release_ready.store(true, Ordering::Release);
+        settle_cleanup(&barrier);
+        if accepted {
+            assert!(barrier.take_key_cleanup_failures().is_empty());
+            wait_peer_finished(&peer);
+        } else {
+            assert!(!barrier.take_key_cleanup_failures().is_empty(), "unexpected response cannot certify cleanup");
+            assert!(!peer.worker.as_ref().unwrap().is_finished(), "unknown cleanup keeps the original attachment owned");
+            drop(barrier);
+            wait_peer_finished(&peer);
+        }
+    }
+}
+
+#[test]
+fn same_terminal_id_and_host_proof_after_real_reconnect_cannot_receive_old_cleanup() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "reconnect-owner", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    let proof = peer.handle().proof().unwrap();
+    let original_epoch = peer.handle().cleanup_epoch().unwrap();
+    dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
+    assert!(peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)));
+    peer.reconnect.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while peer.handle().cleanup_epoch().is_none_or(|epoch| epoch == original_epoch) {
+        assert!(Instant::now() < deadline, "production client did not reconnect");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(peer.connections.load(Ordering::Acquire), 2);
+    assert_eq!(peer.handle().proof(), Some(proof), "negative must retain the exact same advertised host proof and TerminalId");
+    drop(tree);
+    drop(terminal);
+    settle_cleanup(&barrier);
+    assert!(!barrier.take_key_cleanup_failures().is_empty());
+    assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })), "old cleanup cannot be replayed into the new same-ID socket attachment");
 }

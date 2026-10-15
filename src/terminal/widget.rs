@@ -2319,6 +2319,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             }
             state.preedit = None;
             state.review_control_pressed = true;
+            state.input_focused = true;
             self.publish_review(a11y.review, shell);
             shell.capture_event();
             shell.request_redraw();
@@ -2372,6 +2373,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         self.publish_review(true, shell);
                     }
                     Action::Click if control => {
+                        state.input_focused = true;
                         a11y.review = !a11y.review;
                         a11y.selection = None;
                         state.preedit = None;
@@ -2383,6 +2385,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     Action::SetTextSelection if ours => {
                         if let Some(ActionData::SetTextSelection(selection)) = &request.data {
                             if a11y.valid_selection(selection) {
+                                state.input_focused = true;
                                 a11y.review = true;
                                 a11y.selection = Some(selection.clone());
                                 state.preedit = None;
