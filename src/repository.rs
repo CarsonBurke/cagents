@@ -4901,7 +4901,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     policy.reconcile_unchanged = true;
                     continue;
                 }
-                let include = if let Ok(home) = std::env::var("HOME")
+                let include = if let Some(home) = std::env::var_os("HOME")
                     && let Ok(relative) = include.strip_prefix("~")
                 {
                     PathBuf::from(home).join(relative)
@@ -9904,6 +9904,59 @@ mod tests {
                 measured(&changed, "tracked", ChangeArea::Unstaged),
                 (Some(2), Some(1))
             );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn cached_numstat_expands_missing_includes_with_a_non_utf8_home() {
+            const CHILD: &str = "CAGENTS_NUMSTAT_NON_UTF8_HOME_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                use std::os::unix::ffi::OsStringExt;
+                let directory = tempfile::tempdir().unwrap();
+                let home = directory.path().join(OsString::from_vec(b"home-\xff".to_vec()));
+                fs::create_dir(&home).unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "repository::tests::git_contracts::cached_numstat_expands_missing_includes_with_a_non_utf8_home",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", &home)
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "non-UTF8 home child failed: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let outside = tempfile::tempdir().unwrap();
+            let attributes = outside.path().join("attributes");
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "before\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "include.path", "~/late-config"]);
+            fs::write(root.join("tracked"), "after\n").unwrap();
+            let service = service();
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let first = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&first, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+            let status_before = git_output(root, &["status", "--porcelain=v2", "--branch", "-z"]);
+            fs::write(&attributes, "tracked -diff\n").unwrap();
+            fs::write(home.join("late-config"), format!("[core]\nattributesFile = {}\n", attributes.display())).unwrap();
+            assert_eq!(status_before, git_output(root, &["status", "--porcelain=v2", "--branch", "-z"]));
+            let changed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().expect("publishing the home-relative include invalidates unchanged porcelain");
+            assert_eq!(measured(&changed, "tracked", ChangeArea::Unstaged), (None, None));
+            assert!(service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().is_none());
         }
 
         #[test]
