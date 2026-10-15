@@ -345,8 +345,9 @@ impl LspDiagnostic {
     /// Full protocol JSON is materialized only after an explicit copy action.
     /// It preserves message, source, numeric/string code, related info and data.
     pub fn copy_text(&self) -> String {
-        serde_json::to_string_pretty(self.protocol.as_ref())
-            .expect("diagnostic JSON is serializable")
+        // Compact JSON avoids multiplying deeply nested opaque data with
+        // indentation when a user requests the complete payload.
+        serde_json::to_string(self.protocol.as_ref()).expect("diagnostic JSON is serializable")
     }
 }
 
