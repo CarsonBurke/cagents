@@ -270,3 +270,46 @@ fn policy_read_and_write_do_not_depend_on_a_successful_safety_census() {
     let read=client.device_operation(device_service::Operation::Worktree {operation:Operation::GetDisposableIgnoredDirectories {repository,path}}).unwrap();
     assert_eq!(read,saved);
 }
+
+#[test]
+fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
+    use cagents::{device_service,model::OperationId,repository::WorktreeSetupIntent,worktree_control::{Operation,Reply}};
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    let path=fixture.create("recover-setup");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    let configuration=project.join(".cagents/worktree.toml");
+    fs::write(&configuration,"setup = \"printf reviewed >> setup-runs\"\n").unwrap();
+    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
+    let repository=project.join(".git");
+    let device_service::Reply::Worktree(Reply::SetupIntent {intent,current_plan,plan_error,trusted,active,primary,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
+    assert_eq!(primary,project);assert!(!trusted);assert!(!active);assert!(plan_error.is_none());
+    assert_eq!(serde_json::from_str::<Value>(&current_plan.unwrap()).unwrap()["fingerprint"],plan.fingerprint);
+    let prior:WorktreeSetupIntent=serde_json::from_str(&intent).unwrap();assert!(prior.skip);
+    let resume=|run, fingerprint,trust,skip|device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository:repository.clone(),path:path.clone(),expected_run_id:run,expected_plan_fingerprint:fingerprint,trust,skip}};
+    assert!(client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),false,false)).is_err());
+    assert!(client.device_operation(resume(Some(OperationId::new()),Some(plan.fingerprint.clone()),true,false)).is_err());
+    assert_eq!(fixture.setup_intent(&path)["run_id"],serde_json::to_value(prior.run_id).unwrap());
+    let device_service::Reply::Worktree(Reply::SetupPrepared {setup:Some(setup),warnings,..})=client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),true,false)).unwrap() else {panic!("wrong recovery result")};
+    assert!(warnings.is_empty(),"{warnings:?}");assert!(setup.error.is_none(),"{setup:?}");
+    let session=setup.terminal.unwrap();let run=setup.run_id.unwrap();assert_ne!(Some(run),prior.run_id);
+    assert_eq!(session.launch.environment["CAGENTS_WORKTREE_SETUP_ID"],run.to_string());
+    let deadline=Instant::now()+Duration::from_secs(10);
+    while !path.join("setup-runs").exists()||client.list().unwrap().iter().any(|terminal|terminal.session.id==session.id&&terminal.session.last_exit.is_none()) {
+        assert!(Instant::now()<deadline,"reviewed setup did not finish");thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
+    assert_eq!(fixture.setup_intent(&path)["run_id"],run.to_string());
+    assert_eq!(fixture.setup_intent(&path)["copy_done"],true);
+    // The old approval cannot start a second terminal after the first run.
+    assert!(client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),true,false)).is_err());
+    // A broken new configuration remains reviewable; explicit skip never
+    // parses or executes it and records a fresh, completed skip intent.
+    fs::write(&configuration,"setup = [not valid TOML").unwrap();
+    let device_service::Reply::Worktree(Reply::SetupIntent {plan_error,trusted,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
+    assert!(plan_error.is_some());assert!(!trusted);
+    let device_service::Reply::Worktree(Reply::SetupPrepared {setup:None,..})=client.device_operation(resume(Some(run),None,false,true)).unwrap() else {panic!("wrong skip result")};
+    let skipped=fixture.setup_intent(&path);assert_eq!(skipped["skip"],true);assert_eq!(skipped["copy_done"],true);assert!(skipped["plan"].is_null());assert_ne!(skipped["run_id"],run.to_string());
+    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
+}

@@ -1,3 +1,6 @@
+mod setup;
+pub(crate) use setup::SetupReservation;
+pub(crate) struct Execution {pub(crate) reply:Reply,pub(crate) setup_reservation:Option<SetupReservation>}
 use super::*;
 use crate::{
     model::OperationId,
@@ -24,7 +27,7 @@ fn entry(service: &Service, record: &WorktreeRecord, primary: bool, cancellation
     })
 }
 
-pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path) -> Result<Vec<crate::model::TerminalId>,String>) -> Result<Reply,String> {
+pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path) -> Result<Vec<crate::model::TerminalId>,String>) -> Result<Execution,String> {
     let cancellation = CancellationToken::new();
     let service = RepositoryService::system("git");
     let store=journal_store()?;
@@ -39,7 +42,8 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
         }
     }
     let _active=OPERATIONS.read().unwrap_or_else(|poison|poison.into_inner());
-    match operation {
+    let mut setup_reservation=None;
+    let reply=match operation {
         Operation::ResolveProject {id} => {
             let mut matches=std::collections::BTreeSet::new();
             for path in crate::instance::window_database_paths().map_err(|error|error.to_string())? {
@@ -78,30 +82,12 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                     run_id:Some(OperationId::new()),copy_done:no_setup,
                 });
             }
-            let run_id=request.setup_intent.as_ref().and_then(|intent|intent.run_id);
+            setup_reservation=Some(SetupReservation::acquire(&request.destination)?);
             let report=service.create_worktree_journaled_sync(&store,&request,0,&cancellation, |_|{});
             match report.outcome {
                 Some(WorktreeCreationOutcome::Created {worktree,warnings}) if report.state==crate::repository::WorktreeOperationState::Created => {
                     let mut warnings=warnings.into_iter().map(|warning|warning.reported_detail()).collect::<Vec<_>>();
-                    let setup=if let Some(plan)=setup_plan {
-                        match crate::worktree_setup::prepare(&primary,&worktree.path,&plan,false,&cancellation) {
-                            Ok(prepared)=> {
-                                for missing in prepared.missing_patterns { warnings.push(format!("No setup source matched {missing}")); }
-                                for skipped in prepared.skipped_paths { warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason)); }
-                                let mut copied=request.setup_intent.clone().expect("setup plan has retained intent");
-                                copied.copy_done=true;
-                                match service.update_worktree_setup_intent(&store,request.operation_id,request.setup_intent.as_ref(),copied) {
-                                    Ok(_)=>prepared.command.map(|command|Setup {command,run_id,terminal:None,error:None}),
-                                    Err(error)=> {
-                                        let error=format!("Setup copied files, but its progress could not be retained; no command was started: {error}");
-                                        warnings.push(error.clone());
-                                        Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)})
-                                    }
-                                }
-                            }
-                            Err(error)=> { let error=error.to_string(); warnings.push(format!("Worktree was created, but setup failed: {error}")); Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)}) }
-                        }
-                    } else {None};
+                    let setup=setup_plan.as_ref().and_then(|plan|setup::prepare(&service,&store,&request,&primary,&worktree.path,plan,&mut warnings,&cancellation));
                     Ok(Reply::Created { worktree:entry(&service,&worktree,false,&cancellation)?,warnings,setup })
                 }
                 _ => Err(report.detail),
@@ -185,7 +171,17 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
             same_repository(&service,&repository,&path,&cancellation)?;
             Ok(Reply::DisposableIgnoredDirectories {directories:service.disposable_ignored_directories(&path,&cancellation).map_err(|error|error.to_string())?})
         }
-    }
+        Operation::SetupIntent {repository,path}=>setup::read(&service,&store,&repository,&path,&cancellation),
+        Operation::ResumeSetup {repository,path,expected_run_id,expected_plan_fingerprint,trust,skip}=> {
+            let (report,primary)=setup::report(&service,&store,&repository,&path,&cancellation)?;
+            let request=report.request.as_ref().expect("validated request");
+            setup_reservation=Some(SetupReservation::acquire(&request.destination)?);
+            if !live_sessions(&request.destination)?.is_empty() {return Err("Close this worktree's live sessions before resuming interrupted setup".into());}
+            setup::resume(&service,&store,report,&primary,expected_run_id,expected_plan_fingerprint,trust,skip,&cancellation)
+        }
+
+    }?;
+    Ok(Execution {reply,setup_reservation})
 }
 
 fn same_repository(service:&Service,repository:&Path,path:&Path,cancel:&CancellationToken)->Result<(),String> {

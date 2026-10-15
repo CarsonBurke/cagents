@@ -486,7 +486,7 @@ pub(super) fn process_request(
                 if let Some(scope)=scope.take() {scope.check(path).map_err(|error|error.to_string())?;}
                 Ok(host.lock().unwrap_or_else(|p|p.into_inner()).worktree_live_sessions(path))
             });
-            if let Ok(crate::worktree_control::Reply::Created {warnings,..})=&mut result {
+            if let Ok(crate::worktree_control::service::Execution {reply:crate::worktree_control::Reply::Created {warnings,..},..})=&mut result {
                 if let Some(repository)=&repository {
                     if let Err(error)=host.lock().unwrap_or_else(|poison|poison.into_inner()).edit_model(0,crate::workspace_model::ModelEdit::ReopenProject {
                         repository:repository.clone(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git,
@@ -498,11 +498,18 @@ pub(super) fn process_request(
             // A later setup/branch failure can follow a committed Git mutation.
             // Refresh on either outcome so a retained worktree is never hidden.
             if mutates&&let Some(repository)=&repository { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(repository); }
-            let mut reply=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
-            if let crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=&mut reply {
+            let execution=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
+            let mut reply=execution.reply;
+            let _setup_reservation=execution.setup_reservation;
+            let prepared=match &mut reply {
+                crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=>Some((&worktree.path,setup,warnings)),
+                crate::worktree_control::Reply::SetupPrepared {path,setup:Some(setup),warnings}=>Some((&*path,setup,warnings)),
+                _=>None,
+            };
+            if let Some((path,setup,warnings))=prepared {
                 if setup.error.is_none() {
                     let started=match (repository.as_deref(),setup.run_id) {
-                        (Some(repository),Some(run_id))=>start_worktree_setup(host,repository,&worktree.path,&setup.command,run_id),
+                        (Some(repository),Some(run_id))=>start_worktree_setup(host,repository,path,&setup.command,run_id),
                         _=>Err(ProtocolError::new(ProtocolErrorCode::Internal,"Setup has no retained repository/run identity",false)),
                     };
                     match started {
