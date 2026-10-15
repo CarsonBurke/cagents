@@ -44,8 +44,11 @@ def snapshot(ui_path, model_path):
         focused = {workspace: card for workspace, card in db.execute("SELECT workspace_id,focused_card_id FROM workspaces")}
         guards = {row[0] for row in db.execute("SELECT card_id FROM closed_cards")} if "closed_cards" in tables else set()
     with closing(connect(model_path)) as db:
-        owners = {row[0] for row in db.execute("SELECT id FROM shared_view_panes")}
-        members = {pane["id"] for row in db.execute("SELECT panes FROM shared_views") for pane in json.loads(row[0])}
+        owners = dict(db.execute("SELECT id,scope FROM shared_view_panes"))
+        members = {}
+        for scope, panes in db.execute("SELECT scope,panes FROM shared_views"):
+            for pane in json.loads(panes):
+                members.setdefault(pane["id"], set()).add(scope)
     return cards, focused, guards, owners, members
 
 
@@ -100,6 +103,14 @@ def verified_adoption(path, expected):
     if len(proofs) != 1 or any(proofs[0].get(key) != value for key, value in expected.items()):
         raise SystemExit("prior adoption proof does not match this exact UI/workload/control pane")
     return proofs[0]
+
+
+def shared_scope(keep, targets, owners, members):
+    scope = owners.get(keep)
+    if scope is None or any(owners.get(card) != scope or members.get(card) != {scope}
+                            for card in {keep, *targets}):
+        raise SystemExit("control and remaining minted panes must share one exact shared-view scope")
+    return scope
 
 
 def main():
@@ -164,14 +175,16 @@ def main():
     if keep not in cards or cards[keep]["closed"]:
         raise SystemExit("control pane must be durably open")
     workspace = cards[keep]["workspace"]
+    pending = {card for card in targets if not (args.adoption_receipt and closed(card, state))}
+    scope = shared_scope(keep, pending, owners, members)
     proof = {"adopted_cards": sorted(targets), "preserved_card": keep, "workspace": workspace,
-             "pid": args.pid, "start_ticks": ticks, "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()}
+             "shared_scope": scope, "pid": args.pid, "start_ticks": ticks,
+             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()}
     if args.adoption_receipt:
         previous = args.adoption_receipt.resolve(strict=True)
         if not previous.is_relative_to(root):
             raise SystemExit("prior adoption receipt must belong to this fixture root")
         verified_adoption(previous, proof)
-    pending = {card for card in targets if not (args.adoption_receipt and closed(card, state))}
     if any(card not in cards or cards[card]["closed"] or cards[card]["workspace"] != workspace or card not in owners or card not in members for card in pending):
         raise SystemExit("every minted actor must first have a live adopted UI pane in the control workspace")
     receipt_path = root / ("pane-closes-cycle" + str(args.cycle) + "-attempt" + str(args.attempt) + ".jsonl")

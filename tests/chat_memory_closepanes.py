@@ -24,10 +24,10 @@ class CloseProof(unittest.TestCase):
                 INSERT INTO workspaces VALUES ('workspace','minted');
                 INSERT INTO cards VALUES ('minted','workspace','"open"');''')
         with closing(sqlite3.connect(self.model)) as db, db:
-            db.executescript('''CREATE TABLE shared_view_panes(id);
-                CREATE TABLE shared_views(panes);
-                INSERT INTO shared_view_panes VALUES ('minted');
-                INSERT INTO shared_views VALUES ('[{"id":"minted"}]');''')
+            db.executescript('''CREATE TABLE shared_view_panes(id,scope);
+                CREATE TABLE shared_views(scope,panes);
+                INSERT INTO shared_view_panes VALUES ('minted','fixture');
+                INSERT INTO shared_views VALUES ('fixture','[{"id":"minted"}]');''')
 
     def snapshot(self):
         return HELPER["snapshot"](self.ui, self.model)
@@ -70,6 +70,15 @@ class CloseProof(unittest.TestCase):
         for key, replacement in (("pid", 43), ("start_ticks", "100"), ("manifest_sha256", "other"), ("adopted_cards", ["other"])):
             with self.subTest(changed=key), self.assertRaisesRegex(SystemExit, "prior adoption"):
                 HELPER["verified_adoption"](path, {**proof, key: replacement})
+
+    def test_control_in_another_channel_is_rejected_before_closing_actors(self):
+        owners = {"control": "fixture", "minted": "fixture"}
+        members = {"control": {"fixture"}, "minted": {"fixture"}}
+        self.assertEqual(HELPER["shared_scope"]("control", {"minted"}, owners, members), "fixture")
+        for bad_owners, bad_members in (({**owners, "control": "other"}, members),
+                                       (owners, {**members, "minted": {"fixture", "other"}})):
+            with self.assertRaisesRegex(SystemExit, "one exact shared-view"):
+                HELPER["shared_scope"]("control", {"minted"}, bad_owners, bad_members)
 
 
 if __name__ == "__main__":
