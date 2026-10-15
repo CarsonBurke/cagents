@@ -63,7 +63,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
     let (operation,spawn)=match command {
         WorktreeCommand::Create {branch,base,linear,no_setup,spawn_agent,prompt,model,reasoning_effort,..}=>(Operation::Create {repository:repository.clone(),branch,base,linear,no_setup},spawn_agent.map(|provider|(provider,prompt,model,reasoning_effort))),
         WorktreeCommand::List {..}=>(Operation::List {repository:repository.clone()},None),
-        WorktreeCommand::Remove {target,force,delete_branch,..}=>(Operation::Remove {repository:repository.clone(),target,force,delete_branch},None),
+        WorktreeCommand::Remove {target,force,delete_branch,..}=>(Operation::Remove {repository:repository.clone(),target,force,delete_branch,expected_fingerprint:None},None),
     };
     let response=client.device_operation(crate::device_service::Operation::Worktree {operation}).map_err(protocol_error)?;
     let crate::device_service::Reply::Worktree(reply)=response else {return Err(AppError::new("protocol","Unexpected worktree response"));};
@@ -98,6 +98,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             let human=worktrees.iter().map(|entry|format!("{}\t{}\t{}\t{}\t{}\t{}",entry.path.display(),entry.branch.as_deref().unwrap_or("(detached)"),if entry.dirty {"dirty"}else{"clean"},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len())).collect::<Vec<_>>().join("\n");
             ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
+        Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
         Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),
     };
     Ok(CommandOutput {command,data,human})
@@ -119,5 +120,20 @@ fn wait_for_setup(client:&mut ControlClient,id:TerminalId)->Result<(),String> {
         }
         if Instant::now()>=deadline {return Err("Setup is still running; inspect Worktree setup and start the agent after it finishes".into());}
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn worktree_cli_flags_and_global_json_parse_without_starting_services() {
+        for arguments in [
+            vec!["cagents","worktree","create","feat-x","--base","main","--linear","ENG-123","--no-setup","--spawn-agent","codex","--model","gpt-6-luna","--reasoning-effort","low","--json"],
+            vec!["cagents","worktree","list","--json"],
+            vec!["cagents","worktree","remove","feat-x","--force","--delete-branch","--json"],
+        ] {
+            let cli=Cli::try_parse_from(arguments).unwrap();assert!(cli.json);assert!(matches!(cli.command,TopCommand::Worktree {..}));
+        }
     }
 }

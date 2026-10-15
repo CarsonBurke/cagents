@@ -69,7 +69,7 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
                 _ => Err(report.detail),
             }
         }
-        Operation::Remove {repository,target,force,delete_branch:delete} => {
+        Operation::Remove {repository,target,force,delete_branch:delete,expected_fingerprint} => {
             let records=service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
             let full_branch=format!("refs/heads/{}",target.trim_start_matches("refs/heads/"));
             let candidate=if Path::new(&target).is_absolute() { PathBuf::from(&target) } else { repository.join(&target) };
@@ -81,6 +81,9 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             let sessions=live_sessions(&record.path)?;
             if !sessions.is_empty() { return Err(format!("{} live session(s) use this worktree; close them before removing it",sessions.len())); }
             let safety=service.worktree_safety(&record.path,&cancellation).map_err(|error|error.to_string())?;
+            if expected_fingerprint.as_ref().is_some_and(|fingerprint|fingerprint!=&safety.fingerprint) {
+                return Err("The worktree changed after confirmation; review its safety again".into());
+            }
             if safety.requires_confirmation()&&!force {
                 return Err(format!("Worktree contains {} modified, {} untracked, {} notable ignored file(s), {} unpushed and {} detached-only commit(s); pass --force to confirm discarding this work",safety.modified,safety.untracked,safety.notable_ignored.len(),safety.unpushed_commits,safety.detached_only_commits));
             }
@@ -97,5 +100,24 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             } else {None};
             Ok(Reply::Removed {path:record.path.clone(),branch_deleted})
         }
+        Operation::Inspect {repository,path} => inspect(&service,&repository,&path,&cancellation),
+        Operation::SetDisposableIgnoredDirectories {repository,path,directories} => {
+            same_repository(&service,&repository,&path,&cancellation)?;
+            service.set_disposable_ignored_directories(&path,&directories,&cancellation).map_err(|error|error.to_string())?;
+            inspect(&service,&repository,&path,&cancellation)
+        }
     }
+}
+
+fn same_repository(service:&Service,repository:&Path,path:&Path,cancel:&CancellationToken)->Result<(),String> {
+    let common=service.common_dir(repository,cancel).map_err(|error|error.to_string())?;
+    if service.common_dir(path,cancel).map_err(|error|error.to_string())?!=common {
+        return Err("The selected worktree belongs to another repository".into());
+    }
+    Ok(())
+}
+fn inspect(service:&Service,repository:&Path,path:&Path,cancel:&CancellationToken)->Result<Reply,String> {
+    same_repository(service,repository,path,cancel)?;
+    let snapshot=service.worktree_safety(path,cancel).map_err(|error|error.to_string())?;
+    Ok(Reply::Inspected {snapshot:serde_json::to_string(&snapshot).map_err(|error|error.to_string())?,disposable_ignored_directories:service.disposable_ignored_directories(path,cancel).map_err(|error|error.to_string())?})
 }

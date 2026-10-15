@@ -18,7 +18,10 @@ pub enum Operation {
         target: String,
         force: bool,
         delete_branch: bool,
+        expected_fingerprint: Option<String>,
     },
+    Inspect { repository:PathBuf, path:PathBuf },
+    SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
 }
 
 impl Operation {
@@ -26,10 +29,12 @@ impl Operation {
         match self {
             Self::Create { repository, .. }
             | Self::List { repository }
-            | Self::Remove { repository, .. } => repository,
+            | Self::Remove { repository, .. }
+            | Self::Inspect { repository, .. }
+            | Self::SetDisposableIgnoredDirectories { repository, .. } => repository,
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. }) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. }) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +57,9 @@ pub enum Reply {
     Created { worktree: Entry, warnings: Vec<String>, setup: Option<Setup> },
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String> },
+    /// Repository snapshots keep their byte-exact path schema without pulling
+    /// the daemon's Git/SQLite implementation into the control CLI.
+    Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
