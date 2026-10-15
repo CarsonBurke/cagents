@@ -2949,6 +2949,36 @@ mod settings_recorder_tests {
     }
 
     #[test]
+    fn sidebar_thread_binding_retains_worktree_and_rejects_other_native_row_targets() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let project = app.sidebar_model.projects[0].id;
+        let worktree = app.sidebar_model.projects[0].worktrees[1].id;
+        let channel = crate::model::ChannelId::new();
+        app.sidebar_model.projects[0].channels.push(sidebar::SidebarChannel::new(channel, "Example".into(), false, None, false, 0, false, 1));
+        let region = crate::input_trace::KeyboardRegion::from(workspace_widget::FocusedPane::SidebarRows);
+        let focused = app.workspace.focused();
+        let cards = app.durable.cards.len();
+        for (row, available) in [
+            (sidebar::SelectionRow::Worktree(project, worktree), true),
+            (sidebar::SelectionRow::Project(project), false),
+            (sidebar::SelectionRow::Channel(channel), false),
+            (sidebar::SelectionRow::Worktree(project, WorktreeId::new()), false),
+        ] {
+            let _event = app.input_trace.scoped_keyboard_focus(region, Some(sidebar::selection_row_focus_id(row)));
+            assert_eq!(app.command_available(Command::NewThread), available, "{row:?}");
+            if available {
+                let target = app.sidebar_command_target().expect("native row target");
+                assert!(matches!(target.resolve_in(&app.sidebar_model, &app.sidebar_state, Command::NewThread), Some(SidebarAction::ProjectCommand { project_id, worktree_id: Some(id), command: sidebar::ProjectCommand::NewChannel }) if project_id == project && id == worktree));
+            } else {
+                drop(app.run_workspace_command(Command::NewThread, keyboard::Modifiers::empty()));
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.durable.cards.len(), cards, "rejected row must not create a background pane");
+            }
+        }
+    }
+
+    #[test]
     fn stale_native_sidebar_identity_does_not_fall_back_to_focused_pane() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let region = crate::input_trace::KeyboardRegion::from(workspace_widget::FocusedPane::SidebarRows);
