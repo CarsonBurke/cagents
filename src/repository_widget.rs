@@ -7099,7 +7099,7 @@ impl RepositoryRuntime {
     /// must also fence the live buffer revision before applying a patch.
     pub fn current_diff_model_snapshot(&self) -> Option<Arc<DiffModel>> {
         match self.diff_state(&self.diff_basis) {
-            Some(DiffState::Ready(RenderedDiff::Text { model,.. },_)) => Some(Arc::clone(model)),
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(Arc::clone(model)),
             _ => None,
         }
     }

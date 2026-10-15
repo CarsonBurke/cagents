@@ -85,7 +85,8 @@ pub(crate) struct SearchSnapshot {
 
 impl SearchSnapshot {
     fn lines(&self) -> impl Iterator<Item = Cow<'_, str>> {
-        (0..self.source.line_count()).filter_map(|index| self.source.line(index).map(|line| line.text))
+        (0..self.source.line_count())
+            .filter_map(|index| self.source.line(index).map(|line| line.text))
     }
 
     pub(crate) fn find_matches(
@@ -96,24 +97,48 @@ impl SearchSnapshot {
         find_in_lines(self.lines(), query, cancelled)
     }
 
-    pub(crate) fn find_matches_with(&self, query: &str, options: crate::editor_search::FindOptions,
-        cancelled: impl Fn() -> bool) -> Result<Option<Vec<(Position, Position)>>, String> {
+    pub(crate) fn find_matches_with(
+        &self,
+        query: &str,
+        options: crate::editor_search::FindOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<Vec<(Position, Position)>>, String> {
         crate::editor_search::find_in_lines(self.lines(), query, options, cancelled)
     }
 
-    pub(crate) fn replace_matches_with(&self, matches: &[(Position, Position)], query: &str,
-        replacement: &str, options: crate::editor_search::FindOptions, preserve: bool) -> Result<String, String> {
-        let replacement = crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
+    pub(crate) fn replace_matches_with(
+        &self,
+        matches: &[(Position, Position)],
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+    ) -> Result<String, String> {
+        let replacement =
+            crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
         let text = self.source.text();
         let mut result = String::with_capacity(text.len());
         let mut copied = 0;
         for &(start, end) in matches {
-            if start.line != end.line { return Err("A search match crosses a line boundary.".into()); }
-            let line = self.source.line(start.line).ok_or("The selected match is outside the document.")?;
+            if start.line != end.line {
+                return Err("A search match crosses a line boundary.".into());
+            }
+            let line = self
+                .source
+                .line(start.line)
+                .ok_or("The selected match is outside the document.")?;
             let inserted = replacement.expand(&line.text, start.column, end.column)?;
-            let start = self.source.byte_offset(start).ok_or("Invalid search position.")?;
-            let end = self.source.byte_offset(end).ok_or("Invalid search position.")?;
-            if end < start || start < copied { return Err("Search matches overlap.".into()); }
+            let start = self
+                .source
+                .byte_offset(start)
+                .ok_or("Invalid search position.")?;
+            let end = self
+                .source
+                .byte_offset(end)
+                .ok_or("Invalid search position.")?;
+            if end < start || start < copied {
+                return Err("Search matches overlap.".into());
+            }
             result.push_str(text.get(copied..start).ok_or("Invalid search position.")?);
             result.push_str(&inserted);
             copied = end;
@@ -134,7 +159,9 @@ impl SearchSnapshot {
         for &(start, end) in matches {
             let start = self.source.byte_offset(start)?;
             let end = self.source.byte_offset(end)?;
-            if end < start || start < copied { return None; }
+            if end < start || start < copied {
+                return None;
+            }
             result.push_str(text.get(copied..start)?);
             result.push_str(replacement);
             copied = end;
@@ -1378,7 +1405,9 @@ where
     }
 
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
-        SearchSnapshot { source: self.text_snapshot() }
+        SearchSnapshot {
+            source: self.text_snapshot(),
+        }
     }
 
     /// Byte length of the text [`Content::text`] would produce, without
@@ -4039,15 +4068,32 @@ mod tests {
 
     #[test]
     fn capturing_and_searching_large_snapshot_never_materializes_whole_text() {
-        let source="let target = 1;\n".repeat(50_000);
-        let content:Content=Content::with_text(&source);
+        let source = "let target = 1;\n".repeat(50_000);
+        let content: Content = Content::with_text(&source);
         take_text_call_count();
-        let snapshot=content.search_snapshot();
+        let snapshot = content.search_snapshot();
         assert!(!snapshot.source.is_materialized());
-        assert_eq!(snapshot.find_matches("target",||false).unwrap().len(),50_000);
-        assert_eq!(snapshot.find_matches_with("tar(get)",crate::editor_search::FindOptions{regex:true,..Default::default()},||false).unwrap().unwrap().len(),50_000);
+        assert_eq!(
+            snapshot.find_matches("target", || false).unwrap().len(),
+            50_000
+        );
+        assert_eq!(
+            snapshot
+                .find_matches_with(
+                    "tar(get)",
+                    crate::editor_search::FindOptions {
+                        regex: true,
+                        ..Default::default()
+                    },
+                    || false
+                )
+                .unwrap()
+                .unwrap()
+                .len(),
+            50_000
+        );
         assert!(!snapshot.source.is_materialized());
-        assert_eq!(take_text_call_count(),0);
+        assert_eq!(take_text_call_count(), 0);
     }
 
     #[test]

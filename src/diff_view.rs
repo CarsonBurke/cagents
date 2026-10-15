@@ -2444,12 +2444,24 @@ mod tests {
 
     #[test]
     fn immutable_rendered_diff_clones_share_all_model_rows() {
-        let original = RenderedDiff::Text { model: Arc::new(build_diff("old\nkept\n","new\nkept\n")), old_label:"Old".into(),new_label:"New".into() };
+        let original = RenderedDiff::Text {
+            model: Arc::new(build_diff("old\nkept\n", "new\nkept\n")),
+            old_label: "Old".into(),
+            new_label: "New".into(),
+        };
         let copied = original.clone();
-        let (RenderedDiff::Text { model: original,.. },RenderedDiff::Text { model: copied,.. }) = (&original,&copied) else { unreachable!() };
-        assert!(Arc::ptr_eq(original,copied));
-        assert_eq!(original.inline_rows.as_ptr(),copied.inline_rows.as_ptr());
-        assert_eq!(original.split_rows.as_ptr(),copied.split_rows.as_ptr());
+        let (
+            RenderedDiff::Text {
+                model: original, ..
+            },
+            RenderedDiff::Text { model: copied, .. },
+        ) = (&original, &copied)
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(original, copied));
+        assert_eq!(original.inline_rows.as_ptr(), copied.inline_rows.as_ptr());
+        assert_eq!(original.split_rows.as_ptr(), copied.split_rows.as_ptr());
     }
 
     #[test]
@@ -3546,7 +3558,11 @@ mod tests {
         else {
             panic!("{path} on {basis:?} should produce a text diff, got {content:?}");
         };
-        (Arc::try_unwrap(model).expect("fixture owns its complete model"), old_label, new_label)
+        (
+            Arc::try_unwrap(model).expect("fixture owns its complete model"),
+            old_label,
+            new_label,
+        )
     }
 
     /// The working-tree side of an untracked or replaced path, which the
