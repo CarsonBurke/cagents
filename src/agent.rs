@@ -43,6 +43,25 @@ pub enum ActivityOutcome {
     Succeeded,
     Cancelled,
     Failed { reason: String },
+    Interrupted { reason: String },
+}
+
+impl ActivityOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "Finished",
+            Self::Cancelled => "Cancelled",
+            Self::Failed { .. } => "Failed",
+            Self::Interrupted { .. } => "Interrupted",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason } | Self::Interrupted { reason } => Some(reason),
+            Self::Succeeded | Self::Cancelled => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

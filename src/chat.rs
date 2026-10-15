@@ -22,6 +22,8 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
 #[cfg(any(feature = "ui", feature = "host"))]
 #[path = "chat/protocol/terminal_output.rs"]
 pub(crate) mod terminal_output;
@@ -1107,6 +1109,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 thinking,
                 delta,
             }],
+            Event::InputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentInputDelta {
+                id: id.into(),
+                item_id,
+                offset,
+                delta,
+            }],
             Event::OutputDelta {
                 id: item_id,
                 offset,
@@ -1943,6 +1955,19 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    ProviderExit(ProviderExitDiagnostic),
+    InputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
+    SubagentInputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2088,21 +2113,36 @@ mod tests {
         for outcome in [
             ActivityOutcome::Succeeded,
             ActivityOutcome::Cancelled,
-            ActivityOutcome::Failed { reason: "Provider exited with status 3: authentication failed".into() },
+            ActivityOutcome::Failed {
+                reason: "Provider exited with status 3: authentication failed".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "Provider exited with status 0 before its final result".into(),
+            },
         ] {
             let snapshot = super::Snapshot {
                 outcome: Some(outcome),
                 provider_exit: Some(super::ProviderExitDiagnostic {
                     summary: "Provider exited with status 3. Restart session to continue.".into(),
                     output: "First diagnostic\nAuthentication failed\n".into(),
-                    log: Some(super::ProviderExitLog { id: "retained-log".into(), bytes: 4096, omitted: 128 }),
+                    log: Some(super::ProviderExitLog {
+                        id: "retained-log".into(),
+                        bytes: 4096,
+                        omitted: 128,
+                    }),
                 }),
                 ..Default::default()
             };
             let binary = postcard::to_stdvec(&snapshot).unwrap();
-            assert_eq!(postcard::from_bytes::<super::Snapshot>(&binary).unwrap(), snapshot);
+            assert_eq!(
+                postcard::from_bytes::<super::Snapshot>(&binary).unwrap(),
+                snapshot
+            );
             let json = serde_json::to_value(&snapshot).unwrap();
-            assert_eq!(serde_json::from_value::<super::Snapshot>(json).unwrap(), snapshot);
+            assert_eq!(
+                serde_json::from_value::<super::Snapshot>(json).unwrap(),
+                snapshot
+            );
         }
     }
 
