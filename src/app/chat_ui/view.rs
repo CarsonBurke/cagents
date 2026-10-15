@@ -1079,9 +1079,17 @@ impl Runtime {
         } else if matches!(
             &snapshot.outcome,
             Some(crate::agent::ActivityOutcome::Cancelled)
-        ) && (!snapshot.is_working() || snapshot.exited)
-        {
-            (Some(Icon::Cancel), "Cancelled")
+        ) {
+            // The invocation ended; independently owned requests and background
+            // work still report their own state until native proof settles them.
+            let state = if !snapshot.exited && snapshot.activity() == crate::agent::ActivityState::Waiting {
+                "Cancelled · waiting for you"
+            } else if !snapshot.exited && snapshot.is_working() {
+                "Cancelled · work continues"
+            } else {
+                "Cancelled"
+            };
+            (Some(Icon::Cancel), state)
         } else if matches!(
             &snapshot.outcome,
             Some(crate::agent::ActivityOutcome::Succeeded)
@@ -5228,6 +5236,26 @@ mod tests {
         assert_eq!(glyph(&runtime, "tool-B"), Some(chat::ToolStatus::Succeeded));
         assert_eq!(glyph(&runtime, "background-control"), Some(chat::ToolStatus::Running),
             "a terminal current scalar never proves an unbound/background task stopped");
+    }
+
+    #[test]
+    fn attention_cancelled_footer_keeps_independent_work_and_requests_visible() {
+        let (mut runtime, _) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
+        snapshot.subagents.push(native_child_fixture());
+        assert_eq!(runtime.conversation_status(false),
+            (Some(Icon::Cancel), "Cancelled · work continues"));
+        assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+        assert_eq!(runtime.conversation_status(false).1, "Cancelled · waiting for you");
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.outcome = None; // Confirmed next parent turn started.
+        snapshot.busy = true;
+        snapshot.subagents[0].waiting = false;
+        assert_eq!(runtime.conversation_status(false).0, Some(Icon::AgentWorking));
+        assert!(!runtime.conversation_status(false).1.contains("Cancelled"));
+        assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
     }
 
     #[test]
