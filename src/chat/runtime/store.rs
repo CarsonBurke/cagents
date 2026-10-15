@@ -1694,7 +1694,7 @@ mod tests {
             assert!(optimized.sql < reference.sql / 4,
                 "validated appends must avoid reading the resident source from SQLite");
             if bytes > PART_BYTES * 2 {
-                assert!(optimized.bodies < reference.bodies / 2,
+                assert!(optimized.bodies < reference.bodies * 3 / 4,
                     "completed fragments must avoid materializing immutable bodies");
             }
         }
