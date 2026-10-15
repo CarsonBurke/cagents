@@ -1048,8 +1048,9 @@ impl LocalHandle {
         }
     }
 
-    /// The actor compares consent with all earlier admitted commands before
-    /// fencing further work. Call outside HostLock; joining may take time.
+    /// A completed observed owner may reconcile exact cleanup. Live backends
+    /// require explicit Stop until they offer an atomic conditional-close fence.
+    /// Call outside HostLock; retained cleanup can take time.
     pub(crate) fn close_if_revision(&self, revision: u64) -> Result<(), String> {
         if self.close_observation().directory_identity.is_none() {
             return Err("The provider execution scope is not authoritatively observed; reattach before confirming close".into());

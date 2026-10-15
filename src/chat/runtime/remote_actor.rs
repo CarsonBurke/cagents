@@ -2508,10 +2508,8 @@ done"#;
             "prepared restart retains physical close scope"
         );
         assert_eq!(close.working_directory, fixture._root.path());
-        server
-            .actor
-            .close_if_revision(close.close_revision)
-            .unwrap();
+        assert!(server.actor.close_if_revision(close.close_revision).unwrap_err().contains("work is unchanged"));
+        assert!(!server.actor.close_observation().closing);
         server
             .actor
             .close_until(Instant::now() + Duration::from_secs(5))
