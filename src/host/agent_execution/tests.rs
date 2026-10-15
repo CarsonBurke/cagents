@@ -2824,6 +2824,41 @@ fn interrupted_cleanup_preserves_caller_scope_and_refuses_live_work() {
 }
 
 #[test]
+fn interrupted_cleanup_uses_authenticated_session_lineage_and_refuses_all_callers() {
+    if isolated("interrupted_cleanup_uses_authenticated_session_lineage_and_refuses_all_callers").is_some() {
+        return;
+    }
+    let (host, mut request, _) = fixture();
+    let parent = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let session = store.lock().unwrap().agent(parent.agent.id).unwrap().session.unwrap().id();
+    let authority = store.lock().unwrap().retained_agent_authority(session).unwrap();
+    let caller = origin(&host, &authority).unwrap();
+    assert!(matches!(caller, Origin::Child { .. }));
+    request.idempotency_key = "lineage-interrupted".into();
+    let own = store.lock().unwrap().submit_agent(&caller, &request, 1).unwrap();
+    request.idempotency_key = "foreign-interrupted".into();
+    let foreign = store.lock().unwrap().submit_agent(&Origin::User, &request, 2).unwrap();
+    store.lock().unwrap().interrupt_unproven_agent_runs(3).unwrap();
+    request.idempotency_key = "lineage-active".into();
+    let active = store.lock().unwrap().submit_agent(&caller, &request, 4).unwrap();
+    assert!(close_interrupted(&host, &authority, true, None).unwrap_err().contains("Only a user"));
+    assert!(!store.lock().unwrap().agent(own.agent.id).unwrap().closed);
+    assert!(!store.lock().unwrap().agent(foreign.agent.id).unwrap().closed);
+    let closed = close_interrupted(&host, &authority, false, None).unwrap();
+    assert_eq!(closed.closed, [own.agent.id]);
+    assert!(closed.failed.is_empty());
+    assert!(!store.lock().unwrap().agent(active.agent.id).unwrap().closed);
+    assert!(!store.lock().unwrap().agent(foreign.agent.id).unwrap().closed);
+    assert_eq!(store.lock().unwrap().agent_capacity(&caller, Default::default()).unwrap().caller.running, 1);
+    close_as_origin(&host, &caller, active.agent.id, false).unwrap();
+    close(&host, &Authority::default(), foreign.agent.id).unwrap();
+    close(&host, &Authority::default(), parent.agent.id).unwrap();
+    super::super::finish_chat_shutdown(&host).unwrap();
+}
+
+#[test]
 fn interrupted_cleanup_batches_progress_without_repeating_or_crossing_scope() {
     if isolated("interrupted_cleanup_batches_progress_without_repeating_or_crossing_scope").is_some() { return; }
     let (host, mut request, _) = fixture();
