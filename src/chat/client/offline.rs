@@ -3,6 +3,7 @@
 //! The unlinked file is neither durable provider history nor a reattachment
 //! capability. It only keeps an evicted reader usable after transport EOF.
 use super::*;
+mod sources;
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -20,9 +21,11 @@ struct Publication {
     snapshot: Arc<Snapshot>,
     clock: Option<SourceClock>,
     epoch: u64,
+    sources: sources::Manifest,
 }
 struct Cached {
     file: File,
+    sources: sources::Manifest,
     bytes: u64,
     clock: Option<SourceClock>,
     epoch: u64,
@@ -39,6 +42,7 @@ struct Data {
     revoked: bool,
     error: Option<String>,
     rendered: bool,
+    unavailable: bool,
 }
 
 pub(super) struct State {
@@ -86,11 +90,14 @@ impl State {
     pub(super) fn capture(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool) {
         {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
-            if data.revoked || (!rendered && data.rendered) { return; }
+            if data.revoked || (!rendered && data.rendered)
+                || (rendered && data.unavailable && snapshot.transcript_bytes() == 0) { return; }
             data.rendered |= rendered;
+            data.unavailable = false;
             data.epoch = data.epoch.wrapping_add(1);
             let epoch = data.epoch;
-            data.pending = Some(Publication { snapshot, clock, epoch });
+            let sources = sources::Manifest::capture(&snapshot);
+            data.pending = Some(Publication { snapshot, clock, epoch, sources });
             data.fallback = None;
         }
         self.schedule();
@@ -137,6 +144,7 @@ impl State {
         data.restore = false;
         data.requested_show = false;
         data.rendered = false;
+        data.unavailable = false;
     }
 
     /// Content reset keeps the client usable but removes the previous view.
@@ -202,7 +210,7 @@ impl State {
             return Err("Cached publication exceeds its bounded view file limit".into());
         }
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        Ok(Cached { file, bytes, clock: record.clock, epoch: record.epoch })
+        Ok(Cached { file, bytes, sources: record.sources.clone(), clock: record.clock, epoch: record.epoch })
     }
 
     fn work(self: &Arc<Self>) {
@@ -245,6 +253,26 @@ impl State {
         if pending { self.schedule(); }
     }
 
+    fn restore_failed(&self, epoch: u64, request: u64, generation: u64, error: String) {
+        let Some(owner) = self.owner.get().and_then(Weak::upgrade) else { return; };
+        let mut snapshot = owner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        if data.revoked || data.epoch != epoch || data.request != request
+            || owner.alive.load(Ordering::Acquire) || !owner.body_requested.load(Ordering::Acquire)
+            || snapshot.generation != generation { return; }
+        data.error = Some(error.clone());
+        data.unavailable = true;
+        // Publish an honest read-only status without overwriting authoritative
+        // error/outcome metadata. Hide/show can retry when source budget frees.
+        Arc::make_mut(&mut snapshot).read_only_reason = Some(format!(
+            "Connection lost; the last cached view is temporarily unavailable: {error}. Hide and reopen this pane to retry."));
+        owner.transcript_resident.store(true, Ordering::Release);
+        drop(data);
+        drop(snapshot);
+        tracing::warn!(target: "cagents::memory", %error, "Cannot restore cached chat view");
+        (owner.wake)(Wake::Changed);
+    }
+
     fn restore(&self) {
         let Some(owner) = self.owner.get().and_then(Weak::upgrade) else { return; };
         // Keep the snapshot -> cache ordering used by visibility transitions.
@@ -254,27 +282,40 @@ impl State {
             if !data.restore || data.revoked || data.pending.is_some() { return; }
             data.restore = false;
             let file = data.cached.as_ref().and_then(|cached| cached.file.try_clone().ok().map(|file|
-                (file, cached.epoch, cached.clock)));
-            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock));
+                (file, cached.epoch, cached.clock, cached.sources.clone())));
+            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock, record.sources.clone()));
             (data.request, data.epoch, file, fallback)
         };
         if owner.alive.load(Ordering::Acquire) || !owner.body_requested.load(Ordering::Acquire) { return; }
         // A disk reader must not keep the client alive after its pane closes.
         drop(owner);
-        let restored = if let Some((snapshot, record_epoch, clock)) = fallback {
-            Ok((snapshot, record_epoch, clock))
-        } else if let Some((mut file, record_epoch, clock)) = cached {
+        let restored = if let Some((mut snapshot, record_epoch, clock, sources)) = fallback {
+            // These original Item owners already carry their shared leases.
+            sources.normalize(Arc::make_mut(&mut snapshot)).map(|()| (snapshot, record_epoch, clock))
+        } else if let Some((mut file, record_epoch, clock, sources)) = cached {
             self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             self.trace();
-            let result = file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string()).and_then(|_| {
+            let result = sources.reserve().and_then(|reservation| {
+                file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 let checked = CheckedReader { state: self, epoch, request, file: file.take(MAX_VIEW_BYTES + 1) };
                 serde_json::from_reader::<_, Snapshot>(BufReader::with_capacity(BUFFER, checked))
-                    .map(|snapshot| (Arc::new(snapshot), record_epoch, clock)).map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string()).and_then(|mut snapshot| {
+                        sources.adopt(&mut snapshot, reservation)?;
+                        Ok((Arc::new(snapshot), record_epoch, clock))
+                    })
             });
             self.buffer_bytes.store(0, Ordering::Release);
             result
         } else { return; };
-        let Ok((mut restored, record_epoch, _cached_clock)) = restored else { return; };
+        let (mut restored, record_epoch, _cached_clock) = match restored {
+            Ok(restored) => restored,
+            Err(error) => {
+                // Preserve the private file for a later reveal. Capacity denial
+                // must never decode a large uncharged body or launch a provider.
+                self.restore_failed(epoch, request, expected_generation, error);
+                return;
+            }
+        };
         self.in_flight_bytes.store(restored.transcript_bytes() as u64, Ordering::Release);
         self.trace();
         #[cfg(test)]
@@ -287,7 +328,7 @@ impl State {
             return;
         };
         let mut snapshot = owner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-        let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
         if data.revoked || data.request != request || data.epoch != epoch || record_epoch != epoch
             || owner.alive.load(Ordering::Acquire) || !owner.body_requested.load(Ordering::Acquire)
             || snapshot.generation != expected_generation {
@@ -301,6 +342,12 @@ impl State {
         let cached = Arc::make_mut(&mut restored);
         let mut publication = (**snapshot).clone();
         publication.items = std::mem::take(&mut cached.items);
+        // Body ranges describe the cached visible prefix, not the newer control
+        // publication. In particular an old epoch must never be relabelled.
+        publication.source_revision = cached.source_revision;
+        publication.source_parts = std::mem::take(&mut cached.source_parts);
+        publication.source_parts.retain(|part| part.source.agent_id.as_ref().is_none_or(|id|
+            publication.subagents.iter().any(|child| &child.id == id)));
         for child in &mut publication.subagents {
             if let Some(previous) = cached.subagents.iter_mut().find(|previous| previous.id == child.id) {
                 child.items = std::mem::take(&mut previous.items);
@@ -308,6 +355,8 @@ impl State {
         }
         publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
         *snapshot = Arc::new(publication);
+        data.unavailable = false;
+        data.error = None;
         owner.transcript_resident.store(true, Ordering::Release);
         self.in_flight_bytes.store(0, Ordering::Release);
         drop(data);
@@ -331,7 +380,8 @@ fn registry() -> &'static Mutex<Vec<Weak<State>>> {
 }
 
 /// Includes the at-most-two executing jobs even after their client closes.
-/// Partial decoder allocations are bounded by two wire windows but opaque;
+/// Partial decoder allocations include reserved full sources and two inline
+/// windows; allocator/serde metadata amplification remains opaque;
 /// these counters report complete source owners and fixed I/O buffer capacity.
 pub(super) fn global_metrics() -> (usize, usize, usize, u64) {
     let mut states = registry().lock().unwrap_or_else(|p| p.into_inner());
@@ -507,6 +557,17 @@ mod tests {
         *text = "complete projected prefix\n".repeat(64 * 1024);
         let expected = text.len();
         view.items[0] = Arc::new(item);
+        let source = crate::chat::cache::SourceKey { agent_id: None, source_id: view.items[0].id.clone() };
+        assert_eq!(crate::chat::source_owners::admit(&view.items[0], &source, 7, None),
+            crate::chat::source_owners::Admission::Ready);
+        let original_metadata = crate::chat::cache::SourceMetadata::from_item(&view.items[0]).unwrap();
+        // A replacement can be known while the last rendered prefix still has
+        // its original frozen epoch and source timestamps.
+        view.source_parts.push(crate::chat::cache::SourcePart {
+            item_id: "new-raw-part".into(), source, start: 0, end: 8,
+            source_len: expected + 99, replacement: false, epoch: 99,
+            metadata: crate::chat::cache::SourceMetadata { at: Some(999), ..original_metadata.clone() },
+        });
         handle.remember_visible_view(Arc::new(view), None);
         hidden_on_disk(&handle);
         handle.set_visible(true).unwrap();
@@ -514,6 +575,12 @@ mod tests {
         let snapshot = handle.snapshot();
         let super::super::super::ItemContent::Text { text, .. } = &snapshot.items[0].content else { panic!("text"); };
         assert_eq!(text.len(), expected, "raw inline eviction must not replace the displayed view");
+        assert_eq!(snapshot.source_parts.len(), 1);
+        let part = &snapshot.source_parts[0];
+        assert_eq!((part.start, part.end, part.source_len, part.epoch), (0, expected, expected, 7));
+        assert_eq!(part.metadata, original_metadata);
+        assert_eq!(part.item_id, snapshot.items[0].id);
+        assert!(!part.replacement);
     }
 
     #[test]
