@@ -156,6 +156,59 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn scripted_client_project_preparation_holds_owner_before_enrolling_registered_source() {
+        if !crate::git_watch::tests::fixture_isolated(
+            "app::project_source_admission::tests::scripted_client_project_preparation_holds_owner_before_enrolling_registered_source") { return; }
+        use crate::{edited_root_admission::test_peer::{Event, ScriptedEditedRootPeer}, fs_safety::Root};
+        let directory = tempfile::tempdir().unwrap();
+        let command = crate::repository::CommandSpec::new("git").cwd(directory.path())
+            .args(["init", "--template=", "-b", "main"]);
+        crate::git_watch::tests::run_fixture_command(
+            crate::git_watch::tests::isolated_fixture_command(command));
+        let root = Root::open(directory.path()).unwrap();
+        let peer = ScriptedEditedRootPeer::start(&root);
+        let mut admissions = EditedRootAdmissions::default();
+        let ticket = admissions.reserve().unwrap();
+        let project = ProjectId::new();
+        let mut prepared = prepare_project_repository(directory.path(), project,
+            CancellationToken::new(), Some(ProjectKind::Git), None, Ok(peer.endpoint()),
+            ticket.begin_preparation().unwrap(), Instant::now() + Duration::from_secs(3)).unwrap();
+        assert!(prepared.loaded.creation_source.is_none(), "phase one must not mint a usable source");
+        assert_eq!(prepared.loaded.project.id, project);
+        assert_eq!(ticket.phase(), AdmissionPhase::Prepared);
+        assert!(peer.events().is_empty(), "Connect/Catalog and metadata do not register the Root");
+        // This invokes only the phase-two worker helper. Actual App generation,
+        // stale-result and window ingress handlers remain separate requirements.
+        let source = prepared.prepared_creation.take().unwrap().enroll(
+            &CancellationToken::new(), Instant::now() + Duration::from_secs(3)).unwrap();
+        let actor = source.id();
+        let admission = source.edited_root_admission().unwrap();
+        assert_eq!(admission.ticket().id(), ticket.id());
+        admission.validate_for_root(&root, Instant::now() + Duration::from_secs(3)).unwrap();
+        assert_eq!(ticket.phase(), AdmissionPhase::Active);
+        let refreshed = prepare_project_repository(directory.path(), project,
+            CancellationToken::new(), Some(ProjectKind::Git), Some(source.clone()),
+            Err("current endpoint must not replace original source".into()),
+            admissions.reserve().unwrap().begin_preparation().unwrap(),
+            Instant::now() + Duration::from_secs(3)).unwrap();
+        assert!(refreshed.prepared_creation.is_none());
+        assert_eq!(refreshed.loaded.creation_source.as_ref().unwrap().id(), actor);
+        ticket.request_retirement();
+        assert!(admissions.next_retirement().unwrap().is_none());
+        drop(refreshed);
+        drop(admission);
+        drop(source);
+        drop(prepared);
+        admissions.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(3)).unwrap();
+        assert!(admissions.is_settled());
+        let events = peer.finish();
+        assert_eq!(events.iter().filter(|event| **event == Event::Prepared).count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == Event::Activated).count(), 1);
+        assert_eq!(events.iter().filter(|event| **event == Event::Released).count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fresh_git_endpoint_failure_never_publishes_a_legacy_source() {
         if !crate::git_watch::tests::fixture_isolated(
             "app::project_source_admission::tests::fresh_git_endpoint_failure_never_publishes_a_legacy_source") { return; }
