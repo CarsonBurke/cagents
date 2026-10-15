@@ -118,6 +118,11 @@ impl DiscardRecovery {
         self.live_recovery.needs_resolution()
             || (self.remaining_paths() > 0 && unix_ms() <= self.expires_unix_ms.max(self.live_recovery.resume_deadline()))
     }
+    /// Pending cleanup has a separate UI control and no expiry timer. A
+    /// successful typed resolution resumes the remaining Undo window.
+    pub fn undo_deadline_unix_ms(&self) -> Option<u64> {
+        (!self.live_recovery.needs_resolution()).then(|| self.expires_unix_ms.max(self.live_recovery.resume_deadline()))
+    }
     pub fn remaining_paths(&self) -> usize {
         self.entries.len().saturating_sub(self.live_recovery.completed_count())
     }
@@ -536,10 +541,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if cancellation.is_cancelled() {
             return Err(ValidationError::Io("Discard recovery was cancelled before retry".into()).into());
         }
+        if !recovery.live_recovery.needs_resolution() {
+            return Ok(DiscardRecoveryResolution { remaining_paths: recovery.remaining_paths() });
+        }
         if let Some(authority) = recovery.live_recovery.authority() {
-            if let Err(message) = authority.retry() {
-                return Err(RepositoryError::Recovery { message, authority });
-            }
+            self.resolve_recovery(&authority, cancellation)?;
         }
         recovery.live_recovery.acknowledge_resolution();
         Ok(DiscardRecoveryResolution { remaining_paths: recovery.remaining_paths() })
