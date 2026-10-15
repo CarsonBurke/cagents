@@ -65,6 +65,7 @@ pub struct ReplyArgs {
     /// Wait for the answer to this reply, as `ask` does.
     #[arg(long)]
     pub(super) wait: bool,
+    /// Maximum time to wait for a message or reply, in seconds.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -78,6 +79,7 @@ pub struct InboxArgs {
     /// Wait for a message if none is new.
     #[arg(long, conflicts_with = "all")]
     pub(super) wait: bool,
+    /// Maximum time to wait for a message or reply, in seconds.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
