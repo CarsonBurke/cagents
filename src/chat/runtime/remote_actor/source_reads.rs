@@ -1,14 +1,16 @@
 //! Typed original-source reads use the actual ingestion Store in the helper.
-//! Dependencies: cli_contracts ee6993844 and Changes source2caedaf38.
+//! Dependencies: cli_contracts ee6993844, Changes source2caedaf38 and raw
+//! parent source2d8cd3a38 (including its privacy/publication follow-ups).
 //! One fixed worker owns disk reads and socket replies. A stalled cache never
 //! occupies the helper's control loop or creates per-request threads.
 use super::*;
 use crate::chat::cache::{SourceError, SourcePage, SourceQuery,changes::{ManifestQuery,Manifest,PatchQuery,PatchPage}};
+use crate::chat::cache::raw::{RawSourceQuery,RawSourcePage};
 use std::sync::atomic::AtomicU64;
 
 const QUEUED_READS:usize=4;
 enum Query {
-    Text(SourceQuery),Manifest(ManifestQuery),Patch(PatchQuery),
+    Text(SourceQuery),Raw(RawSourceQuery),Manifest(ManifestQuery),Patch(PatchQuery),
     Snapshot(Option<u64>),
     Presentation(crate::model::TerminalId,Option<u64>),
     Files(Command),ExitOutput(String,u64),
@@ -34,6 +36,7 @@ impl Service {
                     authorize(&job.control,&job.proof)?;
                     let result=match job.query {
                         Query::Text(query)=>serde_json::to_value(job.actor.source_query(query)),
+                        Query::Raw(query)=>serde_json::to_value(job.actor.raw_source_query(query)),
                         Query::Manifest(query)=>serde_json::to_value(job.actor.changes_manifest(query)),
                         Query::Patch(query)=>serde_json::to_value(job.actor.change_patch(query)),
                         Query::Snapshot(after)=>{
@@ -64,7 +67,7 @@ impl Service {
     }
 }
 pub(super) fn is_read(method:&str)->bool {
-    matches!(method,"source_query"|"changes_manifest"|"change_patch"|"snapshot"|"presentation"|"file_query"|"exit_output")
+    matches!(method,"source_query"|"raw_source_query"|"changes_manifest"|"change_patch"|"snapshot"|"presentation"|"file_query"|"exit_output")
 }
 impl Server {
     pub(super) fn dispatch_source_read(&mut self,control:UnixStream,request:Invocation)->Result<(),(UnixStream,String)> {
@@ -72,6 +75,7 @@ impl Server {
             if request.epoch!=Some(self.epoch) || request.proof!=self.proof {return Err("Retained actor attachment was superseded; source read refused".into());}
             let query=match request.method.as_str() {
                 "source_query"=>Query::Text(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
+                "raw_source_query"=>Query::Raw(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
                 "changes_manifest"=>Query::Manifest(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
                 "change_patch"=>Query::Patch(serde_json::from_value(request.args).map_err(|error|error.to_string())?),
                 "snapshot"=>{
@@ -115,6 +119,13 @@ impl RemoteActor {
         let args=serde_json::to_value(query).map_err(|error|SourceError::Transport(error.to_string()))?;
         self.call_until::<Result<Manifest,SourceError>>("changes_manifest",args,Instant::now()+TIMEOUT).map_err(SourceError::Transport)?
     }
+    pub fn raw_source_query(&self,query:RawSourceQuery)->Result<RawSourcePage,SourceError> {
+        self.raw_source_query_until(query,Instant::now()+TIMEOUT)
+    }
+    fn raw_source_query_until(&self,query:RawSourceQuery,deadline:Instant)->Result<RawSourcePage,SourceError> {
+        let args=serde_json::to_value(query).map_err(|error|SourceError::Transport(error.to_string()))?;
+        self.call_until::<Result<RawSourcePage,SourceError>>("raw_source_query",args,deadline).map_err(SourceError::Transport)?
+    }
     pub fn change_patch(&self,query:PatchQuery)->Result<PatchPage,SourceError> {
         let args=serde_json::to_value(query).map_err(|error|SourceError::Transport(error.to_string()))?;
         self.call_until::<Result<PatchPage,SourceError>>("change_patch",args,Instant::now()+TIMEOUT).map_err(SourceError::Transport)?
@@ -130,6 +141,88 @@ impl RemoteActor {
 mod tests {
     use super::*;
     use crate::chat::cache::{SourceEpoch,SourceKey,SourceMetadata};
+    use crate::chat::cache::raw::{RawSourceField,RawSourceMetadata,RawRepresentation,RawToolCapture};
+    fn raw_query()->RawSourceQuery {
+        RawSourceQuery {source:SourceKey {agent_id:None,source_id:"exact-raw-call".into()},
+            field:RawSourceField::ToolInput,offset:0,limit:256,expected_epoch:None,until:None}
+    }
+    #[test]
+    fn original_call_reads_use_the_same_bounded_worker_and_leave_stop_admission_live() {
+        const CHILD:&str="CAGENTS_RAW_SOURCE_READER_CONTROL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir_in("/var/tmp").unwrap();let test=thread::current().name().unwrap().to_owned();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",root.path()).env("XDG_DATA_HOME",root.path().join("data"))
+                .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_CACHE_HOME",root.path().join("cache"))
+                .env("HOME",root.path().join("home")).env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        for reattach in [false,true] {
+            let mut fixture=super::super::tests::resident_fixture();let server=&mut fixture.server;
+            server.proof.boot_id=crate::daemon::read_boot_id().unwrap();server.source.proof=Some(server.proof.clone());
+            let paths=crate::daemon::RuntimePaths::discover().unwrap();let _lease=crate::daemon::HostLease::acquire(&paths,&server.proof).unwrap();
+            let store=server.actor.0.store.clone();let mut held=store.lock().unwrap();
+            held.apply(chat::Event::RawToolCapture(RawToolCapture::Full {source:raw_query().source,
+                name:"Opaque".into(),input:"{\"original\":true}".into(),command:None})).unwrap();
+            let (client,control)=UnixStream::pair().unwrap();
+            let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"raw_source_query".into(),args:serde_json::to_value(raw_query()).unwrap()};
+            assert!(is_read(&request.method));assert!(server.dispatch_source_read(control,request).is_ok());
+            let started=Instant::now();
+            let state=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"state".into(),args:json!([0])}).unwrap();
+            assert!(!state.is_null());assert!(started.elapsed()<Duration::from_secs(1));
+            let fallback=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"raw_source_query".into(),args:Value::Null}).unwrap_err();
+            assert!(fallback.contains("off-loop reader"));
+            if reattach {
+                let source=server.source.clone();server.invoke(Invocation {proof:server.proof.clone(),epoch:None,method:"attach".into(),args:json!([source])}).unwrap();
+            } else {
+                let id=server.identity.instance;
+                server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"fence_session_stop".into(),args:json!([id,500])}).unwrap();
+                assert!(server.actor.0.stop.load(Ordering::Acquire));
+            }
+            drop(held);
+            let result:Result<Result<RawSourcePage,SourceError>,String>=receive(&client,TIMEOUT).unwrap();
+            if reattach {assert!(result.unwrap_err().contains("attachment changed"));} else {
+                let page=result.unwrap().unwrap();assert_eq!(page.text,"{\"original\":true}");
+                assert!(page.metadata.complete_call);assert_eq!(page.metadata.representation,RawRepresentation::CanonicalJson);
+            }
+        }
+    }
+    #[test]
+    fn authenticated_original_call_pages_keep_representation_incarnation_and_typed_refusals() {
+        for changed in [false,true] {
+            let root=tempfile::tempdir_in("/var/tmp").unwrap();let socket=root.path().join("raw-reader.sock");let listener=UnixListener::bind(&socket).unwrap();
+            let mut actor=RemoteActor::fixture();Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+            let mut query=raw_query();query.offset=4;query.until=Some(8);query.expected_epoch=Some(SourceEpoch {incarnation:uuid::Uuid::new_v4(),revision:7});
+            let expected=query.clone();let epoch=actor.0.epoch;let proof=actor.0.proof.clone();
+            let worker=thread::spawn(move|| {
+                let (control,_)=listener.accept().unwrap();let request:Invocation=receive(&control,TIMEOUT).unwrap();
+                assert_eq!(request.method,"raw_source_query");assert_eq!(request.epoch,Some(epoch));assert_eq!(request.proof,proof);
+                assert_eq!(serde_json::from_value::<RawSourceQuery>(request.args).unwrap(),expected);
+                let page=if changed {Err(SourceError::Changed)} else {Ok(RawSourcePage {source:expected.source,field:expected.field,
+                    epoch:expected.expected_epoch.unwrap(),source_len:8,offset:4,next_offset:8,text:"null".into(),complete:true,
+                    metadata:RawSourceMetadata {tool_name:"Opaque".into(),representation:RawRepresentation::StreamJson,complete_call:false}})};
+                send(&control,&Ok::<_,String>(page),TIMEOUT).unwrap();
+            });
+            let result=actor.raw_source_query(query.clone());worker.join().unwrap();
+            if changed {assert_eq!(result,Err(SourceError::Changed));} else {
+                let page=result.unwrap();assert_eq!(Some(page.epoch),query.expected_epoch);assert_eq!(page.source,query.source);
+                assert_eq!(page.metadata.representation,RawRepresentation::StreamJson);assert!(!page.metadata.complete_call);
+            }
+            assert!(actor.pending_inputs().is_empty());
+        }
+    }
+    #[test]
+    fn stalled_original_call_read_uses_one_absolute_budget() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();let socket=root.path().join("stalled-raw.sock");let listener=UnixListener::bind(&socket).unwrap();
+        let mut actor=RemoteActor::fixture();Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+        let (release,wait)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move|| {let (control,_)=listener.accept().unwrap();let request:Invocation=receive(&control,TIMEOUT).unwrap();
+            assert_eq!(request.method,"raw_source_query");let _=wait.recv_timeout(Duration::from_secs(2));});
+        let started=Instant::now();let result=actor.raw_source_query_until(raw_query(),started+Duration::from_millis(40));let elapsed=started.elapsed();
+        let _=release.send(());worker.join().unwrap();
+        assert!(matches!(result,Err(SourceError::Transport(error)) if error.contains("deadline")));assert!(elapsed<Duration::from_millis(250));
+        assert!(actor.pending_inputs().is_empty());
+    }
     #[test]
     fn transcript_reads_wait_off_loop_and_old_attachment_results_are_refused() {
         const CHILD:&str="CAGENTS_TRANSCRIPT_READER_CONTROL_TEST";

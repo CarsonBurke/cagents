@@ -1881,7 +1881,7 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
-            "source_query" | "changes_manifest" | "change_patch" | "snapshot" | "presentation" | "file_query" | "exit_output" => {
+            "source_query" | "raw_source_query" | "changes_manifest" | "change_patch" | "snapshot" | "presentation" | "file_query" | "exit_output" => {
                 Err("Cache reads require the owned off-loop reader".into())
             }
             "execution_environment" => value!(self.environment.clone()),

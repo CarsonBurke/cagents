@@ -30,6 +30,9 @@ impl Handle {
     pub(crate) fn changes_manifest(&self,query:chat::cache::changes::ManifestQuery)->Result<chat::cache::changes::Manifest,chat::cache::SourceError> {
         match &self.0 {Owner::Local(local)=>local.changes_manifest(query),Owner::Remote(remote)=>remote.changes_manifest(query)}
     }
+    pub(crate) fn raw_source_query(&self,query:chat::cache::raw::RawSourceQuery)->Result<chat::cache::raw::RawSourcePage,chat::cache::SourceError> {
+        match &self.0 {Owner::Local(local)=>local.raw_source_query(query),Owner::Remote(remote)=>remote.raw_source_query(query)}
+    }
     pub(crate) fn change_patch(&self,query:chat::cache::changes::PatchQuery)->Result<chat::cache::changes::PatchPage,chat::cache::SourceError> {
         match &self.0 {Owner::Local(local)=>local.change_patch(query),Owner::Remote(remote)=>remote.change_patch(query)}
     }
