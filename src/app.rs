@@ -13,6 +13,7 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+mod discard_ui;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
 use crate::file_manager::{self, open_system_url};
@@ -3963,6 +3964,21 @@ pub enum Message {
         key: ActiveWorktreeKey,
         request: u64,
         result: Result<Box<RepositorySnapshot>, String>,
+        source: discard_ui::ReadSource,
+    },
+    SidebarSnapshot {
+        source: uuid::Uuid,
+        action: Box<SidebarAction>,
+    },
+    DiscardFinished {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        slot: discard_ui::Slot,
+        report: Option<String>,
+    },
+    DiscardUndo {
+        id: uuid::Uuid,
+        resolve: bool,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -4900,6 +4916,7 @@ pub struct Cagents {
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
+    discard_ui: discard_ui::State,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     automation_approval: automation_approval::State,
@@ -10091,6 +10108,7 @@ impl Cagents {
                 self.history_ui.next_page_request();
             }
             self.sidebar_model.source_control = None;
+            self.discard_ui.select(None);
             return Task::none();
         }
         if !changed {
@@ -10102,6 +10120,7 @@ impl Cagents {
         self.history_ui.next_page_request();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
             self.sidebar_model.source_control = None;
+            self.discard_ui.select(None);
             return Task::none();
         };
         if self.folder_scope(&key)
@@ -10112,6 +10131,8 @@ impl Cagents {
         {
             self.context_tab = ContextTab::Files;
         }
+        self.discard_ui
+            .select((!self.folder_scope(&key)).then_some(key.clone()));
         let mut source = SourceControlModel::loading(key.clone());
         source.set_mutation(
             self.source_control_mutations
@@ -10957,6 +10978,13 @@ impl Cagents {
                 }
             });
         }
+        self.discard_ui.select(Some(key.clone()));
+        let source = self
+            .discard_ui
+            .source()
+            .cloned()
+            .expect("selected original source");
+        let read_source = source.clone();
         let worktree = key.canonical_path.clone();
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
         let options = crate::repository::SnapshotOptions {
@@ -10978,7 +11006,7 @@ impl Cagents {
             .collect::<Vec<_>>();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
+                let service = read_source.read_service()?;
                 let mut snapshot = service
                     .snapshot_with_options(&worktree, options, &cancellation)
                     .map_err(|error| error.to_string())?;
@@ -11006,6 +11034,7 @@ impl Cagents {
                 key,
                 request,
                 result,
+                source,
             }
         })
     }
@@ -12937,6 +12966,7 @@ impl Application for Cagents {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
+            discard_ui: discard_ui::State::default(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
@@ -14087,7 +14117,108 @@ impl Application for Cagents {
                 }
                 Task::batch(tasks)
             }
+            Message::SidebarSnapshot { source, action } => {
+                let discard = matches!(
+                    &*action,
+                    SidebarAction::RequestDiscard { .. }
+                        | SidebarAction::ConfirmDiscard { .. }
+                        | SidebarAction::ChangeGroup {
+                            command: sidebar::ChangeGroupCommand::Discard,
+                            ..
+                        }
+                );
+                if !discard {
+                    return self.update(Message::Sidebar(*action));
+                }
+                if !self.discard_ui.admit_event(source) {
+                    return Task::none();
+                }
+                self.update(Message::Sidebar(*action))
+            }
+            Message::DiscardUndo { id, resolve } => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(slot) = self.discard_ui.slot(id) else {
+                    return Task::none();
+                };
+                let key = slot.key();
+                if self
+                    .source_control_mutations
+                    .contains_key(&key.canonical_path)
+                {
+                    return Task::none();
+                }
+                let Some(slot) = self.discard_ui.begin_undo(id, resolve) else {
+                    return Task::none();
+                };
+                let operation = uuid::Uuid::new_v4();
+                self.source_control_mutations.insert(
+                    key.canonical_path.clone(),
+                    SourceControlMutation {
+                        id: operation,
+                        kind: MutationKind::Discard,
+                        commit_revision: None,
+                    },
+                );
+                let completed = slot.clone();
+                cosmic::task::future(async move {
+                    let joined =
+                        tokio::task::spawn_blocking(move || slot.finish_undo(resolve)).await;
+                    let report = joined.unwrap_or_else(|e| {
+                        Some(format!(
+                            "Undo worker failed; original receipt retained: {e}"
+                        ))
+                    });
+                    Message::DiscardFinished {
+                        key,
+                        operation,
+                        slot: completed,
+                        report,
+                    }
+                })
+            }
+            Message::DiscardFinished {
+                key,
+                operation,
+                slot,
+                report,
+            } => {
+                let current = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|op| op.id == operation);
+                if !current {
+                    return Task::none();
+                }
+                self.source_control_mutations.remove(&key.canonical_path);
+                let same_origin = self.discard_ui.admits(slot.source_id());
+                if let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_mut()
+                    .filter(|s| s.key.canonical_path == key.canonical_path)
+                {
+                    source.set_mutation(None);
+                    if same_origin {
+                        source.set_error(report.clone());
+                    }
+                }
+                if let Some(report) = report {
+                    self.status = Some(TransientNotice::error(format!(
+                        "{}: {report}",
+                        display_path(&key.canonical_path)
+                    )));
+                }
+                self.discard_ui.prune();
+                if same_origin {
+                    self.reload_source_control(&key)
+                } else {
+                    Task::none()
+                }
+            }
             Message::Sidebar(action) => {
+                let discard_event = self.discard_ui.take_event();
                 // A control in the pane can still be activated while a dialog
                 // is up: the modal captures the pointer, and the focus
                 // operation the dialog issues on open cannot reach a pane
@@ -14130,6 +14261,24 @@ impl Application for Cagents {
                 } else {
                     action
                 };
+                if matches!(
+                    &action,
+                    SidebarAction::RequestDiscard { .. } | SidebarAction::ConfirmDiscard { .. }
+                ) && discard_event.is_none()
+                {
+                    return Task::none();
+                }
+                if let SidebarAction::RequestDiscard { request, .. } = &action {
+                    if !self
+                        .discard_ui
+                        .confirm_intent(discard_event.unwrap(), request)
+                    {
+                        return Task::none();
+                    }
+                }
+                if matches!(&action, SidebarAction::CancelDiscard) {
+                    self.discard_ui.cancel_intent();
+                }
                 // Entering a worktree that is being deleted is refused, and
                 // for the same reason before the selection would claim it.
                 if self
@@ -14513,14 +14662,18 @@ impl Application for Cagents {
                     // `confirmed: true`, and the service refuses an
                     // unconfirmed one outright.
                     SidebarAction::ConfirmDiscard { key, request } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
-                            return Task::none();
+                        let slot=match self.discard_ui.reserve_confirmed(discard_event.unwrap(),&request) {
+                            Ok(slot)=>slot,Err(error)=>{self.status=Some(TransientNotice::error(error));return Task::none();}
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Discard", service.discard(&request, cancel)),
-                                false,
-                            )
+                        let Some(operation)=self.begin_mutation(&key,MutationKind::Discard,None) else {
+                            slot.cancel_before_start();return Task::none();
+                        };
+                        let known=self.sidebar_model.projects.iter().flat_map(|project|project.worktrees.iter().map(|worktree|worktree.path.clone())).collect::<Vec<_>>();
+                        let completed=slot.clone();
+                        cosmic::task::future(async move {
+                            let joined=tokio::task::spawn_blocking(move ||slot.finish_discard(request,known)).await;
+                            let report=joined.unwrap_or_else(|e|Some(format!("Discard worker failed; recovery custody retained: {e}")));
+                            Message::DiscardFinished {key,operation,slot:completed,report}
                         })
                     }
                     SidebarAction::Commit { key, message, amend } => {
@@ -16333,8 +16486,10 @@ impl Application for Cagents {
                 key,
                 request,
                 result,
+                source,
             } => {
                 if request != self.refresh_ui.source_generation
+                    || !self.discard_ui.admits(source.id)
                     || !self.source_control_is_bound(&key)
                 {
                     return Task::none();
@@ -16783,7 +16938,19 @@ impl Application for Cagents {
         // because it is about to destroy work that exists nowhere else.
         if let Some(pending) = self.sidebar_state.pending_discard() {
             return Some(dialog_ui::overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                sidebar::discard_confirmation_dialog(pending).map({
+                    let origin = self.discard_ui.intent_id();
+                    move |action| {
+                        if let Some(source) = origin {
+                            Message::SidebarSnapshot {
+                                source,
+                                action: Box::new(action),
+                            }
+                        } else {
+                            Message::Sidebar(action)
+                        }
+                    }
+                }),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
                 1.0,
             ));
@@ -17027,7 +17194,19 @@ impl Application for Cagents {
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
         )
-        .map(Message::Sidebar);
+        .map({
+            let origin = self.discard_ui.source().map(|s| s.id);
+            move |action| {
+                if let Some(source) = origin {
+                    Message::SidebarSnapshot {
+                        source,
+                        action: Box::new(action),
+                    }
+                } else {
+                    Message::Sidebar(action)
+                }
+            }
+        });
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -17355,6 +17534,7 @@ impl Application for Cagents {
             surface,
             self.daemon_health_banner(),
             self.automation_approval_banner(),
+            self.discard_ui.banner(self.modal_is_open()),
             bar,
         ])
         .width(Length::Fill)
@@ -25257,6 +25437,7 @@ mod tests {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
+            discard_ui: discard_ui::State::default(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),

@@ -9041,7 +9041,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
     }
     if untracked > 0 {
         detail.push(format!(
-            "{untracked} untracked {} will be deleted from the worktree",
+            "{untracked} untracked {} will be moved to the system Trash",
             if untracked == 1 { "file" } else { "files" }
         ));
     }
@@ -9051,7 +9051,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            design::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Tracked contents are backed up. Undo discard is available for 60 seconds and preserves files changed afterwards.").into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
