@@ -2134,6 +2134,53 @@ mod directory_frontier_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn recovery_directory_frontier_descriptor_use_stays_bounded_across_many_siblings() {
+        const NAME: &str = "repository::recovery::directory_frontier_tests::recovery_directory_frontier_descriptor_use_stays_bounded_across_many_siblings";
+        // FD counts belong to the process, so parallel libtest activity cannot
+        // share this oracle. Run this same contract alone, with an exact-count
+        // output assertion so a stale selector cannot silently execute no tests.
+        let arguments: Vec<_> = std::env::args().collect();
+        let isolated = arguments.iter().any(|arg| arg == NAME)
+            && arguments.iter().any(|arg| arg == "--exact")
+            && arguments.iter().any(|arg| arg == "--test-threads=1");
+        if !isolated {
+            struct ChildGuard(std::process::Child);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let capture = tempfile::tempdir().unwrap();
+            let output = capture.path().join("stdout");
+            let errors = capture.path().join("stderr");
+            let mut child = ChildGuard(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([NAME, "--exact", "--test-threads=1"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(fs::File::create(&output).unwrap())
+                    .stderr(fs::File::create(&errors).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(std::time::Instant::now() < deadline, "isolated FD contract timed out");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let read_capture = |path: &std::path::Path| {
+                assert!(fs::metadata(path).unwrap().len() <= 1024 * 1024);
+                fs::read_to_string(path).unwrap()
+            };
+            let stdout = read_capture(&output);
+            let stderr = read_capture(&errors);
+            assert!(status.success(), "{status}: {stdout}\n{stderr}");
+            assert!(stdout.contains(&format!("test {NAME} ... ok")), "{stdout}");
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"), "{stdout}");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = fs_safety::Root::open(dir.path()).unwrap();
         let mut state = RecoveryDirectoryFrontier::new(&root);
