@@ -173,8 +173,8 @@ impl State {
 
     fn merged_cleanup_head(&self)->Option<CleanupHead> {
         let data=self.completion.data.as_ref()?;let target=self.target.as_ref()?;
-        if !data.merged || target.pull_request.state.0!="MERGED" || data.head_oid!=target.pull_request.head_ref_oid || self.completion.blocker().is_some() || self.discussion.has_local_work() { return None; }
-        Some(CleanupHead { repository:target.pull_request.head_repository_key()?, branch:target.pull_request.head_ref_name.clone(), head:Oid::parse(data.head_oid.clone()).ok()? })
+        if !data.merged || target.pull_request.state.0!="MERGED" || target.pull_request.id.as_deref()!=Some(data.pull_request_id.as_str()) || data.head_oid!=target.pull_request.head_ref_oid || self.completion.blocker().is_some() || self.discussion.has_local_work() { return None; }
+        Some(CleanupHead { repository:target.pull_request.head_repository_key()?, branch:target.pull_request.head_ref_name.clone(), head:Oid::parse(data.head_oid.clone()).ok()?, merged_pull_request:Arc::clone(&target.pull_request) })
     }
 
     fn load_completion(&mut self)->ActionTask {
@@ -449,6 +449,9 @@ mod tests {
         assert!(state.merged_cleanup_head().is_none());
         drop(state.update_completion(Action::Cleanup));assert!(state.take_effects().is_empty());
         state.completion.data.as_mut().unwrap().head_oid="a".repeat(40);
+        state.completion.data.as_mut().unwrap().pull_request_id="another-pr".into();
+        assert!(state.merged_cleanup_head().is_none());
+        state.completion.data.as_mut().unwrap().pull_request_id="PR_1".into();
         assert!(state.merged_cleanup_head().is_some());
         drop(state.update_completion(Action::Cleanup));
         assert!(matches!(state.take_effects().as_slice(),[Effect::CleanupMergedHead(head)] if head.branch=="feature"&&head.head.as_str()=="a".repeat(40)));

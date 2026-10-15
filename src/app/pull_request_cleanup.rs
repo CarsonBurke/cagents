@@ -22,7 +22,7 @@ impl Cagents {
     }
     pub(super) fn merged_pull_request_cleanup_ready(&mut self,card:CardId,project:ProjectId,generation:u64,head:CleanupHead,result:Result<Option<crate::repository::WorktreeRecord>,String>)->Task<Message>{
         let Some(CardRuntime::PullRequests(pane))=self.cards.get(&card)else{return Task::none();};
-        if pane.review.selection_generation()!=generation || pane.project(&self.sidebar_model)!=Some(project) || pane.review.target().is_none_or(|target|target.pull_request.state.0!="MERGED"||target.pull_request.head_ref_oid!=head.head.as_str()||target.pull_request.head_ref_name!=head.branch||target.pull_request.head_repository_key().is_none_or(|source|!source.same_repository(&head.repository))){return Task::none();}
+        if pane.review.selection_generation()!=generation || pane.project(&self.sidebar_model)!=Some(project) || pane.review.target().is_none_or(|target|target.pull_request.id!=head.merged_pull_request.id||target.pull_request.number!=head.merged_pull_request.number||target.pull_request.state.0!="MERGED"||target.pull_request.head_ref_oid!=head.head.as_str()||target.pull_request.head_ref_name!=head.branch||target.pull_request.head_repository_key().is_none_or(|source|!source.same_repository(&head.repository))){return Task::none();}
         match result{
             Ok(Some(record))=>{
                 let Some(row)=self.sidebar_model.project(project).and_then(|row|row.worktrees.iter().find(|row|row.id==record.id&&row.path==record.path))else{return Task::none();};

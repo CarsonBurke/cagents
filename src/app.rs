@@ -27441,6 +27441,7 @@ mod tests {
             pr.head_repository_owner = Some(crate::github::GitHubActor { login: "o".into(), name: None, is_bot: false });
             let head = crate::pull_request_review::CleanupHead {
                 repository: target.repository.clone(), branch: pr.head_ref_name.clone(), head: Oid::parse(pr.head_ref_oid.clone()).unwrap(),
+                merged_pull_request: Arc::clone(&target.pull_request),
             };
             let record = crate::repository::WorktreeRecord {
                 id: WorktreeId::new(), path: "/repo/worktrees/feature".into(), created_at_unix_ms: None,

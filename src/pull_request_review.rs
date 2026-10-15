@@ -271,6 +271,9 @@ pub struct CleanupHead {
     pub repository: GitHubRepoKey,
     pub branch: String,
     pub head: Oid,
+    /// Exact merged metadata already confirmed by the review and its controls.
+    /// The cleanup dialog can use this receipt without inventing a sidebar badge.
+    pub merged_pull_request: Arc<PullRequest>,
 }
 
 /// Work the shell carries out on the state's behalf.
