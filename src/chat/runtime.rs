@@ -257,26 +257,8 @@ impl LocalHandle {
         Ok(self.0.store.clone())
     }
     pub(crate) fn refresh_source_authority(&self) {
-        let (authority, unavailable) = {
-            let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
-            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-            store.publish_source_authority(&mut state);
-            (store.source_authority(), store.source_authority_unavailable())
-        };
-        if unavailable.is_some() {
-            if !self.0.source_unavailable.swap(true, Ordering::AcqRel) {
-                self.0.source_dirty.store(true, Ordering::Release); self.wake();
-            }
-            return;
-        }
-        if let Some(authority) = authority {
-            let changed = {
-                let mut cached = self.0.source_authority.lock().unwrap_or_else(|p| p.into_inner());
-                if cached.is_some_and(|old| old.generation > authority.generation) || *cached == Some(authority) { false }
-                else { *cached = Some(authority); true }
-            };
-            if changed { self.0.source_dirty.store(true, Ordering::Release); self.wake(); }
-        }
+        let observer = self.0.store.lock().unwrap_or_else(|p| p.into_inner()).source_authority_observer();
+        refresh_source_authority_observer(observer);
     }
 
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
@@ -287,6 +269,87 @@ impl LocalHandle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+/// Only bounded source metadata and the wake descriptor survive an observer
+/// lookup. This capability owns no provider Handle, holder or cleanup lease.
+struct SourceRefreshContext {
+    store:Arc<Mutex<Store>>,
+    state:Arc<Mutex<Snapshot>>,
+    source_authority:Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty:Arc<AtomicBool>,
+    source_unavailable:Arc<AtomicBool>,
+    wake:Arc<UnixStream>,
+}
+impl SourceRefreshContext {
+    fn capture(inner:&Inner)->Self {
+        Self {store:inner.store.clone(),state:inner.state.clone(),source_authority:inner.source_authority.clone(),source_dirty:inner.source_dirty.clone(),source_unavailable:inner.source_unavailable.clone(),wake:inner.source_wake.clone()}
+    }
+    fn wake(&self) {
+        let byte=[1u8];
+        // The context owns the descriptor. A wake is a one-byte hint, and must
+        // not wait on another caller's wake mutex or a full socket buffer.
+        unsafe {libc::send(self.wake.as_raw_fd(),byte.as_ptr().cast(),byte.len(),libc::MSG_DONTWAIT|libc::MSG_NOSIGNAL);}
+    }
+    fn refresh(&self,expected:&std::sync::Weak<Inner>)->Result<(),std::sync::Weak<Inner>> {
+        let (authority,unavailable)={
+            let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
+            let current=store.source_authority_observer();
+            if !current.ptr_eq(expected) {return Err(current);}
+            let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+            store.publish_source_authority(&mut state);
+            (store.source_authority(),store.source_authority_unavailable())
+        };
+        if unavailable.is_some() {
+            if !self.source_unavailable.swap(true,Ordering::AcqRel) {
+                self.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+            return Ok(());
+        }
+        if let Some(authority)=authority {
+            let changed={
+                let mut cached=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
+                if cached.is_some_and(|old|old.generation>authority.generation) || *cached==Some(authority) {false}
+                else {*cached=Some(authority);true}
+            };
+            if changed {
+                self.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+        }
+        Ok(())
+    }
+}
+/// Called after cache readers release Store and cursor locks. Upgrading only
+/// captures metadata; the strong process owner is dropped before any wait/SQL.
+fn refresh_source_authority_observer(observer:std::sync::Weak<Inner>) {
+    refresh_source_authority_observer_captured(observer,||{});
+}
+fn refresh_source_authority_observer_captured(mut observer:std::sync::Weak<Inner>,after_capture:impl FnOnce()) {
+    let mut after_capture=Some(after_capture);
+    for _ in 0..8 {
+        let Some(inner)=observer.upgrade() else {return;};
+        let context=SourceRefreshContext::capture(&inner);
+        drop(inner);
+        if let Some(after_capture)=after_capture.take() {after_capture();}
+        match context.refresh(&observer) {
+            Ok(())=>return,
+            // The replacement already reseeded Store under this same mutex.
+            // Re-select outside Store ownership; never drop a last Inner while
+            // holding the Store lock or retain it across metadata SQL.
+            Err(current)=>observer=current,
+        }
+    }
+    // Repeated actual rebinds already seed the latest authority themselves.
+    // Leave a bounded nonblocking service hint rather than pinning a provider
+    // through an unbounded retry loop. No token/ACK is manufactured here.
+    if let Some(inner)=observer.upgrade() {
+        let context=SourceRefreshContext::capture(&inner);
+        drop(inner);
+        context.source_dirty.store(true,Ordering::Release);
+        context.wake();
+    }
+}
+
 struct Inner {
     native_holder_record: Option<crate::daemon::holder_registry::Record>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
@@ -295,6 +358,7 @@ struct Inner {
     session_stop: Arc<Mutex<Option<CommandRequest>>>,
     urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
+    source_wake: Arc<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
@@ -586,6 +650,7 @@ impl LocalHandle {
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
+        let source_wake = Arc::new(wake.try_clone().map_err(|error| error.to_string())?);
         let (commands, incoming) = crossbeam_channel::bounded(64);
         let session_stop = Arc::new(Mutex::new(None));
         let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
@@ -648,6 +713,7 @@ impl LocalHandle {
             session_stop: session_stop.clone(),
             urgent_commands,
             wake: Mutex::new(wake),
+            source_wake,
             state: state.clone(),
             close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
@@ -682,6 +748,16 @@ impl LocalHandle {
             history_only: matches!(spec.transport, TransportSpec::History),
             stderr_lease: stderr_lease.clone(),
         });
+        {
+            // Same retained Store, actual current reducer; register and reseed
+            // atomically after the old worker's join and before actor begin.
+            let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+            store.register_source_authority_observer(Arc::downgrade(&inner));
+            store.publish_source_authority(&mut state);
+            *inner.source_authority.lock().unwrap_or_else(|p| p.into_inner()) = store.source_authority();
+            inner.source_unavailable.store(store.source_authority_unavailable().is_some(), Ordering::Release);
+        }
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);
@@ -5014,6 +5090,109 @@ mod tests {
             Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         );
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn original_cache_reader_revokes_the_hidden_successor_of_the_same_retained_store() {
+        struct Idle(Arc<std::sync::atomic::AtomicUsize>);
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step {events:vec![Event::Ready(true)],..Default::default()}) }
+            fn command(&mut self,_:Command) -> Result<Step,String> { self.0.fetch_add(1,Ordering::Relaxed); Ok(Step::default()) }
+            fn receive(&mut self,_:Value) -> Result<Step,String> { self.0.fetch_add(1,Ordering::Relaxed); Ok(Step::default()) }
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()};
+        let spec=ProcessSpec::from(&recipe);
+        let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first_adapter:Box<dyn Adapter>=Box::new(Idle(calls.clone()));
+        let mut first_step=first_adapter.initialize().unwrap();
+        let first_store=preflight(&spec,&mut first_step).unwrap();
+        let original=LocalHandle::start(spec.clone(),first_adapter,first_step,first_store,None,|_|{}).unwrap();
+        until(&original,|state|state.ready);
+        // This is the actual cache-only reader created before replacement,
+        // including its production empty-page incarnation pin. CLI56dfa9 is
+        // a declared foundation dependency, not a fake Remote lifetime.
+        let reader=original.transcript_reader();
+        reader.read(None).unwrap();
+        let original_token=original.source_authority().unwrap();
+        let original_weak=Arc::downgrade(&original.0);
+        original.close().unwrap();
+        let source=crate::chat::Session {id:crate::model::TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:recipe.clone(),session_id:None},proof:None,terminal:None,owned_codex_listener:None,native_continuity:Default::default()};
+        let mut adapter:Box<dyn Adapter>=Box::new(Idle(calls.clone()));
+        let mut initial=adapter.initialize().unwrap();
+        let preparation=preflight(&spec,&mut initial).unwrap();
+        let (notify,notified)=crossbeam_channel::bounded(16);
+        let successor=LocalHandle::start_owned(spec,adapter,initial,preparation,source,Default::default(),Some(&original),move |update|{let _=notify.try_send(update);}).unwrap();
+        until(&successor,|state|state.ready);
+        let current=successor.source_authority().unwrap();
+        assert_eq!(current.incarnation,original_token.incarnation,"replacement retained the actual Store, not preparation's new incarnation");
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop { if matches!(notified.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap(),Update::SourceAuthority {incarnation,..} if incarnation==current.incarnation) {break;} }
+        drop(original);
+        assert!(original_weak.upgrade().is_none(),"reader does not retain the old provider owner");
+        let process=successor.provider_process().unwrap();
+        successor.0.store.lock().unwrap().deny_source_release_for_test();
+        assert!(reader.read(None).is_err(),"actual failed read release poisons the shared Store");
+        let actual=successor.source_authority().unwrap();
+        assert_ne!(actual.incarnation,current.incarnation);
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop { if matches!(notified.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap(),Update::SourceAuthority {incarnation,generation} if incarnation==actual.incarnation && generation==actual.generation) {break;} }
+        assert!(!successor.0.visible.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::Relaxed),0,"revocation needs no provider frame or command");
+        assert!(process.is_current(),"cache observer does not terminate or replace the successor");
+        successor.close().unwrap();
+        assert!(!process.is_current());
+        assert!(reader.read(None).is_err(),"reader cannot revive revoked cached history after provider close");
+    }
+
+    #[test]
+    fn source_observer_tail_does_not_retain_the_last_provider_owner_while_store_is_held() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let marker=directory.path().join("provider.pid");
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf '%s' $$ > \"$1\"; exec /bin/cat".into(),"source-observer".into(),marker.to_str().unwrap().into()],working_directory:directory.path().into(),environment:Default::default()};
+        let mut initial=Step::default();
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Idle),initial,store,None,|_|{}).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let pid=loop {
+            if let Ok(value)=std::fs::read_to_string(&marker) {
+                if let Ok(pid)=value.parse::<u32>() {break pid;}
+            }
+            assert!(Instant::now()<deadline,"owned process did not publish its pid");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,pid,0)};
+        assert!(descriptor>=0);
+        let identity=unsafe {OwnedFd::from_raw_fd(descriptor as i32)};
+        let weak=Arc::downgrade(&handle.0);
+        let completed=handle.0.completed.clone();
+        let store=handle.0.store.clone();
+        let held=store.lock().unwrap();
+        let observer=held.source_authority_observer();
+        let (captured,capture)=crossbeam_channel::bounded(1);
+        let (finished, finish)=crossbeam_channel::bounded(1);
+        let _tail=thread::spawn(move || { refresh_source_authority_observer_captured(observer,||{let _=captured.try_send(());}); let _=finished.try_send(()); });
+        capture.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(weak.strong_count(),1,"observer must drop Inner before waiting on Store");
+        let before=Instant::now();
+        drop(handle);
+        assert!(before.elapsed()<Duration::from_millis(250));
+        assert_eq!(weak.strong_count(),0,"only metadata survives the blocked tail");
+        drop(held);
+        finish.recv_timeout(Duration::from_secs(3)).expect("detached metadata refresh did not finish after Store release");
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while !completed.load(Ordering::Acquire) {
+            assert!(Instant::now()<deadline,"actual actor teardown did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut fd=libc::pollfd {fd:identity.as_raw_fd(),events:libc::POLLIN,revents:0};
+        assert_eq!(unsafe {libc::poll(&mut fd,1,0)},1,"exact owned process must exit after Store is released");
     }
 
     #[test]
