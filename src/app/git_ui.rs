@@ -14,6 +14,7 @@ pub struct Snapshot {
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     heads: HashMap<WorktreeId, GitHubRepoKey>,
+    operations: HashMap<WorktreeId, crate::repository::GitOperationKind>,
 }
 
 struct Entry {
@@ -186,6 +187,7 @@ impl Cagents {
                     repository: repository.clone(),
                     worktrees: loaded.worktrees.clone(),
                     heads: loaded.head_repositories.clone(),
+                    operations: loaded.operations.clone(),
                 },
                 generation,
                 plan: reusable_plan.clone(),
@@ -545,6 +547,23 @@ fn read_local(
     read_local_with_plan(project, snapshot, change, cancellation, None)
 }
 
+/// Local metadata only. Loading/count refreshes must not spawn another Git
+/// command per worktree merely to discover merge/rebase state.
+pub(super) fn worktree_operation(worktree: &Path, known_git_dir: Option<&Path>) -> Option<crate::repository::GitOperationKind> {
+    let git_dir = if let Some(directory) = known_git_dir {
+        directory.to_path_buf()
+    } else {
+        let entry = worktree.join(".git");
+        if entry.is_dir() { entry } else {
+            let content = std::fs::read_to_string(entry).ok()?;
+            let directory = PathBuf::from(content.trim().strip_prefix("gitdir:")?.trim());
+            if directory.is_absolute() { directory } else { worktree.join(directory) }
+        }
+    };
+    RepositoryService::<crate::repository::SystemProcessExecutor>::operation_state_from_git_dir(&git_dir)
+        .map(|operation| operation.kind)
+}
+
 fn read_local_with_plan(
     project: ProjectId,
     mut snapshot: Snapshot,
@@ -580,6 +599,13 @@ fn read_local_with_plan(
                 continue;
             }
         };
+        let known_git_dir = previous_plan.and_then(|plan| plan.worktrees.iter()
+            .find(|worktree| worktree.id == record.id).map(|worktree| worktree.git_dir.as_path()));
+        if let Some(operation) = worktree_operation(&record.path, known_git_dir) {
+            snapshot.operations.insert(record.id, operation);
+        } else {
+            snapshot.operations.remove(&record.id);
+        }
         match &current.head {
             HeadState::Branch { name, oid } => {
                 record.branch = Some(format!("refs/heads/{name}"));
@@ -619,6 +645,10 @@ fn read_local_with_plan(
             .iter()
             .any(|(record, _)| record.id == *id)
     });
+    if change.topology || !vanished.is_empty() {
+        let retained: HashSet<_> = snapshot.worktrees.iter().map(|(record, _)| record.id).collect();
+        snapshot.operations.retain(|id, _| retained.contains(id));
+    }
     let upstreams = snapshot.worktrees.iter().filter_map(|(record, status)| {
         let upstream = match &status.as_ref()?.tracking {
             crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
@@ -692,6 +722,7 @@ fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
                 .remove(&record.id)
                 .unwrap_or_else(|| SidebarWorktree::from_repository(record, status.as_ref()));
             row.apply_repository(record, status.as_ref());
+            row.apply_operation(snapshot.operations.get(&record.id).copied());
             let head = snapshot.heads.get(&record.id).cloned();
             if row.head_repository != head {
                 row.clear_pull_request();
@@ -830,6 +861,7 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+            operations: HashMap::new(),
         }
     }
 
@@ -878,6 +910,23 @@ mod tests {
         let (next, _) = read_local(project, snapshot, git_watch::Change { worktrees: changed, ..Default::default() }, CancellationToken::default()).unwrap();
         assert_eq!(next.worktrees.len(), 2);
         assert!(next.worktrees.iter().find(|(record, _)| record.path == root).unwrap().1.as_ref().unwrap().dirty.is_dirty());
+    }
+
+    #[test]
+    fn operation_metadata_uses_linked_gitfiles_without_running_git() {
+        use crate::repository::GitOperationKind;
+        let fixture = tempfile::tempdir().unwrap();
+        let worktree = fixture.path().join("worktree");
+        let admin = fixture.path().join("admin");
+        fs::create_dir(&worktree).unwrap();
+        fs::create_dir(&admin).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: ../admin\n").unwrap();
+        assert_eq!(worktree_operation(&worktree, None), None);
+        fs::write(admin.join("MERGE_HEAD"), "fixture-head\n").unwrap();
+        assert_eq!(worktree_operation(&worktree, None), Some(GitOperationKind::Merge));
+        fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
+        fs::create_dir(admin.join("rebase-merge")).unwrap();
+        assert_eq!(worktree_operation(&worktree, Some(&admin)), Some(GitOperationKind::Rebase));
     }
 
     #[test]

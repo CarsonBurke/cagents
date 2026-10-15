@@ -1782,6 +1782,7 @@ pub struct LoadedRepository {
     project: ProjectState,
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
+    operations: HashMap<crate::model::WorktreeId, crate::repository::GitOperationKind>,
     github: GitHubAvailability,
     review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
@@ -13819,10 +13820,9 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                existing.worktrees.push(SidebarWorktree::from_repository(
-                                    record,
-                                    status.as_ref(),
-                                ));
+                                let mut row = SidebarWorktree::from_repository(record, status.as_ref());
+                                row.apply_operation(loaded.operations.get(&record.id).copied());
+                                existing.worktrees.push(row);
                             }
                             let existing_id = existing.id;
                             let order = &mut Arc::make_mut(&mut self.durable).project_order;
@@ -13902,6 +13902,7 @@ impl Application for Cagents {
                                         SidebarWorktree::from_repository(record, None)
                                     });
                                 row.apply_repository(record, status.as_ref());
+                                row.apply_operation(loaded.operations.get(&record.id).copied());
                                 let head = loaded.head_repositories.get(&record.id).cloned();
                                 if row.head_repository != head {
                                     row.clear_pull_request();
@@ -16673,6 +16674,7 @@ impl Application for Cagents {
                         })
                 {
                     worktree.apply_status(&prepared.0.status);
+                    worktree.apply_operation(prepared.0.operation.as_ref().map(|operation| operation.kind));
                 }
                 let (snapshot, mut next) = match result {
                     Ok(Some(prepared)) => { let (snapshot, model) = *prepared; (Some(snapshot), model) },
@@ -17858,6 +17860,7 @@ fn load_project(
         },
         repository: None,
         worktrees: Vec::new(),
+        operations: HashMap::new(),
         github: GitHubAvailability::NotAssociated,
         review_repository: None,
         head_repositories: HashMap::new(),
@@ -17897,6 +17900,9 @@ fn load_repository(
             (worktree, status)
         })
         .collect::<Vec<_>>();
+    let operations = worktrees.iter().filter_map(|(record, _)| {
+        git_ui::worktree_operation(&record.path, None).map(|kind| (record.id, kind))
+    }).collect();
     let head_repositories = worktrees
         .iter()
         .filter_map(|(record, _)| {
@@ -17929,6 +17935,7 @@ fn load_repository(
         },
         repository: Some(repository),
         worktrees,
+        operations,
         github: github_availability,
         review_repository,
         head_repositories,
@@ -23830,6 +23837,7 @@ mod tests {
                 is_bare: false,
             }),
             worktrees: Vec::new(),
+            operations: HashMap::new(),
             github: GitHubAvailability::NotAssociated,
             review_repository: None,
             head_repositories: HashMap::new(),

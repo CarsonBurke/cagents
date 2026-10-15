@@ -790,6 +790,7 @@ pub struct SidebarWorktree {
     pub detached: bool,
     pub locked: bool,
     pub dirty: Option<DirtyState>,
+    pub operation: Option<crate::repository::GitOperationKind>,
     pub untracked_omitted: bool,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
@@ -850,6 +851,7 @@ impl SidebarWorktree {
             detached,
             locked,
             dirty,
+            operation: None,
             untracked_omitted: false,
             ahead,
             behind,
@@ -920,6 +922,13 @@ impl SidebarWorktree {
             self.apply_status(status);
         }
         self.refresh_status_chrome();
+    }
+
+    pub fn apply_operation(&mut self, operation: Option<crate::repository::GitOperationKind>) {
+        if self.operation != operation {
+            self.operation = operation;
+            self.refresh_status_chrome();
+        }
     }
 
     /// Apply each authoritative read, including the transition back to clean.
@@ -1031,6 +1040,15 @@ impl SidebarWorktree {
             self.ahead,
             self.behind,
         );
+        if let Some(operation) = self.operation {
+            let operation_label = format!("{} in progress", operation.label());
+            if let Some(label) = self.chrome.dirty_badge.as_mut() {
+                *label = format!("{label}, {operation_label}").into_boxed_str();
+            } else {
+                self.chrome.dirty_badge = Some(operation_label.clone().into_boxed_str());
+            }
+            status.push_str(&format!(", {operation_label}"));
+        }
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
             let state = match pr.state {
@@ -6456,7 +6474,14 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
     {
         Icon::Warning
     } else {
-        Icon::Changes
+        use crate::repository::GitOperationKind;
+        match worktree.operation {
+            Some(GitOperationKind::Merge) => Icon::MergedPullRequest,
+            Some(GitOperationKind::Rebase) => Icon::Branch,
+            Some(GitOperationKind::CherryPick) => Icon::Commit,
+            Some(GitOperationKind::Revert) => Icon::RevertFile,
+            None => Icon::Changes,
+        }
     }
 }
 
@@ -6467,6 +6492,8 @@ fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
         .is_some_and(|dirty| dirty.conflicted > 0)
     {
         BadgeTone::Danger
+    } else if worktree.operation.is_some() {
+        BadgeTone::Neutral
     } else {
         BadgeTone::Warning
     }
@@ -6594,6 +6621,9 @@ fn worktree_view<'a>(
             } else {
                 count.to_string()
             };
+            let count = if let Some(operation) = worktree.operation {
+                format!("{} · {count}", operation.label())
+            } else { count };
             content = content.push(crate::interaction::tooltip(
                 widget::row::with_capacity(2)
                     .spacing(2)
@@ -11847,6 +11877,23 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn merge_and_rebase_rows_keep_operation_state_when_the_index_is_clean() {
+        use crate::repository::GitOperationKind;
+        let mut row = worktree(11, "feature/merge", false);
+        row.apply_operation(Some(GitOperationKind::Merge));
+        row.apply_status(&StatusSnapshot::default());
+        assert!(matches!(worktree_change_icon(&row), Icon::MergedPullRequest));
+        assert!(row.chrome.dirty_badge.as_deref().unwrap().contains("Merge in progress"));
+        assert!(row.chrome.tooltip.contains("Merge in progress"));
+        row.apply_operation(Some(GitOperationKind::Rebase));
+        assert!(matches!(worktree_change_icon(&row), Icon::Branch));
+        assert!(row.chrome.tooltip.contains("Rebase in progress"));
+        row.apply_operation(None);
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(row.chrome.tooltip.contains("No changes"));
+    }
+
     #[test]
     fn inspector_header_exposes_an_explicit_copy_branch_action() {
         let renderer = headless_renderer();
