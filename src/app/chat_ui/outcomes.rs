@@ -499,4 +499,16 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn attention_malformed_simultaneous_terminal_and_loss_alias_is_not_a_valid_projection_delta() {
+        let snapshot = chat::Snapshot {
+            session_id: Some("native-session".into()), items: vec![item("input", chat::Role::User)],
+            turn_outcomes: Arc::new(TurnOutcomeProjection { revision: 2, complete: true,
+                records: vec![record("accepted-A", &["input"], ActivityOutcome::Succeeded)],
+                losses: vec![loss_for_test("native-session", &["input"])] }), ..Default::default()
+        };
+        assert!(snapshot.turn_outcomes.validate().is_err());
+        assert!(project(&snapshot).is_empty(), "producer must suppress resolved loss atomically before publishing the terminal alias");
+    }
 }

@@ -5368,6 +5368,28 @@ mod tests {
         assert_eq!(reattached.turn_outcome_markers, expected,
             "a fresh UI renders supplied durable proof, not local completion memory");
         assert!(reattached.snapshot.busy && reattached.snapshot.outcome.is_none());
+
+        // The valid durable transition replaces loss with exact native fate
+        // atomically. The same input alias must keep its terminal marker; B
+        // does not inherit A's result or lose its retained row.
+        let b_before = runtime.turn_fingerprint_at(&runtime.turns[1], false, Some(5000));
+        snapshot.generation += 1;
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 2, complete: true, losses: vec![],
+            records: vec![chat::turn_outcomes::VisibleTurnOutcome {
+                outcome: chat::turn_outcomes::TurnOutcome { identity: source.losses[0].accepted.input.clone(),
+                    outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 3000 },
+                item_ids: vec!["input-A2".into()],
+            }] });
+        snapshot.turn_outcomes.validate().unwrap();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_outcome_markers["input-A2"].tone, outcomes::Tone::Cancelled);
+        assert_eq!(runtime.turn_fingerprint_at(&runtime.turns[1], false, Some(5000)), b_before);
+        assert!(runtime.snapshot.busy && runtime.snapshot.outcome.is_none());
+        let terminal_replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        fresh_handle.replace_snapshot_for_test(terminal_replay);
+        reattached.refresh();
+        assert_eq!(reattached.turn_outcome_markers["input-A2"].tone, outcomes::Tone::Cancelled);
     }
 
     #[test]
