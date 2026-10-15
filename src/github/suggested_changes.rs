@@ -90,7 +90,7 @@ impl<E:ProcessExecutor> GitHubService<E>{
         let branch=decode_value::<String>(&pr["headRefName"])?;
         let data=self.graphql(&repository,"query($owner:String!,$name:String!,$head:String!,$path:String!){repository(owner:$owner,name:$name){object(expression:$head){... on Commit{file(path:$path){mode object{... on Blob{text isTruncated byteSize}}}}}}}",vec![("owner",repository.owner.clone().into()),("name",repository.name.clone().into()),("head",expected_head.into()),("path",path.into())],cancellation)?;
         let file=&data["repository"]["object"]["file"];
-        if require_author && file["mode"].as_u64()!=Some(0o100644) { return Err(GitHubError::Inspection("This file's executable or symlink mode cannot be preserved by GitHub's suggestion commit API. Apply it in the checked-out worktree.".into())); }
+        if !matches!(file["mode"].as_u64(),Some(0o100644|0o100755|0o120000)) { return Err(GitHubError::Inspection("Suggestions require an existing text blob, executable, or symlink target.".into())); }
         let blob=&file["object"];
         if blob["isTruncated"].as_bool()!=Some(false)||blob["byteSize"].as_u64().is_none_or(|size|size>MAX_SOURCE_BYTES as u64){return Err(GitHubError::Inspection("GitHub could not return the complete text file (maximum 2 MiB).".into()));}
         let text=decode_value::<String>(&blob["text"])?;Ok((text,repository,branch))
