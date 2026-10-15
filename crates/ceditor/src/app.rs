@@ -782,6 +782,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::EditorRecoveryResolved { .. }
             | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::DiagramsRendered { .. }
             | RepositoryAction::MarkdownDue { .. }
