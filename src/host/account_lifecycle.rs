@@ -291,6 +291,53 @@ pub(super) fn ensure_launch(
     ensure_paths(host, paths)
 }
 
+/// An operational directory FD can outlive or move away from the recipe's
+/// issued cwd. Relative credential roots would then be checked against a
+/// different directory from the one the child uses. Refuse that ambiguity
+/// before spawn; absolute roots still enter the ordinary reservation checks.
+pub(super) fn ensure_launch_at_directory(
+    host: &SharedHost,
+    cwd: &Path,
+    environment: &BTreeMap<String, String>,
+    unset: &BTreeSet<String>,
+    inherit: bool,
+    execution_directory: Option<&File>,
+) -> Result<(), ProtocolError> {
+    if let Some(directory) = execution_directory {
+        let metadata = directory.metadata().map_err(|error| {
+            refusal(format!("Cannot inspect the pinned terminal directory: {error}"))
+        })?;
+        if !metadata.is_dir() || metadata.nlink() == 0 {
+            return Err(refusal("The pinned terminal directory is no longer available"));
+        }
+        let effective = |name: &str| {
+            if unset.contains(name) {
+                None
+            } else {
+                environment.get(name).map(std::ffi::OsString::from)
+                    .or_else(|| inherit.then(|| std::env::var_os(name)).flatten())
+            }
+        };
+        // Both providers remain usable from an ordinary terminal, regardless
+        // of which provider initiated the handoff or owns a reserved account.
+        for variable in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+            let selected = effective(variable).filter(|value| !value.is_empty());
+            let (name, root) = match selected {
+                Some(root) => (variable, Some(root)),
+                None => ("HOME", effective("HOME").filter(|value| !value.is_empty())),
+            };
+            if root.as_ref().is_some_and(|root| Path::new(root).is_relative()) {
+                return Err(refusal(format!(
+                    "Cannot launch with relative {name} while using a pinned working directory. Set an absolute credential directory and retry."
+                )));
+            }
+        }
+    }
+    // Keep the normal admission path, including captured account namespace
+    // checks, authoritative for every absolute or unspecified root.
+    ensure_launch(host, cwd, environment, unset, inherit)
+}
+
 pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<(), ProtocolError> {
     let current = Store::installation()
         .ok_or_else(|| refusal("Account registry unavailable"))?
@@ -417,6 +464,131 @@ mod tests {
         )
         .unwrap();
         request(host, ClientRequest::Detach { terminal_id: id }).unwrap();
+    }
+
+    #[test]
+    fn pinned_terminal_directory_refuses_relative_credentials_before_spawn() {
+        const CHILD: &str = "CAGENTS_PINNED_ACCOUNT_DIRECTORY_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::Builder::new().prefix("cagents-account-fd-")
+                .tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "config", "data", "cache", "runtime"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let log = root.path().join("test.log");
+            let output = File::create(&log).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::account_lifecycle::tests::pinned_terminal_directory_refuses_relative_credentials_before_spawn", "--nocapture"])
+                .env_clear().env(CHILD, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("PATH", "/usr/bin:/bin").env("SHELL", "/bin/sh")
+                .env("TERM", "xterm-256color").env("CODEX_HOME", "inherited-relative")
+                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let retained = root.keep();
+                    panic!("pinned-directory fixture timed out; evidence {}", retained.display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let evidence = std::fs::read_to_string(&log).unwrap();
+            if !status.success() {
+                let retained = root.keep();
+                panic!("pinned-directory fixture failed; evidence {}:\n{evidence}", retained.display());
+            }
+            assert!(evidence.contains("1 passed; 0 failed"), "{evidence}");
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let issued = root.join("issued");
+        let operational = root.join("operational");
+        let reserved_home = operational.join("profile");
+        for path in [&issued, &operational, &reserved_home] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let context = Arc::new(crate::chat::protocol::ExecutionContext::capture(&operational).unwrap());
+        let directory = context.directory_descriptor().unwrap();
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("pinned-account-directory"),
+                boot_id: BootId::new("fixture"),
+                host_incarnation: HostIncarnation::new("fixture"),
+            }),
+        ));
+        host.lock().unwrap().register_client(1);
+        let account = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), reserved_home.clone());
+        let _reservation = Reservation::install(&host, &[account]).unwrap();
+        let absolute = root.join("unrelated-credentials").display().to_string();
+        let mut environment = BTreeMap::from([
+            ("HOME".into(), root.join("home").display().to_string()),
+            ("CLAUDE_CONFIG_DIR".into(), absolute.clone()),
+            ("CODEX_HOME".into(), "profile".into()),
+        ]);
+        // An absolute root for one provider must not mask a relative root
+        // for the other, irrespective of the reserved account's provider.
+        for variable in ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "HOME"] {
+            let mut mixed = environment.clone();
+            mixed.insert("CODEX_HOME".into(), absolute.clone());
+            mixed.insert("CLAUDE_CONFIG_DIR".into(), absolute.clone());
+            mixed.insert(variable.into(), "profile".into());
+            if variable == "HOME" { mixed.remove("CODEX_HOME"); }
+            let error = ensure_launch_at_directory(&host, &issued, &mixed, &BTreeSet::new(), false, Some(&directory)).unwrap_err();
+            assert!(error.message.contains(variable), "{error:?}");
+        }
+        // Normal recipe cwd admission would classify issued/profile, which
+        // does not overlap the account reserved under operational/profile.
+        ensure_launch(&host, &issued, &environment, &BTreeSet::new(), false).unwrap();
+        let mut source = terminal(&issued, environment.clone());
+        let marker = root.join("child-cwd");
+        source.launch.arguments = vec!["-c".into(), "pwd -P > \"$1\"".into(), "fixture".into(), marker.display().to_string()];
+        source.continuity = TerminalContinuity::RelaunchAvailable { recipe: source.launch.clone(), last_exit: None };
+        let original = source.launch.clone();
+        let refused_id = source.id;
+        let result = super::super::state::spawn_terminal_view_owned_at_directory(
+            &host, 1, source.clone(), Default::default(),
+            Some(crate::terminal_ipc::ChatExecutionEnvironment(environment.clone())), false, context.clone(),
+        );
+        assert!(result.is_err());
+        assert!(!marker.exists(), "refusal must precede child creation");
+        assert!(!host.lock().unwrap().terminals.contains_key(&refused_id));
+        // Inherited relative roots count, while explicit unset/env_clear do
+        // not accidentally restore daemon credentials.
+        let mut inherited = environment.clone();
+        inherited.remove("CODEX_HOME");
+        assert!(ensure_launch_at_directory(&host, &issued, &inherited, &BTreeSet::new(), true, Some(&directory)).is_err());
+        ensure_launch_at_directory(&host, &issued, &inherited, &BTreeSet::new(), false, Some(&directory)).unwrap();
+        ensure_launch_at_directory(&host, &issued, &inherited, &BTreeSet::from(["CODEX_HOME".into()]), true, Some(&directory)).unwrap();
+        ensure_launch_at_directory(&host, &issued, &environment, &BTreeSet::from(["CODEX_HOME".into()]), false, Some(&directory)).unwrap();
+        let mut empty_root = environment.clone();
+        empty_root.insert("CODEX_HOME".into(), String::new());
+        empty_root.insert("HOME".into(), "relative-fallback".into());
+        assert!(ensure_launch_at_directory(&host, &issued, &empty_root, &BTreeSet::new(), false, Some(&directory)).is_err());
+        // Absolute selected roots still obey the real account reservation.
+        environment.insert("CODEX_HOME".into(), reserved_home.display().to_string());
+        assert!(ensure_launch_at_directory(&host, &issued, &environment, &BTreeSet::new(), false, Some(&directory)).is_err());
+        environment.insert("CODEX_HOME".into(), absolute);
+        // HOME is unused as a provider fallback when both roots are explicit.
+        environment.insert("HOME".into(), "unused-relative-home".into());
+        source.launch.environment = environment.clone();
+        source.continuity = TerminalContinuity::RelaunchAvailable { recipe: source.launch.clone(), last_exit: None };
+        let accepted_recipe = source.launch.clone();
+        let (descriptor, handle) = super::super::state::spawn_terminal_view_owned_at_directory(
+            &host, 1, source, Default::default(),
+            Some(crate::terminal_ipc::ChatExecutionEnvironment(environment)), false, context,
+        ).unwrap();
+        wait_file(&marker);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), operational.to_str().unwrap());
+        assert_eq!(descriptor.session.launch, accepted_recipe);
+        assert_eq!(descriptor.session.launch.working_directory, original.working_directory);
+        handle.shutdown().unwrap();
     }
 
     /// A subprocess owns all environment/config/cache/provider fixtures. The
