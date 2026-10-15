@@ -33,6 +33,7 @@ mod notification_ui;
 mod onboarding_ui;
 mod palette_ui;
 mod project_ui;
+mod project_creation;
 mod pull_request_ui;
 mod refresh_ui;
 mod resume_ui;

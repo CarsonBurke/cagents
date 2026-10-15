@@ -30,6 +30,7 @@ pub struct ModalTarget {
 
 #[derive(Debug, Default)]
 pub struct State {
+    pub(super) creation_sources: HashMap<ProjectId, super::project_creation::PublishedSource>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -496,6 +497,7 @@ impl Cagents {
         self.project_ui
             .close_generation
             .insert(project, self.project_ui.next_close_generation);
+        self.retire_project_creation_source(project);
         self.repository_generations.remove(&project);
         if self.project_has_unsaved_editors(project) {
             self.status = Some(TransientNotice::warning(
@@ -774,6 +776,7 @@ impl Cagents {
             .active_workspace
             .as_deref()
             .is_some_and(|active| scope.contains(active));
+        self.retire_project_creation_source(id);
         self.sidebar_model.projects.remove(index);
         self.refresh_ui.git.forget(id);
         self.github_availability.remove(&id);

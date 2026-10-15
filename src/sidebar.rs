@@ -404,6 +404,10 @@ pub struct SidebarProject {
     pub repository_id: RepositoryId,
     pub name: String,
     pub repository: PathBuf,
+    /// Read-owned project generation for worktree creation. This is never
+    /// supplied by a click or inferred from another pane's Git binding.
+    pub creation_binding: Option<crate::model::OperationId>,
+    pub creation_unavailable_reason: Option<Arc<str>>,
     pub kind: ProjectKind,
     pub navigation_order: Vec<crate::workspace_model::NavigationItem>,
     pub worktrees: Vec<SidebarWorktree>,
@@ -608,6 +612,8 @@ impl SidebarProject {
             repository_id,
             name,
             repository,
+            creation_binding: None,
+            creation_unavailable_reason: None,
             kind: ProjectKind::Git,
             navigation_order: Vec::new(),
             worktrees,
