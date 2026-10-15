@@ -1397,7 +1397,7 @@ fn start_with_execution(
         }
         if let Some(context) = &execution
             && let Some(identity) = context.directory_identity().map_err(unavailable)? {
-            let directory = context.directory.as_ref().ok_or_else(|| unavailable("Native startup requires the approved directory descriptor"))?;
+            let directory = context.directory_descriptor().ok_or_else(|| unavailable("Native startup requires the approved directory descriptor"))?;
             // Recheck the actual opened descriptor, not a path reopened after
             // spawn. Agent contexts and ordinary contexts share this contract.
             if crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata().map_err(|error| unavailable(error.to_string()))?) != identity {

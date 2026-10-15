@@ -1320,7 +1320,7 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if let Some(directory) = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .and_then(|context| context.directory_descriptor())
     {
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
