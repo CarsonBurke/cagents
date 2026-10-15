@@ -354,7 +354,16 @@ impl NoticeLog {
             details_open: false,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // Short-lived success traffic must not hide an unresolved failure.
+            // Within one severity, evict the oldest entry to keep the log bounded.
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index)
+                .expect("an overflowing notice log is nonempty");
+            self.entries.remove(oldest);
         }
     }
 
@@ -20005,6 +20014,30 @@ mod tests {
         log.expire(now + Duration::from_secs(7));
         assert_eq!(log.len(), 1);
         assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+    }
+
+    #[test]
+    fn success_notice_flood_preserves_unresolved_errors_and_warnings() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        log.record_at(TransientNotice::error("Still disconnected").key("error"), now);
+        log.record_at(
+            TransientNotice::warning("Turn interrupted").key("warning"),
+            now,
+        );
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record_at(TransientNotice::success(format!("Information {index}")), now);
+            assert!(log.len() <= NOTICE_LOG_CAPACITY);
+        }
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        for key in ["error", "warning"] {
+            assert!(
+                log.recent()
+                    .any(|entry| entry.notice.key.as_deref() == Some(key))
+            );
+        }
     }
 
     #[test]
