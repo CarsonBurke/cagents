@@ -2890,4 +2890,87 @@ mod tests {
         assert!(ranges.blocks.is_empty());
         assert_eq!(sparse.copy(&ranges), expected);
     }
+    #[test]
+    fn reset_scope_clears_native_selection_and_reader_with_identical_source_and_ids() {
+        const CHILD:&str="CAGENTS_TEST_TRANSCRIPT_RESET_SCOPE";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",concat!("app::chat_ui::selection::tests::",
+                    "reset_scope_clears_native_selection_and_reader_with_identical_source_and_ids"),"--nocapture"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));return;
+        }
+        struct Reader {move_to:Option<f32>,offset:Option<f32>}
+        impl Operation for Reader {
+            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)) {visit(self);}
+            fn scrollable(&mut self,id:Option<&Id>,_:Rectangle,_:Rectangle,translation:Vector,state:&mut dyn operation::Scrollable) {
+                if id.is_some_and(|id|id.to_string()=="reset.same-reader") {
+                    self.offset=Some(translation.x);
+                    if let Some(x)=self.move_to {state.scroll_to(iced::widget::scrollable::AbsoluteOffset {x:Some(x),y:None});}
+                }
+            }
+        }
+        let renderer=crate::app::tests::headless_renderer();
+        // The exact immutable Item and body remain shared through ordinary
+        // publication and Reset; cache/item replacement cannot mask the key.
+        let item=Arc::new(chat::Item {id:"same-source".into(),role:chat::Role::Assistant,
+            content:ItemContent::Text {text:"same selected words".into(),thinking:false,phase:chat::Phase::Final},at:None,started_at:None});
+        let target=Target {card:CardId::new(),generation:1};
+        let make=|scope| {
+            let ItemContent::Text {text,..}=&item.content else {unreachable!()};
+            crate::ui_memory::scoped_gate(transcript(widget::column::with_children(vec![
+                super::super::selectable_prose::plain(text,16.0,iced::Font::default(),target),
+                widget::scrollable(widget::Space::new().width(2000).height(20))
+                    .id(Id::new("reset.same-reader"))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                    .width(Length::Fill).height(40).into(),
+            ]).width(Length::Fill),target,None),scope)
+        };
+        let viewport=Rectangle::with_size(Size::new(400.0,120.0));let limits=layout::Limits::new(Size::ZERO,viewport.size());
+        let mut element=make(7);let mut tree=Tree::new(&element);
+        let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let mut clipboard=ClipboardText::default();
+        for (event,cursor) in [
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),mouse::Cursor::Available(Point::new(0.0,3.0))),
+            (Event::Mouse(mouse::Event::CursorMoved {position:Point::new(350.0,3.0)}),mouse::Cursor::Available(Point::new(350.0,3.0))),
+            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),mouse::Cursor::Available(Point::new(350.0,3.0))),
+            (command("c"),mouse::Cursor::Unavailable),
+        ] {
+            let mut messages=Vec::new();let mut shell=Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),cursor,&renderer,&mut clipboard,&mut shell,&viewport);
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);}
+        }
+        assert_eq!(clipboard.0,"same selected words");
+        let old_selection=tree.children[0].state.downcast_ref::<State>().identity;
+        assert!(tree.children[0].state.downcast_ref::<State>().anchor.is_some());
+        let mut reader=Reader {move_to:Some(120.0),offset:None};
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut reader);
+        // Real UI build extraction/restoration around the SAME tree/IDs.
+        tree::NAMED.with(|named|*named.borrow_mut()=tree.take_all_named());
+        let mut ordinary=make(7);tree.diff(ordinary.as_widget_mut());
+        iced::runtime::user_interface::restore_cached_named_states(&mut tree);
+        let ordinary_node=ordinary.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        assert_eq!(tree.children[0].state.downcast_ref::<State>().identity,old_selection);
+        assert!(tree.children[0].state.downcast_ref::<State>().anchor.is_some());
+        let mut reader=Reader {move_to:None,offset:None};
+        ordinary.as_widget_mut().operate(&mut tree,Layout::new(&ordinary_node),&renderer,&mut reader);
+        assert_eq!(reader.offset,Some(120.0),"same-source publication preserves native reader offset");
+        tree::NAMED.with(|named|*named.borrow_mut()=tree.take_all_named());
+        let mut reset=make(8);tree.diff(reset.as_widget_mut());
+        iced::runtime::user_interface::restore_cached_named_states(&mut tree);
+        let reset_node=reset.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let selection=tree.children[0].state.downcast_ref::<State>();
+        assert_ne!(selection.identity,old_selection);assert!(selection.anchor.is_none() && selection.end.is_none());
+        let mut reader=Reader {move_to:None,offset:None};
+        reset.as_widget_mut().operate(&mut tree,Layout::new(&reset_node),&renderer,&mut reader);
+        assert_eq!(reader.offset,Some(0.0),"same-ID extracted native reader cannot survive Reset");
+        clipboard.0="newer clipboard".into();let mut messages=Vec::new();
+        reset.as_widget_mut().update(&mut tree,&command("c"),Layout::new(&reset_node),mouse::Cursor::Unavailable,&renderer,&mut clipboard,&mut Shell::new(&mut messages),&viewport);
+        assert_eq!(clipboard.0,"newer clipboard","old native selection cannot copy after Reset");
+        assert_eq!(Arc::strong_count(&item),1,"no replacement Item was used to obtain the reset");
+        tree::NAMED.with(|named|named.borrow_mut().clear());
+    }
+
 }

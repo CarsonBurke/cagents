@@ -1681,6 +1681,9 @@ pub(super) struct Runtime {
         HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
     >,
     selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
+    /// Actual transcript resets invalidate native selection/reader trees too.
+    /// Publication, width changes and residency eviction keep this stable.
+    transcript_scope: u64,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -2252,6 +2255,7 @@ impl Runtime {
             history_stash: None,
             selection_bookmarks: Default::default(),
             selection_document: Default::default(),
+            transcript_scope: 0,
             scroll: view::Scroll::default(),
             subagent_scroll: HashMap::new(),
             page_request: None,
@@ -2269,6 +2273,8 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.transcript_scope = self.transcript_scope.wrapping_add(1);
+        self.copied = None;
         self.preparation.clear();
         self.cache.clear();
         self.presentation_evicted = false;

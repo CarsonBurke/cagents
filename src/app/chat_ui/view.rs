@@ -1819,7 +1819,7 @@ impl Runtime {
         let transcript_index = content.len();
         content.push(if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
-            crate::ui_memory::gate(selection::transcript_virtualized(
+            crate::ui_memory::scoped_gate(selection::transcript_virtualized(
                 scroll::transcript_observed(
                     transcript,
                     target,
@@ -1850,14 +1850,15 @@ impl Runtime {
                 self.selected_subagent.as_deref(),
                 catalog,
                 bookmark,
-            ))
+            ), self.transcript_scope)
         } else {
             // Overscan cards can remain mounted after model dehydration.
             // Diff to a cheap child so no old retained paragraph survives.
-            crate::ui_memory::gate(
+            crate::ui_memory::scoped_gate(
                 widget::Space::new()
                     .width(Length::Fill)
                     .height(Length::Fill),
+                self.transcript_scope,
             )
         });
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
@@ -6485,7 +6486,17 @@ mod tests {
         let backing = Arc::downgrade(&catalog);
         assert!(catalog.retained_plain_bytes() > 0);
         drop(catalog);
+        runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
+        runtime.copied = Some(("old-copied-item".into(), Instant::now()));
+        let target = runtime.target;
+        let scope = runtime.transcript_scope;
+        runtime.release_transcript_caches();
+        assert_eq!(runtime.transcript_scope, scope, "residency eviction is not Reset");
         runtime.forget_transcript();
+        assert_eq!(runtime.transcript_scope, scope.wrapping_add(1));
+        assert_eq!(runtime.target, target, "Reset is not app target replacement");
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert!(runtime.copied.is_none());
         assert!(runtime.selection_document.borrow().is_none());
         assert!(runtime.selection_bookmarks.borrow().is_empty());
         assert!(
