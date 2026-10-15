@@ -305,6 +305,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_project_relocation(&mut self, relocation: &Relocation) -> Task<Message> {
+        if relocation.repository == relocation.destination { return Task::none(); }
         let Some(id) = self.sidebar_model.projects.iter().find(|project| project.repository == relocation.repository).map(|project| project.id) else { return Task::none(); };
         let owned = self.project_cards(id);
         let project = self.sidebar_model.projects.iter_mut().find(|project| project.id == id).unwrap();
