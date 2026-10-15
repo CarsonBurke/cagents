@@ -676,6 +676,13 @@ impl Cagents {
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked.clear();
+        let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
+        let managed = self.workspace_model.agents.iter().map(|agent| (CardId::from_uuid(agent.id.as_uuid()), agent)).collect::<HashMap<_, _>>();
+        for view in views {
+            if view.panes.iter().any(|pane| managed.get(&pane.id).is_some_and(|agent| !display_index.permits_projection(agent, pane))) {
+                self.shared_views.blocked.insert(view.scope.clone());
+            }
+        }
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.
@@ -1148,6 +1155,17 @@ impl Cagents {
         // viewport update to tell the saved state.
         self.settle_focus();
         self.sidebar_state.clear_agent_activity(id);
+    }
+
+    /// Refresh presentation after an exact managed owner changes on first model
+    /// sync. The existing runtime remains attached; no snapshot of the old strip
+    /// may publish the pane back into its stale original channel.
+    pub(super) fn refresh_managed_display_strip(&mut self) -> Task<Message> {
+        let scope = self.durable.active_channel.map(Scope::Channel).or_else(|| self.active_workspace.as_deref().and_then(|path| self.worktree_view_scope(path)));
+        let Some(scope) = scope else { return Task::none(); };
+        let panes = self.local_view_panes(&scope);
+        let visible = self.local_view_cards(&scope);
+        self.project_shared_strip(&panes, &visible)
     }
 
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
