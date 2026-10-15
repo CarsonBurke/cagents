@@ -2095,7 +2095,7 @@ impl Cagents {
             editor_feature_commands: card.map_or(0, |card| self.editor_feature_command_capabilities(card)),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             editor_surface_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_surface_command_capabilities(id), Some(CardRuntime::PullRequests(pane)) => pane.runtime.editor_surface_command_capabilities(id), _ => 0 }),
-            editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
+            editor_language_commands: card.map_or(0, |id| self.live_editor_language_capabilities(id)),
             pane_index,
             pane_count: self.workspace.order().count(),
             project_count: self.sidebar_model.projects.len(),
@@ -2345,6 +2345,25 @@ impl Cagents {
                 workspace_widget::diff_presentation_command_bit(command)
             })
             .fold(0, |mask, bit| mask | bit)
+    }
+
+    fn live_editor_language_capabilities(&self, card: CardId) -> u8 {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
+        let Some(doc) = self.lsp_document(card).filter(|doc| runtime.lsp_document() == Some(*doc)) else { return 0; };
+        let capabilities = self.lsp.capabilities(doc);
+        if !capabilities.ready { return 0; }
+        let runtime_mask = runtime.editor_language_command_capabilities();
+        [
+            (Command::EditorComplete, capabilities.completion),
+            (Command::GoToDefinition, capabilities.definition),
+            (Command::FindReferences, capabilities.references),
+            (Command::HoverDocumentation, capabilities.hover),
+            // Diagnostics is the local panel for server-pushed diagnostics;
+            // pull-diagnosticProvider does not describe that capability.
+            (Command::ShowDiagnostics, true),
+        ].into_iter().filter_map(|(command, supported)| {
+            supported.then(|| workspace_widget::editor_language_command_bit(command)).flatten()
+        }).fold(0, |mask, bit| mask | bit) & runtime_mask
     }
 
     fn editor_feature_command_capabilities(&self, card: CardId) -> u8 {
