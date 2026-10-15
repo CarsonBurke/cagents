@@ -352,6 +352,7 @@ mod tests {
         let mut registry = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
                 repository: "/repo".into(),
                 name: "repo".into(),
                 kind: Default::default(),

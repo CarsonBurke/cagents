@@ -2460,6 +2460,7 @@ mod tests {
             1,
             ClientRequest::EditWorkspaceModel {
                 edit: crate::workspace_model::ModelEdit::OpenProject {
+                    checkout: None,
                     kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),
