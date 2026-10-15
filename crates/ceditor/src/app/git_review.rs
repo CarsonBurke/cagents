@@ -312,8 +312,12 @@ impl Editor {
             Action::HistoryLoaded { origin, generation, head, page, query, result } => {
                 let tab = self.tab_mut(origin.card).unwrap();
                 let source = tab.sidebar.source_control.as_mut().unwrap();
-                if tab.git_review.page_cancel.is_none() || tab.git_review.page_generation != generation || source.head_oid.as_deref() != Some(head.as_str()) || source.next_history_page != page || source.history_query != query { return Task::none(); }
+                if tab.git_review.page_cancel.is_none() || tab.git_review.page_generation != generation { return Task::none(); }
                 tab.git_review.page_cancel = None;
+                if source.head_oid.as_deref() != Some(head.as_str()) || source.next_history_page != page || source.history_query != query {
+                    source.history_failed("History changed while loading. Search again to read the current worktree.".into());
+                    return Task::none();
+                }
                 match result { Ok(commits) => source.append_history(&commits), Err(error) => source.history_failed(error) }
                 Task::none()
             }
@@ -435,6 +439,20 @@ mod tests {
         assert_eq!(app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history.len(), 2);
         sidebar_action(&mut app, SidebarAction::SearchHistory { key: origin.key, query: oid.as_str()[..10].into() });
         assert_eq!(app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].oid, oid);
+    }
+
+    #[test]
+    fn standalone_history_changed_head_settles_its_old_read_without_installing_results() {
+        let directory = git_fixture(); let mut app = editor();
+        let card = open_real_git(&mut app, directory.path(), None); let origin = bound(&app, card);
+        let task = app.update(Message::Sidebar(SidebarAction::SearchHistory { key: origin.key, query: "Initial".into() }));
+        app.tab_mut(card).unwrap().sidebar.source_control.as_mut().unwrap().head_oid = Some("f".repeat(40));
+        run_tasks(&mut app, task);
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        assert!(source.history.is_empty());
+        assert!(!source.history_loading);
+        assert!(source.history_error.as_deref().is_some_and(|error| error.contains("History changed")));
+        assert!(app.tab(card).unwrap().git_review.page_cancel.is_none());
     }
 
     #[test]
