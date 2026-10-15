@@ -839,8 +839,9 @@ impl SidebarWorktree {
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
         self.head_oid = match &status.head {
-            HeadState::Branch { oid, .. } | HeadState::Detached { oid } => Some(oid.clone()),
-            HeadState::Unborn { .. } | HeadState::Unknown => None,
+            HeadState::Branch { name, oid } if !self.detached && self.branch.as_ref()==Some(name) => Some(oid.clone()),
+            HeadState::Detached { oid } if self.detached => Some(oid.clone()),
+            _ => None,
         };
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
@@ -11355,6 +11356,9 @@ pub(crate) mod tests {
         status.head = HeadState::Branch { name: "feature".into(), oid: "b".repeat(40) };
         row.apply_status(&status);
         assert_eq!(row.head_oid.as_deref(), Some("b".repeat(40).as_str()));
+        status.head = HeadState::Branch { name: "different".into(), oid: "b".repeat(40) };
+        row.apply_status(&status);
+        assert!(row.head_oid.is_none(), "a newer status for a different branch cannot authorize the cached row");
         status.head = HeadState::Unknown;
         row.apply_status(&status);
         assert!(row.head_oid.is_none(), "an unreadable checkout cannot retain old action authority");
