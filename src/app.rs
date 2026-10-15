@@ -14530,8 +14530,10 @@ impl Application for Cagents {
                         })
                     }
                     SidebarAction::Commit { key, message, amend } => {
-                        let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
+                        let Some(commit_revision) = self.sidebar_state.submitted_commit_revision(&key, &message, amend) else {
+                            return Task::none();
+                        };
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, Some(commit_revision)) else {
                             return Task::none();
                         };
                         let request = CommitRequest {
@@ -16398,6 +16400,9 @@ impl Application for Cagents {
                     }
                 } else {
                     self.sidebar_state.finish_amend_read(&key, revision);
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_error(Some("HEAD changed while loading its message. Toggle Amend again to load the new commit.".into()));
+                    }
                 }
                 Task::none()
             }
@@ -24381,6 +24386,44 @@ mod tests {
                 .unwrap()
                 .error
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn amend_loading_rejects_a_stale_commit_action_before_starting_git() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Original draft".into(),
+            });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        drop(app.update(Message::Sidebar(SidebarAction::Commit {
+            key: key.clone(),
+            message: "Original draft".into(),
+            amend: true,
+        })));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
+        );
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        app.sidebar_state.finish_amend_read(&key, revision);
+        drop(app.update(Message::Sidebar(SidebarAction::Commit {
+            key: key.clone(),
+            message: "Original draft".into(),
+            amend: true,
+        })));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
         );
     }
 

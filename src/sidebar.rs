@@ -2724,10 +2724,16 @@ struct CommitDraft {
     amend_stash: Option<Box<CommitDraft>>,
     amend_loaded_message: Option<String>,
     amend_loading: bool,
+    amend_edited: bool,
     revision: u64,
 }
 
 impl CommitDraft {
+    fn ready(&self) -> bool {
+        !self.amend_loading
+            && (!self.amend || self.amend_loaded_message.is_some() || self.amend_edited)
+    }
+
     fn set_message(&mut self, message: &str) {
         self.message = message.to_owned();
         let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
@@ -3073,6 +3079,7 @@ impl SidebarState {
             .active_worktree
             .as_ref()
             .is_some_and(|active| active.canonical_path == key.canonical_path)
+            && self.commit_draft.ready()
             && self.commit_draft.message == message
             && self.commit_draft.amend == amend)
             .then_some(self.commit_draft.revision)
@@ -3315,6 +3322,7 @@ impl SidebarState {
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
                 self.commit_draft.amend_loading = false;
+                self.commit_draft.amend_edited = true;
                 self.commit_draft.set_message(message);
             }
             SidebarAction::CommitSubjectEditorCursor { cursor, .. } => {
@@ -3327,6 +3335,7 @@ impl SidebarState {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     let text = self.commit_draft.subject_composer.0.text();
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
@@ -3347,6 +3356,7 @@ impl SidebarState {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -3362,17 +3372,19 @@ impl SidebarState {
                         self.commit_draft.amend_stash = Some(Box::new(stash));
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = true;
+                        self.commit_draft.amend_edited = false;
                     } else {
                         let unchanged = self.commit_draft.amend_loaded_message.as_deref()
                             == Some(self.commit_draft.message.as_str());
-                        let pending = self.commit_draft.amend_loading;
+                        let untouched = !self.commit_draft.amend_edited;
                         if let Some(stash) = self.commit_draft.amend_stash.take()
-                            && (unchanged || pending)
+                            && (unchanged || untouched)
                         {
                             self.commit_draft = *stash;
                         }
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = false;
+                        self.commit_draft.amend_edited = false;
                     }
                     self.revise_commit_draft();
                     self.commit_draft.amend = *amend;
@@ -8495,7 +8507,7 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = !modal_open
         && !source.busy()
-        && !state.commit_draft.amend_loading
+        && state.commit_draft.ready()
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0 || (state.commit_draft.amend && source.head_oid.is_some()));
     let commit_action = SidebarAction::Commit {
@@ -16283,6 +16295,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn amend_failed_read_preserves_the_stash_and_requires_a_loaded_or_explicit_message() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Original draft\n\nOriginal body".into(),
+        });
+        let original = state.commit_draft.clone();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert_eq!(
+            state.submitted_commit_revision(&key, state.commit_message(), true),
+            None
+        );
+        state.finish_amend_read(&key, revision);
+        assert_eq!(
+            state.submitted_commit_revision(&key, state.commit_message(), true),
+            None
+        );
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), original.message);
+        assert_eq!(
+            state.commit_draft.subject_composer,
+            original.subject_composer
+        );
+        assert_eq!(state.commit_draft.composer, original.composer);
+
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.finish_amend_read(&key, revision);
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Intentional replacement".into(),
+        });
+        assert!(
+            state
+                .submitted_commit_revision(&key, state.commit_message(), true)
+                .is_some()
+        );
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.commit_message(), "Intentional replacement");
+    }
+
+    #[test]
     fn amend_pushed_head_warning_requires_a_measured_zero_ahead_count() {
         assert!(head_is_pushed(&TrackingState::Compared {
             upstream: "origin/main".into(),
@@ -16447,6 +16513,8 @@ pub(crate) mod tests {
             key: key.clone(),
             amend: true,
         });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "First subject\n\nFirst body"));
         let submitted = state
             .submitted_commit_revision(&key, state.commit_message(), true)
             .unwrap();
