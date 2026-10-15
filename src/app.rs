@@ -16510,6 +16510,23 @@ impl Cagents {
                 }
             }
         }
+        if previous.editor_find_options != self.settings.editor_find_options
+            || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case
+        {
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    _ => {}
+                }
+            }
+        }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
             let shortcuts = Arc::new(self.settings.keyboard_shortcuts.clone());
             for runtime in self.cards.values_mut() {

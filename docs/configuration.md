@@ -192,6 +192,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `editor_auto_close` | boolean | `true` | Pairs brackets and quotes, wraps selected text, and types over an existing closer. Turn it off to insert characters literally |
 | `editor_tab_width` | integer | `4` | `1` through `16` columns. Changes native tab stops without rewriting tabs. Also supplies the space indentation fallback when neither file content nor `.editorconfig` sets it |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
+| `editor_find_options` | table | all options `false` | Persisted Find matching options; see the three fields below |
 | `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
 | `editor_find_options.regex` | boolean | `false` | Interpret Find queries as bounded regular expressions |
 | `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |
