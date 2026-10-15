@@ -48,28 +48,47 @@ struct Key {
     size: iced::Pixels,
     font: iced::Font,
     version: graphics_text::Version,
+    unwrapped: bool,
 }
 
 #[derive(Clone)]
 enum Source {
     Markdown { text: markdown::Text, style: markdown::Style },
+    Code { text: Arc<str>, range: std::ops::Range<usize>, spans: Arc<[Span<'static, String>]>,
+        starts: Arc<[usize]>, source: reader_source::Source },
     Styled(Arc<[Span<'static, String>]>),
 }
 impl Source {
     fn len(&self) -> usize {
-        match self { Self::Markdown { text, .. } => text.len(), Self::Styled(spans) => spans.iter().map(|span| span.text.len()).sum() }
+        match self { Self::Markdown { text, .. } => text.len(), Self::Styled(spans) => spans.iter().map(|span| span.text.len()).sum(), Self::Code {range,..} => range.len() }
     }
     fn extends(&self, previous: &Self) -> bool {
         match (self, previous) {
             (Self::Markdown { text, style }, Self::Markdown { text: old, style: old_style }) => style == old_style && text.append_proven(old),
             (Self::Styled(spans), Self::Styled(previous)) => Arc::ptr_eq(spans, previous),
+            (Self::Code {range,source,..}, Self::Code {range:old,source:previous,..}) =>
+                range.start == old.start && range.end >= old.end && source.accepts(previous.digest()),
             _ => false,
+        }
+    }
+    fn unwrapped(&self) -> bool { matches!(self, Self::Code {..}) }
+    fn presentation_changed(&self, previous: &Self) -> bool {
+        match (self, previous) {
+            (Self::Code {range,spans,..}, Self::Code {range:old,spans:old_spans,..}) =>
+                range.end != old.end || (!spans.is_empty() || !old_spans.is_empty()) && !Arc::ptr_eq(spans,old_spans),
+            _ => self.len() != previous.len(),
         }
     }
     fn materialize(&self) -> (Arc<[Span<'static, String>]>, Arc<str>) {
         match self {
             Self::Markdown { text, style } => (text.spans(*style), text.plain()),
             Self::Styled(spans) => (spans.clone(), spans.iter().map(|span| span.text.as_ref()).collect::<String>().into()),
+            Self::Code {text,range,spans,starts,..} => {
+                let plain: Arc<str> = Arc::from(&text[range.clone()]);
+                let spans = if spans.is_empty() { vec![Span::new(plain.to_string())].into() }
+                    else { prose::sliced_spans(spans,starts,range.clone()) };
+                (spans,plain)
+            }
         }
     }
 }
@@ -82,6 +101,10 @@ impl Cache {
     pub(super) fn markdown_entry(&self, identity: u64, text: markdown::Text, style: markdown::Style) -> Handle {
         self.source_entry(identity, Source::Markdown { text, style })
     }
+    pub(super) fn code_entry(&self, identity: u64, text: Arc<str>, range: std::ops::Range<usize>,
+        spans: Arc<[Span<'static,String>]>, starts: Arc<[usize]>, source: reader_source::Source) -> Handle {
+        self.source_entry(identity, Source::Code {text,range,spans,starts,source})
+    }
     fn source_entry(&self, identity: u64, source: Source) -> Handle {
         let mut entries = self.0.borrow_mut();
         if let Some(entry) = entries.logical.get(&identity).and_then(std::rc::Weak::upgrade) {
@@ -89,7 +112,7 @@ impl Cache {
             if reusable {
                 let mut current = entry.borrow_mut();
                 let length = source.len();
-                if length != current.source_len {
+                if source.presentation_changed(&current.source) {
                     current.source_revision = current.source_revision.wrapping_add(1);
                     current.source_len = length;
                     current.failed = false;
@@ -126,7 +149,8 @@ impl Cache {
 
 impl Entry {
     pub(super) fn configure(&mut self, width: f32, size: iced::Pixels, font: iced::Font) {
-        let key = Key { width, size, font, version: graphics_text::font_system().read().expect("font system").version() };
+        let width = if self.source.unwrapped() && !width.is_finite() { design::READABLE_MEASURE } else { width };
+        let key = Key { width, size, font, unwrapped: self.source.unwrapped(), version: graphics_text::font_system().read().expect("font system").version() };
         if self.key != Some(key) {
             self.key = Some(key);
             self.attempt = self.attempt.wrapping_add(1);
@@ -144,7 +168,7 @@ impl Entry {
     pub(super) fn bounds(&self, _bytes: usize) -> iced::Size {
         self.ready.as_ref().map_or_else(|| {
             let key = self.key.expect("configured layout");
-            let lines = (self.source_len as f32 * key.size.0 * 0.5 / key.width.max(1.0)).ceil().max(1.0);
+            let lines = if key.unwrapped { 1.0 } else { (self.source_len as f32 * key.size.0 * 0.5 / key.width.max(1.0)).ceil().max(1.0) };
             iced::Size::new(key.width, lines * key.size.0 * 1.3)
         }, |ready| ready.bounds)
     }
@@ -229,7 +253,7 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
             let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
             let (spans, plain) = work.source.materialize();
             let prepared = Prepared::with_fonts(spans, plain, work.key.size, work.key.font, work.key.width,
-                iced::widget::text::Wrapping::WordOrGlyph, &mut fonts);
+                if work.key.unwrapped { iced::widget::text::Wrapping::None } else { iced::widget::text::Wrapping::WordOrGlyph }, &mut fonts);
             (!work.cancelled.load(Ordering::Acquire)).then(|| Arc::new(prepared))
         }).await.ok().flatten();
         action(Action::FlowReady(target, request, ready))
@@ -623,4 +647,34 @@ fn request_lookup_does_not_retain_visited_flow_owners() {
     let weak = Rc::downgrade(&active); drop(active);
     assert!(weak.upgrade().is_none());
     assert!(cache.find(id).is_none());
+}
+
+#[test]
+fn code_flow_preserves_full_physical_line_context_without_sync_shaping() {
+    let size = iced::Pixels(16.0);
+    for source in [format!("{}ffi office", "x".repeat(2047)),
+        format!("{}\tend", "x".repeat(2047)),
+        "العربية עברית e\u{301} 👩‍🔬 mixed ".repeat(200)] {
+        let text: Arc<str> = Arc::from(source.as_str());
+        let cache = Cache::default();
+        let flow = cache.code_entry(42,text.clone(),0..text.len(),Arc::from([]),vec![0].into(),reader_source::Source::new(&source));
+        flow.borrow_mut().configure(f32::INFINITY,size,iced::Font::MONOSPACE);
+        let request = flow.borrow_mut().request().expect("bounded worker request");
+        assert!(request.key.unwrapped);
+        assert_eq!(flow.borrow().bounds(source.len()).width,design::READABLE_MEASURE,
+            "unmeasured width must not pin an oversized estimate in reader memory");
+        let (spans,plain) = request.source.materialize();
+        assert_eq!(&*plain,source);
+        let full = reference(&spans,size,iced::Font::MONOSPACE,request.key.width,iced::widget::text::Wrapping::None);
+        let ready = Prepared::new(&spans,size,iced::Font::MONOSPACE,request.key.width,iced::widget::text::Wrapping::None);
+        assert_eq!(ready.bounds,full.min_bounds());
+        assert_eq!(ready.snapshot.visual_line_count(),1);
+        let original = full.buffer().layout_runs().next().expect("physical line");
+        for ((_,actual),expected) in ready.snapshot.glyphs(0).unwrap().zip(original.glyphs) {
+            assert_eq!((actual.glyph_id,actual.font_id,actual.level,actual.metadata),
+                (expected.glyph_id,expected.font_id,expected.level,expected.metadata));
+            assert_eq!((actual.x.to_bits(),actual.y.to_bits(),actual.w.to_bits()),
+                (expected.x.to_bits(),expected.y.to_bits(),expected.w.to_bits()));
+        }
+    }
 }

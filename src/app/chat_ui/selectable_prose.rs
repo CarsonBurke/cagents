@@ -194,11 +194,14 @@ pub(super) fn text(
     build_text(spans, size, font, target, find, None, None)
 }
 pub(super) fn flow_source(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
+    flow_source_optional(size,font,target,find,Some(logical),flow)
+}
+pub(super) fn flow_source_optional(size: iced::Pixels, font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: flow_layout::Handle) -> Element<'static, Message> {
     let ready = flow.borrow().prepared();
     let spans = ready.as_ref().map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
     let plain: Arc<str> = ready.as_ref().map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
     let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    Element::new(Selectable { logical: Some(logical), flow: Some(flow), flow_ready: ready, matches: highlights.ranges, spans, plain, size, font, target })
+    Element::new(Selectable { logical, flow: Some(flow), flow_ready: ready, matches: highlights.ranges, spans, plain, size, font, target })
 }
 
 #[cfg(test)]

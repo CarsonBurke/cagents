@@ -35,6 +35,7 @@ impl Language {
 pub(super) struct ToolText {
     key: u64,
     reader_source: reader_source::Source,
+    flow_cache: flow_layout::Cache,
     language: Language,
     pub(super) text: Arc<str>,
     syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,
@@ -194,9 +195,11 @@ impl ToolText {
         }
         let reader_source = previous.as_ref().filter(|previous| previous.language == language)
             .map_or_else(|| reader_source::Source::new(text), |previous| reader_source::Source::updated(&previous.reader_source, &previous.text, text));
+        let flow_cache = previous.as_ref().map(|previous| previous.flow_cache.clone()).unwrap_or_default();
         Self {
             key,
             reader_source,
+            flow_cache,
             language,
             text: Arc::from(text),
             syntax: std::cell::RefCell::new(None),
@@ -271,7 +274,7 @@ impl ToolText {
             memory.reader_width_for(context.as_deref(), scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal), &self.reader_source));
         let body = widget::container(prose::code_text(
             self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, find, logical,
+            target, find, logical, Some(self.flow_cache.clone()), Some(self.reader_source.clone()),
         ))
         .padding(design::with_vertical_rail(iced::Padding::from([
             step::GAP_S, step::GAP_M,

@@ -435,8 +435,8 @@ impl Renderer {
                 heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache))
             }
             Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical_identity(0)), Some(&self.flow_cache)),
-            Item::CodeBlock { language, code, reader_source, .. } => {
-                self.code_block(settings, language.as_deref(), code, reader_source)
+            Item::CodeBlock { language, code, source, reader_source, .. } => {
+                self.code_block(settings, language.as_deref(), code, source, reader_source)
             }
             Item::List { start, bullets } => self.list(settings, *start, bullets),
             Item::Quote(items) => {
@@ -606,19 +606,20 @@ impl Renderer {
         settings: markdown::Settings,
         language: Option<&str>,
         code: &str,
+        source: &Arc<str>,
         reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
         let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT).then(|| self.blocks.get(&fence_key(language.unwrap_or_default(), code))).flatten()
             .cloned()
             .unwrap_or_else(|| if code.len() > 2048 { Arc::from([]) } else { vec![Span::new(code.to_owned())].into() });
         let text = code_text(
-            Arc::from(code),
+            source.clone(),
             spans,
             settings.code_size,
             CodeBlock::FONT,
             self.target,
             self.find.as_deref(),
-            Some(self.logical(Arc::from(""), 0)),
+            Some(self.logical(Arc::from(""), 0)), Some(self.flow_cache.clone()), Some(reader_source.clone()),
         );
         step::code_frame(
             scroll::block_source(widget::scrollable(
@@ -701,6 +702,7 @@ fn leaf_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced
 pub(super) fn code_text(
     text: Arc<str>, spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
     font: iced::Font, target: Target, find: Option<&str>, logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>, reader_source: Option<reader_source::Source>,
 ) -> Element<'static, Message> {
     if text.len() <= 2048 {
         let spans = if spans.is_empty() { vec![Span::new(text.to_string())].into() } else { spans };
@@ -724,6 +726,7 @@ pub(super) fn code_text(
         (Arc::as_ptr(&text) as *const u8 as usize, &range, &find, font, size.0.to_bits()).hash(&mut revision);
         let revision = revision.finish();
         let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
+        let flow_cache = flow_cache.clone(); let reader_source = reader_source.clone();
         let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
             identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: false });
         let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
@@ -738,7 +741,7 @@ pub(super) fn code_text(
             }
             if display.is_empty() { return widget::Space::new().height(size.0 * 1.3).into(); }
             code_line(text.clone(), spans.clone(), starts.clone(), display,
-                size, font, target, find.clone(), logical.clone())
+                size, font, target, find.clone(), logical.clone(), flow_cache.clone(), reader_source.clone())
         });
         row.anchor = true; row.logical = descriptor; row
     }).collect();
@@ -746,42 +749,25 @@ pub(super) fn code_text(
 }
 
 fn code_line(text: Arc<str>, spans: Arc<[Span<'static, String>]>, starts: Arc<[usize]>, range: std::ops::Range<usize>,
-    size: iced::Pixels, font: iced::Font, target: Target, find: Option<Arc<str>>, logical: Option<selectable_prose::Logical>) -> Element<'static, Message> {
-    // The pinned shaping API has no context-aware horizontal range layout.
-    // Preserve physical-line Bidi, joining, clusters and tab origin rather
-    // than independently shaping a complex run at artificial boundaries.
-    // These lines remain an explicit performance qualification requirement.
-    let pieces = if range.len() <= 2048 || !text[range.clone()].is_ascii() || text[range.clone()].contains('\t') {
-        vec![0..range.len()]
-    } else { chunk_ranges(&text[range.clone()]) };
-    let chunks = pieces.into_iter().map(|piece| {
-        use std::hash::{Hash, Hasher};
-        let source = range.start + piece.start..range.start + piece.end;
-        let mut hash = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), source.start).hash(&mut hash);
-        let key = hash.finish();
-        (Arc::as_ptr(&text) as *const u8 as usize, &source, &find, font, size.0.to_bits()).hash(&mut hash);
-        let revision = hash.finish();
-        let estimate = unicode_width::UnicodeWidthStr::width(&text[source.clone()]) as f32 * size.0 * 0.6;
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + piece.start..logical.start + piece.end, chunk: true });
-        let logical = logical.clone().map(|mut logical| { logical.start += piece.start; logical });
-        let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
-        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
-            let text = text.clone(); let spans = spans.clone(); let starts = starts.clone();
-            let find = find.clone(); let logical = logical.clone(); let source = source.clone();
-            retained::kept(revision, move || {
-                let styled = if spans.is_empty() { vec![Span::new(text[source.clone()].to_owned())].into() }
-                    else { sliced_spans(&spans, &starts, source.clone()) };
-                leaf_text(styled, size, font, target, find.as_deref(), logical.clone())
-            })
-        });
-        row.logical = descriptor; row
-    }).collect();
-    virtualized::row(chunks, size.0 * 1.3, Default::default())
+    size: iced::Pixels, font: iced::Font, target: Target, find: Option<Arc<str>>, logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>, reader_source: Option<reader_source::Source>) -> Element<'static, Message> {
+    if range.len() > 2048
+        && let (Some(cache),Some(source)) = (flow_cache,reader_source) {
+        // The worker shapes the complete physical line with its original
+        // ligatures, Bidi context and tab stops; display projection may cull
+        // glyphs but never introduces an artificial source boundary.
+        use std::hash::{Hash,Hasher};
+        let mut key = std::hash::DefaultHasher::new();
+        ("code-line", logical.as_ref().map(|logical| logical.identity), logical.as_ref().map_or(range.start, |logical| logical.start)).hash(&mut key);
+        let flow = cache.code_entry(key.finish(),text,range,spans,starts,source);
+        return selectable_prose::flow_source_optional(size,font,target,find.as_deref(),logical,flow);
+    }
+    let styled = if spans.is_empty() {vec![Span::new(text[range.clone()].to_owned())].into()}
+        else {sliced_spans(&spans,&starts,range)};
+    leaf_text(styled,size,font,target,find.as_deref(),logical)
 }
 
-fn sliced_spans(spans: &[Span<'static, String>], starts: &[usize], range: std::ops::Range<usize>) -> Arc<[Span<'static, String>]> {
+pub(super) fn sliced_spans(spans: &[Span<'static, String>], starts: &[usize], range: std::ops::Range<usize>) -> Arc<[Span<'static, String>]> {
     let first = starts.partition_point(|start| *start <= range.start).saturating_sub(1);
     spans.iter().enumerate().skip(first).take_while(|(index, _)| starts[*index] < range.end)
         .filter_map(|(index, span)| {
@@ -929,7 +915,7 @@ mod tests {
             let mut reference_tree = Tree::new(&reference);
             let reference_node = reference.as_widget_mut().layout(&mut reference_tree, &renderer, &limits);
             let mut actual = code_text(Arc::from(source.as_str()), Arc::from([]), size,
-                CodeBlock::FONT, target, None, None);
+                CodeBlock::FONT, target, None, None, None, None);
             let mut tree = Tree::new(&actual);
             let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
             assert!((node.size().height - reference_node.size().height).abs() < 1.0,

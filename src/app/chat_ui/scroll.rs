@@ -1050,7 +1050,7 @@ mod tests {
         let source: Arc<str> = line.repeat(5000).into();
         let byte = line.len() * 1500;
         let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(), iced::Font::MONOSPACE,
-            target, None, Some(selectable_prose::Logical { identity, start: 0 }));
+            target, None, Some(selectable_prose::Logical { identity, start: 0 }), None, None);
         let mut cases = vec![(text, identity, byte)];
         let list = format!("{}{}", "prefix\n\n".repeat(4), (0..10000).map(|index| format!("- bullet {index} target\n")).collect::<String>());
         let table = format!("{}| First | Second |\n| --- | --- |\n{}", "prefix\n\n".repeat(4),
