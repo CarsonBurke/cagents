@@ -3205,7 +3205,7 @@ mod tests {
             for request in [second,first] {
                 let ClientRequest::ChatCommand{command:Command::LoadSource{query},..}=request.request else {panic!("source expected")};
                 let text=query.source.source_id.clone();
-                respond(&mut codec,&mut server,Some(request.request_id),ServerResponse::ChatSource{chat_id,result:Ok(SourcePage{source:query.source,epoch:1,source_len:text.len(),offset:0,next_offset:text.len(),text,complete:true,metadata:super::super::cache::SourceMetadata{role:super::super::Role::Assistant,thinking:false,phase:super::super::Phase::Final,at:None,started_at:None}})});
+                respond(&mut codec,&mut server,Some(request.request_id),ServerResponse::ChatSource{chat_id,result:Ok(SourcePage{source:query.source,epoch:super::super::cache::SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:1},source_len:text.len(),offset:0,next_offset:text.len(),text,complete:true,metadata:super::super::cache::SourceMetadata{role:super::super::Role::Assistant,thinking:false,phase:super::super::Phase::Final,at:None,started_at:None}})});
             }
             finished.recv_timeout(Duration::from_secs(5)).unwrap();
         });

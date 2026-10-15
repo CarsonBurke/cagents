@@ -79,6 +79,7 @@ pub(crate) struct Store {
     pending_text: Option<(String, Role, bool, String)>,
     pending_child_source: Option<source::PendingChildSource>,
     pub(super) source_revision: u64,
+    pub(super) source_incarnation: uuid::Uuid,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -178,6 +179,7 @@ impl Store {
                 pending_text: None,
                 pending_child_source: None,
                 source_revision: 0,
+                source_incarnation: uuid::Uuid::new_v4(),
             })
         })();
         if result.is_err() {
@@ -1146,7 +1148,7 @@ impl Store {
                     break 'records;
                 }
                 if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:source_epoch,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:crate::chat::cache::SourceEpoch{incarnation:self.source_incarnation,revision:source_epoch},metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
                 if self
                     .changed
