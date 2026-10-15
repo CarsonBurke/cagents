@@ -87,6 +87,7 @@ where F:FnMut(PatchQuery)->Fut,
 
 #[derive(Default)]
 pub(super) struct State {
+    intents:disclosure_intent::Cache<chat::cache::SourceKey,Disclosure>,
     entries:std::collections::BTreeMap<chat::cache::SourceKey,Entry>,
     aliases:HashMap<String,chat::cache::SourceKey>,
     raw:Option<Arc<Snapshot>>,
@@ -117,6 +118,26 @@ struct Entry {
     restored:HashMap<usize,(Arc<str>,chat::source_owners::ResidentPatch)>,
     patch_requests:HashMap<usize,u64>,
     patch_errors:HashMap<usize,String>,
+}
+/// Sparse numeric interaction metadata only: no Part, Manifest, path or body.
+struct Disclosure {epoch:chat::cache::SourceEpoch,opened:Vec<usize>,pages:Vec<usize>,default_open_applied:bool,suspended:Vec<usize>,paths:Vec<(usize,(bool,usize))>}
+impl Disclosure {
+    fn capture(entry:&Entry)->Option<Self> {
+        if !entry.default_open_applied && entry.opened.is_empty() && entry.manual_pages.is_empty() {return None;}
+        let mut paths=entry.suspended_paths.clone();let mut pages=entry.manual_pages.clone();
+        for (offset,page) in &entry.pages {pages.insert(*offset);for file in &page.files {paths.insert(file.file_index,(matches!(file.kind,chat::ChangeKind::Renamed {..}),*offset));}}
+        let suspended=entry.suspended.iter().copied().chain(entry.patches.keys().copied()).filter(|index|entry.opened.contains(index)).collect::<HashSet<_>>();
+        Some(Self {epoch:entry.part.epoch,opened:entry.opened.iter().copied().collect(),pages:pages.into_iter().collect(),default_open_applied:entry.default_open_applied,
+            suspended:suspended.into_iter().collect(),paths:paths.into_iter().collect()})
+    }
+    fn bytes(&self,key:&chat::cache::SourceKey)->usize {
+        std::mem::size_of::<Self>()+std::mem::size_of::<chat::cache::SourceKey>()+key.source_id.len()+key.agent_id.as_ref().map_or(0,String::len)
+            +(self.opened.len()+self.pages.len()+self.suspended.len())*std::mem::size_of::<usize>()+self.paths.len()*std::mem::size_of::<(usize,(bool,usize))>()
+    }
+    fn install(self,entry:&mut Entry) {
+        entry.opened=self.opened.into_iter().collect();entry.manual_pages=self.pages.into_iter().collect();entry.default_open_applied=self.default_open_applied;
+        entry.suspended=self.suspended.into_iter().collect();entry.suspended_paths=self.paths.into_iter().collect();
+    }
 }
 /// Immutable, ordered logical file descriptors for Find/Catalog. The same
 /// patch Arc is drawn and indexed; byte offsets never refer to a raw prefix.
@@ -208,7 +229,7 @@ impl Entry {
 }
 impl State {
     pub(super) fn clear(&mut self) {
-        self.evict(false);self.entries.clear();self.aliases.clear();self.selected=None;self.session=None;self.incarnation=None;
+        self.evict(false);self.entries.clear();self.intents.clear();self.aliases.clear();self.selected=None;self.session=None;self.incarnation=None;
         self.revision=self.revision.wrapping_add(1);self.context=self.context.wrapping_add(1);
     }
     /// Keep only exact-source file/page disclosure intent on ordinary hide.
@@ -364,12 +385,22 @@ impl State {
                         *entry=Entry::new(part.clone());entry.patches=old;
                         self.revision=self.revision.wrapping_add(1);
                     }
-                    None=>{self.entries.insert(part.source.clone(),Entry::new(part.clone()));self.revision=self.revision.wrapping_add(1);}
+                    None=>{
+                        let mut entry=Entry::new(part.clone());
+                        if let Some(intent)=self.intents.take(&part.source).filter(|intent|intent.epoch==part.epoch) {intent.install(&mut entry);}
+                        self.entries.insert(part.source.clone(),entry);self.revision=self.revision.wrapping_add(1);
+                    }
                 }
             }
         }
-        let previous_len=self.entries.len();self.entries.retain(|key,_|visible.contains(key));
-        if self.entries.len()!=previous_len {self.revision=self.revision.wrapping_add(1);}
+        let removed:Vec<_>=self.entries.keys().filter(|key|!visible.contains(*key)).cloned().collect();
+        for key in removed {if let Some(mut entry)=self.entries.remove(&key) {
+            if let Some(intent)=Disclosure::capture(&entry) {let bytes=intent.bytes(&key);self.intents.remember(key,intent,bytes);}
+            // No active descriptor, pending Catalog leaf, reader, copy demand
+            // or strong source owner survives merely because intent does.
+            retire_copy(std::mem::take(&mut entry.pages));retire_copy(std::mem::take(&mut entry.restored));
+            drop(entry);self.revision=self.revision.wrapping_add(1);
+        }}
         self.aliases=aliases;
         for (key,entry) in &mut self.entries {entry.demand(expanded.contains(&key.source_id),find);}
         let unchanged=self.raw.as_ref().is_some_and(|old|Arc::ptr_eq(old,&raw));
@@ -1107,6 +1138,47 @@ mod tests {
         assert!(state.render_ready(|view|view.text.as_ref()==text));assert!(state.item_revision(&page.source.source_id)>before);
         assert_eq!(state.revision(),semantic);assert_eq!(state.find_sources()[0].revision,file_revision);
         assert!(!state.render_ready(|_|false));
+    }
+
+    #[tokio::test]
+    async fn paged_away_changes_release_bodies_but_restore_exact_file_page_and_default_choices() {
+        let text="@@ -1 +1 @@\n-before\n+after\n";let page=fixture(text);let(mut state,raw,expanded)=open(&page,"visible-part");
+        let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let owner=Arc::downgrade(&state.entries[&page.source].current(0).unwrap().text);
+        state.page(&page.source.source_id,0,false);
+        let mut away=(*raw).clone();away.items.clear();away.changes_parts.clear();away.has_earlier=true;
+        state.project(Arc::new(away.clone()),None,&expanded,false);flush_retired();
+        assert!(expanded.contains(&page.source.source_id));assert!(owner.upgrade().is_none());
+        assert!(state.entries.is_empty() && state.aliases.is_empty());assert!(state.suspended_paths(&page.source.source_id).is_empty());
+        assert_eq!(state.intents.usage().0,1);
+        state.project(raw.clone(),None,&expanded,false);
+        let entry=&state.entries[&page.source];assert!(entry.opened.contains(&0) && entry.manual_pages.contains(&0) && entry.default_open_applied);
+        assert!(entry.requested.contains_key(&0));
+        assert!(state.suspended_paths(&page.source.source_id).contains(&vec![6,0]));
+        let request=state.entries[&page.source].requested[&0];assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
+        state.project(raw.clone(),None,&expanded,false);let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));assert_eq!(state.copy_patch(&page.source.source_id,0).unwrap().as_ref(),text);
+        state.toggle_file(&page.source.source_id,0,false);assert!(!state.entries[&page.source].opened.contains(&0));
+        state.project(Arc::new(away.clone()),None,&expanded,false);state.project(raw.clone(),None,&expanded,false);
+        let request=state.entries[&page.source].requested[&0];assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
+        assert!(!state.entries[&page.source].opened.contains(&0),"explicitly closed single-file default stays closed after paging");
+        state.project(Arc::new(away),None,&expanded,false);let mut rewritten=(*raw).clone();rewritten.changes_parts[0].epoch.revision+=1;
+        state.project(Arc::new(rewritten),None,&expanded,false);
+        assert!(!state.entries[&page.source].opened.contains(&0));assert!(!state.entries[&page.source].default_open_applied);
+        state.clear();assert_eq!(state.intents.usage(),(0,0));
+    }
+
+    #[test]
+    fn later_original_manifest_page_choice_survives_only_exact_epoch_page_return() {
+        let mut first=(*fixture("patch")).clone();let file=first.files[0].clone();
+        first.metadata.total_files=129;first.metadata.total_bytes=129*file.source_len;
+        first.files=(0..128).map(|index|File {file_index:index,path:format!("file-{index}.rs"),..file.clone()}).collect();first.next_offset=Some(128);
+        let first=Arc::new(first);let(mut state,raw,expanded)=open(&first,"page-part");
+        state.page(&first.source.source_id,128,false);assert!(state.entries[&first.source].manual_pages.contains(&128));
+        let mut away=(*raw).clone();away.items.clear();away.changes_parts.clear();state.project(Arc::new(away),None,&expanded,false);
+        assert!(state.entries.is_empty() && state.suspended_paths(&first.source.source_id).is_empty());
+        state.project(raw,None,&expanded,false);let entry=&state.entries[&first.source];
+        assert!(entry.manual_pages.contains(&128) && entry.requested.contains_key(&128));
     }
 
 }
