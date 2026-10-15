@@ -6566,11 +6566,16 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn lsp_diagnostics_reach_standalone_editor_navigation_and_follow_edits() {
+    #[test]
+    fn lsp_diagnostics_reach_standalone_editor_navigation_and_follow_edits() {
         use cagents::lsp::{LspError, LspRange, LspSeverity};
         use cagents::repository_widget::EditorLspAction;
 
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
         let directory = tempfile::tempdir().unwrap();
         let original = "first\nsecond\nthird\n";
         std::fs::write(directory.path().join("a.rs"), original).unwrap();
