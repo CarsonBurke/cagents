@@ -502,18 +502,14 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .current_dir
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
-            let ignored_path = format!(".worktrees/{name}/cagents-ignore-check");
-            let ignore = CommandSpec::new("git")
-                .cwd(root)
-                .args(["check-ignore", "--quiet", "--"])
-                .arg(ignored_path);
-            let ignored = SystemProcessExecutor
-                .execute(&ignore, &CancellationToken::new())
+            let directory = root.join(crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY);
+            let service = crate::repository::RepositoryService::system("git");
+            service
+                .ensure_managed_directory_ignored(root, &directory, &CancellationToken::new())
                 .map_err(|error| error.to_string())?;
-            if !ignored.success {
-                return Err("ignore .worktrees/ in .gitignore or .git/info/exclude before creating a worktree".into());
-            }
-            let directory = root.join(".worktrees");
+            service
+                .ignore_legacy_managed_worktrees(root, &CancellationToken::new())
+                .map_err(|error| error.to_string())?;
             crate::secure_file::reject_symlink_components(&directory)
                 .map_err(|error| error.to_string())?;
             match std::fs::create_dir(&directory) {
@@ -941,6 +937,12 @@ mod tests {
 
     #[test]
     fn git_operations_and_worktrees_target_the_daemon_directory() {
+        if crate::repository::isolated_git_test(concat!(
+            module_path!(),
+            "::git_operations_and_worktrees_target_the_daemon_directory"
+        )) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
         let run = |arguments: &[&str]| {
@@ -977,20 +979,25 @@ mod tests {
         assert!(
             matches!(invoke(GitOperation::Diff {staged:false}).unwrap(),Reply::Text(text) if text.contains("+changed"))
         );
-        assert!(
-            invoke(GitOperation::CreateWorktree {
-                name: "dev".into(),
-                branch: "feature/dev".into()
-            })
-            .is_err()
-        );
-        std::fs::write(root.join(".git/info/exclude"), ".worktrees/\n").unwrap();
         invoke(GitOperation::CreateWorktree {
             name: "dev".into(),
             branch: "feature/dev".into(),
         })
         .unwrap();
         assert!(root.join(".worktrees/dev/-option").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/info/exclude"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "/.worktrees/")
+                .count(),
+            1,
+        );
+        assert!(
+            !std::fs::read_to_string(root.join(".gitignore"))
+                .unwrap_or_default()
+                .contains(".worktrees")
+        );
         std::fs::write(root.join(".worktrees/dev/untracked"), "keep").unwrap();
         assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
         assert!(root.join(".worktrees/dev/untracked").exists());
