@@ -1021,11 +1021,16 @@ impl CachedItem {
         self.flow_cache.retained_bytes()
             + self.source.retained_capacity()
             + self.blocks.values().map(prose::CodeBlock::retained_span_bytes).sum::<usize>()
-            + self.preview.retained_bytes()
-            + self.tool_input.iter().chain(self.tool_output.iter()).chain(self.patches.iter())
-                .map(tool_text::ToolText::retained_bytes).sum::<usize>()
-    }
 
+            + self.preview.retained_bytes()
+            + self
+                .tool_input
+                .iter()
+                .chain(self.tool_output.iter())
+                .chain(self.patches.iter())
+                .map(tool_text::ToolText::retained_bytes)
+                .sum::<usize>()
+    }
 
     fn next_revision() -> u64 {
         static REVISION: AtomicU64 = AtomicU64::new(1);
@@ -1574,6 +1579,10 @@ pub(super) struct Runtime {
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     presentation_revision: u64,
+    presentation_evicted: bool,
+    /// Small tail identity survives body eviction so rehydrating an unchanged
+    /// publication does not invent an unread message while scrolled back.
+    last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
     /// The palette the cache's code blocks are highlighted in.
@@ -1674,6 +1683,13 @@ pub(super) struct Runtime {
     completion: completion::State,
     suggestion_dismissed: Option<(Option<String>, u64)>,
 }
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+            released = true, resident_bytes = 0usize, cache_entries = 0usize, exposed_presentation_bytes = 0usize);
+    }
+}
+
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
 pub(super) const COMPACT_COMMAND: &str = "compact";
@@ -2188,6 +2204,8 @@ impl Runtime {
             drop_hover: false,
             cache: HashMap::new(),
             presentation_revision: 0,
+            presentation_evicted: false,
+            last_presented_tail: None,
             preview_request: None,
             syntax_theme,
             turns: Vec::new(),
@@ -2245,6 +2263,8 @@ impl Runtime {
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.cache.clear();
+        self.presentation_evicted = false;
+        self.last_presented_tail = None;
         self.turns.clear();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
@@ -2483,12 +2503,37 @@ impl Runtime {
     fn refresh(&mut self) {
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
+            if let Some((snapshot, clock)) = self
+                .handle()
+                .and_then(|handle| handle.hidden_snapshot_with_clock())
+            {
+                self.install_snapshot(snapshot, clock);
+            }
             return;
         }
         let Some(handle) = self.handle() else {
             return;
         };
-        let (mut snapshot, source_clock) = handle.snapshot_with_clock();
+        let Some((snapshot, source_clock)) = handle.resident_snapshot_with_clock() else {
+            return;
+        };
+        self.install_snapshot(snapshot, source_clock);
+    }
+
+    /// Install an authoritative hydrated publication without replacing reader
+    /// interaction state. Archived conversations use the same presentation path.
+    pub(super) fn install_snapshot(
+        &mut self,
+        mut snapshot: Arc<Snapshot>,
+        source_clock: Option<chat::client::SourceClock>,
+    ) {
+        if !self.visible.load(Ordering::Relaxed) {
+            self.release_transcript_presentation();
+            Arc::make_mut(&mut snapshot).evict_transcript();
+            self.snapshot = snapshot;
+            self.source_clock = source_clock;
+            return;
+        }
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -2505,11 +2550,8 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id))
             .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
-        if self.snapshot.generation == snapshot.generation
-            && Arc::ptr_eq(&self.snapshot, &snapshot)
-            && selected_items
-                .iter()
-                .all(|item| self.cache.contains_key(&item.id))
+        if !self.presentation_evicted && self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
+            && selected_items.iter().all(|item| self.cache.contains_key(&item.id))
         {
             return;
         }
@@ -2549,9 +2591,15 @@ impl Runtime {
             && self.page_request.is_none()
             && !snapshot.history_loading
             && snapshot.items.last().is_some_and(|item| {
-                self.cache
-                    .get(&item.id)
-                    .is_none_or(|cached| cached.token != ChangeToken::of(&item.content))
+                let token = ChangeToken::of(&item.content);
+                self.cache.get(&item.id).map_or_else(
+                    || {
+                        self.last_presented_tail
+                            .as_ref()
+                            .is_none_or(|(id, previous)| id != &item.id || *previous != token)
+                    },
+                    |cached| cached.token != token,
+                )
             })
         {
             self.unseen_activity = true;
@@ -2747,7 +2795,13 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
+        self.last_presented_tail = snapshot
+            .items
+            .last()
+            .map(|item| (item.id.clone(), ChangeToken::of(&item.content)));
         self.snapshot = snapshot;
+        self.presentation_evicted = false;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id, resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
         images::sync(self);
         self.refresh_find();
     }
@@ -2881,20 +2935,69 @@ impl Runtime {
             self.update_find_paint();
             self.find_dirty = true;
         }
+        let changed = was_visible != visible;
         images::sync(self);
-        self.present()
+        let result = self.present();
+        if visible {
+            if changed {
+                self.refresh();
+            }
+        } else if result.is_ok()
+            && self.handle().is_some()
+            && (changed
+                || !self.cache.is_empty()
+                || !self.snapshot.items.is_empty()
+                || self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .any(|child| !child.items.is_empty()))
+        {
+            self.release_transcript_presentation();
+        } else if !visible && self.handle().is_some()
+            && (!self.cache.is_empty() || self.selection_document.borrow().is_some()) {
+            // An unreachable daemon cannot restore its body yet. Keep that
+            // last readable publication, but shed render-ready amplification.
+            self.release_transcript_caches();
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+                resident_bytes = self.snapshot.transcript_bytes(), cache_entries = 0usize,
+                exposed_presentation_bytes = 0usize);
+        }
+        result
     }
+    fn release_transcript_caches(&mut self) {
+        self.cache = HashMap::new();
+        self.selection_document.get_mut().take();
+        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        self.presentation_evicted = true;
+    }
+
+    /// Evict disposable body/presentation owners while keeping the small
+    /// interaction state needed by either a live or archived rehydration.
+    pub(super) fn release_transcript_presentation(&mut self) {
+        let bytes = self.snapshot.transcript_bytes();
+        let cache_entries = self.cache.len();
+        self.release_transcript_caches();
+        Arc::make_mut(&mut self.snapshot).evict_transcript();
+        if self.history_cursor.is_none() {
+            self.history = Vec::new();
+        }
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id,
+            resident_bytes = 0usize, cache_entries = 0usize, evicted_bytes = bytes,
+            evicted_cache_entries = cache_entries, exposed_presentation_bytes = 0usize);
+    }
+
     /// Tells the connection whether to keep the card's snapshot current.
     ///
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     fn present(&self) -> Result<(), String> {
-        let visible = self.visible.load(Ordering::Relaxed)
-            || self.queued.is_some()
-            || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        let retain_body = self.visible.load(Ordering::Relaxed);
+        let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
+        self.handle().map_or(Ok(()), |handle| {
+            handle.set_interest(interested, retain_body)
+        })
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -5453,6 +5556,8 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         let selection = None;
+        let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            && self.workspace_surfaces_visible();
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -5481,7 +5586,15 @@ impl Cagents {
                                 let _ = sender.try_send((target, wake));
                             },
                         )
-                        .map(Arc::new)
+                        .map(|handle| {
+                            // Background restorations must not queue full bodies
+                            // in Ready messages while the UI processes other panes.
+                            // Ready rechecks actual visibility before rendering.
+                            if !initially_visible {
+                                let _ = handle.set_visible(false);
+                            }
+                            Arc::new(handle)
+                        })
                     },
                 )))
             })
@@ -5772,13 +5885,9 @@ impl Cagents {
             (QueuedStep::Prompt, Err(error)) => {
                 // The conversation is new, so a message of the reader's in
                 // it can only be this one.
-                let arrived = runtime.handle().is_some_and(|handle| {
-                    handle
-                        .snapshot()
-                        .items
-                        .iter()
-                        .any(|item| item.role == chat::Role::User)
-                });
+                let arrived = runtime
+                    .handle()
+                    .is_some_and(|handle| handle.has_observed_user_item());
                 if !arrived {
                     return self.revert_chat_draft(target, Some(error));
                 }
@@ -6561,7 +6670,8 @@ impl Cagents {
                         };
                         handle.take_observed();
                         let visible = self.workspace.visibility(target.card)
-                            == Some(VisibilityClass::Visible);
+                            == Some(VisibilityClass::Visible)
+                            && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
@@ -7815,7 +7925,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7910,7 +8021,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11952,14 +12064,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11978,7 +12095,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -13342,6 +13462,137 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let snapshot = || Snapshot {
+            generation: 17,
+            session_id: Some(KNOWN_THREAD.into()),
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: "parent".into(),
+                role: chat::Role::Assistant,
+                content: text(&format!(
+                    "```rust\n{}\n```",
+                    "let value = 123;\n".repeat(4096)
+                )),
+                started_at: None,
+                at: None,
+            })],
+            subagents: vec![chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(chat::Item {
+                    id: "child-item".into(),
+                    role: chat::Role::Assistant,
+                    content: text(&"child words\n".repeat(4096)),
+                    started_at: None,
+                    at: None,
+                })],
+            }],
+            ..Snapshot::default()
+        };
+        let first = snapshot();
+        let parent = Arc::downgrade(&first.items[0]);
+        let child = Arc::downgrade(&first.subagents[0].items[0]);
+        show_chat_snapshot_for_test(&mut app, card, first);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let handle = runtime.handle().unwrap().clone();
+        runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
+        runtime.selected_subagent = Some("child".into());
+        let plain: Arc<str> = Arc::from("Rendered selected child words\n".repeat(4096));
+        let weak_plain = Arc::downgrade(&plain);
+        let mut document = selection::Catalog::builder();
+        document.plain("child-item", &[0], plain);
+        let document = document.finish();
+        let weak_document = Arc::downgrade(&document);
+        let (anchor, end) = document.endpoints().unwrap();
+        let bookmark = std::rc::Rc::new(std::cell::RefCell::new(selection::Bookmark {
+            anchor: Some(anchor), end: Some(end),
+            anchor_prefix: document.fingerprint(anchor), end_prefix: document.fingerprint(end),
+        }));
+        runtime.selection_document.get_mut().replace((99, document));
+        runtime.selection_bookmarks.get_mut().insert(Some("child".into()), bookmark.clone());
+        runtime.scroll = view::Scroll::new(200.0, 1000.0, 400.0);
+        runtime
+            .subagent_scroll
+            .insert("child".into(), view::Scroll::new(75.0, 900.0, 400.0));
+        runtime.expanded.insert("parent".into());
+        let scroll = runtime.scroll;
+        let child_scroll = runtime.subagent_scroll.clone();
+        let turns = runtime
+            .turns
+            .iter()
+            .map(|turn| turn.key.clone())
+            .collect::<Vec<_>>();
+        runtime.unseen_activity = false;
+        assert!(!runtime.cache.is_empty());
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.cache.is_empty());
+        assert!(runtime.selection_document.borrow().is_none());
+        assert!(weak_document.upgrade().is_none(), "the logical selection catalog must be released");
+        assert!(weak_plain.upgrade().is_none(), "selection must not retain hidden rendered text");
+        assert!(std::rc::Rc::ptr_eq(&runtime.selection_bookmarks.borrow()[&Some("child".into())], &bookmark));
+        assert_eq!(bookmark.borrow().anchor, Some(anchor));
+        assert_eq!(bookmark.borrow().end, Some(end));
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        assert!(
+            parent.upgrade().is_none(),
+            "client, runtime and presentation must all release the parent body"
+        );
+        assert!(
+            child.upgrade().is_none(),
+            "unselected child bodies must be released too"
+        );
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert_eq!(runtime.scroll, scroll);
+        assert_eq!(runtime.subagent_scroll, child_scroll);
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+        runtime.set_visible(true).unwrap();
+        assert!(runtime.cache.is_empty(), "reveal waits for an authoritative body");
+        // The daemon answers the unconditional read at the same generation.
+        handle.replace_snapshot_for_test(snapshot());
+        runtime.refresh();
+        assert!(runtime.snapshot.transcript_bytes() > 0);
+        assert!(!runtime.cache.is_empty());
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert_eq!(runtime.scroll, scroll);
+        assert_eq!(runtime.subagent_scroll, child_scroll);
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+        assert!(runtime.expanded.contains("parent"));
+        assert_eq!(
+            runtime
+                .turns
+                .iter()
+                .map(|turn| turn.key.clone())
+                .collect::<Vec<_>>(),
+            turns
+        );
+        assert!(
+            !runtime.unseen_activity,
+            "unchanged rehydration must not invent new activity"
+        );
+        let mut changed = snapshot();
+        changed.generation += 1;
+        Arc::make_mut(&mut changed.items[0]).content = text("new live tail");
+        handle.replace_snapshot_for_test(changed);
+        runtime.refresh();
+        assert!(
+            runtime.unseen_activity,
+            "new tail content still signals unread activity"
+        );
     }
 
     #[test]
@@ -15626,11 +15877,31 @@ mod tests {
 
         handle.replace_snapshot_for_test(Snapshot {
             ready: true,
+            items: vec![
+                chat::Item {
+                    id: "provider-introduction".into(),
+                    role: chat::Role::Assistant,
+                    content: text(&"hidden body".repeat(64 * 1024)),
+                    started_at: None,
+                    at: None,
+                }
+                .into(),
+            ],
             ..Snapshot::default()
         });
+        assert_eq!(
+            handle.snapshot().transcript_bytes(),
+            0,
+            "control polling does not retain hidden history"
+        );
         let target = chat_runtime(&app, card).target;
         let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
         assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        assert!(
+            chat_runtime(&app, card).snapshot.ready,
+            "hidden runtime receives ready metadata"
+        );
+        assert_eq!(chat_runtime(&app, card).snapshot.transcript_bytes(), 0);
         settle(&mut app, card, Ok(()));
         assert!(
             !handle.is_visible_for_test(),
@@ -15693,6 +15964,7 @@ mod tests {
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, None);
         answer_start(&mut app, target, Ok(handle.clone()));
+        let _ = app.chat_runtime_mut(target).unwrap().set_visible(false);
         handle.replace_snapshot_for_test(Snapshot {
             ready: true,
             items: vec![
@@ -15707,6 +15979,14 @@ mod tests {
             ],
             ..Snapshot::default()
         });
+        assert!(
+            handle.snapshot().items.is_empty(),
+            "the hidden body was actually evicted"
+        );
+        assert!(
+            handle.has_observed_user_item(),
+            "receipt evidence retains no prompt text"
+        );
         settle(
             &mut app,
             card,

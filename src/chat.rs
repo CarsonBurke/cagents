@@ -1105,6 +1105,29 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Drop renderable history while retaining provider continuity, controls,
+    /// activity and pending interactions. Only the UI client's disposable copy
+    /// uses this: the daemon still owns paging and the authoritative transcript.
+    #[cfg(feature = "ui")]
+    pub(crate) fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+
+    /// Logical body bytes referenced by this owner, not unique heap bytes:
+    /// immutable items can be Arc-shared with other snapshots and caches.
+    #[cfg(feature = "ui")]
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
