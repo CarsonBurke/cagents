@@ -2468,6 +2468,32 @@ impl RepositoryRuntime {
         }
     }
 
+    /// PDF toolbar, palette and shortcut activation share page and zoom bounds.
+    pub fn registered_pdf_command_action(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        if self.source_surface == SourceSurface::Diff || self.is_saving() { return None; }
+        let DocumentState::Pdf { pages, page, tone, zoom, .. } = &self.document else { return None; };
+        if *pages == 0 || *page >= *pages { return None; }
+        let target = match command {
+            Command::PdfFirstPage if *page > 0 => 0,
+            Command::PdfPreviousPage if *page > 0 => page - 1,
+            Command::PdfNextPage if *page + 1 < *pages => page + 1,
+            Command::PdfLastPage if *page + 1 < *pages => pages - 1,
+            Command::PdfZoomOut => return Some(RepositoryAction::PdfZoom { card, zoom: zoom.smaller()? }),
+            Command::PdfZoomIn => return Some(RepositoryAction::PdfZoom { card, zoom: zoom.larger()? }),
+            Command::PdfFit if !zoom.is_fit() => return Some(RepositoryAction::PdfZoom { card, zoom: crate::editor::PdfZoom::Fit }),
+            Command::PdfToggleColors => return Some(RepositoryAction::PdfTone { card, tone: if matches!(tone, crate::editor::PdfTone::Inverted { .. }) { crate::editor::PdfTone::Original } else { pdf_tone_inverted(&cosmic::theme::active()) } }),
+            _ => return None,
+        };
+        Some(RepositoryAction::PdfPage { card, page: target, tone: *tone, zoom: *zoom })
+    }
+
+    pub fn pdf_command_capabilities(&self, card: CardId) -> u8 {
+        crate::workspace_widget::PDF_COMMANDS.into_iter().filter_map(|command| {
+            self.registered_pdf_command_action(card, command).and_then(|_| crate::workspace_widget::pdf_command_bit(command))
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
     /// Cached native-buffer capabilities used by menus, palette and shortcuts.
     pub fn editor_command_capabilities(&self) -> u8 {
         let history = u8::from(self.can_step_editor_history(false)) | (u8::from(self.can_step_editor_history(true)) << 1);
@@ -9197,6 +9223,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             chosen_tone: _,
         } => pdf_document_view(
             card,
+            runtime,
             *pages,
             PdfView {
                 page: *page,
@@ -9225,6 +9252,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
 #[allow(clippy::too_many_arguments)]
 fn pdf_document_view<'a>(
     card: CardId,
+    runtime: &'a RepositoryRuntime,
     pages: usize,
     view: PdfView,
     handle: &iced::widget::image::Handle,
@@ -9236,26 +9264,17 @@ fn pdf_document_view<'a>(
 ) -> Element<'a, RepositoryAction> {
     let PdfView { page, tone, zoom } = view;
     let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
-    let turn = |to: usize, glyph: Icon, label: &'static str, enabled: bool| {
-        icon_button(glyph, label).on_press_maybe(enabled.then(|| RepositoryAction::PdfPage {
-            card,
-            page: to,
-            tone,
-            zoom,
-        }))
+    use crate::workspace_widget::GlobalShortcut as Command;
+    let control = |command, glyph: Icon| {
+        icon_button(glyph, crate::workspace_widget::shortcut_tooltip(command, &runtime.keyboard_shortcuts))
+            .on_press_maybe(runtime.registered_pdf_command_action(card, command))
     };
     let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
-        turn(0, Icon::First, "First page", page > 0).into(),
-        turn(
-            page.saturating_sub(1),
-            Icon::ChevronLeft,
-            "Previous page",
-            page > 0,
-        )
-        .into(),
+        control(Command::PdfFirstPage, Icon::First).into(),
+        control(Command::PdfPreviousPage, Icon::ChevronLeft).into(),
         crate::design::body(format!("{} / {pages}", page + 1)).into(),
-        turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
-        turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
+        control(Command::PdfNextPage, Icon::ChevronRight).into(),
+        control(Command::PdfLastPage, Icon::Last).into(),
     ];
     // The status sits on the flexible gap's left, so that a render starting or
     // landing cannot move the controls on its right. The zoom controls are the
@@ -9279,11 +9298,7 @@ fn pdf_document_view<'a>(
     } else {
         controls.push(iced::widget::Space::new().width(Length::Fill).into());
     }
-    let step = |to: Option<crate::editor::PdfZoom>, glyph: Icon, label: &'static str| {
-        icon_button(glyph, label)
-            .on_press_maybe(to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }))
-    };
-    controls.push(step(zoom.smaller(), Icon::ZoomOut, "Draw the page smaller").into());
+    controls.push(control(Command::PdfZoomOut, Icon::ZoomOut).into());
     controls.push(
         crate::interaction::tooltip(
             // A fixed width, because the label is between the two controls a
@@ -9303,46 +9318,9 @@ fn pdf_document_view<'a>(
         )
         .into(),
     );
-    controls.push(step(zoom.larger(), Icon::ZoomIn, "Draw the page larger").into());
-    controls.push(
-        // Enabled even while fitted, because this is the mode the viewer is
-        // in rather than an action: pressing it again asks for what is already
-        // drawn, which the update rejects, and staying enabled is what lets
-        // the selected surface say that fitting is what the size means now.
-        icon_button(Icon::ZoomFit, "Fit the page to the pane")
-            .selected(zoom.is_fit())
-            .on_press(RepositoryAction::PdfZoom {
-                card,
-                zoom: crate::editor::PdfZoom::Fit,
-            })
-            .into(),
-    );
-    controls.push(
-        icon_button(
-            if inverted {
-                Icon::Brightness
-            } else {
-                Icon::Night
-            },
-            if inverted {
-                "Show the document's own colors"
-            } else {
-                "Adapt the document to a dark surface"
-            },
-        )
-        .selected(inverted)
-        .on_press(RepositoryAction::PdfTone {
-            card,
-            tone: if inverted {
-                crate::editor::PdfTone::Original
-            } else {
-                // Deliberately re-read rather than remembered: the reader
-                // may have changed their theme since the page was opened.
-                pdf_tone_inverted(&cosmic::theme::active())
-            },
-        })
-        .into(),
-    );
+    controls.push(control(Command::PdfZoomIn, Icon::ZoomIn).into());
+    controls.push(control(Command::PdfFit, Icon::ZoomFit).selected(zoom.is_fit()).into());
+    controls.push(control(Command::PdfToggleColors, if inverted { Icon::Brightness } else { Icon::Night }).selected(inverted).into());
     widget::column::with_children(vec![
         widget::container(
             widget::row::with_children(controls)
@@ -16986,6 +16964,41 @@ mod tests {
                 rgba: vec![255; 16].into(),
             },
         }
+    }
+
+    #[test]
+    fn registered_pdf_commands_share_current_page_zoom_and_document_availability() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 4);
+        assert!(runtime.registered_pdf_command_action(card, Command::PdfFirstPage).is_none());
+        assert!(runtime.registered_pdf_command_action(card, Command::PdfPreviousPage).is_none());
+        assert!(runtime.registered_pdf_command_action(card, Command::PdfFit).is_none());
+        let next = runtime.registered_pdf_command_action(card, Command::PdfNextPage).unwrap();
+        assert!(matches!(next, RepositoryAction::PdfPage { page: 1, .. }));
+        let last = runtime.registered_pdf_command_action(card, Command::PdfLastPage).unwrap();
+        assert!(matches!(last, RepositoryAction::PdfPage { page: 3, .. }));
+        drop(runtime.update(last));
+        assert!(runtime.registered_pdf_command_action(card, Command::PdfNextPage).is_none());
+        assert!(runtime.registered_pdf_command_action(card, Command::PdfLastPage).is_none());
+        assert!(matches!(runtime.registered_pdf_command_action(card, Command::PdfPreviousPage), Some(RepositoryAction::PdfPage { page: 2, .. })));
+        assert!(matches!(runtime.registered_pdf_command_action(card, Command::PdfZoomIn), Some(RepositoryAction::PdfZoom { .. })));
+        for step in [0, 6] {
+            let DocumentState::Pdf { zoom, .. } = &mut runtime.document else { unreachable!() };
+            *zoom = crate::editor::PdfZoom::Scaled(step);
+            assert_eq!(runtime.registered_pdf_command_action(card, Command::PdfZoomOut).is_some(), step > 0);
+            assert_eq!(runtime.registered_pdf_command_action(card, Command::PdfZoomIn).is_some(), step < 6);
+            assert!(runtime.registered_pdf_command_action(card, Command::PdfFit).is_some());
+        }
+        assert!(matches!(runtime.registered_pdf_command_action(card, Command::PdfToggleColors), Some(RepositoryAction::PdfTone { .. })));
+        let mut context = crate::workspace_widget::CommandContext { focused: crate::workspace_widget::FocusedPane::RepositoryPane, pdf_commands: runtime.pdf_command_capabilities(card), ..Default::default() };
+        assert!(crate::workspace_widget::shortcut_descriptor(Command::PdfFirstPage).available(&context));
+        runtime.source_surface = SourceSurface::Diff;
+        context.pdf_commands = runtime.pdf_command_capabilities(card);
+        assert_eq!(context.pdf_commands, 0);
+        assert!(!crate::workspace_widget::shortcut_descriptor(Command::PdfFirstPage).available(&context));
+        let (editor, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        assert_eq!(editor.pdf_command_capabilities(card), 0);
     }
 
     /// The page, tone, in-flight request and message the viewer is showing.

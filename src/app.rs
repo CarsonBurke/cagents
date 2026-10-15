@@ -2944,12 +2944,20 @@ pub enum SettingsField {
     ShortcutEditorEdit,
     ShortcutEditorPreview,
     ShortcutEditorDiff,
+    ShortcutPdfFirstPage,
+    ShortcutPdfPreviousPage,
+    ShortcutPdfNextPage,
+    ShortcutPdfLastPage,
+    ShortcutPdfZoomOut,
+    ShortcutPdfZoomIn,
+    ShortcutPdfFit,
+    ShortcutPdfToggleColors,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 148] = [
+    const SHORTCUTS: [Self; 156] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3103,6 +3111,14 @@ impl SettingsField {
         Self::ShortcutEditorEdit,
         Self::ShortcutEditorPreview,
         Self::ShortcutEditorDiff,
+        Self::ShortcutPdfFirstPage,
+        Self::ShortcutPdfPreviousPage,
+        Self::ShortcutPdfNextPage,
+        Self::ShortcutPdfLastPage,
+        Self::ShortcutPdfZoomOut,
+        Self::ShortcutPdfZoomIn,
+        Self::ShortcutPdfFit,
+        Self::ShortcutPdfToggleColors,
 
     ];
 
@@ -3261,6 +3277,14 @@ impl SettingsField {
             Self::ShortcutEditorEdit => "Edit file",
             Self::ShortcutEditorPreview => "Preview file",
             Self::ShortcutEditorDiff => "View diff",
+            Self::ShortcutPdfFirstPage => "First PDF page",
+            Self::ShortcutPdfPreviousPage => "Previous PDF page",
+            Self::ShortcutPdfNextPage => "Next PDF page",
+            Self::ShortcutPdfLastPage => "Last PDF page",
+            Self::ShortcutPdfZoomOut => "Zoom PDF out",
+            Self::ShortcutPdfZoomIn => "Zoom PDF in",
+            Self::ShortcutPdfFit => "Fit PDF page to pane",
+            Self::ShortcutPdfToggleColors => "Toggle PDF adapted colors",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3473,6 +3497,14 @@ impl SettingsField {
             | Self::ShortcutEditorEdit
             | Self::ShortcutEditorPreview
             | Self::ShortcutEditorDiff
+            | Self::ShortcutPdfFirstPage
+            | Self::ShortcutPdfPreviousPage
+            | Self::ShortcutPdfNextPage
+            | Self::ShortcutPdfLastPage
+            | Self::ShortcutPdfZoomOut
+            | Self::ShortcutPdfZoomIn
+            | Self::ShortcutPdfFit
+            | Self::ShortcutPdfToggleColors
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3648,6 +3680,14 @@ struct ShortcutDraft {
     editor_edit: String,
     editor_preview: String,
     editor_diff: String,
+    pdf_first_page: String,
+    pdf_previous_page: String,
+    pdf_next_page: String,
+    pdf_last_page: String,
+    pdf_zoom_out: String,
+    pdf_zoom_in: String,
+    pdf_fit: String,
+    pdf_toggle_colors: String,
 
 
     command_palette: String,
@@ -3811,6 +3851,14 @@ impl ShortcutDraft {
             editor_edit: settings::format_chords(&shortcuts.editor_edit),
             editor_preview: settings::format_chords(&shortcuts.editor_preview),
             editor_diff: settings::format_chords(&shortcuts.editor_diff),
+            pdf_first_page: settings::format_chords(&shortcuts.pdf_first_page),
+            pdf_previous_page: settings::format_chords(&shortcuts.pdf_previous_page),
+            pdf_next_page: settings::format_chords(&shortcuts.pdf_next_page),
+            pdf_last_page: settings::format_chords(&shortcuts.pdf_last_page),
+            pdf_zoom_out: settings::format_chords(&shortcuts.pdf_zoom_out),
+            pdf_zoom_in: settings::format_chords(&shortcuts.pdf_zoom_in),
+            pdf_fit: settings::format_chords(&shortcuts.pdf_fit),
+            pdf_toggle_colors: settings::format_chords(&shortcuts.pdf_toggle_colors),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4189,6 +4237,14 @@ impl SettingsDraft {
             SettingsField::ShortcutEditorEdit => self.keyboard_shortcuts.editor_edit = value,
             SettingsField::ShortcutEditorPreview => self.keyboard_shortcuts.editor_preview = value,
             SettingsField::ShortcutEditorDiff => self.keyboard_shortcuts.editor_diff = value,
+            SettingsField::ShortcutPdfFirstPage => self.keyboard_shortcuts.pdf_first_page = value,
+            SettingsField::ShortcutPdfPreviousPage => self.keyboard_shortcuts.pdf_previous_page = value,
+            SettingsField::ShortcutPdfNextPage => self.keyboard_shortcuts.pdf_next_page = value,
+            SettingsField::ShortcutPdfLastPage => self.keyboard_shortcuts.pdf_last_page = value,
+            SettingsField::ShortcutPdfZoomOut => self.keyboard_shortcuts.pdf_zoom_out = value,
+            SettingsField::ShortcutPdfZoomIn => self.keyboard_shortcuts.pdf_zoom_in = value,
+            SettingsField::ShortcutPdfFit => self.keyboard_shortcuts.pdf_fit = value,
+            SettingsField::ShortcutPdfToggleColors => self.keyboard_shortcuts.pdf_toggle_colors = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4560,6 +4616,14 @@ fn settings_update(
         SettingsField::ShortcutEditorEdit => { next.keyboard_shortcuts.editor_edit = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorPreview => { next.keyboard_shortcuts.editor_preview = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorDiff => { next.keyboard_shortcuts.editor_diff = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfFirstPage => { next.keyboard_shortcuts.pdf_first_page = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfPreviousPage => { next.keyboard_shortcuts.pdf_previous_page = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfNextPage => { next.keyboard_shortcuts.pdf_next_page = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfLastPage => { next.keyboard_shortcuts.pdf_last_page = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfZoomOut => { next.keyboard_shortcuts.pdf_zoom_out = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfZoomIn => { next.keyboard_shortcuts.pdf_zoom_in = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfFit => { next.keyboard_shortcuts.pdf_fit = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutPdfToggleColors => { next.keyboard_shortcuts.pdf_toggle_colors = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

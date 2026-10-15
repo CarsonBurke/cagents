@@ -499,3 +499,5 @@ checks. Clearing or remapping `editor_save` retires the original `Ctrl+S`
 binding. Repository commands keep ordinary fields, chat and terminal input
 separate; the Keyboard table shows **Scoped** for bindings whose pane context
 cannot take a terminal's keys.
+
+PDF viewer commands `pdf_first_page`, `pdf_previous_page`, `pdf_next_page`, `pdf_last_page`, `pdf_zoom_out`, `pdf_zoom_in`, `pdf_fit` and `pdf_toggle_colors` are unbound by default. They appear in Keyboard settings; palette availability reflects the mounted PDF preview. Page and zoom limits use the same availability as the viewer toolbar.

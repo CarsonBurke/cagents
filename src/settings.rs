@@ -395,6 +395,14 @@ pub struct KeyboardShortcuts {
     pub editor_edit: Vec<String>,
     pub editor_preview: Vec<String>,
     pub editor_diff: Vec<String>,
+    pub pdf_first_page: Vec<String>,
+    pub pdf_previous_page: Vec<String>,
+    pub pdf_next_page: Vec<String>,
+    pub pdf_last_page: Vec<String>,
+    pub pdf_zoom_out: Vec<String>,
+    pub pdf_zoom_in: Vec<String>,
+    pub pdf_fit: Vec<String>,
+    pub pdf_toggle_colors: Vec<String>,
 
 
     /// Serialized action names whose configured chords pass through to terminals.
@@ -557,6 +565,14 @@ impl Default for KeyboardShortcuts {
             editor_edit: Vec::new(),
             editor_preview: Vec::new(),
             editor_diff: Vec::new(),
+            pdf_first_page: Vec::new(),
+            pdf_previous_page: Vec::new(),
+            pdf_next_page: Vec::new(),
+            pdf_last_page: Vec::new(),
+            pdf_zoom_out: Vec::new(),
+            pdf_zoom_in: Vec::new(),
+            pdf_fit: Vec::new(),
+            pdf_toggle_colors: Vec::new(),
 
 
             terminal_passthrough_actions: [
@@ -590,7 +606,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 148] {
+    pub fn actions(&self) -> [&Vec<String>; 156] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -745,6 +761,14 @@ impl KeyboardShortcuts {
             &self.editor_edit,
             &self.editor_preview,
             &self.editor_diff,
+            &self.pdf_first_page,
+            &self.pdf_previous_page,
+            &self.pdf_next_page,
+            &self.pdf_last_page,
+            &self.pdf_zoom_out,
+            &self.pdf_zoom_in,
+            &self.pdf_fit,
+            &self.pdf_toggle_colors,
 
 
         ]
@@ -752,7 +776,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 148] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 156] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -902,6 +926,14 @@ impl KeyboardShortcuts {
             &mut self.editor_edit,
             &mut self.editor_preview,
             &mut self.editor_diff,
+            &mut self.pdf_first_page,
+            &mut self.pdf_previous_page,
+            &mut self.pdf_next_page,
+            &mut self.pdf_last_page,
+            &mut self.pdf_zoom_out,
+            &mut self.pdf_zoom_in,
+            &mut self.pdf_fit,
+            &mut self.pdf_toggle_colors,
 
         ]
     }
@@ -952,7 +984,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 148] = [
+const SHORTCUT_ACTIONS: [&str; 156] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1106,6 +1138,14 @@ const SHORTCUT_ACTIONS: [&str; 148] = [
     "editor_edit",
     "editor_preview",
     "editor_diff",
+    "pdf_first_page",
+    "pdf_previous_page",
+    "pdf_next_page",
+    "pdf_last_page",
+    "pdf_zoom_out",
+    "pdf_zoom_in",
+    "pdf_fit",
+    "pdf_toggle_colors",
 
 
 ];
@@ -2301,7 +2341,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 143] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2450,6 +2490,14 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 143] = [
     "editor_edit",
     "editor_preview",
     "editor_diff",
+    "pdf_first_page",
+    "pdf_previous_page",
+    "pdf_next_page",
+    "pdf_last_page",
+    "pdf_zoom_out",
+    "pdf_zoom_in",
+    "pdf_fit",
+    "pdf_toggle_colors",
 
 
 ];

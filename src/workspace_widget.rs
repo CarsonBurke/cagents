@@ -161,6 +161,14 @@ pub enum GlobalShortcut {
     EditorEdit,
     EditorPreview,
     EditorDiff,
+    PdfFirstPage,
+    PdfPreviousPage,
+    PdfNextPage,
+    PdfLastPage,
+    PdfZoomOut,
+    PdfZoomIn,
+    PdfFit,
+    PdfToggleColors,
 
 
     CommandPalette,
@@ -399,6 +407,14 @@ impl GlobalShortcut {
             Self::EditorEdit => "editor_edit",
             Self::EditorPreview => "editor_preview",
             Self::EditorDiff => "editor_diff",
+            Self::PdfFirstPage => "pdf_first_page",
+            Self::PdfPreviousPage => "pdf_previous_page",
+            Self::PdfNextPage => "pdf_next_page",
+            Self::PdfLastPage => "pdf_last_page",
+            Self::PdfZoomOut => "pdf_zoom_out",
+            Self::PdfZoomIn => "pdf_zoom_in",
+            Self::PdfFit => "pdf_fit",
+            Self::PdfToggleColors => "pdf_toggle_colors",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -574,6 +590,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub pdf_commands: u8,
     pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
     pub diff_commands: u8,
@@ -659,6 +676,7 @@ impl ShortcutDescriptor {
             return context.diff_commands & bit != 0;
         }
         if let Some(bit) = editor_language_command_bit(self.action) { return context.editor_language_commands & bit != 0; }
+        if let Some(bit) = pdf_command_bit(self.action) { return context.pdf_commands & bit != 0; }
         if let Some(bit) = editor_surface_command_bit(self.action) { return context.editor_surface_commands & bit != 0; }
         if let Some(bit) = editor_command_bit(self.action) {
             return context.editor_commands & bit != 0;
@@ -1353,6 +1371,14 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::EditorEdit, label: "Edit file", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::EditorPreview, label: "Preview file", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::EditorDiff, label: "View diff", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfFirstPage, label: "First PDF page", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfPreviousPage, label: "Previous PDF page", repeatable: true, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfNextPage, label: "Next PDF page", repeatable: true, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfLastPage, label: "Last PDF page", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfZoomOut, label: "Zoom PDF out", repeatable: true, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfZoomIn, label: "Zoom PDF in", repeatable: true, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfFit, label: "Fit PDF page to pane", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::PdfToggleColors, label: "Toggle PDF adapted colors", repeatable: false, scope: ShortcutScope::Repository },
 
 ];
 
@@ -1486,6 +1512,14 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::EditorEdit => &shortcuts.editor_edit,
         GlobalShortcut::EditorPreview => &shortcuts.editor_preview,
         GlobalShortcut::EditorDiff => &shortcuts.editor_diff,
+        GlobalShortcut::PdfFirstPage => &shortcuts.pdf_first_page,
+        GlobalShortcut::PdfPreviousPage => &shortcuts.pdf_previous_page,
+        GlobalShortcut::PdfNextPage => &shortcuts.pdf_next_page,
+        GlobalShortcut::PdfLastPage => &shortcuts.pdf_last_page,
+        GlobalShortcut::PdfZoomOut => &shortcuts.pdf_zoom_out,
+        GlobalShortcut::PdfZoomIn => &shortcuts.pdf_zoom_in,
+        GlobalShortcut::PdfFit => &shortcuts.pdf_fit,
+        GlobalShortcut::PdfToggleColors => &shortcuts.pdf_toggle_colors,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
@@ -2026,6 +2060,22 @@ pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> 
         GlobalShortcut::FindReferences => Some(1 << 2),
         GlobalShortcut::ShowHover => Some(1 << 3),
         GlobalShortcut::ShowDiagnostics => Some(1 << 4),
+        _ => None,
+    }
+}
+
+pub const PDF_COMMANDS: [GlobalShortcut; 8] = [GlobalShortcut::PdfFirstPage, GlobalShortcut::PdfPreviousPage, GlobalShortcut::PdfNextPage, GlobalShortcut::PdfLastPage, GlobalShortcut::PdfZoomOut, GlobalShortcut::PdfZoomIn, GlobalShortcut::PdfFit, GlobalShortcut::PdfToggleColors];
+
+pub const fn pdf_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::PdfFirstPage => Some(1 << 0),
+        GlobalShortcut::PdfPreviousPage => Some(1 << 1),
+        GlobalShortcut::PdfNextPage => Some(1 << 2),
+        GlobalShortcut::PdfLastPage => Some(1 << 3),
+        GlobalShortcut::PdfZoomOut => Some(1 << 4),
+        GlobalShortcut::PdfZoomIn => Some(1 << 5),
+        GlobalShortcut::PdfFit => Some(1 << 6),
+        GlobalShortcut::PdfToggleColors => Some(1 << 7),
         _ => None,
     }
 }
@@ -6270,6 +6320,25 @@ mod tests {
         assert!(shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
         context.editor_commands = 0;
         assert!(!shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
+    }
+
+    #[test]
+    fn pdf_bindings_are_configurable_and_scoped_to_repository_content() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.pdf_next_page = vec!["Alt+F9".into()];
+        assert!(shortcuts.fault().is_none());
+        let event = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F9), modified_key: keyboard::Key::Named(keyboard::key::Named::F9), physical_key: keyboard::key::Physical::Code(Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), Some(GlobalShortcut::PdfNextPage));
+        for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::TextInput, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges, FocusedPane::OutsideWorkspace] {
+            assert_eq!(global_shortcut(&event, &shortcuts, focused), None);
+        }
+        shortcuts.pdf_next_page.clear();
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), None);
+        for command in PDF_COMMANDS {
+            assert!(shortcut_keys(command, &KeyboardShortcuts::default()).is_empty());
+            assert!(pdf_command_bit(command).is_some());
+        }
     }
 
     #[test]

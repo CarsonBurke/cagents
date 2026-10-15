@@ -1201,6 +1201,7 @@ impl Cagents {
                 Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
+            pdf_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.pdf_command_capabilities(id), _ => 0 }),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             editor_surface_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_surface_command_capabilities(id), Some(CardRuntime::PullRequests(pane)) => pane.runtime.editor_surface_command_capabilities(id), _ => 0 }),
             editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
@@ -1365,6 +1366,13 @@ impl Cagents {
             .and_then(|id| self.pane_command_message(id, command))
         {
             return self.update(message);
+        }
+        if workspace_widget::pdf_command_bit(command).is_some() {
+            let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.registered_pdf_command_action(card, command),
+                _ => None,
+            });
+            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
         }
         match command {
             Command::EditorUndo | Command::EditorRedo | Command::EditorCut | Command::EditorCopy | Command::EditorPaste | Command::EditorSelectAll | Command::NextDiagnostic | Command::PreviousDiagnostic => self.workspace.focused().and_then(|card| repository_widget::editor_command_action(card, command)).map_or_else(Task::none, |action| self.update(Message::Repository(action))),
@@ -1566,6 +1574,14 @@ impl Cagents {
             | Command::EditorEdit
             | Command::EditorPreview
             | Command::EditorDiff
+            | Command::PdfFirstPage
+            | Command::PdfPreviousPage
+            | Command::PdfNextPage
+            | Command::PdfLastPage
+            | Command::PdfZoomOut
+            | Command::PdfZoomIn
+            | Command::PdfFit
+            | Command::PdfToggleColors
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1848,6 +1864,14 @@ impl SettingsField {
             Self::ShortcutEditorEdit => Some(Command::EditorEdit),
             Self::ShortcutEditorPreview => Some(Command::EditorPreview),
             Self::ShortcutEditorDiff => Some(Command::EditorDiff),
+            Self::ShortcutPdfFirstPage => Some(Command::PdfFirstPage),
+            Self::ShortcutPdfPreviousPage => Some(Command::PdfPreviousPage),
+            Self::ShortcutPdfNextPage => Some(Command::PdfNextPage),
+            Self::ShortcutPdfLastPage => Some(Command::PdfLastPage),
+            Self::ShortcutPdfZoomOut => Some(Command::PdfZoomOut),
+            Self::ShortcutPdfZoomIn => Some(Command::PdfZoomIn),
+            Self::ShortcutPdfFit => Some(Command::PdfFit),
+            Self::ShortcutPdfToggleColors => Some(Command::PdfToggleColors),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -2034,6 +2058,14 @@ impl ShortcutDraft {
             (Command::EditorEdit, self.editor_edit.as_str()),
             (Command::EditorPreview, self.editor_preview.as_str()),
             (Command::EditorDiff, self.editor_diff.as_str()),
+            (Command::PdfFirstPage, self.pdf_first_page.as_str()),
+            (Command::PdfPreviousPage, self.pdf_previous_page.as_str()),
+            (Command::PdfNextPage, self.pdf_next_page.as_str()),
+            (Command::PdfLastPage, self.pdf_last_page.as_str()),
+            (Command::PdfZoomOut, self.pdf_zoom_out.as_str()),
+            (Command::PdfZoomIn, self.pdf_zoom_in.as_str()),
+            (Command::PdfFit, self.pdf_fit.as_str()),
+            (Command::PdfToggleColors, self.pdf_toggle_colors.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
