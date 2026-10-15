@@ -8831,8 +8831,9 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 let command = ExternalEditorCommand(card, editor.id.as_str());
                 crate::workspace_widget::menu_shortcut(command.command(), &runtime.keyboard_shortcuts).map(|chord| (chord, command))
             }).into_iter().collect();
-            secondary.push(crate::interaction::context_menu(
+            secondary.push(crate::interaction::context_menu_keyed(
                 button,
+                (card, runtime.generation, runtime.external_editors.iter().map(|editor| editor.id.clone()).collect::<Vec<_>>()),
                 widget::menu::items(&bindings, entries),
             ));
         }
@@ -9755,7 +9756,7 @@ fn editable_document_view<'a>(
             });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        crate::interaction::context_menu(editor, editor_context_menu(card, runtime))
+        crate::interaction::context_menu_keyed(editor, (card, runtime.generation, document.revision), editor_context_menu(card, runtime))
     };
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);

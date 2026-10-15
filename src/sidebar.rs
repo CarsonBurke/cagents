@@ -1761,11 +1761,45 @@ fn file_statuses(entries: &[ChangedPath]) -> BTreeMap<RepoPath, FileStatus> {
     statuses
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct FileRowChrome {
     label: Box<str>,
     folded: Box<str>,
     accessible_name: Box<str>,
+    menu_identity: u64,
+}
+
+// A native menu's snapshot identity does not change displayed row equality.
+impl PartialEq for FileRowChrome {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && self.folded == other.folded && self.accessible_name == other.accessible_name
+    }
+}
+impl Eq for FileRowChrome {}
+
+fn next_file_menu_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Clone)]
+struct MenuSelectionIdentity(Option<Arc<[SelectionRow]>>);
+impl PartialEq for MenuSelectionIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for MenuSelectionIdentity {}
+
+fn cached_menu_token(id: &Id) -> Option<u64> {
+    match &id.0 {
+        cosmic::iced::id::Internal::Unique(id) | cosmic::iced::id::Internal::Custom(id, _) => Some(*id),
+        cosmic::iced::id::Internal::Set(_) => None,
+    }
 }
 
 /// One row of a `Changes` group.
@@ -2160,6 +2194,7 @@ fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
         let kind = if entry.directory { "folder" } else { "file" };
         FileRow {
             chrome: FileRowChrome {
+                menu_identity: next_file_menu_identity(),
                 folded: fold(&entry.path.display()),
                 accessible_name: format!("Open {kind} {}", entry.path.display()).into_boxed_str(),
                 label: entry.label.into_boxed_str(),
@@ -2195,6 +2230,7 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
         .map(|entry| {
             let kind = if entry.directory { "folder" } else { "file" };
             let chrome = FileRowChrome {
+                menu_identity: next_file_menu_identity(),
                 folded: fold(&entry.path.display()),
                 accessible_name: format!("Open {kind} {}", entry.path.display()).into_boxed_str(),
                 label: entry.path.file_name().into_owned().into_boxed_str(),
@@ -6722,6 +6758,7 @@ fn channel_context_controls<'a>(
 ) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
+    let identity = (channel_id, MenuSelectionIdentity(selection_rows.clone()));
     let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
         let mut entries = vec![Item::Button(
             match selection_count {
@@ -6764,7 +6801,7 @@ fn channel_context_controls<'a>(
     }) else {
         return content.into();
     };
-    crate::interaction::context_menu(content, menu)
+    crate::interaction::context_menu_keyed(content, identity, menu)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7205,12 +7242,13 @@ fn context_controls<'a>(
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
-    let editors = editors.to_vec();
+    let editors: Arc<[SidebarEditor]> = Arc::from(editors);
+    let identity = (project_id, worktree_id, MenuSelectionIdentity(selection_rows.clone()), Arc::clone(&editors));
     let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
         return content.into();
     }
-    crate::interaction::context_menu_lazy(content, move || {
+    crate::interaction::context_menu_lazy_keyed(content, identity, move || {
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
@@ -7392,7 +7430,7 @@ fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a Act
         widget::menu::Item::Button(_, _, action) | widget::menu::Item::ButtonDisabled(_, _, action) => Some(*action),
         _ => None,
     }), shortcuts, &[]);
-    crate::interaction::context_menu(content, widget::menu::items(&bindings, entries))
+    crate::interaction::context_menu_keyed(content, (cached_menu_token(&row.chrome.stage_id), selection_revision), widget::menu::items(&bindings, entries))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7509,7 +7547,7 @@ fn file_context_controls<'a>(
         widget::menu::Item::Button(_, _, action) => Some(*action),
         _ => None,
     }), shortcuts, editors);
-    crate::interaction::context_menu(content, widget::menu::items(&bindings, entries))
+    crate::interaction::context_menu_keyed(content, (row.chrome.menu_identity, editors.iter().map(|editor| editor.id.clone()).collect::<Vec<_>>()), widget::menu::items(&bindings, entries))
 }
 
 fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
@@ -12812,6 +12850,32 @@ pub(crate) mod tests {
 
     fn project_id(value: u128) -> ProjectId {
         ProjectId::from_uuid(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn channel_menu_closes_when_equal_count_captured_selection_changes() {
+        use cosmic::iced::{Event, Point, Rectangle, Vector, mouse,
+            advanced::{Shell, clipboard}};
+        let renderer = headless_renderer();
+        let window = Size::new(600.0, 400.0);
+        let viewport = Rectangle::with_size(window);
+        let cursor = mouse::Cursor::Available(Point::new(20.0, 16.0));
+        let channel = ChannelId::new();
+        let original: Arc<[SelectionRow]> = Arc::from([SelectionRow::Channel(channel), SelectionRow::Channel(ChannelId::new())]);
+        let replacement: Arc<[SelectionRow]> = Arc::from([SelectionRow::Channel(channel), SelectionRow::Channel(ChannelId::new())]);
+        let make = |selection| channel_context_controls(cosmic::iced::widget::Space::new().width(240).height(32).into(), channel, false, Some(selection), default_menu_shortcuts());
+        let mut element = make(Arc::clone(&original));
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().diff(&mut tree);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+        element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut Vec::new()), &viewport);
+        assert!(element.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some());
+        for (selection, expected_open) in [(original, true), (replacement, false)] {
+            let mut next = make(selection);
+            next.as_widget_mut().diff(&mut tree);
+            let node = next.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            assert_eq!(next.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some(), expected_open, "same-size menus must retain original selection intent");
+        }
     }
 
     #[test]

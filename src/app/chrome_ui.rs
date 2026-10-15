@@ -2349,7 +2349,11 @@ impl Cagents {
         let tab = iced::widget::mouse_area(tab)
             .on_enter(Message::ChromeUi(Action::HoverTab(Some(id))))
             .on_exit(Message::ChromeUi(Action::HoverTab(None)));
-        crate::interaction::context_menu_lazy(tab, move || {
+        let menu_identity = (id, card.map(|card| card.generation), match self.cards.get(&id) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+            _ => self.parked_chat_runtime(id).map(|runtime| runtime.target),
+        });
+        crate::interaction::context_menu_lazy_keyed(tab, menu_identity, move || {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
                     "Rename…".into(),
