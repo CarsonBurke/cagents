@@ -20,6 +20,8 @@ impl ItemKey {
 /// presentation window is sufficient authority for reconstructing old tools.
 pub trait ItemReader:Send+Sync {
     fn read(&self,key:&ItemKey)->Result<Option<Item>,String>;
+    /// Revocation may not be bypassed by a still-resident optional cache copy.
+    fn validate_key(&self,_key:&ItemKey)->Result<(),String>{Ok(())}
     /// Exact native original arguments, independently of a derived Changes item.
     fn original_call(&self,_key:&ItemKey)->Result<Option<(String,String)>,String>{Ok(None)}
 }

@@ -12,6 +12,14 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation!=self.generation {return Err("Original tool source was revoked by a conversation reset".into());}
         store.adapter_item(key)
     }
+    fn validate_key(&self,key:&CanonicalItemKey)->Result<(),String>{
+        let store=self.store.upgrade().ok_or("Original tool Store is no longer available")?;
+        let store=store.lock().unwrap_or_else(|p|p.into_inner());
+        if store.canonical_generation!=self.generation{return Err("Original tool source was revoked by reset".into());}
+        store.raw_guard()?;
+        if key.agent_id.is_none()&&store.raw_revoked(&crate::chat::cache::SourceKey{agent_id:None,source_id:key.item_id.clone()})?{return Err("Original tool identity was removed or reused; its cached copy is unavailable".into());}
+        Ok(())
+    }
     fn original_call(&self,key:&CanonicalItemKey)->Result<Option<(String,String)>,String>{
         let store=self.store.upgrade().ok_or("Original tool Store is no longer available")?;
         let mut store=store.lock().unwrap_or_else(|p|p.into_inner());
@@ -94,6 +102,7 @@ mod tests {
             self.reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
             self.inner.read(key)
         }
+        fn validate_key(&self,key:&CanonicalItemKey)->Result<(),String>{self.inner.validate_key(key)}
         fn original_call(&self,key:&CanonicalItemKey)->Result<Option<(String,String)>,String>{self.inner.original_call(key)}
     }
     fn commit(store:&Arc<Mutex<Store>>,adapter:&mut dyn crate::chat::protocol::Adapter,step:crate::chat::protocol::Step) {

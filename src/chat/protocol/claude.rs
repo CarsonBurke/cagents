@@ -659,8 +659,9 @@ impl Claude {
         }
     }
     fn cached_tool(&self,parent:Option<&str>,id:&str)->Result<Option<Item>,String> {
-        if let Some(item)=self.tools.get(parent,id) {return Ok(Some(item.clone()));}
         let key=CanonicalItemKey::new(parent,id);
+        if let Some(reader)=&self.item_reader {reader.validate_key(&key)?;}
+        if let Some(item)=self.tools.get(parent,id) {return Ok(Some(item.clone()));}
         let Some(reader)=&self.item_reader else {
             return if self.tool_order.contains(&key) {Err("Original tool source is unavailable; its stored call was preserved".into())} else {Ok(None)};
         };

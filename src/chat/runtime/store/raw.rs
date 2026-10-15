@@ -94,6 +94,12 @@ impl Store {
     pub(super) fn raw_revoked(&self,source:&SourceKey)->Result<bool,String> {
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM raw_tool_revoked WHERE agent=?1 AND id=?2)",params![agent(source),source.source_id],|row|row.get(0)).map_err(err)
     }
+    fn raw_fence_identity(&mut self,source:&SourceKey)->Result<(),String>{
+        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
+        tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES(?1,?2)",params![agent(source),source.source_id]).map_err(err)?;tx.commit().map_err(err)?;
+        if let Some(length)=self.raw_sources.open.remove(source){self.raw_sources.open_bytes=self.raw_sources.open_bytes.saturating_sub(length);}
+        self.dirty=true;Ok(())
+    }
     fn raw_full(&mut self,source:&SourceKey,name:&str,input:&str,command:Option<&RawCommandCall>)->Result<Option<String>,String> {
         self.raw_guard()?;
         if self.raw_sources.blocked.is_some() {return Ok(None);}
@@ -103,7 +109,8 @@ impl Store {
         let previous:Option<(i64,Option<Vec<u8>>,String,usize,usize)>=self.db.query_row("SELECT state,hash,name,cost,(SELECT count(*) FROM raw_tool_chunks c WHERE c.agent=s.agent AND c.id=s.id) FROM raw_tool_sources s WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(err)?;
         if let Some((SEALED,old_hash,old_name,..))=&previous {
             if old_hash.as_deref()==Some(hash.as_slice())&&old_name==name {return Ok(None);}
-            return self.raw_refused("A provider reused an original tool identity with different arguments; its old source was kept unavailable".into());
+            self.raw_fence_identity(source)?;
+            return Ok(Some("A provider reused an original tool identity with different arguments; the ambiguous update was discarded".into()));
         }
         let command=command_bytes(command)?;
         if input.len().saturating_add(command.len())>RAW_SOURCE_BYTES {return self.raw_refused("Original tool call exceeds its bounded capture limit".into());}
@@ -255,7 +262,7 @@ impl Store {
     pub(super) fn raw_parts(&self,id:&str)->Result<Vec<RawSourcePart>,String>{
         let _read=self.db.unchecked_transaction().map_err(err)?;
         self.raw_guard()?;if self.raw_sources.blocked.is_some(){return Ok(Vec::new());}
-        let row:Option<(String,i64,usize,usize,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,epoch FROM raw_tool_sources WHERE agent='' AND id=?1 AND state=1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(err)?;
+        let row:Option<(String,i64,usize,usize,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,epoch FROM raw_tool_sources WHERE agent='' AND id=?1 AND state=1 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent='' AND r.id=raw_tool_sources.id)",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(err)?;
         let Some((name,rep,input,command,revision))=row else{return Ok(Vec::new());};
         let epoch=SourceEpoch{incarnation:self.source_incarnation,revision};
         let mut parts=vec![RawSourcePart{item_id:id.into(),source:key("",id),field:RawSourceField::ToolInput,epoch,source_len:input,metadata:RawSourceMetadata{tool_name:name.clone(),representation:if rep==0{RawRepresentation::StreamJson}else{RawRepresentation::CanonicalJson},complete_call:true}}];
