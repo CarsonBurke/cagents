@@ -16355,7 +16355,9 @@ mod tests {
     #[test]
     fn the_document_identity_is_stored_for_the_application_that_minted_it() {
         let card = CardId::new();
-        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        // Loading alone does not register a protocol document. Unlike the LSP
+        // fixture, this exercises the state before the frontend mints its ID.
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "fn main() {}\n");
         assert_eq!(runtime.lsp_document(), None);
         runtime.set_lsp_document(Some(LspDocumentId(7)));
         assert_eq!(runtime.lsp_document(), Some(LspDocumentId(7)));
