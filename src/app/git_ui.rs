@@ -34,6 +34,7 @@ impl Snapshot {
     /// callback delivery. A delayed result cannot overwrite newer accepted facts.
     fn preserve_newer_status(&mut self, current: &Self) {
         let current_rows = current.worktrees.iter().map(|row| (row.0.id, row)).collect::<HashMap<_, _>>();
+        let incoming_ids = self.worktrees.iter().map(|row| row.0.id).collect::<HashSet<_>>();
         self.worktrees.retain_mut(|row| {
             let id = row.0.id;
             let Some(&latest_at) = current.status_reads.get(&id) else { return true; };
@@ -47,6 +48,21 @@ impl Snapshot {
             if let Some(latest) = current_rows.get(&id) { *row = (**latest).clone(); true }
             else { self.status_errors.remove(&id); self.operations.remove(&id); false }
         });
+        // An omission is an attempted removal, not authority over a row whose
+        // newer bound read already proved it present again.
+        for row in &current.worktrees {
+            let id = row.0.id;
+            if incoming_ids.contains(&id) { continue; }
+            let Some(&latest) = current.status_reads.get(&id) else { continue; };
+            if self.status_reads.get(&id).is_some_and(|removed| *removed >= latest) { continue; }
+            self.worktrees.push(row.clone());
+            self.status_updates.remove(&id);
+            self.status_reads.insert(id, latest);
+            if let Some(error) = current.status_errors.get(&id) { self.status_errors.insert(id, error.clone()); }
+            else { self.status_errors.remove(&id); }
+            if let Some(operation) = current.operations.get(&id) { self.operations.insert(id, *operation); }
+            else { self.operations.remove(&id); }
+        }
     }
 }
 
@@ -93,17 +109,15 @@ impl State {
     /// A bound full read shares its row freshness with watcher reads. Keep only
     /// the small status projection here, not the Changes panel's path entries.
     pub(super) fn accept_bound_status(&mut self, key: &ActiveWorktreeKey,
-        snapshot: &RepositorySnapshot, read: u64) -> bool {
+        status: &StatusSnapshot, operation: Option<crate::repository::GitOperationKind>, read: u64) -> bool {
         let Some(entry) = self.entries.get_mut(&key.project_id) else { return true; };
         if entry.snapshot.status_reads.get(&key.worktree_id).is_some_and(|current| *current > read) { return false; }
-        let Some((record, status)) = entry.snapshot.worktrees.iter_mut()
+        let Some((record, cached)) = entry.snapshot.worktrees.iter_mut()
             .find(|(record, _)| record.id == key.worktree_id && record.path == key.canonical_path) else { return false; };
-        *status = Some(StatusSnapshot { untracked_omitted: snapshot.status.untracked_omitted,
-            head: snapshot.status.head.clone(), tracking: snapshot.status.tracking.clone(),
-            dirty: snapshot.status.dirty.clone(), entries: Vec::new() });
-        apply_status_head(record, &snapshot.status);
+        *cached = Some(status.display_summary());
+        apply_status_head(record, status);
         entry.snapshot.status_errors.remove(&key.worktree_id);
-        if let Some(operation) = &snapshot.operation { entry.snapshot.operations.insert(key.worktree_id, operation.kind); }
+        if let Some(operation) = operation { entry.snapshot.operations.insert(key.worktree_id, operation); }
         else { entry.snapshot.operations.remove(&key.worktree_id); }
         entry.snapshot.status_reads.insert(key.worktree_id, read);
         true
@@ -732,7 +746,10 @@ fn read_local_with_plan(
 ) -> Result<(Snapshot, Option<git_watch::Project>), String> {
     let git = RepositoryService::system("git");
     snapshot.status_updates.clear();
+    let mut removed = HashSet::new();
     if change.topology {
+        let previous_ids = snapshot.worktrees.iter().map(|(record, _)| record.id).collect::<Vec<_>>();
+        let listing_read = next_status_read();
         snapshot.worktrees = git
             .list_worktrees_for_repository(&snapshot.repository, &cancellation)
             .map_err(|error| error.to_string())?
@@ -740,6 +757,11 @@ fn read_local_with_plan(
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
             .map(|record| (record, None))
             .collect();
+        let listed = snapshot.worktrees.iter().map(|(record, _)| record.id).collect::<HashSet<_>>();
+        for id in previous_ids.into_iter().filter(|id| !listed.contains(id)) {
+            snapshot.status_reads.insert(id, listing_read);
+            removed.insert(id);
+        }
     }
     let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
@@ -804,7 +826,7 @@ fn read_local_with_plan(
     let retained: HashSet<_> = snapshot.worktrees.iter().map(|(record, _)| record.id).collect();
     snapshot.status_errors.retain(|id, _| retained.contains(id));
     snapshot.status_updates.retain(|id| retained.contains(id));
-    snapshot.status_reads.retain(|id, _| retained.contains(id));
+    snapshot.status_reads.retain(|id, _| retained.contains(id) || removed.contains(id) || vanished.contains(id));
     snapshot.heads.retain(|id, _| retained.contains(id));
     snapshot.operations.retain(|id, _| retained.contains(id));
     let upstreams = snapshot
@@ -1064,6 +1086,30 @@ mod tests {
         }
     }
 
+    fn app_with_status_snapshot(snapshot: Snapshot, key: &ActiveWorktreeKey) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects = vec![SidebarProject::new(key.project_id, snapshot.repository.id,
+            "Fixture".into(), snapshot.repository.common_dir.clone(),
+            snapshot.worktrees.iter().map(|(record, status)| SidebarWorktree::from_repository(record, status.as_ref())).collect(), Vec::new())];
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        app.repository_generations.insert(key.project_id, 9);
+        app.refresh_ui.git.entries.insert(key.project_id, Entry { snapshot, generation: 9,
+            plan: None, archived: Vec::new(), remote_started: false, cancellation: Some(CancellationToken::default()),
+            pending: Default::default(), fallback: None, read_failure: None, read_full_scan: false,
+            last_full_scan: Instant::now() });
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+        app.refresh_ui.source_generation = 7;
+        app
+    }
+
+    fn bound_status_message(key: &ActiveWorktreeKey, request: u64, snapshot: RepositorySnapshot, read: u64) -> Message {
+        let status = snapshot.status.display_summary();
+        let operation = snapshot.operation.as_ref().map(|operation| operation.kind);
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        Message::SourceControlLoaded { key: key.clone(), request,
+            result: Ok(SourceControlRead { prepared: Some(Box::new((snapshot, model))), status, operation, read }) }
+    }
+
     #[test]
     fn failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery() {
         let directory = tempfile::tempdir().unwrap();
@@ -1178,18 +1224,18 @@ mod tests {
             app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
             app.refresh_ui.source_generation = 7;
             let bound_message = Message::SourceControlLoaded { key: key.clone(), request: 7,
-                result: Ok(Some(Box::new((prepared.clone(), SourceControlModel::ready(key.clone(), &prepared), status_read)))) };
+                result: Ok(SourceControlRead { status: prepared.status.display_summary(),
+                    operation: prepared.operation.as_ref().map(|operation| operation.kind), read: status_read,
+                    prepared: Some(Box::new((prepared.clone(), SourceControlModel::ready(key.clone(), &prepared)))) }) };
             let watch_message = Message::GitUi(Action::Read { project: project_id, generation: 9, result: Ok((watch, None)) });
             if scenario.ends_with("bound-first") {
                 drop(app.update(bound_message));
                 drop(app.update(watch_message));
             } else {
                 drop(app.update(watch_message));
-                let retry = app.update(bound_message);
-                if scenario == "older-bound-after-watch" {
-                    assert!(cosmic::iced::runtime::task::into_stream(retry).is_some(), "older full panel must retry instead of installing stale rows");
-                    assert!(app.refresh_ui.source_generation > 7);
-                }
+                drop(app.update(bound_message));
+                assert_eq!(app.refresh_ui.source_generation, 7, "watcher progress must not restart the full model");
+                assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().data_state, sidebar::SidebarDataState::Ready);
             }
             let row = app.sidebar_model.projects[0].worktrees.iter().find(|row| row.id == worktree).unwrap();
             assert!(row.status_error.is_none(), "{scenario}");
@@ -1200,6 +1246,125 @@ mod tests {
             assert!(!cached.operations.contains_key(&worktree), "{scenario}");
             assert_eq!(cached.worktrees[0].1.as_ref().unwrap().dirty.untracked, 1, "{scenario}");
         }
+    }
+
+    #[test]
+    fn delayed_removal_cannot_close_a_worktree_recovered_by_a_newer_bound_read() {
+        for topology in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let primary = directory.path().join("primary");
+            let initial = fixture(&primary);
+            let linked = directory.path().join("linked");
+            git(&primary, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+            let project_id = ProjectId::new();
+            let cancel = CancellationToken::default();
+            let (baseline, _) = read_local(project_id, initial,
+                git_watch::Change { topology: true, ..Default::default() }, cancel.clone()).unwrap();
+            let worktree = baseline.worktrees.iter().find(|(record, _)| record.path == linked).unwrap().0.id;
+            let key = ActiveWorktreeKey { project_id, worktree_id: worktree, canonical_path: linked.clone() };
+            let parked = directory.path().join("parked");
+            fs::rename(&linked, &parked).unwrap();
+            let (removed, _) = read_local(project_id, baseline.clone(), git_watch::Change {
+                topology, worktrees: [worktree].into(), ..Default::default()
+            }, cancel.clone()).unwrap();
+            assert!(!removed.worktrees.iter().any(|(record, _)| record.id == worktree));
+            assert!(removed.status_reads.contains_key(&worktree), "omission has its own read authority");
+            fs::rename(&parked, &linked).unwrap();
+            fs::write(linked.join("new.txt"), "recovered content\n").unwrap();
+            let read = next_status_read();
+            let snapshot = RepositoryService::system("git").snapshot(&linked, &cancel).unwrap();
+            let mut app = app_with_status_snapshot(baseline, &key);
+            drop(app.update(bound_status_message(&key, 7, snapshot, read)));
+            drop(app.update(Message::GitUi(Action::Read { project: project_id, generation: 9, result: Ok((removed, None)) })));
+            let row = app.sidebar_model.projects[0].worktrees.iter().find(|row| row.id == worktree)
+                .expect("newer successful B read must survive old omitted B result");
+            assert!(row.status_error.is_none());
+            assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+            assert!(app.refresh_ui.git.entries[&project_id].snapshot.worktrees.iter().any(|(record, _)| record.id == worktree));
+        }
+    }
+
+    #[test]
+    fn continuous_watcher_progress_does_not_restart_or_starve_the_full_changes_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::default();
+        for step in 0..5usize {
+            let request = 7 + step as u64;
+            app.refresh_ui.source_generation = request;
+            let read = next_status_read();
+            let full = service.snapshot(&root, &cancel).unwrap();
+            fs::write(root.join(format!("new-{step}.txt")), "continuous change\n").unwrap();
+            let (watch, _) = read_local(key.project_id, app.refresh_ui.git.entries[&key.project_id].snapshot.clone(),
+                git_watch::Change { worktrees: [key.worktree_id].into(), untracked: true, ..Default::default() }, cancel.clone()).unwrap();
+            drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9, result: Ok((watch, None)) })));
+            drop(app.update(bound_status_message(&key, request, full, read)));
+            let model = app.sidebar_model.source_control.as_ref().unwrap();
+            assert_eq!(model.data_state, sidebar::SidebarDataState::Ready);
+            assert_eq!(model.group(crate::repository::ChangeArea::Untracked).unwrap().rows().len(), step,
+                "each full generation completes and advances despite newer scalar watcher data");
+            assert_eq!(app.refresh_ui.source_generation, request, "no wholesale retry loop");
+            assert!(app.refresh_ui.source_cancel.is_none());
+            let row = &app.sidebar_model.projects[0].worktrees[0];
+            assert_eq!(row.dirty.as_ref().unwrap().untracked, (step + 1) as u32);
+        }
+    }
+
+    #[test]
+    fn unchanged_bound_status_clears_error_and_fences_delayed_watch_without_rebuilding_model() {
+        use crate::repository::{ProcessExecutor, ProcessFailure, ProcessOutput, CommandSpec, SystemProcessExecutor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Count(Arc<AtomicUsize>);
+        impl ProcessExecutor for Count {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                SystemProcessExecutor.execute(command, cancel)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        fs::write(root.join("one.txt"), "one change\n").unwrap();
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        let count = Arc::new(AtomicUsize::new(0));
+        let service = RepositoryService::new("git", Arc::new(Count(count.clone())));
+        let mut cache = crate::repository::SnapshotCache::default();
+        let options = crate::repository::SnapshotOptions::default();
+        let cancel = CancellationToken::default();
+        let read = next_status_read();
+        let full = service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().unwrap();
+        drop(app.update(bound_status_message(&key, 7, full, read)));
+        let original_rows = app.sidebar_model.source_control.as_ref().unwrap()
+            .group(crate::repository::ChangeArea::Untracked).unwrap().rows().as_ptr();
+        let mut prior = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
+        prior.status_reads.insert(key.worktree_id, next_status_read());
+        prior.status_updates = [key.worktree_id].into();
+        prior.status_errors.insert(key.worktree_id, "temporary status failure".into());
+        drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9, result: Ok((prior.clone(), None)) })));
+        assert!(app.sidebar_model.projects[0].worktrees[0].status_error.is_some());
+        let mut delayed = prior;
+        delayed.status_reads.insert(key.worktree_id, next_status_read());
+        let read = next_status_read();
+        let before = count.load(Ordering::Relaxed);
+        assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none());
+        assert_eq!(count.load(Ordering::Relaxed) - before, 1, "unchanged path still uses only the existing status process");
+        let (status, operation) = cache.row_status().unwrap();
+        assert!(status.entries.is_empty(), "cached proof retains no path listing");
+        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
+            result: Ok(SourceControlRead { prepared: None, status: status.clone(), operation, read }) }));
+        drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9, result: Ok((delayed, None)) })));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert!(row.status_error.is_none());
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap()
+            .group(crate::repository::ChangeArea::Untracked).unwrap().rows().as_ptr(), original_rows,
+            "unchanged read does not rebuild the Changes rows");
+        assert_eq!(app.refresh_ui.source_generation, 7);
     }
 
     #[test]

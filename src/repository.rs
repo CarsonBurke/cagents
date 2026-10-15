@@ -659,6 +659,7 @@ impl Default for SnapshotOptions {
 /// file lists and untracked measurements rather than keeping every visited tree.
 #[derive(Debug, Default)]
 pub struct SnapshotCache {
+    last_status: Option<StatusSnapshot>,
     digest: Option<[u8; 32]>,
     dirty: bool,
     fsmonitor: Option<OsString>,
@@ -845,6 +846,13 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
 }
 
 impl SnapshotCache {
+    /// Tiny display facts proven by the last successful cached read, including
+    /// an unchanged read. Never use this projection as mutation authority.
+    pub fn row_status(&self) -> Option<(&StatusSnapshot, Option<GitOperationKind>)> {
+        self.last_status.as_ref().map(|status| (status,
+            self.control_metadata.as_ref().and_then(|control| control.operation.as_ref().map(|operation| operation.kind))))
+    }
+
     /// Ignored-folder expansion is independent of porcelain status. Observe
     /// its directory membership too, so the slow fallback repairs missed events.
     pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
@@ -901,6 +909,13 @@ pub struct StatusSnapshot {
 }
 
 impl StatusSnapshot {
+    /// Display counts and identity without cloning the changed-path listing.
+    /// This cached projection is never sufficient for a mutation safety check.
+    pub fn display_summary(&self) -> Self {
+        Self { untracked_omitted: self.untracked_omitted, head: self.head.clone(),
+            tracking: self.tracking.clone(), dirty: self.dirty.clone(), entries: Vec::new() }
+    }
+
     /// Entries in one area, in Git's reporting order.
     pub fn area(&self, area: ChangeArea) -> impl Iterator<Item = &ChangedPath> {
         self.entries.iter().filter(move |entry| entry.area == area)
@@ -4377,6 +4392,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cache.admin = admin;
         cache.digest = Some(digest);
         cache.dirty = false;
+        cache.last_status = Some(status.display_summary());
         Ok(Some(RepositorySnapshot {
             operation: control.operation.clone(),
             stashes: control.stashes.clone(),

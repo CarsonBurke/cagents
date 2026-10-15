@@ -3985,6 +3985,14 @@ fn grouped_digits(value: usize) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct SourceControlRead {
+    prepared: Option<Box<(RepositorySnapshot, SourceControlModel)>>,
+    status: StatusSnapshot,
+    operation: Option<crate::repository::GitOperationKind>,
+    read: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
     ReviewFilePanelToggle {
@@ -4009,7 +4017,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel, u64)>>, String>,
+        result: Result<SourceControlRead, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -11272,16 +11280,16 @@ impl Cagents {
                     cache.invalidate(invalidation & 2 != 0);
                 }
                 let status_read = git_ui::next_status_read();
-                let Some(mut snapshot) = service
-                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
-                    .map_err(|error| error.to_string())?
-                else {
-                    return Ok(None);
-                };
+                let snapshot = service.snapshot_cached(&worktree, options, &cancellation, &mut cache)
+                    .map_err(|error| error.to_string())?;
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
                     return Err("source-control read cancelled".to_owned());
                 }
+                let (status, operation) = cache.row_status()
+                    .ok_or_else(|| "successful source-control read did not expose display status".to_owned())?;
+                let mut read = SourceControlRead { prepared: None, status: status.clone(), operation, read: status_read };
+                let Some(mut snapshot) = snapshot else { return Ok(read); };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -11306,7 +11314,8 @@ impl Cagents {
                     cache.invalidate(false);
                     return Err("source-control read cancelled".to_owned());
                 }
-                Ok(Some(Box::new((snapshot, model, status_read))))
+                read.prepared = Some(Box::new((snapshot, model)));
+                Ok(read)
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
@@ -16756,49 +16765,27 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if matches!(result, Ok(None)) {
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                        source.set_reloading(false);
-                    }
+                // The expensive panel model follows its existing request
+                // generation. Watcher scalar updates do not restart it under
+                // continuous writes; only row/cache facts use the shared order.
+                if let Ok(read) = &result
+                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.read)
+                    && let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                        .find(|project| project.id == key.project_id)
+                        .and_then(|project| project.worktrees.iter_mut().find(|worktree| worktree.id == key.worktree_id))
+                {
+                    worktree.apply_status(&read.status);
+                    worktree.apply_operation(read.operation);
+                }
+                if matches!(&result, Ok(read) if read.prepared.is_none()) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() { source.set_reloading(false); }
                     return Task::none();
                 }
-                if let Ok(Some(prepared)) = &result
-                    && !self.refresh_ui.git.accept_bound_status(&key, &prepared.0, prepared.2)
-                {
-                    // A newer watcher read already established this row's
-                    // status. Retry the bound panel instead of installing an
-                    // older full Changes model over those accepted facts.
-                    self.refresh_ui.source_invalidated.fetch_or(3, std::sync::atomic::Ordering::AcqRel);
-                    return self.reload_source_control(&key);
-                }
-                if let Ok(Some(prepared)) = &result
-                    && let Some(worktree) = self
-                        .sidebar_model
-                        .projects
-                        .iter_mut()
-                        .find(|project| project.id == key.project_id)
-                        .and_then(|project| {
-                            project
-                                .worktrees
-                                .iter_mut()
-                                .find(|worktree| worktree.id == key.worktree_id)
-                        })
-                {
-                    worktree.apply_status(&prepared.0.status);
-                    worktree.apply_operation(
-                        prepared
-                            .0
-                            .operation
-                            .as_ref()
-                            .map(|operation| operation.kind),
-                    );
-                }
                 let (snapshot, mut next) = match result {
-                    Ok(Some(prepared)) => {
-                        let (snapshot, model, _) = *prepared;
+                    Ok(read) => {
+                        let (snapshot, model) = *read.prepared.expect("unchanged reads returned above");
                         (Some(snapshot), model)
                     }
-                    Ok(None) => unreachable!(),
                     Err(error) => (None, SourceControlModel::failed(key, error)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
