@@ -13,6 +13,7 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+mod modal_ui;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
 use crate::file_manager::{self, open_system_url};
@@ -2677,9 +2678,9 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ReturnToAutomationBeforeClose
                 | Message::DiscardAutomationAndClose(_)
                 | Message::CommitClose(_)
-                | Message::ConfirmTerminalClose
-                | Message::CancelTerminalClose
-                | Message::TerminalCloseDontAskChanged(_)
+                | Message::ConfirmTerminalClose(_)
+                | Message::CancelTerminalClose(_)
+                | Message::TerminalCloseDontAskChanged(..)
                 | Message::SaveAndCloseRepository(_)
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
@@ -2709,7 +2710,9 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::NativeWindowAction(_)
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
-                        | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::ConfirmDelete(_)
+                        | project_ui::Action::ConfirmRemove(_)
+                        | project_ui::Action::DismissRole(_)
                         | project_ui::Action::Dismiss
                 )
                 | Message::ChannelUi(
@@ -6543,6 +6546,10 @@ fn grouped_digits(value: usize) -> String {
 #[derive(Debug, Clone)]
 pub enum Message {
     Onboarding(onboarding_ui::Action),
+    ModalSurface {
+        target: modal_ui::SurfaceTarget,
+        message: Box<Message>,
+    },
     ChatClose(chat_ui::closing::Action),
     DiffPatchPrepared {
         key: ActiveWorktreeKey,
@@ -6758,9 +6765,9 @@ pub enum Message {
         result: Result<(), String>,
     },
     CommitClose(CardId),
-    ConfirmTerminalClose,
-    CancelTerminalClose,
-    TerminalCloseDontAskChanged(bool),
+    ConfirmTerminalClose(terminal_close::DialogTarget),
+    CancelTerminalClose(terminal_close::DialogTarget),
+    TerminalCloseDontAskChanged(terminal_close::DialogTarget, bool),
     TerminalCloseFinished {
         card: CardId,
         terminal: TerminalId,
@@ -7093,6 +7100,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
+    request: crate::model::OperationId,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -7105,6 +7113,7 @@ impl DirtyRepositoryClose {
         while let Some(card) = self.remaining.pop_front() {
             if unresolved(card) {
                 self.card = card;
+                self.request = crate::model::OperationId::new();
                 return Some(card);
             }
         }
@@ -7571,6 +7580,7 @@ struct SourceControlMutation {
 }
 
 pub struct Cagents {
+    modal_stack: modal_ui::Stack,
     device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -15091,98 +15101,25 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
-        self.chat_ui.close_dialog.is_some()
-            || self.update_ui.confirmation.is_some()
-            || self.other_modal_is_open()
-    }
-
-    fn other_modal_is_open(&self) -> bool {
-        self.editor_features.modal_open() || self.form_dialog_is_open() || self.modal_over_form_dialogs()
-    }
-
-    /// The worktree and pull request dialogs: forms, whose focused field
-    /// captures the keys the dialog itself answers.
-    fn form_dialog_is_open(&self) -> bool {
-        self.device_ui.open
-            || self.worktree_dialog.is_some()
-            || self.pull_request_dialog.is_some()
-            || self.resume_ui.open
-            || self.chrome_ui.clone_repository.is_some()
+        self.top_modal().is_some()
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
-        if self.editor_features.modal_open() { return self.update_editor_features(editor_features::Action::CancelPreview); }
-        if self.automation_approval_open() {
-            return self.cancel_automation_approval();
-        }
-        if self.session_recovery.open() {
-            return self.update_session_recovery(session_recovery::Action::Cancel);
-        }
-        if self.daemon_health_ui.confirmation {
-            return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
-        }
-        if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
-        }
-        if let Some(action) = self.automation_ui.keep_draft_action() {
-            return self.update_automation_ui(action);
-        }
-        if self.device_ui.open {
-            return self.update_device(device_ui::Action::Close);
-        }
-        if self.resume_ui.open {
-            return self.update_resume(resume_ui::Action::Close);
-        }
-        if self.chrome_ui.clone_repository.is_some() {
-            return self.update_onboarding(onboarding_ui::Action::Cancel);
-        }
-        if let Some(dialog) = self.worktree_dialog.take() {
-            dialog.cancel();
-        } else if self.pull_request_dialog.take().is_some() {
-            self.pull_request_dialog_generation =
-                self.pull_request_dialog_generation.wrapping_add(1);
-        }
-        if let Some(target) = self.nested_modal_focus_target() {
-            return iced::widget::operation::focus(target).map(cosmic::Action::App);
-        }
-        self.focus_context_overlay_if_exposed()
+        self.cancel_top_modal()
     }
 
     /// Whether a form dialog is the dialog on screen, not one under another.
     fn form_dialog_on_top(&self) -> bool {
-        self.form_dialog_is_open()
-            && self.update_ui.confirmation.is_none()
-            && !self.modal_over_form_dialogs()
-    }
-
-    /// The dialogs `dialog` mounts above the form dialogs, besides the
-    /// update confirmation, which `modal_is_open` adds.
-    fn modal_over_form_dialogs(&self) -> bool {
-        #[cfg(feature = "integrated-browser")]
-        if self.browser_import.open() {
-            return true;
-        }
-        self.session_recovery.open()
-            || self.daemon_health_ui.confirmation
-            || self.automation_approval_open()
-            || self.dirty_repository_close.is_some()
-            || self.transient_work_close.is_some()
-            || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
-            || self.terminal_paste.is_some()
-            || self.terminal_clipboard.is_some()
-            || self.terminal_close_dialog_visible()
-            || self.settings_reset_confirm
-            || self.project_ui.modal_open()
-            || self.channel_ui.modal_open()
-            || self.sidebar_selection_ui.dialog.is_some()
-            // Mounted by `dialog` from the sidebar's own state, so nothing
-            // beneath it can learn about it any other way. Leaving it out is
-            // how the one dialog that is on screen *because* it is about to
-            // destroy work becomes the one dialog the pane keeps its commands
-            // live behind.
-            || self.sidebar_state.pending_discard().is_some()
+        matches!(
+            self.top_modal(),
+            Some(
+                modal_ui::Modal::Device
+                    | modal_ui::Modal::Resume
+                    | modal_ui::Modal::Worktree
+                    | modal_ui::Modal::PullRequest
+            )
+        )
     }
 
     fn context_inspector_visible(&self) -> bool {
@@ -15783,16 +15720,6 @@ impl Cagents {
             .or_else(|| self.parked_chat_restart_blocker())
     }
 
-    fn primary_dirty_close_control(&self, card: CardId) -> DirtyCloseControl {
-        match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) if runtime.can_save() => DirtyCloseControl::Save,
-            Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes() => {
-                DirtyCloseControl::Discard
-            }
-            _ => DirtyCloseControl::Cancel,
-        }
-    }
-
     fn begin_dirty_close(
         &mut self,
         intent: DirtyCloseIntent,
@@ -15810,16 +15737,16 @@ impl Cagents {
         // while dirty-close is topmost; Cancel re-checks the live modal tree
         // and uses this only when none remains.
         let restore_card = self.workspace.focused();
-        let focused = self.primary_dirty_close_control(card);
+        let focused = DirtyCloseControl::Cancel;
         self.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: cards,
             intent,
             focused,
             restore_card,
         });
-        iced::widget::operation::focus(dirty_close_control_id(card, focused))
-            .map(cosmic::Action::App)
+        self.modal_focus(dirty_close_control_id(card, focused))
     }
 
     fn close_pane_group(&mut self) -> Task<Message> {
@@ -15842,23 +15769,21 @@ impl Cagents {
         if matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         {
             let card = close.card;
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(card, focused))
-                .map(cosmic::Action::App);
+            return self.modal_focus(dirty_close_control_id(card, focused));
         }
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         }) {
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
-            return iced::widget::operation::focus(dirty_close_control_id(
+            return self.modal_focus(dirty_close_control_id(
                 card,
                 focused,
-            ))
-            .map(cosmic::Action::App);
+            ));
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
@@ -15886,36 +15811,16 @@ impl Cagents {
             .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
-        iced::widget::operation::focus(restore_focus).map(cosmic::Action::App)
+        self.modal_restore_focus(restore_focus)
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.automation_ui.draft_dialog_open() {
-            return Some(crate::automation_ui::draft_dialog_focus_id());
-        }
-        if self.resume_ui.open {
-            return Some(resume_ui::focus_id());
-        }
-        if self.chrome_ui.clone_repository.is_some() {
-            return Some(onboarding_ui::clone_focus_id());
-        }
-        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
-            Some(dialog.focus_target())
-        } else if self.sidebar_state.pending_discard().is_some() {
-            Some(sidebar::discard_confirm_id())
-        } else if self.project_ui.modal_open() {
-            Some(self.project_ui.focus_target())
-        } else if self.channel_ui.modal_open() {
-            Some(channel_ui::State::focus_target())
-        } else if self.worktree_dialog.is_some() {
-            Some(worktree_dialog_focus_id())
-        } else if self.pull_request_dialog.is_some() {
-            Some(pull_request_dialog_focus_id())
-        } else if self.context_inspector_is_overlay() {
-            Some(context_inspector_toggle_id())
-        } else {
-            None
-        }
+        self.top_modal()
+            .map(|modal| self.modal_initial_focus(modal))
+            .or_else(|| {
+                self.context_inspector_is_overlay()
+                    .then(context_inspector_toggle_id)
+            })
     }
 
     fn restore_pull_request_dialog(
@@ -15933,7 +15838,7 @@ impl Cagents {
         {
             return Task::none();
         }
-        iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App)
+        self.modal_focus(pull_request_dialog_focus_id())
     }
 
     fn focus_context_overlay_if_exposed(&self) -> Task<Message> {
@@ -15948,6 +15853,7 @@ impl Cagents {
     }
 
     fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
+        let observed = self.modal_stack.focus_snapshot(modal_ui::Modal::DirtyClose).get();
         let Some(close) = self.dirty_repository_close.as_mut() else {
             return Task::none();
         };
@@ -15962,9 +15868,15 @@ impl Cagents {
             self.cards.get(&close.card),
             Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
         );
+        if let Some(id) = observed
+            && let Some(control) = [DirtyCloseControl::Cancel, DirtyCloseControl::Discard, DirtyCloseControl::Save]
+                .into_iter().find(|control| dirty_close_control_id(close.card, *control) == id)
+        {
+            close.focused = control;
+        }
         close.focused = next_dirty_close_control(close.focused, backwards, saving, discardable);
-        iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
-            .map(cosmic::Action::App)
+        let target = dirty_close_control_id(close.card, close.focused);
+        self.modal_focus(target)
     }
 
     fn utility_card(&self, kind: &CardKind) -> Option<CardId> {
@@ -16779,7 +16691,7 @@ impl Cagents {
                 |card| self.card_keyboard_focus(card),
             )
         };
-        iced::widget::operation::focus(target).map(cosmic::Action::App)
+        self.modal_restore_focus(target)
     }
 
     fn reload_settings(&mut self, observed: settings::LiveSettings) -> Task<Message> {
@@ -17087,6 +16999,7 @@ impl Application for Cagents {
         );
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
+        let modal_stack = modal_ui::Stack::with_keyboard_nav(core.keyboard_nav());
         let settings_draft = SettingsDraft::from_settings(&settings);
         let shared_views = shared_views::State::for_workspace(&durable);
         let workspace_history = crate::tab_history::TabHistory::from_recent(
@@ -17233,6 +17146,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            modal_stack,
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
@@ -17421,6 +17335,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let Some(message) = self.admit_modal_surface_message(message) else {
+            return Task::none();
+        };
         self.retire_stale_definition_requests();
         let (message, _keyboard_region) = match message {
             Message::RoutedKeyEvent {
@@ -17435,6 +17352,11 @@ impl Application for Cagents {
             message => (message, None),
         };
         self.reconcile_chat_close_backing_state();
+        self.reconcile_modal_backing_state();
+        let modal_entry_focus = self.finish_modal_update(Task::none());
+        // Keep the large dispatch body in place for independent feature changes.
+        #[rustfmt::skip]
+        let task = (|| {
         self.reconcile_terminal_review_owner();
         self.terminal_review_input
             .flush_orphans(self.terminal_review_card.is_some());
@@ -17557,6 +17479,7 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::ModalSurface { .. } => return Task::none(),
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
@@ -18931,8 +18854,7 @@ impl Application for Cagents {
                             draft: false,
                             retry_confirmation: None,
                         });
-                        iced::widget::operation::focus(pull_request_dialog_focus_id())
-                            .map(cosmic::Action::App)
+                        self.modal_focus(pull_request_dialog_focus_id())
                     }
                     SidebarAction::NewChannel { project_id } => {
                         self.handle_channel_ui(channel_ui::Action::Create(project_id))
@@ -19123,8 +19045,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
-                            iced::widget::operation::focus(sidebar::discard_confirm_id())
-                                .map(cosmic::Action::App)
+                            self.modal_focus(sidebar::discard_cancel_id())
                         } else {
                             Task::none()
                         }
@@ -19658,10 +19579,9 @@ impl Application for Cagents {
                     self.automation_close_generation =
                         self.automation_close_generation.wrapping_add(1);
                     self.transient_work_close = Some(window);
-                    return iced::widget::operation::focus(widget::Id::new(
+                    return self.modal_focus(widget::Id::new(
                         "dialog.transient-close.cancel",
-                    ))
-                    .map(cosmic::Action::App);
+                    ));
                 }
                 self.transient_work_close = None;
                 let dirty = self
@@ -19692,7 +19612,7 @@ impl Application for Cagents {
                     })
                 };
                 target.map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(target).map(cosmic::Action::App)
+                    self.modal_restore_focus(target)
                 })
             }
             Message::ReturnToAutomationBeforeClose => {
@@ -19707,8 +19627,7 @@ impl Application for Cagents {
                 }
                 Task::batch([
                     self.open_automations(),
-                    iced::widget::operation::focus(crate::automation_ui::draft_editor_focus_id())
-                        .map(cosmic::Action::App),
+                    self.modal_focus(crate::automation_ui::draft_editor_focus_id()),
                 ])
             }
             Message::DiscardAutomationAndClose(generation) => {
@@ -19737,8 +19656,7 @@ impl Application for Cagents {
                 self.device_ui.open = true;
                 Task::batch([
                     self.update_device(device_ui::Action::BackToFile),
-                    iced::widget::operation::focus(device_ui::file_editor_id())
-                        .map(cosmic::Action::App),
+                    self.modal_focus(device_ui::file_editor_id()),
                 ])
             }
             Message::CloseCard(id)
@@ -19751,17 +19669,14 @@ impl Application for Cagents {
             Message::CloseCard(id) if self.chat_has_parked_runtime(id) => self.begin_chat_close(id),
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
-            Message::ConfirmTerminalClose => self.confirm_terminal_close(),
-            Message::CancelTerminalClose => self.cancel_terminal_close(),
-            Message::TerminalCloseDontAskChanged(value) => {
-                if let Some(intent) = self.terminal_close.as_mut()
-                    && !intent.pending
-                    && intent.active
-                    && intent.detail.is_none()
-                {
-                    intent.dont_ask_again = value;
-                }
-                Task::none()
+            Message::ConfirmTerminalClose(target) => {
+                if self.terminal_close_decision_current(&target) { self.confirm_terminal_close() } else { Task::none() }
+            }
+            Message::CancelTerminalClose(target) => {
+                if self.terminal_close_decision_current(&target) { self.cancel_terminal_close() } else { Task::none() }
+            }
+            Message::TerminalCloseDontAskChanged(target, value) => {
+                if self.terminal_close_decision_current(&target) { self.set_terminal_close_dont_ask(value) } else { Task::none() }
             }
             Message::TerminalCloseFinished {
                 card,
@@ -20360,8 +20275,7 @@ impl Application for Cagents {
                     // title is no reason to take it away from them.
                     self.status = Some(TransientNotice::error(error.to_string()));
                     self.pull_request_dialog = Some(dialog);
-                    return iced::widget::operation::focus(pull_request_dialog_focus_id())
-                        .map(cosmic::Action::App);
+                    return self.modal_focus(pull_request_dialog_focus_id());
                 }
                 let generation = self.pull_request_dialog_generation;
                 let submit = cosmic::task::future(async move {
@@ -20453,6 +20367,9 @@ impl Application for Cagents {
                     Task::none()
                 };
                 let route_task = (|| {
+                    if let Some(task) = self.modal_key_event(&event, captured) {
+                        return task;
+                    }
                     if self.chat_ui.close_dialog.is_some() {
                         return if is_escape_press(&event) {
                             self.cancel_chat_close()
@@ -21206,8 +21123,7 @@ impl Application for Cagents {
                 self.settings_reset_focus_confirm = false;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.cancel"))
-                    .map(cosmic::Action::App)
+                self.modal_focus(widget::Id::new("dialog.reset-settings.cancel"))
             }
             Message::CancelResetSettings => self.close_settings_reset(),
             Message::ConfirmResetSettings => {
@@ -21793,6 +21709,12 @@ impl Application for Cagents {
             notices,
             terminal_probes,
         ])
+
+        })();
+        self.reconcile_modal_backing_state();
+        // Only the immediate entry focus operation gates feature tasks. A
+        // long-lived feature stream must never delay focus restoration.
+        modal_entry_focus.chain(self.finish_modal_update(task))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -21930,14 +21852,18 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.editor_feature_dialog() { return Some(dialog); }
-        if let Some(dialog) = self.chat_close_dialog() {
+        let top = self.top_modal()?;
+        #[rustfmt::skip]
+        let dialog = (|| {
+        if top == modal_ui::Modal::ChatClose {
+            return self.chat_close_dialog();
+        }
+        if top == modal_ui::Modal::Approval
+            && let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.automation_approval_dialog() {
-            return Some(dialog);
-        }
-        if self.transient_work_close.is_some() {
+        if top == modal_ui::Modal::TransientClose
+            && self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::button::secondary("Cancel close")
                     .id(widget::Id::new("dialog.transient-close.cancel"))
@@ -21974,10 +21900,7 @@ impl Application for Cagents {
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
+                        dialog_ui::confirmation_controls(controls),
                     ])
                     .spacing(space::M),
                     480.0,
@@ -21986,7 +21909,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(dialog) = self.automation_ui.draft_dialog() {
+        if top == modal_ui::Modal::AutomationDraft
+            && let Some(dialog) = self.automation_ui.draft_dialog() {
             return Some(dialog_ui::overlay(
                 dialog.map(Message::AutomationUi),
                 self.automation_ui
@@ -21995,42 +21919,47 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if self.device_ui.open {
+        if top == modal_ui::Modal::Device
+            && self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
                 (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
+        if top == modal_ui::Modal::Image
+            && let Some(gallery) = &self.chat_ui.image_viewer {
             return Some(gallery.view());
         }
-        if let Some(dialog) = self.terminal_clipboard_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.terminal_paste_dialog() {
+        if top == modal_ui::Modal::Paste
+            && let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
         }
         #[cfg(feature = "integrated-browser")]
-        if let Some(dialog) = self.browser_import_dialog() {
+        if top == modal_ui::Modal::BrowserImport
+            && let Some(dialog) = self.browser_import_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.session_recovery_dialog() {
+        if top == modal_ui::Modal::Recovery
+            && let Some(dialog) = self.session_recovery_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.daemon_health_dialog() {
+        if top == modal_ui::Modal::Health
+            && let Some(dialog) = self.daemon_health_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.update_dialog() {
+        if top == modal_ui::Modal::Update
+            && let Some(dialog) = self.update_dialog() {
             return Some(dialog);
         }
-        if let Some(intent) = &self.terminal_close
+        if top == modal_ui::Modal::TerminalClose
+            && let Some(intent) = &self.terminal_close
             && self.terminal_close_dialog_visible()
         {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
                     surface,
-                    (!intent.pending).then_some(Message::CancelTerminalClose),
+                    (!intent.pending).then_some(Message::CancelTerminalClose(intent.target())),
                     1.0,
                 )
             });
@@ -22038,7 +21967,8 @@ impl Application for Cagents {
         // Above the settings surface it is raised from, because it is about to
         // discard every shortcut, font, theme and language-server entry the
         // user configured, with no undo.
-        if self.settings_reset_confirm {
+        if top == modal_ui::Modal::SettingsReset
+            && self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
@@ -22059,9 +21989,7 @@ impl Application for Cagents {
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
-                        ])
-                        .spacing(space::S)
-                        .into(),
+                        ]),
                     ])
                     .spacing(space::M),
                     480.0,
@@ -22072,14 +22000,16 @@ impl Application for Cagents {
         }
         // First, because a discard is the one dialog on screen precisely
         // because it is about to destroy work that exists nowhere else.
-        if let Some(pending) = self.sidebar_state.pending_discard() {
+        if top == modal_ui::Modal::Discard
+            && let Some(pending) = self.sidebar_state.pending_discard() {
             return Some(dialog_ui::overlay(
                 sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
                 1.0,
             ));
         }
-        if let Some(close) = self.dirty_repository_close.as_ref() {
+        if top == modal_ui::Modal::DirtyClose
+            && let Some(close) = self.dirty_repository_close.as_ref() {
             let card = close.card;
             let runtime = match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime,
@@ -22146,9 +22076,7 @@ impl Application for Cagents {
                 .into(),
             );
             rows.push(
-                widget::row::with_children(controls)
-                    .spacing(space::S)
-                    .into(),
+                dialog_ui::confirmation_controls(controls),
             );
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
@@ -22160,7 +22088,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(surface) = self.sidebar_selection_dialog() {
+        if top == modal_ui::Modal::Selection
+            && let Some(surface) = self.sidebar_selection_dialog() {
             return Some(dialog_ui::overlay(
                 surface,
                 Some(Message::SidebarSelection(
@@ -22169,32 +22098,33 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(surface) = self.project_dialog_view() {
+        if let modal_ui::Modal::Project(role) = top
+            && let Some(surface) = self.project_dialog_view_for(role) {
             return Some(dialog_ui::overlay(
                 surface,
-                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
+                Some(Message::ProjectUi(project_ui::Action::DismissRole(self.project_ui.modal_target(role)?))),
                 1.0,
             ));
         }
-        if let Some(surface) = self.channel_dialog_view() {
+        if top == modal_ui::Modal::Channel
+            && let Some(surface) = self.channel_dialog_view() {
             return Some(dialog_ui::overlay(
                 surface,
                 Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
                 1.0,
             ));
         }
-        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+        if top == modal_ui::Modal::Worktree
+            && let Some((surface, dismiss)) = self.worktree_dialog_view() {
             return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
-        if let Some(dialog) = self.clone_repository_dialog() {
+        if top == modal_ui::Modal::Resume
+            && let Some(dialog) = self.resume_dialog() {
             return Some(dialog);
         }
 
-        if let Some(dialog) = self.resume_dialog() {
-            return Some(dialog);
-        }
-
+        if top != modal_ui::Modal::PullRequest { return None; }
         let dialog = self.pull_request_dialog.as_ref()?;
         let head = dialog.head.trim();
         let base = dialog.base.trim();
@@ -22216,6 +22146,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -22225,6 +22156,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -22234,6 +22166,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -22269,7 +22202,7 @@ impl Application for Cagents {
             );
         }
         rows.push(
-            widget::row::with_children(vec![
+            dialog_ui::confirmation_controls(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press(Message::CancelDialog)
                     .into(),
@@ -22287,9 +22220,7 @@ impl Application for Cagents {
                         .then_some(Message::SubmitPullRequest),
                     )
                     .into(),
-            ])
-            .spacing(space::S)
-            .into(),
+            ]),
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(
@@ -22301,6 +22232,22 @@ impl Application for Cagents {
             Some(Message::CancelDialog),
             1.0,
         ))
+        })();
+        dialog.map(|dialog| {
+            let dialog = if top.owns_tab() {
+                crate::interaction::modal_tabs(dialog)
+            } else {
+                dialog
+            };
+            let target = self.modal_surface_target(top);
+            let dialog = crate::interaction::owned_surface(dialog, target);
+            crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top)).map(
+                move |message| Message::ModalSurface {
+                    target,
+                    message: Box::new(message),
+                },
+            )
+        })
     }
 
     /// The application opens no window but its main one, which stops being
@@ -22656,6 +22603,8 @@ impl Application for Cagents {
                 channel,
             },
         );
+        let surface =
+            crate::interaction::observe_focus(surface, self.modal_stack.workspace_focus.clone());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,
@@ -24099,6 +24048,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -26863,6 +26813,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -26926,6 +26877,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
+            request: crate::model::OperationId::new(),
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),
@@ -27039,6 +26991,62 @@ mod tests {
             draft: true,
             retry_confirmation: None,
         }
+    }
+
+    #[test]
+    fn enter_in_the_pull_request_title_publishes_submit() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{Tree, operation},
+            },
+            mouse,
+        };
+        let mut app = context_inspector_test_app(false);
+        app.pull_request_dialog = Some(pull_request_test_dialog());
+        let renderer = headless_renderer();
+        let mut element = app.dialog().unwrap();
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(iced::Size::new(1200.0, 900.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(pull_request_dialog_focus_id()),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages
+                .into_iter()
+                .filter_map(|message| app.admit_modal_surface_message(message))
+                .any(|message| matches!(message, Message::SubmitPullRequest))
+        );
     }
 
     fn authorize_pull_request_test(app: &mut Cagents, dialog: &PullRequestDialog) {
@@ -31075,9 +31083,9 @@ mod tests {
         focused_element(cosmic::Application::view(app), task)
     }
 
-    pub(super) fn focused_element(
-        mut element: Element<'_, Message>,
-        task: Task<Message>,
+    pub(super) fn focused_element<M: 'static>(
+        mut element: Element<'_, M>,
+        task: Task<M>,
     ) -> Option<widget::Id> {
         use cosmic::iced::advanced::layout;
         use cosmic::iced::advanced::widget::Tree;
@@ -31910,6 +31918,7 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            modal_stack: Default::default(),
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
@@ -34012,7 +34021,17 @@ mod tests {
             "with nothing blocking it, the confirming button is offered: {labels:?}"
         );
 
-        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
+        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete(
+            match app
+                .project_ui
+                .modal_target(project_ui::ModalRole::WorktreeDelete)
+                .unwrap()
+                .request
+            {
+                project_ui::ModalRequest::Counter(request) => request,
+                _ => unreachable!(),
+            },
+        )));
         assert!(
             app.project_ui
                 .deleting_directory(Path::new("/repo/feature")),

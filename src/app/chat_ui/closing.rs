@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::app) enum Action {
+pub enum Action {
     End(CardId),
     Cancel(DialogTarget),
     Confirm(DialogTarget),
@@ -10,7 +10,7 @@ pub(in crate::app) enum Action {
     CommitHide(CardId),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::app) struct DialogTarget {
+pub struct DialogTarget {
     card: CardId,
     generation: u64,
 }
@@ -18,8 +18,21 @@ pub(in crate::app) struct Confirmation {
     pub card: CardId,
     pub tab: bool,
     generation: u64,
+    source: CloseSource,
+}
+
+/// The issued descriptor and live logical identity observed at consent time.
+/// Process roster changes do not change either identity. A replacement issued
+/// descriptor requires a correlated recovery receipt before consent can follow.
+#[derive(Clone)]
+struct CloseSource {
+    descriptor: chat::Session,
+    session: chat::Session,
 }
 impl Confirmation {
+    pub(in crate::app) fn generation(&self) -> u64 {
+        self.generation
+    }
     pub(in crate::app) fn target(&self) -> DialogTarget {
         DialogTarget {
             card: self.card,
@@ -37,12 +50,31 @@ pub(in crate::app) fn draft_key(session: &chat::Session) -> Option<String> {
 }
 
 impl Cagents {
+    fn chat_close_source(&self, card: CardId) -> Option<CloseSource> {
+        let state = self.card_state(card)?;
+        let CardKind::Chat(descriptor) = &state.kind else {
+            return None;
+        };
+        state.existence.is_open().then(|| CloseSource {
+            descriptor: descriptor.clone(),
+            session: self
+                .chat_return_session(card)
+                .unwrap_or_else(|| descriptor.clone()),
+        })
+    }
+    fn chat_close_source_matches(&self, dialog: &Confirmation) -> bool {
+        self.card_state(dialog.card).is_some_and(|state| {
+            state.existence.is_open()
+                && matches!(&state.kind, CardKind::Chat(current) if current == &dialog.source.descriptor)
+        }) && self.chat_return_session(dialog.card).as_ref() == Some(&dialog.source.session)
+    }
     pub(in crate::app) fn reconcile_chat_close_backing_state(&mut self) {
-        if self.chat_ui.close_dialog.as_ref().is_some_and(|dialog| {
-            !self
-                .card_state(dialog.card)
-                .is_some_and(|card| card.existence.is_open())
-        }) {
+        if self
+            .chat_ui
+            .close_dialog
+            .as_ref()
+            .is_some_and(|dialog| !self.chat_close_source_matches(dialog))
+        {
             self.chat_ui.close_dialog = None;
         }
     }
@@ -132,14 +164,17 @@ impl Cagents {
         if self.chat_ui.close_dialog.is_some() {
             return Task::none();
         }
+        let Some(source) = self.chat_close_source(card) else {
+            return Task::none();
+        };
         self.chat_ui.close_generation = self.chat_ui.close_generation.wrapping_add(1);
         self.chat_ui.close_dialog = Some(Confirmation {
             card,
             tab,
             generation: self.chat_ui.close_generation,
+            source,
         });
-        iced::widget::operation::focus(widget::Id::new("chat-close.cancel"))
-            .map(cosmic::Action::App)
+        self.modal_focus(widget::Id::new("chat-close.cancel"))
     }
     pub(in crate::app) fn cancel_chat_close(&mut self) -> Task<Message> {
         let Some(target) = self.chat_ui.close_dialog.as_ref().map(Confirmation::target) else {
@@ -151,20 +186,29 @@ impl Cagents {
         if self.update_prepared && !matches!(action, Action::CommitHide(_)) {
             return Task::none();
         }
+        if matches!(
+            action,
+            Action::Cancel(_) | Action::Confirm(_) | Action::Hide(_)
+        ) && self.top_modal() != Some(modal_ui::Modal::ChatClose)
+        {
+            return Task::none();
+        }
         let target = match action {
             Action::Cancel(target) | Action::Confirm(target) | Action::Hide(target) => Some(target),
             _ => None,
         };
         if target.is_some_and(|target| {
-            self.chat_ui
-                .close_dialog
-                .as_ref()
-                .is_none_or(|dialog| dialog.target() != target)
+            self.chat_ui.close_dialog.as_ref().is_none_or(|dialog| {
+                dialog.target() != target || !self.chat_close_source_matches(dialog)
+            })
         }) {
             return Task::none();
         }
         match action {
             Action::End(card) => {
+                if self.chat_close_source(card).is_none() {
+                    return Task::none();
+                }
                 if self.chat_close_needs_confirmation(card) {
                     self.open_chat_close_confirmation(card, false)
                 } else {
@@ -182,7 +226,7 @@ impl Cagents {
                 let target = restore
                     .map(|card| self.card_keyboard_focus(card))
                     .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
-                iced::widget::operation::focus(target).map(cosmic::Action::App)
+                self.modal_restore_focus(target)
             }
             Action::Confirm(_) => {
                 let Some(dialog) = self.chat_ui.close_dialog.take() else {
@@ -355,6 +399,120 @@ mod tests {
         ));
     }
 
+    fn emitted_confirm(app: &Cagents) -> Message {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let mut dialog = app.dialog().expect("visible conversation confirmation");
+        let mut tree = Tree::new(&dialog);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let node = dialog.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        dialog.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("chat-close.confirm")),
+        );
+        let mut messages = Vec::new();
+        dialog.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages.into_iter().find(|message| matches!(message,
+            Message::ModalSurface { message, .. } if matches!(&**message, Message::ChatClose(Action::Confirm(_)))))
+            .expect("actual destructive button publishes its captured decision")
+    }
+
+    #[test]
+    fn held_widget_consent_cannot_end_another_conversation_or_configuration_on_the_same_card() {
+        for changed in 0..7 {
+            let (mut app, card, _directory) = fixture();
+            write(&mut app, card, "original prompt", true);
+            drop(app.update(Message::CloseCard(card)));
+            let held = emitted_confirm(&app);
+            let mut replacement = app.chat_return_session(card).unwrap();
+            match changed {
+                0 => replacement.launch.session_id = Some("different-thread".into()),
+                1 => replacement.id = crate::model::TerminalId::new(),
+                2 => replacement
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-options".into()),
+                3 => {
+                    replacement
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("ACCOUNT".into(), "another".into());
+                }
+                4 => replacement.launch.recipe.working_directory = "/different-directory".into(),
+                _ => replacement.launch.session_id = Some("runtime-or-descriptor-only".into()),
+            }
+            if changed != 5 {
+                app.card_state_mut(card).unwrap().kind = CardKind::Chat(replacement.clone());
+            }
+            if changed != 6 {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                    panic!("chat");
+                };
+                runtime.session = replacement;
+            }
+            drop(app.update(held));
+            assert!(
+                app.card_state(card).unwrap().existence.is_open(),
+                "changed identity {changed}"
+            );
+            assert!(app.cards.contains_key(&card));
+            assert!(
+                app.chat_ui.close_dialog.is_none(),
+                "stale consent must be retired"
+            );
+        }
+    }
+
+    #[test]
+    fn held_widget_consent_survives_same_logical_actor_refresh_without_a_process_roster_fence() {
+        let (mut app, card, _directory) = fixture();
+        write(&mut app, card, "captured prompt", true);
+        drop(app.update(Message::CloseCard(card)));
+        let held = emitted_confirm(&app);
+        let source = app.chat_return_session(card).unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("chat");
+        };
+        // A backend replacement can update its presentation without changing
+        // the issued logical session. Consent never binds a PID or roster row.
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        runtime.session = source.clone();
+        drop(app.update(held));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.durable.conversation_drafts[&draft_key(&source).unwrap()],
+            "captured prompt"
+        );
+    }
+
     #[test]
     fn obsolete_confirmation_cannot_end_a_reopened_dialog_even_for_the_same_card() {
         let (mut app, card, _directory) = fixture();
@@ -378,6 +536,59 @@ mod tests {
             };
             assert_eq!(runtime.unsent_text().trim(), "keep this prompt");
         }
+    }
+
+    #[test]
+    fn a_higher_modal_blocks_chat_decisions_and_escape_restores_its_cancel() {
+        let (mut app, card, _directory) = fixture();
+        write(&mut app, card, "keep this draft", true);
+        let opening = app.update(Message::CloseCard(card));
+        let cancel = widget::Id::new("chat-close.cancel");
+        assert_eq!(
+            crate::app::tests::focused_element(app.dialog().unwrap(), opening),
+            Some(cancel.clone())
+        );
+        let target = app.chat_ui.close_dialog.as_ref().unwrap().target();
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+        for stale in [
+            Action::Confirm(target),
+            Action::Cancel(target),
+            Action::Hide(target),
+        ] {
+            drop(app.update_chat_close(stale));
+            assert!(app.chat_ui.close_dialog.is_some());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+        }
+        let escape = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        };
+        let close_upper = app.update(escape());
+        assert!(!app.settings_reset_confirm);
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::ChatClose));
+        assert_eq!(
+            crate::app::tests::focused_element(app.dialog().unwrap(), close_upper),
+            Some(cancel)
+        );
+        drop(app.update(escape()));
+        assert!(!app.modal_is_open());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("chat retained");
+        };
+        assert_eq!(runtime.unsent_text().trim(), "keep this draft");
+        assert!(runtime.snapshot.busy);
     }
 
     #[test]

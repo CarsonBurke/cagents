@@ -16,6 +16,10 @@ use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 mod context_menu;
+mod owned_surface;
+pub(crate) use owned_surface::owned_surface;
+mod focus_snapshot;
+pub(crate) use focus_snapshot::{FocusSnapshot, observe_focus};
 mod list_navigation;
 pub use list_navigation::{reveal_list_region, reveal_list_selection};
 
@@ -482,6 +486,21 @@ pub fn keyboard_modal<'a, Message: 'a>(
     Effect {
         content: content.into(),
         kind: Kind::KeyboardModal,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+/// The app's modal router owns Tab for these surfaces. Capturing it here
+/// keeps Cosmic's separate ignored-key traversal from also moving focus.
+/// Other keys continue to the native child controls.
+pub(crate) fn modal_tabs<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ModalTabs,
         tip: None,
         on_escape: None,
     }
@@ -1200,6 +1219,7 @@ enum Kind {
     },
     Opaque,
     KeyboardModal,
+    ModalTabs,
 }
 
 struct Effect<'a, Message> {
@@ -1247,6 +1267,7 @@ struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
 struct KeyboardModalTag;
+struct ModalTabsTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
 
@@ -1305,6 +1326,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
+            Kind::ModalTabs => tree::Tag::of::<ModalTabsTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
             Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
@@ -1480,6 +1502,29 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         // Modifier state is not a key press: widgets beneath keep their own
         // copy of it for the clicks and drags that follow, and would be left
         // believing a modifier is still held.
+        if matches!(self.kind, Kind::ModalTabs)
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    } | cosmic::iced::keyboard::Event::KeyReleased {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    }
+                )
+            )
+        {
+            // Repeats remain captured even when the app deliberately ignores
+            // them, otherwise only Cosmic would move the focus on a repeat.
+            shell.capture_event();
+            return;
+        }
         if matches!(self.kind, Kind::KeyboardModal)
             && matches!(
                 event,

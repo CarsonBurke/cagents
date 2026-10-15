@@ -535,10 +535,7 @@ impl Cagents {
         }))
         .abortable();
         self.resume_ui.indexer = Some(handle);
-        Some(Task::batch([
-            iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
-            indexer,
-        ]))
+        Some(Task::batch([self.modal_focus(focus_id()), indexer]))
     }
 
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
@@ -550,8 +547,7 @@ impl Cagents {
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace.focused().map_or_else(Task::none, |card| {
-                    iced::widget::operation::focus(self.card_keyboard_focus(card))
-                        .map(cosmic::Action::App)
+                    self.modal_restore_focus(self.card_keyboard_focus(card))
                 })
             }
             Action::Query(query) => {
@@ -562,10 +558,7 @@ impl Cagents {
             Action::Unscope => {
                 self.resume_ui.scope = None;
                 self.refilter_resume();
-                Task::batch([
-                    self.reveal_resume_selection(),
-                    iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
-                ])
+                Task::batch([self.reveal_resume_selection(), self.modal_focus(focus_id())])
             }
             Action::More => {
                 self.resume_ui.limit += PAGE;

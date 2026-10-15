@@ -1185,7 +1185,7 @@ mod tests {
             ..WorkspaceState::default()
         });
         // Any message that reaches the end of `update` derives the rows.
-        let _ = app.update(Message::CancelTerminalClose);
+        let _ = app.update(Message::DismissStatus);
         assert!(app.sidebar_state.worktree_has_panes(project_id, worktree));
 
         app.workspace

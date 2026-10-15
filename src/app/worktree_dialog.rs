@@ -184,6 +184,9 @@ struct Resolution {
 
 #[derive(Debug, Clone)]
 pub struct WorktreeDialog {
+    /// Per-open consent identity. The modal surface captures this before
+    /// emitting user messages, independently of asynchronous lookup IDs.
+    request: OperationId,
     project_id: ProjectId,
     repository: PathBuf,
     draft: WorktreeDraft,
@@ -196,8 +199,13 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
+    pub(super) fn request(&self) -> OperationId {
+        self.request
+    }
+
     pub fn new(project_id: ProjectId, repository: PathBuf, draft: WorktreeDraft) -> Self {
         Self {
+            request: OperationId::new(),
             project_id,
             repository,
             advanced: draft.uses_options(),
@@ -661,6 +669,106 @@ mod tests {
             project,
             _state: state,
         }
+    }
+
+    fn emitted_form_message(app: &Cagents, focus: widget::Id, editing: bool) -> Message {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let mut surface = app.dialog().expect("visible worktree form");
+        let mut tree = Tree::new(&surface);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0));
+        let node = surface.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        surface.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus),
+        );
+        let key = if editing {
+            keyboard::Key::Character("x".into())
+        } else {
+            keyboard::Key::Named(keyboard::key::Named::Enter)
+        };
+        let mut messages = Vec::new();
+        surface.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: editing.then(|| "x".into()),
+                repeat: false,
+            }),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages.into_iter().find(|message| matches!(message,
+            Message::ModalSurface { message, .. } if matches!(&**message,
+                Message::WorktreeBranchChanged(_) | Message::SubmitWorktree | Message::CancelDialog)))
+            .expect("actual form field/button publishes its instance-bound input")
+    }
+
+    #[test]
+    fn actual_worktree_form_input_cannot_mutate_submit_or_cancel_a_replacement_instance() {
+        let Fixture {
+            mut app, project, ..
+        } = fixture();
+        app.worktree_dialog
+            .as_mut()
+            .unwrap()
+            .edit(WorktreeField::Branch, "feature/original".into());
+        drop(app.finish_modal_update(Task::none()));
+        let old_request = dialog(&app).request();
+        let held = [
+            emitted_form_message(&app, worktree_dialog_focus_id(), true),
+            emitted_form_message(&app, widget::Id::new("dialog.worktree.create"), false),
+            emitted_form_message(&app, widget::Id::new("dialog.worktree.cancel"), false),
+        ];
+        app.worktree_dialog = Some(WorktreeDialog::new(
+            project,
+            "/repo".into(),
+            WorktreeDraft::branch("feature/replacement"),
+        ));
+        let replacement = dialog(&app).request();
+        assert_ne!(replacement, old_request);
+        // Deliberately do not reconcile first: admission must compare the
+        // actual current request before any prelude can run stale input.
+        for message in held {
+            assert!(iced::runtime::task::into_stream(app.update(message)).is_none());
+            assert_eq!(dialog(&app).request(), replacement);
+            assert_eq!(dialog(&app).draft.branch, "feature/replacement");
+            assert!(dialog(&app).resolving.is_none());
+        }
+        let current = emitted_form_message(&app, worktree_dialog_focus_id(), true);
+        drop(app.update(current));
+        assert_ne!(dialog(&app).draft.branch, "feature/replacement");
+        let current = emitted_form_message(&app, widget::Id::new("dialog.worktree.create"), false);
+        drop(app.update(current));
+        let token = dialog(&app)
+            .resolving
+            .as_ref()
+            .expect("current form can submit")
+            .token
+            .clone();
+        let cancel = emitted_form_message(&app, widget::Id::new("dialog.worktree.cancel"), false);
+        drop(app.update(cancel));
+        assert!(app.worktree_dialog.is_none());
+        assert!(token.is_cancelled());
     }
 
     fn dialog(app: &Cagents) -> &WorktreeDialog {

@@ -11644,15 +11644,11 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
-                    .on_press(SidebarAction::CancelDiscard)
-                    .into(),
+                    .on_press(SidebarAction::CancelDiscard),
                 crate::ui_controls::button::destructive("Discard")
                     .id(discard_confirm_id())
-                    .on_press(pending.confirm_action())
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
+                    .on_press(pending.confirm_action()),
+            ),
         ])
         .spacing(space::M),
         520.0,

@@ -33,7 +33,7 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
+        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel")).map(cosmic::Action::App))
     }
     fn core(&self) -> &Core {
         &self.core
@@ -126,12 +126,8 @@ impl Application for DaemonStop {
                         self.report = Some(StopReport::Failed { error });
                     }
                 }
-                iced::widget::operation::focus(widget::Id::new(if self.settled {
-                    "daemon-stop.cancel"
-                } else {
-                    "daemon-stop.confirm"
-                }))
-                .map(cosmic::Action::App)
+                iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
+                    .map(cosmic::Action::App)
             }
             _ => Task::none(),
         }
@@ -152,7 +148,7 @@ impl Application for DaemonStop {
                 ))
                 .into(),
                 crate::design::body(&self.detail).into(),
-                widget::row::with_children(vec![
+                super::dialog_ui::confirmation_controls(vec![
                     crate::ui_controls::button::secondary(if self.settled {
                         "Close"
                     } else {
@@ -173,9 +169,7 @@ impl Application for DaemonStop {
                             (!self.pending && !self.settled).then_some(StopMessage::Confirm),
                         )
                         .into(),
-                ])
-                .spacing(space::S)
-                .into(),
+                ]),
             ])
             .spacing(space::L),
         )
@@ -253,6 +247,19 @@ mod tests {
             (capability, Arc::new(AtomicBool::new(false))),
         )
         .0
+    }
+
+    #[test]
+    fn stop_confirmation_initial_focus_is_cancel() {
+        let fixture = confirmation(1);
+        let (app, task) = DaemonStop::init(
+            Core::default(),
+            (fixture.capability.clone(), Arc::new(AtomicBool::new(false))),
+        );
+        assert_eq!(
+            super::super::tests::focused_element(app.view(), task),
+            Some(widget::Id::new("daemon-stop.cancel"))
+        );
     }
 
     #[test]

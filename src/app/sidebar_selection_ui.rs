@@ -186,7 +186,11 @@ mod tests {
     fn group_confirmation_names_all_targets_and_preserves_unrelated_active_channel() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
-        drop(app.begin_sidebar_group_delete());
+        let task = app.begin_sidebar_group_delete();
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), task),
+            Some(close_focus_id())
+        );
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.targets.len(), 2);
         assert!(
@@ -398,14 +402,9 @@ impl Dialog {
         self.targets[0].row
     }
 
-    /// Confirm, unless a blocker disables it; then Cancel, so focus never
-    /// lands on a dead control.
+    /// Destructive confirmations always start on the safe dismissal.
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.blocked() > 0 {
-            close_focus_id()
-        } else {
-            focus_id()
-        }
+        close_focus_id()
     }
 
     fn blocked(&self) -> usize {
@@ -589,7 +588,7 @@ impl Cagents {
                 };
                 let focus = dialog.focus_target();
                 self.sidebar_selection_ui.dialog = Some(dialog);
-                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+                self.modal_focus(focus)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::warning(error));
@@ -608,8 +607,7 @@ impl Cagents {
                 .first()
                 .filter(|target| self.visible_sidebar_rows().contains(&target.row))
                 .map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(sidebar::selection_row_focus_id(target.row))
-                        .map(cosmic::Action::App)
+                    self.modal_restore_focus(sidebar::selection_row_focus_id(target.row))
                 });
         }
         // Revalidate every target before starting any operation. A reload may
@@ -632,7 +630,7 @@ impl Cagents {
         if dialog.error.is_some() || dialog.blocked() > 0 {
             let focus = dialog.focus_target();
             self.sidebar_selection_ui.dialog = Some(dialog);
-            return iced::widget::operation::focus(focus).map(cosmic::Action::App);
+            return self.modal_focus(focus);
         }
         let mut tasks = Vec::new();
         for target in dialog.targets {
@@ -648,7 +646,14 @@ impl Cagents {
                         worktree_id: None,
                         command: sidebar::ProjectCommand::Remove,
                     }));
-                    self.handle_project_action(project_ui::Action::ConfirmRemove)
+                    self.project_ui
+                        .modal_target(project_ui::ModalRole::ProjectRemove)
+                        .map_or_else(Task::none, |target| {
+                            let project_ui::ModalRequest::Counter(request) = target.request else {
+                                return Task::none();
+                            };
+                            self.handle_project_action(project_ui::Action::ConfirmRemove(request))
+                        })
                 }
             });
         }
