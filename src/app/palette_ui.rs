@@ -1058,7 +1058,10 @@ impl Cagents {
         let pane_index =
             card.and_then(|id| self.workspace.order().position(|candidate| candidate == id));
         let state = card.and_then(|id| self.card_state(id));
+        let save_in_flight = self.focused_repository_is_saving()
+            || card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()));
         workspace_widget::CommandContext {
+            save_in_flight,
             sidebar_commands: self.sidebar_command_target().as_ref().map(|target| self.sidebar_command_mask(target)),
             // The palette's search field owns native keyboard focus. Command
             // availability instead describes the originating pane's content.
@@ -1093,7 +1096,8 @@ impl Cagents {
             pane_has_path: card
                 .is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(_))))
                 || state.and_then(super::worktree_ui::card_directory).is_some(),
-            pane_revealable: pane_index.is_some() && self.active_workspace_destination().is_some(),
+            pane_revealable: pane_index.is_some() && self.active_workspace_destination().is_some()
+                && (!save_in_flight || card == self.workspace.focused()),
             pane_cloneable: !self.focused_repository_is_saving() && state.is_some_and(|state| {
                 state.existence.is_open()
                     && !state.kind.is_utility()
@@ -2141,6 +2145,37 @@ mod tests {
         assert!(
             matches!(entries[0].2, Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: id, .. }) if id == worktree_id)
         );
+    }
+
+    #[test]
+    fn saving_navigation_is_hidden_and_rejected_while_safe_commands_remain_available() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model.projects.push(SidebarProject::new(ProjectId::new(), crate::repository::RepositoryId::new(), "Project".into(), "/repo".into(), Vec::new(), Vec::new()));
+        let blocked = [Command::NewWorktree, Command::NewTerminal, Command::NewThread, Command::OpenSettings, Command::SettingsEditor, Command::FocusProject1];
+        for command in blocked { assert!(app.command_available(command), "baseline {command:?}"); }
+        let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        assert!(app.focused_repository_is_saving());
+        let cards = app.durable.cards.len();
+        let settings_category = app.settings_category;
+        for command in blocked {
+            assert!(!app.command_available(command), "saving {command:?}");
+            assert!(!app.palette_entries().iter().any(|entry| matches!(entry.2, Message::RunCommand(candidate) if candidate == command)));
+            drop(app.update(Message::RunCommand(command)));
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert_eq!(app.durable.cards.len(), cards);
+            assert_eq!(app.settings_category, settings_category);
+            assert!(app.status.as_ref().unwrap().message.contains("unavailable"));
+        }
+        for command in [Command::CopyPath, Command::ToggleTheme, Command::FocusProjectSearch, Command::FindInPane] {
+            assert!(app.command_available(command), "non-navigating {command:?}");
+        }
+        app.sidebar_state.observe_card_update(card);
+        assert!(app.command_available(Command::MarkAllRead));
+        drop(app.update(Message::RunCommand(Command::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(card));
     }
 
     #[test]

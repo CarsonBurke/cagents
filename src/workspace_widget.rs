@@ -202,6 +202,21 @@ impl GlobalShortcut {
         }
     }
 
+    /// These commands change the active workspace or create/focus a pane.
+    /// Native editing and focus-only sidebar actions can continue during saves.
+    pub fn blocked_during_save(self) -> bool {
+        let id = self.id();
+        id.starts_with("settings_") || id.starts_with("focus_project_")
+            || id.starts_with("focus_pane_")
+            || matches!(self, Self::NewTerminal | Self::NewThread | Self::NewBrowser
+                | Self::NewChannel | Self::NewWorktree | Self::ClonePane | Self::ReopenPane
+                | Self::OpenSettings | Self::ToggleInspector | Self::FocusLastPane
+                | Self::FocusAdjacent(_) | Self::CycleWorkspace(_)
+                | Self::NextAttention | Self::PreviousAttention
+                | Self::MovePaneToChannel | Self::DiffOpenInEditor
+                | Self::DeleteChannel)
+    }
+
     pub const fn id(self) -> &'static str {
         match self {
             Self::ToggleProjects => "toggle_projects",
@@ -414,6 +429,7 @@ pub struct ShortcutDescriptor {
 pub struct CommandContext {
     /// Some mask records an originating sidebar target, including a stale target with no actions.
     pub sidebar_commands: Option<u64>,
+    pub save_in_flight: bool,
     pub focused: FocusedPane,
     pub pane_index: Option<usize>,
     pub pane_count: usize,
@@ -498,6 +514,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
+        if context.save_in_flight && self.action.blocked_during_save() { return false; }
         if let Some(mask) = context.sidebar_commands
             && let Some(bit) = self.action.sidebar_command_bit()
         { return mask & bit != 0; }
