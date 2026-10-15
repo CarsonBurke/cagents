@@ -435,7 +435,7 @@ impl Handle {
                     let attention = (!actor.attention.settled && !preserve_holder).then(|| {
                         crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
-                            kind: crate::notifications::Kind::Failed,
+                            kind: crate::notifications::Kind::Interrupted,
                         }
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
@@ -3265,6 +3265,83 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_provider_failure() {
+        struct LostTransport {
+            emit_terminal: bool,
+        }
+        impl Adapter for LostTransport {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![serde_json::json!({"fixture":"receive"})],
+                    events: vec![Event::Ready(true), Event::TurnStarted],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture uses its actual pipe".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                if std::mem::take(&mut self.emit_terminal) {
+                    return Ok(Step {
+                        writes: vec![serde_json::json!({"fixture":"disconnect-after-proof"})],
+                        events: vec![
+                            Event::TurnSettled,
+                            Event::Error { message: "Provider reported migration failure".into(), fatal: false },
+                            Event::TurnFinished { key: Some("confirmed-failed-turn".into()), outcome: crate::notifications::Kind::Failed },
+                        ],
+                        ..Default::default()
+                    });
+                }
+                Err("Fixture local transport failed before further terminal proof".into())
+            }
+        }
+        for known_failure in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: vec![],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(LostTransport { emit_terminal: known_failure });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let (send, receive) = crossbeam_channel::bounded(8);
+            let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+                if let Update::AttentionContext { evidence, content } = update {
+                    let _ = send.try_send((evidence, content));
+                }
+            }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let finished_before_close = handle.is_completed();
+            let failure = handle.failure();
+            let closed = handle.close();
+            // Original process/worker retirement precedes every assertion.
+            closed.unwrap();
+            assert!(handle.is_completed());
+            assert!(finished_before_close, "fixture must actually reach its failing receive before close");
+            assert!(failure.as_deref().is_some_and(|error| error.contains("Fixture local transport failed")));
+            let notices = receive.try_iter().collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1);
+            let (evidence, content) = &notices[0];
+            if known_failure {
+                assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
+                assert_eq!(content.as_ref().unwrap().preview, "Provider reported migration failure");
+            } else {
+                assert_eq!(evidence.kind, crate::notifications::Kind::Interrupted);
+                assert!(content.as_ref().unwrap().preview.contains("Fixture local transport failed"));
+            }
+        }
+    }
+
     #[test]
     fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure() {
         struct FinalFrame {
