@@ -41,14 +41,26 @@ fn durable_parent(plan: &DestinationPlan, relative: &Path)
     let (leaf, parents) = parts.split_last().ok_or(ValidationError::DestinationOutsideRoot)?;
     let mut held = plan.ancestor.try_clone().map_err(filesystem)?;
     for name in parents {
-        let created = fs_safety::create_directory_beneath(&held, Path::new(name), 0o777)
-            .map_err(filesystem)?;
+        let created = match fs_safety::open_directory_beneath(&held, Path::new(name)) {
+            Ok(existing) => fs_safety::DirectoryCreation::Existing(existing),
+            Err(error) if error.is_not_found() => {
+                // A missing managed ancestor needs the same exact-parent proof
+                // before effects as the final checkout. Never bootstrap new
+                // creation authority by reopening an unverified mkdir result.
+                let namespace = fs_safety::DirectoryNamespace::acquire(&held)
+                    .map_err(|error| invalid(format!("The managed parent cannot prove creation ownership: {error}")))?;
+                fs_safety::create_directory_in_namespace(&namespace, &held, Path::new(name), 0o777)
+                    .map_err(filesystem)?
+            }
+            Err(error) => return Err(filesystem(error)),
+        };
         let child = match created {
             fs_safety::DirectoryCreation::Published(publication) => plan.retain_publication(publication)?,
-            // Existing/unverified roots grant traversal only. No permissions,
-            // rollback or created-object receipt is inferred for these roots.
-            fs_safety::DirectoryCreation::Existing(root)
-            | fs_safety::DirectoryCreation::Unverified { directory: root, .. } => root,
+            // Existing roots grant traversal, never chmod or cleanup authority.
+            fs_safety::DirectoryCreation::Existing(root) => root,
+            fs_safety::DirectoryCreation::Unverified { .. } => {
+                return Err(invalid("The managed ancestor has no proven creation identity"));
+            }
         };
         // Syncing existing traversal is harmless and also covers parents that
         // were concurrently created by another cooperating writer.
@@ -697,6 +709,23 @@ mod tests {
         assert!(!destination.exists());
         assert_eq!(fs::metadata(&managed).unwrap().mode() & 0o777, 0o777);
         assert!(fs::read_dir(&managed).unwrap().next().is_none());
+    }
+
+
+    #[test]
+    fn unsafe_missing_managed_parent_refuses_before_mkdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let source_path = fixture.path().join("source");
+        fs::create_dir(&source_path).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o777)).unwrap();
+        let source = fs_safety::Root::open(&source_path).unwrap();
+        let managed = source_path.join(".worktrees");
+        let plan = DestinationPlan::capture(&source, &managed, &managed.join("topic")).unwrap();
+        assert!(plan.ensure_managed_root().is_err());
+        assert!(!managed.exists());
+        assert_eq!(fs::metadata(&source_path).unwrap().mode() & 0o777, 0o777);
+        assert!(fs::read_dir(source_path).unwrap().next().is_none());
     }
 
 }
