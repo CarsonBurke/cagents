@@ -5691,17 +5691,17 @@ pub(crate) fn attention_indicator(state: Option<AttentionState>) -> Option<Eleme
     }
 }
 
-fn with_unread_indicator(base: Element<'static, SidebarAction>, label: &'static str) -> Element<'static, SidebarAction> {
+fn with_unread_indicator<Message: Clone + 'static>(base: Element<'static, Message>, label: &'static str) -> Element<'static, Message> {
     let unread = widget::container(Icon::Attention.handle().icon().size(8))
         .align_right(Length::Fill).align_bottom(Length::Fill);
     crate::interaction::tooltip(cosmic::iced::widget::Stack::with_children(vec![base, unread.into()])
         .width(f32::from(ROW_ICON_SIZE)).height(f32::from(ROW_ICON_SIZE)), label)
 }
 
-fn outcome_indicator(
+pub(crate) fn outcome_indicator<Message: Clone + 'static>(
     activity: Option<crate::agent::ActivityState>, unread: bool,
     outcome: Option<&crate::agent::ActivityOutcome>,
-) -> Option<Element<'static, SidebarAction>> {
+) -> Option<Element<'static, Message>> {
     if matches!(outcome, Some(crate::agent::ActivityOutcome::Cancelled)) && unread && !matches!(activity, Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting)) {
         return Some(with_unread_indicator(status_icon(Icon::Cancel, "Agent cancelled", BadgeTone::Neutral), "Cancelled · unread agent update"));
     }
@@ -5715,10 +5715,10 @@ fn outcome_indicator(
     }
 }
 
-fn agent_indicator<'a>(
+fn agent_indicator<Message: Clone + 'static>(
     activity: Option<crate::agent::ActivityState>,
     unread: bool,
-) -> Option<Element<'static, SidebarAction>> {
+) -> Option<Element<'static, Message>> {
     if activity == Some(crate::agent::ActivityState::Waiting) {
         return Some(status_icon(
             Icon::Warning,
