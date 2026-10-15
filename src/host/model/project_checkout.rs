@@ -83,6 +83,8 @@ mod tests {
         let linked = directory.path().join("linked checkout");
         let git = |cwd: &std::path::Path, args: &[&std::ffi::OsStr]| {
             let output = std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(cwd)
                 .args(args)
                 .output()
