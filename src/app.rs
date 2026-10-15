@@ -21298,7 +21298,13 @@ mod tests {
     #[test]
     fn modal_rejects_editor_input_but_accepts_async_repository_completions() {
         let card = CardId::new();
-        assert!(repository_action_allowed_while_modal(&RepositoryAction::FindReplacementLoaded { card, ticket: card.as_uuid(), result: Ok(None) }));
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket: card.as_uuid(),
+                result: Ok(None)
+            }
+        ));
         assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,

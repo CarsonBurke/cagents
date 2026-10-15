@@ -1884,7 +1884,9 @@ pub struct PreparedFindReplacement(Arc<String>);
 
 impl std::fmt::Debug for PreparedFindReplacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedFindReplacement").field("bytes", &self.0.len()).finish()
+        f.debug_struct("PreparedFindReplacement")
+            .field("bytes", &self.0.len())
+            .finish()
     }
 }
 
@@ -1897,7 +1899,9 @@ struct FindReplacementJob {
 }
 
 impl Drop for FindReplacementJob {
-    fn drop(&mut self) { self.cancellation.cancel(); }
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 pub struct RepositoryRuntime {
@@ -3341,7 +3345,9 @@ impl RepositoryRuntime {
         if let Some(active) = &self.find_active {
             active.cancellation.cancel();
         }
-        if let Some(active) = &self.find_replacement { active.cancellation.cancel(); }
+        if let Some(active) = &self.find_replacement {
+            active.cancellation.cancel();
+        }
         self.set_search_mode(false);
     }
 
@@ -3417,7 +3423,9 @@ impl RepositoryRuntime {
             return;
         }
         if wanted.query.is_empty()
-            || (!wanted.options.regex && document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
+            || (!wanted.options.regex
+                && document.content.line_count() <= 2048
+                && document.content.text_len() <= 64 * 1024)
         {
             match document
                 .content
@@ -3527,15 +3535,28 @@ impl RepositoryRuntime {
         }
     }
 
-    fn replace_find_matches(&mut self, card: CardId, all: bool, prepared: Option<PreparedFindReplacement>) -> Task<RepositoryAction> {
-        if !self.editable_surface_visible() || self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
+    fn replace_find_matches(
+        &mut self,
+        card: CardId,
+        all: bool,
+        prepared: Option<PreparedFindReplacement>,
+    ) -> Task<RepositoryAction> {
+        if !self.editable_surface_visible()
+            || self.is_saving()
+            || self.find_cache.as_ref() != self.wanted_find().as_ref()
+        {
             return Task::none();
         }
         if prepared.is_none() {
-            if self.find_replacement.is_some() { return Task::none(); }
-            if all && self.find_matches.len() > 256
+            if self.find_replacement.is_some() {
+                return Task::none();
+            }
+            if all
+                && self.find_matches.len() > 256
                 && matches!(&self.document, DocumentState::Editable(document) if document.content.text_len() > 64 * 1024)
-            { return self.prepare_find_replacement(card); }
+            {
+                return self.prepare_find_replacement(card);
+            }
         }
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
@@ -3544,8 +3565,7 @@ impl RepositoryRuntime {
             return Task::none();
         }
         let mut protocols = Vec::new();
-        if all && self.find_matches.len() <= 256 && document.content.text_len() > 64 * 1024
-        {
+        if all && self.find_matches.len() <= 256 && document.content.text_len() > 64 * 1024 {
             // Keep sparse fixes in a large file undoable without
             // retaining unchanged megabytes as a whole-file paste.
             // Dense replacement retains the single-splice path below.
@@ -3572,9 +3592,7 @@ impl RepositoryRuntime {
                     .replace_range_recorded(start, end, &inserted)
                 {
                     protocols.push(
-                        if trailing_cr
-                            || trailing_carriage_return(&document.content).is_some()
-                        {
+                        if trailing_cr || trailing_carriage_return(&document.content).is_some() {
                             None
                         } else {
                             protocol_edit(&document.content, &change)
@@ -3598,17 +3616,23 @@ impl RepositoryRuntime {
                 prepared.0
             } else {
                 match snapshot.replace_matches_with(
-                    &self.find_matches, &self.find_query, &self.replace_query,
-                    self.find_options, self.replace_preserve_case,
+                    &self.find_matches,
+                    &self.find_query,
+                    &self.replace_query,
+                    self.find_options,
+                    self.replace_preserve_case,
                 ) {
                     Ok(text) => Arc::new(text),
-                    Err(error) => { self.find_error = Some(error); return Task::none(); }
+                    Err(error) => {
+                        self.find_error = Some(error);
+                        return Task::none();
+                    }
                 }
             };
             document.content.perform(text_editor::Action::SelectAll);
-            if let Applied::Changed(protocol) = document.apply(text_editor::Action::Edit(
-                text_editor::Edit::Paste(text),
-            )) {
+            if let Applied::Changed(protocol) =
+                document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(text)))
+            {
                 protocols.push(protocol);
             }
         } else {
@@ -3630,8 +3654,7 @@ impl RepositoryRuntime {
             let replacement = match replacement {
                 Some(Ok(replacement)) => replacement,
                 _ => {
-                    self.find_error =
-                        Some("The selected match changed; search again.".into());
+                    self.find_error = Some("The selected match changed; search again.".into());
                     return Task::none();
                 }
             };
@@ -3669,8 +3692,12 @@ impl RepositoryRuntime {
     }
 
     fn prepare_find_replacement(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let Some(key) = self.wanted_find() else { return Task::none(); };
-        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
+        let Some(key) = self.wanted_find() else {
+            return Task::none();
+        };
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
         let snapshot = document.content.search_snapshot();
         let matches = self.find_matches.clone();
         let replacement = self.replace_query.clone();
@@ -3678,8 +3705,11 @@ impl RepositoryRuntime {
         let ticket = uuid::Uuid::new_v4();
         let cancellation = CancellationToken::new();
         self.find_replacement = Some(FindReplacementJob {
-            key: key.clone(), replacement: replacement.clone(), preserve_case,
-            ticket, cancellation: cancellation.clone(),
+            key: key.clone(),
+            replacement: replacement.clone(),
+            preserve_case,
+            ticket,
+            cancellation: cancellation.clone(),
         });
         #[cfg(test)]
         let pause = self.find_replacement_pause.take();
@@ -3688,28 +3718,58 @@ impl RepositoryRuntime {
                 #[cfg(test)]
                 if let Some((entered, release)) = pause {
                     let _ = entered.send(());
-                    release.recv_timeout(std::time::Duration::from_secs(5))
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
                         .map_err(|_| "Replacement fixture pause expired.".to_string())?;
                 }
                 let result = snapshot.replace_matches_with_cancellation(
-                    &matches, &key.query, &replacement, key.options, preserve_case,
+                    &matches,
+                    &key.query,
+                    &replacement,
+                    key.options,
+                    preserve_case,
                     || cancellation.is_cancelled(),
                 );
-                if cancellation.is_cancelled() { return Ok(None); }
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
                 result.map(|text| Some(PreparedFindReplacement(Arc::new(text))))
-            }).await.map_err(|error| format!("Replacement worker failed: {error}")).and_then(std::convert::identity);
-            RepositoryAction::FindReplacementLoaded { card, ticket, result }
+            })
+            .await
+            .map_err(|error| format!("Replacement worker failed: {error}"))
+            .and_then(std::convert::identity);
+            RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket,
+                result,
+            }
         })
     }
 
-    fn finish_find_replacement(&mut self, card: CardId, ticket: uuid::Uuid, result: Result<Option<PreparedFindReplacement>, String>) -> Task<RepositoryAction> {
-        if self.find_replacement.as_ref().is_none_or(|active| active.ticket != ticket) { return Task::none(); }
+    fn finish_find_replacement(
+        &mut self,
+        card: CardId,
+        ticket: uuid::Uuid,
+        result: Result<Option<PreparedFindReplacement>, String>,
+    ) -> Task<RepositoryAction> {
+        if self
+            .find_replacement
+            .as_ref()
+            .is_none_or(|active| active.ticket != ticket)
+        {
+            return Task::none();
+        }
         let active = self.find_replacement.take().unwrap();
-        if !self.replacement_is_current(&active) { return Task::none(); }
+        if !self.replacement_is_current(&active) {
+            return Task::none();
+        }
         match result {
             Ok(Some(prepared)) => self.replace_find_matches(card, true, Some(prepared)),
             Ok(None) => Task::none(),
-            Err(error) => { self.find_error = Some(error); Task::none() }
+            Err(error) => {
+                self.find_error = Some(error);
+                Task::none()
+            }
         }
     }
 
@@ -5028,7 +5088,9 @@ impl RepositoryRuntime {
         let task = self.update_inner(action);
         if let Some(active) = &self.find_replacement
             && !self.replacement_is_current(active)
-        { active.cancellation.cancel(); }
+        {
+            active.cancellation.cancel();
+        }
         Task::batch([task, self.find_task(card)])
     }
 
@@ -6213,8 +6275,14 @@ impl RepositoryRuntime {
                 self.replace_open = !self.replace_open;
                 Task::none()
             }
-            RepositoryAction::ReplaceMatch { card, all } => self.replace_find_matches(card, all, None),
-            RepositoryAction::FindReplacementLoaded { card, ticket, result } => self.finish_find_replacement(card, ticket, result),
+            RepositoryAction::ReplaceMatch { card, all } => {
+                self.replace_find_matches(card, all, None)
+            }
+            RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket,
+                result,
+            } => self.finish_find_replacement(card, ticket, result),
             RepositoryAction::ToggleToolbarOverflow { .. } => {
                 self.toolbar_overflow_open = !self.toolbar_overflow_open;
                 Task::none()
@@ -8335,7 +8403,11 @@ fn find_strip<'a>(
         );
     }
     if runtime.find_replacement.is_some() {
-        strips.push(widget::text::body("Preparing replacements… You can keep editing to cancel.").size(12).into());
+        strips.push(
+            widget::text::body("Preparing replacements… You can keep editing to cancel.")
+                .size(12)
+                .into(),
+        );
     }
     if runtime.replace_open {
         strips.push(
@@ -18230,16 +18302,45 @@ mod tests {
     fn benchmark_dense_eight_mib_replace_worker_and_native_publication() {
         const BYTES: usize = 8 * 1024 * 1024;
         for irregular in [false, true] {
-            let original = if irregular { format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3)) } else { "a".repeat(BYTES) };
+            let original = if irregular {
+                format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3))
+            } else {
+                "a".repeat(BYTES)
+            };
             assert_eq!(original.len(), BYTES);
-            let count = if irregular { 2 * (BYTES / 3) + BYTES % 3 } else { BYTES };
+            let count = if irregular {
+                2 * (BYTES / 3) + BYTES % 3
+            } else {
+                BYTES
+            };
             let card = CardId::new();
             let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "dense.txt", &original);
             update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-            if irregular { update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }); }
-            update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged { card, query: if irregular { "." } else { "a" }.into() });
+            if irregular {
+                update_find_settled(
+                    &mut runtime,
+                    RepositoryAction::FindOptionsChanged {
+                        card,
+                        option: crate::ui_controls::FindOption::Regex,
+                        enabled: true,
+                    },
+                );
+            }
+            update_find_settled(
+                &mut runtime,
+                RepositoryAction::FindQueryChanged {
+                    card,
+                    query: if irregular { "." } else { "a" }.into(),
+                },
+            );
             assert_eq!(runtime.find_total, count);
-            update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged { card, query: "b".into() });
+            update_find_settled(
+                &mut runtime,
+                RepositoryAction::ReplaceQueryChanged {
+                    card,
+                    query: "b".into(),
+                },
+            );
             text_editor::take_text_call_count();
             let started = Instant::now();
             let planning = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
@@ -18268,7 +18369,10 @@ mod tests {
             let redo_update = started.elapsed();
             assert_eq!(buffer_text(&runtime), output);
             settle_find_tasks(&mut runtime, refresh);
-            eprintln!("find8MiB_worker irregular={irregular} input_bytes={BYTES} matches={count} output_bytes={} admission={admission:?} worker_wait={worker_wait:?} native_publication_update={publication:?} undo_update={undo_update:?} redo_update={redo_update:?}; headless native content/update only, no glyph layout/render or application RSS", output.len());
+            eprintln!(
+                "find8MiB_worker irregular={irregular} input_bytes={BYTES} matches={count} output_bytes={} admission={admission:?} worker_wait={worker_wait:?} native_publication_update={publication:?} undo_update={undo_update:?} redo_update={redo_update:?}; headless native content/update only, no glyph layout/render or application RSS",
+                output.len()
+            );
         }
     }
 
@@ -18286,12 +18390,18 @@ mod tests {
         });
         update_find_settled(&mut runtime, find_output(scan));
         assert_eq!(runtime.find_total, 100_000);
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged {
-            card,
-            query: "replacement".into(),
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "replacement".into(),
+            },
+        );
         let started = std::time::Instant::now();
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceMatch { card, all: true });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
         let replace_elapsed = started.elapsed();
         assert_eq!(buffer_text(&runtime), replaced);
         update_find_settled(&mut runtime, RepositoryAction::CloseFind { card });
@@ -18366,41 +18476,62 @@ mod tests {
             });
         }
         update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged {
-            card,
-            query: "alpha".into(),
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "alpha".into(),
+            },
+        );
         assert_eq!(runtime.find_total, 4);
-        update_find_settled(&mut runtime, RepositoryAction::FindSelectionChanged {
-            card,
-            enabled: true,
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindSelectionChanged {
+                card,
+                enabled: true,
+            },
+        );
         assert_eq!(runtime.find_total, 2);
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged {
-            card,
-            option: crate::ui_controls::FindOption::CaseSensitive,
-            enabled: true,
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::CaseSensitive,
+                enabled: true,
+            },
+        );
         assert_eq!(runtime.find_total, 1);
-        update_find_settled(&mut runtime, RepositoryAction::FindSelectionChanged {
-            card,
-            enabled: false,
-        });
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged {
-            card,
-            option: crate::ui_controls::FindOption::WholeWord,
-            enabled: true,
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindSelectionChanged {
+                card,
+                enabled: false,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::WholeWord,
+                enabled: true,
+            },
+        );
         assert_eq!(runtime.find_total, 2);
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged {
-            card,
-            option: crate::ui_controls::FindOption::Regex,
-            enabled: true,
-        });
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged {
-            card,
-            query: "[".into(),
-        });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "[".into(),
+            },
+        );
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_error.is_some());
     }
@@ -18529,20 +18660,32 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "call1 call2");
         update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged {
-            card,
-            option: crate::ui_controls::FindOption::Regex,
-            enabled: true,
-        });
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged {
-            card,
-            query: r"call(\d)".into(),
-        });
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged {
-            card,
-            query: "item$1".into(),
-        });
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceMatch { card, all: true });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: r"call(\d)".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "item$1".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
         assert_eq!(buffer_text(&runtime), "item1 item2");
         update_find_settled(&mut runtime, RepositoryAction::Undo { card });
         assert_eq!(buffer_text(&runtime), "call1 call2");
@@ -18551,19 +18694,31 @@ mod tests {
         let (mut runtime, _) =
             RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
         update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged {
-            card,
-            query: "word".into(),
-        });
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged {
-            card,
-            query: "value".into(),
-        });
-        update_find_settled(&mut runtime, RepositoryAction::PreserveCaseChanged {
-            card,
-            enabled: true,
-        });
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceMatch { card, all: true });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "word".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "value".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::PreserveCaseChanged {
+                card,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
         assert_eq!(buffer_text(&runtime), "value Value VALUE value");
         update_find_settled(&mut runtime, RepositoryAction::Undo { card });
         assert_eq!(buffer_text(&runtime), "word Word WORD wOrd");
@@ -18673,11 +18828,28 @@ mod tests {
         let original = "λa𝄞\r\n".repeat(10_000);
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "unicode.txt", &original);
         update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged {
-            card, option: crate::ui_controls::FindOption::Regex, enabled: true,
-        });
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged { card, query: "λ(a)𝄞".into() });
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged { card, query: "$1β".into() });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "λ(a)𝄞".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "$1β".into(),
+            },
+        );
         assert_eq!(runtime.find_total, 10_000);
         (card, runtime, original)
     }
@@ -18685,33 +18857,63 @@ mod tests {
     #[test]
     fn large_replace_planning_keeps_edits_live_and_rejects_obsolete_output() {
         let (card, mut runtime, original) = large_unicode_replacement_fixture();
-        use cosmic::iced::futures::{StreamExt, FutureExt};
+        use cosmic::iced::futures::{FutureExt, StreamExt};
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         runtime.find_replacement_pause = Some((entered_tx, release_rx));
         text_editor::take_text_call_count();
         let held = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
         assert!(runtime.find_replacement.is_some());
-        assert_eq!(text_editor::take_text_call_count(), 0, "admission must capture immutable lines without serializing on UI");
+        assert_eq!(
+            text_editor::take_text_call_count(),
+            0,
+            "admission must capture immutable lines without serializing on UI"
+        );
         assert_eq!(buffer_text(&runtime), original);
-        let executor = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let mut stream = iced::runtime::task::into_stream(held).unwrap();
         let admitted = Instant::now();
         executor.block_on(std::future::poll_fn(|cx| {
             assert!(stream.next().poll_unpin(cx).is_pending());
-            if entered_rx.try_recv().is_ok() { return std::task::Poll::Ready(()); }
+            if entered_rx.try_recv().is_ok() {
+                return std::task::Poll::Ready(());
+            }
             assert!(admitted.elapsed() < std::time::Duration::from_secs(5));
             cx.waker().wake_by_ref();
             std::task::Poll::Pending
         }));
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line: 0, column: 0 }, selection: None });
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            });
         }
-        let edited = runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('z')) });
-        assert!(runtime.find_replacement.as_ref().unwrap().cancellation.is_cancelled());
+        let edited = runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        });
+        assert!(
+            runtime
+                .find_replacement
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .is_cancelled()
+        );
         release_tx.send(()).unwrap();
-        let iced::runtime::Action::Output(callback) = executor.block_on(stream.next()).unwrap() else { panic!("replacement completion"); };
-        assert!(matches!(&callback, RepositoryAction::FindReplacementLoaded { result: Ok(None), .. }));
+        let iced::runtime::Action::Output(callback) = executor.block_on(stream.next()).unwrap()
+        else {
+            panic!("replacement completion");
+        };
+        assert!(matches!(
+            &callback,
+            RepositoryAction::FindReplacementLoaded {
+                result: Ok(None),
+                ..
+            }
+        ));
         drop(runtime.update(callback));
         settle_find_tasks(&mut runtime, edited);
         assert_eq!(buffer_text(&runtime), format!("z{original}"));
@@ -18725,10 +18927,24 @@ mod tests {
         let (card, mut runtime, original) = large_unicode_replacement_fixture();
         let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
         let obsolete = find_output(task);
-        assert_eq!(buffer_text(&runtime), original, "worker completion alone cannot mutate native state");
-        update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged { card, query: "$1γ".into() });
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "worker completion alone cannot mutate native state"
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "$1γ".into(),
+            },
+        );
         drop(runtime.update(obsolete));
-        assert_eq!(buffer_text(&runtime), original, "already-completed output retains its original replacement intent");
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "already-completed output retains its original replacement intent"
+        );
         let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
         assert_eq!(buffer_text(&runtime), original);
         settle_find_tasks(&mut runtime, task);
@@ -18760,14 +18976,30 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "regex.txt", "AAAA");
         update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
-        update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true });
-        let task = runtime.update(RepositoryAction::FindQueryChanged { card, query: "A.*|A".into() });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        let task = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "A.*|A".into(),
+        });
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_active.is_some());
         settle_find_tasks(&mut runtime, task);
         assert_eq!(runtime.find_total, 1);
         assert_eq!(runtime.find_matches.get(0).unwrap().1.column, 4);
-        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged { card, query: ".*[^A-Z]|[A-Z]".into() });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: ".*[^A-Z]|[A-Z]".into(),
+            },
+        );
         assert_eq!(runtime.find_total, 4);
     }
 
@@ -18791,18 +19023,27 @@ mod tests {
 
     fn settle_find_tasks(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
-            let mut pending = vec![task];
-            while let Some(task) = pending.pop() {
-                let Some(mut stream) = iced::runtime::task::into_stream(task) else { continue; };
-                while let Some(action) = stream.next().await {
-                    if let iced::runtime::Action::Output(action) = action {
-                        assert!(matches!(&action, RepositoryAction::FindLoaded { .. } | RepositoryAction::FindReplacementLoaded { .. }));
-                        pending.push(runtime.update(action));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut pending = vec![task];
+                while let Some(task) = pending.pop() {
+                    let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                        continue;
+                    };
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(action) = action {
+                            assert!(matches!(
+                                &action,
+                                RepositoryAction::FindLoaded { .. }
+                                    | RepositoryAction::FindReplacementLoaded { .. }
+                            ));
+                            pending.push(runtime.update(action));
+                        }
                     }
                 }
-            }
-        });
+            });
     }
 
     fn update_find_settled(runtime: &mut RepositoryRuntime, action: RepositoryAction) {
