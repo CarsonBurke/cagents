@@ -674,13 +674,19 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    pub(super) fn locally_closed_card(&self, id: CardId) -> bool {
-        self.card_state(id)
+    fn local_closure_observation(&self, id: CardId) -> Option<bool> {
+        if self
+            .card_state(id)
             .is_some_and(|card| matches!(card.existence, Existence::Closed { .. }))
-            || self
-                .session
-                .as_ref()
-                .is_some_and(|runtime| runtime.card_was_closed(id))
+        {
+            return Some(true);
+        }
+        self.session
+            .as_ref()
+            .map_or(Some(false), |runtime| runtime.card_closure_observation(id))
+    }
+    pub(super) fn locally_closed_card(&self, id: CardId) -> bool {
+        self.local_closure_observation(id).unwrap_or(true)
     }
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
@@ -689,9 +695,16 @@ impl Cagents {
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.
         let mut adoptions = Vec::new();
+        let mut local_scopes = HashMap::<CardId, Vec<Scope>>::new();
+        for scope in self.local_view_scopes() {
+            for id in self.local_view_cards(&scope) {
+                local_scopes.entry(id).or_default().push(scope.clone());
+            }
+        }
         for view in views {
             for shared in &view.panes {
-                if self.locally_closed_card(shared.id) {
+                let closure = self.local_closure_observation(shared.id);
+                if closure == Some(true) {
                     continue;
                 }
                 let aliases = self
@@ -706,6 +719,18 @@ impl Cagents {
                     })
                     .map(|card| card.id)
                     .collect::<Vec<_>>();
+                if closure.is_none() {
+                    // Pending is neither a local close nor a remote removal.
+                    // Preserve both destination and actual source alias views
+                    // until the ordered worker answers this current identity.
+                    self.shared_views.blocked.insert(view.scope.clone());
+                    for alias in &aliases {
+                        if let Some(scopes) = local_scopes.get(alias) {
+                            self.shared_views.blocked.extend(scopes.iter().cloned());
+                        }
+                    }
+                    continue;
+                }
                 for alias in aliases {
                     let ready = self.shared_views.initialized.contains(&view.scope)
                         && !self.shared_views.seeding.contains(&view.scope)
@@ -722,11 +747,10 @@ impl Cagents {
                                 .any(|project| &project.repository == repository),
                         };
                     if !ready {
-                        for scope in self.local_view_scopes() {
-                            if scope != view.scope && self.local_view_cards(&scope).contains(&alias)
-                            {
-                                self.shared_views.blocked.insert(scope);
-                            }
+                        if let Some(scopes) = local_scopes.get(&alias) {
+                            self.shared_views.blocked.extend(
+                                scopes.iter().filter(|scope| **scope != view.scope).cloned(),
+                            );
                         }
                         continue;
                     }
@@ -738,10 +762,8 @@ impl Cagents {
                     };
                     if !can_adopt {
                         self.shared_views.blocked.insert(view.scope.clone());
-                        for scope in self.local_view_scopes() {
-                            if self.local_view_cards(&scope).contains(&alias) {
-                                self.shared_views.blocked.insert(scope);
-                            }
+                        if let Some(scopes) = local_scopes.get(&alias) {
+                            self.shared_views.blocked.extend(scopes.iter().cloned());
                         }
                         self.status = Some(TransientNotice::warning(
                             "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
@@ -830,23 +852,29 @@ impl Cagents {
         owned: &HashSet<CardId>,
         current: Vec<CardId>,
     ) -> Task<Message> {
-        // A stale shared read cannot undo this window's explicit closure,
-        // including after its heavy descriptor has retired or the UI restarted.
-        let filtered = view
-            .panes
-            .iter()
-            .any(|pane| self.locally_closed_card(pane.id))
-            .then(|| View {
-                scope: view.scope.clone(),
-                revision: view.revision,
-                panes: view
-                    .panes
-                    .iter()
-                    .filter(|pane| !self.locally_closed_card(pane.id))
-                    .cloned()
-                    .collect(),
-                retired: view.retired.clone(),
-            });
+        // A pending requested answer cannot prove removal. Capture only
+        // proven closure decisions before any strip/runtime/alias effects.
+        let mut closed = HashSet::new();
+        for pane in &view.panes {
+            match self.local_closure_observation(pane.id) {
+                None => return Task::none(),
+                Some(true) => {
+                    closed.insert(pane.id);
+                }
+                Some(false) => {}
+            }
+        }
+        let filtered = (!closed.is_empty()).then(|| View {
+            scope: view.scope.clone(),
+            revision: view.revision,
+            panes: view
+                .panes
+                .iter()
+                .filter(|pane| !closed.contains(&pane.id))
+                .cloned()
+                .collect(),
+            retired: view.retired.clone(),
+        });
         let view = filtered.as_ref().unwrap_or(view);
         let index = match &view.scope {
             Scope::Channel(id) => {
@@ -1646,14 +1674,27 @@ mod tests {
 
     #[test]
     fn shared_terminal_reconcile_does_not_block_native_input_on_autosave_contention() {
-        fn run(closed_owner: bool) -> Duration {
+        fn run(closed_owner: bool, pending_alias: bool) -> Duration {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("state.sqlite3");
             let mut app = super::super::tests::context_inspector_test_app(true);
             let mut card = app.durable.cards[0].clone();
             let source_id = card.id;
-            if closed_owner {
+            if closed_owner || pending_alias {
                 card.id = CardId::new();
+            }
+            if pending_alias {
+                let mut unrelated = card.clone();
+                unrelated.id = CardId::new();
+                unrelated.kind = CardKind::Settings;
+                unrelated.existence = Existence::Closed {
+                    tombstone: crate::model::Tombstone {
+                        operation_id: None,
+                        closed_at_unix_ms: 1,
+                        reason: Some("unrelated historical close".into()),
+                    },
+                };
+                Arc::make_mut(&mut app.durable).cards.push(unrelated);
             }
             assert!(matches!(card.kind, CardKind::Terminal(_)));
             let channel = ChannelId::new();
@@ -1746,8 +1787,32 @@ mod tests {
             }
             begin_delay.send(()).unwrap();
             // This is the actual synchronous native model-update callback.
+            let focused = app.workspace.focused();
             let started = Instant::now();
             drop(app.reconcile_shared_views());
+            if pending_alias {
+                assert!(
+                    app.card_state(source_id).unwrap().existence.is_open(),
+                    "pending canonical proof must not tombstone its open alias"
+                );
+                assert!(
+                    matches!(app.cards.get(&source_id), Some(CardRuntime::Loading)),
+                    "retain the original runtime while authority is pending"
+                );
+                assert_eq!(app.workspace.focused(), focused);
+                assert!(app.card_state(card.id).is_none());
+                assert!(app.shared_views.blocked.contains(&Scope::Channel(channel)));
+                // The final projection guard must also be safe when reached
+                // directly, independently of alias preparation.
+                let current = app.workspace_model.views[0].clone();
+                drop(app.project_shared_view(&current, &HashSet::from([card.id])));
+                assert!(app.card_state(source_id).unwrap().existence.is_open());
+                assert!(matches!(
+                    app.cards.get(&source_id),
+                    Some(CardRuntime::Loading)
+                ));
+                assert_eq!(app.workspace.focused(), focused);
+            }
             let elapsed = started.elapsed();
             blocker.join().unwrap();
             app.session
@@ -1758,7 +1823,7 @@ mod tests {
             eprintln!(
                 "shared terminal reconciliation closed_owner={closed_owner} blocked native input for {elapsed:?}"
             );
-            if closed_owner {
+            if closed_owner || pending_alias {
                 // A cache miss is pending rather than a synchronous database
                 // probe. Retry the same current shared model after the real
                 // worker has published its requested-identity answer.
@@ -1785,11 +1850,14 @@ mod tests {
             }
             elapsed
         }
-        let normal = run(false);
-        let restoration = run(true);
+        let normal = run(false, false);
+        let restoration = run(true, false);
+        let alias = run(false, true);
         assert!(
-            normal < Duration::from_millis(100) && restoration < Duration::from_millis(100),
-            "native model callbacks waited on contended autosave: normal={normal:?}, closed-owner restoration={restoration:?}"
+            normal < Duration::from_millis(100)
+                && restoration < Duration::from_millis(100)
+                && alias < Duration::from_millis(100),
+            "native model callbacks waited on contended autosave: normal={normal:?}, closed-owner restoration={restoration:?}, pending-alias={alias:?}"
         );
     }
 

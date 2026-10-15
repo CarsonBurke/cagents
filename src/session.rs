@@ -943,8 +943,10 @@ impl SessionRuntime {
         answer
     }
     pub fn card_was_closed(&self, id: CardId) -> bool {
+        self.card_closure_observation(id).unwrap_or(true)
+    }
+    pub(crate) fn card_closure_observation(&self, id: CardId) -> Option<bool> {
         self.closure_observation(ClosureQuery::Card(id))
-            .unwrap_or(true)
     }
     pub fn terminal_was_closed(&self, session: &TerminalSession) -> bool {
         self.terminal_closure_observation(session).unwrap_or(true)
