@@ -2333,14 +2333,14 @@ impl Actor {
                     let content = matches!(&event, Event::TurnFinished { .. })
                         .then(|| frame_contents.pop_front())
                         .flatten();
-                    self.apply_with_attention(event, content);
+                    self.apply_with_attention(event, content, true);
                 }
             } else if let Some(event) = authority {
                 if suppress_current_notification { continue; }
                 let content = matches!(&event, Event::TurnFinished { .. })
                     .then(|| frame_contents.pop_front())
                     .flatten();
-                self.apply_with_attention(event, content);
+                self.apply_with_attention(event, content, true);
             }
             if self.retained > STATE_LIMIT {
                 frame_error.get_or_insert_with(|| {
@@ -2400,12 +2400,13 @@ impl Actor {
         });
     }
     fn apply(&mut self, event: Event) {
-        self.apply_with_attention(event, None);
+        self.apply_with_attention(event, None, false);
     }
     fn apply_with_attention(
         &mut self,
         event: Event,
         content: Option<crate::notifications::Content>,
+        preview_observed: bool,
     ) {
         if matches!(
             event,
@@ -2428,7 +2429,7 @@ impl Actor {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
-        apply_event(&mut state, &mut self.indices, event);
+        apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -2615,8 +2616,17 @@ fn recover_history_error(
     }
 }
 
+#[cfg(test)]
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
-    Arc::make_mut(&mut state.notification_preview).observe(&event);
+    apply_projected_event(state, indices, event, false);
+}
+
+fn apply_projected_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event, preview_observed: bool) {
+    // Frame events have already reached the resident preview before Store.
+    // Do not consume a restored start boundary or append a delta twice.
+    if !preview_observed {
+        Arc::make_mut(&mut state.notification_preview).observe(&event);
+    }
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
