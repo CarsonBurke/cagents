@@ -130,7 +130,7 @@ fn cells(output: &str) -> Vec<Vec<&str>> { output.lines().map(|line| line.split(
 fn every_cli_list_has_a_populated_and_empty_human_snapshot() {
     let populated = Fixture::new(true); let empty = Fixture::new(false);
     for (args, empty_line, expected) in [
-        (vec!["agent", "list"], "No open agents", vec![vec!["ID", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"], vec!["11111111", "claude", "failed (exit 3)", "22222222", "/work/repo", "reviewer"]]),
+        (vec!["agent", "list"], "No open agents", vec![vec!["ID", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"], vec!["11111111", "claude", "Failed (exit 3)", "22222222", "/work/repo", "reviewer"]]),
         (vec!["automation", "list"], "No automations", vec![vec!["ID", "STATE", "NAME", "PROVIDER", "NEXT"], vec![ID, "enabled", "Nightly", "claude", "unscheduled"]]),
         (vec!["channel", "list"], "No channels", vec![vec!["ID", "PROJECT", "TITLE"], vec![ID, "/work/repo", "Fixture channel"]]),
         (vec!["terminal", "list", "--all"], "No terminals", vec![vec!["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], vec![ID, "running", "Fixture shell", "bash", "/work/repo"]]),

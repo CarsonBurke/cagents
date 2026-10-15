@@ -1302,6 +1302,7 @@ fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> Strin
 /// and the end of its result.
 fn state_reason(state: crate::agent_execution::State, reason: Option<&str>) -> String {
     let label = format::label(state);
+    let label = label.chars().next().map_or_else(String::new,|first|format!("{}{}",first.to_uppercase(),&label[first.len_utf8()..]));
     if matches!(state, crate::agent_execution::State::Failed | crate::agent_execution::State::Interrupted) {
         if let Some(reason) = reason {
             let reason: String = reason.chars().take(100).map(|c| if c.is_control() { ' ' } else { c }).collect();
