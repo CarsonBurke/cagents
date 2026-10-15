@@ -3576,6 +3576,7 @@ struct PendingOpen {
     language: LspLanguage,
     version: i32,
     text: String,
+    saved_text: Option<String>,
     ticket: u64,
 }
 
@@ -3757,6 +3758,7 @@ impl LspManager {
             language,
             version,
             text: text.to_owned(),
+            saved_text: None,
             ticket,
         };
         let worker_path = pending.path.clone();
@@ -3804,6 +3806,9 @@ impl LspManager {
             &pending.text,
             root,
         );
+        if let Some(saved_text) = pending.saved_text {
+            self.save(doc, &saved_text);
+        }
         Some(status)
     }
 
@@ -3979,6 +3984,10 @@ impl LspManager {
 
     /// Reports that the document was written to disk.
     pub fn save(&mut self, doc: LspDocumentId, text: &str) {
+        if let Some(pending) = self.pending_opens.get_mut(&doc) {
+            pending.saved_text = Some(text.to_owned());
+            return;
+        }
         let Some(reference) = self.documents.get(&doc) else {
             return;
         };
@@ -4403,7 +4412,7 @@ impl LspManager {
         &mut self,
         key: &SessionKey,
         server: &LanguageServerSettings,
-        root: &Path,
+        _root: &Path,
         worktree: &Path,
     ) -> Result<SessionHandle, String> {
         if self.stopping {
@@ -4487,7 +4496,7 @@ impl LspManager {
             key: key.clone(),
             launch: LaunchSpec {
                 command: server.command.clone(),
-                root: root.to_path_buf(),
+                root: key.root.to_path_buf(),
             },
             transport: Arc::clone(&self.transport),
             snapshots: Arc::clone(&self.snapshots),
@@ -4514,7 +4523,7 @@ impl LspManager {
             }
         }));
         let watched = handle.clone();
-        let watched_root = root.to_path_buf();
+        let watched_root = key.root.to_path_buf();
         let events = self.events.clone();
         let epoch = self.epoch;
         let idle_timeout = self.idle_timeout;
@@ -5468,6 +5477,100 @@ mod tests {
             );
             assert!(!outer.retired.load(Ordering::Acquire));
             assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn closed_ancestor_session_launches_its_canonical_key_root() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let nested = worktree.join("package");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("Cargo.toml"), "[package]\n").unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let factory = Arc::clone(&manager.transport);
+            let roots = Arc::new(Mutex::new(Vec::new()));
+            let launches = Arc::clone(&roots);
+            manager.set_transport(Arc::new(move |spec| {
+                launches.lock().unwrap().push(spec.root.clone());
+                factory(spec)
+            }));
+            let events = manager.events();
+            manager.open_for_test(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "first",
+            );
+            await_ready(&events, LspDocumentId(1)).await;
+            let previous = manager.sessions.values().next().unwrap().clone();
+            let task = previous.task.lock().unwrap().take().unwrap();
+            task.abort();
+            let _ = task.await;
+            assert!(previous.commands.is_closed());
+            assert!(!previous.retired.load(Ordering::Acquire));
+            manager.open_for_test(
+                LspDocumentId(2),
+                &nested.join("lib.rs"),
+                &worktree,
+                rust_language(),
+                1,
+                "nested",
+            );
+            await_ready(&events, LspDocumentId(2)).await;
+            assert_eq!(
+                *roots.lock().unwrap(),
+                vec![worktree.clone(), worktree.clone()]
+            );
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn save_during_root_discovery_is_replayed_after_open_without_losing_newer_edits() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "original");
+            manager.save(doc, "saved while discovering");
+            manager.change(doc, 2, &[], "newer unsaved edit");
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            manager.finish_discovery(doc, ticket, root);
+            await_ready(&events, doc).await;
+            let fake = handle_of(&slot).await;
+            let saved = fake.wait_for("textDocument/didSave").await;
+            assert_eq!(saved.params["text"], "saved while discovering");
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["text"],
+                "newer unsaved edit"
+            );
+            let methods = fake.methods();
+            assert!(
+                methods
+                    .iter()
+                    .position(|method| method == "textDocument/didOpen")
+                    < methods
+                        .iter()
+                        .position(|method| method == "textDocument/didSave")
+            );
             manager.shutdown();
             manager.wait_for_shutdown().await;
         });
