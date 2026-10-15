@@ -12863,7 +12863,10 @@ pub(crate) mod tests {
         let channel = ChannelId::new();
         let original: Arc<[SelectionRow]> = Arc::from([SelectionRow::Channel(channel), SelectionRow::Channel(ChannelId::new())]);
         let replacement: Arc<[SelectionRow]> = Arc::from([SelectionRow::Channel(channel), SelectionRow::Channel(ChannelId::new())]);
-        let make = |selection| channel_context_controls(cosmic::iced::widget::Space::new().width(240).height(32).into(), channel, false, Some(selection), default_menu_shortcuts());
+        let make = |selection| {
+            let content: Element<'static, SidebarAction> = cosmic::iced::widget::Space::new().width(240).height(32).into();
+            channel_context_controls(content, channel, false, Some(selection), default_menu_shortcuts())
+        };
         let mut element = make(Arc::clone(&original));
         let mut tree = Tree::new(&element);
         element.as_widget_mut().diff(&mut tree);
