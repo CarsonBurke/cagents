@@ -1383,6 +1383,7 @@ fn start_with_execution(
         // A helper commit is fallible RPC and must run outside HostState.
         // Keep its exact context in native_actor_startups on any uncertainty.
         handle.commit_native_installation().map_err(unavailable)?;
+        if remote { session.native_continuity = handle.native_continuity(); }
         let execution_instance = handle.actor_identity().map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
