@@ -156,6 +156,24 @@ pub fn reorder_navigation(
     true
 }
 
+/// Current logical ownership and the verified operational spelling of one
+/// accepted agent's directory. Its immutable launch spec remains provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLocation {
+    pub agent: crate::model::AgentId,
+    pub repository: PathBuf,
+    pub directory: PathBuf,
+    pub blocked_directory: Option<PathBuf>,
+}
+
+impl AgentLocation {
+    /// Logical placement can be restored even when process authority refuses
+    /// to move to a replacement inode. This path grants no execution authority.
+    pub fn logical_directory(&self) -> &Path {
+        self.blocked_directory.as_deref().unwrap_or(&self.directory)
+    }
+}
+
 /// The shared sidebar model as the registry currently holds it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
@@ -185,6 +203,8 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    #[serde(default)]
+    pub agent_locations: Vec<AgentLocation>,
 }
 
 impl WorkspaceModel {

@@ -19620,6 +19620,7 @@ mod tests {
 
         draw_frames(&mut app, 4, |app, frame| {
             let model = |channels| crate::workspace_model::WorkspaceModel {
+                agent_locations: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity,
                 sequence: frame as u64 + 1,
