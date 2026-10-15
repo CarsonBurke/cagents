@@ -142,6 +142,8 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// Older-turn evidence must never sample or replace current attention.
+    PastAttention(crate::notifications::Evidence),
 }
 
 #[derive(Clone)]
@@ -2227,12 +2229,15 @@ impl TurnAttention {
             }
             Event::Reset { .. } => *self = Self::default(),
             Event::TurnSettled => self.settled = true,
-            Event::TurnFinished { key, outcome } | Event::PastTurnFinished { key, outcome } => {
+            Event::TurnFinished { key, outcome } => {
                 return Some(crate::notifications::Evidence {
                     key: key.clone().unwrap_or_else(|| self.key.clone()),
                     kind: *outcome,
                 });
             }
+            Event::PastTurnFinished {key:Some(key),outcome}=>return Some(crate::notifications::Evidence {key:key.clone(),kind:*outcome}),
+            Event::PastTurnFinished {key:None,..}=>return None,
+
             _ => {}
         }
         None
@@ -3211,7 +3216,7 @@ impl Actor {
     fn apply(&mut self, event: Event) {
         if matches!(&event, Event::PastTurnFinished { .. }) {
             if let Some(evidence) = self.attention.apply(&event) {
-                (self.notify)(Update::Attention(evidence));
+                (self.notify)(Update::PastAttention(evidence));
             }
             return;
         }
@@ -5112,6 +5117,17 @@ mod tests {
     }
 
     #[test]
+    fn uncorrelated_past_outcome_never_borrows_current_attention_identity() {
+        let mut attention=TurnAttention::default();
+        attention.apply(&Event::TurnStarted);
+        let current=attention.key.clone();
+        assert!(attention.apply(&Event::PastTurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled}).is_none());
+        assert_eq!(attention.key,current);
+        assert_eq!(attention.apply(&Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Succeeded}).unwrap().key,current);
+    }
+
+
+    #[test]
     fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
         struct LateResult;
         impl Adapter for LateResult {
@@ -5190,7 +5206,9 @@ mod tests {
         assert_eq!(after.outcome, before.outcome);
         assert_eq!(after.finished_at, before.finished_at);
         assert_eq!(after.activity(), ActivityState::Waiting);
-        assert!(receive.try_iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        let updates=receive.try_iter().collect::<Vec<_>>();
+        assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        assert!(!updates.iter().any(|update|matches!(update,Update::Attention(evidence) if evidence.key=="old-result")));
         handle.close().unwrap();
     }
 
@@ -7854,6 +7872,8 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::PastAttention(_)
+                | Update::RetainedOutcomes
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })
