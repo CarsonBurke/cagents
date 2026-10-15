@@ -25,9 +25,9 @@ pub enum Operation {
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     GetDisposableIgnoredDirectories {repository:PathBuf,path:PathBuf},
+    DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
     SetupIntent {repository:PathBuf,path:PathBuf},
     ResumeSetup {repository:PathBuf,path:PathBuf,expected_run_id:Option<crate::model::OperationId>,expected_plan_fingerprint:Option<String>,trust:bool,skip:bool},
-    DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
 }
 
 impl Operation {
@@ -75,10 +75,10 @@ pub enum Reply {
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
     DisposableIgnoredDirectories {directories:Vec<String>},
-    SetupIntent {creation_id:crate::model::OperationId,primary:PathBuf,intent:String,current_plan:Option<String>,plan_error:Option<String>,trusted:bool,active:bool},
-    SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>},
     BranchDeleted {branch:String},
     BranchDeleteRefused {failure:BranchDeleteFailure},
+    SetupIntent {creation_id:crate::model::OperationId,primary:PathBuf,intent:String,current_plan:Option<String>,plan_error:Option<String>,trusted:bool,active:bool},
+    SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
