@@ -99,7 +99,10 @@ mod tests {
     ) -> (Vec<Message>, Vec<String>) {
         use iced::{Event, Rectangle, Size, advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree}};
         let renderer = super::super::tests::headless_renderer();
-        let mut element = app.new_tab_popup(context);
+        let mut element = crate::input_trace::observe_keyboard_events(
+            app.new_tab_popup(context), &app.input_trace, keyboard_focus_regions(),
+            |event, captured, region, widget| Message::RoutedKeyEvent { event, captured, region, widget },
+        );
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(500.0, 800.0));
         let node = element.as_widget_mut().layout(&mut tree, &renderer,
@@ -129,7 +132,7 @@ mod tests {
         let mut app = tab_fixture(1, 900.0);
         drop(app.update_chrome(Action::ToggleNewTab));
         for remote_device in [false, true] {
-            let mut context = app.command_context(app.workspace.focused());
+            let mut context = app.chrome_command_context();
             context.remote_device = remote_device;
             for (_, kind, id) in NEW_TAB_CHOICES {
                 let command = kind.command();
@@ -158,7 +161,7 @@ mod tests {
     fn mounted_new_tab_browser_and_resume_hints_follow_binding_replacement() {
         let mut app = tab_fixture(1, 900.0);
         drop(app.update_chrome(Action::ToggleNewTab));
-        let context = app.command_context(app.workspace.focused());
+        let context = app.chrome_command_context();
         for (browser, resume) in [("Ctrl+Alt+B", "Ctrl+Alt+R"), ("Ctrl+Shift+Y", "Ctrl+Shift+U")] {
             app.settings.keyboard_shortcuts.new_browser = vec![browser.into()];
             app.settings.keyboard_shortcuts.resume_conversation = vec![resume.into()];
@@ -179,7 +182,7 @@ mod tests {
     fn new_tab_dispatch_requires_original_popup_context_and_enters_registry_after_close() {
         let mut app = tab_fixture(2, 900.0);
         drop(app.update_chrome(Action::ToggleNewTab));
-        let context = app.command_context(app.workspace.focused());
+        let context = app.chrome_command_context();
         let (messages, _) = mounted_new_tab_row(&app, &context, "chrome.new-tab.resume");
         let old = messages.into_iter().find_map(|message| match message {
             Message::ChromeUi(Action::RunNewTab(request)) => Some(request), _ => None,
@@ -195,7 +198,7 @@ mod tests {
         drop(app.update(Message::ChromeUi(Action::CloseNewTab(old_request))));
         assert_eq!(app.chrome_ui.new_tab_target.as_ref().unwrap().request, current);
         assert!(!app.resume_ui.open);
-        let context = app.command_context(app.workspace.focused());
+        let context = app.chrome_command_context();
         let (messages, _) = mounted_new_tab_row(&app, &context, "chrome.new-tab.resume");
         let current = messages.into_iter().find_map(|message| match message {
             Message::ChromeUi(Action::RunNewTab(request)) => Some(request), _ => None,
@@ -221,6 +224,64 @@ mod tests {
         assert!(app.resume_ui.open, "own popup must retire before registered dispatch");
         assert_eq!(app.chrome_ui.popup, None);
         assert!(app.chrome_ui.new_tab_target.is_none());
+    }
+
+    #[test]
+    fn pointer_opened_new_tab_uses_workspace_scope_after_sidebar_keyboard_focus() {
+        use iced::{Event, Rectangle, Size, advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree}};
+        for worktree_row in [false, true] {
+            let mut app = tab_fixture(1, 900.0);
+            app.sidebar_model = sidebar::tests::panel_model();
+            let project = app.sidebar_model.projects[0].id;
+            let row = if worktree_row {
+                sidebar::SelectionRow::Worktree(project, app.sidebar_model.projects[0].worktrees[1].id)
+            } else {
+                sidebar::SelectionRow::Project(project)
+            };
+            let workspace = PathBuf::from("/workspace/new-tab-current");
+            app.active_workspace = Some(workspace.clone());
+            let _focus = app.input_trace.scoped_keyboard_focus(
+                workspace_widget::FocusedPane::SidebarRows.into(),
+                Some(sidebar::selection_row_focus_id(row)),
+            );
+            let renderer = super::super::tests::headless_renderer();
+            let mut anchor = crate::input_trace::observe_keyboard_events(
+                app.new_tab_control(), &app.input_trace, keyboard_focus_regions(),
+                |event, captured, region, widget| Message::RoutedKeyEvent { event, captured, region, widget },
+            );
+            let mut tree = Tree::new(anchor.as_widget());
+            let viewport = Rectangle::with_size(Size::new(500.0, 800.0));
+            let node = anchor.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()));
+            let position = Layout::new(&node).bounds().center();
+            let mut messages = Vec::new();
+            for event in [Event::Mouse(mouse::Event::CursorMoved { position }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))] {
+                anchor.as_widget_mut().update(&mut tree, &event, Layout::new(&node),
+                    mouse::Cursor::Available(position), &renderer, &mut clipboard::Null,
+                    &mut Shell::new(&mut messages), &viewport);
+            }
+            drop(anchor);
+            assert_eq!(messages.iter().filter(|message| matches!(message,
+                Message::ChromeUi(Action::ToggleNewTab))).count(), 1);
+            for message in messages { drop(app.update(message)); }
+            assert_eq!(app.chrome_ui.popup, Some(Popup::NewTab));
+            let context = app.chrome_command_context();
+            assert!(context.sidebar_commands.is_none());
+            let (messages, _) = mounted_new_tab_row(&app, &context, "chrome.new-tab.thread");
+            assert!(messages.iter().any(|message| matches!(message,
+                Message::RoutedKeyEvent { region, .. } if region.pane == workspace_widget::FocusedPane::Other)));
+            let cards = app.durable.cards.len();
+            for message in messages { drop(app.update(message)); }
+            assert_eq!(app.durable.cards.len(), cards + 1);
+            let CardKind::Chat(session) = &app.durable.cards.last().unwrap().kind else {
+                panic!("registered NewThread must create a draft conversation");
+            };
+            assert_eq!(session.launch.recipe.working_directory, workspace);
+            assert_eq!(app.active_workspace.as_ref(), Some(&workspace));
+            assert!(app.chrome_ui.popup.is_none());
+        }
     }
 
     #[test]
@@ -1253,7 +1314,6 @@ impl NewTab {
 struct NewTabTarget {
     request: crate::model::OperationId,
     origin: palette_ui::PaletteOrigin,
-    sidebar: Option<sidebar::commands::CommandTarget>,
     device: Option<(String, String, String)>,
     directory: Option<PathBuf>,
 }
@@ -1626,7 +1686,7 @@ impl Cagents {
     fn popup_focus_ring(&self, popup: Popup) -> Vec<Cow<'static, str>> {
         match popup {
             Popup::NewTab => {
-                let context = self.command_context(self.workspace.focused());
+                let context = self.chrome_command_context();
                 let mut ring: Vec<_> = new_tab_choices(&context)
                     .map(|(_, _, id)| Cow::Borrowed(id))
                     .collect();
@@ -1944,7 +2004,6 @@ impl Cagents {
                 self.chrome_ui.new_tab_target = (popup == Popup::NewTab).then(|| Arc::new(NewTabTarget {
                     request: crate::model::OperationId::new(),
                     origin: self.palette_origin(),
-                    sidebar: self.sidebar_command_target(),
                     device: selected_device_key(),
                     directory: self.terminal_directory(),
                 }));
@@ -1992,10 +2051,9 @@ impl Cagents {
                     return Task::none();
                 }
                 if request.target.origin != self.palette_origin()
-                    || request.target.sidebar != self.sidebar_command_target()
                     || request.target.device != selected_device_key()
                     || request.target.directory != self.terminal_directory()
-                    || !self.command_available(request.command)
+                    || !workspace_widget::shortcut_descriptor(request.command).available(&self.chrome_command_context())
                     || self.context_inspector_is_overlay()
                     || self.palette.is_open()
                     || self.update_prepared
@@ -2005,7 +2063,7 @@ impl Cagents {
                 // This popup owns the input block. Retire it before entering
                 // the same availability/dispatch path as palette and shortcuts.
                 self.chrome_ui.close();
-                self.run_workspace_command(request.command, keyboard::Modifiers::empty())
+                self.run_chrome_workspace_command(request.command)
             }
             // Trusted lower launch used by registered NewThread itself.
             // Menu rows must enter through RunNewTab, never this helper.
@@ -2043,7 +2101,7 @@ impl Cagents {
             widget::Id::new(TOOLBAR_FOCUS_ID),
             enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
         );
-        let context = self.command_context(self.workspace.focused());
+        let context = self.chrome_command_context();
         let content = (self.chrome_ui.popup == Some(Popup::NewTab) && enabled)
             .then(|| self.new_tab_popup(&context));
         let close = self.chrome_ui.new_tab_target.as_ref().map_or(Action::Close, |target| Action::CloseNewTab(target.request));
