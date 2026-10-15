@@ -27431,7 +27431,7 @@ mod tests {
 
     #[test]
     fn a_stale_pull_request_cleanup_cannot_target_a_new_checkout_at_the_same_path() {
-        for changed in ["branch", "head", "repository", "unknown"] {
+        for changed in ["none", "branch", "head", "repository", "unknown"] {
             let (mut app, project) = pull_request_test_app(&[]);
             let (card, _) = app.add_pull_requests_card("/repo".into());
             let mut target = crate::pull_request_review::tests::target(1);
@@ -27453,14 +27453,15 @@ mod tests {
                 "branch" => row.branch = Some("other".into()),
                 "head" => row.head_oid = Some("b".repeat(40)),
                 "repository" => row.head_repository = Some(GitHubRepoKey::new("github.com", None, "other", "r").unwrap()),
-                _ => row.head_oid = None,
+                "unknown" => row.head_oid = None,
+                _ => {},
             }
             app.sidebar_model.projects.iter_mut().find(|row| row.id == project).unwrap().worktrees.push(row);
             let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("PR pane"); };
             drop(pane.review.update(crate::pull_request_review::Action::Open(target)));
             let generation = pane.review.selection_generation();
             drop(app.merged_pull_request_cleanup_ready(card, project, generation, head, Ok(Some(record.clone()))));
-            assert!(!app.project_ui.modal_open(), "stale {changed} must not open deletion");
+            assert_eq!(app.project_ui.modal_open(), changed=="none", "only the unchanged checkout can open deletion ({changed})");
             let row = app.sidebar_model.project(project).unwrap().worktrees.iter().find(|row| row.id == record.id).unwrap();
             assert_eq!(row.pull_request_state, None, "stale {changed} must not manufacture a merged badge");
         }
