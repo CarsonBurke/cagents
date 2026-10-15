@@ -1469,8 +1469,11 @@ impl Runtime {
         }
         if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let enabled =
-                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && !self.attachment_chooser_pending
+                && !(matches!(self.connection, Connection::Archived)
+                    && self.archive_history_revoked);
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,

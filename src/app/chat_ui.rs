@@ -1483,6 +1483,9 @@ enum QueuedStep {
     Prompt,
 }
 
+const REVOKED_ARCHIVE_HISTORY_REASON: &str =
+    "Local history was removed from this reader. Saved automation run records are retained.";
+
 pub(super) struct Runtime {
     find: Option<String>,
     find_focused: bool,
@@ -1499,6 +1502,8 @@ pub(super) struct Runtime {
     pub(super) session: chat::Session,
     connection: Connection,
     archive_evicted: bool,
+    /// Explicit history deletion permanently revokes this reader's old body.
+    archive_history_revoked: bool,
     archive_readiness: Option<crate::automations::archive::ArchivedPaneReadiness>,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
@@ -2095,6 +2100,7 @@ impl Runtime {
             finished_stamp: None,
             connection,
             archive_evicted: false,
+            archive_history_revoked: false,
             archive_readiness: None,
             queued: None,
             followups: Vec::new(),
@@ -2296,11 +2302,17 @@ impl Runtime {
         mut snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
-        if !self.visible.load(Ordering::Relaxed) {
+        let archive_revoked =
+            self.archive_history_revoked && matches!(self.connection, Connection::Archived);
+        if !self.visible.load(Ordering::Relaxed) || archive_revoked {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).items.clear();
             for agent in &mut Arc::make_mut(&mut snapshot).subagents {
                 agent.items.clear();
+            }
+            if archive_revoked {
+                Arc::make_mut(&mut snapshot).read_only_reason =
+                    Some(REVOKED_ARCHIVE_HISTORY_REASON.into());
             }
             self.snapshot = snapshot;
             self.source_clock = source_clock;
@@ -2649,10 +2661,23 @@ impl Runtime {
         self.visible.store(visible, Ordering::Relaxed);
         images::sync(self);
         if !visible && matches!(self.connection, Connection::Archived) {
-            self.archive_evicted = true;
+            self.archive_evicted = !self.archive_history_revoked;
             self.release_transcript_presentation();
         }
         self.present()
+    }
+
+    /// Account/history deletion revokes the old reader, including a live
+    /// reader which later becomes a completed automation. Descriptor, draft
+    /// and immutable run records are separate from disposable local history.
+    pub(super) fn revoke_automation_archive_history(&mut self) {
+        self.archive_history_revoked = true;
+        self.archive_evicted = false;
+        if matches!(self.connection, Connection::Archived) {
+            self.release_transcript_presentation();
+            Arc::make_mut(&mut self.snapshot).read_only_reason =
+                Some(REVOKED_ARCHIVE_HISTORY_REASON.into());
+        }
     }
 
     pub(super) fn release_transcript_presentation(&mut self) {
@@ -4776,7 +4801,7 @@ impl Cagents {
             && !matches!(runtime.connection, Connection::Archived)
         {
             runtime.connection = Connection::Archived;
-            runtime.archive_evicted = true;
+            runtime.archive_evicted = !runtime.archive_history_revoked;
             if !runtime.visible.load(Ordering::Relaxed) {
                 runtime.release_transcript_presentation();
             }
@@ -4876,6 +4901,7 @@ impl Cagents {
                     Some(CardRuntime::Chat(runtime)) => {
                         matches!(runtime.connection, Connection::Archived)
                             && runtime.archive_evicted
+                            && !runtime.archive_history_revoked
                     }
                     _ => false,
                 };
@@ -6605,7 +6631,7 @@ impl Cagents {
                             runtime.session = session.clone();
                             runtime.connection = Connection::Archived;
                             runtime.visible.store(visible, Ordering::Relaxed);
-                            runtime.archive_evicted = !visible;
+                            runtime.archive_evicted = !visible && !runtime.archive_history_revoked;
                             runtime.install_snapshot(Arc::new(archive.snapshot.clone()), None);
                         } else {
                             let mut runtime = Runtime::new(
@@ -17709,5 +17735,55 @@ mod tests {
             Some(Phase::Starting(_))
         ));
         assert!(!app.prepare_automation_archive(card, &agent));
+    }
+
+    #[test]
+    fn revoked_archive_reader_cannot_restore_its_body_on_reveal_or_late_install() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let agent = crate::model::AgentId::new();
+        Arc::make_mut(&mut app.durable).automation_archives.insert(card, agent);
+        app.mark_automation_archive(card);
+        let descriptor = app.card_state(card).unwrap().kind.clone();
+        let target = chat_runtime(&app, card).target;
+        let body = Snapshot {
+            generation: 7,
+            exited: true,
+            read_only_reason: Some("Saved automation".into()),
+            items: vec![Arc::new(chat::Item {
+                id: "private-saved-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("Private saved response"),
+                at: None,
+                started_at: None,
+            })],
+            ..Default::default()
+        };
+        {
+            let runtime = app.chat_card_runtime_mut(target).unwrap();
+            runtime.visible.store(true, Ordering::Relaxed);
+            runtime.replace_draft(text_editor::Content::with_text("Keep my unsent draft"));
+            runtime.install_snapshot(Arc::new(body.clone()), None);
+            assert!(!runtime.snapshot.items.is_empty());
+            runtime.revoke_automation_archive_history();
+            assert!(runtime.snapshot.items.is_empty());
+            assert!(runtime.cache.is_empty());
+            runtime.set_visible(false).unwrap();
+            runtime.set_visible(true).unwrap();
+            runtime.install_snapshot(Arc::new(body), None);
+            assert!(
+                runtime.snapshot.items.is_empty(),
+                "a late body cannot undo deletion"
+            );
+            assert!(runtime.cache.is_empty());
+            assert!(runtime.handle().is_none());
+            assert_eq!(runtime.composer.text(), "Keep my unsent draft");
+            // Even a stale model/local eviction flag cannot reopen this reader.
+            runtime.archive_evicted = true;
+        }
+        let reload = app.hydrate_visible_automation_archives(&HashSet::from([card]));
+        assert!(iced::runtime::task::into_stream(reload).is_none());
+        assert_eq!(app.card_state(card).unwrap().kind, descriptor);
+        assert_eq!(app.durable.automation_archives.get(&card), Some(&agent));
     }
 }
