@@ -547,6 +547,14 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, None)
+    }
+
+    pub(crate) fn from_stream_with_deadline(stream: UnixStream, deadline: Instant) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, Some(deadline))
+    }
+
+    fn from_stream_inner(stream: UnixStream, deadline: Option<Instant>) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -561,7 +569,7 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake()?;
+        let proof = client.handshake(deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
@@ -1141,6 +1149,17 @@ impl ControlClient {
         }
     }
 
+    pub(crate) fn upgrade_impact_with_deadline(
+        &mut self,
+        policy: crate::update::impact::Policy,
+        deadline: Instant,
+    ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
+        match self.request_with_deadline(ClientRequest::UpgradeImpact { policy }, deadline)? {
+            ServerResponse::UpgradeImpact(impact) => Ok(impact),
+            response => Err(unexpected_response("update impact", &response)),
+        }
+    }
+
     pub fn prepare_confirmed_upgrade(
         &mut self,
         impact: crate::update::impact::DaemonImpact,
@@ -1689,24 +1708,24 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self) -> Result<HostSessionProof, ControlError> {
+    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        write_frame(
-            &mut self.stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id,
-                proof: None,
-                request: ClientRequest::Connect {
-                    expected_host: None,
-                    resume: Vec::new(),
-                },
-            },
-        )?;
+        let request = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id,
+            proof: None,
+            request: ClientRequest::Connect { expected_host: None, resume: Vec::new() },
+        };
+        match deadline {
+            Some(deadline) => write_frame(&mut DeadlineWriter { stream: &mut self.stream, deadline }, &request)?,
+            None => write_frame(&mut self.stream, &request)?,
+        }
         let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = read_frame(&mut self.stream)
-            .map_err(|error| reply_error(error, timeout))?
+        let envelope: ServerEnvelope = match deadline {
+            Some(deadline) => read_frame(&mut DeadlineReader { stream: &mut self.stream, deadline }),
+            None => read_frame(&mut self.stream),
+        }.map_err(|error| reply_error(error, timeout))?
             .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
@@ -4735,6 +4754,24 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn upgrade_source_handshake_deadline_includes_trickled_frame_prefix_and_payload() {
+        for trickle_prefix in [true, false] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                let frame = if trickle_prefix { [4u32.to_be_bytes().as_slice(), b"body"].concat() }
+                else { server.write_all(&4u32.to_be_bytes()).unwrap(); b"body".to_vec() };
+                for byte in frame {
+                    if server.write_all(&[byte]).is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(35));
+                }
+            });
+            assert!(ControlClient::from_stream_with_deadline(client, Instant::now() + Duration::from_millis(55)).is_err());
+            worker.join().unwrap();
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) enum Client {
@@ -79,7 +79,7 @@ impl Client {
             .map_err(ControlError::Connect)?;
         let peer = Peer::observe(&stream, socket)
             .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
-        match ControlClient::from_stream(stream) {
+        match ControlClient::from_stream_with_deadline(stream, Instant::now() + Duration::from_secs(5)) {
             Ok(client) => {
                 peer.verify(client.proof()).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
@@ -119,7 +119,7 @@ impl Client {
             Self::Current { client, peer } => {
                 peer.verify(client.proof())?;
                 client
-                    .upgrade_impact(policy)
+                    .upgrade_impact_with_deadline(policy, Instant::now() + Duration::from_secs(10))
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::V77(client) => client.upgrade_impact(policy),
