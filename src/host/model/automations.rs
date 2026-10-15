@@ -54,9 +54,6 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
              UNIQUE(automation, occurrence_key),
              FOREIGN KEY(automation, revision) REFERENCES automation_revisions(automation, revision)
          ) STRICT;
-         CREATE TABLE IF NOT EXISTS automation_notifications (
-            key TEXT PRIMARY KEY, event TEXT NOT NULL
-         ) STRICT;
          CREATE INDEX IF NOT EXISTS automation_history ON automation_firings(automation, created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_all_history ON automation_firings(created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_active ON automation_firings(state);

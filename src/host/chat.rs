@@ -2822,11 +2822,14 @@ pub(in crate::host) fn reserved_automation_actor(
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(issued.proof.as_ref(), state.proof())?;
     let record = state.chats.get(&issued.id)
-        .filter(|record| !record.handle.is_completed())
-        .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
-        .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id)
         .filter(|record| !require_attached || record.subscribers.contains_key(&client))
         .ok_or_else(|| unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"))?;
+    let identity = record.handle.try_close_identity().map_err(unavailable)?;
+    if identity.completed
+        || !reserved_automation_record_matches(agent, &record.session, &identity.native_continuity)
+        || identity.session_id != issued.launch.session_id {
+        return Err(unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"));
+    }
     Ok(record.handle.clone())
 }
 
@@ -2863,17 +2866,17 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     requested: &chat::Session,
 ) -> Result<ServerResponse, ProtocolError> {
     let handle = reserved_automation_actor(host, client, agent, false)?;
-    let (mut issued, instance) = {
+    let (mut issued, instance, identity) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state
-            .chats
-            .get(&requested.id)
+        let record = state.chats.get(&requested.id)
             .filter(|record| record.handle.same_actor(&handle))
             .ok_or_else(|| unavailable("The pending archive actor changed before attachment"))?;
-        (record.session.clone(), record.execution_instance)
+        let identity = record.handle.try_close_identity().map_err(unavailable)?;
+        if identity.completed { return Err(unavailable("The pending archive actor already ended")); }
+        (record.session.clone(), record.execution_instance, identity)
     };
-    issued.launch.session_id = handle.confirmed_session_id();
-    issued.native_continuity = handle.native_continuity();
+    issued.launch.session_id = identity.session_id;
+    issued.native_continuity = identity.native_continuity;
     if !reserved_automation_request_matches(agent, requested, &issued) {
         return Err(error(
             "The pending archive attachment changed its exact native descriptor",
@@ -2891,26 +2894,16 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(requested.proof.as_ref(), state.proof())?;
-    let record = state
-        .chats
-        .get_mut(&requested.id)
-        .filter(|record| {
-            record.execution_instance == instance
-                && record.handle.same_actor(&handle)
-                && !record.handle.is_completed()
-        })
-        .filter(|record| {
-            reserved_automation_record_matches(
-                agent,
-                &record.session,
-                &record.handle.native_continuity(),
-            )
-        })
-        .filter(|record| {
-            record.handle.confirmed_session_id() == issued.launch.session_id
-                && record.handle.native_continuity() == issued.native_continuity
-        })
+    let record = state.chats.get_mut(&requested.id)
+        .filter(|record| record.execution_instance == instance && record.handle.same_actor(&handle))
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
+    let identity = record.handle.try_close_identity().map_err(unavailable)?;
+    if identity.completed
+        || !reserved_automation_record_matches(agent, &record.session, &identity.native_continuity)
+        || identity.session_id != issued.launch.session_id
+        || identity.native_continuity != issued.native_continuity {
+        return Err(unavailable("The pending archive actor changed during attachment"));
+    }
     let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
     // Capture only this already revalidated record's authenticated metadata.
     let execution_instance = record.execution_instance;

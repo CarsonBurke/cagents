@@ -1024,30 +1024,6 @@ pub(crate) fn bounded_json_bytes(value: &impl Serialize, maximum: usize) -> io::
     Ok(counter.bytes)
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ChatSourceBinding {
-    pub source: crate::chat::Session,
-    pub execution_instance: uuid::Uuid,
-    pub backend: uuid::Uuid,
-}
-
-/// Host-issued evidence for one native chat to exact published terminal transition.
-/// Metadata only: transcript snapshots stay outside this retained receipt.
-/// This wire addition requires a future owner-allocated protocol after 90.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TerminalHandoffReceipt {
-    pub operation: uuid::Uuid,
-    pub source: crate::chat::Session,
-    pub source_execution_instance: uuid::Uuid,
-    pub source_binding: ChatSourceBinding,
-    /// Positive publication after this operation's own pairing or first
-    /// confirmed thread learning. The original captured intent stays above.
-    pub retained_binding: Option<ChatSourceBinding>,
-    /// Retained native publication boundary of the returned resource ID.
-    /// A later terminal -> native -> retired transition invalidates this stamp.
-    pub terminal_native_epoch: uuid::Uuid,
-    pub terminal: TerminalDescriptor,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminalDescriptor {
