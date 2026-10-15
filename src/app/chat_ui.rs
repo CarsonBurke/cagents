@@ -2217,6 +2217,10 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    pub(super) fn parent_transcript_selected(&self) -> bool {
+        self.selected_subagent.is_none()
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {
