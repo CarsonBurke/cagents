@@ -929,13 +929,17 @@ impl Cagents {
         })
     }
 
-    fn restore_archive_report(&mut self,entry:SavedConversation,report:crate::automations::ArchiveReport)->Task<Message> {
+    fn restore_archive_report(&mut self,entry:SavedConversation,mut report:crate::automations::ArchiveReport)->Task<Message> {
         let mut issued=entry.session.clone();issued.archive_report=Some(report.reference.clone());
         if report.reference.registry!=self.workspace_model.identity
             || crate::automations::archive::ArchivedPaneReadiness::qualify_report(&report,&issued).is_err() {
             self.resume_error("The saved report's private source changed. No provider was resumed.");
             return Task::none();
         }
+        // Destination preparation retains the exact private qualification
+        // metadata, while the saved body is fetched only after admission.
+        report.archive.snapshot.items.clear();
+        for child in &mut report.archive.snapshot.subagents {child.items.clear();}
         let restore=ReportRestore {nonce:uuid::Uuid::new_v4(),generation:self.resume_ui.generation,
             registry:self.workspace_model.identity,picker_origin:self.resume_ui.open,entry,report};
         // Hand off only our own picker. The captured intent survives in the

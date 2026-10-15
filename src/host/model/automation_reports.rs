@@ -102,7 +102,7 @@ pub(super) fn capture_removal(db: &Connection, operation: Uuid, scope: &Scope, r
     let presentation=serde_json::to_string(&Presentation {title:pane.title.clone(),user_title:pane.user_title.clone(),width_fraction:pane.width_fraction,scope:pane.scope.clone(),source_reference}).map_err(|error|error.to_string())?;
     let scope=serde_json::to_string(scope).map_err(|error|error.to_string())?;
     if presentation.len()>16384 || scope.len()>16384 || repository.len()>16384 {return Err("The saved report presentation metadata exceeds its limit; its pane was preserved".into());}
-    let identity: String = db.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    let identity: String = db.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=36 THEN identity ELSE '' END FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
     db.execute("INSERT INTO automation_report_sources(operation,agent,card,registry,scope,revision,descriptor,presentation,repository) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![operation.to_string(),agent.id.to_string(),pane.id.to_string(),identity,scope,revision,descriptor,presentation,repository])
         .map_err(|error| error.to_string())?;
@@ -118,7 +118,7 @@ struct Source {
 }
 fn source(db: &Connection, reference: &ArchiveReportReference) -> Result<Source, String> {
     if !reference.is_supported() { return Err("The saved report reference is unsupported".into()); }
-    let identity: String = db.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    let identity: String = db.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=36 THEN identity ELSE '' END FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
     if identity != reference.registry.to_string() { return Err("The saved report belongs to a different registry".into()); }
     type SourceRow=(String,String,String,Option<String>,u64,Option<String>,String,Option<String>,Option<String>);
     let row: Option<SourceRow> = db.query_row(
@@ -175,7 +175,7 @@ impl Registry {
         report_in(&self.db,reference,session)
     }
     pub(crate) fn archive_report_source(&self, identity:Uuid, card:CardId, session:&Session)->Result<Option<ArchiveReport>,String>{
-        let current:String=self.db.query_row("SELECT identity FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        let current:String=self.db.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=36 THEN identity ELSE '' END FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         if identity.is_nil() || current!=identity.to_string() {return Err("The selected report registry changed; wait for its current model".into());}
         let operation:Option<(String,String)>=self.db.query_row("SELECT CASE WHEN length(CAST(operation AS BLOB))<=36 THEN operation ELSE '' END,CASE WHEN length(CAST(agent AS BLOB))<=36 THEN agent ELSE '' END FROM automation_report_sources WHERE card=?1 ORDER BY operation LIMIT 1",[card.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
         let Some((operation,agent))=operation else {
@@ -195,7 +195,7 @@ impl Registry {
             }
             return Ok(None);
         };
-        let identity:String=self.db.query_row("SELECT identity FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        let identity:String=self.db.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=36 THEN identity ELSE '' END FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         let reference=ArchiveReportReference {format:1,registry:identity.parse().map_err(|_|"The report registry identity is invalid")?,agent:agent.parse().map_err(|_|"The report owner identity is invalid")?,source_operation:operation.parse().map_err(|_|"The report operation is invalid")?};
         let source=source(&self.db,&reference)?;
         let mut requested=session.clone();
@@ -298,7 +298,7 @@ impl Registry {
     }
 
     pub(crate) fn archive_report_source_descriptor(&self,identity:Uuid,card:CardId,descriptor:&crate::automations::ArchiveReportDescriptor)->Result<Option<ArchiveReport>,String> {
-        let current:String=self.db.query_row("SELECT identity FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        let current:String=self.db.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=36 THEN identity ELSE '' END FROM metadata WHERE key=0",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         if identity.is_nil() || current!=identity.to_string() {return Err("The selected report registry changed".into());}
         let row:Option<(String,String)>=self.db.query_row("SELECT CASE WHEN length(CAST(operation AS BLOB))<=36 THEN operation ELSE '' END,CASE WHEN length(CAST(agent AS BLOB))<=36 THEN agent ELSE '' END FROM automation_report_sources WHERE card=?1 ORDER BY operation LIMIT 1",[card.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
         let reference=match row {
