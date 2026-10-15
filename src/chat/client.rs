@@ -34,8 +34,11 @@ pub(crate) use provider_exit::Output as ProviderExitOutput;
 // an expired diagnostic reply from becoming an unrelated conversation error.
 fn next_request_id(next: &AtomicU64) -> Result<u64, String> {
     next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        value.checked_add(1).filter(|next| *next < provider_exit::REQUEST_NAMESPACE)
-    }).map_err(|_| "Chat request identifiers are exhausted; reconnect this conversation".to_owned())
+        value
+            .checked_add(1)
+            .filter(|next| *next < provider_exit::REQUEST_NAMESPACE)
+    })
+    .map_err(|_| "Chat request identifiers are exhausted; reconnect this conversation".to_owned())
 }
 
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
@@ -988,9 +991,9 @@ impl ClientHandle {
                         chat_id: id,
                         visible: visibility_value.load(Ordering::Acquire),
                     };
-                    if next_request_id(&visibility_next).and_then(|id| {
-                        transmit(&visibility_wire, &visibility_proof, id, request)
-                    }).is_err()
+                    if next_request_id(&visibility_next)
+                        .and_then(|id| transmit(&visibility_wire, &visibility_proof, id, request))
+                        .is_err()
                     {
                         let _ = visibility_wire
                             .lock()
@@ -3038,17 +3041,38 @@ mod tests {
             }
             assert_eq!(offset, raw.len());
             let late: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            assert!(matches!(late.request, ClientRequest::ChatProviderExitOutput { .. }));
+            assert!(matches!(
+                late.request,
+                ClientRequest::ChatProviderExitOutput { .. }
+            ));
             // Release only after the client has removed its timed-out waiter.
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            codec.write(&mut server, &ServerEnvelope {
-                version: PROTOCOL_VERSION, request_id: Some(late.request_id), proof: proof.clone(),
-                message: ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::TerminalUnavailable, "Expired saved output", false)),
-            }).unwrap();
-            codec.write(&mut server, &ServerEnvelope {
-                version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
-                message: ServerMessage::HostShuttingDown,
-            }).unwrap();
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(late.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Expired saved output",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message: ServerMessage::HostShuttingDown,
+                    },
+                )
+                .unwrap();
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
@@ -3060,7 +3084,9 @@ mod tests {
             false,
             None,
             None,
-            move |wake| { let _ = wake_tx.send(wake); },
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
         )
         .unwrap();
         let output = handle
@@ -3069,15 +3095,30 @@ mod tests {
         assert_eq!(output.text.as_str(), expected);
         assert_eq!(output.omitted, 17);
         assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
-        handle.install_snapshot_for_test(Snapshot { error: Some("Original provider crash".into()), ..Default::default() });
+        handle.install_snapshot_for_test(Snapshot {
+            error: Some("Original provider crash".into()),
+            ..Default::default()
+        });
         handle.take_activity();
-        assert!(handle.provider_exit_page(&log.id, 0, Duration::from_millis(10)).is_err());
+        assert!(
+            handle
+                .provider_exit_page(&log.id, 0, Duration::from_millis(10))
+                .is_err()
+        );
         assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
         done_tx.send(()).unwrap();
         loop {
-            if matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)) { break; }
+            if matches!(
+                wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Disconnected(_)
+            ) {
+                break;
+            }
         }
-        assert_eq!(handle.snapshot().error.as_deref(), Some("Original provider crash"));
+        assert_eq!(
+            handle.snapshot().error.as_deref(),
+            Some("Original provider crash")
+        );
         done_tx.send(()).unwrap();
         worker.join().unwrap();
     }
