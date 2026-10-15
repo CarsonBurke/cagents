@@ -21,6 +21,12 @@ impl Store {
     pub(in crate::chat::runtime) fn capture_export_source(&self, expires: std::time::Instant) -> Result<StoreSourceReceipt, String> {
         if std::time::Instant::now() >= expires { return Err("Export source capture deadline expired".into()); }
         self.source_guard()?;
+        // An inner tracked lease cannot release its outer SQLite snapshot.
+        // Receipt consumers may acquire later codec locks only after this
+        // method has actually ended the source transaction it owns.
+        if !self.db.is_autocommit() {
+            return Err("Export source capture requires its own outermost read lease".into());
+        }
         self.with_source_read(|error| error, |store| {
             // This seed cannot escape: factory output is owned, and the read
             // lease discards that output if its explicit release fails.
@@ -48,6 +54,16 @@ mod tests {
         let store=Store::new().unwrap();
         store.db.execute("UPDATE raw_source_schema SET version=999",[]).unwrap();
         assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err());
+    }
+    #[test]
+    fn export_capture_refuses_a_nested_source_snapshot_without_poisoning_its_owner() {
+        let store=Store::new().unwrap();
+        store.with_source_read(|error|error,|store| {
+            assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err());
+            store.source_guard()
+        }).unwrap();
+        assert!(store.db.is_autocommit());
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_ok());
     }
     #[test]
     fn export_receipt_does_not_escape_denied_source_snapshot_release() {
