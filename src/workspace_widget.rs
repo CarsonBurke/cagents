@@ -237,7 +237,6 @@ pub enum GlobalShortcut {
     OpenAutomations,
     OpenAgentAccounts,
 
-
     CommandPalette,
     NewThread,
     ChatAccount,
@@ -587,7 +586,6 @@ impl GlobalShortcut {
             Self::OpenAutomations => "open_automations",
             Self::OpenAgentAccounts => "open_agent_accounts",
 
-
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
             Self::CommandPalette => "command_palette",
@@ -808,11 +806,26 @@ pub struct CommandContext {
 }
 
 /// Whole-area Git templates, distinct from explicit selected-row operations.
-pub const GIT_GROUP_COMMANDS: [GlobalShortcut; 6] = [GlobalShortcut::GitStageAllUnstaged, GlobalShortcut::GitStageAllUntracked, GlobalShortcut::GitStageAllConflicts, GlobalShortcut::GitUnstageAllStaged, GlobalShortcut::GitDiscardAllUnstaged, GlobalShortcut::GitDiscardAllUntracked];
+pub const GIT_GROUP_COMMANDS: [GlobalShortcut; 6] = [
+    GlobalShortcut::GitStageAllUnstaged,
+    GlobalShortcut::GitStageAllUntracked,
+    GlobalShortcut::GitStageAllConflicts,
+    GlobalShortcut::GitUnstageAllStaged,
+    GlobalShortcut::GitDiscardAllUnstaged,
+    GlobalShortcut::GitDiscardAllUntracked,
+];
 pub fn git_group_command_bit(command: GlobalShortcut) -> Option<u8> {
-    GIT_GROUP_COMMANDS.iter().position(|candidate| *candidate == command).map(|index| 1 << index)
+    GIT_GROUP_COMMANDS
+        .iter()
+        .position(|candidate| *candidate == command)
+        .map(|index| 1 << index)
 }
-pub const fn git_group_command_target(command: GlobalShortcut) -> Option<(crate::repository::ChangeArea, crate::sidebar::ChangeGroupCommand)> {
+pub const fn git_group_command_target(
+    command: GlobalShortcut,
+) -> Option<(
+    crate::repository::ChangeArea,
+    crate::sidebar::ChangeGroupCommand,
+)> {
     use crate::repository::ChangeArea;
     use crate::sidebar::ChangeGroupCommand;
     Some(match command {
@@ -820,8 +833,12 @@ pub const fn git_group_command_target(command: GlobalShortcut) -> Option<(crate:
         GlobalShortcut::GitStageAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Stage),
         GlobalShortcut::GitStageAllConflicts => (ChangeArea::Conflict, ChangeGroupCommand::Stage),
         GlobalShortcut::GitUnstageAllStaged => (ChangeArea::Staged, ChangeGroupCommand::Unstage),
-        GlobalShortcut::GitDiscardAllUnstaged => (ChangeArea::Unstaged, ChangeGroupCommand::Discard),
-        GlobalShortcut::GitDiscardAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Discard),
+        GlobalShortcut::GitDiscardAllUnstaged => {
+            (ChangeArea::Unstaged, ChangeGroupCommand::Discard)
+        }
+        GlobalShortcut::GitDiscardAllUntracked => {
+            (ChangeArea::Untracked, ChangeGroupCommand::Discard)
+        }
         _ => return None,
     })
 }
@@ -916,23 +933,47 @@ impl ShortcutDescriptor {
     /// Remote row navigation remains supported through its captured mask; it
     /// must not silently substitute Device files for a different user action.
     pub fn available_on_device(self, remote: bool) -> bool {
-        if !remote { return true; }
-        if git_group_command_bit(self.action).is_some() { return false; }
-        if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository | ShortcutScope::Review) { return false; }
-        !matches!(self.action,
-            GlobalShortcut::ResumeConversation | GlobalShortcut::NewWorktree
-            | GlobalShortcut::NewChannel | GlobalShortcut::CloneRepository
-            | GlobalShortcut::ChatAttach | GlobalShortcut::SearchInProject
-            | GlobalShortcut::MarkAllRead | GlobalShortcut::OpenInExternalEditor
-            | GlobalShortcut::ReviewConversationChanges | GlobalShortcut::RestartDaemon | GlobalShortcut::OpenAutomations)
+        if !remote {
+            return true;
+        }
+        if git_group_command_bit(self.action).is_some() {
+            return false;
+        }
+        if matches!(
+            self.scope,
+            ShortcutScope::Editor
+                | ShortcutScope::EditorHistory
+                | ShortcutScope::Repository
+                | ShortcutScope::Review
+        ) {
+            return false;
+        }
+        !matches!(
+            self.action,
+            GlobalShortcut::ResumeConversation
+                | GlobalShortcut::NewWorktree
+                | GlobalShortcut::NewChannel
+                | GlobalShortcut::CloneRepository
+                | GlobalShortcut::ChatAttach
+                | GlobalShortcut::SearchInProject
+                | GlobalShortcut::MarkAllRead
+                | GlobalShortcut::OpenInExternalEditor
+                | GlobalShortcut::ReviewConversationChanges
+                | GlobalShortcut::RestartDaemon
+                | GlobalShortcut::OpenAutomations
+        )
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
-        if !self.available_on_device(context.remote_device) { return false; }
+        if !self.available_on_device(context.remote_device) {
+            return false;
+        }
         if context.save_in_flight && self.action.blocked_during_save() {
             return false;
         }
-        if let Some(bit) = git_group_command_bit(self.action) { return context.git_group_commands & bit != 0; }
+        if let Some(bit) = git_group_command_bit(self.action) {
+            return context.git_group_commands & bit != 0;
+        }
         if let Some(bit) = git_command_bit(self.action) {
             return context.git_commands & bit != 0;
         }
@@ -973,7 +1014,9 @@ impl ShortcutDescriptor {
         if let Some(bit) = diff_hunk_command_bit(self.action) {
             return context.diff_hunk_commands & bit != 0;
         }
-        if let Some(bit) = editor_feature_command_bit(self.action) { return context.editor_feature_commands & bit != 0; }
+        if let Some(bit) = editor_feature_command_bit(self.action) {
+            return context.editor_feature_commands & bit != 0;
+        }
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
@@ -1062,7 +1105,6 @@ impl ShortcutDescriptor {
 pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
-
     ShortcutDescriptor {
         action: GlobalShortcut::ChatPermissions,
         label: "Choose chat permission mode",
@@ -2221,38 +2263,150 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Chat,
     },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUnstaged, label: "Stage all unstaged changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUntracked, label: "Stage all untracked files", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllConflicts, label: "Stage all conflicts", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitUnstageAllStaged, label: "Unstage all staged changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUnstaged, label: "Discard all unstaged changes…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUntracked, label: "Delete all untracked files…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::EditorReload, label: "Reload file from disk", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::EditorOverwrite, label: "Overwrite conflicting file on disk", repeatable: false, scope: ShortcutScope::Repository },
-
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllUnstaged,
+        label: "Stage all unstaged changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllUntracked,
+        label: "Stage all untracked files",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllConflicts,
+        label: "Stage all conflicts",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitUnstageAllStaged,
+        label: "Unstage all staged changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitDiscardAllUnstaged,
+        label: "Discard all unstaged changes…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitDiscardAllUntracked,
+        label: "Delete all untracked files…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorReload,
+        label: "Reload file from disk",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorOverwrite,
+        label: "Overwrite conflicting file on disk",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
     ShortcutDescriptor {
         action: GlobalShortcut::TerminalReview,
         label: "Toggle terminal text review",
         repeatable: false,
         scope: ShortcutScope::Terminal,
     },
-    ShortcutDescriptor { action: GlobalShortcut::EditorRenameSymbol, label: "Rename symbol", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::EditorFormatDocument, label: "Format document", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::EditorFormatSelection, label: "Format selection", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::EditorCodeActions, label: "Show code actions", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::EditorSignatureHelp, label: "Show signature help", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::SettingsOpenFile, label: "Open settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::SettingsRevealFile, label: "Reveal settings.toml", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCopySha, label: "Copy commit SHA", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCopyMessage, label: "Copy commit message", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryNewWorktree, label: "New worktree from commit…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCreateBranch, label: "Create branch from commit…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryRevert, label: "Revert commit", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitHistoryCherryPick, label: "Cherry-pick commit into this worktree", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::OpenAutomations, label: "Open automations", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::OpenAgentAccounts, label: "Open agent accounts", repeatable: false, scope: ShortcutScope::Workspace },
-
-
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorRenameSymbol,
+        label: "Rename symbol",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorFormatDocument,
+        label: "Format document",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorFormatSelection,
+        label: "Format selection",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorCodeActions,
+        label: "Show code actions",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorSignatureHelp,
+        label: "Show signature help",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsOpenFile,
+        label: "Open settings.toml",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsRevealFile,
+        label: "Reveal settings.toml",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryCopySha,
+        label: "Copy commit SHA",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryCopyMessage,
+        label: "Copy commit message",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryNewWorktree,
+        label: "New worktree from commit…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryCreateBranch,
+        label: "Create branch from commit…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryRevert,
+        label: "Revert commit",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitHistoryCherryPick,
+        label: "Cherry-pick commit into this worktree",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenAutomations,
+        label: "Open automations",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenAgentAccounts,
+        label: "Open agent accounts",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -2454,7 +2608,6 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitHistoryCherryPick => &shortcuts.git_history_cherry_pick,
         GlobalShortcut::OpenAutomations => &shortcuts.open_automations,
         GlobalShortcut::OpenAgentAccounts => &shortcuts.open_agent_accounts,
-
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2932,7 +3085,10 @@ fn shortcut_applies(
     shortcuts: &KeyboardShortcuts,
 ) -> bool {
     if focused == FocusedPane::Terminal
-        && shortcuts.terminal_passthrough_actions.iter().any(|name| name == descriptor.id())
+        && shortcuts
+            .terminal_passthrough_actions
+            .iter()
+            .any(|name| name == descriptor.id())
     {
         return false;
     }
@@ -2989,14 +3145,19 @@ fn global_shortcut_descriptor(
                         shortcut_matches(binding, key, physical_key, modifiers)
                     })
                 })
-
     };
     // Actual native code-buffer commands take precedence over shared F2 pane
     // rename, even if the language controller must report unsupported.
     if focused == FocusedPane::Editor
-        && let Some(descriptor) = GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| descriptor.scope.is_native_editor() && matches(descriptor))
-    { return Some(descriptor); }
-    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| matches(descriptor))
+        && let Some(descriptor) = GLOBAL_SHORTCUT_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.scope.is_native_editor() && matches(descriptor))
+    {
+        return Some(descriptor);
+    }
+    GLOBAL_SHORTCUT_DESCRIPTORS
+        .iter()
+        .find(|descriptor| matches(descriptor))
 }
 
 pub const fn review_command_bit(command: GlobalShortcut) -> Option<u8> {
@@ -3237,7 +3398,13 @@ pub const fn browser_command_bit(command: GlobalShortcut) -> Option<u8> {
     }
 }
 
-pub const EDITOR_FEATURE_COMMANDS: [GlobalShortcut; 5] = [GlobalShortcut::EditorRenameSymbol, GlobalShortcut::EditorFormatDocument, GlobalShortcut::EditorFormatSelection, GlobalShortcut::EditorCodeActions, GlobalShortcut::EditorSignatureHelp];
+pub const EDITOR_FEATURE_COMMANDS: [GlobalShortcut; 5] = [
+    GlobalShortcut::EditorRenameSymbol,
+    GlobalShortcut::EditorFormatDocument,
+    GlobalShortcut::EditorFormatSelection,
+    GlobalShortcut::EditorCodeActions,
+    GlobalShortcut::EditorSignatureHelp,
+];
 pub const fn editor_feature_command_bit(command: GlobalShortcut) -> Option<u8> {
     match command {
         GlobalShortcut::EditorRenameSymbol => Some(1 << 0),
@@ -3360,7 +3527,9 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
-            ShortcutKey::Space => matches!(key.as_ref(), keyboard::Key::Character(value) if value == " "),
+            ShortcutKey::Space => {
+                matches!(key.as_ref(), keyboard::Key::Character(value) if value == " ")
+            }
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)
@@ -4526,14 +4695,12 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         // changed meanwhile. Browser/terminal ownership guards reject an up
         // whose down was intercepted here; current-chord matching cannot do so.
         match event {
-            Event::Keyboard(
-                keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                },
-            ) if is_global_shortcut_chord(
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if is_global_shortcut_chord(
                 key,
                 *physical_key,
                 *modifiers,
@@ -5750,23 +5917,46 @@ mod tests {
         let handle = crate::browser::BrowserHandle::fixture();
         let content = widget::Id::unique();
         let browser = crate::browser::BrowserWidget::<()>::new(&handle)
-            .id(content.clone()).model_focused(true);
-        let surface = WorkspaceSurface::new(browser, &shortcuts, FocusedPane::Browser, 400., |_| ());
-        let mut ui = UserInterface::build(surface.into(), Size::new(400., 240.), Cache::new(), &mut renderer);
+            .id(content.clone())
+            .model_focused(true);
+        let surface =
+            WorkspaceSurface::new(browser, &shortcuts, FocusedPane::Browser, 400., |_| ());
+        let mut ui = UserInterface::build(
+            surface.into(),
+            Size::new(400., 240.),
+            Cache::new(),
+            &mut renderer,
+        );
         ui.operate(&renderer, &mut focusable::focus::<()>(content));
-        let events = events.iter().cloned().map(Event::Keyboard).collect::<Vec<_>>();
-        let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let events = events
+            .iter()
+            .cloned()
+            .map(Event::Keyboard)
+            .collect::<Vec<_>>();
+        let _ = ui.update(
+            &events,
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
         // Inspect before destroying the native tree: a synthetic blur release
         // must not conceal a missing physical up in this event batch.
         handle.fixture_take_input()
     }
 
     #[cfg(feature = "integrated-browser")]
-    fn key_release(key: keyboard::Key, code: keyboard::key::Code, modifiers: keyboard::Modifiers) -> keyboard::Event {
+    fn key_release(
+        key: keyboard::Key,
+        code: keyboard::key::Code,
+        modifiers: keyboard::Modifiers,
+    ) -> keyboard::Event {
         keyboard::Event::KeyReleased {
-            key: key.clone(), modified_key: key,
+            key: key.clone(),
+            modified_key: key,
             physical_key: keyboard::key::Physical::Code(code),
-            location: keyboard::Location::Standard, modifiers,
+            location: keyboard::Location::Standard,
+            modifiers,
         }
     }
 
@@ -5778,33 +5968,68 @@ mod tests {
         let ctrl = keyboard::Modifiers::CTRL;
         let empty = keyboard::Modifiers::empty();
         let cases = [
-            (vec![
-                key_press("r", Code::KeyR, empty, false),
-                named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
-                key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
-                key_release(keyboard::Key::Named(Named::Control), Code::ControlLeft, empty),
-            ], vec![("KeyR", ButtonState::Pressed), ("ControlLeft", ButtonState::Pressed),
-                ("KeyR", ButtonState::Released), ("ControlLeft", ButtonState::Released)]),
-            (vec![
-                named_key_press(Named::F5, Code::F5, keyboard::Modifiers::SHIFT, false),
-                key_release(keyboard::Key::Named(Named::Shift), Code::ShiftLeft, empty),
-                key_release(keyboard::Key::Named(Named::F5), Code::F5, empty),
-            ], vec![("F5", ButtonState::Pressed), ("F5", ButtonState::Released)]),
-            (vec![
-                key_press("r", Code::KeyR, empty, false),
-                named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
-                key_press("r", Code::KeyR, ctrl, true),
-                key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
-                key_release(keyboard::Key::Named(Named::Control), Code::ControlLeft, empty),
-            ], vec![("KeyR", ButtonState::Pressed), ("ControlLeft", ButtonState::Pressed),
-                ("KeyR", ButtonState::Released), ("ControlLeft", ButtonState::Released)]),
+            (
+                vec![
+                    key_press("r", Code::KeyR, empty, false),
+                    named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
+                    key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
+                    key_release(
+                        keyboard::Key::Named(Named::Control),
+                        Code::ControlLeft,
+                        empty,
+                    ),
+                ],
+                vec![
+                    ("KeyR", ButtonState::Pressed),
+                    ("ControlLeft", ButtonState::Pressed),
+                    ("KeyR", ButtonState::Released),
+                    ("ControlLeft", ButtonState::Released),
+                ],
+            ),
+            (
+                vec![
+                    named_key_press(Named::F5, Code::F5, keyboard::Modifiers::SHIFT, false),
+                    key_release(keyboard::Key::Named(Named::Shift), Code::ShiftLeft, empty),
+                    key_release(keyboard::Key::Named(Named::F5), Code::F5, empty),
+                ],
+                vec![("F5", ButtonState::Pressed), ("F5", ButtonState::Released)],
+            ),
+            (
+                vec![
+                    key_press("r", Code::KeyR, empty, false),
+                    named_key_press(Named::Control, Code::ControlLeft, ctrl, false),
+                    key_press("r", Code::KeyR, ctrl, true),
+                    key_release(keyboard::Key::Character("r".into()), Code::KeyR, ctrl),
+                    key_release(
+                        keyboard::Key::Named(Named::Control),
+                        Code::ControlLeft,
+                        empty,
+                    ),
+                ],
+                vec![
+                    ("KeyR", ButtonState::Pressed),
+                    ("ControlLeft", ButtonState::Pressed),
+                    ("KeyR", ButtonState::Released),
+                    ("ControlLeft", ButtonState::Released),
+                ],
+            ),
         ];
         for (events, expected) in cases {
-            let actual = browser_surface_key_input(&events).into_iter().filter_map(|input| match input {
-                BrowserInput::Key { code, state, .. } => Some((code, state)), _ => None,
-            }).collect::<Vec<_>>();
-            let expected = expected.into_iter().map(|(code, state)| (code.to_owned(), state)).collect::<Vec<_>>();
-            assert_eq!(actual, expected, "raw owned up must survive a newly matching global chord");
+            let actual = browser_surface_key_input(&events)
+                .into_iter()
+                .filter_map(|input| match input {
+                    BrowserInput::Key { code, state, .. } => Some((code, state)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = expected
+                .into_iter()
+                .map(|(code, state)| (code.to_owned(), state))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "raw owned up must survive a newly matching global chord"
+            );
         }
     }
 
@@ -5813,12 +6038,27 @@ mod tests {
     fn browser_surface_does_not_emit_an_up_for_a_global_shortcut_down() {
         use keyboard::key::{Code, Named};
         for events in [
-            vec![key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false),
-                key_release(keyboard::Key::Character("r".into()), Code::KeyR, keyboard::Modifiers::empty())],
-            vec![named_key_press(Named::F5, Code::F5, keyboard::Modifiers::empty(), false),
-                key_release(keyboard::Key::Named(Named::F5), Code::F5, keyboard::Modifiers::SHIFT)],
+            vec![
+                key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false),
+                key_release(
+                    keyboard::Key::Character("r".into()),
+                    Code::KeyR,
+                    keyboard::Modifiers::empty(),
+                ),
+            ],
+            vec![
+                named_key_press(Named::F5, Code::F5, keyboard::Modifiers::empty(), false),
+                key_release(
+                    keyboard::Key::Named(Named::F5),
+                    Code::F5,
+                    keyboard::Modifiers::SHIFT,
+                ),
+            ],
         ] {
-            assert!(browser_surface_key_input(&events).is_empty(), "an intercepted down creates no raw release ownership");
+            assert!(
+                browser_surface_key_input(&events).is_empty(),
+                "an intercepted down creates no raw release ownership"
+            );
         }
     }
 
@@ -8099,17 +8339,51 @@ mod tests {
     fn symbol_rename_owns_its_configured_chord_only_in_actual_code_buffers() {
         let mut shortcuts = KeyboardShortcuts::default();
         assert!(shortcuts.fault().is_none());
-        let event = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F2), modified_key: keyboard::Key::Named(keyboard::key::Named::F2), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false };
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::EditorRenameSymbol));
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), Some(GlobalShortcut::RenamePane));
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Review), Some(GlobalShortcut::RenamePane));
-        let context = CommandContext { focused: FocusedPane::Editor, ..Default::default() };
-        assert!(!shortcut_descriptor(GlobalShortcut::EditorRenameSymbol).available(&context), "missing server capability hides the command without giving its native chord to pane rename");
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::F2),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::F2),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::Editor),
+            Some(GlobalShortcut::EditorRenameSymbol)
+        );
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane),
+            Some(GlobalShortcut::RenamePane)
+        );
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::Review),
+            Some(GlobalShortcut::RenamePane)
+        );
+        let context = CommandContext {
+            focused: FocusedPane::Editor,
+            ..Default::default()
+        };
+        assert!(
+            !shortcut_descriptor(GlobalShortcut::EditorRenameSymbol).available(&context),
+            "missing server capability hides the command without giving its native chord to pane rename"
+        );
         shortcuts.editor_rename_symbol.clear();
         assert!(shortcuts.fault().is_none());
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::RenamePane));
-        for focused in [FocusedPane::Terminal, FocusedPane::TextInput, FocusedPane::Chat, FocusedPane::SidebarRows] {
-            assert_ne!(global_shortcut(&event, &KeyboardShortcuts::default(), focused), Some(GlobalShortcut::EditorRenameSymbol));
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::Editor),
+            Some(GlobalShortcut::RenamePane)
+        );
+        for focused in [
+            FocusedPane::Terminal,
+            FocusedPane::TextInput,
+            FocusedPane::Chat,
+            FocusedPane::SidebarRows,
+        ] {
+            assert_ne!(
+                global_shortcut(&event, &KeyboardShortcuts::default(), focused),
+                Some(GlobalShortcut::EditorRenameSymbol)
+            );
         }
     }
 
@@ -8417,21 +8691,59 @@ mod tests {
     fn terminal_review_and_browser_chrome_use_their_actual_keyboard_scopes() {
         use cosmic::iced::keyboard::key::Code;
         let mut shortcuts = KeyboardShortcuts::default();
-        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
+        let modifiers =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
         let review = key_press("r", Code::KeyR, modifiers, false);
-        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Terminal), Some(GlobalShortcut::TerminalReview));
-        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Other), None);
+        assert_eq!(
+            global_shortcut(&review, &shortcuts, FocusedPane::Terminal),
+            Some(GlobalShortcut::TerminalReview)
+        );
+        assert_eq!(
+            global_shortcut(&review, &shortcuts, FocusedPane::Other),
+            None
+        );
         let descriptor = shortcut_descriptor(GlobalShortcut::TerminalReview);
-        assert!(descriptor.available(&CommandContext { focused: FocusedPane::Terminal, pane_index: Some(0), pane_count: 1, ..Default::default() }));
-        assert!(!descriptor.available(&CommandContext { focused: FocusedPane::Other, pane_index: Some(0), pane_count: 1, ..Default::default() }));
-        shortcuts.terminal_passthrough_actions.push(GlobalShortcut::TerminalReview.id().into());
-        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Terminal), None);
-        assert!(!is_global_shortcut_chord(&keyboard::Key::Character("r".into()), keyboard::key::Physical::Code(Code::KeyR), modifiers, &shortcuts, FocusedPane::Terminal));
-        let reopen = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
-        assert_eq!(global_shortcut(&reopen, &shortcuts, FocusedPane::BrowserChrome), Some(GlobalShortcut::ReopenPane));
-        assert_eq!(global_shortcut(&reopen, &shortcuts, FocusedPane::Browser), None);
+        assert!(descriptor.available(&CommandContext {
+            focused: FocusedPane::Terminal,
+            pane_index: Some(0),
+            pane_count: 1,
+            ..Default::default()
+        }));
+        assert!(!descriptor.available(&CommandContext {
+            focused: FocusedPane::Other,
+            pane_index: Some(0),
+            pane_count: 1,
+            ..Default::default()
+        }));
+        shortcuts
+            .terminal_passthrough_actions
+            .push(GlobalShortcut::TerminalReview.id().into());
+        assert_eq!(
+            global_shortcut(&review, &shortcuts, FocusedPane::Terminal),
+            None
+        );
+        assert!(!is_global_shortcut_chord(
+            &keyboard::Key::Character("r".into()),
+            keyboard::key::Physical::Code(Code::KeyR),
+            modifiers,
+            &shortcuts,
+            FocusedPane::Terminal
+        ));
+        let reopen = key_press(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        assert_eq!(
+            global_shortcut(&reopen, &shortcuts, FocusedPane::BrowserChrome),
+            Some(GlobalShortcut::ReopenPane)
+        );
+        assert_eq!(
+            global_shortcut(&reopen, &shortcuts, FocusedPane::Browser),
+            None
+        );
         assert!(ShortcutScope::Browser.applies_to(FocusedPane::BrowserChrome));
         assert!(!FocusedPane::BrowserChrome.is_text_editing());
     }
-
 }

@@ -2493,7 +2493,10 @@ impl Cagents {
                 // that surface before checking the workspace invocation.
                 self.account_ui.popover = None;
                 self.dismiss_chat_picker();
-                self.run_workspace_command(workspace_widget::GlobalShortcut::OpenAgentAccounts, keyboard::Modifiers::empty())
+                self.run_workspace_command(
+                    workspace_widget::GlobalShortcut::OpenAgentAccounts,
+                    keyboard::Modifiers::empty(),
+                )
             }
             Action::UseReportedLogin {
                 id,
@@ -4379,7 +4382,10 @@ impl Cagents {
             current: current_label,
             choices,
             manage_available: self.agent_accounts_command_available(),
-            manage_label: workspace_widget::shortcut_tooltip(workspace_widget::GlobalShortcut::OpenAgentAccounts, &self.settings.keyboard_shortcuts),
+            manage_label: workspace_widget::shortcut_tooltip(
+                workspace_widget::GlobalShortcut::OpenAgentAccounts,
+                &self.settings.keyboard_shortcuts,
+            ),
         })
     }
 
@@ -4742,7 +4748,10 @@ impl Cagents {
             }
             rows.push(
                 crate::ui_controls::button::secondary("Open Accounts")
-                    .on_press_maybe(self.agent_accounts_command_available().then_some(Message::AccountUi(Action::OpenPane)))
+                    .on_press_maybe(
+                        self.agent_accounts_command_available()
+                            .then_some(Message::AccountUi(Action::OpenPane)),
+                    )
                     .into(),
             );
         }
@@ -4953,11 +4962,19 @@ impl Cagents {
         }
         if placement == Placement::Popover {
             items.push(
-                crate::ui_controls::icon_button(Icon::PopOut,
-                    workspace_widget::shortcut_tooltip(workspace_widget::GlobalShortcut::OpenAgentAccounts, &self.settings.keyboard_shortcuts))
-                    .compact()
-                    .on_press_maybe(self.agent_accounts_command_available().then_some(Message::AccountUi(Action::OpenPane)))
-                    .into(),
+                crate::ui_controls::icon_button(
+                    Icon::PopOut,
+                    workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::OpenAgentAccounts,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                )
+                .compact()
+                .on_press_maybe(
+                    self.agent_accounts_command_available()
+                        .then_some(Message::AccountUi(Action::OpenPane)),
+                )
+                .into(),
             );
         }
         widget::row::with_children(items)

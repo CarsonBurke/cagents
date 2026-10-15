@@ -132,8 +132,14 @@ fn number_setting_current(value: &str, default: f64, min: f64, max: f64) -> f64 
 }
 
 fn number_setting_serialized(field: SettingsField, number: f64) -> String {
-    if matches!(field, SettingsField::HibernationDelayMs | SettingsField::EditorTabWidth) { format!("{number:.0}") }
-    else { format!("{number:.3}") }
+    if matches!(
+        field,
+        SettingsField::HibernationDelayMs | SettingsField::EditorTabWidth
+    ) {
+        format!("{number:.0}")
+    } else {
+        format!("{number:.3}")
+    }
 }
 
 fn number_setting_reset(field: SettingsField, value: &str, default: f64) -> Option<Message> {
@@ -172,8 +178,14 @@ fn setting_stepper<'a>(
         f64::from(default),
     );
     let current = if field == SettingsField::EditorTabWidth {
-        value.parse::<u16>().map(f64::from).unwrap_or(default).clamp(min, max)
-    } else { number_setting_current(value, default, min, max) };
+        value
+            .parse::<u16>()
+            .map(f64::from)
+            .unwrap_or(default)
+            .clamp(min, max)
+    } else {
+        number_setting_current(value, default, min, max)
+    };
     let change = |next: f64| Message::SettingsChanged {
         field,
         value: number_setting_serialized(field, next.clamp(min, max)),
@@ -212,7 +224,10 @@ fn setting_stepper<'a>(
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
-    setting_field(label, detail, control).error(invalid.get(&field).map(String::as_str)).keywords(field.config_key()).keywords(value)
+    setting_field(label, detail, control)
+        .error(invalid.get(&field).map(String::as_str))
+        .keywords(field.config_key())
+        .keywords(value)
 }
 
 fn settings_choice<'a>(
@@ -1377,7 +1392,9 @@ fn settings_layout<'a>(
                 .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into(),
                 crate::ui_controls::button::secondary("Open file")
-                    .on_press(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsOpenFile))
+                    .on_press(Message::RunCommand(
+                        workspace_widget::GlobalShortcut::SettingsOpenFile,
+                    ))
                     .into(),
             ])
             .spacing(space::S)
@@ -1886,10 +1903,9 @@ impl Cagents {
                 .width(Length::Fill)
                 .into(),
                 crate::ui_controls::button::secondary("Open file")
-                    .on_press_maybe(
-                        (!self.modal_is_open())
-                            .then_some(Message::RunCommand(workspace_widget::GlobalShortcut::SettingsOpenFile)),
-                    )
+                    .on_press_maybe((!self.modal_is_open()).then_some(Message::RunCommand(
+                        workspace_widget::GlobalShortcut::SettingsOpenFile,
+                    )))
                     .into(),
             ])
             .spacing(space::M)
@@ -1915,37 +1931,80 @@ mod search_tests {
         for saving in [false, true] {
             for remote in [false, true] {
                 let command_context = workspace_widget::CommandContext {
-                    save_in_flight: saving, remote_device: remote, ..Default::default()
+                    save_in_flight: saving,
+                    remote_device: remote,
+                    ..Default::default()
                 };
                 let context = SettingsContext {
-                    feedback: None, reload_error: None, can_undo: false, invalid: &invalid,
+                    feedback: None,
+                    reload_error: None,
+                    can_undo: false,
+                    invalid: &invalid,
                     fonts: &app.settings_font_choices,
                     terminal_font_size: app.settings.terminal_font_size,
                     shortcuts: &app.settings.keyboard_shortcuts,
                     utility_context: command_context,
-                    accounts: vec![], updates: app.update_summary(), testing_notification: false,
+                    accounts: vec![],
+                    updates: app.update_summary(),
+                    testing_notification: false,
                 };
                 let content = widget::column::with_children(
-                    settings_category_controls(SettingsCategory::Accounts, &app.settings_draft, &context)
-                        .into_iter().filter_map(|group| group.view("Accounts", "")));
-                let mut ui = UserInterface::build(content, iced::Size::new(1200., 1000.),
-                    Cache::new(), &mut renderer);
-                ui.operate(&renderer, &mut focusable::focus::<()>(widget::Id::new("settings.open-accounts")));
+                    settings_category_controls(
+                        SettingsCategory::Accounts,
+                        &app.settings_draft,
+                        &context,
+                    )
+                    .into_iter()
+                    .filter_map(|group| group.view("Accounts", "")),
+                );
+                let mut ui = UserInterface::build(
+                    content,
+                    iced::Size::new(1200., 1000.),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                ui.operate(
+                    &renderer,
+                    &mut focusable::focus::<()>(widget::Id::new("settings.open-accounts")),
+                );
                 let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
                 let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: enter.clone(), modified_key: enter,
-                    physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+                    key: enter.clone(),
+                    modified_key: enter,
+                    physical_key: iced::keyboard::key::Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
                     location: iced::keyboard::Location::Standard,
-                    modifiers: iced::keyboard::Modifiers::empty(), text: None, repeat: false,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
                 });
                 let mut messages = Vec::new();
-                let _ = ui.update(&[event], mouse::Cursor::Unavailable, &mut renderer,
-                    &mut clipboard::Null, &mut messages);
-                assert_eq!(messages.iter().filter(|message| matches!(message,
-                    Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts))).count(),
-                    usize::from(workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::OpenAgentAccounts)
-                        .available(&context.utility_context)),
-                    "saving={saving} remote={remote}");
+                let _ = ui.update(
+                    &[event],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(
+                            message,
+                            Message::RunCommand(
+                                workspace_widget::GlobalShortcut::OpenAgentAccounts
+                            )
+                        ))
+                        .count(),
+                    usize::from(
+                        workspace_widget::shortcut_descriptor(
+                            workspace_widget::GlobalShortcut::OpenAgentAccounts
+                        )
+                        .available(&context.utility_context)
+                    ),
+                    "saving={saving} remote={remote}"
+                );
             }
         }
     }
@@ -2032,13 +2091,25 @@ mod typography_settings_tests {
         for width in [1_u16, 4, 8, 16] {
             let value = number_setting_serialized(field, f64::from(width));
             assert_eq!(value.parse::<u16>().unwrap(), width);
-            assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+            assert!(!matches!(
+                settings_update(&settings, field, &value),
+                SettingsDecision::Invalid(_)
+            ));
         }
-        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(field, "8", 4.0) else { panic!("tab width reset"); };
+        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(field, "8", 4.0)
+        else {
+            panic!("tab width reset");
+        };
         assert_eq!(value, "4");
-        assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+        assert!(!matches!(
+            settings_update(&settings, field, &value),
+            SettingsDecision::Invalid(_)
+        ));
         assert_eq!(number_setting_value(field, "4."), "4");
-        assert!(matches!(settings_update(&settings, field, &number_setting_value(field, "4.5")), SettingsDecision::Invalid(_)));
+        assert!(matches!(
+            settings_update(&settings, field, &number_setting_value(field, "4.5")),
+            SettingsDecision::Invalid(_)
+        ));
     }
 
     #[test]

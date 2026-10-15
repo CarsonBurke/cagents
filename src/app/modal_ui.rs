@@ -118,7 +118,10 @@ impl Stack {
         fallback: widget::Id,
         instance: impl Fn(Modal) -> Option<Instance>,
     ) -> Option<(Modal, u64, bool)> {
-        let previous = self.frames.last().map(|frame| (frame.kind, frame.generation));
+        let previous = self
+            .frames
+            .last()
+            .map(|frame| (frame.kind, frame.generation));
         // A removed lower dialog cannot remain the restore target of the
         // next surviving frame. Carry its parent link through any gap.
         let mut inherited_restore = None;
@@ -151,7 +154,11 @@ impl Stack {
                     .last()
                     .and_then(|frame| frame.focus.get())
                     .or_else(|| {
-                        if self.frames.is_empty() { inherited_restore.take() } else { None }
+                        if self.frames.is_empty() {
+                            inherited_restore.take()
+                        } else {
+                            None
+                        }
                     })
                     .or_else(|| self.workspace_focus.get())
                     .unwrap_or_else(|| fallback.clone());
@@ -165,14 +172,20 @@ impl Stack {
                 pushed = true;
             }
         }
-        let current = self.frames.last().map(|frame| (frame.kind, frame.generation));
+        let current = self
+            .frames
+            .last()
+            .map(|frame| (frame.kind, frame.generation));
         if previous != current {
             self.focus_revision.fetch_add(1, Ordering::AcqRel);
         }
-        self.frames.last().filter(|_| previous != current).map(|frame| {
-            let replaced_top = previous.is_some_and(|(kind, _)| kind == frame.kind);
-            (frame.kind, frame.generation, pushed || replaced_top)
-        })
+        self.frames
+            .last()
+            .filter(|_| previous != current)
+            .map(|frame| {
+                let replaced_top = previous.is_some_and(|(kind, _)| kind == frame.kind);
+                (frame.kind, frame.generation, pushed || replaced_top)
+            })
     }
     pub(super) fn focus_snapshot(&self, kind: Modal) -> crate::interaction::FocusSnapshot {
         self.frames
@@ -277,7 +290,10 @@ impl Stack {
 impl Cagents {
     fn modal_instance(&self, modal: Modal) -> Option<Instance> {
         match modal {
-            Modal::Discard => self.sidebar_state.pending_discard().map(|pending| Instance::Operation(pending.instance)),
+            Modal::Discard => self
+                .sidebar_state
+                .pending_discard()
+                .map(|pending| Instance::Operation(pending.instance)),
             Modal::Clone => self
                 .chrome_ui
                 .clone_repository
@@ -295,8 +311,14 @@ impl Cagents {
                 .worktree_dialog
                 .as_ref()
                 .map(|dialog| Instance::Operation(dialog.request())),
-            Modal::Clipboard => self.terminal_clipboard_modal_request().map(Instance::Operation),
-            Modal::EditorFeatures(kind) => self.editor_features.modal_dialog().filter(|(current, _)| *current == kind).map(|(_, ticket)| Instance::Counter(ticket)),
+            Modal::Clipboard => self
+                .terminal_clipboard_modal_request()
+                .map(Instance::Operation),
+            Modal::EditorFeatures(kind) => self
+                .editor_features
+                .modal_dialog()
+                .filter(|(current, _)| *current == kind)
+                .map(|(_, ticket)| Instance::Counter(ticket)),
             Modal::ChatClose => self
                 .chat_ui
                 .close_dialog
@@ -358,7 +380,9 @@ impl Cagents {
         active!(Resume, self.resume_ui.open);
         active!(Clone, self.chrome_ui.clone_repository.is_some());
         active!(Worktree, self.worktree_dialog.is_some());
-        if let Some((kind, _)) = self.editor_features.modal_dialog() { result.push(Modal::EditorFeatures(kind)); }
+        if let Some((kind, _)) = self.editor_features.modal_dialog() {
+            result.push(Modal::EditorFeatures(kind));
+        }
         active!(Channel, self.channel_ui.modal_open());
         result.extend(self.project_ui.modal_roles().map(Modal::Project));
         active!(Selection, self.sidebar_selection_ui.dialog.is_some());
@@ -496,8 +520,12 @@ impl Cagents {
             Modal::BrowserImport => widget::Id::new("browser-import.cancel"),
             Modal::Paste => widget::Id::new("terminal-paste-cancel"),
             Modal::Clipboard => widget::Id::new("terminal-clipboard-deny"),
-            Modal::EditorFeatures(editor_features::DialogKind::Preview) => widget::Id::new("editor-preview.cancel"),
-            Modal::EditorFeatures(editor_features::DialogKind::Publication) => widget::Id::new("editor-publication.hide"),
+            Modal::EditorFeatures(editor_features::DialogKind::Preview) => {
+                widget::Id::new("editor-preview.cancel")
+            }
+            Modal::EditorFeatures(editor_features::DialogKind::Publication) => {
+                widget::Id::new("editor-publication.hide")
+            }
             Modal::Image => widget::Id::new("image-viewer.close"),
             Modal::Device => widget::Id::new("device.close"),
             Modal::AutomationDraft => crate::automation_ui::draft_dialog_focus_id(),
@@ -524,7 +552,9 @@ impl Cagents {
                 Modal::EditorFeatures(kind) => self.update_editor_features(match kind {
                     editor_features::DialogKind::Preview => editor_features::Action::CancelPreview,
                     editor_features::DialogKind::Publication => {
-                        let Some((_, ticket)) = self.editor_features.modal_dialog() else { return Task::none(); };
+                        let Some((_, ticket)) = self.editor_features.modal_dialog() else {
+                            return Task::none();
+                        };
                         editor_features::Action::HidePublication(ticket)
                     }
                 }),
@@ -849,12 +879,19 @@ mod tests {
         for replace in [false, true] {
             let mut app = app();
             let key = sidebar::ActiveWorktreeKey {
-                project_id: ProjectId::new(), worktree_id: crate::model::WorktreeId::new(), canonical_path: "/fixture/worktree".into(),
+                project_id: ProjectId::new(),
+                worktree_id: crate::model::WorktreeId::new(),
+                canonical_path: "/fixture/worktree".into(),
             };
-            let request = |name: &str| SidebarAction::RequestDiscard { key: key.clone(), request: crate::repository::DiscardRequest {
-                worktree: key.canonical_path.clone(), tracked: Vec::new(),
-                untracked: vec![crate::repository::RepoPath::parse(name).unwrap()], confirmed: false,
-            }};
+            let request = |name: &str| SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: crate::repository::DiscardRequest {
+                    worktree: key.canonical_path.clone(),
+                    tracked: Vec::new(),
+                    untracked: vec![crate::repository::RepoPath::parse(name).unwrap()],
+                    confirmed: false,
+                },
+            };
             // Production state intake mints the immutable prompt ID. No
             // repository mutation task is polled by this native-cache fixture.
             app.sidebar_state.apply(&request("original.txt"));
@@ -990,8 +1027,12 @@ mod tests {
             &mut Shell::new(&mut messages),
             &bounds,
         );
-        messages.into_iter().find(|message| matches!(message,
-            Message::ModalSurface { message, .. } if expected(message)))
+        messages
+            .into_iter()
+            .find(|message| {
+                matches!(message,
+            Message::ModalSurface { message, .. } if expected(message))
+            })
             .expect("actual widget publishes its surface-bound decision")
     }
 
@@ -1005,23 +1046,43 @@ mod tests {
         use iced::advanced::{clipboard, widget::operation};
         use iced::runtime::user_interface::{Cache, UserInterface};
         let mut renderer = super::super::tests::headless_renderer();
-        let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(app),
-            iced::Size::new(1280.0, 900.0), Cache::new(), &mut renderer);
+        let mut ui = UserInterface::build(
+            cosmic::ApplicationExt::view_main(app),
+            iced::Size::new(1280.0, 900.0),
+            Cache::new(),
+            &mut renderer,
+        );
         ui.operate(&renderer, &mut operation::focusable::focus::<()>(focus));
         let mut messages = Vec::new();
-        let (_, statuses) = ui.update(events, iced::mouse::Cursor::Unavailable,
-            &mut renderer, &mut clipboard::Null, &mut messages);
-        (messages.into_iter().filter_map(|message| match message {
-            cosmic::Action::App(message) => Some(message),
-            _ => None,
-        }).collect(), statuses)
+        let (_, statuses) = ui.update(
+            events,
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        (
+            messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    cosmic::Action::App(message) => Some(message),
+                    _ => None,
+                })
+                .collect(),
+            statuses,
+        )
     }
     fn dialog_key(key: keyboard::Key, modifiers: keyboard::Modifiers) -> iced::Event {
         iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            modified_key: key.clone(), key,
-            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            modified_key: key.clone(),
+            key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
             location: keyboard::Location::Standard,
-            modifiers, text: None, repeat: false,
+            modifiers,
+            text: None,
+            repeat: false,
         })
     }
 
@@ -1034,18 +1095,38 @@ mod tests {
         // routing must remain exclusive even with Cosmic traversal enabled.
         app.core.set_keyboard_nav(true);
         for (modifiers, start, destination) in [
-            (keyboard::Modifiers::empty(), "dialog.reset-settings.cancel", "dialog.reset-settings.confirm"),
-            (keyboard::Modifiers::SHIFT, "dialog.reset-settings.confirm", "dialog.reset-settings.cancel"),
+            (
+                keyboard::Modifiers::empty(),
+                "dialog.reset-settings.cancel",
+                "dialog.reset-settings.confirm",
+            ),
+            (
+                keyboard::Modifiers::SHIFT,
+                "dialog.reset-settings.confirm",
+                "dialog.reset-settings.cancel",
+            ),
         ] {
-            let (messages, statuses) = global_dialog_events(&app, widget::Id::new(start),
-                &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Tab), modifiers)]);
+            let (messages, statuses) = global_dialog_events(
+                &app,
+                widget::Id::new(start),
+                &[dialog_key(
+                    keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modifiers,
+                )],
+            );
             assert_eq!(statuses, vec![iced::event::Status::Captured]);
-            assert_eq!(messages.len(), 1, "no lost key, child wrapper, or duplicate base route");
+            assert_eq!(
+                messages.len(),
+                1,
+                "no lost key, child wrapper, or duplicate base route"
+            );
             assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
                 if matches!(&**message, Message::RoutedKeyEvent { captured: true, .. })));
             let task = app.update(messages.into_iter().next().unwrap());
-            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
-                Some(widget::Id::new(destination)));
+            assert_eq!(
+                super::super::tests::focused_element(app.dialog().unwrap(), task),
+                Some(widget::Id::new(destination))
+            );
         }
     }
 
@@ -1055,10 +1136,20 @@ mod tests {
         app.resume_ui.open = true;
         drop(app.finish_modal_update(Task::none()));
         let before = app.workspace.order().collect::<Vec<_>>();
-        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
-            &[dialog_key(keyboard::Key::Character("t".into()), keyboard::Modifiers::CTRL)]);
+        let (messages, statuses) = global_dialog_events(
+            &app,
+            resume_ui::focus_id(),
+            &[dialog_key(
+                keyboard::Key::Character("t".into()),
+                keyboard::Modifiers::CTRL,
+            )],
+        );
         assert_eq!(statuses, vec![iced::event::Status::Captured]);
-        assert_eq!(messages.len(), 1, "ignored chord must not also update the base observer");
+        assert_eq!(
+            messages.len(),
+            1,
+            "ignored chord must not also update the base observer"
+        );
         assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
             if matches!(&**message, Message::RoutedKeyEvent { region, widget: Some(id), .. }
                 if region.pane == workspace_widget::FocusedPane::TextInput && id == &resume_ui::focus_id())));
@@ -1072,20 +1163,41 @@ mod tests {
         let mut app = app();
         app.resume_ui.open = true;
         drop(app.finish_modal_update(Task::none()));
-        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
-            &[iced::Event::InputMethod(iced::advanced::input_method::Event::Commit("modal-ime".into()))]);
+        let (messages, statuses) = global_dialog_events(
+            &app,
+            resume_ui::focus_id(),
+            &[iced::Event::InputMethod(
+                iced::advanced::input_method::Event::Commit("modal-ime".into()),
+            )],
+        );
         assert_eq!(statuses, vec![iced::event::Status::Captured]);
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0], Message::ModalSurface { message, .. }
             if matches!(&**message, Message::ResumeConversation(resume_ui::Action::Query(query)) if query.contains("modal-ime"))));
         drop(app.update(messages.into_iter().next().unwrap()));
         assert!(app.resume_ui.query.contains("modal-ime"));
-        let (messages, statuses) = global_dialog_events(&app, resume_ui::focus_id(),
-            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
+        let (messages, statuses) = global_dialog_events(
+            &app,
+            resume_ui::focus_id(),
+            &[dialog_key(
+                keyboard::Key::Named(keyboard::key::Named::Escape),
+                keyboard::Modifiers::empty(),
+            )],
+        );
         assert_eq!(statuses, vec![iced::event::Status::Captured]);
-        assert_eq!(messages.iter().filter(|message| matches!(message, Message::ModalSurface { message, .. }
-            if matches!(&**message, Message::RoutedKeyEvent { .. }))).count(), 1);
-        for message in messages { drop(app.update(message)); }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |message| matches!(message, Message::ModalSurface { message, .. }
+            if matches!(&**message, Message::RoutedKeyEvent { .. }))
+                )
+                .count(),
+            1
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
         assert!(!app.resume_ui.open);
     }
 
@@ -1093,9 +1205,14 @@ mod tests {
     fn held_global_dialog_escape_cannot_close_a_replacement_instance() {
         let mut app = app();
         drop(app.update(Message::ResetSettings));
-        let (mut held, statuses) = global_dialog_events(&app,
+        let (mut held, statuses) = global_dialog_events(
+            &app,
             widget::Id::new("dialog.reset-settings.cancel"),
-            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
+            &[dialog_key(
+                keyboard::Key::Named(keyboard::key::Named::Escape),
+                keyboard::Modifiers::empty(),
+            )],
+        );
         assert_eq!(statuses, vec![iced::event::Status::Captured]);
         assert_eq!(held.len(), 1);
         let old = app.modal_surface_target(Modal::SettingsReset);
@@ -1104,18 +1221,38 @@ mod tests {
         assert_ne!(old, app.modal_surface_target(Modal::SettingsReset));
         let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
         let task = app.update(held.pop().unwrap());
-        assert!(iced::runtime::task::into_stream(task).is_none(), "stale key has no focus/status effects");
-        assert!(app.settings_reset_confirm, "old Escape must not cancel replacement");
-        assert_eq!(revision, app.modal_stack.focus_revision.load(Ordering::Relaxed));
-        let (current, _) = global_dialog_events(&app, widget::Id::new("dialog.reset-settings.cancel"),
-            &[dialog_key(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::empty())]);
-        for message in current { drop(app.update(message)); }
+        assert!(
+            iced::runtime::task::into_stream(task).is_none(),
+            "stale key has no focus/status effects"
+        );
+        assert!(
+            app.settings_reset_confirm,
+            "old Escape must not cancel replacement"
+        );
+        assert_eq!(
+            revision,
+            app.modal_stack.focus_revision.load(Ordering::Relaxed)
+        );
+        let (current, _) = global_dialog_events(
+            &app,
+            widget::Id::new("dialog.reset-settings.cancel"),
+            &[dialog_key(
+                keyboard::Key::Named(keyboard::key::Named::Escape),
+                keyboard::Modifiers::empty(),
+            )],
+        );
+        for message in current {
+            drop(app.update(message));
+        }
         assert!(!app.settings_reset_confirm, "current Escape still works");
     }
 
     fn emitted_reset_cancel(app: &Cagents) -> Message {
-        emitted_dialog_decision(app, widget::Id::new("dialog.reset-settings.cancel"),
-            |message| matches!(message, Message::CancelResetSettings))
+        emitted_dialog_decision(
+            app,
+            widget::Id::new("dialog.reset-settings.cancel"),
+            |message| matches!(message, Message::CancelResetSettings),
+        )
     }
 
     #[test]
@@ -1128,38 +1265,56 @@ mod tests {
             second_state.id = second;
             Arc::make_mut(&mut app.durable).cards.push(second_state);
             for card in [first, second] {
-                app.cards.insert(card, CardRuntime::Repository(Box::new(
-                    RepositoryRuntime::dirty_fixture(card))));
+                app.cards.insert(
+                    card,
+                    CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+                );
             }
-            drop(app.begin_dirty_close(DirtyCloseIntent::Application(window::Id::unique()),
-                VecDeque::from([first, second])));
+            drop(app.begin_dirty_close(
+                DirtyCloseIntent::Application(window::Id::unique()),
+                VecDeque::from([first, second]),
+            ));
             drop(app.finish_modal_update(Task::none()));
             let old = app.modal_surface_target(Modal::DirtyClose);
-            let held = emitted_dialog_decision(&app,
+            let held = emitted_dialog_decision(
+                &app,
                 dirty_close_control_id(first, DirtyCloseControl::Cancel),
-                |message| matches!(message, Message::CancelRepositoryClose));
+                |message| matches!(message, Message::CancelRepositoryClose),
+            );
             if same_card {
                 // Replacement happens atomically before a stack reconciliation.
                 drop(app.begin_dirty_close(DirtyCloseIntent::Card(first), VecDeque::from([first])));
             } else {
-                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else { panic!() };
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else {
+                    panic!()
+                };
                 assert!(runtime.abandon_unsaved_changes());
                 drop(app.advance_dirty_close());
             }
             let current = app.modal_surface_target(Modal::DirtyClose);
             assert_ne!(old.instance, current.instance);
-            assert_eq!(old.revision, current.revision, "the instance fence must work before reconciliation");
+            assert_eq!(
+                old.revision, current.revision,
+                "the instance fence must work before reconciliation"
+            );
             let card = if same_card { first } else { second };
             let task = app.update(held);
             assert!(iced::runtime::task::into_stream(task).is_none());
             assert_eq!(app.dirty_repository_close.as_ref().unwrap().card, card);
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()));
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+            );
             drop(app.finish_modal_update(Task::none()));
-            let cancel = emitted_dialog_decision(&app,
+            let cancel = emitted_dialog_decision(
+                &app,
                 dirty_close_control_id(card, DirtyCloseControl::Cancel),
-                |message| matches!(message, Message::CancelRepositoryClose));
+                |message| matches!(message, Message::CancelRepositoryClose),
+            );
             drop(app.update(cancel));
-            assert!(app.dirty_repository_close.is_none(), "current Cancel still works");
+            assert!(
+                app.dirty_repository_close.is_none(),
+                "current Cancel still works"
+            );
         }
     }
 
@@ -1175,42 +1330,69 @@ mod tests {
         state.id = second;
         Arc::make_mut(&mut app.durable).cards.push(state);
         for card in [first, second] {
-            app.cards.insert(card, CardRuntime::Repository(Box::new(
-                RepositoryRuntime::dirty_fixture(card))));
+            app.cards.insert(
+                card,
+                CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+            );
         }
-        drop(app.begin_dirty_close(DirtyCloseIntent::Application(window::Id::unique()),
-            VecDeque::from([first, second])));
+        drop(app.begin_dirty_close(
+            DirtyCloseIntent::Application(window::Id::unique()),
+            VecDeque::from([first, second]),
+        ));
         drop(app.finish_modal_update(Task::none()));
         let previous_lower = app.modal_surface_target(Modal::DirtyClose);
-        focus_input(app.modal_stack.focus_snapshot(Modal::DirtyClose),
-            dirty_close_control_id(first, DirtyCloseControl::Discard));
+        focus_input(
+            app.modal_stack.focus_snapshot(Modal::DirtyClose),
+            dirty_close_control_id(first, DirtyCloseControl::Discard),
+        );
         app.settings_reset_confirm = true;
         let upper_focus = app.finish_modal_update(Task::none());
         let upper = app.modal_surface_target(Modal::SettingsReset);
         let held_upper = emitted_reset_cancel(&app);
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else { panic!() };
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else {
+            panic!()
+        };
         assert!(runtime.abandon_unsaved_changes());
         drop(app.advance_dirty_close());
         drop(app.finish_modal_update(Task::none()));
         assert_eq!(app.top_modal(), Some(Modal::SettingsReset));
-        assert_eq!(app.modal_surface_target(Modal::SettingsReset), upper,
-            "a lower request replacement cannot revoke the upper gesture");
-        assert_ne!(app.modal_surface_target(Modal::DirtyClose).instance, previous_lower.instance);
+        assert_eq!(
+            app.modal_surface_target(Modal::SettingsReset),
+            upper,
+            "a lower request replacement cannot revoke the upper gesture"
+        );
+        assert_ne!(
+            app.modal_surface_target(Modal::DirtyClose).instance,
+            previous_lower.instance
+        );
         let upper_cancel = widget::Id::new("dialog.reset-settings.cancel");
-        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), upper_focus),
-            Some(upper_cancel), "queued upper focus remains current");
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), upper_focus),
+            Some(upper_cancel),
+            "queued upper focus remains current"
+        );
         let pop = app.update(held_upper);
         assert!(!app.settings_reset_confirm);
         assert_eq!(app.top_modal(), Some(Modal::DirtyClose));
         let cancel = dirty_close_control_id(second, DirtyCloseControl::Cancel);
-        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), pop),
-            Some(cancel.clone()), "the replacement has safe initial focus, not its predecessor's field");
-        let decision = emitted_dialog_decision(&app, cancel,
-            |message| matches!(message, Message::CancelRepositoryClose));
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), pop),
+            Some(cancel.clone()),
+            "the replacement has safe initial focus, not its predecessor's field"
+        );
+        let decision = emitted_dialog_decision(&app, cancel, |message| {
+            matches!(message, Message::CancelRepositoryClose)
+        });
         let restore = app.update(decision);
         assert!(app.dirty_repository_close.is_none());
-        assert_eq!(super::super::tests::focused_element(observed_input(root_snapshot, root.clone()), restore),
-            Some(root), "full unwind retains the original workspace target");
+        assert_eq!(
+            super::super::tests::focused_element(
+                observed_input(root_snapshot, root.clone()),
+                restore
+            ),
+            Some(root),
+            "full unwind retains the original workspace target"
+        );
     }
 
     #[test]
@@ -1221,7 +1403,10 @@ mod tests {
         stack.reconcile(&[Modal::Resume], widget::Id::new("fallback"));
         // Sampling another workspace field must not rewrite an existing
         // modal chain's original restore link during an atomic replacement.
-        focus_input(stack.workspace_focus.clone(), widget::Id::new("fixture.later-workspace-focus"));
+        focus_input(
+            stack.workspace_focus.clone(),
+            widget::Id::new("fixture.later-workspace-focus"),
+        );
         stack.reconcile(&[Modal::SettingsReset], widget::Id::new("fallback"));
         assert_eq!(stack.frames[0].restore, root);
     }
@@ -1741,23 +1926,40 @@ mod tests {
 
     #[test]
     fn dirty_close_tab_starts_at_the_actual_native_focused_button() {
-        for (backwards, expected) in [(false, DirtyCloseControl::Cancel),
-            (true, DirtyCloseControl::Discard)] {
+        for (backwards, expected) in [
+            (false, DirtyCloseControl::Cancel),
+            (true, DirtyCloseControl::Discard),
+        ] {
             let mut app = app();
             let card = app.workspace.focused().unwrap();
-            app.cards.insert(card, CardRuntime::Repository(Box::new(
-                RepositoryRuntime::dirty_fixture(card))));
+            app.cards.insert(
+                card,
+                CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+            );
             drop(app.begin_dirty_close(DirtyCloseIntent::Card(card), VecDeque::from([card])));
             drop(app.finish_modal_update(Task::none()));
             let save = dirty_close_control_id(card, DirtyCloseControl::Save);
-            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(),
-                iced::widget::operation::focus(save.clone()).map(cosmic::Action::App)), Some(save));
-            assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, DirtyCloseControl::Cancel,
-                "native/accessibility focus can move independently of the custom cycle");
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.dialog().unwrap(),
+                    iced::widget::operation::focus(save.clone()).map(cosmic::Action::App)
+                ),
+                Some(save)
+            );
+            assert_eq!(
+                app.dirty_repository_close.as_ref().unwrap().focused,
+                DirtyCloseControl::Cancel,
+                "native/accessibility focus can move independently of the custom cycle"
+            );
             let task = app.cycle_dirty_close_focus(backwards);
-            assert_eq!(app.dirty_repository_close.as_ref().unwrap().focused, expected);
-            assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
-                Some(dirty_close_control_id(card, expected)));
+            assert_eq!(
+                app.dirty_repository_close.as_ref().unwrap().focused,
+                expected
+            );
+            assert_eq!(
+                super::super::tests::focused_element(app.dialog().unwrap(), task),
+                Some(dirty_close_control_id(card, expected))
+            );
         }
     }
 

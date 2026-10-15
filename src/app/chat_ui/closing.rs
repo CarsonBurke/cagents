@@ -1,6 +1,6 @@
 //! Hiding a view and ending the conversation are separate operations.
-use crate::ui_controls::field::EditorContent;
 use super::*;
+use crate::ui_controls::field::EditorContent;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Action {

@@ -65,10 +65,17 @@ pub(super) fn keyboard_focus_regions() -> Vec<(widget::Id, crate::input_trace::K
     ]
     .into_iter()
     .map(str::to_owned)
-    .chain(crate::agent::Provider::ALL.into_iter().map(|provider| {
-        format!("onboarding.provider.{}", provider.executable())
-    }))
-    .map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into()))
+    .chain(
+        crate::agent::Provider::ALL
+            .into_iter()
+            .map(|provider| format!("onboarding.provider.{}", provider.executable())),
+    )
+    .map(|id| {
+        (
+            widget::Id::new(id),
+            workspace_widget::FocusedPane::Other.into(),
+        )
+    })
     .collect()
 }
 
@@ -175,8 +182,8 @@ impl Cagents {
         let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
         let first_run = self.sidebar_model.projects.is_empty() && !scoped;
         let enabled = !self.workspace_inputs_blocked();
-        let action_enabled = |command| enabled
-            && workspace_widget::shortcut_descriptor(command).available(&context);
+        let action_enabled =
+            |command| enabled && workspace_widget::shortcut_descriptor(command).available(&context);
         let mut content: Vec<Element<'_, Message>> = Vec::new();
         if scoped {
             let directory = self.terminal_directory();
@@ -419,7 +426,8 @@ impl Cagents {
             _ => None,
         };
         if let Some(command) = required
-            && !workspace_widget::shortcut_descriptor(command).available(&self.chrome_command_context())
+            && !workspace_widget::shortcut_descriptor(command)
+                .available(&self.chrome_command_context())
         {
             // Reuse the registry's execution refusal if a previously rendered
             // Home action arrives after its device or save context changed.
@@ -557,7 +565,8 @@ impl Cagents {
 
     pub(super) fn clone_repository_dialog(&self) -> Option<Element<'_, Message>> {
         let dialog = self.chrome_ui.clone_repository.as_ref()?;
-        let can_submit = !dialog.running && !dialog.url.trim().is_empty()
+        let can_submit = !dialog.running
+            && !dialog.url.trim().is_empty()
             && !dialog.destination.trim().is_empty();
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Clone repository").into(),
@@ -582,9 +591,13 @@ impl Cagents {
             rows.push(design::body("Cloning repository…").into());
         }
         rows.push(dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary(if dialog.running { "Stop clone" } else { "Cancel" })
-                .id(widget::Id::new("onboarding.clone.cancel"))
-                .on_press(Message::Onboarding(Action::Cancel)),
+            crate::ui_controls::button::secondary(if dialog.running {
+                "Stop clone"
+            } else {
+                "Cancel"
+            })
+            .id(widget::Id::new("onboarding.clone.cancel"))
+            .on_press(Message::Onboarding(Action::Cancel)),
             crate::ui_controls::button::primary("Clone and open")
                 .on_press_maybe(can_submit.then_some(Message::Onboarding(Action::Submit))),
         ));
@@ -609,37 +622,83 @@ mod tests {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut renderer = super::super::tests::headless_renderer();
         for (scoped, ids) in [
-            (false, &["onboarding.open-folder", "onboarding.clone", "onboarding.home-chat"][..]),
-            (true, &["empty.new-conversation", "empty.resume-conversation", "empty.new-terminal",
-                "empty.new-browser", "empty.accounts"][..]),
+            (
+                false,
+                &[
+                    "onboarding.open-folder",
+                    "onboarding.clone",
+                    "onboarding.home-chat",
+                ][..],
+            ),
+            (
+                true,
+                &[
+                    "empty.new-conversation",
+                    "empty.resume-conversation",
+                    "empty.new-terminal",
+                    "empty.new-browser",
+                    "empty.accounts",
+                ][..],
+            ),
         ] {
             for id in ids {
                 let mut app = super::super::tests::context_inspector_test_app(false);
-                if scoped { app.active_workspace = Some(root.path().to_owned()); }
+                if scoped {
+                    app.active_workspace = Some(root.path().to_owned());
+                }
                 // Render the actual application observer, not a test-only
                 // scope wrapper around a synthetic button.
-                let mut ui = UserInterface::build(cosmic::Application::view(&app),
-                    Size::new(1400., 1400.), Cache::new(), &mut renderer);
+                let mut ui = UserInterface::build(
+                    cosmic::Application::view(&app),
+                    Size::new(1400., 1400.),
+                    Cache::new(),
+                    &mut renderer,
+                );
                 ui.operate(&renderer, &mut focusable::focus::<()>(widget::Id::new(*id)));
                 let key = keyboard::Key::Character("t".into());
                 let event = keyboard::Event::KeyPressed {
-                    key: key.clone(), modified_key: key,
+                    key: key.clone(),
+                    modified_key: key,
                     physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
-                    location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL,
-                    text: None, repeat: false,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
                 };
                 let mut messages = Vec::new();
-                let _ = ui.update(&[Event::Keyboard(event.clone())], mouse::Cursor::Unavailable,
-                    &mut renderer, &mut clipboard::Null, &mut messages);
-                let routed: Vec<_> = messages.iter().filter_map(|message| match message {
-                    Message::RoutedKeyEvent { region, widget, .. } => Some((*region, widget.clone())),
-                    _ => None,
-                }).collect();
-                assert_eq!(routed, vec![(workspace_widget::FocusedPane::Other.into(),
-                    Some(widget::Id::new(*id)))], "actual native action focus must retain its identity: {id}");
-                assert_eq!(workspace_widget::global_shortcut(&event, &app.settings.keyboard_shortcuts,
-                    routed[0].0.pane), Some(workspace_widget::GlobalShortcut::NewThread),
-                    "CtrlT must remain available after focusing {id}");
+                let _ = ui.update(
+                    &[Event::Keyboard(event.clone())],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                let routed: Vec<_> = messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::RoutedKeyEvent { region, widget, .. } => {
+                            Some((*region, widget.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    routed,
+                    vec![(
+                        workspace_widget::FocusedPane::Other.into(),
+                        Some(widget::Id::new(*id))
+                    )],
+                    "actual native action focus must retain its identity: {id}"
+                );
+                assert_eq!(
+                    workspace_widget::global_shortcut(
+                        &event,
+                        &app.settings.keyboard_shortcuts,
+                        routed[0].0.pane
+                    ),
+                    Some(workspace_widget::GlobalShortcut::NewThread),
+                    "CtrlT must remain available after focusing {id}"
+                );
             }
         }
     }
@@ -750,12 +809,22 @@ mod tests {
         assert!(
             activate(app.empty_workspace_view(), "onboarding.open-folder")
                 .iter()
-                .any(|m| matches!(m, Message::Onboarding(Action::Command(workspace_widget::GlobalShortcut::OpenFolder))))
+                .any(|m| matches!(
+                    m,
+                    Message::Onboarding(Action::Command(
+                        workspace_widget::GlobalShortcut::OpenFolder
+                    ))
+                ))
         );
         assert!(
             activate(app.empty_workspace_view(), "onboarding.clone")
                 .iter()
-                .any(|m| matches!(m, Message::Onboarding(Action::Command(workspace_widget::GlobalShortcut::CloneRepository))))
+                .any(|m| matches!(
+                    m,
+                    Message::Onboarding(Action::Command(
+                        workspace_widget::GlobalShortcut::CloneRepository
+                    ))
+                ))
         );
         assert!(
             activate(app.empty_workspace_view(), "onboarding.home-chat")
@@ -780,12 +849,24 @@ mod tests {
                 context.save_in_flight = save_in_flight;
                 let expected = workspace_widget::shortcut_descriptor(command).available(&context);
                 let messages = activate(app.empty_workspace_view_with_context(context), id);
-                let actions: Vec<_> = messages.iter().filter(|message| matches!(message,
-                    Message::Onboarding(Action::Command(_) | Action::HomeChat))).collect();
-                assert_eq!(actions.len(), usize::from(expected),
-                    "actual focused Home button must agree with registry: {id}, remote={remote_device}, saving={save_in_flight}");
+                let actions: Vec<_> = messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message,
+                            Message::Onboarding(Action::Command(_) | Action::HomeChat)
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    actions.len(),
+                    usize::from(expected),
+                    "actual focused Home button must agree with registry: {id}, remote={remote_device}, saving={save_in_flight}"
+                );
                 if command != Command::NewThread && expected {
-                    assert!(matches!(actions[0], Message::Onboarding(Action::Command(actual)) if *actual == command));
+                    assert!(
+                        matches!(actions[0], Message::Onboarding(Action::Command(actual)) if *actual == command)
+                    );
                 }
             }
         }
@@ -810,25 +891,44 @@ mod tests {
                 assert!(context.sidebar_commands.is_none());
                 let expected = workspace_widget::shortcut_descriptor(command).available(&context);
                 let messages = activate(app.empty_workspace_view_with_context(context), id);
-                assert_eq!(messages.iter().filter(|message| matches!(message,
-                    Message::Onboarding(Action::Command(actual)) if *actual == command)).count(),
-                    usize::from(expected), "scoped button must agree with registry: {id}");
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message,
+                    Message::Onboarding(Action::Command(actual)) if *actual == command))
+                        .count(),
+                    usize::from(expected),
+                    "scoped button must agree with registry: {id}"
+                );
             }
         }
-        assert!(activate(app.empty_workspace_view(), "empty.accounts").iter().any(|message|
-            matches!(message, Message::Onboarding(Action::Command(Command::OpenAgentAccounts)))));
+        assert!(
+            activate(app.empty_workspace_view(), "empty.accounts")
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    Message::Onboarding(Action::Command(Command::OpenAgentAccounts))
+                ))
+        );
     }
 
     #[test]
     fn queued_home_commands_respect_update_freeze_without_a_confirmation_modal() {
         use workspace_widget::GlobalShortcut as Command;
-        for command in [Command::NewThread, Command::CloneRepository, Command::ResumeConversation, Command::OpenAgentAccounts] {
+        for command in [
+            Command::NewThread,
+            Command::CloneRepository,
+            Command::ResumeConversation,
+            Command::OpenAgentAccounts,
+        ] {
             let mut app = super::super::tests::context_inspector_test_app(false);
             assert!(!app.modal_is_open());
             assert!(!app.workspace_inputs_blocked());
             app.update_prepared = true;
             let message = Message::Onboarding(Action::Command(command));
-            assert!(super::super::user_workspace_message_blocked_while_modal(&message));
+            assert!(super::super::user_workspace_message_blocked_while_modal(
+                &message
+            ));
             assert!(super::super::user_message_blocked_during_update(&message));
             let cards = app.durable.cards.len();
             let focused = app.workspace.focused();
@@ -836,7 +936,10 @@ mod tests {
             assert_eq!(app.durable.cards.len(), cards);
             assert_eq!(app.workspace.focused(), focused);
             assert!(app.chrome_ui.clone_repository.is_none());
-            assert!(!app.modal_is_open(), "a frozen command must not open a form");
+            assert!(
+                !app.modal_is_open(),
+                "a frozen command must not open a form"
+            );
         }
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update_onboarding(Action::Clone));
@@ -844,11 +947,19 @@ mod tests {
         form.running = true;
         let id = form.id;
         app.update_prepared = true;
-        let completed = Message::Onboarding(Action::Finished { id, result: Err("fixture failure".into()) });
-        assert!(!super::super::user_message_blocked_during_update(&completed));
+        let completed = Message::Onboarding(Action::Finished {
+            id,
+            result: Err("fixture failure".into()),
+        });
+        assert!(!super::super::user_message_blocked_during_update(
+            &completed
+        ));
         drop(app.update(completed));
         let form = app.chrome_ui.clone_repository.as_ref().unwrap();
-        assert!(!form.running, "background completion must settle during the freeze");
+        assert!(
+            !form.running,
+            "background completion must settle during the freeze"
+        );
         assert!(form.error.as_ref().unwrap().contains("fixture failure"));
     }
 
@@ -940,8 +1051,14 @@ mod tests {
             let id = dialog.id;
             let task = app.update_onboarding(Action::Submit);
             let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
-            assert!(dialog.running, "Submit must schedule the worker before validation");
-            assert!(dialog.error.is_none(), "validation must not run during Submit dispatch");
+            assert!(
+                dialog.running,
+                "Submit must schedule the worker before validation"
+            );
+            assert!(
+                dialog.error.is_none(),
+                "validation must not run during Submit dispatch"
+            );
             let reply = super::super::tests::task_app_message(task);
             let Message::Onboarding(Action::Finished { id: actual, result }) = reply else {
                 panic!("clone worker must return its owned result");
@@ -1151,30 +1268,67 @@ mod native_header_tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update_onboarding(Action::Clone));
         let renderer = super::super::tests::headless_renderer();
-        for (running, filled, submits) in [(false, false, false), (false, true, true), (true, true, false)] {
+        for (running, filled, submits) in [
+            (false, false, false),
+            (false, true, true),
+            (true, true, false),
+        ] {
             let form = app.chrome_ui.clone_repository.as_mut().unwrap();
             form.running = running;
-            form.url = if filled { "https://example.invalid/repo.git".into() } else { String::new() };
-            form.destination = if filled { "/fixture/clone".into() } else { String::new() };
-            for id in [clone_focus_id(), widget::Id::new("onboarding.clone.destination")] {
+            form.url = if filled {
+                "https://example.invalid/repo.git".into()
+            } else {
+                String::new()
+            };
+            form.destination = if filled {
+                "/fixture/clone".into()
+            } else {
+                String::new()
+            };
+            for id in [
+                clone_focus_id(),
+                widget::Id::new("onboarding.clone.destination"),
+            ] {
                 let mut element = app.clone_repository_dialog().unwrap();
                 let mut tree = Tree::new(&element);
                 let bounds = Rectangle::with_size(Size::new(800.0, 600.0));
-                let node = element.as_widget_mut().layout(&mut tree, &renderer,
-                    &layout::Limits::new(Size::ZERO, bounds.size()));
-                element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-                    &mut iced::advanced::widget::operation::focusable::focus::<()>(id));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, bounds.size()),
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+                );
                 let mut messages = Vec::new();
-                element.as_widget_mut().update(&mut tree, &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
-                }), Layout::new(&node), mouse::Cursor::Unavailable, &renderer,
-                    &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
-                assert_eq!(messages.iter().any(|message| matches!(message, Message::Onboarding(Action::Submit))), submits,
-                    "running={running}, filled={filled}");
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &bounds,
+                );
+                assert_eq!(
+                    messages
+                        .iter()
+                        .any(|message| matches!(message, Message::Onboarding(Action::Submit))),
+                    submits,
+                    "running={running}, filled={filled}"
+                );
             }
         }
     }
@@ -1184,31 +1338,67 @@ mod native_header_tests {
         let mut element = app.dialog().expect("actual registered Clone surface");
         let mut tree = Tree::new(&element);
         let bounds = Rectangle::with_size(Size::new(800.0, 600.0));
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, bounds.size()));
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(focus));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(focus),
+        );
         let mut messages = Vec::new();
-        let key = if editing { keyboard::Key::Character("x".into()) }
-            else { keyboard::Key::Named(keyboard::key::Named::Enter) };
-        element.as_widget_mut().update(&mut tree, &Event::Keyboard(keyboard::Event::KeyPressed {
-            modified_key: key.clone(), key,
-            physical_key: keyboard::key::Physical::Code(if editing { keyboard::key::Code::KeyX }
-                else { keyboard::key::Code::Enter }),
-            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
-            text: editing.then(|| "x".into()), repeat: false,
-        }), Layout::new(&node), mouse::Cursor::Unavailable, &renderer,
-            &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
-        messages.into_iter().find(|message| matches!(message,
-            Message::ModalSurface { message, .. } if matches!(&**message, Message::Onboarding(_))))
+        let key = if editing {
+            keyboard::Key::Character("x".into())
+        } else {
+            keyboard::Key::Named(keyboard::key::Named::Enter)
+        };
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Code(if editing {
+                    keyboard::key::Code::KeyX
+                } else {
+                    keyboard::key::Code::Enter
+                }),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: editing.then(|| "x".into()),
+                repeat: false,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages
+            .into_iter()
+            .find(|message| {
+                matches!(message,
+            Message::ModalSurface { message, .. } if matches!(&**message, Message::Onboarding(_)))
+            })
             .expect("actual widget emits an owner-bound Clone action")
     }
 
     #[test]
     fn replaced_clone_request_rejects_held_widget_input_submit_and_cancel() {
         let directory = tempfile::tempdir().unwrap();
-        let original_destination = directory.path().join("original").to_string_lossy().into_owned();
-        let replacement_destination = directory.path().join("replacement").to_string_lossy().into_owned();
+        let original_destination = directory
+            .path()
+            .join("original")
+            .to_string_lossy()
+            .into_owned();
+        let replacement_destination = directory
+            .path()
+            .join("replacement")
+            .to_string_lossy()
+            .into_owned();
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update_onboarding(Action::Clone));
         {
@@ -1235,7 +1425,10 @@ mod native_header_tests {
         assert_ne!(original, replacement);
         for decision in held {
             assert!(iced::runtime::task::into_stream(app.update(decision)).is_none());
-            assert_eq!(app.modal_surface_target(modal_ui::Modal::Clone), replacement);
+            assert_eq!(
+                app.modal_surface_target(modal_ui::Modal::Clone),
+                replacement
+            );
             let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
             assert_eq!(dialog.url, "https://example.invalid/replacement.git");
             assert_eq!(dialog.destination, replacement_destination);
@@ -1244,14 +1437,17 @@ mod native_header_tests {
         drop(app.finish_modal_update(Task::none()));
         let current = emitted_clone_form_message(&app, clone_focus_id(), true);
         drop(app.update(current));
-        assert_ne!(app.chrome_ui.clone_repository.as_ref().unwrap().url,
-            "https://example.invalid/replacement.git");
+        assert_ne!(
+            app.chrome_ui.clone_repository.as_ref().unwrap().url,
+            "https://example.invalid/replacement.git"
+        );
         let submit = emitted_clone_form_message(&app, clone_focus_id(), false);
         // The worker is deliberately not polled: this is user-consent
         // admission, not a live/network Git clone test.
         drop(app.update(submit));
         assert!(app.chrome_ui.clone_repository.as_ref().unwrap().running);
-        let cancel = emitted_clone_form_message(&app, widget::Id::new("onboarding.clone.cancel"), false);
+        let cancel =
+            emitted_clone_form_message(&app, widget::Id::new("onboarding.clone.cancel"), false);
         drop(app.update(cancel));
         assert!(app.chrome_ui.clone_repository.is_none());
     }

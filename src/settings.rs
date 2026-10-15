@@ -464,7 +464,6 @@ pub struct KeyboardShortcuts {
     pub open_automations: Vec<String>,
     pub open_agent_accounts: Vec<String>,
 
-
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
     pub terminal_review: Vec<String>,
@@ -695,7 +694,6 @@ impl Default for KeyboardShortcuts {
             git_history_cherry_pick: Vec::new(),
             open_automations: Vec::new(),
             open_agent_accounts: Vec::new(),
-
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -947,7 +945,6 @@ impl KeyboardShortcuts {
             &self.git_history_cherry_pick,
             &self.open_automations,
             &self.open_agent_accounts,
-
         ]
     }
 
@@ -1172,7 +1169,6 @@ impl KeyboardShortcuts {
             &mut self.git_history_cherry_pick,
             &mut self.open_automations,
             &mut self.open_agent_accounts,
-
         ]
     }
 
@@ -1452,7 +1448,6 @@ const SHORTCUT_ACTIONS: [&str; 217] = [
     "git_history_cherry_pick",
     "open_automations",
     "open_agent_accounts",
-
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1587,7 +1582,16 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
 /// Native code-buffer actions have a narrower scope than workspace actions.
 /// Ordinary text controls and shells keep their own editing commands.
 pub fn is_editor_command(action: &str) -> bool {
-    if matches!(action, "editor_rename_symbol" | "editor_format_document" | "editor_format_selection" | "editor_code_actions" | "editor_signature_help") { return true; }
+    if matches!(
+        action,
+        "editor_rename_symbol"
+            | "editor_format_document"
+            | "editor_format_selection"
+            | "editor_code_actions"
+            | "editor_signature_help"
+    ) {
+        return true;
+    }
     matches!(
         action,
         "editor_undo"
@@ -1662,7 +1666,12 @@ pub fn is_review_command(action: &str) -> bool {
 
 pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
     // Code buffers own their configured symbol rename before generic pane rename.
-    if matches!((left, right), ("editor_rename_symbol", "rename_pane") | ("rename_pane", "editor_rename_symbol")) { return false; }
+    if matches!(
+        (left, right),
+        ("editor_rename_symbol", "rename_pane") | ("rename_pane", "editor_rename_symbol")
+    ) {
+        return false;
+    }
     if (matches!(left, "editor_undo" | "editor_redo") && is_review_command(right))
         || (matches!(right, "editor_undo" | "editor_redo") && is_review_command(left))
     {
@@ -1969,9 +1978,13 @@ const fn default_focus_follows_mouse() -> bool {
     false
 }
 
-const fn default_editor_auto_close() -> bool { true }
+const fn default_editor_auto_close() -> bool {
+    true
+}
 
-const fn default_editor_tab_width() -> u16 { 4 }
+const fn default_editor_tab_width() -> u16 {
+    4
+}
 
 const fn default_editor_auto_save() -> bool {
     true
@@ -2426,7 +2439,10 @@ pub struct LanguageServerSettings {
     pub root_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "server_option_disabled")]
     pub format_on_save: bool,
-    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    #[serde(
+        default = "default_formatting_timeout",
+        skip_serializing_if = "formatting_timeout_is_default"
+    )]
     pub formatting_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "optional_json_absent")]
     pub initialization_options: Option<serde_json::Value>,
@@ -2434,12 +2450,31 @@ pub struct LanguageServerSettings {
     pub configuration: serde_json::Value,
 }
 
-fn server_option_disabled(value:&bool)->bool {!*value}
-fn default_formatting_timeout()->u64 {1000}
-fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
-fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+fn server_option_disabled(value: &bool) -> bool {
+    !*value
+}
+fn default_formatting_timeout() -> u64 {
+    1000
+}
+fn formatting_timeout_is_default(value: &u64) -> bool {
+    *value == default_formatting_timeout()
+}
+fn optional_json_absent(value: &Option<serde_json::Value>) -> bool {
+    value.as_ref().is_none_or(serde_json::Value::is_null)
+}
 impl Default for LanguageServerSettings {
-    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            languages: Vec::new(),
+            command: Vec::new(),
+            root_markers: Vec::new(),
+            format_on_save: false,
+            formatting_timeout_ms: default_formatting_timeout(),
+            initialization_options: None,
+            configuration: serde_json::Value::Null,
+        }
+    }
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -3055,7 +3090,6 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 212] = [
     "git_history_cherry_pick",
     "open_automations",
     "open_agent_accounts",
-
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -3329,7 +3363,9 @@ impl AppSettings {
             ));
         }
         if !(1..=16).contains(&self.editor_tab_width) {
-            return Err(SettingsError::Invalid("editor_tab_width must be between 1 and 16".into()));
+            return Err(SettingsError::Invalid(
+                "editor_tab_width must be between 1 and 16".into(),
+            ));
         }
         if self
             .editor_font_size
@@ -3424,11 +3460,18 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
     for server in servers {
         let id = server.id.as_str();
         if !(50..=10_000).contains(&server.formatting_timeout_ms) {
-            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} formatting_timeout_ms must be between 50 and 10000"
+            )));
         }
-        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
-            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
-            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) || serde_json::to_vec(&server.configuration)
+            .map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} configuration must fit within 1 MiB"
+            )));
         }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -4805,20 +4848,25 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 mod tests {
     #[test]
     fn language_server_editor_options_round_trip_and_validate() {
-        let mut settings=AppSettings::default();
-        settings.language_servers[0].format_on_save=true;
-        settings.language_servers[0].formatting_timeout_ms=750;
-        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
-        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
-        let text=toml::to_string(&settings).unwrap();
-        let decoded:AppSettings=toml::from_str(&text).unwrap();
-        assert_eq!(decoded.language_servers,settings.language_servers);
+        let mut settings = AppSettings::default();
+        settings.language_servers[0].format_on_save = true;
+        settings.language_servers[0].formatting_timeout_ms = 750;
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration =
+            serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers, settings.language_servers);
         assert!(decoded.validate().is_ok());
-        for timeout in [0,49,10001,u64::MAX] {
-            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+        for timeout in [0, 49, 10001, u64::MAX] {
+            let mut settings = AppSettings::default();
+            settings.language_servers[0].formatting_timeout_ms = timeout;
             assert!(settings.validate().is_err());
         }
-        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        let mut settings = AppSettings::default();
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
         assert!(settings.validate().is_err());
     }
 
@@ -4980,7 +5028,6 @@ mod tests {
         settings.git_status_limit = usize::MAX;
         assert_eq!(settings.validate().unwrap().git_status_limit, 100_000);
     }
-
 
     #[test]
     fn introduced_terminal_review_preserves_existing_custom_binding() {
@@ -7471,8 +7518,19 @@ new_thread = "Alt+Shift+G"
         assert_eq!(shortcuts.rename_pane, ["F2"]);
         assert_eq!(shortcuts.editor_rename_symbol, ["F2"]);
         assert!(shortcuts.fault().is_none());
-        assert!(!shortcut_binding_conflicts("editor_rename_symbol", "rename_pane", parse_shortcut("F2").unwrap()));
-        assert!(shortcut_binding_conflicts("editor_code_actions", "rename_pane", parse_shortcut("F2").unwrap()), "only the deliberate symbol/pane rename precedence is shared");
+        assert!(!shortcut_binding_conflicts(
+            "editor_rename_symbol",
+            "rename_pane",
+            parse_shortcut("F2").unwrap()
+        ));
+        assert!(
+            shortcut_binding_conflicts(
+                "editor_code_actions",
+                "rename_pane",
+                parse_shortcut("F2").unwrap()
+            ),
+            "only the deliberate symbol/pane rename precedence is shared"
+        );
     }
 
     #[test]
@@ -7489,7 +7547,6 @@ new_thread = "Alt+Shift+G"
             assert_eq!(shortcuts.actions()[index], &chords);
         }
     }
-
 
     #[test]
     fn terminal_integration_settings_have_safe_backwards_compatible_defaults() {

@@ -1,5 +1,5 @@
-use super::*;
 use super::worktree_dialog::WorktreeCreationSource;
+use super::*;
 use crate::{
     model::OperationId,
     repository::{
@@ -37,11 +37,17 @@ pub(super) struct ActiveWorktreeOperation {
 }
 
 impl ActiveWorktreeOperation {
-    pub(super) fn project_generation(&self) -> Option<u64> { self.project_generation }
+    pub(super) fn project_generation(&self) -> Option<u64> {
+        self.project_generation
+    }
 
-    pub(super) fn project_creation_id(&self) -> Option<OperationId> { self.project_creation_id }
+    pub(super) fn project_creation_id(&self) -> Option<OperationId> {
+        self.project_creation_id
+    }
 
-    pub(super) fn source(&self) -> Option<WorktreeCreationSource> { self.source.clone() }
+    pub(super) fn source(&self) -> Option<WorktreeCreationSource> {
+        self.source.clone()
+    }
 
     pub(super) fn project(&self) -> ProjectId {
         self.project
@@ -194,18 +200,31 @@ impl Cagents {
         draft: Option<WorktreeDraft>,
         source: Option<WorktreeCreationSource>,
     ) -> Task<Message> {
-        self.start_worktree_operation_with_project_source(project, request, draft, source, None, None)
+        self.start_worktree_operation_with_project_source(
+            project, request, draft, source, None, None,
+        )
     }
 
     pub(super) fn start_worktree_operation_with_project_source(
-        &mut self, project: ProjectId, request: CreateWorktreeRequest,
-        draft: Option<WorktreeDraft>, source: Option<WorktreeCreationSource>,
-        project_creation_id: Option<OperationId>, project_generation: Option<u64>,
+        &mut self,
+        project: ProjectId,
+        request: CreateWorktreeRequest,
+        draft: Option<WorktreeDraft>,
+        source: Option<WorktreeCreationSource>,
+        project_creation_id: Option<OperationId>,
+        project_generation: Option<u64>,
     ) -> Task<Message> {
-        if !self.creation_project_is_current(project, project_generation) || project_creation_id.is_some_and(|id| {
-            !self.current_project_creation_source(project, id) || source.as_ref().is_none_or(|source| source.id() != id || !source.is_available())
-        }) {
-            self.status = Some(TransientNotice::warning("The original project source changed. No worktree creation was started; reload the project."));
+        if !self.creation_project_is_current(project, project_generation)
+            || project_creation_id.is_some_and(|id| {
+                !self.current_project_creation_source(project, id)
+                    || source
+                        .as_ref()
+                        .is_none_or(|source| source.id() != id || !source.is_available())
+            })
+        {
+            self.status = Some(TransientNotice::warning(
+                "The original project source changed. No worktree creation was started; reload the project.",
+            ));
             return Task::none();
         }
         let Some(session) = self.session.as_ref() else {
@@ -398,19 +417,31 @@ impl Cagents {
         };
         self.sync_worktree_operation_rows();
         if !self.creation_project_is_current(project_id, project_generation)
-            || project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
-            self.status = Some(TransientNotice::warning("Creation settled against its original source after the displayed project changed. Its journal receipt was retained; reload the original project to inspect the result."));
+            || project_creation_id
+                .is_some_and(|binding| !self.current_project_creation_source(project_id, binding))
+        {
+            self.status = Some(TransientNotice::warning(
+                "Creation settled against its original source after the displayed project changed. Its journal receipt was retained; reload the original project to inspect the result.",
+            ));
             return Task::none();
         }
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
-            let (Some(source_id), Some(project_generation)) = (source_id, project_generation) else {
-                self.status = Some(TransientNotice::warning("Creation settled without its original source receipt. Its result was retained; reload the original project to inspect it."));
+            let (Some(source_id), Some(project_generation)) = (source_id, project_generation)
+            else {
+                self.status = Some(TransientNotice::warning(
+                    "Creation settled without its original source receipt. Its result was retained; reload the original project to inspect it.",
+                ));
                 return Task::none();
             };
             return cosmic::task::message(Message::ProjectWorktreeCreated {
-                project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome),
+                project_id,
+                source_id,
+                project_generation,
+                operation: id,
+                repository,
+                result: Ok(outcome),
             });
         }
         Task::none()
@@ -418,20 +449,33 @@ impl Cagents {
     /// Final queued UI publication must still name this exact settled receipt.
     /// Recheck logical generation and the original physical source lifetime at ingress.
     pub(super) fn completed_project_creation_matches(
-        &self, id: OperationId, project: ProjectId, source_id: OperationId, project_generation: u64,
-        repository: &Path, outcome: &WorktreeCreationOutcome,
+        &self,
+        id: OperationId,
+        project: ProjectId,
+        source_id: OperationId,
+        project_generation: u64,
+        repository: &Path,
+        outcome: &WorktreeCreationOutcome,
     ) -> bool {
         self.creation_project_is_current(project, Some(project_generation))
             && self.worktree_operations.get(&id).is_some_and(|operation| {
-            operation.project == project && operation.finished
-                && operation.state == Some(WorktreeOperationState::Created)
-                && operation.project_generation == Some(project_generation)
-                && operation.project_creation_id.is_none_or(|binding| self.current_project_creation_source(project, binding))
-                && operation.source.as_ref().is_some_and(|source| source.id() == source_id && source.is_available())
-                && operation.request.as_ref().is_some_and(|request| request.operation_id == id && request.repository == repository)
-                && matches!(outcome, WorktreeCreationOutcome::Created { .. })
-                && operation.settled_outcome.as_ref() == Some(outcome)
-        })
+                operation.project == project
+                    && operation.finished
+                    && operation.state == Some(WorktreeOperationState::Created)
+                    && operation.project_generation == Some(project_generation)
+                    && operation.project_creation_id.is_none_or(|binding| {
+                        self.current_project_creation_source(project, binding)
+                    })
+                    && operation
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.id() == source_id && source.is_available())
+                    && operation.request.as_ref().is_some_and(|request| {
+                        request.operation_id == id && request.repository == repository
+                    })
+                    && matches!(outcome, WorktreeCreationOutcome::Created { .. })
+                    && operation.settled_outcome.as_ref() == Some(outcome)
+            })
     }
 
     pub(super) fn rehydrate_worktree_operations(&self) -> Task<Message> {

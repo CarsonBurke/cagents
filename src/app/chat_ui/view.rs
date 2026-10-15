@@ -1,6 +1,6 @@
-use crate::ui_controls::field::EditorContent;
 use super::coordination::Coordinated;
 use super::*;
+use crate::ui_controls::field::EditorContent;
 use crate::workspace_widget::GlobalShortcut as RegisteredAction;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
@@ -2939,7 +2939,9 @@ impl Runtime {
                             .class(crate::ui_controls::control_style(false, None))
                             .padding([step::GAP_XS, step::GAP_S])
                             .width(Length::Fill)
-                            .on_press_maybe(accounts.manage_available.then_some(Message::AccountUi(crate::app::account_ui::Action::OpenPane)))
+                            .on_press_maybe(accounts.manage_available.then_some(
+                                Message::AccountUi(crate::app::account_ui::Action::OpenPane),
+                            ))
                             .into(),
                     ))
                     .collect::<Vec<_>>(),

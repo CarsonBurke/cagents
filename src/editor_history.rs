@@ -159,7 +159,9 @@ impl Default for History {
 }
 
 impl History {
-    pub(crate) fn retained_bytes(&self) -> usize { self.bytes }
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
 
     fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
@@ -176,7 +178,9 @@ impl History {
 
     /// Identifies this exact point in the undo graph, independent of stack
     /// length, pruning and coalescing. Saving seals the active transaction.
-    pub fn revision(&self) -> u64 { self.revision }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 
     /// Reserves an identity for an external disk baseline without claiming
     /// that the current buffer or any existing undo state contains its bytes.
@@ -197,11 +201,13 @@ impl History {
     /// (for example Discard edits restored the saved contents).
     pub fn adopt_revision(&mut self, known: u64) {
         if let Some(transaction) = self.undo.back_mut()
-            && transaction.after_revision == self.revision {
+            && transaction.after_revision == self.revision
+        {
             transaction.after_revision = known;
         }
         if let Some(transaction) = self.redo.last_mut()
-            && transaction.before_revision == self.revision {
+            && transaction.before_revision == self.revision
+        {
             transaction.before_revision = known;
         }
         self.revision = known;
@@ -689,12 +695,22 @@ impl Excerpt {
 
     /// Captures exactly one explicit server range while retaining the native
     /// removed line boundaries. Every position must lie in this excerpt.
-    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+    pub fn range_change(
+        &self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) -> Option<TextChange> {
         let (from, to) = (self.offset(start)?, self.offset(end)?);
         let removed = self.text.get(from..to)?;
         let inserted = Self::document(replacement);
-        Some(TextChange { start, removed: removed.to_owned(), inserted: replacement.to_owned(),
-            removed_breaks: self.slice_breaks(from, to), inserted_breaks: inserted.slice_breaks(0, replacement.len()) })
+        Some(TextChange {
+            start,
+            removed: removed.to_owned(),
+            inserted: replacement.to_owned(),
+            removed_breaks: self.slice_breaks(from, to),
+            inserted_breaks: inserted.slice_breaks(0, replacement.len()),
+        })
     }
 
     /// The line an offset falls on, by index into `lines`.
@@ -996,7 +1012,11 @@ mod tests {
         assert_eq!(history.revision(), later);
         assert_eq!(history.undo(&mut model), Replay::Applied);
         model.type_text(&mut history, "?", now);
-        assert_ne!(history.revision(), later, "a branch cannot reuse a redo state identity");
+        assert_ne!(
+            history.revision(),
+            later,
+            "a branch cannot reuse a redo state identity"
+        );
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert_eq!(history.revision(), saved);
         assert_eq!(history.undo(&mut model), Replay::Applied);
@@ -1012,17 +1032,29 @@ mod tests {
         model.edit(&mut history, 0, 1, "B", EditKind::Other, now);
         let mine = history.revision();
         let external = history.reserve_revision();
-        assert_eq!(history.revision(), mine, "Keep mine must retain the buffer's identity");
+        assert_eq!(
+            history.revision(),
+            mine,
+            "Keep mine must retain the buffer's identity"
+        );
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert_eq!(model.text, "A");
         assert_eq!(history.revision(), initial);
-        assert_ne!(history.revision(), external, "Undo to A is dirty against external disk C");
+        assert_ne!(
+            history.revision(),
+            external,
+            "Undo to A is dirty against external disk C"
+        );
         assert_eq!(history.redo(&mut model), Replay::Applied);
         assert_eq!(model.text, "B");
         assert_eq!(history.revision(), mine);
         assert_ne!(history.revision(), external);
         model.edit(&mut history, 0, 1, "C", EditKind::Other, now);
-        assert_ne!(history.revision(), external, "future edits cannot consume the reserved identity");
+        assert_ne!(
+            history.revision(),
+            external,
+            "future edits cannot consume the reserved identity"
+        );
         // A byte comparison now proves that this state equals disk C.
         history.adopt_revision(external);
         assert_eq!(history.undo(&mut model), Replay::Applied);

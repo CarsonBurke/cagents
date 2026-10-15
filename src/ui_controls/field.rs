@@ -4,7 +4,7 @@
 //! A field here is one dense row high with the same corner as the buttons
 //! beside it and a hairline edge, so a form reads as one column of controls.
 
-pub use super::editable::{TextEditor, TextInput, EditorContent, EditorHistoryCommand};
+pub use super::editable::{EditorContent, EditorHistoryCommand, TextEditor, TextInput};
 use std::borrow::Cow;
 
 use cosmic::{

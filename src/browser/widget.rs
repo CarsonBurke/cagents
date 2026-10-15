@@ -870,24 +870,47 @@ mod tests {
                 .id(content.clone())
                 .model_focused(true)
                 .window_focused(view_focused);
-            let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
-                Cache::new(), &mut renderer);
+            let mut ui = UserInterface::build(
+                browser.into(),
+                Size::new(400., 240.),
+                Cache::new(),
+                &mut renderer,
+            );
             ui.operate(&renderer, &mut focusable::focus::<()>(content));
             // UserInterface processes this whole native batch before the
             // queued application focus message can build a fresh view.
-            let (_, statuses) = ui.update(&[
-                Event::Window(if view_focused { window::Event::Unfocused } else { window::Event::Focused }),
-                press("a", Code::KeyA, keyboard::Modifiers::empty()),
-            ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+            let (_, statuses) = ui.update(
+                &[
+                    Event::Window(if view_focused {
+                        window::Event::Unfocused
+                    } else {
+                        window::Event::Focused
+                    }),
+                    press("a", Code::KeyA, keyboard::Modifiers::empty()),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut Vec::new(),
+            );
             let input = queued_input(&handle);
             if view_focused {
-                assert!(input.is_empty(), "native blur overrides the stale active view");
+                assert!(
+                    input.is_empty(),
+                    "native blur overrides the stale active view"
+                );
                 assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Ignored));
             } else {
-                assert!(matches!(input.as_slice(), [BrowserInput::Key {
+                assert!(
+                    matches!(input.as_slice(), [BrowserInput::Key {
                     state: ButtonState::Pressed, code, ..
-                }] if code == "KeyA"), "first key after native return must be delivered");
-                assert_eq!(statuses.last(), Some(&cosmic::iced::event::Status::Captured));
+                }] if code == "KeyA"),
+                    "first key after native return must be delivered"
+                );
+                assert_eq!(
+                    statuses.last(),
+                    Some(&cosmic::iced::event::Status::Captured)
+                );
             }
         }
     }
@@ -901,27 +924,59 @@ mod tests {
         let handle = BrowserHandle::fixture();
         let content = Id::unique();
         let browser = BrowserWidget::<()>::new(&handle)
-            .id(content.clone()).model_focused(true).window_focused(true);
-        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.),
-            Cache::new(), &mut renderer);
+            .id(content.clone())
+            .model_focused(true)
+            .window_focused(true);
+        let mut ui = UserInterface::build(
+            browser.into(),
+            Size::new(400., 240.),
+            Cache::new(),
+            &mut renderer,
+        );
         ui.operate(&renderer, &mut focusable::focus::<()>(content.clone()));
-        let _ = ui.update(&[Event::Window(window::Event::Focused)],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let _ = ui.update(
+            &[Event::Window(window::Event::Focused)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
         // Preserve the native tree and exact attachment, but deliver no blur
         // to it while parked. The remounted view has the newer app snapshot.
         let cache = ui.into_cache();
         let browser = BrowserWidget::<()>::new(&handle)
-            .id(content).model_focused(true).window_focused(false);
-        let mut ui = UserInterface::build(browser.into(), Size::new(400., 240.), cache, &mut renderer);
-        let _ = ui.update(&[press("b", Code::KeyB, keyboard::Modifiers::empty())],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
-        assert!(queued_input(&handle).is_empty(), "old native true cannot outlive a fresh inactive view");
-        let _ = ui.update(&[Event::Window(window::Event::Focused),
-            press("c", Code::KeyC, keyboard::Modifiers::empty())],
-            mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
-        assert!(matches!(queued_input(&handle).as_slice(), [BrowserInput::Key {
+            .id(content)
+            .model_focused(true)
+            .window_focused(false);
+        let mut ui =
+            UserInterface::build(browser.into(), Size::new(400., 240.), cache, &mut renderer);
+        let _ = ui.update(
+            &[press("b", Code::KeyB, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        assert!(
+            queued_input(&handle).is_empty(),
+            "old native true cannot outlive a fresh inactive view"
+        );
+        let _ = ui.update(
+            &[
+                Event::Window(window::Event::Focused),
+                press("c", Code::KeyC, keyboard::Modifiers::empty()),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(queued_input(&handle).as_slice(), [BrowserInput::Key {
             state: ButtonState::Pressed, code, ..
-        }] if code == "KeyC"), "remount retains native content focus for the next window return");
+        }] if code == "KeyC"),
+            "remount retains native content focus for the next window return"
+        );
     }
 
     #[test]

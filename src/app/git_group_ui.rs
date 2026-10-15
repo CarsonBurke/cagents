@@ -58,14 +58,27 @@ impl Cagents {
             .filter(|mutation| mutation.id == operation)
             .map(|mutation| mutation.cancellation.clone())
             .unwrap_or_default();
-        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
-            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
+        let Some(binding) = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|active| active.id == operation)
+            .map(|active| active.binding.clone())
+        else {
+            return Task::none();
+        };
         cosmic::task::future(async move {
             let target = key.clone();
             tokio::task::spawn_blocking(move || {
                 let service = match binding.mutation_service() {
                     Ok(service) => service,
-                    Err(error) => return Message::SourceControlMutated { key: target, operation, report: Some(error), committed: false },
+                    Err(error) => {
+                        return Message::SourceControlMutated {
+                            key: target,
+                            operation,
+                            report: Some(error),
+                            committed: false,
+                        };
+                    }
                 };
                 let worktree = target.canonical_path.clone();
                 let complete = |report| Message::SourceControlMutated {
@@ -160,7 +173,10 @@ impl Cagents {
         let binding = active.binding.clone();
         let cancelled = active.cancellation.is_cancelled();
         let (selection, report) = match result {
-            _ if cancelled => (None, Some("The Git action was cancelled before confirmation.".into())),
+            _ if cancelled => (
+                None,
+                Some("The Git action was cancelled before confirmation.".into()),
+            ),
             Ok(selection) => (Some(selection), None),
             Err(error) => (None, Some(error)),
         };
@@ -172,8 +188,14 @@ impl Cagents {
             report,
             committed: false,
         });
-        if !self.source_control_is_bound(&key) || self.modal_is_open()
-            || self.refresh_ui.source_binding.as_ref().is_none_or(|current| current.id != binding.id) {
+        if !self.source_control_is_bound(&key)
+            || self.modal_is_open()
+            || self
+                .refresh_ui
+                .source_binding
+                .as_ref()
+                .is_none_or(|current| current.id != binding.id)
+        {
             return release;
         }
         let Some(action) = selection
@@ -203,8 +225,16 @@ mod tests {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
-            .arg("-C").arg(root);
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
+            ])
+            .arg("-C")
+            .arg(root);
         command
     }
 
@@ -227,9 +257,20 @@ mod tests {
         output.stdout
     }
 
-    fn group_task(app: &mut Cagents, key: ActiveWorktreeKey, area: ChangeArea, command: ChangeGroupCommand) -> Task<Message> {
-        if let Some(active) = app.source_control_mutations.remove(&key.canonical_path) { active.cancellation.cancel(); }
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation(None);
+    fn group_task(
+        app: &mut Cagents,
+        key: ActiveWorktreeKey,
+        area: ChangeArea,
+        command: ChangeGroupCommand,
+    ) -> Task<Message> {
+        if let Some(active) = app.source_control_mutations.remove(&key.canonical_path) {
+            active.cancellation.cancel();
+        }
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation(None);
         let operation = app.begin_mutation(&key, MutationKind::Other, None).unwrap();
         app.queued_group_task(key, operation, area, command)
     }
@@ -247,12 +288,15 @@ mod tests {
 
     #[tokio::test]
     async fn whole_group_stage_and_unstage_resolve_paths_at_execution_time() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-b", "main"]);
         let (mut app, key) = super::super::git_binding::tests::app_for(root.path());
         fs::write(root.path().join("first.txt"), "first\n").unwrap();
-        let task = group_task(&mut app,
+        let task = group_task(
+            &mut app,
             key.clone(),
             ChangeArea::Untracked,
             ChangeGroupCommand::Stage,
@@ -272,7 +316,8 @@ mod tests {
                 .count(),
             3
         );
-        let task = group_task(&mut app,
+        let task = group_task(
+            &mut app,
             key,
             ChangeArea::Staged,
             ChangeGroupCommand::Unstage,
@@ -289,7 +334,9 @@ mod tests {
 
     #[tokio::test]
     async fn whole_group_stage_preserves_marker_confirmation_and_discard_binds_exact_paths() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-b", "main"]);
         fs::write(root.path().join("merge.txt"), "baseline\n").unwrap();
@@ -322,7 +369,8 @@ mod tests {
         fs::write(root.path().join("safe.txt"), "safe\n").unwrap();
         fs::write(root.path().join("markers.txt"), "untracked text\n").unwrap();
         let (mut app, key) = super::super::git_binding::tests::app_for(root.path());
-        let stage = group_task(&mut app,
+        let stage = group_task(
+            &mut app,
             key.clone(),
             ChangeArea::Conflict,
             ChangeGroupCommand::Stage,
@@ -336,7 +384,8 @@ mod tests {
         assert_eq!(selection.len(), 1);
         assert!(!markers.is_empty());
         assert!(!git(root.path(), &["ls-files", "--unmerged", "-z"]).is_empty());
-        let discard = group_task(&mut app,
+        let discard = group_task(
+            &mut app,
             key.clone(),
             ChangeArea::Untracked,
             ChangeGroupCommand::Discard,

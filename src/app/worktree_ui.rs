@@ -2263,7 +2263,10 @@ mod tests {
         let _ = app.restore_worktree_scope();
         // Exercise presentation after the guarded operation ingress. The
         // actual consent/worker/publication boundary has separate Task tests.
-        let _ = app.apply_worktree_created(project, root.path().into(), Ok(WorktreeCreationOutcome::Created {
+        let _ = app.apply_worktree_created(
+            project,
+            root.path().into(),
+            Ok(WorktreeCreationOutcome::Created {
                 worktree: WorktreeRecord {
                     id: crate::model::WorktreeId::new(),
                     path: nested.clone(),
@@ -2413,7 +2416,10 @@ mod tests {
         let _ = app.restore_worktree_scope();
         // Exercise presentation after the guarded operation ingress. The
         // actual consent/worker/publication boundary has separate Task tests.
-        let _ = app.apply_worktree_created(project, repository.clone(), Ok(report
+        let _ = app.apply_worktree_created(
+            project,
+            repository.clone(),
+            Ok(report
                 .outcome
                 .expect("a created operation reports its outcome")),
         );

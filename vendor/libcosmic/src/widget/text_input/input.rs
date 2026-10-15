@@ -827,7 +827,11 @@ where
             if state.dirty
                 || state.value.raw().font() != font
                 || state.value.raw().size() != iced::Pixels(size)
-                || state.value.raw().line_height().to_absolute(iced::Pixels(size))
+                || state
+                    .value
+                    .raw()
+                    .line_height()
+                    .to_absolute(iced::Pixels(size))
                     != line_height.to_absolute(iced::Pixels(size))
             {
                 state.dirty = false;

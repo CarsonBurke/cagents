@@ -446,8 +446,12 @@ impl Cagents {
         // A conversation can retain a channel after its pane ends. Build the
         // membership index once, rather than scanning all saved conversations
         // again for every candidate channel.
-        let saved_channels: std::collections::HashSet<ChannelId> = self.durable
-            .conversation_channels.values().copied().collect();
+        let saved_channels: std::collections::HashSet<ChannelId> = self
+            .durable
+            .conversation_channels
+            .values()
+            .copied()
+            .collect();
         self.durable
             .channels
             .iter()
@@ -505,7 +509,8 @@ impl Cagents {
     }
 
     fn keep_channel_for_editor_write(&mut self, id: ChannelId) -> Task<Message> {
-        let reason = "Finish saving or applying edits in this channel, then retry deleting it.".to_owned();
+        let reason =
+            "Finish saving or applying edits in this channel, then retry deleting it.".to_owned();
         self.channel_ui.deleting.remove(&id);
         self.channel_ui.failed.insert(id, reason.clone());
         self.status = Some(TransientNotice::warning(format!("Channel kept: {reason}")));
@@ -1395,11 +1400,17 @@ mod tests {
     #[test]
     fn ending_a_saved_conversation_keeps_its_channel_but_explicit_deletion_still_works() {
         let (mut app, channel, _, card) = channel_with_a_conversation();
-        Arc::make_mut(&mut app.durable).conversation_channels.insert("codex:saved-thread".into(), channel);
+        Arc::make_mut(&mut app.durable)
+            .conversation_channels
+            .insert("codex:saved-thread".into(), channel);
         assert!(app.channels_emptied_by(&[card]).is_empty());
-        app.card_state_mut(card).unwrap().existence = Existence::Closed { tombstone: crate::model::Tombstone {
-            operation_id: None, closed_at_unix_ms: 1, reason: Some("closed by user".into()),
-        }};
+        app.card_state_mut(card).unwrap().existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
         drop(app.handle_channel_ui(Action::Delete(channel)));
         assert!(!app.durable.channels.iter().any(|row| row.id == channel));
     }

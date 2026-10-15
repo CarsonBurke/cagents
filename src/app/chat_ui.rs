@@ -1,12 +1,12 @@
 mod session_links;
 use super::*;
-use crate::ui_controls::field::EditorContent;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
 use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
+use crate::ui_controls::field::EditorContent;
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
@@ -1979,9 +1979,7 @@ impl Runtime {
             (Some(_), false) => None,
         };
         let composer = match next {
-            Some(index) => {
-                EditorContent::with_text(self.history[index].trim_end_matches('\n'))
-            }
+            Some(index) => EditorContent::with_text(self.history[index].trim_end_matches('\n')),
             None => self.history_stash.take().unwrap_or_default(),
         };
         self.history_cursor = next;
@@ -6953,7 +6951,9 @@ impl Cagents {
             Action::ComposerHistory(target, command) => {
                 let mut files = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if !command.apply(&mut runtime.composer) { return Task::none(); }
+                    if !command.apply(&mut runtime.composer) {
+                        return Task::none();
+                    }
                     {
                         runtime.dismiss_suggestion();
                         runtime.revision = runtime.revision.wrapping_add(1);
@@ -11315,9 +11315,7 @@ mod tests {
             }));
         }
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(EditorContent::with_text(
-            "Retain this unsent message",
-        ));
+        runtime.replace_draft(EditorContent::with_text("Retain this unsent message"));
         assert_eq!(
             app.automatic_chat_account(target, PromptMode::Send)
                 .unwrap()
@@ -11381,27 +11379,74 @@ mod tests {
 
     #[test]
     fn actual_composer_reducer_handles_type_undo_redo_in_one_native_batch() {
-        use cosmic::iced::{advanced::clipboard, runtime::{UserInterface, user_interface::Cache}};
-        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
+        use cosmic::iced::{
+            advanced::clipboard,
+            runtime::{UserInterface, user_interface::Cache},
+        };
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let initial_revision = chat_runtime(&app, card).revision;
-        let events = [('a', Code::KeyA, false), ('z', Code::KeyZ, true), ('y', Code::KeyY, true)]
-            .into_iter().map(|(character, code, command)| cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(character.to_string().into()), modified_key: keyboard::Key::Character(character.to_string().into()),
-                physical_key: Physical::Code(code), modifiers: if command { keyboard::Modifiers::CTRL } else { keyboard::Modifiers::empty() },
-                text: (!command).then(|| character.to_string().into()), location: keyboard::Location::Standard, repeat: false,
-            })).collect::<Vec<_>>();
+        let events = [
+            ('a', Code::KeyA, false),
+            ('z', Code::KeyZ, true),
+            ('y', Code::KeyY, true),
+        ]
+        .into_iter()
+        .map(|(character, code, command)| {
+            cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(character.to_string().into()),
+                modified_key: keyboard::Key::Character(character.to_string().into()),
+                physical_key: Physical::Code(code),
+                modifiers: if command {
+                    keyboard::Modifiers::CTRL
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: (!command).then(|| character.to_string().into()),
+                location: keyboard::Location::Standard,
+                repeat: false,
+            })
+        })
+        .collect::<Vec<_>>();
         let mut renderer = crate::app::tests::headless_renderer();
         let mut messages = Vec::new();
         {
-            let mut ui = UserInterface::build(app.chat_view(card), iced::Size::new(900.0, 650.0), Cache::new(), &mut renderer);
-            ui.operate(&renderer, &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(card, "chat-composer")));
-            let _ = ui.update(&events, iced::mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+            let mut ui = UserInterface::build(
+                app.chat_view(card),
+                iced::Size::new(900.0, 650.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            ui.operate(
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    card,
+                    "chat-composer",
+                )),
+            );
+            let _ = ui.update(
+                &events,
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
         }
         assert_eq!(chat_runtime(&app, card).composer.text(), "");
-        assert_eq!(messages.iter().filter(|message| matches!(message, Message::ChatUi(Action::ComposerHistory(..)))).count(), 3);
-        for message in messages { drop(app.update(message)); }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::ChatUi(Action::ComposerHistory(..))))
+                .count(),
+            3
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), "a");
         assert_eq!(runtime.revision, initial_revision.wrapping_add(3));

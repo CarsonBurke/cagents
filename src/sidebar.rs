@@ -2369,13 +2369,19 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
 }
 
 impl SourceControlModel {
-    pub fn command_binding_id(&self) -> crate::model::OperationId { self.command_binding_id }
+    pub fn command_binding_id(&self) -> crate::model::OperationId {
+        self.command_binding_id
+    }
 
     /// Only the actual owner may carry this token across its own refreshes.
     /// Equal worktree keys or filesystem names do not establish owner continuity.
-    pub fn set_command_binding_id(&mut self, binding: crate::model::OperationId) { self.command_binding_id = binding; }
+    pub fn set_command_binding_id(&mut self, binding: crate::model::OperationId) {
+        self.command_binding_id = binding;
+    }
 
-    pub fn matches_command_binding(&self, binding: crate::model::OperationId) -> bool { self.command_binding_id == binding }
+    pub fn matches_command_binding(&self, binding: crate::model::OperationId) -> bool {
+        self.command_binding_id == binding
+    }
 
     /// File navigation for a plain folder, without invented Git data.
     pub fn directory(key: ActiveWorktreeKey, paths: &[RepoPath]) -> Self {
@@ -2854,7 +2860,9 @@ impl SourceControlModel {
         }
         // A freshly supplied host refusal takes precedence over older state;
         // an ordinary snapshot with no capability metadata retains the refusal.
-        let mutation_reason = next.mutation_unavailable_reason.clone()
+        let mutation_reason = next
+            .mutation_unavailable_reason
+            .clone()
             .or_else(|| self.mutation_unavailable_reason.clone());
         if matches!(self.data_state, SidebarDataState::Ready)
             && matches!(next.data_state, SidebarDataState::Loading)
@@ -2936,7 +2944,8 @@ impl SourceControlModel {
     /// Amend changes a draft until submission. Turning it off remains possible
     /// if HEAD disappears or an operation begins after it was enabled.
     pub fn can_toggle_amend(&self, current_amend: bool) -> bool {
-        !self.busy() && !self.is_reloading()
+        !self.busy()
+            && !self.is_reloading()
             && (current_amend || (self.head_oid.is_some() && self.operation.is_none()))
     }
 
@@ -2956,7 +2965,8 @@ impl SourceControlModel {
 
     /// Commit needs a message, something staged, and no mutation in flight.
     pub fn can_commit(&self, message: &str) -> bool {
-        self.mutations_available() && !message.trim().is_empty()
+        self.mutations_available()
+            && !message.trim().is_empty()
             && (self.staged_count > 0
                 || self.operation.as_ref().is_some_and(|operation| {
                     operation.kind == crate::repository::GitOperationKind::Merge
@@ -2971,7 +2981,8 @@ impl SourceControlModel {
     /// A branch with no upstream is published instead; see
     /// [`Self::can_publish`].
     pub fn can_push(&self) -> bool {
-        self.mutations_available() && self.branch.is_some()
+        self.mutations_available()
+            && self.branch.is_some()
             && !self.detached
             && !self.busy()
             && self.upstream.is_some()
@@ -2986,7 +2997,8 @@ impl SourceControlModel {
     /// upstream and when this panel could not name the one it has, while
     /// `tracking` is what `git status` reported and knows the difference.
     pub fn can_publish(&self) -> bool {
-        self.mutations_available() && self.branch.is_some()
+        self.mutations_available()
+            && self.branch.is_some()
             && !self.detached
             && !self.busy()
             && self.upstream.is_none()
@@ -3472,9 +3484,8 @@ impl CommitDraft {
         self.message = message.to_owned();
         let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
         self.subject = subject.to_owned();
-        self.subject_composer = CommitComposer(
-            crate::ui_controls::field::EditorContent::with_text(subject),
-        );
+        self.subject_composer =
+            CommitComposer(crate::ui_controls::field::EditorContent::with_text(subject));
         self.composer = CommitComposer(crate::ui_controls::field::EditorContent::with_text(
             description.trim_start_matches('\n'),
         ));
@@ -4063,7 +4074,9 @@ impl SidebarState {
 
     /// A submitted branch form must still own its exact commit and draft.
     pub fn history_branch_matches(&self, oid: &Oid, name: &ValidatedBranchName) -> bool {
-        self.history_branch.as_ref().is_some_and(|(current, draft)| current == oid && draft == name.as_str())
+        self.history_branch
+            .as_ref()
+            .is_some_and(|(current, draft)| current == oid && draft == name.as_str())
     }
 
     pub fn selected_file(&self) -> Option<&RepoPath> {
@@ -4445,7 +4458,10 @@ impl SidebarState {
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
                     if text.trim_end_matches('\n').contains('\n') {
                         // A pasted message stays a single subject line.
-                        self.commit_draft.subject_composer.0.normalize_text(&self.commit_draft.subject);
+                        self.commit_draft
+                            .subject_composer
+                            .0
+                            .normalize_text(&self.commit_draft.subject);
                     }
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -4474,7 +4490,10 @@ impl SidebarState {
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
                     if text.trim_end_matches('\n').contains('\n') {
                         // A pasted message stays a single subject line.
-                        self.commit_draft.subject_composer.0.normalize_text(&self.commit_draft.subject);
+                        self.commit_draft
+                            .subject_composer
+                            .0
+                            .normalize_text(&self.commit_draft.subject);
                     }
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -4493,13 +4512,21 @@ impl SidebarState {
                     );
                 }
             }
-            SidebarAction::HistoryQueryChanged { query, .. } => self.history_query.clone_from(query),
+            SidebarAction::HistoryQueryChanged { query, .. } => {
+                self.history_query.clone_from(query)
+            }
             SidebarAction::HistoryBranchChanged { name, .. } => {
-                if let Some((_, draft)) = self.history_branch.as_mut() { draft.clone_from(name); }
+                if let Some((_, draft)) = self.history_branch.as_mut() {
+                    draft.clone_from(name);
+                }
             }
             SidebarAction::CancelHistoryBranch => self.history_branch = None,
-            SidebarAction::CreateHistoryBranch { .. } => {},
-            SidebarAction::HistoryCommand { oid, command: HistoryCommand::CreateBranch, .. } => self.history_branch = Some((oid.clone(), String::new())),
+            SidebarAction::CreateHistoryBranch { .. } => {}
+            SidebarAction::HistoryCommand {
+                oid,
+                command: HistoryCommand::CreateBranch,
+                ..
+            } => self.history_branch = Some((oid.clone(), String::new())),
             SidebarAction::AmendChanged { amend, .. } => {
                 if self.commit_draft.amend != *amend {
                     if *amend {
@@ -4656,7 +4683,10 @@ pub enum SidebarAction {
     /// Global utility destinations share the registry rather than a row target.
     RunUtilityCommand(crate::workspace_widget::GlobalShortcut),
     /// Original logical owner captured when this source control intent was made.
-    RunBound { binding: crate::model::OperationId, action: Box<SidebarAction> },
+    RunBound {
+        binding: crate::model::OperationId,
+        action: Box<SidebarAction>,
+    },
     RunChangeGroup {
         key: ActiveWorktreeKey,
         area: ChangeArea,
@@ -4965,8 +4995,14 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         message: String,
     },
-    CommitSubjectEditorHistory { key: ActiveWorktreeKey, command: crate::ui_controls::field::EditorHistoryCommand },
-    CommitEditorHistory { key: ActiveWorktreeKey, command: crate::ui_controls::field::EditorHistoryCommand },
+    CommitSubjectEditorHistory {
+        key: ActiveWorktreeKey,
+        command: crate::ui_controls::field::EditorHistoryCommand,
+    },
+    CommitEditorHistory {
+        key: ActiveWorktreeKey,
+        command: crate::ui_controls::field::EditorHistoryCommand,
+    },
     CommitSubjectEditorCursor {
         key: ActiveWorktreeKey,
         cursor: cosmic::iced::widget::text_editor::Cursor,
@@ -4983,12 +5019,31 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         action: cosmic::iced::widget::text_editor::Action,
     },
-    HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
-    SearchHistory { key: ActiveWorktreeKey, query: String },
-    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str> },
-    HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
+    HistoryQueryChanged {
+        key: ActiveWorktreeKey,
+        query: String,
+    },
+    SearchHistory {
+        key: ActiveWorktreeKey,
+        query: String,
+    },
+    HistoryCommand {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+        command: HistoryCommand,
+        mainline: Option<u32>,
+        message: Arc<str>,
+    },
+    HistoryBranchChanged {
+        key: ActiveWorktreeKey,
+        name: String,
+    },
     CancelHistoryBranch,
-    CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
+    CreateHistoryBranch {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+        name: ValidatedBranchName,
+    },
     AmendChanged {
         key: ActiveWorktreeKey,
         amend: bool,
@@ -5237,12 +5292,25 @@ pub fn view_cached<'a>(
 /// ADE passes live workspace capability only to the global utility controls;
 /// row editing and focus remain independently available during a pane save.
 pub fn view_cached_with_utility_context<'a>(
-    model: &'a SidebarModel, state: &'a SidebarState, mode: SidebarMode,
-    persisted_width: f32, modal_open: bool, cache: &'a NavigationCache,
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    mode: SidebarMode,
+    persisted_width: f32,
+    modal_open: bool,
+    cache: &'a NavigationCache,
     shortcuts: &crate::settings::KeyboardShortcuts,
     utility_context: &crate::workspace_widget::CommandContext,
 ) -> Element<'a, SidebarAction> {
-    view_inner(model, state, mode, persisted_width, modal_open, Some(cache), shortcuts, Some(utility_context))
+    view_inner(
+        model,
+        state,
+        mode,
+        persisted_width,
+        modal_open,
+        Some(cache),
+        shortcuts,
+        Some(utility_context),
+    )
 }
 
 fn view_inner<'a>(
@@ -5256,13 +5324,15 @@ fn view_inner<'a>(
     utility_context: Option<&crate::workspace_widget::CommandContext>,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
-    let creation_allowed = utility_context.is_none_or(|context| !context.save_in_flight && !context.remote_device);
+    let creation_allowed =
+        utility_context.is_none_or(|context| !context.save_in_flight && !context.remote_device);
     let width = effective_width(mode, persisted_width);
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts, utility_context)).padding([0.0, space::XS]),
+            widget::container(utilities(compact, modal_open, shortcuts, utility_context))
+                .padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(
@@ -5301,7 +5371,16 @@ fn view_inner<'a>(
                         crate::design::typography_revision(),
                         shortcut_generation,
                     ),
-                    move |_| project_list_with_creation_allowed(model, state, compact, modal_open, &shortcuts, creation_allowed),
+                    move |_| {
+                        project_list_with_creation_allowed(
+                            model,
+                            state,
+                            compact,
+                            modal_open,
+                            &shortcuts,
+                            creation_allowed,
+                        )
+                    },
                 )
                 .into()
             } else {
@@ -5606,16 +5685,35 @@ fn utility_controls<'a>(
     );
     let settings: Element<'a, SidebarAction> =
         crate::ui_controls::icon_button(Icon::Settings, label)
-            .on_press_maybe(gated(SidebarAction::OpenSettings, modal_open || utility_context.is_some_and(|context| !crate::workspace_widget::shortcut_descriptor(crate::workspace_widget::GlobalShortcut::OpenSettings).available(context))))
+            .on_press_maybe(gated(
+                SidebarAction::OpenSettings,
+                modal_open
+                    || utility_context.is_some_and(|context| {
+                        !crate::workspace_widget::shortcut_descriptor(
+                            crate::workspace_widget::GlobalShortcut::OpenSettings,
+                        )
+                        .available(context)
+                    }),
+            ))
             .id(stable_id("settings"))
             .into();
     let command = crate::workspace_widget::GlobalShortcut::OpenAutomations;
-    let label = shortcuts.map_or_else(|| "Automations are available in ADE".to_owned(), |shortcuts| crate::workspace_widget::shortcut_tooltip(command, shortcuts));
-    let available = shortcuts.is_some() && utility_context.map_or_else(
-        || crate::workspace_widget::shortcut_descriptor(command).available_on_device(crate::device::is_remote()),
-        |context| crate::workspace_widget::shortcut_descriptor(command).available(context));
+    let label = shortcuts.map_or_else(
+        || "Automations are available in ADE".to_owned(),
+        |shortcuts| crate::workspace_widget::shortcut_tooltip(command, shortcuts),
+    );
+    let available = shortcuts.is_some()
+        && utility_context.map_or_else(
+            || {
+                crate::workspace_widget::shortcut_descriptor(command)
+                    .available_on_device(crate::device::is_remote())
+            },
+            |context| crate::workspace_widget::shortcut_descriptor(command).available(context),
+        );
     let automations = crate::ui_controls::icon_button(Icon::Alarm, label)
-        .on_press_maybe((available && !modal_open).then_some(SidebarAction::RunUtilityCommand(command)))
+        .on_press_maybe(
+            (available && !modal_open).then_some(SidebarAction::RunUtilityCommand(command)),
+        )
         .id(stable_id("automations"))
         .into();
     [settings, automations]
@@ -5713,11 +5811,25 @@ fn body_with_creation_allowed<'a>(
 ) -> Element<'a, SidebarAction> {
     match &model.data_state {
         SidebarDataState::Loading if !model.projects.is_empty() => {
-            project_list_with_creation_allowed(model, state, compact, modal_open, shortcuts, creation_allowed)
+            project_list_with_creation_allowed(
+                model,
+                state,
+                compact,
+                modal_open,
+                shortcuts,
+                creation_allowed,
+            )
         }
         SidebarDataState::Loading => loading(),
         SidebarDataState::Error(message) => error(message, compact, modal_open),
-        SidebarDataState::Ready => project_list_with_creation_allowed(model, state, compact, modal_open, shortcuts, creation_allowed),
+        SidebarDataState::Ready => project_list_with_creation_allowed(
+            model,
+            state,
+            compact,
+            modal_open,
+            shortcuts,
+            creation_allowed,
+        ),
     }
 }
 
@@ -6643,7 +6755,11 @@ fn project_view<'a>(
                     worktree_view(
                         project_id,
                         worktree,
-                        project_creation_targets_when_allowed(entity, Some(worktree.id), creation_allowed),
+                        project_creation_targets_when_allowed(
+                            entity,
+                            Some(worktree.id),
+                            creation_allowed,
+                        ),
                         is_primary_worktree(&entity.repository, &worktree.path),
                         project.state.filter == SidebarFilter::PullRequests,
                         selection,
@@ -7796,8 +7912,11 @@ impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        if matches!(self.2, ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch)
-            && let Some(target) = self.4 {
+        if matches!(
+            self.2,
+            ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch
+        ) && let Some(target) = self.4
+        {
             return commands::registered(SidebarAction::CreateProjectWorktree(target.clone()));
         }
         if let Some(rows) = &self.3 {
@@ -7826,27 +7945,54 @@ fn new_conversation_label(worktree_id: Option<WorktreeId>) -> &'static str {
 
 /// A press belongs to the published creation owner and its enabled state.
 /// Named button state must not survive replacing that owner under the same project ID.
-fn project_creation_control(project: &SidebarProject, modal_open: bool, allowed: bool, shortcuts: &crate::settings::KeyboardShortcuts) -> Element<'static, SidebarAction> {
+fn project_creation_control(
+    project: &SidebarProject,
+    modal_open: bool,
+    allowed: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'static, SidebarAction> {
     let target = commands::ProjectCreationTarget::capture_project(project, None, false)
         .filter(|_| !modal_open && allowed);
     let enabled = target.is_some();
-    let chords = crate::workspace_widget::shortcut_chords(crate::workspace_widget::GlobalShortcut::NewWorktree, shortcuts);
-    let label = if chords.is_empty() { project.chrome.new_worktree_name.to_string() }
-        else { format!("{} · {chords}", project.chrome.new_worktree_name) };
-    crate::interaction::owned_surface(project_icon_action(
-        Icon::WorktreeAdd,
-        label,
-        target.map(SidebarAction::CreateProjectWorktree),
-        project.chrome.new_worktree_id.clone(),
-    ), (project.creation_binding, enabled))
+    let chords = crate::workspace_widget::shortcut_chords(
+        crate::workspace_widget::GlobalShortcut::NewWorktree,
+        shortcuts,
+    );
+    let label = if chords.is_empty() {
+        project.chrome.new_worktree_name.to_string()
+    } else {
+        format!("{} · {chords}", project.chrome.new_worktree_name)
+    };
+    crate::interaction::owned_surface(
+        project_icon_action(
+            Icon::WorktreeAdd,
+            label,
+            target.map(SidebarAction::CreateProjectWorktree),
+            project.chrome.new_worktree_id.clone(),
+        ),
+        (project.creation_binding, enabled),
+    )
 }
 
-fn project_creation_targets(project: &SidebarProject, worktree: Option<WorktreeId>) -> [Option<commands::ProjectCreationTarget>; 2] {
-    [false, true].map(|from_branch| commands::ProjectCreationTarget::capture_project(project, worktree, from_branch))
+fn project_creation_targets(
+    project: &SidebarProject,
+    worktree: Option<WorktreeId>,
+) -> [Option<commands::ProjectCreationTarget>; 2] {
+    [false, true].map(|from_branch| {
+        commands::ProjectCreationTarget::capture_project(project, worktree, from_branch)
+    })
 }
 
-fn project_creation_targets_when_allowed(project: &SidebarProject, worktree: Option<WorktreeId>, allowed: bool) -> [Option<commands::ProjectCreationTarget>; 2] {
-    if allowed { project_creation_targets(project, worktree) } else { [None, None] }
+fn project_creation_targets_when_allowed(
+    project: &SidebarProject,
+    worktree: Option<WorktreeId>,
+    allowed: bool,
+) -> [Option<commands::ProjectCreationTarget>; 2] {
+    if allowed {
+        project_creation_targets(project, worktree)
+    } else {
+        [None, None]
+    }
 }
 
 fn context_controls<'a>(
@@ -7991,15 +8137,18 @@ fn context_controls<'a>(
                 ProjectCommand::NewWorktreeFromBranch => creation_targets[1].as_ref(),
                 _ => None,
             };
-            let creation_unavailable = matches!(command, ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch)
-                && creation_target.is_none();
-            let item = if creation_unavailable || (!has_branch
-                && matches!(
-                    command,
-                    ProjectCommand::CopyBranch
-                        | ProjectCommand::NewWorktreeFromBranch
-                        | ProjectCommand::PullRequest
-                )) {
+            let creation_unavailable = matches!(
+                command,
+                ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch
+            ) && creation_target.is_none();
+            let item = if creation_unavailable
+                || (!has_branch
+                    && matches!(
+                        command,
+                        ProjectCommand::CopyBranch
+                            | ProjectCommand::NewWorktreeFromBranch
+                            | ProjectCommand::PullRequest
+                    )) {
                 Item::ButtonDisabled
             } else {
                 Item::Button
@@ -8078,15 +8227,18 @@ impl widget::menu::Action for ChangeContextCommand<'_> {
     fn message(&self) -> SidebarAction {
         let key = self.key.clone();
         let path = self.row.entry.path.clone();
-        commands::bound(self.binding, SidebarAction::RunChangeCommand {
-            key,
-            row: ChangeSelectionRow {
-                area: self.row.entry.area,
-                path,
+        commands::bound(
+            self.binding,
+            SidebarAction::RunChangeCommand {
+                key,
+                row: ChangeSelectionRow {
+                    area: self.row.entry.area,
+                    path,
+                },
+                selection_revision: self.selection_revision,
+                command: self.action.command(),
             },
-            selection_revision: self.selection_revision,
-            command: self.action.command(),
-        })
+        )
     }
 }
 fn change_context_controls<'a>(
@@ -8112,7 +8264,11 @@ fn change_context_controls<'a>(
     } else {
         ChangeGroupCommand::Stage
     };
-    let mutation = if mutations_available { widget::menu::Item::Button } else { widget::menu::Item::ButtonDisabled };
+    let mutation = if mutations_available {
+        widget::menu::Item::Button
+    } else {
+        widget::menu::Item::ButtonDisabled
+    };
     let mut entries: Vec<widget::menu::Item<ChangeContextCommand<'_>, String>> = vec![mutation(
         commands::label(commands::change_command_id(command)).into(),
         None,
@@ -8181,7 +8337,7 @@ fn change_context_controls<'a>(
             commands::label(commands::change_command_id(ChangeGroupCommand::Discard)).into(),
             None,
             ChangeContextCommand {
-            binding,
+                binding,
                 key,
                 row,
                 selection_revision,
@@ -8200,14 +8356,24 @@ fn change_context_controls<'a>(
     );
     crate::interaction::context_menu_keyed(
         content,
-        (binding, cached_menu_token(&row.chrome.stage_id), selection_revision, mutations_available),
+        (
+            binding,
+            cached_menu_token(&row.chrome.stage_id),
+            selection_revision,
+            mutations_available,
+        ),
         widget::menu::items(&bindings, entries),
     )
 }
 
-pub fn history_row_focus_id(row: &CommitRow) -> widget::Id { row.chrome.focus_id.clone() }
+pub fn history_row_focus_id(row: &CommitRow) -> widget::Id {
+    row.chrome.focus_id.clone()
+}
 
-pub fn history_row_from_focus_id<'a>(source: &'a SourceControlModel, id: &widget::Id) -> Option<&'a CommitRow> {
+pub fn history_row_from_focus_id<'a>(
+    source: &'a SourceControlModel,
+    id: &widget::Id,
+) -> Option<&'a CommitRow> {
     source.history.iter().find(|row| row.chrome.focus_id == *id)
 }
 
@@ -8216,29 +8382,63 @@ impl SourceControlModel {
     /// Draft forms and Git writes use the same host-capability policy as the
     /// existing dispatcher; copying remains available during an operation.
     fn history_command_policy_available(&self, command: HistoryCommand) -> bool {
-        !self.is_reloading() && matches!(self.data_state, SidebarDataState::Ready)
-            && (matches!(command, HistoryCommand::CopySha | HistoryCommand::CopyMessage)
-                || (self.mutations_available() && !self.busy()))
+        !self.is_reloading()
+            && matches!(self.data_state, SidebarDataState::Ready)
+            && (matches!(
+                command,
+                HistoryCommand::CopySha | HistoryCommand::CopyMessage
+            ) || (self.mutations_available() && !self.busy()))
     }
 
-    pub fn history_command_available(&self, oid: &Oid, mainline: Option<u32>, message: &str, command: HistoryCommand) -> bool {
+    pub fn history_command_available(
+        &self,
+        oid: &Oid,
+        mainline: Option<u32>,
+        message: &str,
+        command: HistoryCommand,
+    ) -> bool {
         self.history_command_policy_available(command)
-            && self.history.iter().chain(self.commit_changes.iter().map(|changes| &changes.commit))
-                .any(|row| row.oid == *oid && row.mainline == mainline && row.message.as_ref() == message)
+            && self
+                .history
+                .iter()
+                .chain(self.commit_changes.iter().map(|changes| &changes.commit))
+                .any(|row| {
+                    row.oid == *oid && row.mainline == mainline && row.message.as_ref() == message
+                })
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
+pub enum HistoryCommand {
+    CopySha,
+    CopyMessage,
+    NewWorktree,
+    CreateBranch,
+    Revert,
+    CherryPick,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistoryContextCommand<'a> { binding: crate::model::OperationId, key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+struct HistoryContextCommand<'a> {
+    binding: crate::model::OperationId,
+    key: &'a ActiveWorktreeKey,
+    row: &'a CommitRow,
+    command: HistoryCommand,
+}
 
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        commands::registered(commands::bound(self.binding, SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }))
+        commands::registered(commands::bound(
+            self.binding,
+            SidebarAction::HistoryCommand {
+                key: self.key.clone(),
+                oid: self.row.oid.clone(),
+                command: self.command,
+                mainline: self.row.mainline,
+                message: Arc::clone(&self.row.message),
+            },
+        ))
     }
 }
 
@@ -8250,30 +8450,67 @@ fn history_context_controls<'a>(
     worktree: Arc<ActiveWorktreeKey>,
     binding_key: Arc<[Option<widget::menu::KeyBind>; 6]>,
 ) -> Element<'a, SidebarAction> {
-    if blocked { return content; }
-    let identity = (source.command_binding_id(), worktree, row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), Arc::clone(&binding_key));
+    if blocked {
+        return content;
+    }
+    let identity = (
+        source.command_binding_id(),
+        worktree,
+        row.chrome.focus_id.clone(),
+        row.mainline,
+        Arc::clone(&row.message),
+        source.mutations_available(),
+        source.busy(),
+        source.history_command_policy_available(HistoryCommand::CopySha),
+        Arc::clone(&binding_key),
+    );
     crate::interaction::context_menu_lazy_keyed(content, identity, move || {
-        let entries = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
-            .into_iter().map(|command| {
-                let id = commands::history_command_id(command);
-                let label = if row.mainline.is_some() && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick) {
-                    format!("{} (first parent)", commands::label(id))
-                } else { commands::label(id).to_owned() };
-                let action = HistoryContextCommand { binding: source.command_binding_id(), key: &source.key, row, command };
-                // Rows come directly from this source; only activation needs a commit lookup.
-                if source.history_command_policy_available(command) {
-                    widget::menu::Item::Button(label, None, action)
-                } else { widget::menu::Item::ButtonDisabled(label, None, action) }
-            }).collect::<Vec<_>>();
+        let entries = [
+            HistoryCommand::CopySha,
+            HistoryCommand::CopyMessage,
+            HistoryCommand::NewWorktree,
+            HistoryCommand::CreateBranch,
+            HistoryCommand::Revert,
+            HistoryCommand::CherryPick,
+        ]
+        .into_iter()
+        .map(|command| {
+            let id = commands::history_command_id(command);
+            let label = if row.mainline.is_some()
+                && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick)
+            {
+                format!("{} (first parent)", commands::label(id))
+            } else {
+                commands::label(id).to_owned()
+            };
+            let action = HistoryContextCommand {
+                binding: source.command_binding_id(),
+                key: &source.key,
+                row,
+                command,
+            };
+            // Rows come directly from this source; only activation needs a commit lookup.
+            if source.history_command_policy_available(command) {
+                widget::menu::Item::Button(label, None, action)
+            } else {
+                widget::menu::Item::ButtonDisabled(label, None, action)
+            }
+        })
+        .collect::<Vec<_>>();
         // Parse the six bindings once per section, and materialize only an open
         // menu. Building hints never calls Action::message or clones its payload.
-        let bindings = entries.iter().enumerate().filter_map(|(index, item)| {
-            let action = match item {
-                widget::menu::Item::Button(_, _, action) | widget::menu::Item::ButtonDisabled(_, _, action) => *action,
-                _ => return None,
-            };
-            binding_key[index].clone().map(|binding| (binding, action))
-        }).collect::<std::collections::HashMap<_, _>>();
+        let bindings = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let action = match item {
+                    widget::menu::Item::Button(_, _, action)
+                    | widget::menu::Item::ButtonDisabled(_, _, action) => *action,
+                    _ => return None,
+                };
+                binding_key[index].clone().map(|binding| (binding, action))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         widget::menu::items(&bindings, entries)
     })
 }
@@ -8298,24 +8535,31 @@ impl widget::menu::Action for FileContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        let binding = match self { Self::Manage { binding, .. } | Self::Editor { binding, .. } => *binding };
-        commands::registered(commands::bound(binding, match self {
-            Self::Manage { key, path, command, .. } => SidebarAction::FileCommand {
-                key: (*key).clone(),
-                path: (*path).clone(),
-                command: *command,
+        let binding = match self {
+            Self::Manage { binding, .. } | Self::Editor { binding, .. } => *binding,
+        };
+        commands::registered(commands::bound(
+            binding,
+            match self {
+                Self::Manage {
+                    key, path, command, ..
+                } => SidebarAction::FileCommand {
+                    key: (*key).clone(),
+                    path: (*path).clone(),
+                    command: *command,
+                },
+                Self::Editor {
+                    key,
+                    path,
+                    editor_id,
+                    ..
+                } => SidebarAction::OpenFileInEditor {
+                    key: (*key).clone(),
+                    path: (*path).clone(),
+                    editor_id: (*editor_id).to_owned(),
+                },
             },
-            Self::Editor {
-                key,
-                path,
-                editor_id,
-                ..
-            } => SidebarAction::OpenFileInEditor {
-                key: (*key).clone(),
-                path: (*path).clone(),
-                editor_id: (*editor_id).to_owned(),
-            },
-        }))
+        ))
     }
 }
 
@@ -8391,7 +8635,12 @@ fn file_context_controls<'a>(
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
             Some(icon.handle()),
-            FileContextCommand::Manage { binding, key, path, command },
+            FileContextCommand::Manage {
+                binding,
+                key,
+                path,
+                command,
+            },
         ));
     }
     if !row.directory {
@@ -9008,7 +9257,8 @@ fn source_control_notices<'a>(
     let mut notices = widget::column::with_capacity(4).spacing(space::XS);
     let mutation_controls_available = source.mutations_available() && !source.busy();
     if let Some(reason) = source.mutation_unavailable_reason() {
-        notices = notices.push(design::caption(reason).wrapping(cosmic::iced::widget::text::Wrapping::Word));
+        notices = notices
+            .push(design::caption(reason).wrapping(cosmic::iced::widget::text::Wrapping::Word));
     }
     if let Some(error) = source.error.as_deref() {
         let summary = error
@@ -9070,11 +9320,13 @@ fn source_control_notices<'a>(
         notices = notices.push(
             widget::row::with_children(vec![
                 widget::button::text("Abort")
-                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
-                        key: source.key.clone(),
-                        operation: GitOperation::Abort {
-                            kind: operation.kind,
-                        },
+                    .on_press_maybe(mutation_controls_available.then(|| {
+                        SidebarAction::GitOperation {
+                            key: source.key.clone(),
+                            operation: GitOperation::Abort {
+                                kind: operation.kind,
+                            },
+                        }
                     }))
                     .into(),
                 widget::button::text("Continue")
@@ -9116,9 +9368,11 @@ fn source_control_notices<'a>(
 
         notices = notices.push(widget::row::with_children(vec![
             widget::button::text("Stage anyway")
-                .on_press_maybe(source.mutations_available().then(|| SidebarAction::ConfirmStageMarkers {
-                    key: source.key.clone(),
-                    confirmed: true,
+                .on_press_maybe(source.mutations_available().then(|| {
+                    SidebarAction::ConfirmStageMarkers {
+                        key: source.key.clone(),
+                        confirmed: true,
+                    }
                 }))
                 .into(),
             widget::button::text("Cancel")
@@ -9179,12 +9433,14 @@ fn source_control_notices<'a>(
                     .on_press(SidebarAction::ToggleStashes { key: key.clone() })
                     .into(),
                 widget::button::text("Stash changes")
-                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
-                        key: key.clone(),
-                        operation: GitOperation::StashPush {
-                            message: None,
-                            include_untracked: false,
-                        },
+                    .on_press_maybe(mutation_controls_available.then(|| {
+                        SidebarAction::GitOperation {
+                            key: key.clone(),
+                            operation: GitOperation::StashPush {
+                                message: None,
+                                include_untracked: false,
+                            },
+                        }
                     }))
                     .into(),
             ])
@@ -9211,23 +9467,27 @@ fn source_control_notices<'a>(
                 rows = rows.push(
                     widget::row::with_children(vec![
                         widget::button::text("Apply")
-                            .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
-                                key: key.clone(),
-                                operation: GitOperation::StashApply {
-                                    reference: stash.reference.clone(),
-                                    expected_oid: stash.oid.clone(),
-                                    pop: false,
-                                },
+                            .on_press_maybe(mutation_controls_available.then(|| {
+                                SidebarAction::GitOperation {
+                                    key: key.clone(),
+                                    operation: GitOperation::StashApply {
+                                        reference: stash.reference.clone(),
+                                        expected_oid: stash.oid.clone(),
+                                        pop: false,
+                                    },
+                                }
                             }))
                             .into(),
                         widget::button::text("Pop")
-                            .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
-                                key: key.clone(),
-                                operation: GitOperation::StashApply {
-                                    reference: stash.reference.clone(),
-                                    expected_oid: stash.oid.clone(),
-                                    pop: true,
-                                },
+                            .on_press_maybe(mutation_controls_available.then(|| {
+                                SidebarAction::GitOperation {
+                                    key: key.clone(),
+                                    operation: GitOperation::StashApply {
+                                        reference: stash.reference.clone(),
+                                        expected_oid: stash.oid.clone(),
+                                        pop: true,
+                                    },
+                                }
                             }))
                             .into(),
                         widget::button::text("Drop…")
@@ -9251,12 +9511,14 @@ fn source_control_notices<'a>(
             )));
             notices = notices.push(widget::row::with_children(vec![
                 widget::button::text("Drop stash")
-                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
-                        key: key.clone(),
-                        operation: GitOperation::StashDrop {
-                            reference: stash.reference.clone(),
-                            expected_oid: stash.oid.clone(),
-                        },
+                    .on_press_maybe(mutation_controls_available.then(|| {
+                        SidebarAction::GitOperation {
+                            key: key.clone(),
+                            operation: GitOperation::StashDrop {
+                                reference: stash.reference.clone(),
+                                expected_oid: stash.oid.clone(),
+                            },
+                        }
                     }))
                     .into(),
                 widget::button::text("Cancel")
@@ -9285,7 +9547,19 @@ fn source_control_panel<'a>(
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let binding = source.command_binding_id();
-    source_control_panel_unbound(state, source, worktree, editors, file_management, modal_open, panel, navigation, width, shortcuts).map(move |action| commands::bound(binding, action))
+    source_control_panel_unbound(
+        state,
+        source,
+        worktree,
+        editors,
+        file_management,
+        modal_open,
+        panel,
+        navigation,
+        width,
+        shortcuts,
+    )
+    .map(move |action| commands::bound(binding, action))
 }
 
 fn source_control_panel_unbound<'a>(
@@ -9676,22 +9950,38 @@ fn files_section<'a>(
         });
     }
     if !modal_open
-        && let Some((path, _, _)) = crate::editor_navigation::parse_location(state.files_query().trim()) {
+        && let Some((path, _, _)) =
+            crate::editor_navigation::parse_location(state.files_query().trim())
+    {
         let candidate = PathBuf::from(path);
-        let relative = if candidate.is_absolute() { candidate.strip_prefix(&key.canonical_path).ok().map(Path::to_path_buf) } else { Some(candidate) };
+        let relative = if candidate.is_absolute() {
+            candidate
+                .strip_prefix(&key.canonical_path)
+                .ok()
+                .map(Path::to_path_buf)
+        } else {
+            Some(candidate)
+        };
         if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
             let key = key.clone();
-            filter = filter.on_submit(move |_| SidebarAction::OpenFile { key: key.clone(), path: path.clone() });
+            filter = filter.on_submit(move |_| SidebarAction::OpenFile {
+                key: key.clone(),
+                path: path.clone(),
+            });
         }
     }
-    let folded = fold(&crate::editor_navigation::file_query(state.files_query().trim()));
+    let folded = fold(&crate::editor_navigation::file_query(
+        state.files_query().trim(),
+    ));
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
     let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
     {
         FileSearch::Pending { query }
-            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             let (visible, hidden) = file_row_page(
                 &source.files,
@@ -9708,12 +9998,17 @@ fn files_section<'a>(
             query,
             files,
             hidden,
-        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() => {
+        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+            == folded.as_ref()
+            && !folded.is_empty() =>
+        {
             let notice = files.is_empty().then_some("No files match this filter.");
             (files.iter().collect(), *hidden, notice)
         }
         FileSearch::Failed { query, message }
-            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             (Vec::new(), 0, Some(message.as_str()))
         }
@@ -10174,22 +10469,43 @@ fn changes_section<'a>(
                     .into_iter()
                     .map(|mut control| {
                         let mut label = Cow::Borrowed(control.name);
-                        if let Some(SidebarAction::ChangeGroup { key, area, command }) = control.action.take() {
-                            let registered = if let Some(row) = selected_change_group_anchor(source, state, area) {
+                        if let Some(SidebarAction::ChangeGroup { key, area, command }) =
+                            control.action.take()
+                        {
+                            let registered = if let Some(row) =
+                                selected_change_group_anchor(source, state, area)
+                            {
                                 let id = commands::change_command_id(command);
-                                control.action = Some(SidebarAction::RunChangeCommand { command: id, key, row, selection_revision: state.change_selection_revision() });
+                                control.action = Some(SidebarAction::RunChangeCommand {
+                                    command: id,
+                                    key,
+                                    row,
+                                    selection_revision: state.change_selection_revision(),
+                                });
                                 id
                             } else {
-                                let id = commands::whole_group_command_id(area, command).expect("existing group control has a template");
-                                if whole_change_group_available_for(source, state, area, command, modal_open) {
-                                    control.action = Some(SidebarAction::RunChangeGroup { key, area, command, selection_revision: state.change_selection_revision() });
+                                let id = commands::whole_group_command_id(area, command)
+                                    .expect("existing group control has a template");
+                                if whole_change_group_available_for(
+                                    source, state, area, command, modal_open,
+                                ) {
+                                    control.action = Some(SidebarAction::RunChangeGroup {
+                                        key,
+                                        area,
+                                        command,
+                                        selection_revision: state.change_selection_revision(),
+                                    });
                                 }
                                 id
                             };
-                            let descriptor = crate::workspace_widget::shortcut_descriptor(registered);
+                            let descriptor =
+                                crate::workspace_widget::shortcut_descriptor(registered);
                             label = Cow::Borrowed(descriptor.label);
-                            let chords = crate::workspace_widget::shortcut_chords(registered, shortcuts);
-                            if !chords.is_empty() { label = Cow::Owned(format!("{} · {}", descriptor.label, chords)); }
+                            let chords =
+                                crate::workspace_widget::shortcut_chords(registered, shortcuts);
+                            if !chords.is_empty() {
+                                label = Cow::Owned(format!("{} · {}", descriptor.label, chords));
+                            }
                         }
                         panel_icon_action(control.icon, label, control.action, control.id)
                     }),
@@ -10779,7 +11095,10 @@ pub fn resolve_group_command(
     let SidebarAction::ChangeGroup { key, area, command } = action else {
         return None;
     };
-    if !source.mutations_available() || key != &source.key || (source.busy() && matches!(command, ChangeGroupCommand::Discard)) {
+    if !source.mutations_available()
+        || key != &source.key
+        || (source.busy() && matches!(command, ChangeGroupCommand::Discard))
+    {
         return None;
     }
     let group = source.group(*area)?;
@@ -10870,15 +11189,28 @@ pub fn whole_change_group_available(
     command: ChangeGroupCommand,
     modal_open: bool,
 ) -> bool {
-    model.source_control.as_ref().is_some_and(|source| model.contains_worktree(&source.key) && whole_change_group_available_for(source, state, area, command, modal_open))
+    model.source_control.as_ref().is_some_and(|source| {
+        model.contains_worktree(&source.key)
+            && whole_change_group_available_for(source, state, area, command, modal_open)
+    })
 }
-fn whole_change_group_available_for(source: &SourceControlModel, state: &SidebarState, area: ChangeArea, command: ChangeGroupCommand, modal_open: bool) -> bool {
-    if !source.mutations_available() || modal_open || state.active_worktree() != Some(&source.key)
+fn whole_change_group_available_for(
+    source: &SourceControlModel,
+    state: &SidebarState,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    modal_open: bool,
+) -> bool {
+    if !source.mutations_available()
+        || modal_open
+        || state.active_worktree() != Some(&source.key)
         || !matches!(source.data_state, SidebarDataState::Ready)
         || state.change_rows.first_in_area(area).is_some()
         || source.group(area).is_none_or(ChangeGroup::is_empty)
         || (source.busy() && command == ChangeGroupCommand::Discard)
-    { return false; }
+    {
+        return false;
+    }
     match command {
         ChangeGroupCommand::Stage => area != ChangeArea::Staged,
         ChangeGroupCommand::Unstage => area == ChangeArea::Staged,
@@ -10898,11 +11230,20 @@ pub fn resolve_captured_change_group(
     modal_open: bool,
 ) -> Option<SidebarAction> {
     if state.active_worktree() != Some(key)
-        || model.source_control.as_ref().is_none_or(|source| source.key != *key)
+        || model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.key != *key)
         || state.change_selection_revision() != selection_revision
         || !whole_change_group_available(model, state, area, command, modal_open)
-    { return None; }
-    Some(SidebarAction::ChangeGroup { key: key.clone(), area, command })
+    {
+        return None;
+    }
+    Some(SidebarAction::ChangeGroup {
+        key: key.clone(),
+        area,
+        command,
+    })
 }
 
 pub fn selected_change_group_anchor(
@@ -11262,7 +11603,10 @@ fn changes_footer<'a>(
         let cursor_key = key.clone();
         let history_key = key.clone();
         subject_input = subject_input
-            .on_history(move |command| SidebarAction::CommitSubjectEditorHistory { key: history_key.clone(), command })
+            .on_history(move |command| SidebarAction::CommitSubjectEditorHistory {
+                key: history_key.clone(),
+                command,
+            })
             .on_action(move |action| SidebarAction::CommitSubjectEditorAction {
                 key: key.clone(),
                 action,
@@ -11316,7 +11660,10 @@ fn changes_footer<'a>(
         let cursor_key = input_key.clone();
         let history_key = input_key.clone();
         commit_input = commit_input
-            .on_history(move |command| SidebarAction::CommitEditorHistory { key: history_key.clone(), command })
+            .on_history(move |command| SidebarAction::CommitEditorHistory {
+                key: history_key.clone(),
+                command,
+            })
             .on_action(move |action| SidebarAction::CommitEditorAction {
                 key: input_key.clone(),
                 action,
@@ -11332,7 +11679,8 @@ fn changes_footer<'a>(
     } else {
         "Commit"
     };
-    let commit_hint = if let Some(reason) = source.mutation_unavailable_reason() { reason
+    let commit_hint = if let Some(reason) = source.mutation_unavailable_reason() {
+        reason
     } else if !has_subject {
         "Enter a commit summary"
     } else if source.busy() {
@@ -11510,7 +11858,9 @@ fn publish_picker<'a>(
                 remote_branch,
             });
     }
-    let blocked = source.mutation_unavailable_reason().or_else(|| publish.blocked_reason(source.busy()));
+    let blocked = source
+        .mutation_unavailable_reason()
+        .or_else(|| publish.blocked_reason(source.busy()));
     let mut confirm =
         crate::ui_controls::button::secondary("Publish").id(chrome.publish_id.clone());
     if let Some(push) = publish
@@ -11662,16 +12012,36 @@ fn commit_changes_section<'a>(
 }
 
 #[cfg(test)]
-fn history_section<'a>(state: &'a SidebarState, source: &'a SourceControlModel, modal_open: bool) -> Element<'a, SidebarAction> {
+fn history_section<'a>(
+    state: &'a SidebarState,
+    source: &'a SourceControlModel,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
     static DEFAULT: LazyLock<crate::settings::KeyboardShortcuts> = LazyLock::new(Default::default);
     history_section_with_shortcuts(state, source, modal_open, &DEFAULT)
 }
 
-fn history_section_with_shortcuts<'a>(state: &'a SidebarState, source: &'a SourceControlModel, modal_open: bool, shortcuts: &crate::settings::KeyboardShortcuts) -> Element<'a, SidebarAction> {
+fn history_section_with_shortcuts<'a>(
+    state: &'a SidebarState,
+    source: &'a SourceControlModel,
+    modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'a, SidebarAction> {
     // Six parsed native chords form a bounded shared snapshot for all row
     // popup keys. No row clones the full shortcut table or a path vector.
-    let binding_key = Arc::new([HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
-        .map(|command| crate::workspace_widget::menu_shortcut(commands::history_command_id(command), shortcuts)));
+    let binding_key = Arc::new(
+        [
+            HistoryCommand::CopySha,
+            HistoryCommand::CopyMessage,
+            HistoryCommand::NewWorktree,
+            HistoryCommand::CreateBranch,
+            HistoryCommand::Revert,
+            HistoryCommand::CherryPick,
+        ]
+        .map(|command| {
+            crate::workspace_widget::menu_shortcut(commands::history_command_id(command), shortcuts)
+        }),
+    );
     let worktree = Arc::new(source.key.clone());
     let key = &source.key;
     if let Some(changes) = &source.commit_changes {
@@ -11695,69 +12065,105 @@ fn history_section_with_shortcuts<'a>(state: &'a SidebarState, source: &'a Sourc
     ));
     let search_key = key.clone();
     let submit_key = key.clone();
-    let mut search = crate::ui_controls::field::search("Message, author or SHA — Enter to search", &state.history_query);
+    let mut search = crate::ui_controls::field::search(
+        "Message, author or SHA — Enter to search",
+        &state.history_query,
+    );
     if !modal_open {
-        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query });
+        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged {
+            key: search_key.clone(),
+            query,
+        });
         if source.head_oid.is_some() {
-            search = search.on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+            search = search.on_submit(move |query| SidebarAction::SearchHistory {
+                key: submit_key.clone(),
+                query,
+            });
         }
     }
     column = column.push(search);
-    column = column.push(design::caption("Paste a commit SHA from another branch to find it here."));
+    column = column.push(design::caption(
+        "Paste a commit SHA from another branch to find it here.",
+    ));
     if let Some((oid, name)) = &state.history_branch {
         let branch_key = key.clone();
-        let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| SidebarAction::CreateHistoryBranch { key: key.clone(), oid: oid.clone(), name });
+        let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| {
+            SidebarAction::CreateHistoryBranch {
+                key: key.clone(),
+                oid: oid.clone(),
+                name,
+            }
+        });
         let mut input = crate::ui_controls::field::text("New branch name", name);
-        if !modal_open { input = input.on_input(move |name| SidebarAction::HistoryBranchChanged { key: branch_key.clone(), name }); }
+        if !modal_open {
+            input = input.on_input(move |name| SidebarAction::HistoryBranchChanged {
+                key: branch_key.clone(),
+                name,
+            });
+        }
         column = column.push(input);
-        column = column.push(widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Cancel").on_press_maybe((!modal_open).then_some(SidebarAction::CancelHistoryBranch)).into(),
-            crate::ui_controls::button::primary("Create branch").on_press_maybe(create.filter(|_| !modal_open)).into(),
-        ]).spacing(space::XS));
+        column = column.push(
+            widget::row::with_children(vec![
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press_maybe((!modal_open).then_some(SidebarAction::CancelHistoryBranch))
+                    .into(),
+                crate::ui_controls::button::primary("Create branch")
+                    .on_press_maybe(create.filter(|_| !modal_open))
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
     }
     let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(history_context_controls(crate::interaction::keyboard_list_row(
-            button::custom(
-                widget::row::with_children(vec![
-                    widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
-                        .center_x(Length::Fixed(ROW_ICON_WIDTH))
+        rows = rows.push(history_context_controls(
+            crate::interaction::keyboard_list_row(
+                button::custom(
+                    widget::row::with_children(vec![
+                        widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
+                            .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                            .into(),
+                        widget::column::with_children(vec![
+                            design::body(&*chrome.subject)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .width(Length::Fill)
+                                .into(),
+                            design::caption(&*chrome.metadata)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .width(Length::Fill)
+                                .into(),
+                        ])
+                        .width(Length::Fill)
                         .into(),
-                    widget::column::with_children(vec![
-                        design::body(&*chrome.subject)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .width(Length::Fill)
-                            .into(),
-                        design::caption(&*chrome.metadata)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .width(Length::Fill)
-                            .into(),
                     ])
-                    .width(Length::Fill)
-                    .into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center),
-            )
-            .padding([space::XS, space::XS])
-            .class(sidebar_button_style(false))
-            .id(history_row_focus_id(row))
-            .on_press_maybe(gated(
-                SidebarAction::OpenCommit {
-                    key: key.clone(),
-                    oid: row.oid.clone(),
-                },
-                modal_open,
-            ))
-            .width(Length::Fill),
-        ), source, row, modal_open, Arc::clone(&worktree), Arc::clone(&binding_key)));
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .padding([space::XS, space::XS])
+                .class(sidebar_button_style(false))
+                .id(history_row_focus_id(row))
+                .on_press_maybe(gated(
+                    SidebarAction::OpenCommit {
+                        key: key.clone(),
+                        oid: row.oid.clone(),
+                    },
+                    modal_open,
+                ))
+                .width(Length::Fill),
+            ),
+            source,
+            row,
+            modal_open,
+            Arc::clone(&worktree),
+            Arc::clone(&binding_key),
+        ));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -13453,9 +13859,7 @@ mod row_interaction {
                         ..
                     }) if state.focused => {
                         let action = match named {
-                            keyboard::key::Named::Enter
-                                if modifiers.is_empty() =>
-                            {
+                            keyboard::key::Named::Enter if modifiers.is_empty() => {
                                 Some(SidebarAction::InvokeChangeRows {
                                     key: key.clone(),
                                     row: row.clone(),
@@ -14569,8 +14973,20 @@ pub(crate) mod tests {
             },
             &settings,
         );
-        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
-        let commit = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![], author: identity.clone(), committer: identity, subject: "Commit".into(), body: String::new() });
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let commit = CommitRow::new(&CommitSummary {
+            oid: oid_of(3),
+            parents: vec![],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Commit".into(),
+            body: String::new(),
+        });
         for (command, chord) in [
             (HistoryCommand::CopySha, "Ctrl+Alt+F1"),
             (HistoryCommand::CopyMessage, "Ctrl+Alt+F2"),
@@ -14580,10 +14996,21 @@ pub(crate) mod tests {
             (HistoryCommand::CherryPick, "Ctrl+Alt+F7"),
         ] {
             let id = commands::history_command_id(command);
-            let index = crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().position(|descriptor| descriptor.action == id).unwrap();
+            let index = crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
+                .iter()
+                .position(|descriptor| descriptor.action == id)
+                .unwrap();
             *settings.actions_mut()[index] = vec![chord.into()];
             assert_eq!(commands::history_command(id), Some(command));
-            assert_hint(HistoryContextCommand { binding: crate::model::OperationId::new(), key: &key, row: &commit, command }, &settings);
+            assert_hint(
+                HistoryContextCommand {
+                    binding: crate::model::OperationId::new(),
+                    key: &key,
+                    row: &commit,
+                    command,
+                },
+                &settings,
+            );
         }
         let model = panel_model();
         let source = model.source_control.as_ref().unwrap();
@@ -18279,25 +18706,55 @@ pub(crate) mod tests {
         shortcuts.git_stage_all_unstaged = vec!["F9".into()];
         let source = model.source_control.as_ref().unwrap();
         let target = commands::GroupTarget::capture(&model, &state).unwrap();
-        let names = accessible_names(&renderer, changes_section(&state, source, false, &shortcuts));
-        assert!(names.iter().any(|name| name == "Stage all unstaged changes · F9"), "{names:?}");
-        let actions = frame_enter_presses(&renderer, changes_section(&state, source, false, &shortcuts));
-        let groups: Vec<_> = actions.into_iter().filter(|action| matches!(action, SidebarAction::RunChangeGroup { .. })).collect();
+        let names = accessible_names(
+            &renderer,
+            changes_section(&state, source, false, &shortcuts),
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Stage all unstaged changes · F9"),
+            "{names:?}"
+        );
+        let actions = frame_enter_presses(
+            &renderer,
+            changes_section(&state, source, false, &shortcuts),
+        );
+        let groups: Vec<_> = actions
+            .into_iter()
+            .filter(|action| matches!(action, SidebarAction::RunChangeGroup { .. }))
+            .collect();
         assert_eq!(groups.len(), 6);
         for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
-            let (area, mutation) = crate::workspace_widget::git_group_command_target(command).unwrap();
-            assert_eq!(commands::whole_group_command_id(area, mutation), Some(command));
+            let (area, mutation) =
+                crate::workspace_widget::git_group_command_target(command).unwrap();
+            assert_eq!(
+                commands::whole_group_command_id(area, mutation),
+                Some(command)
+            );
             assert!(target.available(&model, &state, command, false));
             assert!(groups.iter().any(|action| matches!(action, SidebarAction::RunChangeGroup { key, area: actual, command: kind, selection_revision } if key == &target.key && *actual == area && *kind == mutation && *selection_revision == target.selection_revision)));
             assert!(!target.available(&model, &state, command, true));
         }
-        let row = ChangeSelectionRow { area: ChangeArea::Unstaged, path: repo_path("assets/logo.png") };
+        let row = ChangeSelectionRow {
+            area: ChangeArea::Unstaged,
+            path: repo_path("assets/logo.png"),
+        };
         state.select_change_rows(row.clone(), SelectionIntent::Toggle, &[row]);
         assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false));
-        state.apply(&SidebarAction::ClearChangeSelection { key: target.key.clone() });
-        assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false), "clearing a newer selection never revives the old payload");
+        state.apply(&SidebarAction::ClearChangeSelection {
+            key: target.key.clone(),
+        });
+        assert!(
+            !target.available(&model, &state, Command::GitStageAllUnstaged, false),
+            "clearing a newer selection never revives the old payload"
+        );
         let fresh = commands::GroupTarget::capture(&model, &state).unwrap();
-        model.source_control.as_mut().unwrap().set_mutation(Some(MutationKind::Stage));
+        model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation(Some(MutationKind::Stage));
         assert!(fresh.available(&model, &state, Command::GitStageAllUnstaged, false));
         assert!(fresh.available(&model, &state, Command::GitUnstageAllStaged, false));
         assert!(!fresh.available(&model, &state, Command::GitDiscardAllUnstaged, false));
@@ -18333,18 +18790,25 @@ pub(crate) mod tests {
         use widget::menu::Action;
         let mut model = panel_model();
         model.projects[0].creation_binding = Some(crate::model::OperationId::new());
-        let project = model.projects[0].id; let worktree = model.projects[0].worktrees[0].id;
+        let project = model.projects[0].id;
+        let worktree = model.projects[0].worktrees[0].id;
         let targets = project_creation_targets(&model.projects[0], Some(worktree));
         let command = ProjectCommand::NewWorktreeFromBranch;
-        let saved = ContextCommand(project, Some(worktree), &command, None, targets[1].as_ref()).message();
-        let SidebarAction::RunCommand { command, action } = saved else { panic!("context action must stay registered") };
+        let saved =
+            ContextCommand(project, Some(worktree), &command, None, targets[1].as_ref()).message();
+        let SidebarAction::RunCommand { command, action } = saved else {
+            panic!("context action must stay registered")
+        };
         let original = commands::CommandTarget::from_action(&action).unwrap();
         assert!(original.accepts(&model, command, &action));
         model.projects[0].worktrees[0].branch = Some("replacement-branch".into());
         assert!(!original.accepts(&model, command, &action));
         model.projects[0].creation_binding = Some(crate::model::OperationId::new());
         assert!(!original.accepts(&model, command, &action));
-        assert_eq!(commands::CommandTarget::from_action(&action), Some(original));
+        assert_eq!(
+            commands::CommandTarget::from_action(&action),
+            Some(original)
+        );
         let fresh = project_creation_targets(&model.projects[0], Some(worktree));
         let current = fresh[1].as_ref().unwrap();
         assert_eq!(current.branch.as_deref(), Some("replacement-branch"));
@@ -18358,14 +18822,29 @@ pub(crate) mod tests {
         entry.creation_binding = Some(crate::model::OperationId::new());
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
-        let captures = |model: &SidebarModel| frame_enter_presses(&renderer,
-            body(model, &state, false, false, &default_menu_shortcuts())).into_iter()
-            .filter_map(|action| match action { SidebarAction::CreateProjectWorktree(target) => Some(target), _ => None }).collect::<Vec<_>>();
-        let old = captures(&model).into_iter().find(|target| target.worktree_id.is_none()).unwrap();
+        let captures = |model: &SidebarModel| {
+            frame_enter_presses(
+                &renderer,
+                body(model, &state, false, false, &default_menu_shortcuts()),
+            )
+            .into_iter()
+            .filter_map(|action| match action {
+                SidebarAction::CreateProjectWorktree(target) => Some(target),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let old = captures(&model)
+            .into_iter()
+            .find(|target| target.worktree_id.is_none())
+            .unwrap();
         assert!(old.current_in(&model));
         model.projects[0].creation_binding = Some(crate::model::OperationId::new());
         assert!(!old.current_in(&model));
-        let current = captures(&model).into_iter().find(|target| target.worktree_id.is_none()).unwrap();
+        let current = captures(&model)
+            .into_iter()
+            .find(|target| target.worktree_id.is_none())
+            .unwrap();
         assert_ne!(old.binding, current.binding);
         assert!(current.current_in(&model));
         model.projects[0].creation_binding = None;
@@ -18374,7 +18853,11 @@ pub(crate) mod tests {
 
     #[test]
     fn project_creation_native_press_is_owned_across_retained_cache_replacement() {
-        use cosmic::iced::{Event, Point, advanced::{clipboard, mouse}, runtime::{UserInterface, user_interface::Cache}};
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{clipboard, mouse},
+            runtime::{UserInterface, user_interface::Cache},
+        };
         let mut renderer = headless_renderer();
         let mut cache = Cache::default();
         let mut entry = project();
@@ -18384,24 +18867,49 @@ pub(crate) mod tests {
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let mut feed = |entry: &SidebarProject, allowed, events: &[Event]| {
-            let mut ui = UserInterface::build(project_creation_control(entry, false, allowed, &crate::settings::KeyboardShortcuts::default()),
-                Size::new(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE), std::mem::take(&mut cache), &mut renderer);
+            let mut ui = UserInterface::build(
+                project_creation_control(
+                    entry,
+                    false,
+                    allowed,
+                    &crate::settings::KeyboardShortcuts::default(),
+                ),
+                Size::new(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE),
+                std::mem::take(&mut cache),
+                &mut renderer,
+            );
             let mut messages = Vec::new();
-            ui.update(events, mouse::Cursor::Available(cursor), &mut renderer, &mut clipboard::Null, &mut messages);
+            ui.update(
+                events,
+                mouse::Cursor::Available(cursor),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
             cache = ui.into_cache();
             messages
         };
         assert!(feed(&entry, true, &[press.clone()]).is_empty());
         let same = feed(&entry, true, &[release.clone()]);
-        assert!(matches!(same.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if target.binding == first));
+        assert!(
+            matches!(same.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if target.binding == first)
+        );
         assert!(feed(&entry, true, &[press.clone()]).is_empty());
         entry.creation_binding = Some(crate::model::OperationId::new());
-        assert!(feed(&entry, true, &[release.clone()]).is_empty(), "an A press cannot activate replacement B");
+        assert!(
+            feed(&entry, true, &[release.clone()]).is_empty(),
+            "an A press cannot activate replacement B"
+        );
         let fresh = feed(&entry, true, &[press.clone(), release.clone()]);
-        assert!(matches!(fresh.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if Some(target.binding) == entry.creation_binding));
+        assert!(
+            matches!(fresh.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if Some(target.binding) == entry.creation_binding)
+        );
         assert!(feed(&entry, true, &[press.clone()]).is_empty());
         assert!(feed(&entry, false, &[]).is_empty());
-        assert!(feed(&entry, true, &[release]).is_empty(), "save admission changes also retire the old press");
+        assert!(
+            feed(&entry, true, &[release]).is_empty(),
+            "save admission changes also retire the old press"
+        );
     }
 
     #[test]
@@ -18421,11 +18929,32 @@ pub(crate) mod tests {
         model.projects[0].reloading = false;
         let shortcuts = default_menu_shortcuts();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body_with_creation_allowed(&model, &state, compact, false, &shortcuts, false));
-            assert!(!actions.iter().any(|action| matches!(action, SidebarAction::CreateProjectWorktree(_))));
-            assert!(actions.iter().any(|action| matches!(action, SidebarAction::OpenRepository { .. } | SidebarAction::OpenWorktree { .. })), "save/device gating preserves navigation");
+            let actions = frame_enter_presses(
+                &renderer,
+                body_with_creation_allowed(&model, &state, compact, false, &shortcuts, false),
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::CreateProjectWorktree(_)))
+            );
+            assert!(
+                actions.iter().any(|action| matches!(
+                    action,
+                    SidebarAction::OpenRepository { .. } | SidebarAction::OpenWorktree { .. }
+                )),
+                "save/device gating preserves navigation"
+            );
         }
-        assert!(project_creation_targets_when_allowed(&model.projects[0], Some(model.projects[0].worktrees[0].id), false).iter().all(Option::is_none));
+        assert!(
+            project_creation_targets_when_allowed(
+                &model.projects[0],
+                Some(model.projects[0].worktrees[0].id),
+                false
+            )
+            .iter()
+            .all(Option::is_none)
+        );
     }
 
     #[test]
@@ -18435,13 +18964,30 @@ pub(crate) mod tests {
         entry.creation_binding = Some(crate::model::OperationId::new());
         let mut shortcuts = crate::settings::KeyboardShortcuts::default();
         shortcuts.new_worktree = vec!["ctrl+alt+w".into()];
-        let names = accessible_names(&renderer, project_creation_control(&entry, false, true, &shortcuts));
-        let chords = crate::workspace_widget::shortcut_chords(crate::workspace_widget::GlobalShortcut::NewWorktree, &shortcuts);
+        let names = accessible_names(
+            &renderer,
+            project_creation_control(&entry, false, true, &shortcuts),
+        );
+        let chords = crate::workspace_widget::shortcut_chords(
+            crate::workspace_widget::GlobalShortcut::NewWorktree,
+            &shortcuts,
+        );
         assert!(!chords.is_empty());
-        assert!(names.iter().any(|name| name == &format!("{} · {chords}", entry.chrome.new_worktree_name)));
+        assert!(
+            names
+                .iter()
+                .any(|name| name == &format!("{} · {chords}", entry.chrome.new_worktree_name))
+        );
         shortcuts.new_worktree.clear();
-        let names = accessible_names(&renderer, project_creation_control(&entry, false, true, &shortcuts));
-        assert!(names.iter().any(|name| name == entry.chrome.new_worktree_name.as_ref()));
+        let names = accessible_names(
+            &renderer,
+            project_creation_control(&entry, false, true, &shortcuts),
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == entry.chrome.new_worktree_name.as_ref())
+        );
         assert!(names.iter().all(|name| !name.contains('·')));
     }
 
@@ -18458,14 +19004,31 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
-            assert!(actions.contains(&open));
-            assert!(
-                !actions
-                    .iter()
-                    .any(|action| matches!(action, SidebarAction::NewWorktree { .. } | SidebarAction::CreateProjectWorktree(_)))
+            let actions = frame_enter_presses(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            assert!(actions.contains(&open));
+            assert!(!actions.iter().any(|action| matches!(
+                action,
+                SidebarAction::NewWorktree { .. } | SidebarAction::CreateProjectWorktree(_)
+            )));
+            let names = accessible_names(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(!names.iter().any(|name| name.starts_with("New worktree")));
         }
     }
@@ -18496,7 +19059,16 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let actions = frame_enter_presses(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(
                 actions.contains(&reload),
                 "compact {compact}: the row cannot be read again: {actions:?}"
@@ -18506,10 +19078,29 @@ pub(crate) mod tests {
                 "compact {compact}: an unreadable project offered more than a reload: {actions:?}"
             );
             assert!(
-                frame_enter_presses(&renderer, body(&model, &state, compact, true, default_menu_shortcuts_shared())).is_empty(),
+                frame_enter_presses(
+                    &renderer,
+                    body(
+                        &model,
+                        &state,
+                        compact,
+                        true,
+                        default_menu_shortcuts_shared()
+                    )
+                )
+                .is_empty(),
                 "compact {compact}: the reload stays withheld while a modal is up"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let names = accessible_names(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(
                 names.iter().any(|name| name
                     == "Couldn’t read project Cagents: fatal: not a git repository. Try again"),
@@ -18528,10 +19119,29 @@ pub(crate) mod tests {
         let state = SidebarState::default();
         for compact in [false, true] {
             assert!(
-                frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared())).is_empty(),
+                frame_enter_presses(
+                    &renderer,
+                    body(
+                        &model,
+                        &state,
+                        compact,
+                        false,
+                        default_menu_shortcuts_shared()
+                    )
+                )
+                .is_empty(),
                 "compact {compact}: a retry was offered while a read was already running"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let names = accessible_names(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(
                 names.iter().any(|name| name
                     == "Couldn’t read project Cagents: fatal: not a git repository. Trying again"),
@@ -18583,7 +19193,16 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let actions = frame_enter_presses(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(
                 actions.contains(&SidebarAction::CancelWorktreeOperation(operation)),
                 "compact {compact}: a running operation lost its cancel: {actions:?}"
@@ -18623,7 +19242,16 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         state.set_worktrees_with_panes(BTreeSet::from([(project_id, kept)]));
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let actions = frame_enter_presses(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(opens(&actions, kept), "compact {compact}: {actions:?}");
             assert!(
                 !opens(&actions, doomed),
@@ -18635,7 +19263,16 @@ pub(crate) mod tests {
                 }),
                 "compact {compact}: a channel being deleted can still be opened"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let names = accessible_names(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             for expected in [
                 // The row is labelled by its pull request.
                 "Deleting worktree Polish sidebar",
@@ -18651,7 +19288,16 @@ pub(crate) mod tests {
         entry.worktrees[1].deletion = Some(RowDeletion::Failed("The worktree has changes".into()));
         entry.channels[0].deletion = Some(RowDeletion::Failed("Daemon unreachable".into()));
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
+        let actions = frame_enter_presses(
+            &renderer,
+            body(
+                &model,
+                &state,
+                false,
+                false,
+                default_menu_shortcuts_shared(),
+            ),
+        );
         assert!(
             opens(&actions, doomed),
             "a failed deletion leaves the row usable"
@@ -18669,7 +19315,16 @@ pub(crate) mod tests {
             }),
             "{actions:?}"
         );
-        let names = accessible_names(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
+        let names = accessible_names(
+            &renderer,
+            body(
+                &model,
+                &state,
+                false,
+                false,
+                default_menu_shortcuts_shared(),
+            ),
+        );
         assert!(
             names
                 .iter()
@@ -18694,7 +19349,16 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
+            let actions = frame_enter_presses(
+                &renderer,
+                body(
+                    &model,
+                    &state,
+                    compact,
+                    false,
+                    default_menu_shortcuts_shared(),
+                ),
+            );
             assert!(
                 actions.contains(&SidebarAction::DismissWorktreeOperation(operation)),
                 "compact {compact}: a failed operation cannot be dismissed: {actions:?}"
@@ -18723,7 +19387,16 @@ pub(crate) mod tests {
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
-        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
+        let actions = frame_enter_presses(
+            &renderer,
+            body(
+                &model,
+                &state,
+                false,
+                false,
+                default_menu_shortcuts_shared(),
+            ),
+        );
         for action in [
             SidebarAction::EditWorktreeOperation(operation),
             SidebarAction::RetryWorktreeOperation(operation),
@@ -18731,7 +19404,10 @@ pub(crate) mod tests {
         ] {
             assert!(actions.contains(&action), "{action:?} missing: {actions:?}");
         }
-        let behind_a_dialog = frame_enter_presses(&renderer, body(&model, &state, false, true, default_menu_shortcuts_shared()));
+        let behind_a_dialog = frame_enter_presses(
+            &renderer,
+            body(&model, &state, false, true, default_menu_shortcuts_shared()),
+        );
         assert!(
             !behind_a_dialog.iter().any(|action| matches!(
                 action,
@@ -20206,11 +20882,13 @@ pub(crate) mod tests {
         element: Element<'_, SidebarAction>,
         width: f32,
     ) -> Vec<SidebarAction> {
-        frame_enter_bound_presses_at_width(renderer, element, width).into_iter()
+        frame_enter_bound_presses_at_width(renderer, element, width)
+            .into_iter()
             .map(|action| match action {
                 SidebarAction::RunBound { action, .. } => *action,
                 action => action,
-            }).collect()
+            })
+            .collect()
     }
 
     fn frame_enter_bound_presses_at_width(
@@ -20285,16 +20963,26 @@ pub(crate) mod tests {
                         remote_device: remote,
                         ..Default::default()
                     };
-                    let actions = frame_enter_presses(&renderer,
-                        utilities(compact, false, &shortcuts, Some(&context)));
-                    assert_eq!(actions.iter().any(|action| matches!(action,
-                        SidebarAction::RunUtilityCommand(GlobalShortcut::OpenAutomations))),
+                    let actions = frame_enter_presses(
+                        &renderer,
+                        utilities(compact, false, &shortcuts, Some(&context)),
+                    );
+                    assert_eq!(
+                        actions.iter().any(|action| matches!(
+                            action,
+                            SidebarAction::RunUtilityCommand(GlobalShortcut::OpenAutomations)
+                        )),
                         shortcut_descriptor(GlobalShortcut::OpenAutomations).available(&context),
-                        "compact={compact} saving={saving} remote={remote}: {actions:?}");
-                    assert_eq!(actions.contains(&SidebarAction::OpenSettings),
-                        shortcut_descriptor(GlobalShortcut::OpenSettings).available(&context));
-                    assert!(actions.contains(&SidebarAction::ToggleProjects),
-                        "saving must leave the sidebar toggle usable");
+                        "compact={compact} saving={saving} remote={remote}: {actions:?}"
+                    );
+                    assert_eq!(
+                        actions.contains(&SidebarAction::OpenSettings),
+                        shortcut_descriptor(GlobalShortcut::OpenSettings).available(&context)
+                    );
+                    assert!(
+                        actions.contains(&SidebarAction::ToggleProjects),
+                        "saving must leave the sidebar toggle usable"
+                    );
                 }
             }
         }
@@ -21360,20 +22048,41 @@ pub(crate) mod tests {
     #[test]
     fn amend_footer_requires_the_current_pinned_head_even_with_staged_changes() {
         let renderer = headless_renderer();
-        for basis in ["matching", "missing-head", "changed-head", "missing-pin", "normal-unborn"] {
+        for basis in [
+            "matching",
+            "missing-head",
+            "changed-head",
+            "missing-pin",
+            "normal-unborn",
+        ] {
             let mut model = panel_model();
             let mut state = panel_state(&model);
             let source = model.source_control.as_mut().unwrap();
-            source.groups.retain(|group| group.area != ChangeArea::Conflict);
-            assert!(source.staged_count > 0, "staged paths must not bypass the amend basis");
+            source
+                .groups
+                .retain(|group| group.area != ChangeArea::Conflict);
+            assert!(
+                source.staged_count > 0,
+                "staged paths must not bypass the amend basis"
+            );
             let head = Oid::parse_object(source.head_oid.as_deref().unwrap()).unwrap();
             let key = source.key.clone();
-            state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Retained draft".into() });
+            state.apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Retained draft".into(),
+            });
             if basis != "normal-unborn" {
-                state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+                state.apply(&SidebarAction::AmendChanged {
+                    key: key.clone(),
+                    amend: true,
+                });
                 let revision = state.amend_request_revision().unwrap();
                 state.pin_amend_head(&key, revision, head);
-                assert!(state.load_amend_message(&key, revision, "Loaded subject\n\nLoaded body\n"));
+                assert!(state.load_amend_message(
+                    &key,
+                    revision,
+                    "Loaded subject\n\nLoaded body\n"
+                ));
             }
             match basis {
                 "missing-head" | "normal-unborn" => source.head_oid = None,
@@ -21382,7 +22091,13 @@ pub(crate) mod tests {
                 _ => {}
             }
             let actions = frame_enter_presses(&renderer, changes_footer(&state, source, false));
-            assert_eq!(actions.iter().any(|action| matches!(action, SidebarAction::Commit { .. })), matches!(basis, "matching" | "normal-unborn"), "{basis}");
+            assert_eq!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Commit { .. })),
+                matches!(basis, "matching" | "normal-unborn"),
+                "{basis}"
+            );
         }
     }
 
@@ -21512,11 +22227,16 @@ pub(crate) mod tests {
         old.set_mutation_unavailable_reason(Some(Arc::from("old host capability")));
         old.error = Some("old operation failed".into());
         old.pending_stash_drop = Some(crate::repository::StashEntry {
-            reference: "stash@{0}".into(), oid: oid_of(7), message: "old stash".into(),
+            reference: "stash@{0}".into(),
+            oid: oid_of(7),
+            message: "old stash".into(),
         });
         for loading in [false, true] {
-            let mut next = if loading { SourceControlModel::loading(main_key()) }
-                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            let mut next = if loading {
+                SourceControlModel::loading(main_key())
+            } else {
+                SourceControlModel::ready(main_key(), &snapshot())
+            };
             assert_ne!(old.command_binding_id(), next.command_binding_id());
             old.carry_mutation_into(&mut next);
             assert!(next.mutation.is_none());
@@ -21527,7 +22247,10 @@ pub(crate) mod tests {
             old.carry_mutation_into(&mut next);
             assert_eq!(next.mutation, old.mutation);
             assert_eq!(next.pending_stash_drop, old.pending_stash_drop);
-            assert_eq!(next.mutation_unavailable_reason(), old.mutation_unavailable_reason());
+            assert_eq!(
+                next.mutation_unavailable_reason(),
+                old.mutation_unavailable_reason()
+            );
         }
     }
 
@@ -21537,22 +22260,39 @@ pub(crate) mod tests {
         let state = panel_state(&model);
         let source = model.source_control.as_ref().unwrap();
         let renderer = headless_renderer();
-        let messages = frame_enter_bound_presses_at_width(&renderer, git_panel(&model, &state, 380.0, false), 380.0);
-        assert!(!messages.is_empty(), "actual mounted controls must be exercised");
+        let messages = frame_enter_bound_presses_at_width(
+            &renderer,
+            git_panel(&model, &state, 380.0, false),
+            380.0,
+        );
+        assert!(
+            !messages.is_empty(),
+            "actual mounted controls must be exercised"
+        );
         for message in messages {
-            let payload = match &message { SidebarAction::RunCommand { action, .. } => action.as_ref(), message => message };
-            assert!(matches!(payload, SidebarAction::RunBound { binding, .. } if *binding == source.command_binding_id()), "unbound panel action: {message:?}");
+            let payload = match &message {
+                SidebarAction::RunCommand { action, .. } => action.as_ref(),
+                message => message,
+            };
+            assert!(
+                matches!(payload, SidebarAction::RunBound { binding, .. } if *binding == source.command_binding_id()),
+                "unbound panel action: {message:?}"
+            );
         }
     }
 
     #[test]
     fn read_only_git_capability_survives_refresh_and_does_not_rebind() {
-        let reason: Arc<str> = "Git mutations are unavailable on this host; repository reads remain available.".into();
+        let reason: Arc<str> =
+            "Git mutations are unavailable on this host; repository reads remain available.".into();
         let mut original = SourceControlModel::ready(main_key(), &snapshot());
         original.set_mutation_unavailable_reason(Some(reason.clone()));
         for loading in [false, true] {
-            let mut next = if loading { SourceControlModel::loading(main_key()) }
-                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            let mut next = if loading {
+                SourceControlModel::loading(main_key())
+            } else {
+                SourceControlModel::ready(main_key(), &snapshot())
+            };
             next.set_command_binding_id(original.command_binding_id());
             original.carry_mutation_into(&mut next);
             assert_eq!(next.mutation_unavailable_reason(), Some(reason.as_ref()));
@@ -21561,56 +22301,117 @@ pub(crate) mod tests {
         }
         let writable = SourceControlModel::ready(main_key(), &snapshot());
         for loading in [false, true] {
-            let mut next = if loading { SourceControlModel::loading(main_key()) }
-                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            let mut next = if loading {
+                SourceControlModel::loading(main_key())
+            } else {
+                SourceControlModel::ready(main_key(), &snapshot())
+            };
             next.set_mutation_unavailable_reason(Some(reason.clone()));
             next.set_command_binding_id(writable.command_binding_id());
             writable.carry_mutation_into(&mut next);
-            assert!(!next.mutations_available(), "new explicit host capability must not be overwritten by old writable state");
+            assert!(
+                !next.mutations_available(),
+                "new explicit host capability must not be overwritten by old writable state"
+            );
         }
         let mut other = SourceControlModel::ready(fix_key(), &snapshot());
         original.carry_mutation_into(&mut other);
-        assert!(other.mutations_available(), "one worktree never lends its capability to another");
+        assert!(
+            other.mutations_available(),
+            "one worktree never lends its capability to another"
+        );
     }
 
-    fn click_amend_checkbox(state: &SidebarState, source: &SourceControlModel, modal_open: bool) -> Vec<SidebarAction> {
+    fn click_amend_checkbox(
+        state: &SidebarState,
+        source: &SourceControlModel,
+        modal_open: bool,
+    ) -> Vec<SidebarAction> {
         let renderer = headless_renderer();
         // Pinned native checkboxes activate through pointer/touch, not Enter.
         let mut footer = changes_footer(state, source, modal_open);
         let mut tree = Tree::new(footer.as_widget());
         let viewport = cosmic::iced::Rectangle::with_size(Size::new(380., 1200.));
-        let node = footer.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()));
-        let nodes = footer.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
-        let bounds = nodes.root().iter().chain(nodes.children())
-            .find(|node| node.node().label() == Some("Amend")).unwrap().node().bounds().unwrap();
-        let point = cosmic::iced::Point::new(((bounds.x0 + bounds.x1) / 2.) as f32, ((bounds.y0 + bounds.y1) / 2.) as f32);
+        let node = footer.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let nodes = footer.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            cosmic::iced::mouse::Cursor::Unavailable,
+        );
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Amend"))
+            .unwrap()
+            .node()
+            .bounds()
+            .unwrap();
+        let point = cosmic::iced::Point::new(
+            ((bounds.x0 + bounds.x1) / 2.) as f32,
+            ((bounds.y0 + bounds.y1) / 2.) as f32,
+        );
         let mut toggles = Vec::new();
-        footer.as_widget_mut().update(&mut tree,
-            &cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(cosmic::iced::mouse::Button::Left)),
-            Layout::new(&node), cosmic::iced::mouse::Cursor::Available(point), &renderer,
-            &mut cosmic::iced::advanced::clipboard::Null, &mut cosmic::iced::advanced::Shell::new(&mut toggles), &viewport);
+        footer.as_widget_mut().update(
+            &mut tree,
+            &cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(
+                cosmic::iced::mouse::Button::Left,
+            )),
+            Layout::new(&node),
+            cosmic::iced::mouse::Cursor::Available(point),
+            &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut cosmic::iced::advanced::Shell::new(&mut toggles),
+            &viewport,
+        );
         toggles
     }
 
     #[test]
     fn mounted_amend_recovers_checked_draft_after_head_or_operation_changes() {
         for head_present in [false, true] {
-            for kind in [None, Some(crate::repository::GitOperationKind::Merge), Some(crate::repository::GitOperationKind::Rebase), Some(crate::repository::GitOperationKind::CherryPick), Some(crate::repository::GitOperationKind::Revert)] {
+            for kind in [
+                None,
+                Some(crate::repository::GitOperationKind::Merge),
+                Some(crate::repository::GitOperationKind::Rebase),
+                Some(crate::repository::GitOperationKind::CherryPick),
+                Some(crate::repository::GitOperationKind::Revert),
+            ] {
                 for checked in [false, true] {
                     let mut model = panel_model();
                     let mut state = panel_state(&model);
-                    state.apply(&SidebarAction::AmendChanged { key: main_key(), amend: checked });
+                    state.apply(&SidebarAction::AmendChanged {
+                        key: main_key(),
+                        amend: checked,
+                    });
                     let source = model.source_control.as_mut().unwrap();
-                    if !head_present { source.head_oid = None; }
-                    source.operation = kind.map(|kind| crate::repository::GitOperationState { kind, incoming_ref: None, message: None });
-                    source.set_mutation_unavailable_reason(Some(Arc::from("Git writes unavailable; drafts remain editable.")));
+                    if !head_present {
+                        source.head_oid = None;
+                    }
+                    source.operation = kind.map(|kind| crate::repository::GitOperationState {
+                        kind,
+                        incoming_ref: None,
+                        message: None,
+                    });
+                    source.set_mutation_unavailable_reason(Some(Arc::from(
+                        "Git writes unavailable; drafts remain editable.",
+                    )));
                     let expected = checked || (head_present && kind.is_none());
                     let actions = click_amend_checkbox(&state, source, false);
                     assert_eq!(actions.iter().any(|action| matches!(action, SidebarAction::AmendChanged { amend, .. } if *amend == !checked)), expected);
-                    assert!(click_amend_checkbox(&state, source, true).is_empty(), "modal owns activation");
+                    assert!(
+                        click_amend_checkbox(&state, source, true).is_empty(),
+                        "modal owns activation"
+                    );
                     source.set_mutation(Some(MutationKind::Other));
-                    assert!(click_amend_checkbox(&state, source, false).is_empty(), "a running operation owns its draft");
+                    assert!(
+                        click_amend_checkbox(&state, source, false).is_empty(),
+                        "a running operation owns its draft"
+                    );
                 }
             }
         }
@@ -21623,48 +22424,117 @@ pub(crate) mod tests {
         let mut model = panel_model();
         let mut state = panel_state(&model);
         state.changes_tab = ChangesTab::Changes;
-        state.apply(&SidebarAction::CommitMessageChanged { key: main_key(), message: "Retain this draft".into() });
-        let mutates = |action: &SidebarAction| matches!(action,
-            SidebarAction::Stage { .. } | SidebarAction::Unstage { .. }
-            | SidebarAction::InvokeChangeRows { .. } | SidebarAction::ChangeGroup { .. }
-            | SidebarAction::RunChangeGroup { .. } | SidebarAction::RequestDiscard { .. }
-            | SidebarAction::Commit { .. } | SidebarAction::Push { .. }
-            | SidebarAction::OpenPublish { .. } | SidebarAction::GitOperation { .. }
-            | SidebarAction::RunChangeCommand { command: Command::StageSelectedChanges | Command::UnstageSelectedChanges | Command::DiscardSelectedChanges | Command::GitAcceptOurs | Command::GitAcceptTheirs | Command::IgnoreChangePath, .. });
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: main_key(),
+            message: "Retain this draft".into(),
+        });
+        let mutates = |action: &SidebarAction| {
+            matches!(
+                action,
+                SidebarAction::Stage { .. }
+                    | SidebarAction::Unstage { .. }
+                    | SidebarAction::InvokeChangeRows { .. }
+                    | SidebarAction::ChangeGroup { .. }
+                    | SidebarAction::RunChangeGroup { .. }
+                    | SidebarAction::RequestDiscard { .. }
+                    | SidebarAction::Commit { .. }
+                    | SidebarAction::Push { .. }
+                    | SidebarAction::OpenPublish { .. }
+                    | SidebarAction::GitOperation { .. }
+                    | SidebarAction::RunChangeCommand {
+                        command: Command::StageSelectedChanges
+                            | Command::UnstageSelectedChanges
+                            | Command::DiscardSelectedChanges
+                            | Command::GitAcceptOurs
+                            | Command::GitAcceptTheirs
+                            | Command::IgnoreChangePath,
+                        ..
+                    }
+            )
+        };
         let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
-        assert!(live.iter().any(mutates), "the actual native controls start usable");
-        let reason = "Git mutations need retained worktree support; repository reads are available.";
-        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from(reason)));
+        assert!(
+            live.iter().any(mutates),
+            "the actual native controls start usable"
+        );
+        let reason =
+            "Git mutations need retained worktree support; repository reads are available.";
+        model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(Arc::from(reason)));
         let source = model.source_control.as_ref().unwrap();
         assert!(!source.can_push());
         assert!(!source.can_commit(state.commit_message()));
-        assert!(source.wants_history() && source.can_load_history(), "history remains readable");
+        assert!(
+            source.wants_history() && source.can_load_history(),
+            "history remains readable"
+        );
         let mut committable = source.clone();
-        committable.groups.retain(|group| group.area != ChangeArea::Conflict);
+        committable
+            .groups
+            .retain(|group| group.area != ChangeArea::Conflict);
         committable.set_mutation_unavailable_reason(None);
         assert!(committable.can_commit(state.commit_message()));
         assert!(committable.can_push());
         committable.set_mutation_unavailable_reason(Some(Arc::from(reason)));
         assert!(!committable.can_commit(state.commit_message()));
         let disabled = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
-        assert!(!disabled.iter().any(mutates), "mounted native mutation controls must not emit actions");
-        assert!(disabled.iter().any(|action| matches!(action, SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. })), "read navigation remains mounted and usable");
+        assert!(
+            !disabled.iter().any(mutates),
+            "mounted native mutation controls must not emit actions"
+        );
+        assert!(
+            disabled.iter().any(|action| matches!(
+                action,
+                SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. }
+            )),
+            "read navigation remains mounted and usable"
+        );
         let toggles = click_amend_checkbox(&state, source, false);
-        assert!(toggles.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
+        assert!(
+            toggles
+                .iter()
+                .any(|action| matches!(action, SidebarAction::AmendChanged { .. })),
+            "Amend draft toggle/HEAD read remains usable; committing it does not"
+        );
         let mut retained = SourceControlModel::ready(main_key(), &snapshot());
         retained.upstream = None;
         retained.tracking = TrackingState::NoUpstream;
         assert!(retained.can_publish());
         retained.set_mutation_unavailable_reason(Some(Arc::from(reason)));
         assert!(!retained.can_publish());
-        let publish = PublishDraft::new(main_key(), retained.branch.clone().unwrap(), &retained.remotes);
-        assert!(!frame_enter_presses(&renderer, publish_picker(&retained, &publish, false)).iter().any(|action| matches!(action, SidebarAction::Push { .. })));
+        let publish = PublishDraft::new(
+            main_key(),
+            retained.branch.clone().unwrap(),
+            &retained.remotes,
+        );
+        assert!(
+            !frame_enter_presses(&renderer, publish_picker(&retained, &publish, false))
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Push { .. }))
+        );
         let mut notice: Element<'_, SidebarAction> = source_control_notices(source, true).into();
         let mut tree = Tree::new(notice.as_widget());
-        let node = notice.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(380., 4000.)));
-        let nodes = notice.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
-        assert!(nodes.root().iter().chain(nodes.children()).any(|node| node.node().label() == Some(reason)), "the actual panel explains why mutations are disabled");
+        let node = notice.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(380., 4000.)),
+        );
+        let nodes = notice.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            cosmic::iced::mouse::Cursor::Unavailable,
+        );
+        assert!(
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .any(|node| node.node().label() == Some(reason)),
+            "the actual panel explains why mutations are disabled"
+        );
     }
 
     #[test]
@@ -21792,56 +22662,181 @@ pub(crate) mod tests {
 
     #[test]
     fn history_popup_closes_when_an_identical_commit_moves_to_another_worktree() {
-        use cosmic::iced::{Event, Point, Rectangle, Vector, advanced::{Shell, clipboard}, mouse};
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
         let renderer = headless_renderer();
-        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
-        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![], author: identity.clone(), committer: identity, subject: "Same commit".into(), body: "Same body".into() });
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let row = CommitRow::new(&CommitSummary {
+            oid: oid_of(3),
+            parents: vec![],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Same commit".into(),
+            body: "Same body".into(),
+        });
         let mut original = source_control();
         original.history = vec![row.clone()];
-        assert!(original.history_command_available(&row.oid, row.mainline, &row.message, HistoryCommand::Revert));
-        fn make<'a>(source: &'a SourceControlModel, row: &'a CommitRow) -> Element<'a, SidebarAction> {
-            history_context_controls(cosmic::iced::widget::Space::new().width(240).height(32).into(), source, row, false, Arc::new(source.key.clone()), Arc::new(std::array::from_fn(|_| None)))
+        assert!(original.history_command_available(
+            &row.oid,
+            row.mainline,
+            &row.message,
+            HistoryCommand::Revert
+        ));
+        fn make<'a>(
+            source: &'a SourceControlModel,
+            row: &'a CommitRow,
+        ) -> Element<'a, SidebarAction> {
+            history_context_controls(
+                cosmic::iced::widget::Space::new()
+                    .width(240)
+                    .height(32)
+                    .into(),
+                source,
+                row,
+                false,
+                Arc::new(source.key.clone()),
+                Arc::new(std::array::from_fn(|_| None)),
+            )
         }
         let window = Size::new(600.0, 400.0);
         let viewport = Rectangle::with_size(window);
         let cursor = mouse::Cursor::Available(Point::new(20.0, 16.0));
         for path_only in [false, true] {
             let mut changed = original.clone();
-            changed.key = if path_only { ActiveWorktreeKey { canonical_path: "/replacement/main".into(), ..original.key.clone() } } else { fix_key() };
-            assert!(changed.history_command_available(&row.oid, row.mainline, &row.message, HistoryCommand::Revert), "the replacement target would otherwise admit its own action");
+            changed.key = if path_only {
+                ActiveWorktreeKey {
+                    canonical_path: "/replacement/main".into(),
+                    ..original.key.clone()
+                }
+            } else {
+                fix_key()
+            };
+            assert!(
+                changed.history_command_available(
+                    &row.oid,
+                    row.mainline,
+                    &row.message,
+                    HistoryCommand::Revert
+                ),
+                "the replacement target would otherwise admit its own action"
+            );
             let mut element = make(&original, &row);
             let widget = element.as_widget_mut();
             let mut tree = Tree::new(&*widget);
             widget.diff(&mut tree);
-            let node = widget.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            let node = widget.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, window),
+            );
             let mut messages = Vec::new();
-            widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            widget.update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
             {
-                let mut popup = widget.overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).expect("original worktree popup");
+                let mut popup = widget
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .expect("original worktree popup");
                 let popup_node = popup.as_overlay_mut().layout(&renderer, window);
-                popup.as_overlay_mut().update(&Event::Window(cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now())), Layout::new(&popup_node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+                popup.as_overlay_mut().update(
+                    &Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    )),
+                    Layout::new(&popup_node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
             }
             for (source, expected_open) in [(&original, true), (&changed, false)] {
                 let mut next = make(source, &row);
                 let widget = next.as_widget_mut();
                 widget.diff(&mut tree);
-                let node = widget.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, window));
-                assert_eq!(widget.overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some(), expected_open, "same commit must retain only its original exact worktree");
+                let node = widget.layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, window),
+                );
+                assert_eq!(
+                    widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO
+                        )
+                        .is_some(),
+                    expected_open,
+                    "same commit must retain only its original exact worktree"
+                );
             }
         }
     }
 
     #[test]
     fn history_actions_pin_the_message_and_merge_parent_from_the_rendered_commit() {
-        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
-        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let row = CommitRow::new(&CommitSummary {
+            oid: oid_of(3),
+            parents: vec![oid_of(1), oid_of(2)],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Merge subject".into(),
+            body: "Body line\n".into(),
+        });
         let key = main_key();
-        let action = widget::menu::Action::message(&HistoryContextCommand { binding: crate::model::OperationId::new(), key: &key, row: &row, command: HistoryCommand::Revert });
+        let action = widget::menu::Action::message(&HistoryContextCommand {
+            binding: crate::model::OperationId::new(),
+            key: &key,
+            row: &row,
+            command: HistoryCommand::Revert,
+        });
         let message = Arc::clone(&row.message);
         drop(row);
-        let SidebarAction::RunCommand { command, action } = action else { panic!("registered history command"); };
-        assert_eq!(command, crate::workspace_widget::GlobalShortcut::GitHistoryRevert);
-        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = commands::bound_payload(&action) else { panic!("expected a history command"); };
+        let SidebarAction::RunCommand { command, action } = action else {
+            panic!("registered history command");
+        };
+        assert_eq!(
+            command,
+            crate::workspace_widget::GlobalShortcut::GitHistoryRevert
+        );
+        let SidebarAction::HistoryCommand {
+            oid,
+            mainline,
+            message: captured,
+            ..
+        } = commands::bound_payload(&action)
+        else {
+            panic!("expected a history command");
+        };
         assert_eq!(oid, &oid_of(3));
         assert_eq!(*mainline, Some(1));
         assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");

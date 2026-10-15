@@ -51,13 +51,18 @@ const FAILURE_EXCERPT_LIMIT: usize = 64 * 1024;
 struct InheritedFile(Arc<std::fs::File>);
 
 impl PartialEq for InheritedFile {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for InheritedFile {}
 
 fn validate_inherited_fd(fd: i32) -> io::Result<()> {
     if fd < 3 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "inherited descriptors must not name standard input, output, or error"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inherited descriptors must not name standard input, output, or error",
+        ));
     }
     Ok(())
 }
@@ -193,7 +198,9 @@ impl CommandSpec {
                         for file in &inherited {
                             let fd = file.0.as_raw_fd();
                             let flags = libc::fcntl(fd, libc::F_GETFD);
-                            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                            if flags == -1
+                                || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                            {
                                 return Err(io::Error::last_os_error());
                             }
                         }
@@ -955,7 +962,8 @@ mod tests {
         let spec = CommandSpec::new("/bin/sh")
             .args(["-c", "exec /usr/bin/stat -Lc '%d:%i' \"$1\"", "fixture"])
             .arg(format!("/proc/self/fd/{number}"))
-            .inherit_file(retained.clone()).unwrap();
+            .inherit_file(retained.clone())
+            .unwrap();
         let clone = spec.clone();
         assert_eq!(spec, clone);
         let mut command = clone.to_command();
@@ -966,10 +974,20 @@ mod tests {
         std::fs::rename(&path, temporary.path().join("original")).unwrap();
         std::fs::create_dir(&path).unwrap();
         let replacement = std::fs::metadata(&path).unwrap();
-        assert_ne!((metadata.dev(), metadata.ino()), (replacement.dev(), replacement.ino()));
+        assert_ne!(
+            (metadata.dev(), metadata.ino()),
+            (replacement.dev(), replacement.ino())
+        );
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("{}:{}", metadata.dev(), metadata.ino()));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        );
     }
 
     #[test]
@@ -986,15 +1004,19 @@ mod tests {
         // an inherited descriptor across exec without assuming BSD stat flags.
         let spec = CommandSpec::new("/bin/sh")
             .args(["-c", ":"])
-            .inherit_file(original.clone()).unwrap();
+            .inherit_file(original.clone())
+            .unwrap();
         let other = CommandSpec::new("/bin/sh")
             .args(["-c", ":"])
-            .inherit_file(duplicate).unwrap();
+            .inherit_file(duplicate)
+            .unwrap();
         assert_ne!(spec, other);
         assert!(spec.to_command().output().unwrap().status.success());
         // SAFETY: original still owns the descriptor after child execution.
         assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, before);
-        for fd in [-1, 0, 1, 2] { assert!(validate_inherited_fd(fd).is_err()); }
+        for fd in [-1, 0, 1, 2] {
+            assert!(validate_inherited_fd(fd).is_err());
+        }
         assert!(validate_inherited_fd(descriptor).is_ok());
     }
     use std::fs;

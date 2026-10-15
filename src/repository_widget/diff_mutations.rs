@@ -43,33 +43,58 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub fn identity(&self) -> &AsyncIdentity { &self.identity }
+    pub fn identity(&self) -> &AsyncIdentity {
+        &self.identity
+    }
 
-    pub fn applies_to_buffer(&self) -> bool { self.buffer_revision.is_some() }
+    pub fn applies_to_buffer(&self) -> bool {
+        self.buffer_revision.is_some()
+    }
 
     /// Cached Stage reads captured live text and leaves disk/buffers intact.
-    pub fn stages_live_buffer(&self) -> bool { self.kind == git_patch::Kind::Stage }
+    pub fn stages_live_buffer(&self) -> bool {
+        self.kind == git_patch::Kind::Stage
+    }
 
     /// At the owned queue turn, refuse any change of the rendered source.
     /// Buffer Revert is one native Undo transaction; disk effects are returned
     /// to the host's existing ordered Git/recovery pipeline.
-    pub fn apply(self, runtime: &mut RepositoryRuntime) -> Result<Option<crate::repository::GitOperation>, String> {
+    pub fn apply(
+        self,
+        runtime: &mut RepositoryRuntime,
+    ) -> Result<Option<crate::repository::GitOperation>, String> {
         let current = runtime.current_diff_model_snapshot();
         if !runtime.accepts_selected(&self.identity)
-            || runtime.diff_basis != self.basis || runtime.diff_mode != self.mode
+            || runtime.diff_basis != self.basis
+            || runtime.diff_mode != self.mode
             || runtime.diff_layout_revision != self.layout_revision
             || runtime.diff_interaction.selection != self.selection
             || !runtime.can_mutate_diff(self.kind)
             || !current.is_some_and(|model| Arc::ptr_eq(&model, &self.model))
-        { return Err("The selected diff changed while the action was prepared. Try again.".into()); }
+        {
+            return Err(
+                "The selected diff changed while the action was prepared. Try again.".into(),
+            );
+        }
         let mut patch = self.patch;
         if let Some(revision) = self.buffer_revision {
-            let present = patch.working_present.ok_or("The selected change has no working-file presence state")?;
-            runtime.apply_diff_buffer_revert_with_presence(&self.identity, revision, patch.buffer_change.take(), present, patch.working_mode)?;
+            let present = patch
+                .working_present
+                .ok_or("The selected change has no working-file presence state")?;
+            runtime.apply_diff_buffer_revert_with_presence(
+                &self.identity,
+                revision,
+                patch.buffer_change.take(),
+                present,
+                patch.working_mode,
+            )?;
             Ok(None)
         } else {
             Ok(Some(crate::repository::GitOperation::ApplyPatch {
-                patch: patch.patch, cached: patch.cached, reverse: patch.reverse, expected_head: patch.expected_head,
+                patch: patch.patch,
+                cached: patch.cached,
+                reverse: patch.reverse,
+                expected_head: patch.expected_head,
             }))
         }
     }
@@ -77,7 +102,9 @@ impl Prepared {
 
 impl Capture {
     /// This capture edits only the open document through native Undo.
-    pub fn applies_to_buffer(&self) -> bool { self.buffer_revision.is_some() }
+    pub fn applies_to_buffer(&self) -> bool {
+        self.buffer_revision.is_some()
+    }
 
     /// Build patch bytes and any minimal native buffer replacement off thread.
     pub fn prepare(self) -> Option<Prepared> {
@@ -88,7 +115,17 @@ impl Capture {
         let layout_revision = self.layout_revision;
         let selection = self.selection;
         let (identity, buffer_revision, patch) = self.build()?;
-        Some(Prepared { identity, model, kind, basis, mode, layout_revision, selection, buffer_revision, patch })
+        Some(Prepared {
+            identity,
+            model,
+            kind,
+            basis,
+            mode,
+            layout_revision,
+            selection,
+            buffer_revision,
+            patch,
+        })
     }
 
     pub fn build(self) -> Option<(AsyncIdentity, Option<u64>, git_patch::Patch)> {
@@ -120,7 +157,9 @@ impl Capture {
 impl RepositoryRuntime {
     /// A gutter action names the exact row coordinates that were rendered.
     pub fn diff_mutation_request(&self, card: CardId, rows: Range<usize>) -> Option<Arc<Request>> {
-        if self.disk_comparison.is_some() { return None; }
+        if self.disk_comparison.is_some() {
+            return None;
+        }
         let path = self.selected_path()?.to_owned();
         Some(Arc::new(Request {
             identity: self.current_identity(card, path),
@@ -582,7 +621,12 @@ pub(super) fn gutter<'a>(
     let button = |kind, icon: Icon, label: &'static str| {
         let enabled = runtime.can_mutate_diff(kind);
         let target = height.min(20.0);
-        let glyph = runtime.diff_typography().gutter_size().min(target).floor().max(1.0) as u16;
+        let glyph = runtime
+            .diff_typography()
+            .gutter_size()
+            .min(target)
+            .floor()
+            .max(1.0) as u16;
         let control = widget::button::custom(icon.handle().icon().size(glyph))
             .name(label)
             .class(crate::ui_controls::control_style(false, None))
@@ -1132,40 +1176,77 @@ mod tests {
 
     #[test]
     fn disk_comparison_refuses_hidden_git_hunks_selection_and_prepared_effects() {
-        for kind in [git_patch::Kind::Stage,git_patch::Kind::Unstage,git_patch::Kind::Revert] {
-            for loading in [false,true] {
-                let card=CardId::new();let mut runtime=selected_mutation_fixture(card);
-                if kind==git_patch::Kind::Unstage {
-                    let mut model=crate::diff_view::build_diff("original\nkeep\n","changed\nkeep\n");
-                    model.present=[true;2];model.modes=[Some(0o100644);2];
-                    model.source_head=Some(crate::repository::GitHeadGuard::Unborn);
-                    runtime.diff_basis=DiffBasis::HeadToIndex;
-                    runtime.set_diff_state(DiffBasis::HeadToIndex,DiffState::ready(RenderedDiff::Text{
-                        model:Arc::new(model),old_label:"HEAD".into(),new_label:"Index".into(),
-                    }));
+        for kind in [
+            git_patch::Kind::Stage,
+            git_patch::Kind::Unstage,
+            git_patch::Kind::Revert,
+        ] {
+            for loading in [false, true] {
+                let card = CardId::new();
+                let mut runtime = selected_mutation_fixture(card);
+                if kind == git_patch::Kind::Unstage {
+                    let mut model =
+                        crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");
+                    model.present = [true; 2];
+                    model.modes = [Some(0o100644); 2];
+                    model.source_head = Some(crate::repository::GitHeadGuard::Unborn);
+                    runtime.diff_basis = DiffBasis::HeadToIndex;
+                    runtime.set_diff_state(
+                        DiffBasis::HeadToIndex,
+                        DiffState::ready(RenderedDiff::Text {
+                            model: Arc::new(model),
+                            old_label: "HEAD".into(),
+                            new_label: "Index".into(),
+                        }),
+                    );
                 }
                 assert!(runtime.can_apply_diff_hunk(kind));
-                let hidden=runtime.current_diff_model_snapshot().unwrap();
-                let request=runtime.diff_mutation_request(card,0..2).unwrap();
-                let prepared=runtime.capture_diff_mutation(card,kind,Some(&request)).unwrap().prepare().unwrap();
-                runtime.disk_comparison=Some(if loading {
-                    DiffState::Loading{request:0,cancellation:CancellationToken::new()}
+                let hidden = runtime.current_diff_model_snapshot().unwrap();
+                let request = runtime.diff_mutation_request(card, 0..2).unwrap();
+                let prepared = runtime
+                    .capture_diff_mutation(card, kind, Some(&request))
+                    .unwrap()
+                    .prepare()
+                    .unwrap();
+                runtime.disk_comparison = Some(if loading {
+                    DiffState::Loading {
+                        request: 0,
+                        cancellation: CancellationToken::new(),
+                    }
                 } else {
-                    DiffState::ready(RenderedDiff::Text{
-                        model:Arc::new(crate::diff_view::build_diff("external disk\n","entirely different visible buffer\n")),
-                        old_label:"Disk".into(),new_label:"Buffer".into(),
+                    DiffState::ready(RenderedDiff::Text {
+                        model: Arc::new(crate::diff_view::build_diff(
+                            "external disk\n",
+                            "entirely different visible buffer\n",
+                        )),
+                        old_label: "Disk".into(),
+                        new_label: "Buffer".into(),
                     })
                 });
                 assert!(!runtime.can_mutate_diff(kind));
                 assert!(!runtime.can_apply_diff_hunk(kind));
-                assert!(runtime.diff_mutation_request(card,0..2).is_none());
-                assert!(runtime.capture_diff_mutation(card,kind,Some(&request)).is_none());
-                assert!(prepared.apply(&mut runtime).is_err(),"Compare must fence an already prepared Git/buffer mutation");
-                assert!(Arc::ptr_eq(&hidden,&runtime.current_diff_model_snapshot().unwrap()));
-                assert_eq!(runtime.editor_text().unwrap(),"changed\nkeep\n");
-                runtime.diff_interaction.selection=Some(crate::diff_interaction::Selection::new(runtime.diff_mode,crate::diff_interaction::Side::New,0));
+                assert!(runtime.diff_mutation_request(card, 0..2).is_none());
+                assert!(
+                    runtime
+                        .capture_diff_mutation(card, kind, Some(&request))
+                        .is_none()
+                );
+                assert!(
+                    prepared.apply(&mut runtime).is_err(),
+                    "Compare must fence an already prepared Git/buffer mutation"
+                );
+                assert!(Arc::ptr_eq(
+                    &hidden,
+                    &runtime.current_diff_model_snapshot().unwrap()
+                ));
+                assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
+                runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+                    runtime.diff_mode,
+                    crate::diff_interaction::Side::New,
+                    0,
+                ));
                 assert!(!runtime.can_apply_diff_selection(kind));
-                assert!(runtime.diff_selection_mutation_action(card,kind).is_none());
+                assert!(runtime.diff_selection_mutation_action(card, kind).is_none());
             }
         }
     }
@@ -1177,17 +1258,35 @@ mod tests {
         runtime.set_git_mutation_unavailable_reason(Some(Arc::from("Git writes unsupported")));
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
         assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
-        let revert = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, None).unwrap();
+        let revert = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, None)
+            .unwrap();
         assert!(revert.applies_to_buffer());
-        assert!(revert.prepare().unwrap().apply(&mut runtime).unwrap().is_none());
+        assert!(
+            revert
+                .prepare()
+                .unwrap()
+                .apply(&mut runtime)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
         assert!(runtime.selected_staging_selection(true).is_none());
         let request = runtime.diff_mutation_request(card, 0..2).unwrap();
-        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).is_none());
+        assert!(
+            runtime
+                .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+                .is_none()
+        );
         runtime.source_surface = SourceSurface::Editor;
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("editable ".into()))) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "editable ".into(),
+            ))),
+        }));
         assert!(runtime.editor_text().unwrap().contains("editable"));
         assert!(runtime.can_step_editor_history(false));
         drop(runtime.update(RepositoryAction::Undo { card }));
@@ -1199,14 +1298,33 @@ mod tests {
         let card = CardId::new();
         let mut runtime = selected_mutation_fixture(card);
         let request = runtime.diff_mutation_request(card, 0..1).unwrap();
-        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
-        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(runtime.diff_mode, crate::diff_interaction::Side::New, 0));
+        let prepared = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+            runtime.diff_mode,
+            crate::diff_interaction::Side::New,
+            0,
+        ));
         assert!(prepared.apply(&mut runtime).is_err());
         runtime.diff_interaction.selection = None;
-        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
+        let prepared = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+            .unwrap()
+            .prepare()
+            .unwrap();
         let model = runtime.current_diff_model_snapshot().unwrap();
         let replacement = Arc::new((*model).clone());
-        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text { model: replacement, old_label: "Index".into(), new_label: "Working tree".into() }));
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: replacement,
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
         assert!(prepared.apply(&mut runtime).is_err());
     }
 
@@ -1215,7 +1333,11 @@ mod tests {
         let card = CardId::new();
         let mut runtime = selected_mutation_fixture(card);
         let request = runtime.diff_mutation_request(card, 0..2).unwrap();
-        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap().prepare().unwrap();
+        let prepared = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .prepare()
+            .unwrap();
         assert!(prepared.applies_to_buffer());
         assert!(prepared.apply(&mut runtime).unwrap().is_none());
         assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");

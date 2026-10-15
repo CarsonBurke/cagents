@@ -125,7 +125,9 @@ fn entry_command(message: &Message) -> Option<Command> {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::Palette(Action::RunGitGroup(command, _)) => format!("command:{}", command.id()),
-        Message::Palette(Action::RunProjectCreation(target)) => format!("command:{}", target.command().id()),
+        Message::Palette(Action::RunProjectCreation(target)) => {
+            format!("command:{}", target.command().id())
+        }
         Message::Palette(Action::RunOriginCommand(command, _)) => {
             format!("command:{}", command.id())
         }
@@ -159,7 +161,10 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
-        (Message::Palette(Action::RunProjectCreation(left)), Message::Palette(Action::RunProjectCreation(right))) => left == right,
+        (
+            Message::Palette(Action::RunProjectCreation(left)),
+            Message::Palette(Action::RunProjectCreation(right)),
+        ) => left == right,
         (
             Message::Palette(Action::RunGitGroup(lc, lt)),
             Message::Palette(Action::RunGitGroup(rc, rt)),
@@ -470,8 +475,8 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.group_target = None;
                 self.palette.git_captured = false;
-            self.palette.project_creation_captured = false;
-            self.palette.project_creation_targets = [None, None];
+                self.palette.project_creation_captured = false;
+                self.palette.project_creation_targets = [None, None];
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
                 self.palette.recording = Some(field);
@@ -1324,11 +1329,14 @@ impl Cagents {
                 .filter(|descriptor| descriptor.action != Command::CommandPalette)
                 .filter(|descriptor| descriptor.available(&context))
                 .filter_map(|descriptor| {
-                    let message = if matches!(descriptor.action, Command::NewWorktree | Command::NewWorktreeFromBranch) {
-                        Message::Palette(Action::RunProjectCreation(self.project_creation_command_target(descriptor.action)?))
-                    } else if workspace_widget::git_group_command_bit(descriptor.action)
-                        .is_some()
-                    {
+                    let message = if matches!(
+                        descriptor.action,
+                        Command::NewWorktree | Command::NewWorktreeFromBranch
+                    ) {
+                        Message::Palette(Action::RunProjectCreation(
+                            self.project_creation_command_target(descriptor.action)?,
+                        ))
+                    } else if workspace_widget::git_group_command_bit(descriptor.action).is_some() {
                         Message::Palette(Action::RunGitGroup(
                             descriptor.action,
                             self.git_group_target()?,
@@ -1486,7 +1494,7 @@ impl Cagents {
                                     | Action::RunChatUser(_)
                                     | Action::RunOriginCommand(_, _)
                                     | Action::RunGitGroup(_, _)
-                        | Action::RunProjectCreation(_),
+                                    | Action::RunProjectCreation(_),
                                 ) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
@@ -1708,24 +1716,56 @@ impl Cagents {
         )
     }
 
-    fn project_creation_command_target(&self, command: Command) -> Option<sidebar::commands::ProjectCreationTarget> {
+    fn project_creation_command_target(
+        &self,
+        command: Command,
+    ) -> Option<sidebar::commands::ProjectCreationTarget> {
         let from_branch = command == Command::NewWorktreeFromBranch;
-        if !matches!(command, Command::NewWorktree | Command::NewWorktreeFromBranch) { return None; }
+        if !matches!(
+            command,
+            Command::NewWorktree | Command::NewWorktreeFromBranch
+        ) {
+            return None;
+        }
         if self.palette.project_creation_captured {
-            return self.palette.project_creation_targets[usize::from(from_branch)].as_ref()
-                .filter(|target| target.current_in(&self.sidebar_model)
-                    && self.project_creation_source(target.project_id).is_some_and(|source| source.id() == target.binding)).cloned();
+            return self.palette.project_creation_targets[usize::from(from_branch)]
+                .as_ref()
+                .filter(|target| {
+                    target.current_in(&self.sidebar_model)
+                        && self
+                            .project_creation_source(target.project_id)
+                            .is_some_and(|source| source.id() == target.binding)
+                })
+                .cloned();
         }
         let captured = if let Some(target) = self.sidebar_command_target() {
             match target {
-                sidebar::commands::CommandTarget::Rows(rows) => sidebar::commands::ProjectCreationTarget::capture_rows(&self.sidebar_model, &rows, from_branch),
-                sidebar::commands::CommandTarget::ProjectCreation(target) if target.command() == command && target.current_in(&self.sidebar_model) => Some(target),
+                sidebar::commands::CommandTarget::Rows(rows) => {
+                    sidebar::commands::ProjectCreationTarget::capture_rows(
+                        &self.sidebar_model,
+                        &rows,
+                        from_branch,
+                    )
+                }
+                sidebar::commands::CommandTarget::ProjectCreation(target)
+                    if target.command() == command && target.current_in(&self.sidebar_model) =>
+                {
+                    Some(target)
+                }
                 _ => None,
             }
         } else if !from_branch {
-            sidebar::commands::ProjectCreationTarget::capture(&self.sidebar_model, self.command_project()?.id, None, false)
-        } else { None }?;
-        self.project_creation_source(captured.project_id).filter(|source| source.id() == captured.binding)?;
+            sidebar::commands::ProjectCreationTarget::capture(
+                &self.sidebar_model,
+                self.command_project()?.id,
+                None,
+                false,
+            )
+        } else {
+            None
+        }?;
+        self.project_creation_source(captured.project_id)
+            .filter(|source| source.id() == captured.binding)?;
         Some(captured)
     }
 
@@ -1898,8 +1938,15 @@ impl Cagents {
             .iter()
             .filter_map(|descriptor| {
                 let bit = descriptor.action.sidebar_command_bit()?;
-                if matches!(descriptor.action, Command::NewWorktree | Command::NewWorktreeFromBranch) {
-                    return (!crate::device::is_remote() && self.project_creation_command_target(descriptor.action).is_some()).then_some(bit);
+                if matches!(
+                    descriptor.action,
+                    Command::NewWorktree | Command::NewWorktreeFromBranch
+                ) {
+                    return (!crate::device::is_remote()
+                        && self
+                            .project_creation_command_target(descriptor.action)
+                            .is_some())
+                    .then_some(bit);
                 }
                 let action = target.resolve_in(
                     &self.sidebar_model,
@@ -2397,10 +2444,19 @@ impl Cagents {
     }
 
     fn live_editor_language_capabilities(&self, card: CardId) -> u8 {
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
-        let Some(doc) = self.lsp_document(card).filter(|doc| runtime.lsp_document() == Some(*doc)) else { return 0; };
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return 0;
+        };
+        let Some(doc) = self
+            .lsp_document(card)
+            .filter(|doc| runtime.lsp_document() == Some(*doc))
+        else {
+            return 0;
+        };
         let capabilities = self.lsp.capabilities(doc);
-        if !capabilities.ready { return 0; }
+        if !capabilities.ready {
+            return 0;
+        }
         let runtime_mask = runtime.editor_language_command_capabilities();
         [
             (Command::EditorComplete, capabilities.completion),
@@ -2410,9 +2466,15 @@ impl Cagents {
             // Diagnostics is the local panel for server-pushed diagnostics;
             // pull-diagnosticProvider does not describe that capability.
             (Command::ShowDiagnostics, true),
-        ].into_iter().filter_map(|(command, supported)| {
-            supported.then(|| workspace_widget::editor_language_command_bit(command)).flatten()
-        }).fold(0, |mask, bit| mask | bit) & runtime_mask
+        ]
+        .into_iter()
+        .filter_map(|(command, supported)| {
+            supported
+                .then(|| workspace_widget::editor_language_command_bit(command))
+                .flatten()
+        })
+        .fold(0, |mask, bit| mask | bit)
+            & runtime_mask
     }
 
     fn editor_feature_command_capabilities(&self, card: CardId) -> u8 {
@@ -2453,11 +2515,22 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
-        if matches!(command, Command::NewWorktree | Command::NewWorktreeFromBranch) {
-            return self.project_creation_command_target(command).map_or_else(Task::none, |target| self.run_project_creation_target(target));
+        if matches!(
+            command,
+            Command::NewWorktree | Command::NewWorktreeFromBranch
+        ) {
+            return self
+                .project_creation_command_target(command)
+                .map_or_else(Task::none, |target| {
+                    self.run_project_creation_target(target)
+                });
         }
-        if command == Command::OpenAutomations { return self.open_automations(); }
-        if command == Command::OpenAgentAccounts { return self.open_agent_accounts(); }
+        if command == Command::OpenAutomations {
+            return self.open_automations();
+        }
+        if command == Command::OpenAgentAccounts {
+            return self.open_agent_accounts();
+        }
         if matches!(
             command,
             Command::SettingsOpenFile | Command::SettingsRevealFile
@@ -2711,9 +2784,11 @@ impl Cagents {
                 self.update(Message::Onboarding(onboarding_ui::Action::Clone))
             }
             Command::OpenFolder => self.update(Message::OpenRepository),
-            Command::NewWorktree => {
-                self.project_creation_command_target(command).map_or_else(Task::none, |target| self.run_project_creation_target(target))
-            }
+            Command::NewWorktree => self
+                .project_creation_command_target(command)
+                .map_or_else(Task::none, |target| {
+                    self.run_project_creation_target(target)
+                }),
             Command::ResumeConversation => {
                 self.update(Message::ResumeConversation(resume_ui::Action::Open))
             }
@@ -2805,7 +2880,10 @@ impl Cagents {
             )));
             return Task::none();
         }
-        if allow_sidebar && command.sidebar_command_bit().is_some() && self.sidebar_command_target().is_some() {
+        if allow_sidebar
+            && command.sidebar_command_bit().is_some()
+            && self.sidebar_command_target().is_some()
+        {
             return self.run_registered_command(command);
         }
         match command {
@@ -3347,7 +3425,6 @@ impl SettingsField {
             Self::ShortcutOpenAutomations => Some(Command::OpenAutomations),
             Self::ShortcutOpenAgentAccounts => Some(Command::OpenAgentAccounts),
 
-
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
             Self::ShortcutClonePane => Some(Command::ClonePane),
@@ -3790,8 +3867,10 @@ impl ShortcutDraft {
                 self.git_history_cherry_pick.as_str(),
             ),
             (Command::OpenAutomations, self.open_automations.as_str()),
-            (Command::OpenAgentAccounts, self.open_agent_accounts.as_str()),
-
+            (
+                Command::OpenAgentAccounts,
+                self.open_agent_accounts.as_str(),
+            ),
         ]
     }
 }
@@ -3808,51 +3887,92 @@ mod tests {
         runtime.descriptor.worktree = root.path().into();
         runtime.descriptor.repository = root.path().into();
         runtime.set_lsp_document(Some(doc));
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
-        app.lsp = crate::lsp::LspManager::fixture_ready_code_actions(doc,
-            &root.path().join("source.rs"), root.path(), "call();\n").await;
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp = crate::lsp::LspManager::fixture_ready_code_actions(
+            doc,
+            &root.path().join("source.rs"),
+            root.path(),
+            "call();\n",
+        )
+        .await;
         app.lsp_documents.insert(doc, card);
         app.lsp_contexts.entry(card).or_default().document = Some(doc);
         assert!(app.lsp.capabilities(doc).ready);
         assert!(app.lsp.document_version(doc).is_some());
-        let diagnostics = workspace_widget::editor_language_command_bit(Command::ShowDiagnostics).unwrap();
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, diagnostics,
-            "a Ready code-action-only server must expose local pushed diagnostics, without advertising unsupported providers");
+        let diagnostics =
+            workspace_widget::editor_language_command_bit(Command::ShowDiagnostics).unwrap();
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            diagnostics,
+            "a Ready code-action-only server must expose local pushed diagnostics, without advertising unsupported providers"
+        );
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(crate::lsp::LspDocumentId(80)));
         }
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
-            "another mounted document cannot borrow the manager's Ready capability");
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            0,
+            "another mounted document cannot borrow the manager's Ready capability"
+        );
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
         }
         app.lsp.begin_shutdown().await;
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
-            "retired session commands must disappear");
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            0,
+            "retired session commands must disappear"
+        );
     }
 
     #[test]
     fn utility_destinations_are_registered_bindable_and_use_actual_workspace_dispatch() {
-        for (command, account) in [(Command::OpenAutomations, false), (Command::OpenAgentAccounts, true)] {
+        for (command, account) in [
+            (Command::OpenAutomations, false),
+            (Command::OpenAgentAccounts, true),
+        ] {
             let descriptor = workspace_widget::shortcut_descriptor(command);
             assert!(descriptor.default_chords().is_empty());
-            assert!(!descriptor.available(&workspace_widget::CommandContext { save_in_flight: true, ..Default::default() }));
+            assert!(!descriptor.available(&workspace_widget::CommandContext {
+                save_in_flight: true,
+                ..Default::default()
+            }));
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            if account { app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()]; }
-            else { app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()]; }
-            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), "F10");
+            if account {
+                app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()];
+            } else {
+                app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()];
+            }
+            assert_eq!(
+                workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts),
+                "F10"
+            );
             assert!(app.command_available(command));
             app.palette.query = Some(">".into());
-            assert!(app.palette_entries().iter().any(|(_, _, message)| matches!(message, Message::RunCommand(found) if *found == command)));
+            assert!(app.palette_entries().iter().any(
+                |(_, _, message)| matches!(message, Message::RunCommand(found) if *found == command)
+            ));
             drop(app.update_palette(Action::Close));
             drop(app.update(Message::RunCommand(command)));
-            assert!(app.durable.cards.iter().any(|card| card.existence.is_open() && if account { matches!(card.kind, CardKind::Accounts) } else { matches!(card.kind, CardKind::Automations) }));
+            assert!(app.durable.cards.iter().any(|card| card.existence.is_open()
+                && if account {
+                    matches!(card.kind, CardKind::Accounts)
+                } else {
+                    matches!(card.kind, CardKind::Automations)
+                }));
         }
-        let remote = workspace_widget::CommandContext { remote_device: true, ..Default::default() };
-        assert!(!workspace_widget::shortcut_descriptor(Command::OpenAutomations).available(&remote));
-        assert!(workspace_widget::shortcut_descriptor(Command::OpenAgentAccounts).available(&remote));
+        let remote = workspace_widget::CommandContext {
+            remote_device: true,
+            ..Default::default()
+        };
+        assert!(
+            !workspace_widget::shortcut_descriptor(Command::OpenAutomations).available(&remote)
+        );
+        assert!(
+            workspace_widget::shortcut_descriptor(Command::OpenAgentAccounts).available(&remote)
+        );
     }
-
 
     #[test]
     fn pane_list_uses_shared_attention_ranking_and_preserves_unread_work() {
@@ -3980,38 +4100,76 @@ mod tests {
     #[test]
     fn palette_creation_refuses_replaced_project_and_new_open_uses_new_actor() {
         const TEST: &str = "app::palette_ui::tests::palette_creation_refuses_replaced_project_and_new_open_uses_new_actor";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         let files = tempfile::tempdir().unwrap();
         let parent = files.path().canonicalize().unwrap();
         let root = parent.join("repository");
         super::super::git_binding::tests::init(&root, "original\n");
         let (mut app, key) = super::super::git_binding::tests::app_for(&root);
         let publish = |app: &mut Cagents, generation| {
-            let loaded = super::super::load_repository(&root, Some(key.project_id), CancellationToken::new()).unwrap();
-            app.repository_generations.insert(key.project_id, generation);
-            drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation, open_cards: false, result: Ok(Box::new(loaded)) }));
+            let loaded = super::super::load_repository(
+                &root,
+                Some(key.project_id),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            app.repository_generations
+                .insert(key.project_id, generation);
+            drop(app.update(Message::RepositoryLoaded {
+                project_id: key.project_id,
+                generation,
+                open_cards: false,
+                result: Ok(Box::new(loaded)),
+            }));
         };
         publish(&mut app, 1);
         drop(app.update_palette(Action::Open));
-        let old = app.palette_entries().into_iter().find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree)).unwrap().2;
-        let old_binding = app.project_creation_command_target(Command::NewWorktree).unwrap().binding;
+        let old = app
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree))
+            .unwrap()
+            .2;
+        let old_binding = app
+            .project_creation_command_target(Command::NewWorktree)
+            .unwrap()
+            .binding;
         std::fs::rename(&root, parent.join("original")).unwrap();
         super::super::git_binding::tests::init(&root, "replacement\n");
         publish(&mut app, 2);
-        assert_ne!(app.project_creation_source(key.project_id).unwrap().id(), old_binding);
+        assert_ne!(
+            app.project_creation_source(key.project_id).unwrap().id(),
+            old_binding
+        );
         let generation = app.palette.generation;
         drop(app.update_palette(Action::Run(generation, MessageBox(Box::new(old)))));
         assert!(app.worktree_dialog.is_none());
-        assert!(app.palette.query.is_some(), "stale pointer activation preserves the result surface");
-        assert!(app.project_creation_command_target(Command::NewWorktree).is_none(), "an old opening never remints its project intent");
+        assert!(
+            app.palette.query.is_some(),
+            "stale pointer activation preserves the result surface"
+        );
+        assert!(
+            app.project_creation_command_target(Command::NewWorktree)
+                .is_none(),
+            "an old opening never remints its project intent"
+        );
         drop(app.update_palette(Action::Close));
         drop(app.update_palette(Action::Open));
-        let fresh = app.palette_entries().into_iter().find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree)).unwrap().2;
+        let fresh = app
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree))
+            .unwrap()
+            .2;
         app.palette.selected_message = Some(fresh);
         drop(app.update_palette(Action::Submit));
-        assert!(app.worktree_dialog.is_some(), "a fresh palette opening admits the replacement's current capability");
+        assert!(
+            app.worktree_dialog.is_some(),
+            "a fresh palette opening admits the replacement's current capability"
+        );
     }
-
 
     /// Run a real scroll operation against the retained native widget tree.
     fn scroll_fixture_step(
@@ -5253,7 +5411,11 @@ mod tests {
                     .is_some_and(|notice| notice.message.contains("selected diff changed"))
         );
         let (mut app, _, _) = diff_command_fixture();
-        app.sidebar_model.source_control.as_mut().unwrap().set_reloading(true);
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_reloading(true);
         assert!(!app.command_available(Command::DiffStageSelection));
         app.sidebar_model.source_control = None;
         for command in [
@@ -5845,13 +6007,14 @@ mod tests {
         let _ = app.update_palette(Action::Query("open settings".into()));
         // File-opening commands share these words. Choose the destination by
         // its command identity so this remains a pane-focus contract.
-        app.palette.selected_message = Some(app
-            .palette_entries()
-            .into_iter()
-            .find_map(|(_, _, message)| {
-                matches!(message, Message::RunCommand(Command::OpenSettings)).then_some(message)
-            })
-            .expect("the settings-pane command is listed"));
+        app.palette.selected_message = Some(
+            app.palette_entries()
+                .into_iter()
+                .find_map(|(_, _, message)| {
+                    matches!(message, Message::RunCommand(Command::OpenSettings)).then_some(message)
+                })
+                .expect("the settings-pane command is listed"),
+        );
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();

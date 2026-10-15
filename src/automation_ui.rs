@@ -1219,10 +1219,18 @@ impl State {
                 }
             }
             Action::PromptHistory(command) => {
-                if let Some(draft) = &mut self.draft { if command.apply(&mut draft.prompt) { self.error = None; } }
+                if let Some(draft) = &mut self.draft {
+                    if command.apply(&mut draft.prompt) {
+                        self.error = None;
+                    }
+                }
             }
             Action::ShellHistory(command) => {
-                if let Some(draft) = &mut self.draft { if command.apply(&mut draft.shell) { self.error = None; } }
+                if let Some(draft) = &mut self.draft {
+                    if command.apply(&mut draft.shell) {
+                        self.error = None;
+                    }
+                }
             }
             Action::Prompt(action) => {
                 if let Some(draft) = &mut self.draft {

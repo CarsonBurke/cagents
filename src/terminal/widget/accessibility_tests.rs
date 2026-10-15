@@ -482,9 +482,15 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     // A key held during review may release after ordinary focus moves to the
     // other card. The shared app barrier must consume it there, then retire it.
-    let new_id = new_widget.a11y_nodes(
-        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &new_tree, mouse::Cursor::Unavailable,
-    ).root()[0].id().clone();
+    let new_id = new_widget
+        .a11y_nodes(
+            Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+            &new_tree,
+            mouse::Cursor::Unavailable,
+        )
+        .root()[0]
+        .id()
+        .clone();
     assert_eq!(
         dispatch(
             &mut new_widget,
@@ -687,9 +693,14 @@ fn same_card_cancellation_clears_pending_review_without_a_true_view_acknowledgme
 fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     let peer = Peer::new();
     let replacement = Peer::with_generation(
-        peer.surface().terminal_id(), uuid::Uuid::new_v4(), peer.surface().host_proof().unwrap(),
+        peer.surface().terminal_id(),
+        uuid::Uuid::new_v4(),
+        peer.surface().host_proof().unwrap(),
     );
-    assert_ne!(peer.surface().execution_instance(), replacement.surface().execution_instance());
+    assert_ne!(
+        peer.surface().execution_instance(),
+        replacement.surface().execution_instance()
+    );
     let renderer = renderer();
     let barrier = ReviewInputBarrier::default();
     let mut widget = widget(&peer, "remount-card", barrier.clone(), true, true);
@@ -758,7 +769,14 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     widget = self::widget(&peer, "remount-card", barrier.clone(), true, true);
     widget.review_revision = 5;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
-    assert!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.is_some());
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection
+            .is_some()
+    );
     widget = self::widget(&replacement, "remount-card", barrier, true, true);
     widget.review_revision = 5;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
@@ -797,56 +815,119 @@ fn scoped_native_root_and_stable_focus_handoff_share_the_operation_identity() {
     #[derive(Default)]
     struct Focused(Option<Id>);
     impl Operation for Focused {
-        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
-        fn focusable(&mut self, id: Option<&Id>, _: Rectangle, state: &mut dyn operation::Focusable) {
-            if state.is_focused() { self.0 = id.cloned(); }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            _: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if state.is_focused() {
+                self.0 = id.cloned();
+            }
         }
     }
     let peer = Peer::new();
     let renderer = renderer();
     for parent in [Id::new("stable-terminal-focus"), Id::unique()] {
-        let mut widget = widget(&peer, "unused-parent", ReviewInputBarrier::default(), true, false).id(parent.clone());
+        let mut widget = widget(
+            &peer,
+            "unused-parent",
+            ReviewInputBarrier::default(),
+            true,
+            false,
+        )
+        .id(parent.clone());
         let mut tree = widget_tree(&widget);
         operation::Focusable::unfocus(tree.state.downcast_mut::<WidgetState>());
         let node = layout::Node::new(Size::new(640.0, 320.0));
         let mut focus = operation::focusable::focus::<()>(parent);
         widget.operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
-        assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()));
+        assert!(operation::Focusable::is_focused(
+            tree.state.downcast_ref::<WidgetState>()
+        ));
         let mut observed = Focused::default();
         widget.operate(&mut tree, Layout::new(&node), &renderer, &mut observed);
         let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
         // Same matching contract as the actual iced-winit tree_update path:
         // focused operation ID must match one of the emitted semantic nodes.
         let observed = A11yId::from(observed.0.unwrap());
-        assert!(iced_accessibility::IdEq::eq(nodes.root()[0].id(), &observed));
-        assert!(!matches!(observed, A11yId::Widget(Id(cosmic::iced::id::Internal::Set(_)))));
+        assert!(iced_accessibility::IdEq::eq(
+            nodes.root()[0].id(),
+            &observed
+        ));
+        assert!(!matches!(
+            observed,
+            A11yId::Widget(Id(cosmic::iced::id::Internal::Set(_)))
+        ));
     }
 }
 
 #[test]
 fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
     let old = Peer::new();
-    let new = Peer::with_generation(old.surface().terminal_id(), uuid::Uuid::new_v4(), old.surface().host_proof().unwrap());
+    let new = Peer::with_generation(
+        old.surface().terminal_id(),
+        uuid::Uuid::new_v4(),
+        old.surface().host_proof().unwrap(),
+    );
     let renderer = renderer();
     let barrier = ReviewInputBarrier::default();
     let old_widget = widget(&old, "same-card", barrier.clone(), true, false);
     let mut tree = widget_tree(&old_widget);
     let old_nodes = old_widget.a11y_nodes(
-        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+        &tree,
+        mouse::Cursor::Unavailable,
     );
     let old_root = old_nodes.root()[0].id().clone();
-    let old_control = tree.state.downcast_ref::<WidgetState>().a11y.borrow().control_id.clone().unwrap();
+    let old_control = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .control_id
+        .clone()
+        .unwrap();
     let mut current = widget(&new, "same-card", barrier, true, false);
     tree.diff(&mut current as &mut dyn Widget<Message, Theme, Renderer>);
     let current_nodes = current.a11y_nodes(
-        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+        &tree,
+        mouse::Cursor::Unavailable,
     );
     let current_root = current_nodes.root()[0].id().clone();
     assert_ne!(old_root, current_root);
-    assert!(dispatch(&mut current, &mut tree, &renderer, action(old_root, Action::Focus, None)).is_empty());
-    assert!(dispatch(&mut current, &mut tree, &renderer, action(old_control, Action::Click, None)).is_empty());
+    assert!(
+        dispatch(
+            &mut current,
+            &mut tree,
+            &renderer,
+            action(old_root, Action::Focus, None)
+        )
+        .is_empty()
+    );
+    assert!(
+        dispatch(
+            &mut current,
+            &mut tree,
+            &renderer,
+            action(old_control, Action::Click, None)
+        )
+        .is_empty()
+    );
     assert!(!reviewing(&tree));
-    assert_eq!(dispatch(&mut current, &mut tree, &renderer, action(current_root, Action::Focus, None)), vec![Message::Review(true)]);
+    assert_eq!(
+        dispatch(
+            &mut current,
+            &mut tree,
+            &renderer,
+            action(current_root, Action::Focus, None)
+        ),
+        vec![Message::Review(true)]
+    );
     assert!(reviewing(&tree));
     assert_no_pty_input(&new.fence());
 }
@@ -855,13 +936,39 @@ fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
 fn visible_review_blur_publishes_one_current_attachment_exit() {
     let peer = Peer::new();
     let renderer = renderer();
-    let mut widget = widget(&peer, "review-blur", ReviewInputBarrier::default(), true, true);
+    let mut widget = widget(
+        &peer,
+        "review-blur",
+        ReviewInputBarrier::default(),
+        true,
+        true,
+    );
     let mut tree = widget_tree(&widget);
-    let _ = widget.a11y_nodes(Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable);
-    assert_eq!(dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused)), vec![Message::Review(false)]);
+    let _ = widget.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+        &tree,
+        mouse::Cursor::Unavailable,
+    );
+    assert_eq!(
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            Event::Window(window::Event::Unfocused)
+        ),
+        vec![Message::Review(false)]
+    );
     assert!(!reviewing(&tree));
     assert!(!widget.review_active);
-    assert!(dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused)).is_empty());
+    assert!(
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            Event::Window(window::Event::Unfocused)
+        )
+        .is_empty()
+    );
     assert_no_pty_input(&peer.fence());
 }
 
@@ -875,13 +982,29 @@ fn temporary_detach_keeps_the_same_attachment_review_and_visible_selection() {
     let mut tree = widget_tree(&widget);
     // Publish the real lazy visible projection before navigating it.
     let _ = widget.a11y_nodes(
-        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+        &tree,
+        mouse::Cursor::Unavailable,
     );
     // Move the visible review caret to create an actual retained selection.
-    dispatch(&mut widget, &mut tree, &renderer,
-        key(keyboard::key::Named::ArrowRight, keyboard::key::Code::ArrowRight, true));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::ArrowRight,
+            keyboard::key::Code::ArrowRight,
+            true,
+        ),
+    );
     assert!(reviewing(&tree));
-    let old_selection = tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.clone();
+    let old_selection = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .selection
+        .clone();
     assert!(old_selection.is_some());
     peer.stop.store(true, Ordering::Relaxed);
     peer.worker.take().unwrap().join().unwrap();
@@ -894,7 +1017,14 @@ fn temporary_detach_keeps_the_same_attachment_review_and_visible_selection() {
     assert_eq!(rebuilt.review_attachment, identity);
     tree.diff(&mut rebuilt as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(reviewing(&tree));
-    assert_eq!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection, old_selection);
+    assert_eq!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection,
+        old_selection
+    );
 }
 
 #[test]
@@ -1197,9 +1327,15 @@ fn key_released_during_review_pairs_after_exit_without_requiring_a_blur() {
             .count(),
         1
     );
-    let id = widget.a11y_nodes(
-        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
-    ).root()[0].id().clone();
+    let id = widget
+        .a11y_nodes(
+            Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
+            &tree,
+            mouse::Cursor::Unavailable,
+        )
+        .root()[0]
+        .id()
+        .clone();
     dispatch(
         &mut widget,
         &mut tree,
@@ -1900,28 +2036,55 @@ impl HeldKeyWidget {
     pub(crate) fn wait_for_press_admission(&self) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while self._widget.review_input_barrier.confirmed_held_keys() != 1 {
-            assert!(Instant::now() < deadline, "original press was not authenticated and accepted");
+            assert!(
+                Instant::now() < deadline,
+                "original press was not authenticated and accepted"
+            );
             thread::sleep(Duration::from_millis(1));
         }
     }
     pub(crate) fn exit_review_through_native_focus_publication(&mut self) -> Vec<bool> {
         let node = layout::Node::new(Size::new(640.0, 320.0));
-        let _ = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        let _ =
+            self._widget
+                .a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
         assert!(reviewing(&self._tree));
         // The actual winit native focus path operates first. Its next tree
         // publication can observe the new focus before the A11y event update.
         let mut unfocus = operation::focusable::unfocus::<()>();
-        self._widget.operate(&mut self._tree, Layout::new(&node), &self._renderer, &mut unfocus);
-        let _ = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        self._widget.operate(
+            &mut self._tree,
+            Layout::new(&node),
+            &self._renderer,
+            &mut unfocus,
+        );
+        let _ =
+            self._widget
+                .a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
         assert!(!reviewing(&self._tree));
-        let messages = dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now())));
-        let exits = messages.into_iter().filter_map(|message| match message {
-            Message::Review(active) => Some(active), _ => None,
-        }).collect::<Vec<_>>();
+        let messages = dispatch(
+            &mut self._widget,
+            &mut self._tree,
+            &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+        );
+        let exits = messages
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Review(active) => Some(active),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(exits, vec![false]);
-        assert!(dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now()))).is_empty());
+        assert!(
+            dispatch(
+                &mut self._widget,
+                &mut self._tree,
+                &self._renderer,
+                Event::Window(window::Event::RedrawRequested(Instant::now()))
+            )
+            .is_empty()
+        );
         exits
     }
     pub(crate) fn acknowledge_review_exit(&mut self, revision: u64) {
@@ -1929,24 +2092,41 @@ impl HeldKeyWidget {
         self._widget.suppress_focus_reports = false;
         self._widget.review_revision = revision;
         self._widget.diff(&mut self._tree);
-        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now())));
+        dispatch(
+            &mut self._widget,
+            &mut self._tree,
+            &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+        );
     }
     pub(crate) fn wait_key_pairs(&self, expected: (usize, usize)) {
         wait_key_counts(&self._widget.review_input_barrier, expected);
     }
     pub(crate) fn enter_review(&mut self) {
         let node = layout::Node::new(Size::new(640.0, 320.0));
-        let nodes = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
+        let nodes =
+            self._widget
+                .a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
         let root = nodes.root()[0].id().clone();
-        assert_eq!(dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            action(root, Action::Focus, None)), vec![Message::Review(true)]);
+        assert_eq!(
+            dispatch(
+                &mut self._widget,
+                &mut self._tree,
+                &self._renderer,
+                action(root, Action::Focus, None)
+            ),
+            vec![Message::Review(true)]
+        );
         // Match the App's acknowledgment after the actual native entry. A
         // revision acknowledgment alone must never manufacture a local entry.
         self._widget.suppress_focus_reports = true;
         self._widget.review_revision += 1;
-        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now())));
+        dispatch(
+            &mut self._widget,
+            &mut self._tree,
+            &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+        );
         assert!(reviewing(&self._tree));
     }
 }
@@ -2019,69 +2199,170 @@ fn bounded_window_exit_fences_unknown_delivery_without_killing_the_pty() {
     );
 }
 
-
 #[test]
 fn native_focus_batch_overrides_stale_builder_and_next_diff_retires_the_override() {
     let peer = Peer::new();
     let renderer = renderer();
-    let mut widget = widget(&peer, "batched-focus", ReviewInputBarrier::default(), true, false);
+    let mut widget = widget(
+        &peer,
+        "batched-focus",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
     widget.on_shortcut = None;
     let mut tree = widget_tree(&widget);
     // The inactive App snapshot is still installed while Iced dispatches
     // Focused followed by the first physical key in the SAME widget batch.
     widget.window_focused = false;
     widget.diff(&mut tree);
-    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Focused),
+    );
     for pressed in [true, false] {
-        dispatch(&mut widget, &mut tree, &renderer,
-            key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, pressed));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::Enter,
+                keyboard::key::Code::Enter,
+                pressed,
+            ),
+        );
     }
-    let keys: Vec<_> = peer.fence().into_iter().filter_map(|request| match request {
-        ClientRequest::Key {input, ..} => Some(input), _ => None,
-    }).collect();
+    let keys: Vec<_> = peer
+        .fence()
+        .into_iter()
+        .filter_map(|request| match request {
+            ClientRequest::Key { input, .. } => Some(input),
+            _ => None,
+        })
+        .collect();
     assert_eq!(keys.len(), 2);
     assert_eq!(keys[0].action, KeyAction::Press);
     assert_eq!(keys[1].action, KeyAction::Release);
-    assert!(!widget.window_focused, "no App rebuild occurred between native focus and key");
+    assert!(
+        !widget.window_focused,
+        "no App rebuild occurred between native focus and key"
+    );
     // Conversely a native blur prevents input before the active builder has
     // caught up. It does not erase the terminal's logical native focus.
     widget.window_focused = true;
     widget.diff(&mut tree);
-    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Unfocused));
-    dispatch(&mut widget, &mut tree, &renderer,
-        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
-    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
-    assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Unfocused),
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
+    assert!(operation::Focusable::is_focused(
+        tree.state.downcast_ref::<WidgetState>()
+    ));
     // A parked tree may miss Focused entirely. Its new builder is authoritative
     // on remount, so the old native false must not keep suppressing input.
     widget.window_focused = true;
     widget.diff(&mut tree);
     for pressed in [true, false] {
-        dispatch(&mut widget, &mut tree, &renderer,
-            key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, pressed));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            key(
+                keyboard::key::Named::Enter,
+                keyboard::key::Code::Enter,
+                pressed,
+            ),
+        );
     }
-    assert_eq!(peer.fence().iter().filter(|request| matches!(request, ClientRequest::Key {..})).count(), 2);
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|request| matches!(request, ClientRequest::Key { .. }))
+            .count(),
+        2
+    );
     // Equally, a parked tree's old native true cannot override a newer inactive
     // App snapshot when it missed Unfocused.
-    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Focused),
+    );
     widget.window_focused = false;
     widget.diff(&mut tree);
-    dispatch(&mut widget, &mut tree, &renderer,
-        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
-    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
 }
-
 
 #[test]
 fn admitted_physical_release_precedes_new_clipboard_or_viewport_chord() {
     use keyboard::key::{Code, Named, Physical};
     let cases = [
-        (keyboard::Key::Character("c".into()), Code::KeyC, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
-        (keyboard::Key::Character("v".into()), Code::KeyV, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
-        (keyboard::Key::Named(Named::PageUp), Code::PageUp, keyboard::Modifiers::SHIFT),
-        (keyboard::Key::Named(Named::PageDown), Code::PageDown, keyboard::Modifiers::SHIFT),
-        (keyboard::Key::Named(Named::Home), Code::Home, keyboard::Modifiers::SHIFT),
-        (keyboard::Key::Named(Named::End), Code::End, keyboard::Modifiers::SHIFT),
+        (
+            keyboard::Key::Character("c".into()),
+            Code::KeyC,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        ),
+        (
+            keyboard::Key::Character("v".into()),
+            Code::KeyV,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        ),
+        (
+            keyboard::Key::Named(Named::PageUp),
+            Code::PageUp,
+            keyboard::Modifiers::SHIFT,
+        ),
+        (
+            keyboard::Key::Named(Named::PageDown),
+            Code::PageDown,
+            keyboard::Modifiers::SHIFT,
+        ),
+        (
+            keyboard::Key::Named(Named::Home),
+            Code::Home,
+            keyboard::Modifiers::SHIFT,
+        ),
+        (
+            keyboard::Key::Named(Named::End),
+            Code::End,
+            keyboard::Modifiers::SHIFT,
+        ),
     ];
     for (key, code, changed) in cases {
         let peer = Peer::new();
@@ -2090,39 +2371,101 @@ fn admitted_physical_release_precedes_new_clipboard_or_viewport_chord() {
         let mut widget = widget(&peer, "release-owner-first", barrier.clone(), true, false);
         widget.on_shortcut = None;
         Arc::make_mut(&mut widget.snapshot).scroll = super::super::ScrollSnapshot {
-            total:100, len:1, ..Default::default()
+            total: 100,
+            len: 1,
+            ..Default::default()
         };
         let mut tree = widget_tree(&widget);
-        let event = |down, modifiers| Event::Keyboard(if down {
-            keyboard::Event::KeyPressed {key:key.clone(), modified_key:key.clone(), physical_key:Physical::Code(code),
-                location:keyboard::Location::Standard, modifiers, text:None, repeat:false}
-        } else {
-            keyboard::Event::KeyReleased {key:key.clone(), modified_key:key.clone(), physical_key:Physical::Code(code),
-                location:keyboard::Location::Standard, modifiers}
-        });
-        dispatch(&mut widget, &mut tree, &renderer, event(true, keyboard::Modifiers::empty()));
-        let press = peer.fence().into_iter().filter_map(|request| match request {
-            ClientRequest::Key {input,..} => Some(input), _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(press.len(), 1, "plain physical press must reach the actual hosted peer: {code:?}");
+        let event = |down, modifiers| {
+            Event::Keyboard(if down {
+                keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key.clone(),
+                    physical_key: Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key.clone(),
+                    physical_key: Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                }
+            })
+        };
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            event(true, keyboard::Modifiers::empty()),
+        );
+        let press = peer
+            .fence()
+            .into_iter()
+            .filter_map(|request| match request {
+                ClientRequest::Key { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            press.len(),
+            1,
+            "plain physical press must reach the actual hosted peer: {code:?}"
+        );
         assert_eq!(press[0].action, KeyAction::Press);
-        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(keyboard::Event::ModifiersChanged(changed)));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(changed)),
+        );
         dispatch(&mut widget, &mut tree, &renderer, event(false, changed));
-        let releases = peer.fence().into_iter().filter_map(|request| match request {
-            ClientRequest::Key {input,..} => Some(input), _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(releases.len(), 1, "changed modifiers must not swallow an admitted release: {code:?}");
+        let releases = peer
+            .fence()
+            .into_iter()
+            .filter_map(|request| match request {
+                ClientRequest::Key { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            releases.len(),
+            1,
+            "changed modifiers must not swallow an admitted release: {code:?}"
+        );
         assert_eq!(releases[0].action, KeyAction::Release);
         assert_eq!(releases[0].key, press[0].key);
-        assert_eq!(releases[0].unshifted_codepoint, press[0].unshifted_codepoint);
+        assert_eq!(
+            releases[0].unshifted_codepoint,
+            press[0].unshifted_codepoint
+        );
         assert_eq!(releases[0].modifiers, map_iced_modifiers(changed));
-        assert!(tree.state.downcast_ref::<WidgetState>().input_keys.is_empty());
-        assert_eq!(barrier.pending_counts(), (0,0));
+        assert!(
+            tree.state
+                .downcast_ref::<WidgetState>()
+                .input_keys
+                .is_empty()
+        );
+        assert_eq!(barrier.pending_counts(), (0, 0));
         // Duplicate release/redraw and a UI-only chord with no admitted press
         // must not synthesize a second/phantom key-up for the terminal.
         dispatch(&mut widget, &mut tree, &renderer, event(false, changed));
         dispatch(&mut widget, &mut tree, &renderer, event(true, changed));
-        dispatch(&mut widget, &mut tree, &renderer, event(false, keyboard::Modifiers::empty()));
-        assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
+        dispatch(
+            &mut widget,
+            &mut tree,
+            &renderer,
+            event(false, keyboard::Modifiers::empty()),
+        );
+        assert!(
+            !peer
+                .fence()
+                .iter()
+                .any(|request| matches!(request, ClientRequest::Key { .. }))
+        );
     }
 }

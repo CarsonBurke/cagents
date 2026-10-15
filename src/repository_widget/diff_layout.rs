@@ -55,7 +55,11 @@ impl RowOffsets {
         assert!(fold_height.is_finite() && fold_height > 0.0);
         let mut rows = Self::uniform(folded.len(), line_height);
         if fold_height != line_height {
-            rows.row_heights = folded.hidden.iter().map(|hidden| (hidden.display, fold_height)).collect();
+            rows.row_heights = folded
+                .hidden
+                .iter()
+                .map(|hidden| (hidden.display, fold_height))
+                .collect();
             rows.rebuild_offsets();
         }
         rows
@@ -444,7 +448,8 @@ impl DiffLayout {
         self.reveals = previous.reveals.clone();
         for mode in [DiffMode::Inline, DiffMode::Split] {
             let folded = Self::fold(Some(model), mode, &self.reveals);
-            self.offsets[layout_index(mode)] = RowOffsets::folded(&folded, self.row_height, self.fold_height);
+            self.offsets[layout_index(mode)] =
+                RowOffsets::folded(&folded, self.row_height, self.fold_height);
             self.folded[layout_index(mode)] = folded;
         }
     }
@@ -534,7 +539,11 @@ mod tests {
     #[test]
     fn fold_extents_survive_annotations_zoom_and_reveal_without_changing_model_anchors() {
         let before = "unchanged\n".repeat(100);
-        let after = format!("{}replacement\n{}", "unchanged\n".repeat(50), "unchanged\n".repeat(49));
+        let after = format!(
+            "{}replacement\n{}",
+            "unchanged\n".repeat(50),
+            "unchanged\n".repeat(49)
+        );
         let model = crate::diff_view::build_diff(&before, &after);
         let mut layout = DiffLayout::new(Some(&model), 8.0);
         layout.set_row_heights(8.0, 20.0);
@@ -544,7 +553,10 @@ mod tests {
             let mut sum = 0.0;
             for display in 0..folded.len() {
                 assert_eq!(rows.offset(display), sum);
-                let height = match folded.row(display) { DisplayRow::Code(_) => 8.0, DisplayRow::Fold { .. } => 20.0 };
+                let height = match folded.row(display) {
+                    DisplayRow::Code(_) => 8.0,
+                    DisplayRow::Fold { .. } => 20.0,
+                };
                 assert_eq!(rows.height(display), height);
                 let anchor = rows.anchor(sum + height * 0.5);
                 assert_eq!(rows.restore(anchor), sum + height * 0.5);
@@ -553,14 +565,19 @@ mod tests {
             assert_eq!(rows.total_height(), sum);
         }
         let row = layout.folded(DiffMode::Inline).display(50);
-        layout.rows_mut(DiffMode::Inline).annotate(11.0, &[(row, 37.0)]);
+        layout
+            .rows_mut(DiffMode::Inline)
+            .annotate(11.0, &[(row, 37.0)]);
         assert_eq!(layout.rows(DiffMode::Inline).height(row), 45.0);
         layout.set_row_heights(80.0, 84.0);
         assert_eq!(layout.rows(DiffMode::Inline).height(row), 117.0);
         assert_eq!(layout.rows(DiffMode::Inline).leading_height(), 11.0);
         assert!(layout.expand(&model, 0, FoldExpansion::Down));
         let row = layout.folded(DiffMode::Inline).display(50);
-        assert_eq!(layout.rows(DiffMode::Inline).annotations().get(&row), Some(&37.0));
+        assert_eq!(
+            layout.rows(DiffMode::Inline).annotations().get(&row),
+            Some(&37.0)
+        );
         for mode in [DiffMode::Inline, DiffMode::Split] {
             for display in 0..layout.folded(mode).len() {
                 if matches!(layout.folded(mode).row(display), DisplayRow::Fold { .. }) {
@@ -570,7 +587,10 @@ mod tests {
         }
         assert!(layout.set_folding(&model, false));
         assert_eq!(layout.rows(DiffMode::Inline).height(50), 117.0);
-        assert_eq!(layout.rows(DiffMode::Inline).total_height(), 11.0 + model.row_count(DiffMode::Inline) as f32 * 80.0 + 37.0);
+        assert_eq!(
+            layout.rows(DiffMode::Inline).total_height(),
+            11.0 + model.row_count(DiffMode::Inline) as f32 * 80.0 + 37.0
+        );
     }
 
     #[test]
