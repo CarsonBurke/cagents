@@ -4203,6 +4203,7 @@ impl Application for Editor {
                     }
                 }
                 Message::OpenQuickFile(path) => {
+                    if !self.quick_open || !self.quick_open_results().contains(&path) { return Task::none(); }
                     let Some(id) = self.active else {
                         return Task::none();
                     };
@@ -6404,6 +6405,30 @@ mod tests {
         assert_eq!(app.active, Some(file));
         assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 41, character: 2 }));
         assert!(app.tab(folder).unwrap().pending_file.is_none());
+    }
+
+    #[test]
+    fn obsolete_quick_open_rows_cannot_consume_a_new_querys_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "first\n").unwrap();
+        std::fs::write(root.join("b.rs"), "second\n").unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        drop(app.update(Message::QuickOpen));
+        let query = app.update(Message::QuickOpenQueryChanged("b.rs:1:2".into()));
+        run_tasks(&mut app, query);
+        let stale = app.update(Message::OpenQuickFile("a.rs".into()));
+        run_tasks(&mut app, stale);
+        assert!(app.quick_open);
+        assert!(app.tab(card).unwrap().pending_file.is_none());
+        assert!(app.tab(card).unwrap().runtime.selected_path().is_none());
+        drop(app.update(Message::CloseQuickOpen));
+        let dismissed = app.update(Message::OpenQuickFile("b.rs".into()));
+        run_tasks(&mut app, dismissed);
+        assert!(app.tab(card).unwrap().pending_file.is_none());
     }
 
     #[test]
