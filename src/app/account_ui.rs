@@ -181,7 +181,9 @@ impl State {
     pub(super) fn provider_ready(&self, provider: Provider) -> bool {
         self.installed.get(&provider) == Some(&true)
             && self.of(provider).any(|account| {
-                account.identity.is_some()
+                account.present
+                    && account.identity.is_some()
+                    && self.login_conflict(account).is_none()
                     && !account
                         .snapshot
                         .as_ref()
@@ -216,7 +218,10 @@ impl State {
             Some(true) => Some((
                 "Sign in",
                 self.of(provider).next().map_or(
-                    Action::Add { provider, device: false },
+                    Action::Add {
+                        provider,
+                        device: false,
+                    },
                     |account| Action::SignIn(account.id.clone()),
                 ),
             )),
@@ -5242,22 +5247,64 @@ mod tests {
                 Some(("Install", Action::Install(selected))) if selected == provider));
             state.installed.insert(provider, true);
             if provider == Provider::Omp {
-                assert!(matches!(state.onboarding_action(provider),
-                    Some(("Set up OMP", Action::Install(Provider::Omp)))));
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Set up OMP", Action::Install(Provider::Omp)))
+                ));
             } else {
-                assert!(matches!(state.onboarding_action(provider),
-                    Some(("Sign in", Action::SignIn(_)))));
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Sign in", Action::SignIn(_)))
+                ));
                 let id = Account::system(provider).id();
                 let account = state.account_mut(&id).unwrap();
+                account.present = true;
                 account.identity = Some(Identity::default());
                 account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
-                assert!(matches!(state.onboarding_action(provider),
-                    Some(("Manage accounts", Action::OpenPane))));
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Manage accounts", Action::OpenPane))
+                ));
                 state.account_mut(&id).unwrap().snapshot =
                     Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW));
                 assert!(matches!(state.onboarding_action(provider),
                     Some(("Sign in", Action::SignIn(selected))) if selected == id));
             }
+        }
+    }
+
+    #[test]
+    fn onboarding_readiness_requires_a_present_home_and_unconflicted_login() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut state = State::new(None, None, None);
+            state.installed.insert(provider, true);
+            let system = Account::system(provider).id();
+            let account = state.account_mut(&system).unwrap();
+            account.present = false;
+            account.identity = Some(Identity::default());
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+            assert!(!state.provider_ready(provider));
+            assert!(matches!(
+                state.onboarding_action(provider),
+                Some(("Sign in", Action::SignIn(_)))
+            ));
+            state.account_mut(&system).unwrap().present = true;
+            assert!(state.provider_ready(provider));
+            state.account_mut(&system).unwrap().present = false;
+            let managed = state.add_managed_fixture(provider, 991);
+            let account = state.account_mut(&managed).unwrap();
+            account.identity = Some(Identity {
+                email: Some("changed-login@example.com".into()),
+                ..Identity::default()
+            });
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+            assert!(
+                state
+                    .login_conflict(state.account(&managed).unwrap())
+                    .is_some()
+            );
+            assert!(!state.provider_ready(provider));
+            assert_eq!(state.provider_status(provider), "Sign in again");
         }
     }
 
