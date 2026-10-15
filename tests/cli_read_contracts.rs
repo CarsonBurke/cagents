@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 //! CLI-only behavior: reads can refuse startup even when a launchable sibling exists.
 use serde_json::Value;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::{Command, Output, Stdio}};
+use cagents::process::{CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor};
+use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
 struct Fixture { root: tempfile::TempDir, cli: PathBuf }
 impl Fixture {
@@ -16,20 +17,29 @@ impl Fixture {
         fs::set_permissions(daemon, fs::Permissions::from_mode(0o700)).unwrap();
         Self { root, cli }
     }
-    fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.cli);
-        command.env_clear().env("HOME", self.root.path().join("home"))
+    fn command(&self, args: &[&str]) -> CommandSpec {
+        let mut command = CommandSpec::new(&self.cli);
+        // Keep delegation authority inherited unchanged. All other child state
+        // is private to this fixture, including the only possible SSH target.
+        for (name, _) in std::env::vars_os() {
+            if name != OsStr::new("CAGENTS_AGENT_AUTHORITY") { command=command.env_remove(name); }
+        }
+        command.env("HOME", self.root.path().join("home"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("run"))
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_CACHE_HOME", self.root.path().join("cache"))
-            .env("PATH", "/usr/bin:/bin").current_dir(self.root.path()).stdin(Stdio::null());
-        command.arg("--json").args(args);command
+            .env("PATH", "/usr/bin:/bin").cwd(self.root.path())
+            .timeout(Duration::from_secs(15)).output_limits(64*1024,64*1024)
+            .arg("--json").args(args.iter().copied())
     }
-    fn output(&self, args: &[&str], environment_policy: bool) -> Output {
+    fn run(&self, command: CommandSpec) -> ProcessOutput {
+        SystemProcessExecutor.execute(&command,&CancellationToken::new()).unwrap()
+    }
+    fn output(&self, args: &[&str], environment_policy: bool) -> ProcessOutput {
         let mut command=self.command(args);
-        if environment_policy { command.env("CAGENTS_NO_START", "1"); }
-        command.output().unwrap()
+        if environment_policy { command=command.env("CAGENTS_NO_START", "1"); }
+        self.run(command)
     }
 
 }
@@ -43,7 +53,7 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
             let mut arguments = args;
             if !environment { arguments.push("--no-start"); }
             let output = fixture.output(&arguments, environment);
-            assert_eq!(output.status.code(), Some(1), "{arguments:?}: {output:?}");
+            assert_eq!(output.exit_code, Some(1), "{arguments:?}: {output:?}");
             let value: Value = serde_json::from_slice(&output.stderr).unwrap();
             assert_eq!(value["error"]["kind"], "daemon_not_running", "{value}");
             assert!(!fixture.root.path().join("spawned").exists(), "daemon was spawned: {arguments:?}");
@@ -56,7 +66,7 @@ fn stopping_an_absent_daemon_twice_succeeds_and_has_a_stable_shape() {
     let fixture = Fixture::new();
     for _ in 0..2 {
         let output = fixture.output(&["daemon", "stop"], false);
-        assert!(output.status.success(), "{output:?}");
+        assert!(output.success, "{output:?}");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["data"], serde_json::json!({"state":"already_stopped"}));
         assert!(!fixture.root.path().join("spawned").exists());
@@ -77,16 +87,16 @@ fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
     let fixture=Fixture::new();configure_remote_fixture(&fixture,false);
     let path=format!("{}:/usr/bin:/bin",fixture.root.path().join("bin").display());
     for _ in 0..2 {
-        let output=fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",&path).output().unwrap();
-        assert!(output.status.success(),"{output:?}");
+        let output=fixture.run(fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",&path));
+        assert!(output.success,"{output:?}");
         let value:Value=serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["data"],serde_json::json!({"state":"already_stopped"}));
     }
     for environment in [false,true] {
         let mut command=fixture.command(&["--device","fixture","agent","list"]);
-        if environment {command.env("CAGENTS_NO_START","1");} else {command.arg("--no-start");}
-        let output=command.env("PATH",&path).output().unwrap();
-        assert_eq!(output.status.code(),Some(1),"{output:?}");
+        if environment {command=command.env("CAGENTS_NO_START","1");} else {command=command.arg("--no-start");}
+        let output=fixture.run(command.env("PATH",&path));
+        assert_eq!(output.exit_code,Some(1),"{output:?}");
         let error:Value=serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(error["error"]["kind"],"daemon_not_running");
     }
@@ -99,8 +109,8 @@ fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
 fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
     let fixture=Fixture::new();configure_remote_fixture(&fixture,true);
     let path=format!("{}:/usr/bin:/bin",fixture.root.path().join("bin").display());
-    let output=fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",path).output().unwrap();
-    assert_eq!(output.status.code(),Some(1),"{output:?}");
+    let output=fixture.run(fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",path));
+    assert_eq!(output.exit_code,Some(1),"{output:?}");
     assert!(output.stdout.is_empty());
     let error:Value=serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["kind"],"device");
