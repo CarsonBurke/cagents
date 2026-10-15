@@ -472,6 +472,27 @@ mod tests {
     }
 
     #[test]
+    fn whole_session_stop_retires_only_consented_detached_actors_in_selected_worktree() {
+        let root=repository_fixture();let unrelated=tempfile::tempdir_in("/var/tmp").unwrap();let host=host();
+        let selected=live_record(root.path().into());let other=live_record(unrelated.path().into());
+        let selected_id=selected.session.id;let other_id=other.session.id;
+        let selected_handle=selected.handle.clone();let other_handle=other.handle.clone();
+        {
+            let mut state=host.lock().unwrap();
+            state.chats.insert(selected_id,selected);state.chats.insert(other_id,other);
+        }
+        let consent=SessionStopConsent {sessions:session_identities(&census(&host,root.path()).unwrap())};
+        assert_eq!(consent.sessions.len(),1,"a detached actor in another worktree must not enter consent");
+        let mut pending=prepare_stop(&host,root.path(),root.path(),&consent).unwrap();
+        pending.cleanup().unwrap();
+        assert!(matches!(pending.commit(&host).unwrap(),Reply::SessionsStopped {path} if path==root.path()));
+        let state=host.lock().unwrap();
+        assert!(!state.chats.contains_key(&selected_id));assert!(state.chats.contains_key(&other_id));drop(state);
+        assert!(selected_handle.is_completed());assert!(!other_handle.close_observation().closing);
+        other_handle.close_until(std::time::Instant::now()+std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
     fn stopped_actor_cannot_retire_a_same_id_replacement_after_gate_release() {
         let root=repository_fixture();let host=host();let record=live_record(root.path().into());
         let id=record.session.id;let original=record.handle.clone();host.lock().unwrap().chats.insert(id,record);
