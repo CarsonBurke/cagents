@@ -2167,7 +2167,10 @@ mod directory_frontier_tests {
                 if let Some(status) = child.0.try_wait().unwrap() {
                     break status;
                 }
-                assert!(std::time::Instant::now() < deadline, "isolated FD contract timed out");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "isolated FD contract timed out"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
             let read_capture = |path: &std::path::Path| {
@@ -2178,7 +2181,10 @@ mod directory_frontier_tests {
             let stderr = read_capture(&errors);
             assert!(status.success(), "{status}: {stdout}\n{stderr}");
             assert!(stdout.contains(&format!("test {NAME} ... ok")), "{stdout}");
-            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"), "{stdout}");
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "{stdout}"
+            );
             return;
         }
         let dir = tempfile::tempdir().unwrap();
