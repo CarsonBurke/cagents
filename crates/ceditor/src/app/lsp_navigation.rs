@@ -55,7 +55,7 @@ pub(super) struct State {
     next_resolution: u64,
     pub(super) history: cagents::editor_locations::History,
     history_origins: HashMap<CardId, cagents::editor_locations::Location>,
-    history_restores: HashMap<CardId, (cagents::editor_locations::Location, cagents::editor_locations::Target)>,
+    history_restores: HashMap<CardId, (cagents::editor_locations::Location, cagents::editor_locations::Target, u64)>,
 }
 
 impl State {
@@ -244,9 +244,13 @@ impl Editor {
             let external = relative.is_none().then(|| target.location.source.clone());
             let task = self.add_with_source_context(Opened { root, file: relative, snapshot: None, authority }, true, external, git);
             let opened = self.active?;
-            if !self.tab(opened).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
+            let admitted = self.tab(opened).is_some_and(|tab| {
+                tab.runtime.source_tab_path().as_ref() == Some(&target.location.source)
+                    || tab.pending_file.as_ref().and_then(|pending| pending.canonical.as_ref()) == Some(&target.location.source)
+            });
+            if !admitted { return Some(task); }
             self.selection_epoch = self.selection_epoch.wrapping_add(1);
-            self.lsp_navigation.history_restores.insert(opened, (from, target));
+            self.lsp_navigation.history_restores.insert(opened, (from, target, self.selection_epoch));
             self.finish_editor_history_restore(opened);
             return Some(task);
         }
@@ -267,13 +271,13 @@ impl Editor {
     }
 
     pub(super) fn finish_editor_history_restore(&mut self, card: CardId) {
-        let Some((_, target)) = self.lsp_navigation.history_restores.get(&card) else { return; };
-        if self.active != Some(card) || !self.lsp_navigation.history.is_current_target(target) {
+        let Some((_, target, epoch)) = self.lsp_navigation.history_restores.get(&card) else { return; };
+        if self.active != Some(card) || self.selection_epoch != *epoch || !self.lsp_navigation.history.is_current_target(target) {
             self.lsp_navigation.history_restores.remove(&card); return;
         }
         let Some(loaded) = self.capture_editor_location(card) else { return; };
         if loaded.source != target.location.source { self.lsp_navigation.history_restores.remove(&card); return; }
-        let (from, target) = self.lsp_navigation.history_restores.remove(&card).unwrap();
+        let (from, target, _) = self.lsp_navigation.history_restores.remove(&card).unwrap();
         if let Some(tab) = self.tab_mut(card) && tab.runtime.restore_editor_navigation_anchor(target.location.anchor) {
             tab.runtime.take_location_jump_origin(card);
             if self.lsp_navigation.history.navigate(from, &target)
@@ -553,15 +557,44 @@ mod tests {
         let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card: a, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('!')) })); run_tasks(&mut app, edit);
         let retained = app.tab(a).unwrap().runtime.editor_text();
         app.active = Some(b);
-        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: b, forward: false })); run_tasks(&mut app, back);
+        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: b, forward: false }));
         let restored = app.active.unwrap();
         assert_ne!(restored, a);
+        assert_eq!(app.tab(restored).unwrap().pending_file.as_ref().and_then(|pending| pending.canonical.as_ref()), Some(&origin.source));
+        assert!(app.lsp_navigation.history_restores.contains_key(&restored), "the anchor must be parked before the new tab's asynchronous file list/load");
+        run_tasks(&mut app, back);
         assert_eq!(app.capture_editor_location(restored).unwrap().source, origin.source);
         assert_eq!(app.capture_editor_location(restored).unwrap().anchor, origin.anchor);
         assert_eq!(app.tab(a).unwrap().runtime.editor_text(), retained);
         assert!(app.tab(a).unwrap().runtime.is_dirty());
         let forward = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: restored, forward: true })); run_tasks(&mut app, forward);
         assert_eq!(app.active, Some(b));
+    }
+
+    #[test]
+    fn reopening_history_does_not_apply_an_anchor_after_a_newer_tab_selection() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in [("a.rs", "first\na😀éX\n"), ("b.rs", "destination\n"), ("c.rs", "keep C\n")] { std::fs::write(root.path().join(path), text).unwrap(); }
+        let mut app = editor();
+        let a = open_file(&mut app, root.path(), "a.rs");
+        assert!(app.tab_mut(a).unwrap().runtime.move_cursor_to(LspPosition::new(1, 3)));
+        let origin = app.capture_editor_location(a).unwrap();
+        let b = open_file(&mut app, root.path(), "b.rs");
+        let destination = app.capture_editor_location(b).unwrap();
+        app.lsp_navigation.history.record_jump(origin.clone(), destination);
+        let replace = app.request_file(a, "c.rs".into()); run_tasks(&mut app, replace);
+        app.active = Some(b);
+        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: b, forward: false }));
+        let opened = app.active.unwrap();
+        let target = app.lsp_navigation.history_restores.get(&opened).unwrap().1.clone();
+        drop(app.update(Message::Select(b)));
+        drop(app.update(Message::Select(opened)));
+        run_tasks(&mut app, back);
+        assert_eq!(app.active, Some(opened));
+        assert_eq!(app.capture_editor_location(opened).unwrap().source, origin.source);
+        assert_ne!(app.capture_editor_location(opened).unwrap().anchor.caret, origin.anchor.caret);
+        assert!(!app.lsp_navigation.history_restores.contains_key(&opened));
+        assert!(app.lsp_navigation.history.is_current_target(&target), "an abandoned load must not consume the history entry");
     }
 
     #[test]
