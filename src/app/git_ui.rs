@@ -3449,6 +3449,46 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_repository_load_preserves_new_linked_row_status_error_detail() {
+        const TEST: &str = "app::git_ui::tests::duplicate_repository_load_preserves_new_linked_row_status_error_detail";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repository");
+        let baseline = fixture(&root);
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        let original = app.sidebar_model.projects[0].worktrees[0].clone();
+        let linked = directory.path().join("linked");
+        git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        let binding = RepositoryService::system("git").discover(&linked, &CancellationToken::default()).unwrap();
+        fs::write(binding.git_dir.join("index"), "broken index").unwrap();
+        let provisional = ProjectId::new();
+        app.repository_generations.insert(provisional, 20);
+        let loaded = super::super::tests::task_app_message(app.repository_read_task(
+            linked.clone(), provisional, 20, false, Some(ProjectKind::Git)));
+        let (id, expected_error) = match &loaded {
+            Message::RepositoryLoaded { result: Ok(loaded), .. } => {
+                let id = loaded.worktrees.iter().find(|(record, _)| record.path == linked).unwrap().0.id;
+                (id, loaded.status_order.errors[&id].clone())
+            }
+            _ => panic!("actual duplicate loader did not complete"),
+        };
+        drop(app.update(loaded));
+        assert_eq!(app.sidebar_model.projects.len(), 1);
+        let project = &app.sidebar_model.projects[0];
+        assert_eq!(project.id, key.project_id);
+        assert_eq!(project.worktrees.iter().find(|row| row.id == key.worktree_id).unwrap(), &original);
+        let row = project.worktrees.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.status_error.as_deref(), Some(expected_error.as_str()));
+        assert!(row.status_tooltip_for_test().contains(&expected_error));
+        let entry = &app.refresh_ui.git.entries[&key.project_id];
+        assert_eq!(entry.generation, 9, "duplicate load does not replace the existing watcher owner");
+        assert_eq!(entry.snapshot.worktrees.len(), 1);
+        assert!(!app.repository_generations.contains_key(&provisional));
+    }
+
+    #[test]
     fn repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order() {
         const TEST: &str = "app::git_ui::tests::repository_reload_and_bound_tasks_publish_the_newest_sample_in_either_delivery_order";
         if !crate::git_watch::tests::fixture_isolated(TEST) {
