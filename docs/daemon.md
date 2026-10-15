@@ -78,7 +78,8 @@ cagents daemon stop --confirm
 | `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 
-- An agent handle moves its main pane when present. If the same session also
+- An agent handle moves its authenticated main pane and fails if that pane
+  is missing or replaced. If the same session also
   has a separate console pane, use that pane's full ID to move the console;
   the agent's saved location follows its main pane. A session ID shared by
   several panes is ambiguous and requires an explicit pane ID.
