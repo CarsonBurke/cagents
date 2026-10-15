@@ -383,8 +383,21 @@ fn epoch_ms() -> u64 {
 
 fn rate_limit_details(headers: &[(String, String)], now: u64) -> Value {
     let header = |name: &str| headers.iter().rev().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
-    let reset = ["x-ratelimit-requests-reset", "x-ratelimit-endpoint-requests-reset", "x-ratelimit-complexity-reset"]
-        .into_iter().filter_map(|name| header(name)?.parse::<u64>().ok()).max();
+    let cost = header("x-complexity").and_then(|value| value.parse::<u64>().ok());
+    let reset = [
+        ("x-ratelimit-requests-reset", "x-ratelimit-requests-remaining", false),
+        ("x-ratelimit-endpoint-requests-reset", "x-ratelimit-endpoint-requests-remaining", false),
+        ("x-ratelimit-complexity-reset", "x-ratelimit-complexity-remaining", true),
+    ].into_iter().filter_map(|(reset, remaining, complexity)| {
+        let reset = header(reset)?.parse::<u64>().ok()?;
+        let remaining = header(remaining).and_then(|value| value.parse::<u64>().ok());
+        // Global windows are included on every response, even when healthy.
+        // Only a depleted applicable bucket should delay the next request.
+        // A positive complexity balance can still be smaller than query cost.
+        let applicable = remaining.is_none_or(|remaining| remaining == 0
+            || (complexity && cost.is_none_or(|cost| remaining < cost)));
+        applicable.then_some(reset)
+    }).max();
     let retry = header("retry-after").and_then(|value| {
         value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1_000))
             .or_else(|| http_date_ms(value).map(|date| date.saturating_sub(now)))
@@ -443,6 +456,41 @@ mod tests {
         assert_eq!(error.kind, "linear_rate_limited");
         assert_eq!(error.details.as_ref().unwrap()["retry_after_ms"], 2000);
         assert_eq!(error.details.unwrap()["retryable"], true);
+    }
+
+    #[test]
+    fn healthy_global_window_does_not_hide_an_exhausted_endpoint_window() {
+        let details = rate_limit_details(&[
+            ("x-ratelimit-requests-reset".into(), "3_600_000".replace('_', "")),
+            ("x-ratelimit-requests-remaining".into(), "100".into()),
+            ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
+            ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
+            ("x-ratelimit-complexity-reset".into(), "9000".into()),
+            ("x-ratelimit-complexity-remaining".into(), "1000".into()),
+            ("x-complexity".into(), "10".into()),
+        ], 1000);
+        assert_eq!(details["retry_after_ms"], 2000);
+        assert_eq!(details["reset_at"], 3000);
+        let details = rate_limit_details(&[
+            ("x-ratelimit-requests-reset".into(), "4000".into()),
+            ("x-ratelimit-requests-remaining".into(), "0".into()),
+            ("x-ratelimit-endpoint-requests-reset".into(), "3000".into()),
+            ("x-ratelimit-endpoint-requests-remaining".into(), "0".into()),
+            ("retry-after".into(), "10".into()),
+        ], 1000);
+        assert_eq!(details["retry_after_ms"], 10000);
+        assert_eq!(details["reset_at"], 11000);
+    }
+
+    #[test]
+    fn positive_complexity_balance_can_still_be_too_small_for_the_query() {
+        let details = rate_limit_details(&[
+            ("x-ratelimit-complexity-reset".into(), "9000".into()),
+            ("x-ratelimit-complexity-remaining".into(), "5".into()),
+            ("x-complexity".into(), "10".into()),
+        ], 1000);
+        assert_eq!(details["retry_after_ms"], 8000);
+        assert_eq!(details["reset_at"], 9000);
     }
 
     #[test]
