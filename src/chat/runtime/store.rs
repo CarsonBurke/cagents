@@ -47,6 +47,7 @@ enum LatestBoundary {
 pub(super) struct Window {
     pub items: Vec<std::sync::Arc<Item>>,
     pub changes: Vec<crate::chat::presentation::ItemChange>,
+    pub source_parts: Vec<crate::chat::cache::SourcePart>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
@@ -1092,6 +1093,7 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut source_parts = Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
@@ -1136,22 +1138,34 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    std::borrow::Cow::Owned(format!(
-                        "{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}"
-                    ))
+                    let base_id=format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                    let mut candidate=base_id.clone();
+                    let mut attempt=0_u64;
+                    // A provider's real ID may resemble any generated suffix.
+                    // Escape only synthetic aliases, preserving opaque root IDs.
+                    // The private cache nonce keeps aliases stable across pages.
+                    while self.exists(&candidate)? {
+                        candidate=format!("{base_id}:native-alias:{}:{attempt}",self.directory.file_name().unwrap().to_string_lossy());
+                        attempt=attempt.checked_add(1).ok_or("Native alias capacity exhausted")?;
+                    }
+                    std::borrow::Cow::Owned(candidate)
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
+                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0};
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
                     } else {
                         0
                     };
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
+                }
+                if kind=="text" {
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false});
                 }
                 if let Some(previous) = old.get(item_id.as_ref())
                     && (self.changed.as_ref().is_some_and(|changed| !changed.contains(&id))
@@ -1271,7 +1285,7 @@ impl Store {
                         }
                     }
                 }
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + end - start + 128 + attached + source_bytes;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
@@ -1366,6 +1380,7 @@ impl Store {
         Ok(Window {
             items,
             changes,
+            source_parts,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
