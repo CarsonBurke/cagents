@@ -738,6 +738,46 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_stalled_holder_census_expires_without_closing_healthy_pane() {
+        const STAGE:&str="CAGENTS_STALLED_PROJECT_HOLDER_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let runtime=tempfile::tempdir_in("/var/tmp").unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","host::project_removal::tests::authenticated_stalled_holder_census_expires_without_closing_healthy_pane","--nocapture"]).env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path()).env("XDG_DATA_HOME",runtime.path().join("data")).output().unwrap();
+            assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use crate::daemon::holder_registry::{self as holders,Kind,Process,Record};
+        let mut fixture=Fixture::with_proof(HostSessionProof {
+            host_session_id:HostSessionId::new("stalled-census"),
+            boot_id:crate::daemon::read_boot_id().unwrap(),
+            host_incarnation:HostIncarnation::new("original"),
+        });
+        let healthy=fixture.spawn(crate::model::TerminalId::new());
+        let directory=holders::directory(Kind::Native).unwrap();
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let record=Record { version:3,kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:crate::daemon::read_boot_id().unwrap(),terminal:crate::model::TerminalId::new(),holder:Process::read(std::process::id() as i32).unwrap(),root:Process::read(std::process::id() as i32).unwrap() };
+        let endpoint=holders::socket(&directory,record.terminal);
+        let listener=std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        record.create(&directory).unwrap();
+        let (release,wait)=crossbeam_channel::bounded::<()>(1);
+        let server=std::thread::spawn(move || { let (_socket,_)=listener.accept().unwrap(); wait.recv_timeout(Duration::from_secs(3)).unwrap(); });
+        let reservation=reserve(&fixture.host,&fixture.expected,&[healthy]).unwrap();
+        let start=Instant::now();
+        let failure=census::require_no_unhosted_owners_until(&fixture.host,&reservation,start+Duration::from_millis(80)).unwrap_err();
+        assert!(failure.message.contains("could not be authenticated"),"{failure:?}");
+        assert!(start.elapsed()<Duration::from_secs(2));
+        assert!(!fixture.handles[0].is_completed());
+        assert!(super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().model().unwrap().project(&fixture.root).is_some());
+        drop(reservation);
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(endpoint.exists());
+        assert!(holders::evidence(&endpoint,Kind::Native).unwrap().is_some());
+        record.remove(&directory);
+    }
+
+    #[test]
     fn authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not() {
         const STAGE: &str = "CAGENTS_PROJECT_ORPHAN_CENSUS_TEST";
         if std::env::var_os(STAGE).is_none() {

@@ -38,6 +38,10 @@ fn records(directory: &Path, kind: Kind) -> Result<Vec<Record>, String> {
 }
 
 pub(super) fn require_no_unhosted_owners(host: &SharedHost, reservation: &Reservation) -> Result<(), ProtocolError> {
+    require_no_unhosted_owners_until(host, reservation, Instant::now() + Duration::from_secs(10))
+}
+
+pub(super) fn require_no_unhosted_owners_until(host: &SharedHost, reservation: &Reservation, deadline: Instant) -> Result<(), ProtocolError> {
     let (proof, installed) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let installed = state.terminals.values().filter_map(|record| record.handle.holder_identity().cloned())
@@ -45,17 +49,16 @@ pub(super) fn require_no_unhosted_owners(host: &SharedHost, reservation: &Reserv
         (state.proof().clone(), installed)
     };
     let registry = super::super::agent_execution::registry(host).map_err(error)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
     for kind in [Kind::Native, Kind::Terminal] {
         let directory = holders::directory(kind).map_err(error)?;
         for record in records(&directory, kind).map_err(|reason| error(format!("Retained session census is uncertain: {reason}. No project sessions were closed.")))? {
             if installed.get(&(kind == Kind::Native, record.terminal)) == Some(&record) { continue; }
             if Instant::now() >= deadline { return Err(error("Retained session census reached its time limit. No project sessions were closed; retry after resolving retained sessions.")); }
             let inspected = match kind {
-                Kind::Native => crate::chat::native_holder::inspect(&record, &proof).map(|(recovery, _)| {
+                Kind::Native => crate::chat::native_holder::inspect_until(&record, &proof, deadline).map(|(recovery, _)| {
                     recovery.previous_sources.into_iter().chain(std::iter::once(recovery.source)).map(HostedSession::Chat).collect::<Vec<_>>()
                 }),
-                Kind::Terminal => crate::terminal::inspect_holder(&holders::socket(&directory, record.terminal), &record, &proof).map(|(recovery, _)| {
+                Kind::Terminal => crate::terminal::inspect_holder_until(&holders::socket(&directory, record.terminal), &record, &proof, deadline).map(|(recovery, _)| {
                     recovery.previous_sources.into_iter().chain(std::iter::once(recovery.source)).map(HostedSession::Terminal).collect::<Vec<_>>()
                 }),
             };
