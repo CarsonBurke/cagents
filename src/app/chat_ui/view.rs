@@ -5986,7 +5986,8 @@ mod tests {
         }
 
         let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
-        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
         let mut target = live.target;
         target.card = app.workspace.focused().unwrap();
         live.target = target;
