@@ -87,7 +87,7 @@ impl Cagents {
     /// An absent endpoint MUST remain read-only in the shared runtime. The
     /// endpoint is not an Active lease; only the actual enrolled worker receipt
     /// permits Editable publication. Historical/preview runtimes do not call it.
-    fn configure_repository_recovery_endpoint(&mut self, runtime: &mut RepositoryRuntime) {
+    pub(super) fn configure_repository_recovery_endpoint(&mut self, runtime: &mut RepositoryRuntime) {
         let expected = (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY)
             .then_some(self.workspace_model.identity);
         match LocalRecoveryEndpoint::capture(expected) {
