@@ -50,6 +50,14 @@ pub enum Instance {
     Operation(crate::model::OperationId),
 }
 
+/// The visible dialog which produced a widget message. Lifecycle task outputs
+/// deliberately do not carry this UI-only admission token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceTarget {
+    modal: Modal,
+    revision: u64,
+}
+
 #[derive(Default)]
 pub(super) struct Stack {
     frames: Vec<Frame>,
@@ -250,6 +258,25 @@ impl Stack {
 }
 
 impl Cagents {
+    pub(super) fn modal_surface_target(&self, modal: Modal) -> SurfaceTarget {
+        SurfaceTarget {
+            modal,
+            revision: self.modal_stack.focus_revision.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn admit_modal_surface_message(&self, message: Message) -> Option<Message> {
+        match message {
+            Message::ModalSurface { target, message } => {
+                (self.top_modal() == Some(target.modal)
+                    && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
+                    && !matches!(&*message, Message::ModalSurface { .. }))
+                .then_some(*message)
+            }
+            message => Some(message),
+        }
+    }
+
     /// Feature focus tasks share the modal revision, and cannot clear focus
     /// when their lower dialog is hidden by the current modal tree.
     pub(super) fn modal_focus(&self, target: widget::Id) -> Task<Message> {
@@ -564,6 +591,68 @@ mod tests {
             },
             captured: false,
         }));
+    }
+
+    fn emitted_reset_cancel(app: &Cagents) -> Message {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}};
+        let renderer = super::super::tests::headless_renderer();
+        let mut dialog = app.dialog().expect("visible dialog");
+        let mut tree = Tree::new(&dialog);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let node = dialog.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+        dialog.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("dialog.reset-settings.cancel")));
+        let mut messages = Vec::new();
+        dialog.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        }), Layout::new(&node), iced::mouse::Cursor::Unavailable, &renderer,
+            &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        messages.into_iter().find(|message| matches!(message,
+            Message::ModalSurface { message, .. } if matches!(&**message, Message::CancelResetSettings)))
+            .expect("actual Cancel widget publishes its surface-bound decision")
+    }
+
+    #[test]
+    fn held_widget_decision_cannot_close_a_hidden_or_reopened_modal() {
+        let mut app = app();
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let old = emitted_reset_cancel(&app);
+        app.resume_ui.open = true;
+        drop(app.finish_modal_update(Task::none()));
+        let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
+        drop(app.update(old.clone()));
+        assert!(app.settings_reset_confirm && app.resume_ui.open);
+        assert_eq!(app.modal_stack.focus_revision.load(Ordering::Relaxed), revision,
+            "rejected UI messages must not run reconciliation or focus side effects");
+        escape(&mut app);
+        drop(app.update(emitted_reset_cancel(&app)));
+        assert!(!app.settings_reset_confirm);
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.update(old));
+        assert!(app.settings_reset_confirm, "reopening the same kind creates a new UI owner");
+        drop(app.update(emitted_reset_cancel(&app)));
+        assert!(!app.modal_is_open());
+    }
+
+    #[test]
+    fn lower_only_removal_keeps_the_visible_widget_decision_valid() {
+        let mut app = app();
+        app.resume_ui.open = true;
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let current = emitted_reset_cancel(&app);
+        app.resume_ui.open = false;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.update(current));
+        assert!(!app.modal_is_open());
     }
     #[test]
     fn escape_closes_the_visible_top_modal_only() {

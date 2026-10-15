@@ -3941,6 +3941,10 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ModalSurface {
+        target: modal_ui::SurfaceTarget,
+        message: Box<Message>,
+    },
     ChatClose(chat_ui::closing::Action),
     Device(device_ui::Action),
     ReviewFilePanelToggle {
@@ -13025,6 +13029,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let Some(message) = self.admit_modal_surface_message(message) else {
+            return Task::none();
+        };
         self.reconcile_modal_backing_state();
         let modal_entry_focus = self.finish_modal_update(Task::none());
         // Keep the large dispatch body in place for independent feature changes.
@@ -13144,6 +13151,7 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::ModalSurface { .. } => return Task::none(),
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
@@ -16801,7 +16809,9 @@ impl Application for Cagents {
             } else {
                 dialog
             };
+            let target = self.modal_surface_target(top);
             crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
+                .map(move |message| Message::ModalSurface { target, message: Box::new(message) })
         })
     }
 
@@ -20688,7 +20698,8 @@ mod tests {
         );
         assert!(
             messages
-                .iter()
+                .into_iter()
+                .filter_map(|message| app.admit_modal_surface_message(message))
                 .any(|message| matches!(message, Message::SubmitPullRequest))
         );
     }

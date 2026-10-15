@@ -886,11 +886,11 @@ mod tests {
                         messages
                     };
                     assert!(messages.iter().any(|message| matches!(
-                        message,
-                        Message::TerminalCloseDontAskChanged(_, true)
+                        app.admit_modal_surface_message(message.clone()),
+                        Some(Message::TerminalCloseDontAskChanged(_, true))
                     )));
                     for message in messages {
-                        let toggled = matches!(message, Message::TerminalCloseDontAskChanged(..));
+                        let toggled = matches!(app.admit_modal_surface_message(message.clone()), Some(Message::TerminalCloseDontAskChanged(..)));
                         let task = app.update(message);
                         if toggled {
                             assert_eq!(
