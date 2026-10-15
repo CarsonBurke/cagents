@@ -22,6 +22,10 @@ pub(super) struct Choices {
     pub default_base: String,
     pub prefix: String,
     pub remotes: Vec<String>,
+    pub primary: Option<std::path::PathBuf>,
+    pub setup_plan: Option<crate::worktree_setup::SetupPlan>,
+    pub setup_trusted: bool,
+    pub setup_error: Option<String>,
 }
 
 impl Choices {
@@ -44,6 +48,23 @@ impl Choices {
             .timeout(std::time::Duration::from_secs(5)).output_limits(4096, 4096);
         if let Ok(output) = SystemProcessExecutor.execute(&command, cancellation) && output.success {
             choices.prefix = String::from_utf8(output.stdout).map_err(|error| error.to_string())?.trim().to_owned();
+        }
+        let service = crate::repository::RepositoryService::system("git");
+        choices.primary = service.list_worktrees(repository, cancellation).map_err(|error| error.to_string())?
+            .first().filter(|record| !record.bare).map(|record| record.path.clone());
+        if let Some(primary) = &choices.primary {
+            match crate::worktree_setup::load(primary) {
+                Ok(plan) => {
+                    choices.setup_plan = plan;
+                    if let Some(plan) = &choices.setup_plan {
+                        match crate::worktree_setup::is_trusted(primary, plan, cancellation) {
+                            Ok(trusted) => choices.setup_trusted = trusted,
+                            Err(error) => choices.setup_error = Some(error.to_string()),
+                        }
+                    }
+                }
+                Err(error) => choices.setup_error = Some(error.to_string()),
+            }
         }
         Ok(choices)
     }

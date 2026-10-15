@@ -47,6 +47,7 @@ mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_choices;
 mod worktree_operations;
+mod worktree_setup_ui;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
@@ -2557,6 +2558,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::WorktreeFieldFocused(_)
                 | Message::WorktreeChoiceSelected { .. }
                 | Message::WorktreePrefixChanged(_)
+                | Message::WorktreeSetupSkipChanged(_)
+                | Message::WorktreeSetupTrustChanged(_)
                 | Message::WorktreeSuggestionsDismissed(_)
                 | Message::WorktreeBranchChanged(_)
                 | Message::WorktreeBaseChanged(_)
@@ -4244,6 +4247,9 @@ pub enum Message {
         request: DelegateRequestId,
         result: Result<Option<Vec<PathBuf>>, String>,
     },
+    WorktreeSetupSkipChanged(bool),
+    WorktreeSetupTrustChanged(bool),
+    WorktreeSetupPrepared { operation: crate::model::OperationId, worktree: PathBuf, result: Result<crate::worktree_setup::SetupPreparation, String> },
     WorktreeChoicesResolved { id: crate::model::OperationId, result: Result<worktree_choices::Choices, String> },
     WorktreeFieldFocused(WorktreeField),
     WorktreeChoiceSelected { field: WorktreeField, reference: String },
@@ -4950,6 +4956,7 @@ pub struct Cagents {
     terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
+    setup_ui: worktree_setup_ui::State,
     /// A source-control navigation waiting for its repository card to finish
     /// listing files.
     ///
@@ -12984,6 +12991,7 @@ impl Application for Cagents {
             pending_terminal_handoffs: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
+            setup_ui: Default::default(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
@@ -15449,6 +15457,15 @@ impl Application for Cagents {
             Message::WorktreeBranchChanged(value) => self.edit_worktree_branch(value),
             Message::WorktreeLinearResolved { id, result } => self.finish_worktree_linear(id, result),
             Message::WorktreeChoicesResolved { id, result } => self.finish_worktree_choices(id, result),
+            Message::WorktreeSetupPrepared { operation, worktree, result } => self.finish_worktree_setup(operation, worktree, result),
+            Message::WorktreeSetupSkipChanged(skip) => {
+                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_setup_skip(skip); }
+                Task::none()
+            }
+            Message::WorktreeSetupTrustChanged(trust) => {
+                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_setup_trust(trust); }
+                Task::none()
+            }
             Message::WorktreeFieldFocused(field) => {
                 if let Some(dialog) = &mut self.worktree_dialog { dialog.focus_field(field); }
                 Task::none()
@@ -15535,6 +15552,7 @@ impl Application for Cagents {
                                 .worktrees
                                 .push(SidebarWorktree::from_repository(&worktree, None));
                         }
+                        self.refresh_worktree_setup_rows();
                         let terminal = self.select_worktree(worktree.path, true);
                         let chrome = self.sync_chrome();
                         return Task::batch([
@@ -25266,6 +25284,7 @@ mod tests {
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             worktree_operations: HashMap::new(),
+            setup_ui: Default::default(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),

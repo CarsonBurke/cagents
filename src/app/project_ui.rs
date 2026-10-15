@@ -1608,6 +1608,7 @@ impl Cagents {
     }
 
     fn worktree_deletion_blocker(&self, target: &Target) -> Option<String> {
+        if self.setup_ui.preparing(&target.path) { return Some("Wait for this worktree's setup file copy to finish before deleting it.".into()); }
         if self.session.is_none() {
             return Some(
                 "Session storage is unavailable; deletion cannot be recorded safely.".into(),

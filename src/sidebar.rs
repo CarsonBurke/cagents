@@ -687,8 +687,25 @@ pub struct SidebarEditor {
     pub icon: String,
 }
 
-/// Worktree presentation data derived from a worktree record and its optional
-/// status snapshot. A missing status is represented rather than guessed.
+/// Creation setup state shown beside a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeSetupStatus {
+    Preparing,
+    Running,
+    Succeeded,
+    Failed(String),
+    Skipped,
+}
+
+impl WorktreeSetupStatus {
+    fn label(&self) -> &'static str {
+        match self { Self::Preparing | Self::Running => "Setting up", Self::Succeeded => "Setup complete", Self::Failed(_) => "Setup failed", Self::Skipped => "Setup skipped" }
+    }
+    fn detail(&self) -> &str {
+        match self { Self::Failed(detail) => detail, _ => self.label() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarWorktree {
     pub id: WorktreeId,
@@ -703,6 +720,7 @@ pub struct SidebarWorktree {
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
     pub creation_basis: Option<crate::worktree_basis::CreationBasis>,
+    pub setup_status: Option<WorktreeSetupStatus>,
     pub pull_request_state: Option<WorktreePullRequestState>,
     /// Held by the application rather than read from the checkout, and
     /// reapplied whenever a read replaces the row.
@@ -763,6 +781,7 @@ impl SidebarWorktree {
             behind,
             created_at_unix_ms: None,
             creation_basis: None,
+            setup_status: None,
             head_repository: None,
             pull_request_state: None,
             deletion: None,
@@ -5929,6 +5948,12 @@ fn worktree_view<'a>(
             }
             None => {}
         }
+    }
+    if !deleting && let Some(status) = &worktree.setup_status {
+        let indicator: Element<'static, SidebarAction> = if compact {
+            widget::icon(Icon::Terminal.handle()).size(design::COMPACT_ICON_SIZE).into()
+        } else { design::caption(status.label()).into() };
+        content = content.push(crate::interaction::tooltip(indicator, status.detail().to_owned()));
     }
     // Durable attributes, after the reserved slot: each is a fact about the
     // worktree rather than live activity, so none of them moves while an agent

@@ -20,6 +20,7 @@ pub struct WorktreeDraft {
     pub branch: String,
     pub base: String,
     pub destination: String,
+    pub skip_setup: bool,
 }
 
 impl WorktreeDraft {
@@ -203,6 +204,7 @@ pub struct WorktreeDialog {
     choices_error: Option<String>,
     submit_after_choices: bool,
     prefix_dirty: bool,
+    trust_setup: bool,
     focused_field: Option<WorktreeField>,
     resolving: Option<Resolution>,
     error: Option<WorktreeInputError>,
@@ -225,6 +227,7 @@ impl WorktreeDialog {
             choices_error: None,
             submit_after_choices: false,
             prefix_dirty: false,
+            trust_setup: false,
             focused_field: Some(WorktreeField::Branch),
             resolving: None,
             error: None,
@@ -328,6 +331,29 @@ impl WorktreeDialog {
         }
     }
 
+    pub fn edit_setup_skip(&mut self, skip: bool) {
+        if self.resolving.is_none() {
+            self.draft.skip_setup = skip;
+            self.submit_after_choices = false;
+            self.submit_after_linear = false;
+            self.error = None;
+        }
+    }
+
+    pub fn edit_setup_trust(&mut self, trust: bool) {
+        if self.resolving.is_none() {
+            self.trust_setup = trust;
+            self.submit_after_choices = false;
+            self.submit_after_linear = false;
+            self.error = None;
+        }
+    }
+
+    fn setup_approved(&self) -> bool {
+        self.draft.skip_setup || (self.choices.setup_error.is_none() &&
+            self.choices.setup_plan.as_ref().is_none_or(|plan| !plan.requires_trust() || self.choices.setup_trusted || self.trust_setup))
+    }
+
     fn choices_task(&mut self) -> Task<Message> {
         let id = OperationId::new();
         let token = CancellationToken::new();
@@ -393,7 +419,7 @@ impl WorktreeDialog {
     }
 
     fn can_submit(&self) -> bool {
-        self.resolving.is_none() && self.choices_request.is_none() && !matches!(self.linear, LinearLookup::Pending { .. }) && !self.draft.branch.trim().is_empty()
+        self.resolving.is_none() && self.choices_request.is_none() && self.setup_approved() && !matches!(self.linear, LinearLookup::Pending { .. }) && !self.draft.branch.trim().is_empty()
     }
 
     /// Stops a resolution the user no longer wants.
@@ -462,7 +488,10 @@ impl Cagents {
                 if dialog.prefix_dirty { choices.prefix.clone_from(&dialog.choices.prefix); }
                 dialog.choices = choices;
             }
-            Err(error) => dialog.choices_error = Some(error),
+            Err(error) => {
+                dialog.choices_error = Some(error.clone());
+                dialog.choices.setup_error = Some(format!("Project setup could not be inspected: {error}. Retry opening the dialog, or explicitly skip setup."));
+            }
         }
         if std::mem::take(&mut dialog.submit_after_choices) { return self.submit_worktree_dialog(); }
         Task::none()
@@ -507,6 +536,10 @@ impl Cagents {
         if let Err(error) = dialog.validate() {
             return dialog.show_error(error);
         }
+        if !dialog.setup_approved() {
+            return dialog.show_error(WorktreeInputError::general(dialog.choices.setup_error.as_deref()
+                .unwrap_or("Review and trust this project's setup commands, or skip setup for this creation.")));
+        }
         let operation_id = OperationId::new();
         let token = CancellationToken::new();
         dialog.error = None;
@@ -521,6 +554,8 @@ impl Cagents {
             _ => None,
         };
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
+        let trust = (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
+            .then(|| dialog.choices.primary.clone().zip(dialog.choices.setup_plan.clone())).flatten();
         let input = WorktreeInput {
             repository: dialog.repository.clone(),
             input: dialog.effective_branch().expect("branch was validated before resolving"),
@@ -531,6 +566,9 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if let Some((primary, plan)) = trust {
+                    crate::worktree_setup::trust(&primary, &plan, &token).map_err(|error| WorktreeInputError::general(error.to_string()))?;
+                }
                 if let Some(prefix) = prefix {
                     super::worktree_choices::save_prefix(&input.repository, &prefix, &token)
                         .map_err(WorktreeInputError::general)?;
@@ -573,12 +611,18 @@ impl Cagents {
         match result {
             Ok(request) => {
                 let draft = dialog.draft.clone();
+                let setup_intent = (dialog.choices.setup_plan.is_some() || dialog.draft.skip_setup)
+                    .then(|| super::worktree_setup_ui::SetupIntent {
+                        primary: dialog.choices.primary.clone(), plan: dialog.choices.setup_plan.clone(), skip: dialog.draft.skip_setup,
+                    });
                 let replaces = dialog.replaces;
                 self.worktree_dialog = None;
                 if let Some(replaced) = replaces {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
+                let id = request.operation_id;
                 let start = self.start_worktree_operation(project_id, request, Some(draft));
+                if let Some(intent) = setup_intent { self.set_worktree_setup_intent(id, intent); }
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
                     None => self.focus_context_overlay_if_exposed(),
@@ -760,6 +804,24 @@ impl Cagents {
                 )),
             ));
         }
+        if let Some(plan) = &dialog.choices.setup_plan {
+            if !plan.copy.is_empty() { rows.push(design::caption(format!("Copies from the primary checkout: {}", plan.copy.join(", "))).into()); }
+            if !plan.commands.is_empty() {
+                rows.push(design::caption("Setup commands (run in an interactive terminal in the new worktree)").into());
+                rows.push(widget::scrollable(widget::selectable_text(plan.commands.join("\n")).size(design::TEXT_BODY))
+                    .height(96.0).into());
+                if !dialog.choices.setup_trusted {
+                    rows.push(crate::ui_controls::field::checkbox(dialog.trust_setup)
+                        .label("Trust these setup commands for this project")
+                        .on_toggle_maybe(editable.then_some(Message::WorktreeSetupTrustChanged as fn(bool) -> Message)).into());
+                } else { rows.push(design::caption("Setup commands are trusted for this project.").into()); }
+            }
+        }
+        if let Some(error) = &dialog.choices.setup_error { rows.push(error_note(error)); }
+        if dialog.choices.setup_plan.is_some() || dialog.choices.setup_error.is_some() {
+            rows.push(crate::ui_controls::field::checkbox(dialog.draft.skip_setup).label("Skip setup for this worktree")
+                .on_toggle_maybe(editable.then_some(Message::WorktreeSetupSkipChanged as fn(bool) -> Message)).into());
+        }
         if let Some(error) = dialog.error.as_ref().filter(|error| error.field.is_none()) {
             rows.push(
                 widget::selectable_text(error.message.as_str())
@@ -900,6 +962,26 @@ mod tests {
             .as_ref()
             .expect("the request is resolving")
             .id
+    }
+
+    #[test]
+    fn setup_requires_explicit_trust_or_per_creation_skip() {
+        let mut dialog = WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::branch("feature/setup"));
+        dialog.choices.setup_plan = Some(crate::worktree_setup::SetupPlan {
+            copy: vec![".env".into()], commands: vec!["pnpm install".into()], fingerprint: "a".repeat(64),
+        });
+        assert!(!dialog.setup_approved());
+        assert!(!dialog.can_submit());
+        dialog.edit_setup_trust(true);
+        assert!(dialog.setup_approved());
+        dialog.edit_setup_trust(false);
+        dialog.edit_setup_skip(true);
+        assert!(dialog.setup_approved());
+        assert!(dialog.draft.skip_setup);
+        dialog.edit_setup_skip(false);
+        assert!(!dialog.setup_approved());
+        dialog.choices.setup_trusted = true;
+        assert!(dialog.setup_approved());
     }
 
     #[test]

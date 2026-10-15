@@ -29,6 +29,7 @@ pub(super) struct ActiveWorktreeOperation {
     /// What the user typed to start it, when this session started it: a
     /// failure can then be reopened in the dialog instead of retyped.
     draft: Option<WorktreeDraft>,
+    setup_intent: Option<super::worktree_setup_ui::SetupIntent>,
 }
 
 impl ActiveWorktreeOperation {
@@ -200,6 +201,7 @@ impl Cagents {
                 created_worktree: None,
                 state: None,
                 draft,
+                setup_intent: None,
             },
         );
         self.sync_worktree_operation_rows();
@@ -219,6 +221,10 @@ impl Cagents {
             }
         })
     }
+    pub(super) fn set_worktree_setup_intent(&mut self, id: OperationId, intent: super::worktree_setup_ui::SetupIntent) {
+        if let Some(operation) = self.worktree_operations.get_mut(&id) { operation.setup_intent = Some(intent); }
+    }
+
     pub(super) fn worktree_progress(&mut self, event: WorktreeProgressEvent) -> Task<Message> {
         let Some(operation) = self.worktree_operations.get_mut(&event.operation_id) else {
             return Task::none();
@@ -326,15 +332,20 @@ impl Cagents {
                 None
             }
         };
+        let setup_intent = operation.setup_intent.take();
         self.sync_worktree_operation_rows();
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
+            let setup = match (&outcome, setup_intent) {
+                (WorktreeCreationOutcome::Created { worktree, .. }, Some(intent)) => self.start_worktree_setup(id, worktree.path.clone(), intent),
+                _ => Task::none(),
+            };
             return cosmic::task::message(Message::WorktreeCreated {
                 project_id,
                 repository,
                 result: Ok(outcome),
-            });
+            }).chain(setup);
         }
         Task::none()
     }
@@ -405,6 +416,7 @@ impl Cagents {
                             detail: report.detail,
                             state: Some(report.state),
                             draft: None,
+                            setup_intent: None,
                         },
                     );
                 }
@@ -432,7 +444,7 @@ impl Cagents {
         if self
             .worktree_operations
             .values()
-            .any(|operation| !operation.finished)
+            .any(|operation| !operation.finished) || self.setup_ui.active()
         {
             subscriptions.push(
                 Subscription::run_with(0_u8, elapsed_stream).map(|()| Message::WorktreeElapsed),
@@ -472,6 +484,7 @@ impl Cagents {
             }),
         );
         self.sync_worktree_deletion_rows();
+        self.refresh_worktree_setup_rows();
     }
 }
 
@@ -497,14 +510,14 @@ mod tests {
                 project, generation: 1, request: Some(request.clone()), token: None, receiver: None,
                 stage: None, started: Instant::now(), completed_elapsed: None, restored: false,
                 termination_requested: false, finished: false, detail: "creating".into(),
-                created_worktree: None, label: "eng-123".into(), state: None, draft: None,
+                created_worktree: None, label: "eng-123".into(), state: None, draft: None, setup_intent: None,
             });
             let task = app.finish_worktree_operation(id, 1, Ok(WorktreeOperationReport {
                 operation_id: id, generation: 1, request: Some(request), state,
                 outcome: Some(WorktreeCreationOutcome::Created {
                     worktree: crate::repository::WorktreeRecord {
                         id: crate::model::WorktreeId::new(), path: destination,
-                        created_at_unix_ms: Some(1), head_oid: Some("a".repeat(40)),
+                        creation_basis: None, created_at_unix_ms: Some(1), head_oid: Some("a".repeat(40)),
                         branch: Some("refs/heads/eng-123".into()), detached: false, bare: false,
                         lock: crate::repository::WorktreeLock::default(), prunable_reason: None,
                     }, warnings: Vec::new(),
@@ -547,6 +560,7 @@ mod tests {
                     label: "review".into(),
                     state: None,
                     draft: None,
+                            setup_intent: None,
                 },
             );
             let _ = app.cancel_worktree_operation(id);
@@ -616,6 +630,7 @@ mod tests {
             label: path.into(),
             state: Some(WorktreeOperationState::Created),
             draft: None,
+            setup_intent: None,
         };
         let deleted = OperationId::new();
         let other = OperationId::new();

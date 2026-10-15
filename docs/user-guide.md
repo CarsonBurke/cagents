@@ -990,3 +990,21 @@ scripts/run-ceditor-development /path/to/project   # isolated development identi
   remotes (`origin` first) through `gh`, with the same viewed marks and
   **Alt+V**, **Alt+Down**, and **Alt+Up** shortcuts, configurable in Editor
   settings.
+
+
+New-worktree suggestions use locally available branches, remote-tracking branches,
+and tags. The base defaults to the last fetched remote default branch. A caption
+shows whether creation checks out an existing branch or creates a branch, and warns
+when a selected local base is behind its upstream. Spaces in pasted titles become
+hyphens. **Base branch & destination** also contains an optional branch prefix,
+saved per project in clone-local Git configuration (`cagents.worktreeBranchPrefix`).
+The Branch view uses the immutable commit recorded when the worktree was created;
+older worktrees continue using their repository default branch.
+
+A primary checkout may declare file copies and commands in
+[`.cagents/worktree.toml`](worktree-setup.md). The creation dialog shows the commands
+and requires explicit trust for the current configuration before creation. **Skip
+setup for this worktree** skips both file copies and commands. After Git creates
+the checkout, copies run first and commands run in its **Worktree setup** terminal
+card. The worktree row shows **Setting up**, **Setup complete**, **Setup failed**,
+or **Setup skipped**. A setup failure keeps the created worktree and copied files.
