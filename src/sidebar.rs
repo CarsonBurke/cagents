@@ -5737,7 +5737,7 @@ fn channel_context_controls<'a>(
                 ),
                 _ => "Delete channel…".to_owned(),
             },
-            None,
+            Some(Icon::Delete.handle()),
             ChannelContextCommand(
                 channel_id,
                 selection_count.unwrap_or(1) > 1,
@@ -5749,7 +5749,7 @@ fn channel_context_controls<'a>(
                 0,
                 Item::Button(
                     "Rename channel…".into(),
-                    None,
+                    Some(Icon::Rename.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
                 ),
             );
@@ -5757,11 +5757,12 @@ fn channel_context_controls<'a>(
                 1,
                 Item::Button(
                     "Mark as read".into(),
-                    None,
+                    Some(Icon::Check.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::MarkRead),
                 ),
             );
         }
+        if selection_count == Some(1) { entries.insert(2, Item::Divider); }
         items(&std::collections::HashMap::new(), entries)
     }) else {
         return content.into();
@@ -6151,6 +6152,32 @@ impl widget::menu::Action for ContextCommand<'_> {
     }
 }
 
+fn project_menu_group(command: &ProjectCommand) -> u8 {
+    match command {
+        ProjectCommand::NewTerminal | ProjectCommand::NewChannel | ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch => 0,
+        ProjectCommand::CopyPath | ProjectCommand::CopyBranch => 1,
+        ProjectCommand::Reveal | ProjectCommand::OpenEditor(_) | ProjectCommand::RepositoryUrl | ProjectCommand::PullRequest => 2,
+        ProjectCommand::MoveUp | ProjectCommand::MoveDown | ProjectCommand::ResetSidebarOrder => 3,
+        ProjectCommand::Delete | ProjectCommand::Remove => 4,
+    }
+}
+
+fn project_menu_icon(command: &ProjectCommand) -> Icon {
+    match command {
+        ProjectCommand::NewTerminal => Icon::Terminal,
+        ProjectCommand::NewChannel => Icon::ChannelAdd,
+        ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch | ProjectCommand::CopyBranch => Icon::Branch,
+        ProjectCommand::CopyPath => Icon::CopyPath,
+        ProjectCommand::Reveal | ProjectCommand::OpenEditor(_) => Icon::OpenFolder,
+        ProjectCommand::RepositoryUrl => Icon::Browser,
+        ProjectCommand::PullRequest => Icon::Changes,
+        ProjectCommand::MoveUp => Icon::ChevronUp,
+        ProjectCommand::MoveDown => Icon::ChevronDown,
+        ProjectCommand::ResetSidebarOrder => Icon::History,
+        ProjectCommand::Delete | ProjectCommand::Remove => Icon::Delete,
+    }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -6176,8 +6203,8 @@ fn context_controls<'a>(
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
         }
+        commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
         if worktree_id.is_some() {
-            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
             if git {
                 commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
                 commands.push((
@@ -6235,9 +6262,13 @@ fn context_controls<'a>(
             };
             commands.push((format!("{label}…"), None, command));
         }
-        let entries = commands
-            .iter()
-            .map(|(label, icon, command)| {
+        commands.sort_by_key(|(_, _, command)| project_menu_group(command));
+        let mut previous_group = None;
+        let mut entries = Vec::new();
+        for (label, icon, command) in &commands {
+                let group = project_menu_group(command);
+                if previous_group.is_some_and(|previous| previous != group) { entries.push(Item::Divider); }
+                previous_group = Some(group);
                 let item = if !has_branch
                     && matches!(
                         command,
@@ -6249,7 +6280,7 @@ fn context_controls<'a>(
                 } else {
                     Item::Button
                 };
-                item(
+                entries.push(item(
                     if !has_branch
                         && matches!(
                             command,
@@ -6262,7 +6293,7 @@ fn context_controls<'a>(
                     } else {
                         label.clone()
                     },
-                    icon.clone(),
+                    Some(icon.clone().unwrap_or_else(|| project_menu_icon(command).handle())),
                     ContextCommand(
                         project_id,
                         worktree_id,
@@ -6270,9 +6301,8 @@ fn context_controls<'a>(
                         selection_count.is_some_and(|count| count > 1)
                             && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
                     ),
-                )
-            })
-            .collect();
+                ));
+        }
         items(&std::collections::HashMap::new(), entries)
     })
 }
@@ -6362,7 +6392,15 @@ fn file_context_controls<'a>(
     }
     let path = &row.path;
     let mut entries = Vec::with_capacity(5 + editors.len());
+    let mut previous_group = None;
     for (label, icon, command) in file_commands(row.directory, file_management) {
+        let group = match command {
+            FileCommand::Rename | FileCommand::CopyFile => 0,
+            FileCommand::CopyPath | FileCommand::CopyRelativePath => 1,
+            FileCommand::RevealInFileManager => 2,
+        };
+        if previous_group.is_some_and(|previous| previous != group) { entries.push(widget::menu::Item::Divider); }
+        previous_group = Some(group);
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
             Some(icon.handle()),
@@ -12881,6 +12919,36 @@ pub(crate) mod tests {
                 FileCommand::RevealInFileManager,
             ],
         );
+    }
+
+    #[test]
+    fn project_menu_renders_copy_path_and_dispatches_its_original_project() {
+        use cosmic::iced::{Event, Point, Rectangle, Vector, advanced::{Shell, clipboard, widget::Operation}, mouse};
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(900.0, 900.0));
+        let mut element = context_controls(widget::Space::new().width(900).height(900), project_id(17), None, false, true, true, false, &[], Some(1));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+        let mut messages = Vec::new();
+        let anchor = mouse::Cursor::Available(Point::new(850.0, 850.0));
+        element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&node), anchor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        let mut popup = element.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).unwrap();
+        let popup_node = popup.as_overlay_mut().layout(&renderer, viewport.size());
+        popup.as_overlay_mut().update(&Event::Window(cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now())), Layout::new(&popup_node), anchor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        let popup_node = popup.as_overlay_mut().layout(&renderer, viewport.size());
+        #[derive(Default)] struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) { self.0.push((text.to_owned(), bounds)); }
+        }
+        let mut texts = Texts::default();
+        popup.as_overlay_mut().operate(Layout::new(&popup_node), &renderer, &mut texts);
+        let copy = texts.0.iter().find(|(text, _)| text == "Copy path").expect("project root offers Copy path").1;
+        assert!(viewport.contains(copy.center()));
+        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
+            popup.as_overlay_mut().update(&Event::Mouse(event), Layout::new(&popup_node), mouse::Cursor::Available(copy.center()), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        }
+        assert_eq!(messages, [SidebarAction::ProjectCommand { project_id: project_id(17), worktree_id: None, command: ProjectCommand::CopyPath }]);
     }
 
     #[test]

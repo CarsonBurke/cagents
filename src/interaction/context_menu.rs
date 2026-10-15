@@ -16,6 +16,7 @@ pub(super) fn surface<'a, Message: Clone + 'static>(
     menu: Vec<widget::menu::Tree<Message>>,
 ) -> Element<'a, Message> {
     let items = menu.len();
+    let width = menu.iter().map(widget::menu::Tree::preferred_width).max().unwrap_or(240);
     Element::new(MenuSurface {
         native: widget::context_menu(
             cosmic::iced::widget::Space::new()
@@ -24,6 +25,7 @@ pub(super) fn surface<'a, Message: Clone + 'static>(
             Some(menu),
         ),
         items,
+        width,
         builder: None,
         footprint: layout::Node::new(Size::ZERO),
     })
@@ -40,26 +42,27 @@ pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
             Some(Vec::new()),
         ),
         items: 0,
+        width: 240,
         builder: Some(Box::new(builder)),
         footprint: layout::Node::new(Size::ZERO),
     })
 }
 
-/// How many items the menu had when the native widget last measured it.
+/// The shape used when the native widget last measured this flat menu.
 ///
-/// This is the only quantity the retained menu geometry is indexed by: the
-/// native widget stores one `MenuState` per open level, and its `MenuBounds`
-/// holds a position and a size per item of the list that level was opened on.
-/// Our menus are flat, so the top-level item count is their entire shape.
-/// Retain the click in window space as well, to size the popup's anchor.
+/// Native `MenuState` stores positions and sizes for the open list. A changed
+/// item count or preferred label width invalidates that retained geometry.
+/// Keep the click in window space as well, to size the popup's anchor.
 struct MenuItems {
     count: usize,
+    width: u16,
     anchor: Point,
 }
 
 struct MenuSurface<'a, Message> {
     native: widget::ContextMenu<'a, Message>,
     items: usize,
+    width: u16,
     builder: Option<Box<dyn Fn() -> Vec<widget::menu::Tree<Message>> + 'a>>,
     footprint: layout::Node,
 }
@@ -69,6 +72,7 @@ impl<Message: Clone + 'static> MenuSurface<'_, Message> {
         if let Some(builder) = &self.builder {
             let menu = builder();
             self.items = menu.len();
+            self.width = menu.iter().map(widget::menu::Tree::preferred_width).max().unwrap_or(240);
             self.native = widget::context_menu(
                 cosmic::iced::widget::Space::new()
                     .width(Length::Fill)
@@ -101,6 +105,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     fn state(&self) -> tree::State {
         tree::State::new(MenuItems {
             count: self.items,
+            width: self.width,
             anchor: Point::ORIGIN,
         })
     }
@@ -130,8 +135,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // an open menu that silently restructures under the pointer is a
         // mis-click waiting to happen either way.
         let measured = tree.state.downcast_mut::<MenuItems>();
-        let remeasured = measured.count != self.items;
+        let remeasured = measured.count != self.items || measured.width != self.width;
         measured.count = self.items;
+        measured.width = self.width;
         if remeasured || tree.children.is_empty() {
             tree.children = vec![self.native_tree()];
         }
@@ -179,6 +185,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             if self.builder.is_some() && self.items == 0 {
                 self.build_menu();
                 tree.state.downcast_mut::<MenuItems>().count = self.items;
+                tree.state.downcast_mut::<MenuItems>().width = self.width;
                 tree.children = vec![self.native_tree()];
             }
             self.native.diff(&mut tree.children[0]);
@@ -272,7 +279,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // keep the popup inside the window, including clicks near its center
         // where neither side of a point anchor has enough room.
         let anchor = tree.state.downcast_ref::<MenuItems>().anchor;
-        let menu_width = 240.0;
+        let menu_width = f32::from(self.width).min(viewport.width);
         // A scrollable may supply only its clipped viewport. Its right edge
         // is in window space just like the anchor; its width alone is not.
         let right = viewport.x + viewport.width;
@@ -311,6 +318,56 @@ mod tests {
         type Message = ();
 
         fn message(&self) {}
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct RowAction(usize);
+    impl widget::menu::Action for RowAction {
+        type Message = usize;
+        fn message(&self) -> usize { self.0 }
+    }
+
+    #[test]
+    fn tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge() {
+        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(Renderer::new(cosmic::iced::Font::default(), cosmic::iced::Pixels(14.0), Some("tiny-skia"))).unwrap();
+        let window = Size::new(900.0, 900.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = Point::new(850.0, 850.0);
+        let chords = vec!["Ctrl+Alt+F5".to_owned()];
+        let bindings = menu_shortcuts([(chords.as_slice(), RowAction(39))]);
+        let hint = bindings.keys().next().unwrap().to_string();
+        let mut element = surface(widget::menu::items(&bindings,
+            (0..40).map(|index| widget::menu::Item::Button(if index == 0 { "New worktree from this branch…".into() } else { format!("Action {index}") }, None, RowAction(index))).collect()));
+        let widget = element.as_widget_mut();
+        let mut tree = Tree::new(&*widget);
+        widget.diff(&mut tree);
+        let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+        let mut messages = Vec::new();
+        widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&row), mouse::Cursor::Available(anchor), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        let mut popup = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).unwrap();
+        let node = popup.as_overlay_mut().layout(&renderer, window);
+        popup.as_overlay_mut().update(&Event::Window(window::Event::RedrawRequested(Instant::now())), Layout::new(&node), mouse::Cursor::Available(anchor), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        let node = popup.as_overlay_mut().layout(&renderer, window);
+        let menu = node.children().first().unwrap().bounds();
+        assert!(menu.x >= 0.0 && menu.x + menu.width <= window.width);
+        assert!(menu.width > 240.0, "long labels grow the shared menu beyond its old fixed width");
+        let pointer = mouse::Cursor::Available(Point::new(menu.x + 30.0, window.height - 18.0));
+        // No pointer motion is required before the first wheel event.
+        popup.as_overlay_mut().update(&Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 } }), Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        let node = popup.as_overlay_mut().layout(&renderer, window);
+        #[derive(Default)] struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) { self.0.push(text.to_owned()); }
+        }
+        let mut texts = Texts::default();
+        popup.as_overlay_mut().operate(Layout::new(&node), &renderer, &mut texts);
+        assert!(texts.0.iter().any(|text| text == &hint), "the rendered trailing action must expose its configured chord: {:?}", texts.0);
+        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
+            popup.as_overlay_mut().update(&Event::Mouse(event), Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        }
+        assert_eq!(messages, [39], "the destructive trailing item must remain reachable");
     }
 
     #[test]
@@ -434,7 +491,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_
         shell: &mut Shell<'_, Message>,
     ) {
         let press = match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => cursor.position(),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left) | mouse::Event::WheelScrolled { .. }) => cursor.position(),
             _ => None,
         };
         let mut messages = Vec::new();
