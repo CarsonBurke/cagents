@@ -807,7 +807,7 @@ fn preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree() {
     });
     assert_ne!(new, fixture.original);
     assert_eq!(
-        git_text(&fixture.root, &["rev-parse", &format!("{new}^{{tree}}")]),
+        git_text(&fixture.bare, &["rev-parse", &format!("{new}^{{tree}}")]),
         git_text(
             &fixture.root,
             &["rev-parse", &format!("{}^{{tree}}", fixture.original)]
