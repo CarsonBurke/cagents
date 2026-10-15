@@ -3,6 +3,15 @@
 use super::*;
 
 impl Runtime {
+    /// Replace only the latest matching failure row; earlier identical exits
+    /// remain part of the conversation's history.
+    pub(super) fn provider_exit_failure_index(&self) -> Option<usize> {
+        let diagnostic = self.snapshot.provider_exit.as_ref()?;
+        self.failures
+            .iter()
+            .rposition(|(_, message)| message == &diagnostic.summary)
+    }
+
     pub(super) fn provider_exit_notice(&self, message: &str) -> bool {
         self.snapshot
             .provider_exit

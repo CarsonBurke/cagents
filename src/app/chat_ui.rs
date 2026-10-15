@@ -11193,6 +11193,11 @@ mod tests {
         assert!(chat_runtime(&app, card).provider_exit_expanded);
         assert!(chat_runtime(&app, card).provider_exit_notice(&diagnostic.summary));
         assert!(!chat_runtime(&app, card).provider_exit_notice("Another failure"));
+        app.chat_runtime_mut(target).unwrap().failures = vec![
+            (Some("previous-turn".into()), diagnostic.summary.clone()),
+            (None, diagnostic.summary.clone()),
+        ];
+        assert_eq!(chat_runtime(&app, card).provider_exit_failure_index(), Some(1));
         drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
         assert!(!chat_runtime(&app, card).provider_exit_expanded);
     }
