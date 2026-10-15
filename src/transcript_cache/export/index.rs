@@ -33,6 +33,9 @@ struct Member {
     installation: Uuid, index: FileIdentity, index_locator: UnixPath,
 }
 
+fn finish<T>(value: T, deadline: Instant) -> Result<T> {
+    if Instant::now() >= deadline { Err(Error::Deadline) } else { Ok(value) }
+}
 struct Ancestors { _files: Vec<File>, identities: Vec<FileIdentity> }
 fn file_identity(file: &File) -> Result<FileIdentity> {
     let m = file.metadata()?;
@@ -161,7 +164,7 @@ impl Namespace {
         home.atomic(OsStr::new(POINTER), &pointer, false)?;
         created.revalidate()?;
         drop(ancestors);
-        Ok(Self(Arc::new(Federation { dir, members, header })))
+        finish(Self(Arc::new(Federation { dir, members, header })), deadline)
     }
 
     pub(crate) fn open_existing(home_path: &Path, expected: FileIdentity, deadline: Instant) -> Result<Self> {
@@ -187,7 +190,7 @@ impl Namespace {
             return Err(Error::Incomplete("Export federation home locator changed"));
         }
         let members = dir.open_dir(OsStr::new("members"))?;
-        Ok(Self(Arc::new(Federation { dir, members, header })))
+        finish(Self(Arc::new(Federation { dir, members, header })), deadline)
     }
 
     pub(crate) fn read_admission(&self, deadline: Instant) -> Result<NamespaceRead> {
@@ -208,7 +211,7 @@ impl Namespace {
         if Directory::open(&pointer.locator.path())?.identity() != self.0.header.directory {
             return Err(Error::Incomplete("Export federation locator changed during admission"));
         }
-        Ok(NamespaceRead { namespace: self.clone(), _ancestors: ancestors, _namespace: namespace })
+        finish(NamespaceRead { namespace: self.clone(), _ancestors: ancestors, _namespace: namespace }, deadline)
     }
 
     /// A complete bounded metadata census, not a deletion permit. Every member
@@ -221,7 +224,7 @@ impl Namespace {
         for member in members { bindings.push(self.complete_member(&member, deadline)?); }
         drop(_f);
         drop(admission);
-        Ok(bindings)
+        finish(bindings, deadline)
     }
     fn complete_member(&self, member: &Member, deadline: Instant) -> Result<BindingData> {
         if member.phase != Phase::Committed { return Err(Error::Incomplete("Export federation contains an unfinished or revoked membership")); }
@@ -233,7 +236,7 @@ impl Namespace {
             || record.binding.account.home != self.0.header.home {
             return Err(Error::Incomplete("Export membership does not match its complete installation record"));
         }
-        Ok(record.binding)
+        finish(record.binding, deadline)
     }
     fn members(&self) -> Result<(Vec<Member>, usize)> {
         let mut total = 0usize;
@@ -320,7 +323,7 @@ impl InstallationIndex {
             if record.binding != binding || member.commit != record.commit || member.installation != self.header.installation || member.index != self.header.directory {
                 return Err(Error::Incomplete("Export association cannot be rebound"));
             }
-            return Ok(RegisteredBinding { admission, record: record.clone(), index: self.header.clone() });
+            return finish(RegisteredBinding { admission, record: record.clone(), index: self.header.clone() }, deadline);
         }
         if members.iter().any(|row| row.association == binding.association) { return Err(Error::Incomplete("Export federation member has no local record")); }
         if members.len() >= MAX_RECORDS || records.len() >= MAX_RECORDS { return Err(Error::Capacity); }
@@ -345,7 +348,7 @@ impl InstallationIndex {
         if Instant::now() >= deadline { return Err(Error::Deadline); }
         // Mutual commit identity plus actual N admission survives in this
         // result. It still needs an independently issued ActualStore proof.
-        Ok(RegisteredBinding { admission, record, index: self.header.clone() })
+        finish(RegisteredBinding { admission, record, index: self.header.clone() }, deadline)
     }
 }
 

@@ -63,22 +63,22 @@ pub(super) fn disposal(directory: &Path, deadline: Instant) -> Result<DisposalHo
 /// One actual Store source generation owns this descriptor. A new generation
 /// gets a NEW eventfd; the old one is never drained or reauthorized after Reset.
 /// This kernel epoch has no From<UUID/path/JSON> read-capability conversion.
-pub(super) struct RevocationEpoch { incarnation: Uuid, signal: File }
-pub(super) struct RevocationProbe { incarnation: Uuid, signal: File }
+pub(crate) struct RevocationEpoch { incarnation: Uuid, signal: File }
+pub(crate) struct RevocationProbe { incarnation: Uuid, signal: File }
 impl RevocationEpoch {
-    pub(super) fn new(incarnation: Uuid) -> Result<Self> {
+    pub(crate) fn new(incarnation: Uuid) -> Result<Self> {
         if incarnation.is_nil() { return Err(Error::InvalidMetadata("Source revocation epoch has no Store incarnation")); }
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 { return Err(io::Error::last_os_error().into()); }
         Ok(Self { incarnation, signal: unsafe { File::from_raw_fd(fd) } })
     }
-    pub(super) fn probe(&self) -> Result<RevocationProbe> {
+    pub(crate) fn probe(&self) -> Result<RevocationProbe> {
         Ok(RevocationProbe { incarnation: self.incarnation, signal: self.signal.try_clone()? })
     }
     /// MUST succeed before Reset intent/body mutation. If signaling fails the
     /// Store must refuse that mutation; an in-RAM revoked flag cannot protect a
     /// reader whose only surviving authority is this transferred kernel FD.
-    pub(super) fn revoke(&self) -> Result<()> {
+    pub(crate) fn revoke(&self) -> Result<()> {
         let one = 1u64.to_ne_bytes();
         loop {
             let result = unsafe { libc::write(self.signal.as_raw_fd(), one.as_ptr().cast(), one.len()) };
@@ -99,9 +99,9 @@ impl RevocationEpoch {
     }
 }
 impl RevocationProbe {
-    pub(super) fn incarnation(&self) -> Uuid { self.incarnation }
+    pub(crate) fn incarnation(&self) -> Uuid { self.incarnation }
     pub(super) fn duplicate_for_private_transfer(&self) -> Result<File> { Ok(self.signal.try_clone()?) }
-    pub(super) fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let mut fd = libc::pollfd { fd: self.signal.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         loop {
             let result = unsafe { libc::poll(&mut fd, 1, 0) };
