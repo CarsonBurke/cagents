@@ -1574,7 +1574,7 @@ impl Cagents {
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
-                    let window_recovery=self.publication_recovery_blocks(&target.path);
+                    let window_recovery=self.project_worktree_publication_recovery(target.project,&target.path);
                     let retained_editors = window_recovery || self.durable.cards.iter().any(|card| {
                         card.existence.is_open() && card_belongs_to(card, &target.path)
                             && (self.card_has_editor_recovery(card.id) || self.card_has_project_editor_write(card.id))
@@ -1880,7 +1880,7 @@ impl Cagents {
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
         }
-        if self.publication_recovery_blocks(&target.path) {
+        if self.project_worktree_publication_recovery(target.project,&target.path) {
             return Some("Resolve this worktree's file recovery before deleting it.".into());
         }
         if self.cards.iter().any(|(card, runtime)| {

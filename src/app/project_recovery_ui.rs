@@ -11,6 +11,9 @@ pub(super) struct State {
     checking: bool,
     locating: HashSet<ProjectId>,
     location_generations: HashMap<ProjectId,uuid::Uuid>,
+    // Refusal only: the exact unresolved window capability follows this local
+    // project through Locate. It grants no retry, filesystem or start authority.
+    relocated_recovery: HashMap<ProjectId, crate::editor::RecoveryAuthority>,
     pub(super) closing_panes: bool,
     details: HashSet<CardId>,
 }
@@ -198,15 +201,35 @@ impl Cagents {
             .map(|card| card.id)
             .collect()
     }
-    pub(super) fn project_has_publication_recovery(&self, project: ProjectId) -> bool {
-        let Some(row)=self.sidebar_model.project(project) else {return false;};
-        let roots=std::iter::once(self.project_root(row))
+    fn project_publication_recovery_roots(&self, project: ProjectId) -> HashSet<PathBuf> {
+        let Some(row)=self.sidebar_model.project(project) else {return HashSet::new();};
+        std::iter::once(self.project_root(row))
             .chain(std::iter::once(row.repository.clone()))
             .chain(row.worktrees.iter().map(|worktree|worktree.path.clone()))
             .chain(self.project_ui.checkout_roots.get(&row.repository).cloned())
             .chain(self.project_ui.primary_checkout_roots.get(&row.repository).cloned())
-            .collect::<HashSet<_>>();
-        roots.iter().any(|root|self.publication_recovery_blocks(root))
+            .collect()
+    }
+    fn capture_project_publication_recovery(&mut self, project: ProjectId) {
+        let current=self.sidebar_model.projects.iter().map(|row|row.id).collect::<HashSet<_>>();
+        self.project_recovery_ui.relocated_recovery.retain(|id,authority|current.contains(id) && !authority.is_resolved());
+        for root in self.project_publication_recovery_roots(project) {
+            let Some(authority)=self.publication_recovery_authority(&root) else {continue;};
+            let authority=self.project_recovery_ui.relocated_recovery.remove(&project)
+                .map_or_else(||authority.clone(),|previous|previous.combine(authority.clone()));
+            self.project_recovery_ui.relocated_recovery.insert(project,authority);
+        }
+    }
+    pub(super) fn project_retains_relocated_recovery(&self, project: ProjectId) -> bool {
+        self.sidebar_model.project(project).is_some()
+            && self.project_recovery_ui.relocated_recovery.get(&project).is_some_and(|authority|!authority.is_resolved())
+    }
+    pub(super) fn project_worktree_publication_recovery(&self, project: ProjectId, path: &Path) -> bool {
+        self.project_retains_relocated_recovery(project) || self.publication_recovery_blocks(path)
+    }
+    pub(super) fn project_has_publication_recovery(&self, project: ProjectId) -> bool {
+        self.project_retains_relocated_recovery(project)
+            || self.project_publication_recovery_roots(project).iter().any(|root|self.publication_recovery_blocks(root))
     }
     pub(super) fn project_has_editor_recovery(&self, project: ProjectId) -> bool {
         self.project_has_publication_recovery(project)
@@ -364,6 +387,7 @@ impl Cagents {
                 let Some(expected)=self.project_instance(id) else { self.finish_project_location(id); self.status=Some(TransientNotice::warning("Refresh Projects before verifying its location.")); return Task::none(); };
                 let root = self.project_root(project);
                 let repository=project.repository.clone();
+                self.capture_project_publication_recovery(id);
                 let generation=uuid::Uuid::new_v4();
                 self.project_recovery_ui.location_generations.insert(id,generation);
                 let relocation = Relocation {
@@ -415,6 +439,7 @@ impl Cagents {
                 }
                 let Some(expected)=self.project_instance(id) else { self.finish_project_location(id); self.status=Some(TransientNotice::warning("Refresh Projects before locating its folder.")); return Task::none(); };
                 let original_root=self.project_root(self.sidebar_model.project(id).unwrap());
+                self.capture_project_publication_recovery(id);
                 let generation=uuid::Uuid::new_v4();
                 self.project_recovery_ui.location_generations.insert(id,generation);
                 if let Some(project)=self.sidebar_model.projects.iter_mut().find(|project|project.id==id) { project.reloading=true; }
@@ -562,13 +587,13 @@ impl Cagents {
                         if model.identity == self.workspace_model.identity
                             && model.sequence < self.workspace_model.sequence
                         {
-                            return self.apply_project_relocation(&relocation);
+                            return self.apply_project_relocation_retained(&relocation);
                         }
                         self.workspace_model = model;
                         let relocated = if relocation.verification_only() {
                             Task::none()
                         } else {
-                            self.apply_project_relocation(&relocation)
+                            self.apply_project_relocation_retained(&relocation)
                         };
                         let refused = self
                             .project_cards(id)
@@ -786,6 +811,15 @@ impl Cagents {
     }
 
     pub(super) fn apply_project_relocation(&mut self, relocation: &Relocation) -> Task<Message> {
+        // A peer/watch transition has no local chooser intake. Capture its
+        // currently attributed capability before changing any logical roots.
+        if let Some(id)=self.sidebar_model.projects.iter().find(|row|row.repository==relocation.repository).map(|row|row.id) {
+            self.capture_project_publication_recovery(id);
+        }
+        self.apply_project_relocation_retained(relocation)
+    }
+
+    fn apply_project_relocation_retained(&mut self, relocation: &Relocation) -> Task<Message> {
         if relocation.verification_only() {
             return Task::none();
         }
@@ -979,6 +1013,51 @@ mod tests {
         app.workspace_model.projects.push(crate::workspace_model::ModelProject{repository:root.to_owned(),checkout:None,primary_checkout:None,name:"Fixture".into(),kind:ProjectKind::Folder,ordinal:1});
         (app, id)
     }
+    #[tokio::test]
+    async fn locate_keeps_only_its_original_window_recovery_until_exact_resolution() {
+        let fixture=tempfile::tempdir().unwrap();
+        let old=fixture.path().join("original");let moved=fixture.path().join("moved");
+        let other_root=fixture.path().join("other");
+        std::fs::create_dir(&old).unwrap();std::fs::create_dir(&other_root).unwrap();
+        let (mut app,project)=app(&old);
+        let other=ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(other,RepositoryId::new(),"Other".into(),other_root.clone(),Vec::new(),Vec::new()).with_kind(ProjectKind::Folder));
+        let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("original pinned file operation".into(),||Ok(()));
+        let failure=crate::editor_workspace_edit::PublicationFailure {message:"original cleanup still owns files".into(),recovery:Some(authority.clone()),worktree:Some(old.clone())};
+        drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:999,result:Err(failure)})));
+        // Exercise actual chooser intake; dropping its Task avoids opening a
+        // native dialog. The capture precedes any asynchronous location work.
+        let expected=app.project_instance(project).unwrap();
+        drop(app.update_project_recovery(Action::Command(project,ProjectRecoveryAction::Locate)));
+        let generation=app.project_recovery_ui.location_generations[&project];
+        assert!(app.project_retains_relocated_recovery(project));
+        std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
+        let later=crate::editor::RecoverySlot::reserve().unwrap().retain("later operation at the reused old name".into(),||Ok(()));
+        let failure=crate::editor_workspace_edit::PublicationFailure {message:"different retained operation".into(),recovery:Some(later.clone()),worktree:Some(old.clone())};
+        drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:1000,result:Err(failure)})));
+        let relocation=Relocation {repository:old.clone(),destination:moved.clone(),old_root:old.clone(),new_root:moved.clone()};
+        // Local Applied uses its original intake, not a fresh old-path query.
+        let mut model=app.workspace_model.clone();model.sequence+=1;
+        model.projects[0].repository=moved.clone();
+        drop(app.update_project_recovery(Action::Applied(project,expected,generation,relocation.clone(),Ok(model))));
+        assert_eq!(app.project_root(app.sidebar_model.project(project).unwrap()),moved);
+        assert!(app.project_has_editor_recovery(project));assert!(!app.project_has_editor_recovery(other));
+        assert!(app.project_worktree_publication_recovery(project,&relocation.new_root));
+        assert!(!app.project_worktree_publication_recovery(other,&other_root));
+        assert_eq!(app.project_recovery_ui.relocated_recovery[&project],authority);
+        let worker=authority.clone();tokio::task::spawn_blocking(move||worker.retry()).await.unwrap().unwrap();
+        assert!(authority.is_resolved());assert!(!later.is_resolved());
+        assert!(!app.project_has_publication_recovery(project),"later old-name recovery cannot inherit the original project's marker");
+        assert!(!app.project_worktree_publication_recovery(project,&relocation.new_root));
+        assert!(app.publication_recovery_blocks(&old));
+        // A project created after Locate has no marker, even if its repository
+        // spelling matches the moved display root. No authority is transferred.
+        let replacement=ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(replacement,RepositoryId::new(),"Replacement".into(),relocation.new_root,Vec::new(),Vec::new()).with_kind(ProjectKind::Folder));
+        assert!(!app.project_retains_relocated_recovery(replacement));
+        let worker=later.clone();tokio::task::spawn_blocking(move||worker.retry()).await.unwrap().unwrap();
+    }
+
     #[test]
     fn reconnect_follows_non_reused_project_identity_even_when_old_path_is_reopened() {
         let old = Path::new("/old/project");
