@@ -1047,7 +1047,6 @@ pub fn save_file(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     save_file_with_hooks(
         worktree,
         relative_path,
@@ -1069,16 +1068,25 @@ pub(crate) fn save_file_at(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    // The workspace planner retains its cleanup protection with this Root
-    // from preparation through rollback, even if the directory is renamed.
-    save_file_at_with_hooks(
-        root,
-        relative_path,
-        text,
-        expected_disk_hash,
-        overwrite,
-        || Ok(()),
-        fs_safety::sync_directory,
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
+    );
+    let context = recovery_context_at(root, protection)?;
+    save_file_at_in_context(root, relative_path, text, expected_disk_hash, overwrite, &context)
+}
+
+/// Retains the caller's original cleanup lease with any unresolved publication.
+pub(crate) fn save_file_at_in_context(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &RecoveryContext,
+) -> Result<SaveOutcome, FileIoError> {
+    save_file_at_with_hooks_in_context(
+        root, relative_path, text, expected_disk_hash, overwrite,
+        || Ok(()), fs_safety::sync_directory, context,
     )
 }
 
@@ -1092,8 +1100,12 @@ fn save_file_with_hooks(
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(worktree).map_err(io_error)?
+    );
     let root = worktree_root(worktree)?;
-    save_file_at_with_hooks(
+    let context = recovery_context_at(&root, protection)?;
+    save_file_at_with_hooks_in_context(
         &root,
         relative_path,
         text,
@@ -1101,6 +1113,7 @@ fn save_file_with_hooks(
         overwrite,
         before_publish,
         sync_parent,
+        &context,
     )
 }
 
@@ -1112,6 +1125,24 @@ pub(crate) fn save_file_at_with_hooks(
     overwrite: bool,
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<SaveOutcome, FileIoError> {
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
+    );
+    let context = recovery_context_at(root, protection)?;
+    save_file_at_with_hooks_in_context(root, relative_path, text, expected_disk_hash,
+        overwrite, before_publish, sync_parent, &context)
+}
+
+pub(crate) fn save_file_at_with_hooks_in_context(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    context: &RecoveryContext,
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
     let (parent, name) =
@@ -1167,6 +1198,7 @@ pub(crate) fn save_file_at_with_hooks(
         text.as_bytes(),
         metadata.permissions(),
         &baseline,
+        context,
         before_publish,
         sync_parent,
     )?;
@@ -1888,6 +1920,7 @@ mod tests {
             b"after",
             source.permissions(),
             &SaveBaseline::capture(&foreign, None).unwrap(),
+            &RecoveryContext::with_guard((), 0).unwrap(),
             || Ok(()),
             fs_safety::sync_directory,
         );

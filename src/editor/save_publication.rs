@@ -174,8 +174,8 @@ struct Holding {
     files: Vec<File>,
 }
 impl Holding {
-    fn create(parent: &Root, source: &File) -> Result<Self, FileIoError> {
-        let slot = RecoverySlot::reserve().map_err(FileIoError::Io)?;
+    fn create(parent: &Root, source: &File, context: &RecoveryContext) -> Result<Self, FileIoError> {
+        let slot = context.reserve().map_err(FileIoError::Io)?;
         let retained_parent = parent.try_clone().map_err(io_error)?;
         // Duplicate the authenticated source BEFORE mkdir/acquisition. Even a
         // later verification error keeps this inode pinned in the result.
@@ -324,6 +324,7 @@ pub(super) fn publish_replacement(
     bytes: &[u8],
     permissions: Permissions,
     baseline: &SaveBaseline,
+    context: &RecoveryContext,
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
@@ -334,6 +335,7 @@ pub(super) fn publish_replacement(
         bytes,
         permissions,
         baseline,
+        context,
         before_publish,
         |_, _| Ok(()),
         |_, _| Ok(()),
@@ -348,12 +350,13 @@ fn publish_with_hooks(
     bytes: &[u8],
     permissions: Permissions,
     baseline: &SaveBaseline,
+    context: &RecoveryContext,
     before_publish: impl FnOnce() -> io::Result<()>,
     after_acquire: impl FnOnce(&Root, &Root) -> io::Result<()>,
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    let mut holding = Holding::create(parent, destination)?;
+    let mut holding = Holding::create(parent, destination, context)?;
     let result = publish_in_holding(
         &mut holding,
         parent,
@@ -670,6 +673,7 @@ mod tests {
             b"mine",
             source.metadata().unwrap().permissions(),
             &baseline,
+            &RecoveryContext::with_guard((), 0).unwrap(),
             || Ok(()),
             after_acquire,
             after_publish,
@@ -727,6 +731,7 @@ mod tests {
             b"mine",
             source.metadata().unwrap().permissions(),
             &baseline,
+            &RecoveryContext::with_guard((), 0).unwrap(),
             || Ok(()),
             |_, private| {
                 let path = private.path().join("previous");
@@ -943,11 +948,36 @@ mod tests {
     }
 
     #[test]
+    fn save_acquisition_unresolved_holding_retains_original_context_until_resolution() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let context = RecoveryContext::with_guard(Guard(dropped.clone()), 0).unwrap();
+        let (_directory, root) = fixture();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let holding = Holding::create(&root, &source, &context).unwrap();
+        let private_path = holding.root.path().to_owned();
+        fs::write(private_path.join("unresolved"), b"retained").unwrap();
+        let authority = holding.retain();
+        drop(context);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(authority.retry().is_err());
+        assert!(!dropped.load(Ordering::Acquire));
+        fs::remove_file(private_path.join("unresolved")).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn save_acquisition_recovery_keeps_authenticated_file_descriptors_until_actual_resolution() {
         use std::os::fd::AsRawFd;
         let (dir, root) = fixture();
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
-        let holding = Holding::create(&root, &source).unwrap();
+        let holding = Holding::create(&root, &source, &RecoveryContext::with_guard((), 0).unwrap()).unwrap();
         let descriptor = holding.files[0].as_raw_fd();
         let expected = source.metadata().unwrap();
         let expected = (expected.dev(), expected.ino());
