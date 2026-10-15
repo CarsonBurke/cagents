@@ -273,19 +273,17 @@ impl Handle {
         let directory_identity = if let Some(physical_directory)=physical_directory {
             spec.working_directory = physical_directory;
             if spec.execution.is_none() {
-                let directory = std::fs::File::open(&spec.working_directory)
-                    .map_err(|error| format!("Cannot pin provider execution directory: {error}"))?;
-                spec.execution = Some(Arc::new(super::protocol::ExecutionContext::new(Some(Arc::new(directory)))));
+                spec.execution = Some(Arc::new(super::protocol::ExecutionContext::capture(&spec.working_directory)?));
             }
             let context = spec.execution.as_ref().unwrap();
             context.verify_directory(&spec.working_directory)?;
-            if scope_observed {context.directory.as_ref().map(|directory|directory.metadata()
+            if scope_observed {context.directory_descriptor().as_ref().map(|directory|directory.metadata()
                 .map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)))
                 .transpose().map_err(|error|error.to_string())?} else {None}
         } else { None };
         // Keep the admitted inode alive even after the actor completes. Numeric
         // identities alone can be recycled after a directory is removed.
-        let close_directory=if scope_observed {spec.execution.as_ref().and_then(|context|context.directory.clone())} else {None};
+        let close_directory=if scope_observed {spec.execution.as_ref().and_then(|context|context.directory_descriptor())} else {None};
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -1410,7 +1408,7 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if let Some(directory) = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .and_then(|context| context.directory_descriptor())
     {
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
@@ -1724,10 +1722,13 @@ impl Actor {
     fn record_execution_directory(&mut self,directory:&std::path::Path) {
         let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        let pinned=self.launch_context.as_ref().and_then(|context|context.directory.clone());
+        let pinned=self.launch_context.as_ref()
+            .filter(|context|context.provider_directory_observed(directory).unwrap_or(false))
+            .and_then(|context|context.directory_descriptor());
         let identity=pinned.as_ref().and_then(|pinned|pinned.metadata().ok()).map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata));
-        if close.working_directory!=directory || close.directory_identity!=identity {
-            close.working_directory=directory.into();
+        let observed_directory=if identity.is_some() {directory.to_path_buf()} else {Default::default()};
+        if close.working_directory!=observed_directory || close.directory_identity!=identity {
+            close.working_directory=observed_directory;
             close.directory_identity=identity;
             close._directory=pinned;
             close.revision=close.revision.saturating_add(1);

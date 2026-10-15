@@ -22,16 +22,13 @@ pub(super) fn prepare(issued: &Launch, supplied: Option<Arc<ExecutionContext>>) 
     let context = match supplied {
         Some(context) => {
             context.verify_directory(&physical).map_err(unavailable)?;
-            if context.directory.is_none() {
+            if context.directory_descriptor().is_none() {
                 return Err(unavailable("Native preparation requires the original approved directory descriptor"));
             }
             context
         }
         None => {
-            let directory = std::fs::File::open(&physical).map_err(|error| unavailable(error.to_string()))?;
-            let context = Arc::new(ExecutionContext::new(Some(Arc::new(directory))));
-            context.verify_directory(&physical).map_err(unavailable)?;
-            context
+            Arc::new(ExecutionContext::capture(&physical).map_err(unavailable)?)
         }
     };
     launch.recipe.working_directory = physical;

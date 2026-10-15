@@ -94,12 +94,49 @@ struct LaunchOwnership {
 #[derive(Default)]
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
+    owned_directory: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
     provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let directory = if relative.as_os_str().is_empty() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")
+                .map_err(|error| error.to_string())
+        } else {
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin the selected provider directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if !directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            return Err("The selected provider directory is not a folder".into());
+        }
+        let context = Self::new(Some(std::sync::Arc::new(directory)));
+        context.verify_directory(path)?;
+        Ok(context)
+    }
+
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
@@ -115,7 +152,7 @@ impl ExecutionContext {
     pub(crate) fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
-        match &self.directory {
+        match self.directory_descriptor() {
             Some(directory) => directory
                 .metadata()
                 .map(|metadata| {
@@ -126,6 +163,50 @@ impl ExecutionContext {
                 .map_err(|error| error.to_string()),
             None => Ok(self.expected_directory),
         }
+    }
+    pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.directory.clone().or_else(|| {
+            self.owned_directory
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        })
+    }
+    /// Only positive owned-process cwd evidence may add a legacy pin. Keep
+    /// this same shared context so its launch cleanup/ownership stays intact.
+    pub(crate) fn pin_owned_directory(
+        &self,
+        directory: std::sync::Arc<std::fs::File>,
+    ) -> Result<(), String> {
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        );
+        if self
+            .directory_identity()?
+            .is_some_and(|approved| approved != identity)
+        {
+            return Err(
+                "The owned process directory differs from its approved launch identity".into(),
+            );
+        }
+        // A fresh launch already retains this exact inode. Avoid adding a
+        // second long-lived descriptor merely because Locate verified it.
+        if self.directory.is_some() {
+            return Ok(());
+        }
+        let mut pinned = self
+            .owned_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = pinned.as_ref()
+            && crate::agent_execution::DirectoryIdentity::from_metadata(
+                &previous.metadata().map_err(|error| error.to_string())?,
+            ) != identity
+        {
+            return Err("The approved process directory changed during capture".into());
+        }
+        *pinned = Some(directory);
+        Ok(())
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
@@ -176,7 +257,7 @@ impl ExecutionContext {
     /// updated the adapter before initialize. A process cwd alone is no proof
     /// of a resumed provider thread's operational directory.
     pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
-        if self.directory.is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
+        if self.directory_descriptor().is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
         self.verify_directory(path)?;
         *self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()) = Some(path.to_owned());
         Ok(())
