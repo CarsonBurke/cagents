@@ -11189,15 +11189,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            self.ensure_managed_directory_ignored(
-                &journal.request.repository,
-                journal
-                    .request
-                    .managed_ignore_root
-                    .as_deref()
-                    .unwrap_or(&journal.request.destination),
-                cancellation,
-            )?;
+            self.ensure_creation_destination_ignored(&journal.request, cancellation)?;
             self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;

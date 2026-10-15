@@ -69,10 +69,42 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         managed_root: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), RepositoryError> {
-        use std::io::Write;
-        use std::os::unix::ffi::OsStrExt;
-        let managed = canonical_managed_directory(managed_root)
+        self.ensure_managed_directory_or_destination_ignored(
+            repository,
+            managed_root,
+            None,
+            cancellation,
+        )
+    }
+
+    pub(super) fn ensure_creation_destination_ignored(
+        &self,
+        request: &CreateWorktreeRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        self.ensure_managed_directory_or_destination_ignored(
+            &request.repository,
+            request
+                .managed_ignore_root
+                .as_deref()
+                .unwrap_or(&request.destination),
+            Some(&request.destination),
+            cancellation,
+        )
+    }
+
+    fn ensure_managed_directory_or_destination_ignored(
+        &self,
+        repository: &Path,
+        managed_root: &Path,
+        destination: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        let mut managed = canonical_managed_directory(managed_root)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
+        // The destination determines which checkout's status must exclude it.
+        // A configured parent can be that checkout itself, or lie outside it.
+        let placement = destination.unwrap_or(&managed);
         let mut checkout: Option<PathBuf> = None;
         // A project/device can be opened at a linked checkout, including one
         // outside the primary. Common exclude patterns are relative to EACH
@@ -82,7 +114,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .iter()
             .skip(1)
         {
-            if record.bare || !managed.starts_with(&record.path) {
+            if record.bare || !placement.starts_with(&record.path) {
                 continue;
             }
             if checkout.as_ref().is_none_or(|current| {
@@ -106,13 +138,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if checkout.is_none() {
             checkout = self
                 .managed_primary_checkout(repository, cancellation)?
-                .filter(|path| managed.starts_with(path));
+                .filter(|path| placement.starts_with(path));
         }
         let Some(primary) = checkout else {
             return Ok(());
         };
+        if let Some(destination) = destination {
+            if managed == primary || !managed.starts_with(&primary) {
+                // Never hide a whole checkout or a shared ancestor. Keep the
+                // valid location and exclude only this operation's child.
+                managed = destination.to_owned();
+            }
+        }
+        self.ensure_managed_directory_in_checkout_ignored(
+            repository,
+            &primary,
+            &managed,
+            cancellation,
+        )
+    }
+
+    fn ensure_managed_directory_in_checkout_ignored(
+        &self,
+        repository: &Path,
+        primary: &Path,
+        managed: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         let relative = managed
-            .strip_prefix(&primary)
+            .strip_prefix(primary)
             .map_err(|_| ValidationError::DestinationOutsideRoot)?;
         if relative.as_os_str().is_empty() {
             return Err(ValidationError::Io(
@@ -123,7 +179,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut directory = relative.as_os_str().to_owned();
         directory.push("/");
         let check = self.git_read(
-            &primary,
+            primary,
             [
                 OsString::from("check-ignore"),
                 "--quiet".into(),
@@ -244,9 +300,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .list_worktrees(repository, cancellation)?
             .iter()
             .skip(1)
-            .any(|record| record.path.starts_with(&legacy))
+            .any(|record| record.path != legacy && record.path.starts_with(&legacy))
         {
-            self.ensure_managed_directory_ignored(repository, &legacy, cancellation)?;
+            let legacy = canonical_managed_directory(&legacy)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            // This is a collection relative to the known primary, even when
+            // one registered checkout happens to occupy the collection root.
+            self.ensure_managed_directory_in_checkout_ignored(
+                repository,
+                &primary,
+                &legacy,
+                cancellation,
+            )?;
         }
         Ok(())
     }
@@ -801,6 +866,96 @@ mod tests {
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
             rules
         );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn journaled_checkout_root_parents_ignore_only_created_destinations() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::journaled_checkout_root_parents_ignore_only_created_destinations"
+        )) {
+            return;
+        }
+        for variant in 0..3 {
+            let (directory, root) = fixture();
+            let service = RepositoryService::system("git");
+            let cancel = CancellationToken::new();
+            let store = StateStore::open(
+                directory.path().join("journal.sqlite3"),
+                crate::model::BootId::new("checkout-root-parent"),
+            )
+            .unwrap();
+            fs::write(root.join("unrelated.txt"), b"keep visible").unwrap();
+            let managed = match variant {
+                0 => ".".to_owned(),
+                1 => root.to_str().unwrap().to_owned(),
+                _ => "..".to_owned(),
+            };
+            // A checkout itself named worktrees is not a legacy collection.
+            // The next creation must not try to ignore its entire checkout.
+            let branches = if variant == 2 {
+                vec!["repo/ancestor-one", "repo/ancestor-two"]
+            } else {
+                vec!["worktrees", "next"]
+            };
+            for branch in branches {
+                let request = service
+                    .resolve_worktree_request(
+                        &WorktreeInput {
+                            repository: root.clone(),
+                            input: branch.into(),
+                            base: String::new(),
+                            managed_directory: managed.clone(),
+                            destination: String::new(),
+                            operation_id: OperationId::new(),
+                        },
+                        &cancel,
+                    )
+                    .unwrap();
+                let expected = root.join(branch.rsplit('/').next().unwrap());
+                assert_eq!(request.destination, expected);
+                let (send, _receive) = async_channel::bounded(8);
+                let report = service.create_worktree_journaled(&store, &request, 1, &cancel, &send);
+                assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+                assert!(expected.join(".git").is_file());
+                if variant == 0 && branch == "worktrees" {
+                    let nested = service
+                        .resolve_worktree_request(
+                            &WorktreeInput {
+                                repository: root.clone(),
+                                input: "nested-legacy".into(),
+                                base: String::new(),
+                                managed_directory: "worktrees/".into(),
+                                destination: String::new(),
+                                operation_id: OperationId::new(),
+                            },
+                            &cancel,
+                        )
+                        .unwrap();
+                    assert_eq!(nested.destination, root.join("worktrees/nested-legacy"));
+                    let report =
+                        service.create_worktree_journaled(&store, &nested, 1, &cancel, &send);
+                    assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+                }
+            }
+            assert_eq!(
+                git(&root, &["status", "--porcelain", "-uall"]),
+                b"?? unrelated.txt\n"
+            );
+            assert_eq!(
+                fs::read(root.join("unrelated.txt")).unwrap(),
+                b"keep visible"
+            );
+            let rules = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+            assert!(!rules.lines().any(|line| line == "/"));
+            assert!(rules.lines().any(|line| line
+                == if variant == 2 {
+                    "/ancestor-one/"
+                } else {
+                    "/worktrees/"
+                }));
+        }
     }
 
     #[cfg(feature = "ui")]
