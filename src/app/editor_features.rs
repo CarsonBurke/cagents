@@ -47,6 +47,25 @@ mod tests {
         card
     }
 
+    fn sample_signature() -> LspSignatureHelp {
+        LspSignatureHelp { signatures: vec![LspSignature { label: "call(argument: i32)".into(), documentation: None, parameters: vec![LspParameter { label: "argument".into(), range: Some(5..13), documentation: None }], active_parameter: Some(0) }], active_signature: 0, active_parameter: Some(0) }
+    }
+
+    fn signature_fixture(root: &Path) -> (Cagents, CardId, LspDocumentId) {
+        let path = root.join("call.rs");
+        std::fs::write(&path, "call(").unwrap();
+        let mut app = app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = buffer(&mut app, root, "call.rs", "call(");
+        let doc = LspDocumentId(44);
+        app.lsp_documents.insert(doc, card);
+        app.lsp_contexts.entry(card).or_default().document = Some(doc);
+        let language = app.lsp.language_for(&path).unwrap();
+        // Pending discovery is never applied, so no server process launches.
+        app.lsp.open(doc, &path, root, language, 1, "call(");
+        (app, card, doc)
+    }
+
     fn operation(app: &Cagents, card: CardId) -> Operation {
         Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
     }
@@ -250,16 +269,7 @@ mod tests {
     #[tokio::test]
     async fn signature_response_after_caret_movement_cannot_reopen_the_old_call() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("call.rs");
-        std::fs::write(&path, "call(").unwrap();
-        let mut app = app();
-        app.lsp = LspManager::new(AppSettings::default().language_servers);
-        let card = buffer(&mut app, root.path(), "call.rs", "call(");
-        let doc = LspDocumentId(44);
-        app.lsp_documents.insert(doc, card);
-        app.lsp_contexts.entry(card).or_default().document = Some(doc);
-        let language = app.lsp.language_for(&path).unwrap();
-        app.lsp.open(doc, &path, root.path(), language, 1, "call(");
+        let (mut app, card, doc) = signature_fixture(root.path());
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             drop(runtime.take_lsp_intents());
             runtime.set_lsp_document(Some(doc));
@@ -268,25 +278,34 @@ mod tests {
         drop(app.update_editor_features(Action::Signature(card, None)));
         let (request, _) = app.editor_features.signature_requests[&card];
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 0)); }
-        drop(app.editor_feature_event(&LspEvent::SignatureHelp { request, doc, help: Some(LspSignatureHelp { signatures: Vec::new(), active_signature: 0, active_parameter: None }) }));
+        drop(app.editor_feature_event(&LspEvent::SignatureHelp { request, doc, help: Some(sample_signature()) }));
         assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_signature_visible()));
         assert!(!app.editor_features.signature_requests.contains_key(&card));
     }
 
     #[tokio::test]
+    async fn empty_signature_response_clears_visible_help_and_retrigger_context() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, card, doc) = signature_fixture(root.path());
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            drop(runtime.take_lsp_intents());
+            runtime.set_lsp_document(Some(doc));
+            runtime.move_cursor_to(LspPosition::new(0, 5));
+            runtime.set_editor_signature(Some(sample_signature()));
+            assert!(runtime.editor_signature_visible());
+        }
+        drop(app.update_editor_features(Action::Signature(card, None)));
+        let (request, _) = app.editor_features.signature_requests[&card];
+        drop(app.editor_feature_event(&LspEvent::SignatureHelp { request, doc, help: Some(LspSignatureHelp { signatures: Vec::new(), active_signature: 0, active_parameter: None }) }));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_signature_visible() && runtime.editor_signature_help().is_none()));
+        assert!(!app.editor_features.signatures.contains(&card));
+    }
+
+    #[tokio::test]
     async fn application_change_drain_keeps_signature_until_close_character_or_undo() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("call.rs");
-        std::fs::write(&path, "call(").unwrap();
-        let mut app = app();
-        app.lsp = LspManager::new(AppSettings::default().language_servers);
-        let card = buffer(&mut app, root.path(), "call.rs", "call(");
-        let doc = LspDocumentId(44);
-        app.lsp_documents.insert(doc, card);
-        app.lsp_contexts.entry(card).or_default().document = Some(doc);
-        let language = app.lsp.language_for(&path).unwrap();
-        app.lsp.open(doc, &path, root.path(), language, 1, "call(");
-        let help = LspSignatureHelp { signatures: Vec::new(), active_signature: 0, active_parameter: None };
+        let (mut app, card, doc) = signature_fixture(root.path());
+        let help = sample_signature();
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             drop(runtime.take_lsp_intents());
             runtime.set_lsp_document(Some(doc));
@@ -599,7 +618,7 @@ impl Cagents {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 let expected = self.editor_features.signature_requests.remove(&operation.card);
                 if !self.editor_operation_current(&operation) || expected.is_none_or(|(expected, at)| expected != *request || !matches!(self.cards.get(&operation.card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at))) { return Some(Task::none()); }
-                if help.is_some() { self.editor_features.signatures.insert(operation.card); } else { self.editor_features.signatures.remove(&operation.card); }
+                if help.as_ref().is_some_and(|help| help.signatures.get(help.active_signature).is_some()) { self.editor_features.signatures.insert(operation.card); } else { self.editor_features.signatures.remove(&operation.card); }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_signature(help.clone()); }
                 Some(Task::none())
             }

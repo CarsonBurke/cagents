@@ -3095,9 +3095,11 @@ impl RepositoryRuntime {
         self.language.hover.clear();
     }
     pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
-    pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) { self.language.signature = signature; }
-    pub fn editor_signature_visible(&self) -> bool { self.language.signature.is_some() }
-    pub fn editor_signature_help(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref() }
+    pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) {
+        self.language.signature = signature.filter(|help| help.signatures.get(help.active_signature).is_some());
+    }
+    pub fn editor_signature_visible(&self) -> bool { self.editor_signature_help().is_some() }
+    pub fn editor_signature_help(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref().filter(|help| help.signatures.get(help.active_signature).is_some()) }
     pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
     pub fn rename_focus_id(card: CardId) -> widget::Id { widget::Id::new(format!("editor.rename.{card}")) }
 
