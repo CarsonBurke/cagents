@@ -467,11 +467,18 @@ impl Claude {
     }
 
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
-        let mut expired = self.expire_controls(std::time::Instant::now());
+        let now = std::time::Instant::now();
         let interrupt = string(&request, "subtype") == "interrupt";
-        if !interrupt && self.controls.len() >= MAX_PENDING {
+        // Refusal must not consume expired semantic outcomes and discard their
+        // Step. Leave those entries for tick() unless this call can return the
+        // expiry events together with its admitted request.
+        let active = self.controls.keys().filter(|id| {
+            self.control_deadlines.get(*id).is_none_or(|deadline| *deadline > now)
+        }).count();
+        if !interrupt && active >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
         }
+        let mut expired = self.expire_controls(now);
         let id = uuid::Uuid::new_v4().to_string();
         // Repeated interrupts supersede an unanswered interrupt, keeping the
         // emergency lane bounded without letting ordinary requests block it.
@@ -5533,6 +5540,34 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn refused_control_keeps_expired_old_turn_proof_for_the_runtime_tick() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let old = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
+        let mut started = Step::default();
+        adapter.start_turn(&mut started);
+        adapter.busy = true;
+        let now = std::time::Instant::now();
+        adapter.control_deadlines.insert(old.clone(), now - std::time::Duration::from_secs(1));
+        for index in 0..MAX_PENDING {
+            let id = format!("active-normal-{index}");
+            adapter.controls.insert(id.clone(), json!({"subtype":"get_settings"}));
+            adapter.control_deadlines.insert(id, now + std::time::Duration::from_secs(60));
+        }
+        assert!(adapter.control(json!({"subtype":"get_settings"})).is_err());
+        assert!(adapter.controls.contains_key(&old));
+        assert_eq!(adapter.deferred_attention.len(), 1,
+            "an ordinary refusal cannot discard an old turn's native terminal evidence");
+        let tick = adapter.tick();
+        assert!(tick.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:A")));
+        assert!(!tick.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
+        assert!(adapter.busy, "the new current turn must remain active");
     }
 
     #[test]
