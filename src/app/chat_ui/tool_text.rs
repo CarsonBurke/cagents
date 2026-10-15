@@ -315,8 +315,8 @@ impl ToolText {
             step::GAP_S,
             step::GAP_M,
         ])))
-        .width(Length::Shrink)
-        .min_width(previous_width);
+        .width(Length::Shrink);
+        let body = scroll::minimum_width(body, previous_width);
         let mut horizontal = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
             .width(Length::Fill);
