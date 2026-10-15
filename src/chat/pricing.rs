@@ -13,6 +13,7 @@ pub struct CostEstimate {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "host", test))]
 pub(crate) struct Tokens {
     pub input: u64,
     pub cached_input: u64,
@@ -20,6 +21,7 @@ pub(crate) struct Tokens {
     /// Includes reasoning output; do not add reasoning tokens a second time.
     pub output: u64,
 }
+#[cfg(any(feature = "host", test))]
 impl Tokens {
     fn difference(self, old: Self) -> Option<Self> {
         Some(Self {
@@ -35,12 +37,14 @@ impl Tokens {
 }
 
 /// Rates in 1/10,000 microdollars per token, keeping fractions until presentation.
+#[cfg(any(feature = "host", test))]
 struct Rates {
     input: u64,
     cached: u64,
     write: u64,
     output: u64,
 }
+#[cfg(any(feature = "host", test))]
 fn rates(model: &str, tier: Option<&str>, long: bool) -> Option<Rates> {
     // Recognize dated snapshots without treating arbitrary model suffixes as aliases.
     let model = if model.len() > 11 && model.as_bytes()[model.len() - 11] == b'-' {
@@ -91,6 +95,7 @@ fn rates(model: &str, tier: Option<&str>, long: bool) -> Option<Rates> {
         output: output * numerator / denominator * if long { 3 } else { 2 } / 2,
     })
 }
+#[cfg(any(feature = "host", test))]
 fn cost(tokens: Tokens, rates: Rates) -> Option<u128> {
     let ordinary = tokens
         .input
@@ -107,12 +112,14 @@ fn cost(tokens: Tokens, rates: Rates) -> Option<u128> {
 /// Cumulative usage notifications may repeat; charge only their increments at
 /// the model/tier that ran that request. Never reprice earlier turns on a toggle.
 #[derive(Debug, Default)]
+#[cfg(any(feature = "host", test))]
 pub(crate) struct CostTracker {
     previous: Option<Tokens>,
     units: u128,
     priced: bool,
     partial: bool,
 }
+#[cfg(any(feature = "host", test))]
 impl CostTracker {
     pub fn update(
         &mut self,

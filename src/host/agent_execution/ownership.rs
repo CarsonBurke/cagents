@@ -78,6 +78,7 @@ pub(in crate::host) fn interactive(
 /// Reconcile only the exact finished firing inspected by the scheduler. A
 /// later run or interactive ownership change invalidates that receipt. A close
 /// is reported only after normal synchronous teardown (or its durable receipt).
+#[cfg(test)]
 pub(in crate::host) fn reconcile_agent_run(
     host: &SharedHost,
     expected: &Run,
@@ -180,6 +181,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
 
 /// Explicit scheduler cancellation targets a provider-confirmed RunId, never
 /// whichever turn happens to be active when its interrupt reaches the actor.
+#[cfg(test)]
 pub(in crate::host) fn cancel_agent_run(host: &SharedHost, expected: &Run) -> Result<(), String> {
     let control = host
         .lock()

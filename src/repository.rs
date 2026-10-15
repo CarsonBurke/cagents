@@ -20,7 +20,9 @@ use std::{
 
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
-use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};
+#[cfg(feature = "ui")]
+use crate::persistence::PendingOperation;
+use crate::persistence::{PendingOperationStatus, StateStore, StoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -37,10 +39,9 @@ use std::{
 
 #[cfg(test)]
 use crate::process::WaitEvent;
-pub(crate) use crate::process::{
-    CLEANUP_GRACE, DEFAULT_STDERR_LIMIT, SIGKILL, SIGTERM, TERMINATION_GRACE, process_failure,
-    signal_process_group,
-};
+pub(crate) use crate::process::{CLEANUP_GRACE, DEFAULT_STDERR_LIMIT, process_failure};
+#[cfg(any(feature = "ui", test))]
+pub(crate) use crate::process::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_group};
 pub use crate::process::{
     CancellationToken, CommandSpec, FAILURE_DETAIL_LIMIT, ProcessExecutor, ProcessFailure,
     ProcessFailureKind, ProcessOutput, SystemProcessExecutor,
@@ -10519,6 +10520,7 @@ struct WorktreeJournal {
     detail: String,
 }
 
+#[cfg(feature = "ui")]
 fn operation_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10634,6 +10636,7 @@ fn canonical_future_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(any(feature = "ui", test))]
 fn worktree_lease(path: &Path, create: bool) -> io::Result<fs::File> {
     worktree_lease_with_grace(path, create, Duration::ZERO)
 }
@@ -11184,6 +11187,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         finish_worktree_journal(store, &journal, &payload, created_at, &emit)
     }
 
+    #[cfg(any(feature = "ui", test))]
     fn prepare_worktree_journal(
         &self,
         request: &CreateWorktreeRequest,
@@ -11416,6 +11420,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
+    #[cfg(any(feature = "ui", test))]
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
         let cleanup = (|| -> Result<(), RepositoryError> {
             let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)

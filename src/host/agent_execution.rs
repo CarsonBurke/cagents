@@ -22,9 +22,10 @@ mod directory;
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod terminals;
+#[cfg(test)]
+pub(super) use ownership::{cancel_agent_run, reconcile_agent_run};
 pub(super) use ownership::{
-    Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
-    reconcile_agent_run, reconcile_agent_run_under_control,
+    Reconciliation, cancel_agent_run_under_control, interactive, reconcile_agent_run_under_control,
 };
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns

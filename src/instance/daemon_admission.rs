@@ -76,6 +76,7 @@ fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn compatible_window(window: &VerifiedWindow) -> io::Result<()> {
     if !window.still_owns_lease()? {
         return Err(io::Error::other(
@@ -250,10 +251,12 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct DaemonAdmissionGuard {
     _launch: LaunchFence,
     _legacy: OwnedLock,
 }
+#[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
     pub(crate) fn acquire() -> io::Result<Self> {
         let launch = if let Some((file, descriptor)) = inherited_fence()? {
@@ -276,6 +279,7 @@ impl DaemonAdmissionGuard {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn upgrade_fence(file: &File) -> io::Result<()> {
     // An SH→EX conversion is NOT atomic. On failure Linux can drop the
     // parent's SH lock: return immediately, before any startup mutation.
@@ -288,6 +292,7 @@ fn upgrade_fence(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
     let legacy = owned_lock(
         &runtime.join(APPLICATION_LOCK_FILE),

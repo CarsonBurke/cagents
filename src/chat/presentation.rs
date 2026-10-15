@@ -50,6 +50,7 @@ fn body_mut(content: &mut ItemContent) -> Option<&mut String> {
     }
 }
 impl ItemChange {
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn between(previous: Option<&Item>, current: &Item) -> Self {
         if let Some(previous) = previous
             && let (Some(old), Some(new)) = (body(&previous.content), body(&current.content))

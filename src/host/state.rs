@@ -1245,6 +1245,7 @@ impl HostState {
             .clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn focus_handle(
         &self,
         client_id: ClientId,
@@ -1289,6 +1290,7 @@ impl HostState {
     /// resize, a detached capture, or a first request falls back to a full
     /// repaint. The base is recorded before returning, so the diff for the next
     /// repaint is a pointer scan over the row list.
+    #[cfg(test)]
     pub(crate) fn snapshot(
         &mut self,
         client_id: ClientId,

@@ -546,6 +546,7 @@ impl Registry {
     /// Invoked only after holder authentication and a successful adoption of
     /// this exact retained source. This CAS rotates only host proof, retaining
     /// the capability already inherited by the surviving process and tools.
+    #[cfg(test)]
     pub(crate) fn adopt_agent_authority(
         &mut self,
         source: &HostedSession,
@@ -589,6 +590,7 @@ impl Registry {
 
     /// Only an actual newly spawned session or a proved exact reattachment can
     /// call this. The token never appears in `Agent` or its public descriptor.
+    #[cfg(test)]
     pub(crate) fn register_agent_authority(
         &mut self,
         session: &HostedSession,

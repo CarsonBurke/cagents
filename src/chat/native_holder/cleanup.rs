@@ -119,6 +119,7 @@ impl Detached {
         holder.close_inner(retain)
     }
 
+    #[cfg(test)]
     pub fn consume_receipt(&self) -> Result<bool, String> {
         self.receipt(false)
     }

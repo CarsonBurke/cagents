@@ -24,8 +24,10 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(feature = "host")]
+pub(crate) use daemon_admission::DaemonAdmissionGuard;
 pub(crate) use daemon_admission::{
-    DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
+    DAEMON_FENCE_ENV, LaunchFence, has_inherited_daemon_fence,
     inherit_daemon_fence,
 };
 
@@ -468,10 +470,12 @@ pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
 /// An older independent editor has no interpretable directory inventory.
 /// Preserve all candidates while any local editor cannot prove readiness.
 /// Never inspect its buffers, environment, cwd or command arguments.
+#[cfg(any(feature = "host", test))]
 pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+#[cfg(any(feature = "host", test))]
 fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
@@ -521,6 +525,7 @@ fn editor_executable(
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
@@ -592,6 +597,7 @@ pub(crate) fn window_is_initialized() -> bool {
     WINDOW_SLOT.get().is_some()
 }
 
+#[cfg(any(feature = "ui", test))]
 pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
     owned_lock(
         &runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))),
@@ -600,6 +606,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 }
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
+#[cfg(any(feature = "host", test))]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
     owned_lock(
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
@@ -616,6 +623,7 @@ pub(crate) struct VerifiedWindow {
 }
 
 impl VerifiedWindow {
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn protects_worktrees(&self) -> io::Result<bool> {
         let name = self
             .lease_path
@@ -639,6 +647,7 @@ impl VerifiedWindow {
             )?)
     }
 
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
@@ -1071,6 +1080,7 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
 /// coordination link against a different device's saved window.
+#[cfg(any(feature = "ui", test))]
 pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
     match (crate::device::selected(), slot.starts_with("device-")) {
         (None, device_slot) => Ok(!device_slot),

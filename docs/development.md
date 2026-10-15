@@ -57,6 +57,22 @@ cargo check --locked --no-default-features --features ui --bin cagents-ui
 cargo check --locked --features integrated-browser --bin cagents-ui
 ```
 
+All four isolated lanes must compile without warnings. To enforce this when
+qualifying feature gates or dependencies, run these checks **sequentially**:
+
+```sh
+RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --bin cagents
+RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features host --bin cagentsd
+RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features ui --bin cagents-ui
+RUSTFLAGS="-D warnings" cargo check --locked --features integrated-browser --bin cagents-ui
+```
+
+Changing `RUSTFLAGS` can rebuild the dependency graph; keep these checks in the
+same warmed target directory and respect the resource guidance below. Gate
+lane-specific implementation items and imports at their owning feature boundary;
+retain test-only helpers with `#[cfg(test)]` instead of hiding unused code with a
+blanket lint allowance.
+
 The default `full` feature selects production identity only; `ui`, `host`, and
 `integrated-browser` select implementation graphs. Cargo features are
 package-wide, so combining `ui` and `host` in one `--bins` invocation would undo

@@ -3,8 +3,9 @@
 //! Locks live outside repositories and are never unlinked: every process must
 //! contend on the same file description, including across daemon restarts.
 use sha2::{Digest, Sha256};
+#[cfg(any(feature = "ui", test))]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
 };
@@ -271,6 +272,7 @@ impl std::fmt::Debug for Protection {
 }
 
 impl Protection {
+    #[cfg(any(feature = "ui", test))]
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
@@ -427,12 +429,14 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
+#[cfg(any(feature = "ui", test))]
 pub(crate) struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     requested: std::collections::BTreeSet<PathBuf>,
     ready: Option<crate::instance::OwnedLock>,
 }
 
+#[cfg(any(feature = "ui", test))]
 impl WindowProtections {
     fn suspend_readiness(&mut self) {
         self.ready = None;

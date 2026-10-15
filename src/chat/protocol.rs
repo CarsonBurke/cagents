@@ -134,6 +134,7 @@ impl ExecutionContext {
             owner: Some(owner),
         };
     }
+    #[cfg(test)]
     pub(crate) fn outcome(&self) -> LaunchOutcome {
         self.ownership
             .lock()

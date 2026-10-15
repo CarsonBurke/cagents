@@ -136,6 +136,7 @@ enum Command {
         deadline: std::time::Instant,
         reply: Sender<super::ipc::TerminalCloseResult>,
     },
+    #[cfg(test)]
     Shutdown,
 }
 
@@ -2361,6 +2362,7 @@ impl Worker {
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
+            #[cfg(test)]
             Command::Shutdown => return true,
         }
         false

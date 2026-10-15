@@ -62,6 +62,7 @@ impl Authority {
     pub fn from_environment() -> Self {
         Self(std::env::var(AUTHORITY_ENV).ok())
     }
+    #[cfg(feature = "host")]
     pub(crate) fn session(token: String) -> Self {
         Self(Some(token))
     }
@@ -285,6 +286,7 @@ pub enum HostedSession {
 impl HostedSession {
     /// Runtime ownership excludes mutable conversation/presentation metadata.
     /// A successor proof or different launch never identifies this process.
+    #[cfg(feature = "host")]
     pub(crate) fn same_process(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Chat(a), Self::Chat(b)) => {
@@ -341,11 +343,13 @@ impl Agent {
 /// replacement authority. A restart can reconstruct checks without opening a
 /// replacement directory or blocking interruption of an existing provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "host")]
 pub(crate) struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
+#[cfg(feature = "host")]
 impl DirectoryIdentity {
     pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
