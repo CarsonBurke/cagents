@@ -550,7 +550,7 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadChangesManifest { .. } | Command::LoadChangePatch { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -723,6 +723,16 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
+    /// Read only the ingestion cache, including after the actor exits.
+    pub(crate) fn source_query(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)
+    }
+    pub(crate) fn changes_manifest(&self, query: super::cache::changes::ManifestQuery) -> Result<super::cache::changes::Manifest,super::cache::SourceError> {
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).changes_manifest(query)
+    }
+    pub(crate) fn change_patch(&self, query: super::cache::changes::PatchQuery) -> Result<super::cache::changes::PatchPage,super::cache::SourceError> {
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).change_patch(query)
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -746,6 +756,10 @@ impl Handle {
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
+                    state.source_parts.retain(|part|part.source.agent_id.is_some());
+                    state.source_parts.extend(window.source_parts);
+                    state.changes_parts.retain(|part|part.source.agent_id.is_some());
+                    state.changes_parts.extend(window.changes_parts);
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -755,6 +769,8 @@ impl Handle {
                 }
             }
         }
+        if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
+        if let Err(error)=store.publish_changes_parts(&mut state) {state.error=Some(format!("Cannot identify original Changes source: {error}"));}
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -792,6 +808,10 @@ impl Handle {
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
                     Ok(window) => {
+                        state.source_parts.retain(|part|part.source.agent_id.is_some());
+                        state.source_parts.extend(window.source_parts);
+                    state.changes_parts.retain(|part|part.source.agent_id.is_some());
+                    state.changes_parts.extend(window.changes_parts);
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
@@ -805,6 +825,8 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
+        if let Err(error)=store.publish_changes_parts(&mut state) {state.error=Some(format!("Cannot identify original Changes source: {error}"));}
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {

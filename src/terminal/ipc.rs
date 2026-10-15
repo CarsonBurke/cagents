@@ -143,7 +143,10 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 79 carries exact Changes fragment provenance in every chat snapshot
+/// and incarnation-bound original-source epochs. Postcard cannot default added
+/// struct fields, so these layouts require matched daemon and UI executables.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -778,6 +781,18 @@ pub enum ServerResponse {
     ChatFileChangePatches {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
+    },
+    ChatSource {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::SourcePage, crate::chat::cache::SourceError>,
+    },
+    ChatChangesManifest {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::changes::Manifest, crate::chat::cache::SourceError>,
+    },
+    ChatChangePatch {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::changes::PatchPage, crate::chat::cache::SourceError>,
     },
 }
 
