@@ -1336,10 +1336,17 @@ fn killed_setup_holder_with_surviving_children_cannot_authorize_resume_after_res
     use std::os::fd::{AsRawFd, FromRawFd};
     struct Pinned(File);
     impl Pinned {
-        fn open(pid: i32) -> Self {
+        fn open(pid: i32, expected_start: u64) -> Self {
+            let current_start=|| {
+                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+                    .and_then(|stat|stat.rsplit_once(')').and_then(|(_,fields)|fields.split_whitespace().nth(19)).and_then(|value|value.parse::<u64>().ok()))
+            };
+            assert_eq!(current_start(),Some(expected_start),"owned fixture process changed before pidfd capture");
             let fd=unsafe {libc::syscall(libc::SYS_pidfd_open,pid,0)};
             assert!(fd>=0,"pin owned fixture process: {}",std::io::Error::last_os_error());
-            Self(unsafe {File::from_raw_fd(fd as i32)})
+            let pinned=unsafe {File::from_raw_fd(fd as i32)};
+            assert_eq!(current_start(),Some(expected_start),"owned fixture process changed during pidfd capture");
+            Self(pinned)
         }
         fn signal(&self, signal: i32) {assert_eq!(unsafe {libc::syscall(libc::SYS_pidfd_send_signal,self.0.as_raw_fd(),signal,std::ptr::null::<libc::siginfo_t>(),0)},0);}
         fn exited(&self, timeout: i32) -> bool {
@@ -1353,7 +1360,8 @@ fn killed_setup_holder_with_surviving_children_cannot_authorize_resume_after_res
     fs::create_dir(project.join(".cagents")).unwrap();
     let script=r#"import pathlib,subprocess,time
 child=subprocess.Popen(["/usr/bin/python3","-c","import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); time.sleep(600)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-pathlib.Path("survivor").write_text(str(child.pid))
+start=pathlib.Path(f"/proc/{child.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
+pathlib.Path("survivor").write_text(f"{child.pid} {start}")
 with pathlib.Path("setup-starts").open("a") as output: output.write("started\n")
 time.sleep(600)
 "#;
@@ -1370,11 +1378,13 @@ time.sleep(600)
     while !path.join("survivor").exists() || !path.join("setup-starts").exists() {
         assert!(Instant::now()<deadline,"owned setup did not start: {created}");thread::sleep(Duration::from_millis(10));
     }
-    let survivor=Pinned::open(fs::read_to_string(path.join("survivor")).unwrap().parse().unwrap());
+    let survivor_identity=fs::read_to_string(path.join("survivor")).unwrap();
+    let mut survivor_fields=survivor_identity.split_whitespace();
+    let survivor=Pinned::open(survivor_fields.next().unwrap().parse().unwrap(),survivor_fields.next().unwrap().parse().unwrap());
     let runtime=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY);
     let record:Value=serde_json::from_slice(&fs::read(runtime.join("holders").join(format!("{terminal}.json"))).unwrap()).unwrap();
-    let root=Pinned::open(record["root"]["pid"].as_i64().unwrap() as i32);
-    let holder=Pinned::open(record["holder"]["pid"].as_i64().unwrap() as i32);
+    let root=Pinned::open(record["root"]["pid"].as_i64().unwrap() as i32,record["root"]["start"].as_u64().unwrap());
+    let holder=Pinned::open(record["holder"]["pid"].as_i64().unwrap() as i32,record["holder"]["start"].as_u64().unwrap());
     holder.signal(libc::SIGKILL);
     assert!(holder.exited(5000));
     assert!(!survivor.exited(0),"fixture must retain the escaped child after holder loss");
