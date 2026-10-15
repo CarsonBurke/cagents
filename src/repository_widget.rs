@@ -3026,6 +3026,11 @@ impl RepositoryRuntime {
         self.ensure_current_diff(card)
     }
 
+    #[cfg(test)]
+    pub(crate) fn ignores_diff_whitespace_for_test(&self) -> bool {
+        self.diff_ignore_whitespace
+    }
+
     pub fn set_diff_ignore_whitespace(&mut self, enabled: bool) {
         if self.diff_ignore_whitespace != enabled {
             self.diff_ignore_whitespace = enabled;

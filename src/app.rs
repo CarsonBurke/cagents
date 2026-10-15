@@ -16816,6 +16816,22 @@ impl Cagents {
                 }
             }
         }
+        if previous.diff_ignore_whitespace != self.settings.diff_ignore_whitespace {
+            let visible: HashSet<_> = self.durable.cards.iter()
+                .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
+                .map(|card| card.id).collect();
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
+                if visible.contains(&card) || self.workspace.focused() == Some(card) {
+                    tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                }
+            }
+        }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {
                 let runtime = match runtime {
@@ -25839,6 +25855,26 @@ mod tests {
             app.settings.keyboard_shortcuts
         );
         assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
+    fn external_whitespace_preference_updates_existing_repository_diffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let (mut app, card) = editing_repository_app();
+        let initial = app.settings.diff_ignore_whitespace;
+        let mut external = app.settings.clone();
+        external.diff_ignore_whitespace = !initial;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository"); };
+        assert_eq!(runtime.ignores_diff_whitespace_for_test(), !initial);
+        // Reset/Undo use the same synchronization entrypoint as a reload.
+        let previous = app.settings.clone();
+        app.settings.diff_ignore_whitespace = initial;
+        drop(app.synchronize_settings(&previous));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository"); };
+        assert_eq!(runtime.ignores_diff_whitespace_for_test(), initial);
     }
 
     #[test]
