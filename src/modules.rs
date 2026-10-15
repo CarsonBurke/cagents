@@ -129,3 +129,6 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+#[cfg(target_os = "macos")]
+mod unix_descriptor;
