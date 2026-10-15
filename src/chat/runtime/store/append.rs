@@ -36,6 +36,20 @@ impl Store {
         }
     }
 
+    /// Completed prose fragments keep their original publication payload.
+    /// Root identity/status/source clocks are published separately by the
+    /// authoritative source metadata; the growing first/tail fragments stay
+    /// on the ordinary reconstruction path.
+    pub(super) fn completed_text_reusable(&self, id: &str, start: usize, end: usize,
+        previous: &Item, current: &Item) -> bool {
+        let (ItemContent::Text { text, thinking: old_thinking, phase: old_phase },
+            ItemContent::Text { thinking, phase, .. }) = (&previous.content, &current.content)
+            else { return false; };
+        previous.role == current.role && old_thinking == thinking && old_phase == phase
+            && text.len() == end.saturating_sub(start)
+            && self.appended.0.get(id).and_then(|fields| fields[0]).is_some_and(|offset| end <= offset)
+    }
+
     /// A validated append permits restoring a resident prefix from memory and
     /// asking SQLite only for its suffix. Canonical IDs still fence part ranges;
     /// missing/changed IDs and untrusted replacements use the full read path.

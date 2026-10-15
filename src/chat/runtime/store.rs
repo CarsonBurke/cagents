@@ -1136,11 +1136,9 @@ impl Store {
                 {
                     break 'records;
                 }
-                if self
-                    .changed
-                    .as_ref()
-                    .is_some_and(|changed| !changed.contains(&id))
-                    && let Some(previous) = old.get(item_id.as_ref())
+                if let Some(previous) = old.get(item_id.as_ref())
+                    && (self.changed.as_ref().is_some_and(|changed| !changed.contains(&id))
+                        || (part > 0 && self.completed_text_reusable(&id, start0, end0, previous, &base)))
                 {
                     reused.insert(item_id.into_owned());
                     newest = Some(
@@ -1633,11 +1631,19 @@ mod tests {
         store.apply(Event::Item(history_item("large", &source))).unwrap();
         let mut previous = store.window().unwrap().items;
         assert_eq!(previous.len(), 9);
+        let completed: std::collections::HashMap<_, _> = previous.iter()
+            .skip(1).take(7).map(|item| (item.id.clone(), item.clone())).collect();
         store.field_bytes.set(0);
         store.apply(Event::TextDelta { id: "large".into(), role: Role::Assistant,
             thinking: false, delta: "尾".into() }).unwrap();
         let window = store.window_reusing(&mut previous).unwrap();
         assert!(store.field_bytes.get() < 4096, "only new canonical tail part and UTF-8 boundary probes are read: {}", store.field_bytes.get());
+        for (id, previous) in completed {
+            let current = window.items.iter().find(|item| item.id == id).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&previous, current),
+                "completed fragments must not copy immutable body bytes on each tail append");
+        }
+        assert!(window.changes.len() <= 2, "completed fragment bodies need no empty append patch");
         let actual = window.items.iter().map(|item| match &item.content {
             ItemContent::Text { text, .. } => text.as_str(), _ => unreachable!(),
         }).collect::<String>();
