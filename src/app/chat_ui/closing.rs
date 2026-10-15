@@ -113,26 +113,28 @@ pub(in crate::app) fn draft_key(session: &chat::Session) -> Option<String> {
 }
 
 impl Cagents {
-    fn conversation_end_placement(&self, card: CardId) -> Option<(Option<crate::model::ChannelId>, Option<ProjectId>, Option<PathBuf>, Option<crate::workspace_model::views::Scope>, Option<PathBuf>)> {
+    fn conversation_end_placement(&self, card: CardId) -> Option<(Option<crate::model::ChannelId>, Option<ProjectId>, Option<PathBuf>, Option<crate::workspace_model::views::Scope>, Option<PathBuf>, Option<PathBuf>)> {
         let mut channels = self.durable.channels.iter().filter(|channel| channel.cards.contains(&card));
         let (channel, channel_project) = channels.next().map_or((None, None), |channel| (Some(channel.id), Some(channel.project_id)));
         if channels.next().is_some() { return None; }
         let mut views = self.workspace_model.views.iter().filter(|view| view.panes.iter().any(|pane| pane.id == card));
-        let shared_scope = views.next().map(|view| view.scope.clone());
+        let shared_view = views.next();
+        let shared_scope = shared_view.map(|view| view.scope.clone());
+        let shared_worktree = shared_view.and_then(|view| view.panes.iter().find(|pane| pane.id == card)).and_then(|pane| pane.scope.clone());
         if views.next().is_some() { return None; }
         let shared_repository = match shared_scope.as_ref() {
             Some(crate::workspace_model::views::Scope::Channel(id)) => Some(self.workspace_model.channel(*id)?.repository.clone()),
             Some(crate::workspace_model::views::Scope::Worktree { repository, .. }) => Some(repository.clone()),
             None => None,
         };
-        Some((channel, channel_project, self.durable.card_scopes.get(&card).cloned(), shared_scope, shared_repository))
+        Some((channel, channel_project, self.durable.card_scopes.get(&card).cloned(), shared_scope, shared_repository, shared_worktree))
     }
     /// Capture when constructing a lazy, scoped sidebar menu, not in response
     /// to its later click. The original issued and observed identity are kept
     /// separately, including the legitimate unlearned/learned thread pair.
     pub(in crate::app) fn capture_conversation_end_target(&self, card: CardId) -> Option<Arc<sidebar::ConversationEndTarget>> {
         let source = self.chat_close_source(card)?;
-        let (channel, channel_project, worktree, shared_scope, shared_repository) = self.conversation_end_placement(card)?;
+        let (channel, channel_project, worktree, shared_scope, shared_repository, shared_worktree, shared_worktree) = self.conversation_end_placement(card)?;
         if !self.conversation_end_shared_source_current(card, &source.descriptor, shared_scope.as_ref()) { return None; }
         Some(Arc::new(sidebar::ConversationEndTarget {
             card, registry: source.registry, issued: Arc::new(source.descriptor), observed: Arc::new(source.session),
@@ -160,7 +162,7 @@ impl Cagents {
             && self.card_state(target.card).is_some_and(|card| card.existence.is_open()
                 && matches!(&card.kind, CardKind::Chat(issued) if terminal_close::same_chat_removal_source(&target.issued, issued)))
             && self.chat_return_session(target.card).as_ref().is_some_and(|observed| terminal_close::same_chat_removal_source(&target.observed, observed))
-            && self.conversation_end_placement(target.card).is_some_and(|(channel, project, worktree, scope, repository)| channel == target.channel && project == target.channel_project && worktree == target.worktree && scope == target.shared_scope && repository == target.shared_repository)
+            && self.conversation_end_placement(target.card).is_some_and(|(channel, project, worktree, scope, repository, shared_worktree)| channel == target.channel && project == target.channel_project && worktree == target.worktree && scope == target.shared_scope && repository == target.shared_repository && shared_worktree == target.shared_worktree)
     }
     /// Existing command-template dispatch supplies its captured parameters;
     /// never reconstruct authority from the current row/CardId on delivery.
@@ -933,7 +935,7 @@ mod tests {
 
     #[test]
     fn sidebar_end_parameters_cannot_follow_replaced_identity_or_moved_scope() {
-        for change in 0..11 {
+        for change in 0..12 {
             let (mut app, card, directory) = fixture();
             write(&mut app, card, "keep sidebar conversation", true);
             retain_in_channel(&mut app, directory.path(), vec![card]);
@@ -959,10 +961,11 @@ mod tests {
                 }
                 8 => app.workspace_model.views[0].panes[0].pending_terminal_start = true,
                 9 => { let duplicate = app.workspace_model.views[0].panes[0].clone(); app.workspace_model.views[0].panes.push(duplicate); }
+                10 => app.workspace_model.views[0].panes[0].scope = Some(directory.path().join("different-filing")),
                 _ => {}
             }
             drop(app.request_conversation_end(target));
-            assert_eq!(app.chat_ui.close_dialog.is_some(), change == 10);
+            assert_eq!(app.chat_ui.close_dialog.is_some(), change == 11);
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.chat_ui.phases.is_empty());
         }

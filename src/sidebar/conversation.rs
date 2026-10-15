@@ -14,6 +14,7 @@ pub struct ConversationEndTarget {
     pub(crate) worktree: Option<PathBuf>,
     pub(crate) shared_scope: Option<Scope>,
     pub(crate) shared_repository: Option<PathBuf>,
+    pub(crate) shared_worktree: Option<PathBuf>,
 }
 impl ConversationEndTarget {
     pub fn card(&self) -> CardId { self.card }
