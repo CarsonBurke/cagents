@@ -13371,7 +13371,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel_attribution_uses_the_longest_known_launch_root() {
+    fn attention_channel_attribution_uses_the_longest_known_launch_root() {
         let root =
             SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
         let linked = SidebarWorktree::from_durable(

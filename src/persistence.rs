@@ -6208,7 +6208,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_agent_updates_survive_autosave_restore_and_read() {
+    fn attention_unread_agent_updates_survive_autosave_restore_and_read() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("state.db");
         let boot_id = boot("unread");

@@ -4888,7 +4888,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_outcome_with_unknown_activity_marks_background_pane_unread() {
+    fn attention_terminal_outcome_with_unknown_activity_marks_background_pane_unread() {
         use crate::agent::{ActivityOutcome, ActivityState};
         for outcome in [
             ActivityOutcome::Cancelled,
@@ -4940,7 +4940,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_completed_outcome_does_not_recreate_unread_after_attach() {
+    fn attention_initial_completed_outcome_does_not_recreate_unread_after_attach() {
         let (runtime, handle) = frame_cost::live_runtime(&[]);
         let card = runtime.target.card;
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -4969,7 +4969,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_outcome_stops_running_tool_turn() {
+    fn attention_cancelled_outcome_stops_running_tool_turn() {
         let items = [chat::Item {
             id: "cancelled-tool".into(),
             role: chat::Role::Assistant,
@@ -5010,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_run_outcomes_have_distinct_footer_status() {
+    fn attention_terminal_run_outcomes_have_distinct_footer_status() {
         use crate::agent::ActivityOutcome;
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         for (outcome, label, glyph) in [

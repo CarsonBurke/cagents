@@ -25611,7 +25611,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_visible_acknowledgement_cannot_read_an_update_from_a_later_focus_cycle() {
+    fn attention_stale_visible_acknowledgement_cannot_read_an_update_from_a_later_focus_cycle() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         app.core.set_main_window_id(Some(window::Id::RESERVED));
@@ -25695,7 +25695,7 @@ mod tests {
     }
 
     #[test]
-    fn late_root_reconciliation_preserves_folder_ownership_and_explicit_filing() {
+    fn attention_late_root_reconciliation_preserves_folder_ownership_and_explicit_filing() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
@@ -25901,7 +25901,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_pane_finishing_in_background_is_unread_until_visible_acknowledgement() {
+    fn attention_focused_pane_finishing_in_background_is_unread_until_visible_acknowledgement() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;

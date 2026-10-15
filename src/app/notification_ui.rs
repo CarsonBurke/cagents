@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn marking_a_channel_read_acknowledges_the_journal_before_the_next_snapshot() {
+    fn attention_marking_a_channel_read_acknowledges_the_journal_before_the_next_snapshot() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.refresh_ui.focused = false;
         let card = app.workspace.focused().unwrap();
@@ -1324,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn marking_all_read_retains_only_previously_qualified_channels() {
+    fn attention_marking_all_read_retains_only_previously_qualified_channels() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
