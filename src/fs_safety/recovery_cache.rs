@@ -651,15 +651,17 @@ mod tests {
         assert!(recovery.is_resolved());
         assert!(names(parent).is_empty());
     }
-    struct UnknownCreationGuard(Arc<std::sync::atomic::AtomicUsize>);
+    #[derive(Default)]
+    struct UnknownCreation { sealed: bool, in_flight: usize }
+    struct UnknownCreationGuard(Arc<std::sync::Mutex<UnknownCreation>>);
     impl Drop for UnknownCreationGuard {
         fn drop(&mut self) {
-            assert!(self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0);
+            let mut state = self.0.lock().unwrap();
+            state.in_flight = state.in_flight.checked_sub(1).expect("one guard admission");
         }
     }
     struct UnknownEnrollment {
-        creation_count: Arc<std::sync::atomic::AtomicUsize>,
-        sealed: std::sync::atomic::AtomicBool,
+        creation: Arc<std::sync::Mutex<UnknownCreation>>,
         attempts: std::sync::atomic::AtomicUsize,
         payload: std::sync::Mutex<Option<Root>>,
         _outside: tempfile::TempDir,
@@ -670,11 +672,10 @@ mod tests {
         fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
             // This complete isolated test topology grants only counted owned
             // creation admission. Sealing blocks new work, never old cleanup.
-            if self.sealed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(io::Error::other("Fixture creation admission sealed"));
-            }
-            self.creation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Arc::new(UnknownCreationGuard(self.creation_count.clone())))
+            let mut state = self.creation.lock().unwrap();
+            if state.sealed { return Err(io::Error::other("Fixture creation admission sealed")); }
+            state.in_flight = state.in_flight.checked_add(1).expect("bounded fixture admission");
+            Ok(Arc::new(UnknownCreationGuard(self.creation.clone())))
         }
         fn descriptor_budget(&self) -> usize { 1 }
         fn register_payload(&self, root: &Root) -> io::Result<()> {
@@ -712,8 +713,7 @@ mod tests {
         let parent = Arc::new(Root::open(outside.path()).unwrap());
         // Complete isolated topology; the owned lease deliberately records the
         // real original Root BEFORE returning unknown, as a daemon handoff can.
-        let registry = Arc::new(UnknownEnrollment { creation_count: Arc::default(),
-            sealed: std::sync::atomic::AtomicBool::new(false), attempts: std::sync::atomic::AtomicUsize::new(0),
+        let registry = Arc::new(UnknownEnrollment { creation: Arc::default(), attempts: std::sync::atomic::AtomicUsize::new(0),
             payload: std::sync::Mutex::new(None), _outside: outside, _runtime: runtime });
         let placement = RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
             RecoveryRegistryCheck::from_lease(registry.clone())).unwrap();
@@ -726,16 +726,16 @@ mod tests {
         .unwrap_err();
         let recovery = error.recovery().unwrap();
         assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        registry.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(registry.creation.lock().unwrap().in_flight, 1);
+        registry.creation.lock().unwrap().sealed = true;
         assert!(context.reserve_directory().is_err(), "retirement refuses new mkdir admission");
         assert!(recovery.retry().is_err()); assert!(!recovery.is_resolved());
         assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(parent.path().join("holding").is_dir(), "unknown enrollment must not remove H");
-        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 1, "same-slot uncertain recovery retains creation admission");
+        assert_eq!(registry.creation.lock().unwrap().in_flight, 1, "same-slot uncertain recovery retains creation admission");
         recovery.retry().unwrap(); assert!(recovery.is_resolved());
         assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 0, "positive retry cleanup releases the final original slot guard");
+        assert_eq!(registry.creation.lock().unwrap().in_flight, 0, "positive retry cleanup releases the final original slot guard");
         assert!(names(&parent).is_empty());
     }
 
