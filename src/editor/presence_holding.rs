@@ -53,6 +53,9 @@ struct OwnedTemporary { file: File, name: OsString }
 
 pub(super) struct PresenceHolding {
     publication: fs_safety::DirectoryPublication,
+    // None means consumer-private setup has not completed. The producer's
+    // immutable initial access witness then remains the only permitted base.
+    private_access: Option<(u32, u32, u32)>,
     parent: Root,
     name: OsString,
     original: Option<AuthenticatedLeaf>,
@@ -111,18 +114,38 @@ impl PresenceHolding {
                 return Err(FileIoError::Recovery { message, authority });
             },
         };
-        let holding = Self { publication, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
+        let mut holding = Self { publication, private_access: None, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
         let prepared = (|| {
             if let Some(error) = holding.publication.publication_error() { return Err(FileIoError::Io(error.into())); }
-            fs_safety::set_directory_permissions(holding.directory(), 0o700).map_err(io_error)?;
-            if holding.directory().metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
-                return Err(FileIoError::Io("The editor staging directory is not private.".into()));
-            }
-            Ok(())
+            holding.establish_private_access().map_err(FileIoError::Io)
         })();
         match prepared { Ok(()) => Ok(holding), Err(error) => Err(holding.finish_error(error)) }
     }
     pub(super) fn directory(&self) -> &Root { self.publication.directory() }
+    fn access(metadata: &fs::Metadata) -> (u32, u32, u32) { (metadata.uid(), metadata.gid(), metadata.mode()) }
+    fn establish_private_access(&mut self) -> Result<(), String> {
+        let current = self.directory().metadata().map_err(|error| error.to_string())?;
+        if let Some(expected) = self.private_access {
+            if Self::access(&current) != expected {
+                return Err("The retained editor staging access metadata changed. Its newer permissions and files were preserved.".into());
+            }
+            return Ok(());
+        }
+        let initial = self.publication.initial_metadata();
+        if Self::access(&current) != Self::access(initial) {
+            return Err("The staging access metadata changed before private setup completed. It was preserved for recovery.".into());
+        }
+        let expected = (initial.uid(), initial.gid(), (initial.mode() & !0o7777) | 0o700);
+        fs_safety::set_directory_permissions(self.directory(), 0o700).map_err(|error| error.to_string())?;
+        // Record only the exact access state established by our successful
+        // syscall, before any later fallible verification. Never adopt current
+        // metadata as a replacement permission witness during retry.
+        self.private_access = Some(expected);
+        if Self::access(&self.directory().metadata().map_err(|error| error.to_string())?) != expected {
+            return Err("The editor staging access metadata changed during private setup.".into());
+        }
+        Ok(())
+    }
     pub(super) fn create_temporary(&mut self) -> Result<(), FileIoError> {
         if self.temporary.is_some() { return Err(FileIoError::Io("An editor temporary file is already retained.".into())); }
         let (file, name) = fs_safety::create_temporary_in(self.directory(), 0o600).map_err(resolve_error)?;
@@ -178,7 +201,7 @@ impl PresenceHolding {
         // this consumer's explicit private0700 policy to its original inode.
         // This step never acquires/removes a public recovery entry.
         self.publication.retry_publication_steps().map_err(|error| error.to_string())?;
-        fs_safety::set_directory_permissions(self.directory(), 0o700).map_err(|error| error.to_string())?;
+        self.establish_private_access()?;
         if self.temporary.is_some() { self.unlink_temporary().map_err(|error| error.to_string())?; }
         if self.restore_original {
             if let Some(original) = &self.original {
@@ -220,6 +243,19 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn recovery_does_not_overwrite_newer_original_holding_permissions() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        let holding = PresenceHolding::create(&root, std::ffi::OsStr::new("file")).unwrap();
+        let original = holding.directory().try_clone().unwrap();
+        fs_safety::set_directory_permissions(&original, 0o711).unwrap();
+        let error = holding.finish().unwrap_err(); let authority = error.recovery_authority().unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(original.metadata().unwrap().mode() & 0o7777, 0o711);
+        fs_safety::set_directory_permissions(&original, 0o700).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+    }
+
     #[test]
     fn unverified_actual_mkdir_keeps_typed_receipt_without_chmod_or_guessed_cleanup() {
         let directory = tempfile::tempdir().unwrap(); let other = tempfile::tempdir().unwrap();
