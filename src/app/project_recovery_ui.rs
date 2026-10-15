@@ -14,6 +14,9 @@ pub(super) struct State {
     // Refusal only: the exact unresolved window capability follows this local
     // project through Locate. It grants no retry, filesystem or start authority.
     relocated_recovery: HashMap<ProjectId, crate::editor::RecoveryAuthority>,
+    // The original App publisher may deliver recovery after the logical move.
+    // Only its exact captured ticket can attribute that late refusal marker.
+    relocation_publications: HashMap<u64, HashSet<ProjectId>>,
     pub(super) closing_panes: bool,
     details: HashSet<CardId>,
 }
@@ -213,12 +216,35 @@ impl Cagents {
     fn capture_project_publication_recovery(&mut self, project: ProjectId) {
         let current=self.sidebar_model.projects.iter().map(|row|row.id).collect::<HashSet<_>>();
         self.project_recovery_ui.relocated_recovery.retain(|id,authority|current.contains(id) && !authority.is_resolved());
+        let cards=self.project_cards(project);
+        if let Some(ticket)=self.pending_publication_ticket_for_project(project,&cards) {
+            self.project_recovery_ui.relocation_publications.entry(ticket).or_default().insert(project);
+        }
         for root in self.project_publication_recovery_roots(project) {
             let Some(authority)=self.publication_recovery_authority(&root) else {continue;};
             let authority=self.project_recovery_ui.relocated_recovery.remove(&project)
                 .map_or_else(||authority.clone(),|previous|previous.combine(authority.clone()));
             self.project_recovery_ui.relocated_recovery.insert(project,authority);
         }
+    }
+    /// Called for every actual App publisher result before its stale-owner
+    /// return. No source path is inspected or re-attributed at completion.
+    pub(super) fn retain_relocated_publication_recovery(&mut self, ticket: u64, authority: Option<&crate::editor::RecoveryAuthority>) {
+        let Some(projects)=self.project_recovery_ui.relocation_publications.remove(&ticket) else {return;};
+        let Some(authority)=authority.filter(|authority|!authority.is_resolved()) else {return;};
+        for project in projects {
+            if self.sidebar_model.project(project).is_none() {continue;}
+            let authority=self.project_recovery_ui.relocated_recovery.remove(&project)
+                .map_or_else(||authority.clone(),|previous|previous.combine(authority.clone()));
+            self.project_recovery_ui.relocated_recovery.insert(project,authority);
+        }
+    }
+    /// Publisher intake supplies its actual origin and participant cards before
+    /// lease/freeze/I/O. A new operation cannot slip behind a chooser's capture.
+    pub(super) fn project_relocation_blocks_publication(&self, cards: &HashSet<CardId>) -> bool {
+        self.project_recovery_ui.location_generations.keys().any(|project| {
+            self.project_cards(*project).iter().any(|card|cards.contains(card))
+        })
     }
     pub(super) fn project_retains_relocated_recovery(&self, project: ProjectId) -> bool {
         self.sidebar_model.project(project).is_some()
