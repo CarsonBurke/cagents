@@ -5421,7 +5421,7 @@ impl Cagents {
                 continue;
             }
             let runtime = match self.cards.get(card) {
-                Some(CardRuntime::Chat(runtime)) => Some(runtime),
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
                 _ => self.chat_ui.parked.get(card).map(Box::as_ref),
             };
             let Some(runtime) = runtime else {
