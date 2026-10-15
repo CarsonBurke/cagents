@@ -24,7 +24,7 @@ impl RemovalSource {
     /// descriptor transition. Keeps the original issued wire pane and filing.
     pub(in crate::app) fn after_terminal_handoff(mut self,receipt:&crate::terminal::ipc::TerminalHandoffReceipt,observed_after:Option<&crate::chat::Session>)->Option<Self> {
         if self.handoff.is_some() || !views::handoff_source_matches(&self.before,receipt)
-            || !self.observed_chat.as_ref().is_some_and(|observed|super::super::terminal_close::same_chat_removal_source(observed,&receipt.source)) {return None;}
+            || !self.observed_chat.as_ref().is_some_and(|observed|views::handoff_chat_source_matches(observed,&receipt.source)) {return None;}
         if let Some(after)=observed_after {
             let mut expected=receipt.source.clone();
             expected.terminal=Some(receipt.terminal.session.clone());
@@ -253,6 +253,12 @@ mod handoff_projection_tests {
         let (before,receipt)=views::handoff_tests::fixture();
         let original=RemovalSource {registry:uuid::Uuid::new_v4(),repository:"/repo".into(),scope:Scope::Worktree {repository:"/repo".into(),path:"/repo".into()},before:before.clone(),execution_instance:None,observed_chat:Some(receipt.source.clone()),handoff:None};
         let mut parked=receipt.source.clone();parked.terminal=Some(receipt.terminal.session.clone());
+        // Both issued and independently observed sources can be unlearned at
+        // intake. Only the host-issued same-backend receipt may promote them.
+        let mut unlearned=original.clone();unlearned.observed_chat.as_mut().unwrap().launch.session_id=None;
+        assert!(unlearned.after_terminal_handoff(&receipt,None).is_some());
+        let mut known_other=original.clone();known_other.observed_chat.as_mut().unwrap().launch.session_id=Some("different-known-thread".into());
+        assert!(known_other.after_terminal_handoff(&receipt,None).is_none());
         let advanced=original.clone().after_terminal_handoff(&receipt,Some(&parked)).unwrap();
         assert_eq!(advanced.before,before);assert!(advanced.matches_handoff(&receipt));
         let completed=advanced.after_observed_chat_cleanup(&parked).unwrap();

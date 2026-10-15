@@ -245,15 +245,20 @@ pub fn same_removal_pane_source(expected:&Pane,current:&Pane,handoff:Option<&cra
 /// thread, recipe, proof, paired console or listener is never substituted.
 pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::TerminalHandoffReceipt)->bool {
     let CardKind::Chat(issued)=&expected.kind else {return false;};
-    let mut confirmed=receipt.source.clone();
-    if issued.launch.session_id.is_none() { confirmed.launch.session_id=None; }
     !receipt.operation.is_nil() && !receipt.source_execution_instance.is_nil()
         && !receipt.source_binding.backend.is_nil()
         && receipt.source_binding.execution_instance==receipt.source_execution_instance
         && receipt.source_binding.source==receipt.source
         && !receipt.terminal.execution_instance.is_nil()
         && receipt.terminal.session.continuity.live_proof().is_some_and(|proof|proof.is_complete())
-        && same_card_source(&expected.kind,&CardKind::Chat(confirmed))
+        && handoff_chat_source_matches(issued,&receipt.source)
+}
+/// Receipt-owned thread learning is narrower than ordinary logical-source
+/// matching. Known thread IDs and all other issued source fields remain exact.
+pub fn handoff_chat_source_matches(expected:&crate::chat::Session,confirmed:&crate::chat::Session)->bool {
+    let mut confirmed=confirmed.clone();
+    if expected.launch.session_id.is_none() {confirmed.launch.session_id=None;}
+    same_card_source(&CardKind::Chat(expected.clone()),&CardKind::Chat(confirmed))
 }
 
 /// Logical source equality permits the same execution to finish and the same
