@@ -222,8 +222,9 @@ impl ActivityObservation {
         if generation < self.generation {
             return false;
         }
+        let newer_idle = generation > self.generation && state == ActivityState::Idle;
         self.generation = generation;
-        if self.state == state && self.outcome == outcome {
+        if self.state == state && self.outcome == outcome && !newer_idle {
             return false;
         }
         self.state = state;
@@ -2167,7 +2168,10 @@ mod tests {
         assert!(activity.observe(6, ActivityState::Waiting));
         assert!(!activity.observe(7, ActivityState::Idle));
         assert_eq!(activity.take(), ActivityState::Idle);
+        assert!(activity.observe(8, ActivityState::Idle));
+        assert_eq!(activity.take(), ActivityState::Idle);
         assert!(!activity.observe(8, ActivityState::Idle));
+        assert!(!activity.observe(7, ActivityState::Idle));
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
     }

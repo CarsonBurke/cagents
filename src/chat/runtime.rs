@@ -664,6 +664,7 @@ impl LocalHandle {
                     dirty: false,
                     activity: ActivityState::Idle,
                     activity_outcome: None,
+                    account_switch_idle: false,
                     ready: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
@@ -2569,6 +2570,8 @@ struct Actor {
     dirty: bool,
     activity: ActivityState,
     activity_outcome: Option<crate::agent::ActivityOutcome>,
+    /// Last actor-ordered account readiness, independent of scalar activity.
+    account_switch_idle: bool,
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     attention: TurnAttention,
@@ -2867,6 +2870,10 @@ impl Actor {
                 }
                 self.close_input_drained = self.output.is_empty();
                 self.drain_commands(closing.is_some())?;
+                // A final control reply may publish while the input-drained
+                // fence is still false. Re-evaluate after the entire batch,
+                // before an offscreen actor can sleep indefinitely in poll.
+                self.publish_activity();
                 if self.output.len() > FRAME_LIMIT {
                     return Err("Provider stdout frame exceeds 32 MiB".into());
                 }
@@ -3884,6 +3891,18 @@ impl Actor {
         }
         let activity = state.activity();
         let outcome = state.outcome.clone();
+        let account_switch_idle = self.update_readiness(&state) == UpdateReadiness::Idle
+            && self.adapter.account_switch_ready()
+            && state.queued_messages.is_empty();
+        let account_became_idle = account_switch_idle && !self.account_switch_idle;
+        self.account_switch_idle = account_switch_idle;
+        if account_became_idle {
+            // A control acknowledgement need not change Snapshot metadata.
+            // Give hidden consumers a strictly newer scheduling hint while
+            // keeping the fresh actor query as the only readiness authority.
+            state.generation = state.generation.saturating_add(1);
+            self.dirty = true;
+        }
         let generation = state.generation;
         let waiting_fingerprint = if activity == ActivityState::Waiting {
             state.waiting_fingerprint()
@@ -3912,7 +3931,7 @@ impl Actor {
             });
         }
         // Outcomes can change without an activity transition (e.g. idle death).
-        if activity_changed || outcome_changed {
+        if activity_changed || outcome_changed || account_became_idle {
             self.activity_outcome = outcome.clone();
             (self.notify)(Update::Activity {
                 state: activity,
@@ -5248,6 +5267,83 @@ mod tests {
         assert!(handle.launch_account_scope().unwrap().revalidate().is_err());
         handle.close().unwrap();
     }
+    #[test]
+    fn hidden_control_settlement_publishes_newer_idle_without_a_snapshot_event() {
+        struct ControlFixture { settled: bool }
+        impl Adapter for ControlFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step { events: vec![Event::Ready(true)], ..Step::default() })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::SetModel { .. } => {
+                        self.settled = false;
+                        Ok(Step { writes: vec![serde_json::json!({"settled":true})], ..Step::default() })
+                    }
+                    Command::Compact => Ok(Step::default()),
+                    _ => Err("unexpected control fixture command".into()),
+                }
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                assert_eq!(value["settled"], true);
+                self.settled = true;
+                // The provider acknowledged a control, with no transcript,
+                // status, model or other Snapshot event.
+                Ok(Step::default())
+            }
+            fn account_switch_ready(&self) -> bool { self.settled }
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+            arguments: vec!["-c".into(),
+                r#"IFS= read -r frame; : > "$1/admitted"; while [ ! -f "$1/release" ]; do sleep 0.01; done; printf '%s\n' "$frame"; exec cat"#.into(),
+                "control-fixture".into(), root.path().to_string_lossy().into_owned()],
+            working_directory: root.path().into(), environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ControlFixture { settled: true });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = send.send(update);
+        }).unwrap();
+        handle.set_visible(false);
+        until(&handle, |snapshot| snapshot.ready);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let before = loop {
+            if let Some(generation) = handle.account_switch_generation().unwrap() { break generation; }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        receive.try_iter().for_each(drop);
+        handle.command(Command::SetModel { model: "control-only".into(), reasoning: None }).unwrap();
+        while !root.path().join("admitted").exists() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(handle.account_switch_generation().unwrap(), None);
+        assert_eq!(handle.0.state.lock().unwrap().activity(), ActivityState::Idle);
+        assert!(handle.0.state.lock().unwrap().items.is_empty());
+        std::fs::write(root.path().join("release"), b"").unwrap();
+        let generation = loop {
+            match receive.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Update::Activity { state: ActivityState::Idle, generation, .. } => break generation,
+                Update::Presentation => panic!("hidden control settlement requested transcript presentation"),
+                _ => {}
+            }
+        };
+        assert!(generation > before);
+        assert_eq!(handle.account_switch_generation().unwrap(), Some(generation));
+        assert!(handle.0.state.lock().unwrap().items.is_empty());
+        // Neither a read-only query nor unchanged housekeeping creates an
+        // unbounded stream of new idle notifications.
+        handle.command(Command::Compact).unwrap();
+        assert!(!receive.try_iter().any(|update| matches!(update, Update::Activity { .. })));
+        handle.close().unwrap();
+    }
+
     #[test]
     fn unchanged_idle_activity_publishes_new_outcomes_once_with_their_reason() {
         struct ActivityFixture;

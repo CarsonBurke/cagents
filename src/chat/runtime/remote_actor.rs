@@ -764,7 +764,9 @@ impl RemoteActor {
                         let generation = state.generation;
                         let activity = state.activity;
                         let outcome = state.outcome.clone();
-                        let activity_changed = activity != old.activity || outcome != old.outcome;
+                        let activity_changed = activity != old.activity || outcome != old.outcome
+                            || (activity == crate::agent::ActivityState::Idle
+                                && generation > old.generation);
                         let ready = state.ready && !old.ready;
                         let identity_changed = state.confirmed_session != old.confirmed_session;
                         let outcomes = (state.outbox_latest > state.outbox_ack
