@@ -3119,8 +3119,8 @@ fn project_output(
         }
         ResolvedProject::List => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            // Newest first, the order `channel list` answers in and the order
-            // the sidebar renders.
+            // Shared creation rank, newest first. Each window independently
+            // persists its custom sidebar order.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
             let human = projects
