@@ -141,18 +141,34 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     impl FixtureProcesses {
-        fn retain(&mut self, process: &crate::daemon::holder_registry::Process) -> std::io::Result<()> {
-            self.retain_after_open(process, || crate::daemon::holder_registry::Process::read(process.pid))
+        fn retain(
+            &mut self,
+            process: &crate::daemon::holder_registry::Process,
+        ) -> std::io::Result<()> {
+            self.retain_after_open(process, || {
+                crate::daemon::holder_registry::Process::read(process.pid)
+            })
         }
-        fn retain_after_open(&mut self, process: &crate::daemon::holder_registry::Process,
-            read: impl FnOnce() -> std::io::Result<crate::daemon::holder_registry::Process>) -> std::io::Result<()> {
+        fn retain_after_open(
+            &mut self,
+            process: &crate::daemon::holder_registry::Process,
+            read: impl FnOnce() -> std::io::Result<crate::daemon::holder_registry::Process>,
+        ) -> std::io::Result<()> {
             use std::os::fd::FromRawFd;
-            if !process.is_current() { return Err(std::io::Error::other("fixture process identity changed before capture")); }
+            if !process.is_current() {
+                return Err(std::io::Error::other(
+                    "fixture process identity changed before capture",
+                ));
+            }
             let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) as i32 };
-            if descriptor < 0 { return Err(std::io::Error::last_os_error()); }
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) };
             if read()? != *process {
-                return Err(std::io::Error::other("fixture process identity changed during capture"));
+                return Err(std::io::Error::other(
+                    "fixture process identity changed during capture",
+                ));
             }
             self.descriptors.push(descriptor);
             Ok(())
@@ -164,23 +180,35 @@ mod tests {
             use std::os::fd::AsRawFd;
             for (index, descriptor) in self.descriptors.iter().enumerate() {
                 unsafe {
-                    libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(), 0);
-                    let mut ready = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        descriptor.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                    let mut ready = libc::pollfd {
+                        fd: descriptor.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
                     libc::poll(&mut ready, 1, 2000);
                     // Until carry joins, the original worker still owns its
                     // Child and its wait. After carry relinquished it, only
                     // this exact originally captured holder may need reaping.
                     if self.original_released && index == 1 {
                         let mut status: libc::siginfo_t = std::mem::zeroed();
-                        libc::waitid(libc::P_PIDFD, descriptor.as_raw_fd() as libc::id_t, &mut status,
-                            libc::WEXITED | libc::WNOHANG);
+                        libc::waitid(
+                            libc::P_PIDFD,
+                            descriptor.as_raw_fd() as libc::id_t,
+                            &mut status,
+                            libc::WEXITED | libc::WNOHANG,
+                        );
                     }
                 }
             }
         }
     }
-
 
     fn proof(incarnation: &str) -> HostSessionProof {
         HostSessionProof {
@@ -460,19 +488,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fixture_pidfd_capture_refuses_changed_identity_before_arming_cleanup() {
-        if isolated_fixture(concat!(module_path!(), "::fixture_pidfd_capture_refuses_changed_identity_before_arming_cleanup")) { return; }
-        let original = crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
+        if isolated_fixture(concat!(
+            module_path!(),
+            "::fixture_pidfd_capture_refuses_changed_identity_before_arming_cleanup"
+        )) {
+            return;
+        }
+        let original =
+            crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
         let mut changed = original.clone();
         changed.start = changed.start.checked_add(1).unwrap();
         let mut processes = FixtureProcesses::default();
-        let error = processes.retain_after_open(&original, || Ok(changed)).unwrap_err();
+        let error = processes
+            .retain_after_open(&original, || Ok(changed))
+            .unwrap_err();
         assert!(error.to_string().contains("during capture"));
-        assert!(processes.descriptors.is_empty(), "an unauthenticated pidfd must be close-only, never enrolled for signals");
+        assert!(
+            processes.descriptors.is_empty(),
+            "an unauthenticated pidfd must be close-only, never enrolled for signals"
+        );
         drop(processes);
-        assert!(original.is_current(), "refused fixture capture cannot signal its target");
+        assert!(
+            original.is_current(),
+            "refused fixture capture cannot signal its target"
+        );
         println!("SETUP_FIXTURE_PIDFD_IDENTITY_REFUSED");
     }
-
 
     #[cfg(target_os = "linux")]
     #[test]
