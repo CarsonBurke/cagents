@@ -149,17 +149,9 @@ impl State {
             return widget::Id::new("dialog.project.cleanup.directories");
         }
         if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
+            return widget::Id::new("dialog.project.remove.cancel");
         }
-        widget::Id::new(
-            if self.dialog.as_ref().is_some_and(|dialog| {
-                dialog.blocker.is_some() || dialog.loading || dialog.safety.is_none()
-            }) {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        widget::Id::new("dialog.project.close")
     }
 }
 
@@ -1582,9 +1574,9 @@ impl Cagents {
                     }
                     Ok(snapshot) => {
                         let unchanged = dialog.safety.as_ref() == Some(&snapshot);
-                        dialog.safety = Some(snapshot.clone());
                         if !dialog.branch_choice_edited && !dialog.branch_elsewhere { dialog.delete_branch = default_branch; }
                         if confirming && busy > 0 && dialog.busy_confirmed != Some(busy) {
+                            dialog.safety = Some(snapshot);
                             dialog.busy_confirmed = None;
                             dialog.failure = Some("The number of working agents changed. Review and confirm their interruption again.".into());
                             return Task::none();
@@ -1607,6 +1599,7 @@ impl Cagents {
                             let next = self.next_worktree_delete_dialog();
                             return Task::batch([deletion, next]);
                         }
+                        dialog.safety = Some(snapshot);
                         if confirming {
                             dialog.failure = Some("This worktree changed while confirmation was open. Review the updated counts and confirm again.".into());
                         }
@@ -2160,6 +2153,7 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
                             .on_press(Message::ProjectUi(Action::Dismiss)),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
@@ -2265,15 +2259,28 @@ impl Cagents {
             Some(snapshot) if snapshot.detached_only_commits > 0 => {
                 if snapshot.files_to_discard() > 0 {
                     format!(
-                        "Rescue, discard {} files and delete",
-                        snapshot.files_to_discard()
+                        "Rescue, discard {} file{} and delete",
+                        snapshot.files_to_discard(),
+                        if snapshot.files_to_discard() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
                     )
                 } else {
                     "Create rescue branch and delete".to_owned()
                 }
             }
             Some(snapshot) if snapshot.files_to_discard() > 0 => {
-                format!("Discard {} files and delete", snapshot.files_to_discard())
+                format!(
+                    "Discard {} file{} and delete",
+                    snapshot.files_to_discard(),
+                    if snapshot.files_to_discard() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
             }
             _ => "Delete worktree".to_owned(),
         };
@@ -2288,6 +2295,7 @@ impl Cagents {
         );
         let form = widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(Length::Shrink))
             .max_height((self.window_height - 180.0).max(120.0));
+
         Some(super::dialog_ui::surface(
             widget::column::with_children(vec![form.into(), actions]).spacing(space::M),
             480.0,
@@ -4197,6 +4205,10 @@ mod tests {
             confirming: false,
             result: Ok(observed.clone()),
         }));
+        assert_eq!(
+            app.project_ui.focus_target(),
+            widget::Id::new("dialog.project.close")
+        );
         drop(app.handle_project_action(Action::ConfirmDelete));
         assert!(app.project_ui.dialog.as_ref().unwrap().loading);
         let mut current = observed;
@@ -4285,6 +4297,10 @@ mod tests {
         let command = worktree_removal_command(&target, &clean);
         assert!(!command.arguments.iter().any(|arg| arg == "--force"));
         std::fs::write(linked.join("agent-output.txt"), "new work").unwrap();
+        let untracked = service.worktree_safety(&linked, &cancellation).unwrap();
+        assert_eq!(untracked.untracked, 1);
+        assert_eq!(untracked.modified, 0);
+        assert!(untracked.notable_ignored.is_empty());
         assert!(
             verify_worktree_safety(&service, &linked, &clean, &cancellation)
                 .unwrap_err()
