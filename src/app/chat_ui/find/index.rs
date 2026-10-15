@@ -147,6 +147,9 @@ pub(in crate::app::chat_ui) struct Results {
     pub matches: Arc<Vec<Match>>,
     pub blocks: Arc<HashMap<u64, Arc<[Range<usize>]>>>,
     pub revisions: HashMap<String,u64>,
+    pub turns: Arc<HashSet<String>>,
+    pub items: Arc<HashSet<String>>,
+    pub scope: u64,
     positions: HashMap<(String,u64,usize,usize),usize>,
 }
 impl Results {
@@ -154,13 +157,16 @@ impl Results {
         let blocks = Paint::new(0,&matches,None).blocks;
         let positions = matches.iter().enumerate().map(|(index,found)|
             ((found.item.clone(),found.identity,found.range.start,found.range.end),index)).collect();
-        Self { matches:Arc::new(matches),blocks,positions,revisions:HashMap::new() }
+        let turns=matches.iter().map(|found|found.turn.clone()).collect();
+        let items=matches.iter().map(|found|found.item.clone()).collect();
+        Self { matches:Arc::new(matches),blocks,positions,revisions:HashMap::new(),turns:Arc::new(turns),items:Arc::new(items),scope:0 }
     }
-    pub fn with_revisions(matches:Vec<Match>,inputs:&[Input]) -> Self {
+    pub fn with_revisions(matches:Vec<Match>,inputs:&[Input],scope:u64) -> Self {
         let mut result=Self::new(matches);
         let matched:HashSet<_>=result.matches.iter().map(|found|found.item.as_str()).collect();
         result.revisions=inputs.iter().filter(|input|matched.contains(input.item.id.as_str()))
             .map(|input|(input.item.id.clone(),input.revision)).collect();
+        result.scope=scope;
         result
     }
     pub fn position(&self, found: &Match) -> Option<usize> {

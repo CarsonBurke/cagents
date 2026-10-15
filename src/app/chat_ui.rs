@@ -1475,6 +1475,9 @@ pub(super) struct Runtime {
     find_focused: bool,
     find_matches: Arc<Vec<find::Match>>,
     find_blocks: Arc<HashMap<u64,Arc<[std::ops::Range<usize>]>>>,
+    find_turns: Arc<HashSet<String>>,
+    find_items: Arc<HashSet<String>>,
+    find_scope_revision: u64,
     find_generation: Arc<AtomicU64>,
     find_waiting: Option<u64>,
     find_dirty: bool,
@@ -2112,6 +2115,9 @@ impl Runtime {
             find_focused: false,
             find_matches: Default::default(),
             find_blocks: Default::default(),
+            find_turns: Default::default(),
+            find_items: Default::default(),
+            find_scope_revision: 0,
             find_generation: Arc::new(AtomicU64::new(0)),
             find_waiting: None,
             find_dirty: false,
@@ -2198,6 +2204,19 @@ impl Runtime {
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
+        self.find_generation.fetch_add(1,Ordering::Relaxed);
+        self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
+        self.find_navigation = self.find_navigation.wrapping_add(1);
+        self.find_locating = None;
+        self.find_waiting = None;
+        self.find_worker = Default::default();
+        self.find_matches = Default::default();
+        self.find_blocks = Default::default();
+        self.find_turns = Default::default();
+        self.find_items = Default::default();
+        self.find_paint = None;
+        self.find_dirty = self.find.as_ref().is_some_and(|query|!query.is_empty());
+        self.find_origin = None;
         self.opened.clear();
         self.expanded.clear();
         self.answers.clear();
@@ -2478,6 +2497,7 @@ impl Runtime {
             || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
             self.cache.retain(|id, _| snapshot.items.iter().chain(selected.into_iter().flat_map(|agent| &agent.items)).any(|item| &item.id == id));
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
         }
         // Rare disclosure-budget pruning can inspect all raw identities;
         // ordinary streaming refreshes need no newly allocated ID HashSet.
@@ -2587,6 +2607,7 @@ impl Runtime {
         }
         if let Some(turns) = turns {
             self.turns = turns;
+            self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
         if snapshot.error != self.snapshot.error
@@ -2634,10 +2655,11 @@ impl Runtime {
         let worker = self.find_worker.clone();
         let provider = self.session.launch.provider;
         let inputs = self.find_inputs();
+        let scope = self.find_scope_revision;
         Some(cosmic::task::future(async move {
             let matches = if current.load(Ordering::Relaxed) != generation { None } else {
                 tokio::task::spawn_blocking(move || {
-                    worker.lock().ok()?.search(&inputs,provider,&query,generation,&current).map(|matches| find::Results::with_revisions(matches,&inputs))
+                    worker.lock().ok()?.search(&inputs,provider,&query,generation,&current).map(|matches| find::Results::with_revisions(matches,&inputs,scope))
                 }).await.ok().flatten()
             };
             Message::ChatUi(Action::FindIndexed(target,generation,matches.map(Arc::new)))
@@ -2679,6 +2701,11 @@ impl Runtime {
             self.find_locating = None;
             self.find_waiting = None;
             self.find_worker = Default::default();
+            self.find_matches = Default::default();
+            self.find_blocks = Default::default();
+            self.find_turns = Default::default();
+            self.find_items = Default::default();
+            self.update_find_paint();
             self.find_dirty = true;
         }
         images::sync(self);
@@ -7292,6 +7319,8 @@ impl Cagents {
                     runtime.find_waiting = None;
                     runtime.find_matches = Default::default();
                     runtime.find_blocks = Default::default();
+                    runtime.find_turns = Default::default();
+                    runtime.find_items = Default::default();
                     runtime.find_index = 0;
                     runtime.find_dirty = true;
                     runtime.find_debounce = true;
@@ -7312,7 +7341,7 @@ impl Cagents {
                 if runtime.find.is_none() || runtime.find_generation.load(Ordering::Relaxed) != generation { return Task::none(); }
                 runtime.find_waiting = None;
                 if let Some(matches) = matches {
-                    if matches.revisions.iter().any(|(item,revision)| runtime.cache.get(item).is_none_or(|cached| cached.revision != *revision)) {
+                    if matches.scope != runtime.find_scope_revision || matches.revisions.iter().any(|(item,revision)| runtime.cache.get(item).is_none_or(|cached| cached.revision != *revision)) {
                         runtime.find_dirty = true;
                         return Task::none();
                     }
@@ -7320,6 +7349,8 @@ impl Cagents {
                     runtime.find_index = previous.and_then(|previous| matches.position(&previous)).unwrap_or(0);
                     runtime.find_matches = matches.matches.clone();
                     runtime.find_blocks = matches.blocks.clone();
+                    runtime.find_turns = matches.turns.clone();
+                    runtime.find_items = matches.items.clone();
                     runtime.update_find_paint();
                     if runtime.find_auto_reveal && !runtime.find_matches.is_empty() {
                         runtime.find_auto_reveal = false;
@@ -7375,6 +7406,8 @@ impl Cagents {
                     runtime.find_focused = false;
                     runtime.find_matches = Default::default();
                     runtime.find_blocks = Default::default();
+                    runtime.find_turns = Default::default();
+                    runtime.find_items = Default::default();
                     runtime.update_find_paint();
                     if !runtime.find_navigated { restore = runtime.find_origin.take(); }
                     runtime.find_origin = None;
@@ -7744,6 +7777,8 @@ impl Cagents {
                         runtime.find_navigated = false;
                         runtime.find_matches = Default::default();
                     runtime.find_blocks = Default::default();
+                    runtime.find_turns = Default::default();
+                    runtime.find_items = Default::default();
                         runtime.find_dirty = true;
                         runtime.update_find_paint();
                     }
@@ -10862,7 +10897,7 @@ mod tests {
         let matches = {
             let mut worker = runtime.find_worker.lock().unwrap();
             worker.search(&runtime.find_inputs(),runtime.session.launch.provider,
-                runtime.find.as_deref().unwrap_or_default(),generation,&runtime.find_generation).map(|matches| find::Results::with_revisions(matches,&runtime.find_inputs())).map(Arc::new)
+                runtime.find.as_deref().unwrap_or_default(),generation,&runtime.find_generation).map(|matches| find::Results::with_revisions(matches,&runtime.find_inputs(),runtime.find_scope_revision)).map(Arc::new)
         };
         drop(app.handle_chat_ui(Action::FindIndexed(target,generation,matches)));
     }

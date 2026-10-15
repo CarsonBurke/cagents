@@ -1380,7 +1380,7 @@ impl Runtime {
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
                 let mut revision = std::hash::DefaultHasher::new();
-                (cached.revision, self.expanded.contains(&item.id), &self.find, self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).map(|found| (found.identity,found.range.start)), dark).hash(&mut revision);
+                (cached.revision, self.expanded.contains(&item.id), self.find.as_ref().filter(|_|self.find_items.contains(&item.id)), self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found|found.item==item.id).map(|found| (found.identity,found.range.start)), dark).hash(&mut revision);
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0)).ceil().max(1.0) * 22.0 + footer
                 });
@@ -3154,7 +3154,7 @@ impl Runtime {
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
     pub(super) fn find_turn_matches(&self, key: &str) -> bool {
-        self.find_matches.iter().any(|candidate| candidate.turn == key)
+        self.find_turns.contains(key)
     }
 
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
