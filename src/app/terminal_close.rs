@@ -49,8 +49,8 @@ pub enum CompletedCloseOutcome {
         execution_instance: uuid::Uuid,
         proof: HostSessionProof,
     },
-    /// Presentation dismissal only; no execution/retirement RPC was issued.
-    Dismissed {
+    /// List found no resident owner; this cannot authorize shared pane removal.
+    Absent {
         expected_worker: Option<(uuid::Uuid, HostSessionProof)>,
     },
     Active(HostSessionProof),
@@ -547,7 +547,7 @@ impl Cagents {
             result => result,
         };
         match result {
-            Ok(CompletedCloseOutcome::Dismissed { expected_worker }) => {
+            Ok(CompletedCloseOutcome::Absent { expected_worker }) => {
                 if captured
                     .as_ref()
                     .map(|current| (current.execution_instance, current.proof.clone()))
@@ -1206,7 +1206,7 @@ mod tests {
             } else if !resident {
                 assert!(matches!(
                     outcome,
-                    Ok(CompletedCloseOutcome::Dismissed { .. })
+                    Ok(CompletedCloseOutcome::Absent { .. })
                 ));
             } else {
                 assert!(outcome.is_err());
@@ -1275,7 +1275,7 @@ mod tests {
                 execution_instance: uuid::Uuid::nil(),
                 proof: bound_fixture().2.proof,
             },
-            CompletedCloseOutcome::Dismissed {
+            CompletedCloseOutcome::Absent {
                 expected_worker: None,
             },
         ] {
@@ -1441,7 +1441,7 @@ mod tests {
         let _ = app.completed_terminal_closed(
             card,
             ended,
-            Ok(CompletedCloseOutcome::Dismissed {
+            Ok(CompletedCloseOutcome::Absent {
                 expected_worker: Some((captured.execution_instance, captured.proof)),
             }),
         );
@@ -1803,9 +1803,9 @@ fn close_completed_with_client(
         .into_iter()
         .find(|descriptor| descriptor.session.id == source.id)
     else {
-        // Presentation only. A successor may appear after List, so do not
-        // issue the legacy source-only release or any other teardown RPC.
-        return Ok(CompletedCloseOutcome::Dismissed {
+        // A successor may appear after List. Report absence without granting
+        // teardown or shared pane removal authority.
+        return Ok(CompletedCloseOutcome::Absent {
             expected_worker: captured
                 .map(|captured| (captured.execution_instance, captured.proof.clone())),
         });
