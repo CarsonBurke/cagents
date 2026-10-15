@@ -12,8 +12,12 @@ small (one normal chat), restore100, visit20 (scroll each), hidden20 (focus the
 small chat), closed100, then repeat the same seed/visit/hide/close cycle twice.
 Use a 1280x900 logical viewport at scale 1.0. Visit the next 20 panes with
 Ctrl+PageDown; in each send eight wheel notches down and eight up, then focus
-the small chat to hide them. Wait 10 seconds before each 10 second sample. Close
-only minted actor IDs with the close action. After seeding, restart only the
+the small chat to hide them. Wait 10 seconds before each 10 second sample. Use
+scripts/measure-chat-memory-closepanes for the closed100 stage: it proves exact
+UI adoption, native pane closure and removal from shared membership while
+preserving an explicit small control pane. This script's close action ends
+only minted provider actors and alone does not qualify pane retirement.
+After seeding, restart only the
 private UI to measure fresh restore. Record raw
 screenshots, input sequences, source SHA/dirty diff, build profile and compositor
 alongside samples. Actor counts alone do not verify actual UI attachment.

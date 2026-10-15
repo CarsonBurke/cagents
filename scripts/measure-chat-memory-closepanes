@@ -8,6 +8,11 @@ real native pane close if necessary; an exited provider alone is not success.
 Both baseline existence tombstones and newer closed_cards guards are supported.
 Before each close the parent transcript's final exact actor marker must be
 visible to native OCR, independently confirming the durable focused card.
+If OCR refuses after partial progress, restore the selected parent footer and
+retry with --attempt 2 --adoption-receipt PATH_TO_ATTEMPT1_JSONL, keeping all
+other arguments identical. Exact original adoption, process start identity,
+manifest hash and preserved control pane are revalidated; unknown missing panes
+never count as closed. Each attempt writes a new receipt without overwriting.
 This helper records ownership/close proof, not memory or presentation latency.
 """
 import argparse
