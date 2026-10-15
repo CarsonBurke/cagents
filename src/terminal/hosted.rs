@@ -958,6 +958,8 @@ impl ClientCommand {
 }
 
 struct HostedHandleInner {
+    #[cfg(feature = "ui")]
+    attachment_id: uuid::Uuid,
     terminal_id: TerminalId,
     commands: Sender<ClientCommand>,
     events: Receiver<TerminalEvent>,
@@ -1095,6 +1097,8 @@ impl HostedTerminalHandle {
 
         Ok(Self {
             inner: Arc::new(HostedHandleInner {
+                #[cfg(feature = "ui")]
+                attachment_id: uuid::Uuid::new_v4(),
                 terminal_id,
                 commands: command_tx,
                 events: event_rx,
@@ -1108,6 +1112,14 @@ impl HostedTerminalHandle {
     #[cfg(feature = "ui")]
     pub(crate) fn same_attachment(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Local actor identity, including before its first authenticated attach.
+    /// The transport permanently pins the first worker and host; reconnecting
+    /// this actor never grants authority to a successor emulator.
+    #[cfg(feature = "ui")]
+    pub(crate) fn attachment_id(&self) -> uuid::Uuid {
+        self.inner.attachment_id
     }
 
     pub fn terminal_id(&self) -> TerminalId {

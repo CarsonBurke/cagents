@@ -1044,7 +1044,7 @@ struct WidgetState {
     link_hover_spans: Vec<(usize, u16, u16)>,
     review_control_pressed: bool,
     observed_review_revision: Option<u64>,
-    observed_review_identity: Option<crate::model::TerminalId>,
+    observed_review_identity: Option<uuid::Uuid>,
     history_total: u64,
     history_position: super::HistoryPosition,
     completed_read_only: bool,
@@ -1470,7 +1470,7 @@ pub struct TerminalWidget<Message> {
     review_shortcuts: Vec<crate::settings::ShortcutBinding>,
     review_revision: u64,
     on_review: Option<Box<dyn Fn(bool) -> Message>>,
-    terminal_identity: crate::model::TerminalId,
+    review_attachment: uuid::Uuid,
     read_only: bool,
     handle: TerminalSurface,
     snapshot: Arc<RenderSnapshot>,
@@ -1519,7 +1519,7 @@ impl<Message> TerminalWidget<Message> {
         // and selection handling read the same grid, as they do the grid a
         // hidden terminal kept, until the first live frame replaces it.
         let snapshot = handle.frame();
-        let terminal_identity = handle.terminal_id();
+        let review_attachment = handle.attachment_id();
         Self {
             id: None,
             accessible_name: "Terminal".into(),
@@ -1531,7 +1531,7 @@ impl<Message> TerminalWidget<Message> {
             review_shortcuts: Vec::new(),
             review_revision: 0,
             on_review: None,
-            terminal_identity,
+            review_attachment,
             read_only: false,
             handle,
             snapshot,
@@ -1620,11 +1620,11 @@ impl<Message> TerminalWidget<Message> {
         self
     }
     fn reconcile_review(&self, state: &mut WidgetState) {
-        if state.observed_review_identity != Some(self.terminal_identity) {
+        if state.observed_review_identity != Some(self.review_attachment) {
             if let Some(id) = &self.id {
-                state.a11y.borrow_mut().bind(id, self.terminal_identity);
+                state.a11y.borrow_mut().bind(id, self.review_attachment);
             }
-            state.observed_review_identity = Some(self.terminal_identity);
+            state.observed_review_identity = Some(self.review_attachment);
             state.observed_review_revision = None;
         }
         if state.observed_review_revision != Some(self.review_revision) {
@@ -1648,7 +1648,7 @@ impl<Message> TerminalWidget<Message> {
     }
     fn publish_review(&self, active: bool, shell: &mut Shell<'_, Message>) {
         self.review_input_barrier
-            .note_review(self.terminal_identity, active);
+            .note_review(self.review_attachment, active);
         if let Some(callback) = &self.on_review {
             shell.publish(callback(active));
         }
@@ -2170,7 +2170,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let state = tree.state.downcast_ref::<WidgetState>();
         let mut a11y = state.a11y.borrow_mut();
         a11y.barrier = self.review_input_barrier.clone();
-        a11y.bind(id, self.terminal_identity);
+        a11y.bind(id, self.review_attachment);
         a11y.refresh(
             &self.snapshot,
             accessibility::View {
@@ -2297,7 +2297,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             a11y.control_id.as_ref().unwrap().clone(),
         ));
         A11yTree::node_with_child_tree(
-            A11yNode::new(terminal, id.clone()),
+            A11yNode::new(terminal, a11y.root_id.as_ref().unwrap().clone()),
             A11yTree::join(children.into_iter()),
         )
     }
@@ -2436,7 +2436,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             let mut a11y = state.a11y.borrow_mut();
             a11y.barrier = self.review_input_barrier.clone();
             if let Some(id) = &self.id {
-                a11y.bind(id, self.terminal_identity);
+                a11y.bind(id, self.review_attachment);
             }
         }
         if self.on_review.is_some() {
@@ -2518,8 +2518,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if let Event::A11y(id, request) = event {
             use iced_accessibility::accesskit::{Action, ActionData};
             let mut a11y = state.a11y.borrow_mut();
-            let ours = self
-                .id
+            let ours = a11y
+                .root_id
                 .as_ref()
                 .is_some_and(|own| iced_accessibility::IdEq::eq(own, id));
             let control = a11y

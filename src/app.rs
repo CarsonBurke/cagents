@@ -6949,7 +6949,7 @@ pub enum Message {
     },
     TerminalReviewMode {
         card: CardId,
-        terminal: crate::model::TerminalId,
+        terminal: uuid::Uuid,
         active: bool,
     },
     ResizeCard {
@@ -7836,7 +7836,7 @@ pub struct Cagents {
     terminal_review_card: Option<CardId>,
     assistive_technology_active: bool,
     terminal_review_revision: u64,
-    terminal_review_identity: Option<crate::model::TerminalId>,
+    terminal_review_identity: Option<uuid::Uuid>,
     terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
@@ -8083,7 +8083,7 @@ impl Cagents {
         let previous = self.terminal_review_identity;
         self.terminal_review_card = owner;
         self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
-            Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
+            Some(CardRuntime::Terminal(handle)) => Some(handle.attachment_id()),
             _ => None,
         });
         self.terminal_review_input
@@ -8096,7 +8096,7 @@ impl Cagents {
 
         if let Some(owner) = self.terminal_review_card {
             let current_identity = match self.cards.get(&owner) {
-                Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
+                Some(CardRuntime::Terminal(handle)) => Some(handle.attachment_id()),
                 _ => None,
             };
             if self.workspace.focused() != Some(owner)
@@ -12601,7 +12601,7 @@ impl Cagents {
                 message => message,
             }),
             Some(CardRuntime::Terminal(handle)) => {
-                let terminal = handle.terminal_id();
+                let terminal = handle.attachment_id();
                 let find = self.terminal_find.get(&id).filter(|find| find.open);
                 let terminal = crate::file_drop::target(
                     TerminalWidget::new(handle.clone())
@@ -12611,7 +12611,7 @@ impl Cagents {
                         .review_boundary(
                             self.terminal_review_input.clone(),
                             self.terminal_review_card.is_some(),
-                            self.terminal_review_card == Some(id),
+                            self.terminal_review_card == Some(id) && self.terminal_review_identity == Some(terminal),
                             self.terminal_review_revision,
                             move |active| Message::TerminalReviewMode {
                                 card: id,
@@ -19578,7 +19578,7 @@ impl Application for Cagents {
             } => {
                 // Queued requests belong to their originating terminal, not a
                 // successor mounted in the same card while the task was pending.
-                if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
+                if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.attachment_id() == terminal)
                 {
                     self.terminal_review_input.note_review(terminal, false);
                     return Task::none();
@@ -28244,7 +28244,7 @@ mod tests {
     fn terminal_review_revision_acknowledges_same_card_cancellation_and_focus_switch() {
         let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
         let terminal = match app.cards.get(&card).unwrap() {
-            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            CardRuntime::Terminal(handle) => handle.attachment_id(),
             _ => unreachable!(),
         };
         let initial = app.terminal_review_revision;
@@ -28281,7 +28281,7 @@ mod tests {
     fn terminal_review_owner_is_revoked_when_its_runtime_identity_changes() {
         let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
         let terminal = match app.cards.get(&card).unwrap() {
-            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            CardRuntime::Terminal(handle) => handle.attachment_id(),
             _ => unreachable!(),
         };
         drop(app.update(Message::TerminalReviewMode {
@@ -28306,14 +28306,14 @@ mod tests {
     fn queued_review_requests_cannot_claim_or_cancel_a_replacement_terminal() {
         let (mut app, card, _directory) = live_agent_app("owned-old-fixture");
         let old_terminal = match app.cards.get(&card).unwrap() {
-            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            CardRuntime::Terminal(handle) => handle.attachment_id(),
             _ => unreachable!(),
         };
         let (mut replacement, replacement_card, _replacement_directory) =
             live_agent_app("owned-new-fixture");
         let replacement_runtime = replacement.cards.remove(&replacement_card).unwrap();
         let new_terminal = match &replacement_runtime {
-            CardRuntime::Terminal(handle) => handle.terminal_id(),
+            CardRuntime::Terminal(handle) => handle.attachment_id(),
             _ => unreachable!(),
         };
         app.cards.insert(card, replacement_runtime);
@@ -28348,6 +28348,52 @@ mod tests {
         }));
         assert_eq!(app.terminal_review_card, None);
         assert_eq!(app.terminal_review_revision, accepted_revision + 1);
+    }
+
+    #[test]
+    fn review_actions_and_owner_are_scoped_to_the_original_same_id_attachment() {
+        let (mut app, card, _directory) = live_agent_app("review-before-handshake");
+        let CardRuntime::Terminal(original) = app.cards.get(&card).unwrap() else { unreachable!() };
+        let original = original.clone();
+        let old_attachment = original.attachment_id();
+        // Accessibility is usable before the first handshake. A transient
+        // unknown live proof must not disable or clear Review on this actor.
+        assert!(original.execution_instance().is_none());
+        assert!(original.host_proof().is_none());
+        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: true }));
+        app.reconcile_terminal_review_owner();
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert_eq!(app.terminal_review_identity, Some(old_attachment));
+        assert_eq!(original.clone().attachment_id(), old_attachment);
+
+        let peer = crate::terminal::TerminalTestPeer::with_generation(
+            original.terminal_id(), uuid::Uuid::new_v4(),
+            crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("review-successor-host"),
+                boot_id: crate::model::BootId::new("review-successor-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("review-successor-incarnation"),
+            },
+        );
+        let replacement = peer.surface();
+        assert_eq!(replacement.terminal_id(), original.terminal_id());
+        let current_attachment = replacement.attachment_id();
+        assert_ne!(old_attachment, current_attachment);
+        app.cards.insert(card, CardRuntime::Terminal(replacement));
+        app.reconcile_terminal_review_owner();
+        assert_eq!(app.terminal_review_card, None);
+        let revision = app.terminal_review_revision;
+        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: true }));
+        assert_eq!(app.terminal_review_revision, revision);
+        assert_eq!(app.terminal_review_card, None);
+        drop(app.update(Message::TerminalReviewMode { card, terminal: current_attachment, active: true }));
+        let revision = app.terminal_review_revision;
+        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: false }));
+        app.reconcile_terminal_review_owner();
+        assert_eq!(app.terminal_review_identity, Some(current_attachment));
+        assert_eq!(app.terminal_review_card, Some(card));
+        assert_eq!(app.terminal_review_revision, revision);
+        drop(app.update(Message::TerminalReviewMode { card, terminal: current_attachment, active: false }));
+        assert_eq!(app.terminal_review_card, None);
     }
 
     fn busy_chat_snapshot() -> crate::chat::Snapshot {
