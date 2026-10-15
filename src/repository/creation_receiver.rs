@@ -79,11 +79,14 @@ impl ReceivedCreationScopes {
     /// before retaining/using its grant. This does not acquire that guard or
     /// certify any provider, filesystem effect, or Started receipt.
     pub(crate) fn revalidate(&self, store: &StateStore) -> Result<(), RepositoryError> {
-        if store.journaled_worktree_operation(self.operation.id).map_err(|error| invalid(&error.to_string()))?.as_ref() != Some(&self.operation) {
+        let source=self.source.retained_roots()?;
+        let destination=self.destination.retained_roots()?;
+        let fresh=Self::validate_received(store,self.operation.id,self.operation.base_generation,
+            [source.0,source.1,source.2,destination.0,destination.1,destination.2])?;
+        if fresh.operation != self.operation || fresh.record != self.record {
             return Err(invalid("The original settled creation operation changed"));
         }
-        self.source.validate()?;
-        self.destination.validate()
+        Ok(())
     }
 }
 fn invalid(message: &str) -> RepositoryError { ValidationError::Io(message.into()).into() }

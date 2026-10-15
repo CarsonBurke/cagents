@@ -29,6 +29,16 @@ fn received_created_scopes_bind_actual_journal_and_original_six_roles() {
     assert_eq!(accepted.source().path(), fixture.request.repository);
     assert_eq!(accepted.destination().path(), fixture.request.destination);
     accepted.revalidate(&fixture.store).unwrap();
+    let admin=created.transport_roots().unwrap().destination.1;
+    let admin_path=admin.path().to_owned();
+    fs::write(admin_path.join("locked"),b"later operation").unwrap();
+    assert!(accepted.revalidate(&fixture.store).is_err(),"late lock cannot pass final grant admission");
+    fs::remove_file(admin_path.join("locked")).unwrap();
+    let head=fs::read(admin_path.join("HEAD")).unwrap();
+    fs::write(admin_path.join("HEAD"),b"ref: refs/heads/another-branch\n").unwrap();
+    assert!(accepted.revalidate(&fixture.store).is_err(),"late branch redirect cannot pass final grant admission");
+    fs::write(admin_path.join("HEAD"),head).unwrap();
+    accepted.revalidate(&fixture.store).unwrap();
     let mut wrong_roles = received_original_roles(created);
     wrong_roles.swap(1,4); // actual source and destination admin are DIFFERENT
     assert!(ReceivedCreationScopes::validate_received(&fixture.store, created.operation(),
