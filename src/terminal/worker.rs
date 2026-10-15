@@ -316,6 +316,7 @@ type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 /// admission is released. Dropping this receipt never reopens worker input.
 pub(crate) struct TerminalSessionStop {
     handle: TerminalHandle,
+    instance: uuid::Uuid,
     result: Receiver<super::ipc::TerminalCloseResult>,
 }
 impl TerminalSessionStop {
@@ -325,13 +326,16 @@ impl TerminalSessionStop {
             Ok(other) => return Err(format!("Session stop cleanup is unconfirmed: {other:?}")),
             Err(error) => return Err(format!("Session stop cleanup is unconfirmed; its owner remains retained: {error}")),
         }
-        if !self.handle.join_worker_until(deadline,true) {
-            return Err("Terminal stop cleanup exceeded its deadline; its exact owner remains retained".into());
+        // A retained holder can supply independent family proof even when the
+        // worker could not confirm root exit. Run all receipt/filesystem I/O
+        // on the fixed cleanup service, never this deadline-bearing caller.
+        let cleanup=holder::release::stopped_until(&self.handle,self.instance,deadline)?;
+        match cleanup.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(CompletedRelease::Released)=>Ok(()),
+            Ok(CompletedRelease::Deferred)=>Err("Terminal cleanup capacity deferred this stop; its exact owner remains retained for retry".into()),
+            Ok(CompletedRelease::Retained(error))=>Err(error),
+            Err(_)=>Err("Terminal stop cleanup is still unconfirmed; its exact owner remains retained for retry".into()),
         }
-        // A retained holder can supply independent family-cleanup proof even
-        // when the worker could not publish a confirmed root exit. Let that
-        // exact owner reconcile before requiring completed=true.
-        self.handle.release_completed_holder_until(deadline)
 
     }
 }
@@ -1345,7 +1349,7 @@ impl TerminalHandle {
             *priority = Some(Command::StopSession {instance, deadline, reply});
             let _ = published.capture_tx.try_send(());
         }
-        Ok(TerminalSessionStop {handle:self.clone(),result})
+        Ok(TerminalSessionStop {handle:self.clone(),instance,result})
     }
 
     /// Terminal providers currently expose no authoritative turn revision or

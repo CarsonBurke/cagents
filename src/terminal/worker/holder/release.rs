@@ -66,10 +66,28 @@ pub(crate) fn completed(handle: &super::super::TerminalHandle) -> Result<std::sy
     completed_until(handle, Instant::now()+Duration::from_secs(3))
 }
 
+/// The opaque stop receipt owns explicit whole-session admission. Unlike a
+/// natural completion, root-exit uncertainty may still require the retained
+/// holder's independent family proof. Never perform its I/O on the caller.
+pub(crate) fn stopped_until(handle:&super::super::TerminalHandle, instance:uuid::Uuid, deadline:Instant)->Result<std::sync::mpsc::Receiver<CompletedRelease>,String> {
+    if Instant::now()>=deadline {return Err("Terminal stop cleanup deadline expired; retain its exact owner".into());}
+    {
+        let order=handle.inner.published.input_order.try_lock().map_err(|_|"Terminal stop ownership is busy; retain its exact owner".to_owned())?;
+        if handle.execution_instance()!=instance || !order.closing || order.handoff {
+            return Err("Terminal stop no longer owns this exact worker; its replacement was preserved".into());
+        }
+    }
+    submit_completed(handle,deadline)
+}
+
 fn completed_until(handle: &super::super::TerminalHandle, deadline: Instant) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
     if !handle.is_completed() {
         return Err("Terminal is still running; completed cleanup cannot retire it".into());
     }
+    submit_completed(handle,deadline)
+}
+
+fn submit_completed(handle:&super::super::TerminalHandle, deadline:Instant)->Result<std::sync::mpsc::Receiver<CompletedRelease>,String> {
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let task = Task::Completed {
         handle: handle.clone(),
