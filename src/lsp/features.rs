@@ -232,7 +232,11 @@ pub(super) fn convert_feature(store:&SnapshotStore,req:&PendingRequest,snapshot:
         }
         RawFeatureResult::Rename(edit)=>workspace(edit.unwrap_or_default(),LspEditKind::Rename),
         RawFeatureResult::Formatting(edits)=>workspace(lsp_types::WorkspaceEdit{changes:Some(HashMap::from([((*req.uri).clone(),edits.unwrap_or_default())])),..Default::default()},if req.kind==RequestKind::RangeFormatting{LspEditKind::RangeFormatting}else{LspEditKind::Formatting}),
-        RawFeatureResult::CodeActions(items)=>match items.unwrap_or_default().into_iter().map(|item|convert_action(store,req,item)).collect::<Result<Vec<_>,_>>() {Ok(items)=>LspEvent::CodeActions{request:req.id,doc:req.doc,items},Err(e)=>failed(e)},
+        RawFeatureResult::CodeActions(items)=>{
+            let items=items.unwrap_or_default();
+            if items.len()>512 || serde_json::to_vec(&items).map_or(true,|data|data.len()>16*1024*1024){return failed(LspError::Unsupported("code-action response exceeds 512 items or 16 MiB".into()));}
+            match items.into_iter().map(|item|convert_action(store,req,item)).collect::<Result<Vec<_>,_>>(){Ok(items)=>LspEvent::CodeActions{request:req.id,doc:req.doc,items},Err(e)=>failed(e)}
+        },
         RawFeatureResult::CodeActionResolved(item)=>match convert_action(store,req,lsp_types::CodeActionOrCommand::CodeAction(item)){Ok(item)=>LspEvent::CodeActionResolved{request:req.id,doc:req.doc,item},Err(e)=>failed(e)},
         RawFeatureResult::SignatureHelp(help)=>LspEvent::SignatureHelp{request:req.id,doc:req.doc,help:help.map(convert_signature)},
         RawFeatureResult::CommandExecuted(_)=>LspEvent::CommandExecuted{request:req.id,doc:req.doc},
@@ -283,6 +287,12 @@ pub(super) fn convert_workspace_edit(store:&SnapshotStore,edit:lsp_types::Worksp
 
 fn command(c:lsp_types::Command)->LspCommand{LspCommand{title:c.title,command:c.command,arguments:c.arguments.unwrap_or_default()}}
 fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeActionOrCommand)->Result<LspCodeAction,LspError>{
+    let valid_command=|c:&lsp_types::Command|c.title.len()<=4096&&c.command.len()<=4096;
+    let valid=match &raw {
+        lsp_types::CodeActionOrCommand::Command(c)=>valid_command(c),
+        lsp_types::CodeActionOrCommand::CodeAction(c)=>c.title.len()<=4096 && c.kind.as_ref().is_none_or(|kind|kind.as_str().len()<=1024) && c.disabled.as_ref().is_none_or(|disabled|disabled.reason.len()<=4096) && c.command.as_ref().is_none_or(valid_command),
+    };
+    if !valid || serde_json::to_vec(&raw).map_or(true,|data|data.len()>16*1024*1024){return Err(LspError::Unsupported("code-action title, disabled reason, command, or payload exceeds its bounded metadata budget".into()));}
     let (title,kind,is_preferred,disabled,edit,cmd,needs_resolve)=match &raw {
         lsp_types::CodeActionOrCommand::Command(c)=>(c.title.clone(),None,false,None,None,Some(command(c.clone())),false),
         lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),c.edit.is_none()&&c.command.is_none()&&c.data.is_some()),
