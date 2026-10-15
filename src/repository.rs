@@ -6027,7 +6027,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// `rm --cached` and `commit` all refresh the index. A repository that
     /// arrived as an archive carries its own `.git/config`, so without this a
     /// single click on Stage would run code the repository chose.
-    fn git_base(&self, repository: &Path, literal_pathspecs: bool) -> CommandSpec {
+    pub(crate) fn git_base(&self, repository: &Path, literal_pathspecs: bool) -> CommandSpec {
         let mut command = CommandSpec::new(&self.git);
         if literal_pathspecs {
             command = command.arg("--literal-pathspecs");

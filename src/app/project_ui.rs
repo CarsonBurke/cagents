@@ -2642,8 +2642,8 @@ fn delete_worktree(
 }
 
 fn worktree_removal_command(target: &Target, confirmed: &WorktreeSafetySnapshot) -> CommandSpec {
-    let command = CommandSpec::new("git")
-        .cwd(&target.repository)
+    let command = RepositoryService::system("git")
+        .git_base(&target.repository, true)
         .args(["worktree", "remove"]);
     let command = if confirmed.files_to_discard() > 0 {
         command.arg("--force")
