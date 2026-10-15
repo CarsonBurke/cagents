@@ -23,7 +23,19 @@ pub enum Operation {
         provider: Provider,
         key: uuid::Uuid,
     },
+    /// Safe default: sign out and archive; saved transcripts stay on disk.
     Remove {
+        id: AccountId,
+    },
+    InspectRemoval {
+        id: AccountId,
+    },
+    MoveAndArchive {
+        id: AccountId,
+        target: AccountId,
+    },
+    /// Explicit destructive action, confirmed separately in the interface.
+    DeleteFiles {
         id: AccountId,
     },
 }
@@ -58,14 +70,36 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
                 homes.path(*provider, *key),
             )))
         }
-        Operation::Remove { id } => registry
-            .accounts(Some(&homes))
+        Operation::Remove { id }
+        | Operation::MoveAndArchive { id, .. }
+        | Operation::DeleteFiles { id } => registry
+            .all_accounts(Some(&homes))
             .into_iter()
             .find(|account| account.id() == *id)
             .map(Some)
             .ok_or("The device account was removed".into()),
         _ => Ok(None),
     }
+}
+
+/// Move writes the destination history as well, so the daemon fences both homes.
+#[cfg(feature = "host")]
+pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Account>, String> {
+    let mut accounts: Vec<_> = affected_account(operation)?.into_iter().collect();
+    if let Operation::MoveAndArchive { target, .. } = operation {
+        let homes = super::home::Homes::installation();
+        let registry = super::registry::Store::installation()
+            .ok_or("Account registry unavailable")?
+            .load()
+            .map_err(|error| error.to_string())?;
+        let target = registry
+            .accounts(homes.as_ref())
+            .into_iter()
+            .find(|account| account.id() == *target)
+            .ok_or("The destination account was removed")?;
+        accounts.push(target);
+    }
+    Ok(accounts)
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -115,8 +149,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                 return Err("Omp manages its own logins".into());
             }
             let search = runtime.block_on(probe::search_path());
-            let program = probe::find_executable(provider.executable(), search.as_deref())
-                .ok_or("The provider CLI is not installed on this device")?;
+            let program = probe::Cli::discover(provider, search.as_deref())?;
             let system = Account::system(provider).resolved_home();
             let (key, home) = store
                 .create_pending(&homes, provider, now, || {
@@ -132,7 +165,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                 })
                 .map_err(|error| error.to_string())?;
             let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, program) {
+            let recipe = match login_recipe(&account, &program) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     // A launch recipe failure must not strand an unused home
@@ -280,56 +313,177 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
         }
-        Operation::Remove { id } => {
+        Operation::InspectRemoval { id } => {
             let registry = store.load().map_err(|error| error.to_string())?;
             let account = registry
-                .accounts(Some(&homes))
+                .all_accounts(Some(&homes))
                 .into_iter()
                 .find(|account| account.id() == id)
-                .ok_or("The account was already removed from this device")?;
-            let key = account
-                .registry_key()
-                .ok_or("System accounts cannot be removed")?;
-            let (registry, error) = if account.is_linked() {
-                let (registry, ()) = store
-                    .update(|registry| {
-                        registry.unregister(key);
-                    })
-                    .map_err(|error| error.to_string())?;
-                (registry, None)
-            } else {
-                runtime.block_on(probe::logout(account.clone()))?;
-                store
-                    .remove_home(&homes, account.provider, key, true)
-                    .map_err(|error| error.to_string())?
-            };
-            serde_json::to_value((registry, error)).map_err(|error| error.to_string())
+                .ok_or("The account is no longer registered")?;
+            serde_json::to_value(super::handoff::conversation_count(&account)?)
+                .map_err(|error| error.to_string())
+        }
+        operation @ (Operation::Remove { .. }
+        | Operation::MoveAndArchive { .. }
+        | Operation::DeleteFiles { .. }) => {
+            let cache = super::cache::Cache::installation().ok_or(
+                "Account storage cannot be locked; restore the cache directory and retry.",
+            )?;
+            let result = remove_account(operation, &store, &homes, &cache, |account| {
+                runtime.block_on(probe::logout_locked(account))
+            })?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
         }
     }
 }
 
 #[cfg(feature = "host")]
-fn login_recipe(
+fn remove_account(
+    operation: Operation,
+    store: &super::registry::Store,
+    homes: &super::home::Homes,
+    cache: &super::cache::Cache,
+    mut logout: impl FnMut(super::Account) -> Result<(), String>,
+) -> Result<(super::registry::Registry, Option<String>), String> {
+    use super::probe;
+    let (id, target, delete) = match operation {
+        Operation::Remove { id } => (id, None, false),
+        Operation::MoveAndArchive { id, target } => (id, Some(target), false),
+        Operation::DeleteFiles { id } => (id, None, true),
+        _ => unreachable!(),
+    };
+    let registry = store.load().map_err(|error| error.to_string())?;
+    let account = registry
+        .all_accounts(Some(homes))
+        .into_iter()
+        .find(|account| account.id() == id)
+        .ok_or("The account was already removed from this device")?;
+    let key = account
+        .registry_key()
+        .ok_or("System accounts cannot be removed")?;
+    let target = target
+        .map(|id| {
+            registry
+                .accounts(Some(homes))
+                .into_iter()
+                .find(|account| account.id() == id)
+                .ok_or_else(|| "The destination account is unavailable".to_owned())
+        })
+        .transpose()?;
+    let mut affected = vec![&account];
+    affected.extend(target.as_ref());
+    let _locks = probe::lock_accounts(cache, &affected)?;
+    if let Some(target) = &target {
+        super::handoff::move_history(&account, target)?;
+    }
+    let (registry, error) = if account.is_linked() {
+        let (registry, ()) = store
+            .update(|registry| {
+                registry.unregister(key);
+            })
+            .map_err(|error| error.to_string())?;
+        (registry, None)
+    } else {
+        if delete {
+            // Explicit file deletion remains available without an installed
+            // provider CLI. Report failed sign-out separately from deletion.
+            let logout_error = logout(account.clone()).err();
+            let mut annotation_warning = None;
+            let (registry, error) = store
+                .remove_home_checked(homes, account.provider, key, true, || {
+                    annotation_warning = purge_deleted_account_annotations(&account)
+                        .map_err(std::io::Error::other)?;
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
+            let error = match (error, annotation_warning) {
+                (Some(error), Some(warning)) => Some(format!("{error}; {warning}")),
+                (error, warning) => error.or(warning),
+            };
+            let error = match (error, logout_error) {
+                (Some(error), Some(logout)) => Some(format!(
+                    "{error}; provider sign-out could not be confirmed: {logout}"
+                )),
+                (None, Some(logout)) => Some(format!(
+                    "Provider sign-out could not be confirmed: {logout}"
+                )),
+                (error, None) => error,
+            };
+            (registry, error)
+        } else {
+            logout(account.clone())?;
+            let _lifecycle = homes.lifecycle_lock().map_err(|error| error.to_string())?;
+            let (registry, _) = store
+                .update(|registry| registry.archive(key))
+                .map_err(|error| error.to_string())?;
+            (registry, None)
+        }
+    };
+
+    Ok((registry, error))
+}
+
+/// Physical home identity authorizes deletion of retained originals. A missing
+/// home can only use a previously persisted purge-only registration index.
+#[cfg(feature = "host")]
+fn purge_deleted_account_annotations(account: &super::Account) -> Result<Option<String>, String> {
+    use crate::chat::annotations::storage;
+    let home = account.resolved_home().ok_or("The account has no credential directory")?;
+    match std::fs::symlink_metadata(&home) {
+        Ok(_) => {
+            crate::secure_file::reject_symlink_components(&home).map_err(|error| error.to_string())?;
+            let variable = super::home_variable(account.provider)
+                .ok_or("This provider has no attested credential-directory scope")?;
+            let scope = super::scope::LaunchAccountScope::resolve(
+                account.provider,
+                &home,
+                |name| (name == variable).then(|| home.as_os_str().to_owned()),
+            )?;
+            storage::purge_account(&scope)?;
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match storage::purge_registered(&account.id())? {
+                Some(_) => Ok(None),
+                None => Ok(Some("The account home was already absent. No prior physical annotation association was available, so removal of older retained prompt data could not be verified".into())),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn login_recipe(
     account: &super::Account,
-    program: std::path::PathBuf,
+    cli: &super::probe::Cli,
 ) -> Result<crate::model::LaunchRecipe, String> {
-    let mut environment = std::collections::BTreeMap::new();
+    let mut environment = cli.configuration.environment.clone();
+    environment.insert(
+        super::SIGN_IN_MARKER.into(),
+        account.provider.executable().into(),
+    );
+    let mut arguments = cli.configuration.arguments.clone();
+    arguments.extend(match account.provider {
+        Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
+        Provider::Codex => vec!["login".into(), "--device-auth".into()],
+        Provider::Omp => return Err("Omp manages its own sign-in".into()),
+    });
     if let (Some(variable), Some(home)) = (
         super::home_variable(account.provider),
         account.resolved_home(),
     ) {
         environment.insert(variable.into(), home.display().to_string());
     }
-    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.to_str()) {
-        environment.insert("PATH".into(), path.into());
+    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.into_string().ok()) {
+        environment.entry("PATH".into()).or_insert(path);
     }
     Ok(crate::model::LaunchRecipe {
-        program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
-        arguments: match account.provider {
-            Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-            Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp => return Err("Omp manages its own sign-in".into()),
-        },
+        program: cli
+            .program
+            .to_str()
+            .ok_or("Provider path is not UTF-8")?
+            .into(),
+        arguments,
         working_directory: std::env::var_os("HOME")
             .ok_or("Remote HOME is unavailable")?
             .into(),
@@ -346,6 +500,111 @@ fn login_recipe(
 #[cfg(feature = "host")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_lifecycle_refuses_probe_owners_without_changing_homes_or_registry() {
+        use crate::account::{
+            Account,
+            cache::Cache,
+            home::Homes,
+            registry::{Registered, Store},
+        };
+        for action in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let homes = Homes::at(directory.path().join("homes"));
+            let store = Store::at(directory.path().join("config"));
+            let cache = Cache::at(directory.path().join("cache"));
+            let mut accounts = Vec::new();
+            for email in ["a@fixture.invalid", "b@fixture.invalid"] {
+                let (key, home) = homes.create(Provider::Claude, None).unwrap();
+                let account = Account::managed(Provider::Claude, key, home);
+                store
+                    .update(|registry| {
+                        registry
+                            .register(
+                                Registered {
+                                    key,
+                                    provider: Provider::Claude,
+                                    linked_home: None,
+                                    label: None,
+                                    email: Some(email.into()),
+                                    organization: None,
+                                    added_at: 0,
+                                },
+                                &[],
+                            )
+                            .unwrap()
+                    })
+                    .unwrap();
+                accounts.push(account);
+            }
+            let source = &accounts[0];
+            let target = &accounts[1];
+            let relative =
+                std::path::Path::new("projects/fixture/11111111-1111-4111-8111-111111111111.jsonl");
+            let transcript = source.resolved_home().unwrap().join(relative);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, "saved conversation").unwrap();
+            let operation = match action {
+                0 => Operation::Remove { id: source.id() },
+                1 => Operation::MoveAndArchive {
+                    id: source.id(),
+                    target: target.id(),
+                },
+                _ => Operation::DeleteFiles { id: source.id() },
+            };
+            let before = store.load().unwrap();
+            let lock = cache.try_probe_lock(&source.lock_name()).unwrap().unwrap();
+            let error = remove_account(operation.clone(), &store, &homes, &cache, |_| {
+                panic!("must not sign out a probed home")
+            })
+            .unwrap_err();
+            assert!(error.contains("being checked or changed"));
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(&transcript).unwrap(),
+                "saved conversation"
+            );
+            assert!(!target.resolved_home().unwrap().join(relative).exists());
+            drop(lock);
+            if action == 1 {
+                let target_lock = cache.try_probe_lock(&target.lock_name()).unwrap().unwrap();
+                assert!(
+                    remove_account(operation.clone(), &store, &homes, &cache, |_| panic!(
+                        "must not move into a probed home"
+                    ))
+                    .is_err()
+                );
+                assert_eq!(store.load().unwrap(), before);
+                assert!(!target.resolved_home().unwrap().join(relative).exists());
+                // A failed multi-home acquisition releases the already acquired
+                // source guard rather than leaving either account stuck.
+                assert!(cache.try_probe_lock(&source.lock_name()).unwrap().is_some());
+                drop(target_lock);
+            }
+            let (registry, error) =
+                remove_account(operation, &store, &homes, &cache, |_| Ok(())).unwrap();
+            assert!(error.is_none());
+            if action == 2 {
+                assert!(!source.resolved_home().unwrap().exists());
+                assert!(registry.find(source.registry_key().unwrap()).is_none());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&transcript).unwrap(),
+                    "saved conversation"
+                );
+                assert!(registry.is_archived(source.registry_key().unwrap()));
+                assert!(!registry.accounts(Some(&homes)).contains(source));
+                if action == 1 {
+                    assert_eq!(
+                        std::fs::read_to_string(target.resolved_home().unwrap().join(relative))
+                            .unwrap(),
+                        "saved conversation"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn host_lifecycle_creates_isolated_login_and_never_deletes_linked_files() {
@@ -450,6 +709,63 @@ mod tests {
             created.home.is_dir(),
             "lost registration replies never remove the login"
         );
+        // Archive retains original command metadata and attachment bytes;
+        // explicit DeleteFiles purges them while the home is still provable.
+        use crate::chat::annotations::{OriginalPrompt, OriginalSettings, Setting, storage};
+        let account = super::super::Account::managed(Provider::Codex, created.key, created.home.clone());
+        let scope = super::super::scope::LaunchAccountScope::resolve(Provider::Codex, &root,
+            |name| (name == "CODEX_HOME").then(|| created.home.as_os_str().to_owned())).unwrap();
+        let mut annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
+        let image = root.join("picked-image.png");
+        std::fs::write(&image, b"original fixture image").unwrap();
+        let attachment = annotations.retain_attachment(&image).unwrap();
+        let retained_image = attachment.path.clone();
+        let original = OriginalPrompt {
+            user_id: "confirmed-user".into(), turn_id: "confirmed-turn".into(),
+            text_bytes: 16, attachments: vec![attachment],
+            settings: OriginalSettings { model: Setting::Default, reasoning: Setting::Default,
+                fast: Setting::Unsupported, permission: Setting::Default },
+        };
+        annotations.accept(&original, "original request", &[]).unwrap();
+        drop(annotations);
+        let cache = crate::account::cache::Cache::installation().unwrap();
+        remove_account(Operation::Remove { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+        assert!(created.home.is_dir());
+        assert!(retained_image.is_file());
+        let annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
+        assert_eq!(annotations.original(Some("confirmed-user"), 0, 4096).unwrap().text, "original request");
+        drop(annotations);
+        let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(!created.home.exists());
+        assert!(!retained_image.exists());
+        assert!(registry.find(created.key).is_none());
+        assert!(storage::Store::installation(&scope, "provider-confirmed-fixture").is_err());
+        // A prior purge-only association also cleans retained bytes after
+        // external home loss, without inventing a new read authority.
+        for indexed in [true, false] {
+            let (key, home) = homes.create(Provider::Codex, None).unwrap();
+            let account = super::super::Account::managed(Provider::Codex, key, home.clone());
+            store.update(|registry| registry.register(crate::account::registry::Registered {
+                key, provider: Provider::Codex, linked_home: None, label: None,
+                email: Some(format!("absent-{indexed}@fixture.invalid")), organization: None, added_at: 0,
+            }, &[]).unwrap()).unwrap();
+            let retained = if indexed {
+                let scope = super::super::scope::LaunchAccountScope::resolve(Provider::Codex, &root,
+                    |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+                let annotations = storage::Store::installation(&scope, "confirmed-absent-session").unwrap();
+                Some(annotations.retain_attachment(&image).unwrap().path)
+            } else { None };
+            std::fs::remove_dir_all(&home).unwrap();
+            let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+            assert!(registry.find(key).is_none());
+            if let Some(retained) = retained {
+                assert!(!retained.exists());
+                assert!(warning.is_none());
+            } else {
+                assert!(warning.unwrap().contains("No prior physical annotation association"));
+            }
+        }
         let linked = root.join("home/linked-account");
         std::fs::create_dir_all(&linked).unwrap();
         std::fs::write(linked.join(&credential_file), "linked-private-login").unwrap();

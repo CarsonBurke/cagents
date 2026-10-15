@@ -343,12 +343,116 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
+/// Both local UI and remote device lifecycle calls enter this daemon guard.
+/// Idle hosted actors still own their homes and must release them first.
+fn ensure_account_homes_unused(
+    host: &SharedHost,
+    accounts: impl IntoIterator<Item = crate::account::Account>,
+) -> Result<(), ProtocolError> {
+    for account in accounts {
+        let variable = crate::account::home_variable(account.provider).unwrap();
+        let home = account.resolved_home().unwrap();
+        let selected_home = |environment: &std::collections::BTreeMap<String, String>,
+                             cwd: &std::path::Path| {
+            environment.get(variable).filter(|path| !path.is_empty())
+                .map(|path| cwd.join(path))
+                .or_else(|| environment.get("HOME").filter(|path| !path.is_empty())
+                    .map(|path| cwd.join(path).join(if account.provider == crate::agent::Provider::Claude {
+                        ".claude"
+                    } else { ".codex" })))
+        };
+        let selected_recipe = |recipe: &crate::model::LaunchRecipe| {
+            let mut environment = recipe.environment.clone();
+            for name in &recipe.unset_environment { environment.remove(name); }
+            selected_home(&environment, &recipe.working_directory)
+        };
+        // Copy small ownership metadata under HostState. Resolving aliases and
+        // reading retained checkpoints happens after releasing that mutex.
+        let (paths, scopes, closing, upgrade) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let mut paths = Vec::new();
+            let mut scopes = Vec::new();
+            for record in state.terminals.values().filter(|record| !record.handle.is_completed()) {
+                paths.extend(selected_recipe(&record.session.launch));
+                if let Some(environment) = &record.execution_environment {
+                    paths.extend(selected_home(&environment.0, &record.session.launch.working_directory));
+                }
+            }
+            for record in state.chats.values().filter(|record| record.handle.owns_work()) {
+                paths.extend(selected_recipe(&record.session.launch.recipe));
+                paths.extend(selected_home(&record.handle.execution_environment().0,
+                    &record.session.launch.recipe.working_directory));
+                if let Ok(scope) = record.handle.launch_account_scope() {
+                    scopes.push(scope.clone());
+                }
+            }
+            for session in state.chat_spawning.values() {
+                paths.extend(selected_recipe(&session.launch.recipe));
+            }
+            for pending in state.chat_handoffs.values() {
+                paths.extend(selected_recipe(&pending.source().launch.recipe));
+                paths.extend(selected_recipe(&pending.replacement().launch));
+            }
+            (paths, scopes, state.native_closing.values()
+                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence())
+        };
+        use std::os::unix::fs::MetadataExt;
+        let identity = std::fs::metadata(&home).ok().filter(|metadata| metadata.is_dir())
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let uses_path = |path: &std::path::Path| {
+            path == home || identity.is_some_and(|identity| std::fs::metadata(path).ok()
+                .is_some_and(|metadata| metadata.is_dir() && (metadata.dev(), metadata.ino()) == identity))
+        };
+        if closing || paths.iter().any(|path| uses_path(path)) || scopes.iter().any(|scope| {
+            scope.provider == account.provider &&
+                (scope.canonical_home == home || identity == Some((scope.device, scope.inode)))
+        }) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
+                false,
+            ));
+        }
+        // Unattached holders keep their effective environment private. Their
+        // provider is enough to identify uncertainty, not enough to authorize
+        // changing a home. Inspect durable summaries outside HostState.
+        if let Some(store) = upgrade {
+            let retained = store.unattached().map_err(|error| ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                format!("Cannot verify retained account ownership: {error}. Resolve retained conversations before changing accounts."),
+                false,
+            ))?;
+            if retained
+                .iter()
+                .any(|retained| retained.provider == account.provider)
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "This provider has an unattached retained conversation whose account ownership is unresolved. Reattach or close it before changing account homes.",
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::EditWorkspaceModel {
+        edit: crate::workspace_model::ModelEdit::RelocateProject { relocation },
+    } = &request
+    {
+        let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+        ensure_control_open(host)?;
+        super::agent_execution::terminals::admit(host, client_id, &request)?;
+        let model = super::session_locations::relocate(host, client_id, relocation.clone())?;
+        return Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -391,10 +495,7 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
-            | ClientRequest::ChatRecoverAccount {
-                idle_generation: Some(_),
-                ..
-            }
+            | ClientRequest::ChatRecoverAccount { .. }
             | ClientRequest::DeviceOperation {
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
@@ -407,39 +508,11 @@ pub(super) fn process_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
-                let account =
-                    crate::account::remote::affected_account(operation).map_err(|message| {
+                let accounts =
+                    crate::account::remote::affected_accounts(operation).map_err(|message| {
                         ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
                     })?;
-                if let Some(account) = account {
-                    let variable = crate::account::home_variable(account.provider).unwrap();
-                    let home = account.resolved_home().unwrap();
-                    let uses = |recipe: &crate::model::LaunchRecipe| {
-                        recipe
-                            .environment
-                            .get(variable)
-                            .is_some_and(|path| std::path::Path::new(path) == home)
-                    };
-                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    if state
-                        .terminals
-                        .values()
-                        .any(|record| !record.handle.is_completed() && uses(&record.session.launch))
-                        || state.chats.values().any(|record| {
-                            record.handle.owns_work() && uses(&record.session.launch.recipe)
-                        })
-                        || state
-                            .chat_spawning
-                            .values()
-                            .any(|session| uses(&session.launch.recipe))
-                    {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
-                            false,
-                        ));
-                    }
-                }
+                ensure_account_homes_unused(host, accounts)?;
             }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -680,6 +753,7 @@ pub(super) fn process_request(
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }
         | ClientRequest::ChatRecoverAccount { .. }
+        | ClientRequest::ChatAccountSwitchGeneration { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }
         | ClientRequest::ChatStartSelected { .. }
@@ -1386,6 +1460,163 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn account_lifecycle_guard_refuses_idle_and_spawning_hosted_homes() {
+        use crate::{
+            agent::Provider,
+            chat::{
+                self,
+                protocol::{Adapter, ProcessSpec, Step},
+            },
+            model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
+        };
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let account = crate::account::Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            directory.path().join("account"),
+        );
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("account-lifecycle"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(proof.clone()),
+        ));
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                account.resolved_home().unwrap().display().to_string(),
+            )]),
+            unset_environment: Default::default(),
+        };
+        let selected = account.resolved_home().unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        let alias = directory.path().join("selected-home-alias");
+        std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.environment.insert("CLAUDE_CONFIG_DIR".into(), alias.display().to_string());
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {})
+                .unwrap();
+        let id = TerminalId::new();
+        let session = chat::Session {
+            id,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            proof: Some(proof),
+            terminal: None,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe,
+                session_id: None,
+            },
+        };
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.insert(
+                id,
+                super::super::chat::Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: session.clone(),
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: Default::default(),
+                    observations: Default::default(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        assert!(!handle.is_completed());
+        let error = ensure_account_homes_unused(&host, [account.clone()]).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("live terminal, sign-in or conversation")
+        );
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert(
+                "CLAUDE_CONFIG_DIR".into(),
+                directory
+                    .path()
+                    .join("a-different-saved-home")
+                    .display()
+                    .to_string(),
+            );
+        assert!(
+            ensure_account_homes_unused(&host, [account.clone()]).is_err(),
+            "effective startup home through an alias still owns the physical account, even when the saved descriptor differs"
+        );
+        host.lock().unwrap().chats.remove(&id);
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(id, session.clone());
+        assert!(ensure_account_homes_unused(&host, [account.clone()]).is_err());
+        host.lock().unwrap().chat_spawning.clear();
+        handle.close().unwrap();
+        assert!(ensure_account_homes_unused(&host, [account.clone()]).is_ok());
+        let terminal = crate::model::TerminalSession {
+            id,
+            launch: session.launch.recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.recipe.clone(),
+                last_exit: None,
+            },
+        };
+        host.lock().unwrap().chat_handoffs.insert(
+            id,
+            super::super::chat::TerminalHandoff::new(
+                session,
+                terminal,
+                1,
+                Default::default(),
+                Instant::now() + Duration::from_secs(300),
+            ),
+        );
+        assert!(
+            ensure_account_homes_unused(&host, [account.clone()]).is_err(),
+            "an unacknowledged handoff retains its account fence"
+        );
+        host.lock().unwrap().chat_handoffs.clear();
+        assert!(ensure_account_homes_unused(&host, [account]).is_ok());
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {

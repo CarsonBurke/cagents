@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+// Version 78 adds explicit account-switch intent and safe archive/move operations.
+pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -289,6 +290,9 @@ pub enum ClientRequest {
         /// Automatic handoff fences the exact idle actor before replacing it.
         #[serde(default)]
         idle_generation: Option<u64>,
+        /// A user-requested idle switch may replace an available pinned account.
+        #[serde(default)]
+        explicit: bool,
         execution_environment: ChatExecutionEnvironment,
     },
     ChatAttach {
@@ -471,6 +475,10 @@ pub enum ClientRequest {
         pane: crate::model::CardId,
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
+    },
+    /// Read ownership readiness without enabling a hidden transcript stream.
+    ChatAccountSwitchGeneration {
+        source: crate::chat::Session,
     },
 }
 
@@ -779,6 +787,9 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ChatAccountSwitchGeneration {
+        generation: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -880,6 +891,8 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+    /// Exact account switch refused before closing or spawning any provider.
+    AccountSwitchBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

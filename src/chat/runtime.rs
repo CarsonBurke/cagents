@@ -20,9 +20,11 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod directory;
 mod execution;
 mod store;
 mod websocket;
+pub(crate) use directory::DirectoryProof;
 use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
@@ -35,7 +37,40 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+/// Current, actor-confirmed controls, separate from the immutable issued recipe.
+/// Codex can stage model/effort for the next prompt without persisting them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountSwitchOptions {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub permission_mode: Option<String>,
+    pub fast_mode: Option<bool>,
+    pub permissions: Option<super::PermissionSettings>,
+}
+impl AccountSwitchOptions {
+    fn capture(state: &Snapshot) -> Self {
+        Self {
+            model: state.selected_model.clone(),
+            reasoning: state.reasoning.clone(),
+            permission_mode: state.permission_mode.clone(),
+            fast_mode: state.fast_mode.as_ref().map(super::FastMode::enabled),
+            permissions: state.permissions.clone(),
+        }
+    }
+}
+
 enum ActorCommand {
+    AccountNotice(String),
+    AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
+    CloseForAccountSwitch {
+        generation: u64,
+        admitted: crossbeam_channel::Sender<Option<AccountSwitchOptions>>,
+    },
+    CaptureExecutionDirectory {
+        directory: std::path::PathBuf,
+        proof: crossbeam_channel::Sender<Result<DirectoryProof, String>>,
+    },
+    RelocateExecutionDirectory(std::path::PathBuf),
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -127,6 +162,7 @@ impl Handle {
     }
 }
 struct Inner {
+    pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
@@ -141,6 +177,7 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
@@ -149,6 +186,20 @@ struct Inner {
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
+}
+
+fn capture_account_scope(
+    spec: &ProcessSpec,
+    provider: crate::agent::Provider,
+) -> Result<crate::account::scope::LaunchAccountScope, String> {
+    if matches!(spec.transport, TransportSpec::History) {
+        return Err("Read-only history has no authenticated provider launch scope".into());
+    }
+    crate::account::scope::LaunchAccountScope::resolve(provider, &spec.working_directory, |name| {
+        (!spec.unset_environment.contains(name))
+            .then(|| spec.environment.get(name).map(std::ffi::OsString::from))
+            .flatten()
+    })
 }
 
 enum NativeOwnership {
@@ -168,7 +219,7 @@ impl Handle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+        Self::start_inner(spec, adapter, initial, store, session_id, None, Err("This actor has no typed provider launch scope".into()), notify)
     }
 
     pub(crate) fn start_owned(
@@ -181,6 +232,7 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
+        let account_scope = capture_account_scope(&spec, source.launch.provider);
         Self::start_inner(
             spec,
             adapter,
@@ -188,6 +240,7 @@ impl Handle {
             store,
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
+            account_scope,
             notify,
         )
     }
@@ -205,6 +258,8 @@ impl Handle {
             .server_process
             .ok_or("Missing retained app-server process identity")?;
         spec.environment = recovery.execution_environment.0;
+        let account_scope = recovery.launch_account_scope
+            .ok_or_else(|| "The retained provider has no captured credential-directory scope".to_owned());
         Self::start_inner(
             spec,
             adapter,
@@ -212,6 +267,7 @@ impl Handle {
             store,
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
+            account_scope,
             notify,
         )
     }
@@ -223,6 +279,7 @@ impl Handle {
         store: Store,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
+        launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -301,7 +358,13 @@ impl Handle {
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
+        let pinned_directory = Arc::new(Mutex::new(
+            spec.execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor()),
+        ));
         let inner = Arc::new(Inner {
+            pinned_directory: pinned_directory.clone(),
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
@@ -318,6 +381,7 @@ impl Handle {
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
+            launch_account_scope,
             recovery_environment,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
@@ -335,6 +399,7 @@ impl Handle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    pinned_directory,
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
                     child: None,
@@ -524,6 +589,28 @@ impl Handle {
         }
         Ok(handle)
     }
+    pub(crate) fn account_switch_notice(
+        &self,
+        source: &super::Launch,
+        target: &super::Launch,
+    ) -> Result<(), String> {
+        let home = crate::account::home_variable(target.provider).unwrap_or_default();
+        let source = source
+            .recipe
+            .environment
+            .get(home)
+            .map(String::as_str)
+            .unwrap_or("system");
+        let target = target
+            .recipe
+            .environment
+            .get(home)
+            .map(String::as_str)
+            .unwrap_or("system");
+        // Account identifiers are non-secret metadata; never include credentials.
+        self.ownership_command(ActorCommand::AccountNotice(format!("Account switched from {source} to {target}. This is the same saved conversation; provider caches may be rebuilt.")))
+    }
+
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command).map_err(String::from)
     }
@@ -602,6 +689,15 @@ impl Handle {
             })?
             .map_err(Rejection::Refused)
     }
+    pub(crate) fn relocate_execution_directory(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        self.ownership_command(ActorCommand::RelocateExecutionDirectory(
+            directory.to_path_buf(),
+        ))
+    }
+
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
@@ -638,6 +734,125 @@ impl Handle {
         self.close_for_resume()
     }
 
+    /// None proves the close was refused before teardown or handoff effects.
+    /// Errors are uncertain and must never authorize an automatic retry.
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<AccountSwitchOptions>, String> {
+        if matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            self.0.retain_cleanup_receipt.store(true, Ordering::Release);
+        }
+        let (admitted, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseForAccountSwitch {
+            generation,
+            admitted,
+        })?;
+        let admitted = response.try_recv().map_err(|error| {
+            format!("Account-switch close admission was not acknowledged: {error}")
+        })?;
+        if admitted.is_some() {
+            self.close_for_resume()?;
+        }
+        Ok(admitted)
+    }
+
+    /// Restore controls only after exact-thread confirmation. No prompt is issued,
+    /// and the successor's published launch recipe remains the original contract.
+    pub(crate) fn restore_account_options(
+        &self,
+        options: &AccountSwitchOptions,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut model_sent = false;
+        let mut permission_sent = false;
+        let mut fast_sent = false;
+        let mut permissions_requested = false;
+        loop {
+            if cancelled() || self.is_completed() {
+                return Err("The account switch stopped before the current conversation options were confirmed".into());
+            }
+            if let Some(failure) = self.failure() {
+                return Err(failure);
+            }
+            let snapshot = self
+                .snapshot(None)
+                .ok_or("The account switch options are unavailable")?;
+            if snapshot.ready {
+                let model_matches = options.model.is_none()
+                    || (snapshot.selected_model == options.model
+                        && snapshot.reasoning == options.reasoning);
+                let permission_matches = options.permission_mode.is_none()
+                    || snapshot.permission_mode == options.permission_mode;
+                let fast_matches = options.fast_mode.is_none()
+                    || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)
+                        == options.fast_mode;
+                // Account-owned inherited rules are never rewritten as session
+                // rules. If known permissions differ, refuse the seamless handoff
+                // rather than silently losing a restriction or granting access.
+                let permissions_match =
+                    options.permissions.is_none() || snapshot.permissions == options.permissions;
+                if model_matches && permission_matches && fast_matches && permissions_match {
+                    return Ok(());
+                }
+                if options.fast_mode == Some(false)
+                    && snapshot
+                        .fast_mode
+                        .as_ref()
+                        .is_some_and(super::FastMode::enabled)
+                {
+                    // A successor may restart with the issued recipe's fast tier.
+                    // Disable it and await confirmation before a non-fast model
+                    // can be selected. Enabling follows model restoration below.
+                    if !fast_sent {
+                        self.command(Command::SetFastMode { enabled: false })?;
+                        fast_sent = true;
+                    }
+                } else if !model_matches
+                    && !model_sent
+                    && snapshot
+                        .models
+                        .iter()
+                        .any(|model| Some(&model.id) == options.model.as_ref())
+                {
+                    self.command(Command::SetModel {
+                        model: options.model.clone().expect("a differing known model"),
+                        reasoning: options.reasoning.clone(),
+                    })?;
+                    model_sent = true;
+                } else if model_matches && !permission_matches && !permission_sent {
+                    self.command(Command::SetPermissionMode {
+                        mode: options
+                            .permission_mode
+                            .clone()
+                            .expect("a differing known permission mode"),
+                    })?;
+                    permission_sent = true;
+                } else if model_matches && permission_matches && !fast_matches && !fast_sent {
+                    self.command(Command::SetFastMode {
+                        enabled: options.fast_mode.expect("a differing known fast mode"),
+                    })?;
+                    fast_sent = true;
+                } else if model_matches
+                    && permission_matches
+                    && !permissions_match
+                    && !permissions_requested
+                {
+                    self.command(Command::RefreshPermissions)?;
+                    permissions_requested = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Checks readiness on the actor after all previously queued commands.
     /// The caller must hold the host's exclusive control gate until checkpoint
     /// preparation finishes: a snapshot alone cannot fence a command whose
@@ -649,6 +864,15 @@ impl Handle {
         response
             .try_recv()
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
+    /// An actor-ordered metadata barrier; never hydrates transcript history.
+    pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::AccountSwitchGeneration(reply))?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Account-switch readiness was not acknowledged: {error}"))
     }
 
     pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
@@ -920,6 +1144,18 @@ impl Handle {
     }
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
+    }
+    /// A completed source has no further actor publications. Retain its last
+    /// actor-published controls when its approved directory pin can be handed on.
+    pub(crate) fn completed_account_options(&self) -> Option<AccountSwitchOptions> {
+        self.is_completed().then(|| AccountSwitchOptions::capture(
+            &self.0.state.lock().unwrap_or_else(|p| p.into_inner())))
+    }
+
+    pub(crate) fn launch_account_scope(
+        &self,
+    ) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
+        self.0.launch_account_scope.as_ref().map_err(String::as_str)
     }
     pub(crate) fn recovery_environment_matches(
         &self,
@@ -1309,7 +1545,7 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if let Some(directory) = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .and_then(|context| context.directory_descriptor())
     {
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
@@ -1503,6 +1739,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
@@ -1912,7 +2149,74 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::CaptureExecutionDirectory { directory, proof } => {
+                    let result = directory::capture(self, &directory);
+                    let _ = proof.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::AccountSwitchGeneration(readiness) => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let generation = (self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty())
+                    .then_some(state.generation);
+                    drop(state);
+                    let _ = readiness.send(generation);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                ActorCommand::AccountNotice(text) => {
+                    let result = self.step(Step {
+                        events: vec![Event::Item(Item {
+                            started_at: super::now_ms(),
+                            id: format!("cagents-account-switch-{}", uuid::Uuid::new_v4()),
+                            role: super::Role::System,
+                            content: ItemContent::Text {
+                                text,
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                            at: super::now_ms(),
+                        })],
+                        ..Step::default()
+                    });
+                    let _ = reply.send(result);
+                    continue;
+                }
+                ActorCommand::RelocateExecutionDirectory(directory) => {
+                    let result: Result<(), String> = (|| {
+                        let context = self
+                            .launch_context
+                            .as_ref()
+                            .ok_or("The provider has no approved directory identity")?;
+                        if context.directory_identity()?.is_none() {
+                            return Err("The provider has no approved directory identity".into());
+                        }
+                        crate::secure_file::reject_symlink_components(&directory)
+                            .map_err(|error| error.to_string())?;
+                        context.verify_directory(&directory)?;
+                        if self.working_directory == directory {
+                            return Ok(());
+                        }
+                        self.adapter.relocate_directory(&directory)?;
+                        if let Err(error) = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .relocate_file_directory(&directory)
+                        {
+                            let _ = self.adapter.relocate_directory(&self.working_directory);
+                            return Err(error);
+                        }
+                        self.working_directory = directory;
+                        self.dirty = true;
+                        Ok(())
+                    })();
+                    let _ = reply.send(result);
+                    continue;
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -1960,6 +2264,23 @@ impl Actor {
                         }
                     }
                     (None, Command::Interrupt)
+                }
+                ActorCommand::CloseForAccountSwitch {
+                    generation,
+                    admitted,
+                } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let idle = state.generation == generation
+                        && self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty();
+                    if idle {
+                        self.stop.store(true, Ordering::Release);
+                    }
+                    let options = idle.then(|| AccountSwitchOptions::capture(&state));
+                    let _ = admitted.send(options);
+                    let _ = reply.send(Ok(()));
+                    continue;
                 }
                 ActorCommand::CloseIfIdle { generation } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -3248,6 +3569,104 @@ mod tests {
     }
 
     #[test]
+    fn same_inode_project_move_updates_actor_paths_without_new_process_authority() {
+        struct PathAware {
+            directory: std::path::PathBuf,
+            calls: Arc<Mutex<Vec<std::path::PathBuf>>>,
+        }
+        impl Adapter for PathAware {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+                self.directory = directory.into();
+                Ok(())
+            }
+            fn command(&mut self, _command: Command) -> Result<Step, String> {
+                self.calls.lock().unwrap().push(self.directory.clone());
+                Ok(Step::default())
+            }
+            fn command_for_run(
+                &mut self,
+                _run: crate::model::RunId,
+                command: Command,
+            ) -> Result<Step, String> {
+                self.command(command)
+            }
+            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        let original = Arc::new(std::fs::File::open(&old).unwrap());
+        let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(
+            original,
+        )));
+        let spec = ProcessSpec {
+            execution: Some(context),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: old.clone(),
+            environment: BTreeMap::new(),
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(PathAware {
+                directory: old.clone(),
+                calls: calls.clone(),
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let moved = fixture.path().join("moved");
+        std::fs::rename(&old, &moved).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        handle.relocate_execution_directory(&moved).unwrap();
+        handle
+            .command_for_run(
+                crate::model::RunId::new(),
+                Command::Prompt {
+                    text: "fixture".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send,
+                },
+            )
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
+        assert!(
+            handle.relocate_execution_directory(&old).is_err(),
+            "reused path is another inode, not the approved process directory"
+        );
+        std::fs::rename(&moved, fixture.path().join("retained")).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        assert!(
+            handle
+                .command(Command::Prompt {
+                    text: "replacement must refuse".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send
+                })
+                .is_err()
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
         use super::super::protocol::{ExecutionContext, LaunchOutcome};
         let directory = tempfile::tempdir().unwrap();
@@ -3385,6 +3804,42 @@ mod tests {
 
     use super::super::Role;
     use super::*;
+
+    #[test]
+    fn account_scope_captures_actual_startup_environment_after_unsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let selected = home.join(".claude");
+        std::fs::create_dir_all(&selected).unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(), arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                ("CLAUDE_CONFIG_DIR".into(), directory.path().join("removed-override").to_string_lossy().into_owned()),
+            ]),
+            unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let source = super::super::Session {
+            id: crate::model::TerminalId::new(), proof: None, terminal: None,
+            native_continuity: Default::default(), owned_codex_listener: None,
+            launch: super::super::Launch { provider: crate::agent::Provider::Claude, recipe, session_id: None },
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start_owned(spec, adapter, initial, store, source, Default::default(), |_| {}).unwrap();
+        let captured = handle.launch_account_scope().unwrap().clone();
+        assert_eq!(captured.canonical_home, selected.canonicalize().unwrap());
+        assert!(!handle.execution_environment().0.contains_key("CLAUDE_CONFIG_DIR"));
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(handle.launch_account_scope().unwrap(), &captured);
+        std::fs::rename(&selected, home.join("old-claude")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(handle.launch_account_scope().unwrap().revalidate().is_err());
+        handle.close().unwrap();
+    }
     use serde_json::{Value, json};
 
     #[test]

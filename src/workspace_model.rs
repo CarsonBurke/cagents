@@ -31,7 +31,8 @@ pub const PENDING_ORDINAL: u32 = u32::MAX;
 ///
 /// The canonical repository path is the key because a [`crate::model::ProjectId`]
 /// is minted per window and re-keying one would cascade through the `worktrees`
-/// foreign key. A path is the real identity of a project and needs no migration.
+/// foreign key. Explicit Locate edits migrate this key atomically while preserving
+/// channel, view and pane identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProject {
     pub repository: PathBuf,
@@ -156,6 +157,33 @@ pub fn reorder_navigation(
     true
 }
 
+/// Current logical ownership and the verified operational spelling of one
+/// accepted agent's directory. Its immutable launch spec remains provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLocation {
+    pub agent: crate::model::AgentId,
+    pub repository: PathBuf,
+    pub directory: PathBuf,
+    pub blocked_directory: Option<PathBuf>,
+}
+
+/// Actionable location failures only. Private launch/process/directory proof
+/// records remain in the daemon and never cross the presentation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocationRefusal {
+    pub session: crate::model::TerminalId,
+    pub directory: PathBuf,
+    pub reason: String,
+}
+
+impl AgentLocation {
+    /// Logical placement can be restored even when process authority refuses
+    /// to move to a replacement inode. This path grants no execution authority.
+    pub fn logical_directory(&self) -> &Path {
+        self.blocked_directory.as_deref().unwrap_or(&self.directory)
+    }
+}
+
 /// The shared sidebar model as the registry currently holds it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
@@ -185,6 +213,10 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    #[serde(default)]
+    pub agent_locations: Vec<AgentLocation>,
+    #[serde(default)]
+    pub session_location_refusals: Vec<SessionLocationRefusal>,
 }
 
 impl WorkspaceModel {
@@ -234,6 +266,76 @@ impl WorkspaceModel {
                         kind: *kind,
                         ordinal: PENDING_ORDINAL,
                     }),
+                }
+            }
+            ModelEdit::RelocateProject { relocation } => {
+                if self
+                    .projects
+                    .iter()
+                    .any(|project| project.repository == relocation.destination)
+                {
+                    return;
+                }
+                for project in &mut self.projects {
+                    if project.repository == relocation.repository {
+                        project.repository = relocation.destination.clone();
+                    }
+                }
+                let channels = self
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.repository == relocation.repository)
+                    .map(|channel| channel.id)
+                    .collect::<std::collections::HashSet<_>>();
+                for channel in &mut self.channels {
+                    if channel.repository == relocation.repository {
+                        channel.repository = relocation.destination.clone();
+                    }
+                }
+                for order in &mut self.navigation_orders {
+                    if order.repository == relocation.repository {
+                        order.repository = relocation.destination.clone();
+                        for item in &mut order.items {
+                            if let NavigationItem::Worktree(path) = item {
+                                relocation.path(path);
+                            }
+                        }
+                    }
+                }
+                for view in &mut self.views {
+                    let owned = match &view.scope {
+                        views::Scope::Channel(channel) => channels.contains(channel),
+                        views::Scope::Worktree { repository, .. } => {
+                            *repository == relocation.repository
+                        }
+                    };
+                    if owned {
+                        relocation.view(view);
+                        view.revision = view.revision.saturating_add(1);
+                    }
+                }
+                let owned_agents = self
+                    .agent_locations
+                    .iter()
+                    .filter(|location| location.repository == relocation.repository)
+                    .map(|location| location.agent)
+                    .collect::<std::collections::HashSet<_>>();
+                for location in &mut self.agent_locations {
+                    if location.repository == relocation.repository {
+                        location.repository = relocation.destination.clone();
+                    }
+                }
+                for agent in &mut self.agents {
+                    if owned_agents.contains(&agent.id)
+                        || agent.spec.target.repository == relocation.repository
+                    {
+                        relocation.agent(agent);
+                    }
+                }
+                self.closed_projects
+                    .retain(|path| *path != relocation.destination);
+                if !self.closed_projects.contains(&relocation.repository) {
+                    self.closed_projects.push(relocation.repository.clone());
                 }
             }
             ModelEdit::CloseProject { repository } => {
@@ -338,6 +440,10 @@ pub enum ModelEdit {
     /// Removes the project and every channel inside it. A project nobody has
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
+    /// Atomically preserve project/channel/pane identity at a located path.
+    RelocateProject {
+        relocation: crate::project_recovery::Relocation,
+    },
     /// Idempotent by id. The id is minted by the client, the rank by the
     /// registry.
     CreateChannel {
@@ -424,6 +530,17 @@ impl ModelEdit {
                 before,
                 fallback,
             },
+            Self::RelocateProject { relocation } => {
+                relocation.validate()?;
+                Self::RelocateProject {
+                    relocation: crate::project_recovery::Relocation {
+                        repository: canonical_repository(&relocation.repository)?,
+                        destination: canonical_repository(&relocation.destination)?,
+                        old_root: canonical_repository(&relocation.old_root)?,
+                        new_root: canonical_repository(&relocation.new_root)?,
+                    },
+                }
+            }
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },
@@ -524,6 +641,37 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn session_location_refusals_roundtrip_and_missing_legacy_field_defaults_empty() {
+        let model = WorkspaceModel {
+            session_location_refusals: vec![SessionLocationRefusal {
+                session: crate::model::TerminalId::new(),
+                directory: "/located/project".into(),
+                reason: "Recover the original provider or close this pane explicitly".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_slice::<WorkspaceModel>(&serde_json::to_vec(&model).unwrap()).unwrap(),
+            model
+        );
+        assert_eq!(
+            postcard::from_bytes::<WorkspaceModel>(&postcard::to_stdvec(&model).unwrap()).unwrap(),
+            model
+        );
+        let mut legacy = serde_json::to_value(&model).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("session_location_refusals");
+        assert!(
+            serde_json::from_value::<WorkspaceModel>(legacy)
+                .unwrap()
+                .session_location_refusals
+                .is_empty()
+        );
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {

@@ -52,6 +52,8 @@ pub(in crate::app) struct Table {
     pub(in crate::app) confirm_remove: Option<AccountId>,
     /// How many open cards run on the account being removed.
     pub(in crate::app) confirm_in_use: usize,
+    pub(in crate::app) confirm_conversations: Option<Result<usize, String>>,
+    pub(in crate::app) confirm_delete: String,
     pub(in crate::app) add_menu: bool,
     pub(in crate::app) own_codex_config: bool,
     /// The row being renamed, and the name typed so far.
@@ -119,7 +121,7 @@ enum Column {
 const GUTTER: f32 = space::L;
 const COLUMN_SPACING: f32 = space::M;
 const ACCOUNT_MIN_WIDTH: f32 = 180.0;
-const ACTIONS_WIDTH: f32 = design::COMPACT_CONTROL_SIZE * 2.0 + design::GRID_UNIT;
+const ACTIONS_WIDTH: f32 = 112.0;
 const USAGE_WIDTH: f32 = 128.0;
 const NARROW_USAGE_WIDTH: f32 = 96.0;
 /// The widest the table grows: past this a row is a long way to read
@@ -304,14 +306,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
         sections.push(link_form(state, *provider, path));
     }
     for provider in Account::REPORTED {
-        // A provider accounts cannot be added to is listed only while it
-        // reports some, or its record of them cannot be read.
-        if Account::PROVIDERS.contains(&provider)
-            || !rows(state, provider, state.table.sort).is_empty()
-            || (provider == Provider::Omp && state.omp_problem().is_some())
-        {
-            sections.push(group(app, provider, &layout, project));
-        }
+        sections.push(group(app, provider, &layout, project));
     }
     widget::scrollable(
         widget::container(
@@ -564,6 +559,20 @@ fn group<'a>(
         .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
+    if provider == Provider::Omp {
+        lines.push(
+            widget::column::with_children(vec![
+                design::caption("Managed by Omp · Omp chooses and rotates its own accounts.")
+                    .into(),
+                crate::ui_controls::button::secondary("Omp account documentation")
+                    .on_press(Message::AccountUi(Action::Documentation))
+                    .into(),
+            ])
+            .spacing(space::S)
+            .padding(space::M)
+            .into(),
+        );
+    }
     if (count > 0 || !logins.is_empty()) && !layout.stacked {
         lines.push(column_titles(layout));
     }
@@ -651,9 +660,10 @@ fn line<'a>(
     widget::container(
         widget::row::with_children(items)
             .spacing(COLUMN_SPACING)
-            .height(height),
+            .height(Length::Shrink),
     )
-    .padding([0.0, space::M])
+    .min_height(height)
+    .padding([space::XS, space::M])
     .into()
 }
 
@@ -828,7 +838,11 @@ fn account_cell<'a>(
         .filter(|other| other.present || !other.account.is_system())
         .count()
         > 1;
-    if several && state.registry.is_default(&account.account) && renaming.is_none() {
+    if several
+        && !state.registry.automatic(account.account.provider)
+        && state.registry.is_default(&account.account)
+        && renaming.is_none()
+    {
         title.push(crate::ui_controls::badge(
             "Default",
             design::Tone::Themed(design::muted_color),
@@ -890,6 +904,20 @@ fn account_cell<'a>(
             .align_y(Alignment::Center)
             .into(),
     ];
+    if let Some(reason) = status_reason(account) {
+        lines.push(
+            design::caption(reason)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+        );
+    }
+    if let Some(conflict) = state.login_conflict(account) {
+        lines.push(
+            design::caption(conflict.detail())
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+        );
+    }
     if !subtitle.is_empty() {
         lines.push(
             design::caption(subtitle.join(" · "))
@@ -951,7 +979,7 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
 }
 
 /// How an account stands, in a word and a tone.
-fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::Color) {
+pub(super) fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::Color) {
     let Some(snapshot) = &account.snapshot else {
         return if account.failure.is_some() {
             ("Unavailable", design::muted_color)
@@ -966,6 +994,25 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
         UsageStatus::NeedsLogin => ("Signed out", design::warning_color),
         UsageStatus::Unavailable => ("Unavailable", design::muted_color),
     }
+}
+
+fn status_reason(account: &AccountState) -> Option<String> {
+    if let Some(failure) = &account.failure {
+        return Some(format!("Last check failed: {failure}"));
+    }
+    let Some(snapshot) = &account.snapshot else {
+        return Some("Usage has not been checked yet; refresh to check this account.".into());
+    };
+    snapshot
+        .detail
+        .clone()
+        .filter(|detail| !detail.trim().is_empty())
+        .or_else(|| {
+            snapshot
+                .windows
+                .is_empty()
+                .then(|| "Usage not reported for this plan.".into())
+        })
 }
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
@@ -1017,6 +1064,17 @@ fn actions<'a>(
     };
     let first: Element<'a, Message> = if removing {
         design::caption("Removing…").into()
+    } else if account
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.status == UsageStatus::NeedsLogin)
+    {
+        crate::ui_controls::button::primary("Sign in")
+            .on_press_maybe(
+                (!app.account_sign_in_running(&account.account))
+                    .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
+            )
+            .into()
     } else {
         refresh_control(account, now).into()
     };
@@ -1026,24 +1084,11 @@ fn actions<'a>(
         .into()
 }
 
-/// What removing an account does to the cards open on it.
-fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
-    match cards {
-        0 => iced::widget::Space::new().into(),
-        count => design::caption(if linked {
-            format!(
-                "{count} open {} on this home and will keep running.",
-                if count == 1 { "card runs" } else { "cards run" }
-            )
-        } else {
-            format!(
-                "{count} open {} this account. Running processes are not stopped, but may lose access after sign-out.",
-                if count == 1 { "card uses" } else { "cards use" },
-            )
-        })
-        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-        .into(),
-    }
+/// Open panes must release the home before any sign-out or deletion.
+fn in_use_warning<'a>(cards: usize, _linked: bool) -> Element<'a, Message> {
+    design::caption(if cards == 0 { String::new() } else {
+        format!("Close {cards} open pane(s) using this home before changing it. Hosted sessions on any window or device must also be closed.")
+    }).wrapping(cosmic::iced::widget::text::Wrapping::Word).into()
 }
 
 fn menu<'a>(
@@ -1055,40 +1100,90 @@ fn menu<'a>(
     let action = |action| Message::AccountUi(action);
     let id = &account.id;
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
-        widget::column::with_children(vec![
-            design::body(format!("Remove {}?", state.display_name(account))).into(),
+        let count = match &state.table.confirm_conversations {
+            Some(Ok(count)) => format!("{count} saved conversation(s) in this account home."),
+            Some(Err(error)) => format!(
+                "Could not count saved conversations: {error}. Archive preserves all files."
+            ),
+            None => "Counting saved conversations…".into(),
+        };
+        let ready = state.table.confirm_in_use == 0;
+        let mut content = vec![
+            design::body(format!("Archive {}?", state.display_name(account))).into(),
+            design::caption(count).into(),
             design::caption(if account.account.is_linked() {
-                "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
+                "This forgets the linked home. Its login, conversations and files stay where they are."
             } else {
-                format!(
-                    "{} signs this account out and cagents deletes its files. Resuming saved conversations will require choosing another account that can access them.",
-                    probe::cli_name(account.account.provider)
-                )
-            })
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
+                "Archive signs out and hides this account from routing. All transcripts and files stay on disk. Link the home again to restore it, or choose another account to resume a saved conversation."
+            }).wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
             in_use_warning(state.table.confirm_in_use, account.account.is_linked()),
+        ];
+        if !account.account.is_linked() {
+            for target in state
+                .of(account.account.provider)
+                .filter(|target| target.id != *id && state.login_conflict(target).is_none())
+            {
+                content.push(
+                    crate::ui_controls::button::secondary(format!(
+                        "Move conversations to {} and archive",
+                        state.display_name(target)
+                    ))
+                    .on_press_maybe(
+                        ready
+                            .then(|| action(Action::MoveAndArchive(id.clone(), target.id.clone()))),
+                    )
+                    .into(),
+                );
+            }
+            content.push(design::caption("Delete files permanently removes this home's conversations and caches. This cannot be undone. Type the account name to enable deletion.").into());
+            content.push(
+                crate::ui_controls::field::text(
+                    "Account name to confirm deletion",
+                    &state.table.confirm_delete,
+                )
+                .on_input(|text| action(Action::RemovalDeleteInput(text)))
+                .into(),
+            );
+            content.push(
+                crate::ui_controls::button::destructive("Delete files permanently")
+                    .on_press_maybe(
+                        (ready
+                            && matches!(state.table.confirm_conversations, Some(Ok(_)))
+                            && state.table.confirm_delete == state.display_name(account))
+                        .then(|| action(Action::DeleteAccountFiles(id.clone()))),
+                    )
+                    .into(),
+            );
+        }
+        content.push(
             widget::row::with_children(vec![
-                iced::widget::Space::new().width(Length::Fill).into(),
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press(action(Action::RemoveCancel))
                     .into(),
-                crate::ui_controls::button::destructive("Remove")
-                    .on_press(action(Action::RemoveConfirm(id.clone())))
-                    .into(),
+                crate::ui_controls::button::primary(if account.account.is_linked() {
+                    "Forget link"
+                } else {
+                    "Archive"
+                })
+                .on_press_maybe(ready.then(|| action(Action::RemoveConfirm(id.clone()))))
+                .into(),
             ])
             .spacing(space::S)
             .into(),
-        ])
-        .spacing(space::S)
-        .padding(space::S)
-        .into()
+        );
+        widget::column::with_children(content)
+            .spacing(space::S)
+            .padding(space::S)
+            .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
-        if state.login_conflict(account).is_none() && !state.registry.is_default(&account.account) {
+        if state.login_conflict(account).is_none()
+            && (state.registry.automatic(account.account.provider)
+                || !state.registry.is_default(&account.account))
+        {
             items.push(
                 crate::ui_controls::popover_item(
-                    Icon::Check,
+                    Icon::Avatar,
                     "Set as default",
                     "New conversations and shell terminals use this account",
                     action(Action::SetDefault(id.clone())),
@@ -1185,7 +1280,7 @@ fn menu<'a>(
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
                     } else {
-                        "Sign out and delete this account's files"
+                        "Archive safely; keep saved conversations and files"
                     },
                     action(Action::Remove(id.clone())),
                 )
@@ -1310,7 +1405,7 @@ mod tests {
         }
         assert_eq!(dropped, Column::DROP_ORDER.to_vec());
         assert!(!wide.stacked && !wide.compact_toolbar);
-        let narrow = layout(520.0);
+        let narrow = layout(580.0);
         assert_eq!(narrow.columns, [Column::Session, Column::Weekly]);
         assert_eq!(narrow.usage, NARROW_USAGE_WIDTH);
         assert!(!narrow.stacked && narrow.compact_toolbar);
@@ -1348,6 +1443,25 @@ mod tests {
             snapshot
         });
         state
+    }
+
+    #[test]
+    fn account_reasons_are_available_as_visible_captions_without_hover() {
+        let mut state = account_with(Provider::Claude, 1, None);
+        state.failure = Some("Fixture provider could not connect".into());
+        assert!(status_reason(&state).unwrap().contains("could not connect"));
+        state.failure = None;
+        let mut snapshot = UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "Usage not reported for this plan",
+            0,
+        );
+        snapshot.detail = Some("Usage not reported for this plan".into());
+        state.snapshot = Some(snapshot);
+        assert_eq!(
+            status_reason(&state).as_deref(),
+            Some("Usage not reported for this plan")
+        );
     }
 
     #[test]
@@ -1400,5 +1514,50 @@ mod tests {
         table.escape();
         assert_eq!(table.rename, None);
         assert!(!table.has_popup());
+    }
+
+    #[test]
+    fn account_table_renders_omp_and_failure_reasons_without_hover() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 606);
+        app.account_ui.installed.insert(Provider::Claude, true);
+        app.account_ui.account_mut(&id).unwrap().failure = Some("Fixture provider could not connect".into());
+        let (rendered, _) = super::super::acceptance_support::inspect(table(&app, 1100.0), None);
+        assert!(rendered.0.iter().any(|(text, _)| text.contains("Managed by Omp")));
+        assert!(rendered.0.iter().any(|(text, _)| text.contains("Fixture provider could not connect")));
+        let account = app.account_ui.account_mut(&id).unwrap();
+        account.failure = None;
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Unavailable, "Usage not reported for this plan", now_ms());
+        snapshot.detail = Some("Usage not reported for this plan".into());
+        account.snapshot = Some(snapshot);
+        let (rendered, _) = super::super::acceptance_support::inspect(table(&app, 1100.0), None);
+        assert!(rendered.0.iter().any(|(text, _)| text.contains("Usage not reported for this plan")));
+    }
+
+    #[test]
+    fn inline_sign_in_click_starts_preparation_for_that_account() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 607);
+        app.account_ui.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", now_ms()));
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        let (_, messages) = super::super::acceptance_support::inspect(
+            actions(&app, app.account_ui.account(&id).unwrap(), now_ms(), None), Some("Sign in"));
+        let message = messages.into_iter().find(|message| matches!(message, Message::AccountUi(Action::SignIn(actual)) if actual == &id))
+            .expect("one direct click must target this account's sign-in");
+        drop(app.update(message));
+        assert!(app.account_ui.preparing_logins.contains(&owner));
+        assert!(app.account_ui.table.menu.is_none(), "sign-in needs no account menu");
+    }
+
+    #[test]
+    fn removal_dialog_renders_count_archive_and_explicit_deletion_contracts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 608);
+        app.account_ui.table.confirm_remove = Some(id.clone());
+        app.account_ui.table.confirm_conversations = Some(Ok(3));
+        let (rendered, _) = super::super::acceptance_support::inspect(menu(&app, app.account_ui.account(&id).unwrap(), None), None);
+        for expected in ["3 saved conversation(s)", "Archive signs out", "All transcripts and files stay on disk", "Delete files permanently removes", "Type the account name"] {
+            assert!(rendered.0.iter().any(|(text, _)| text.contains(expected)), "missing dialog text {expected:?}");
+        }
     }
 }

@@ -10,6 +10,19 @@ pub(in crate::host) struct NativeClose {
     paired: Option<RetainedPair>,
 }
 
+impl NativeClose {
+    pub(in crate::host) fn source(&self) -> &Session {
+        &self.source
+    }
+
+    /// An unresolved owner can retain a private startup environment which is
+    /// intentionally absent from the saved descriptor. Conservatively fence
+    /// this provider until exact cleanup retires the receipt.
+    pub(in crate::host) fn may_own_provider(&self, provider: Provider) -> bool {
+        self.source.launch.provider == provider
+    }
+}
+
 #[derive(Clone)]
 struct RetainedPair {
     source: Option<crate::model::TerminalSession>,
@@ -205,6 +218,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                         .into(),
                 );
             }
+            state.issued_chat_ids.insert(source.id);
             state.chats.remove(&source.id);
         }
         state.native_closing.remove(&source.id);

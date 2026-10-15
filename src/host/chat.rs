@@ -110,6 +110,10 @@ pub(super) struct TerminalHandoff {
 pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
 
 impl TerminalHandoff {
+    pub(super) fn source(&self) -> &Session {
+        &self.source
+    }
+
     pub(super) fn new(
         source: Session,
         terminal: crate::model::TerminalSession,
@@ -384,7 +388,23 @@ fn attached_mut(
     }
     Ok(record)
 }
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
+    changed_from(host, id, Some(instance), update);
+}
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    changed_from(host, id, None, update);
+}
+fn changed_from(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: Option<uuid::Uuid>,
+    update: Update,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -416,7 +436,29 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(instance) = instance {
+        if !state
+            .chats
+            .get(&id)
+            .is_some_and(|record| record.execution_instance == instance)
+        {
+            return;
+        }
+        if let Err(error) = state.observe_chat_directory_thread(id, instance) {
+            tracing::warn!(%error, "cannot retain the owned provider's confirmed thread");
+        }
+    }
     let proof = state.proof().clone();
+    if let Update::AccountUsage {
+        report,
+        observed_at,
+    } = &update
+        && let (Some(signal), Some(record)) = (&state.account_routing, state.chats.get(&id))
+    {
+        if let Ok(scope) = record.handle.launch_account_scope() {
+            signal.record(scope, report.clone(), *observed_at);
+        }
+    }
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
         &update,
@@ -705,6 +747,8 @@ fn start(
         execution_environment,
         None,
         None,
+        &[],
+        None,
     )
 }
 
@@ -724,6 +768,34 @@ pub(super) fn start_execution(
         Default::default(),
         Some(context),
         None,
+        &[],
+        None,
+    )
+}
+
+/// Trusted handoffs supply a pin proved from the original hosted source before
+/// stopping it. The new descriptor retains its issued recipe independently.
+pub(super) fn start_at_execution_directory(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    context: Arc<chat::protocol::ExecutionContext>,
+    directory: &std::path::Path,
+) -> Result<ServerResponse, ProtocolError> {
+    context.verify_directory(directory).map_err(unavailable)?;
+    start_with_execution(
+        host,
+        client,
+        session,
+        None,
+        false,
+        None,
+        environment,
+        Some(context),
+        None,
+        &[],
+        Some(directory),
     )
 }
 
@@ -749,9 +821,19 @@ fn start_with_execution(
     terminate_source: bool,
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
-    execution: Option<Arc<chat::protocol::ExecutionContext>>,
+    mut execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    retained_sources: &[crate::agent_execution::HostedSession],
+    execution_directory: Option<&std::path::Path>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if source.is_none() && retained_sources.is_empty() {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.issued_chat_ids.contains(&session.id) && !state.chats.contains_key(&session.id) {
+            return Err(error(
+                "This native session ID was retired by this daemon. Open a new pane to start another provider; the old pane cannot identify a replacement actor",
+            ));
+        }
+    }
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -917,7 +999,73 @@ fn start_with_execution(
     // Classify a removed account before that read can mask it as missing
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
-    let saved_history_only = session.launch.needs_read_only_history();
+    let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
+    let binding_registry = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_registry
+        .clone();
+    let operational_binding = binding_registry
+        .as_ref()
+        .map(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.session_location(&binding_source).or_else(|error| {
+                if retained_sources.is_empty() {
+                    Err(error)
+                } else {
+                    registry.retained_session_location(retained_sources)
+                }
+            })
+        })
+        .transpose()
+        .map_err(unavailable)?
+        .flatten();
+    let previous_binding_source = operational_binding
+        .as_ref()
+        .map(|binding| binding.source.clone())
+        .unwrap_or_else(|| binding_source.clone());
+    if let Some(binding) = &operational_binding {
+        if let Some(reason) = &binding.refusal {
+            return Err(unavailable(reason.clone()));
+        }
+        let approved = binding.approved.ok_or_else(|| unavailable("The original conversation has no proven directory; recover its exact provider or close it before restarting"))?;
+        if execution.is_none() {
+            execution = Some(Arc::new(
+                chat::protocol::ExecutionContext::capture(&binding.directory)
+                    .map_err(unavailable)?,
+            ));
+        }
+        if execution
+            .as_ref()
+            .unwrap()
+            .directory_identity()
+            .map_err(unavailable)?
+            != Some(approved)
+        {
+            return Err(unavailable(
+                "The original conversation directory was replaced; close it and create a new session for this folder",
+            ));
+        }
+    }
+    let mut operational_launch = restart_launch.unwrap_or(&session.launch).clone();
+    if let Some(binding) = &operational_binding {
+        operational_launch.recipe.working_directory = binding.directory.clone();
+    }
+    if let Some(directory) = execution_directory {
+        let context = execution.as_ref().ok_or_else(|| {
+            unavailable(
+                "An operational directory override requires its original approved descriptor",
+            )
+        })?;
+        context.verify_directory(directory).map_err(unavailable)?;
+        if context.directory_descriptor().is_none() {
+            return Err(unavailable(
+                "An operational directory override requires its original approved descriptor",
+            ));
+        }
+        operational_launch.recipe.working_directory = directory.to_owned();
+    }
+    let saved_history_only = operational_launch.needs_read_only_history();
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
     }
@@ -964,7 +1112,7 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = restart_launch.unwrap_or(&session.launch);
+    let process_launch = &operational_launch;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1038,6 +1186,47 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    // Ordinary native sessions need the same pinned authority as delegated
+    // agents. Capture before any provider starts; immutable launch provenance
+    // remains untouched when a proven operational spelling has moved.
+    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
+        let binding = operational_binding;
+        if let Some(binding) = &binding {
+            if let Some(reason) = &binding.refusal {
+                return Err(unavailable(reason.clone()));
+            }
+            if binding.directory != spec.working_directory {
+                adapter
+                    .relocate_directory(&binding.directory)
+                    .map_err(unavailable)?;
+                spec.working_directory = binding.directory.clone();
+            }
+        }
+        if execution.is_none()
+            && source.is_none()
+            && !matches!(
+                spec.transport,
+                chat::protocol::TransportSpec::UnixWebSocket { .. }
+            )
+        {
+            execution = Some(Arc::new(
+                chat::protocol::ExecutionContext::capture(&spec.working_directory)
+                    .map_err(unavailable)?,
+            ));
+        }
+        if let Some(context) = &execution {
+            context
+                .verify_directory(&spec.working_directory)
+                .map_err(unavailable)?;
+            if let Some(expected) = binding.and_then(|binding| binding.approved)
+                && context.directory_identity().map_err(unavailable)? != Some(expected)
+            {
+                return Err(unavailable(
+                    "The original native conversation directory was replaced; close it and create a new session for this folder",
+                ));
+            }
+        }
+    }
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -1147,6 +1336,7 @@ fn start_with_execution(
             None
         };
         if recovering {
+            state.issued_chat_ids.insert(session.id);
             retired = state.chats.remove(&session.id);
         }
         session.proof = Some(state.proof().clone());
@@ -1296,6 +1486,7 @@ fn start_with_execution(
         // If removal wins between them, startup's validation refuses the launch.
         let weak = Arc::downgrade(host);
         let id = session.id;
+        let operational_directory = spec.working_directory.clone();
         let handle = Handle::start_owned(
             spec,
             adapter,
@@ -1315,7 +1506,7 @@ fn start_with_execution(
                         );
                     }
                 } else {
-                    changed(&weak, id, update);
+                    changed_owned(&weak, id, execution_instance, update);
                 }
             },
         )
@@ -1344,6 +1535,46 @@ fn start_with_execution(
                 let _ = handle.close();
                 // The still-uncommitted pidfd guard resumes the source on drop.
                 return Err(failure);
+            }
+        }
+        if let Some(context) = &execution
+            && let Some(identity) = context.directory_identity().map_err(unavailable)?
+        {
+            let directory = context.directory_descriptor().ok_or_else(|| {
+                unavailable("Native startup requires the approved directory descriptor")
+            })?;
+            // Recheck the actual opened descriptor, not a path reopened after
+            // spawn. Agent contexts and ordinary contexts share this contract.
+            if crate::agent_execution::DirectoryIdentity::from_metadata(
+                &directory
+                    .metadata()
+                    .map_err(|error| unavailable(error.to_string()))?,
+            ) != identity
+            {
+                let _ = handle.close();
+                return Err(unavailable(
+                    "The approved provider directory descriptor changed during startup",
+                ));
+            }
+            let registry = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .execution_registry
+                .clone();
+            if let Some(registry) = registry {
+                let result = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .bind_session_location(
+                        &crate::agent_execution::HostedSession::Chat(session.clone()),
+                        Some(&previous_binding_source),
+                        &operational_directory,
+                        identity,
+                    );
+                if let Err(reason) = result {
+                    let _ = handle.close();
+                    return Err(unavailable(reason));
+                }
             }
         }
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1375,6 +1606,7 @@ fn start_with_execution(
         };
         let response = session_snapshot(&record);
         record.handle.commit_native_installation();
+        state.issued_chat_ids.insert(id);
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
@@ -1458,6 +1690,23 @@ fn codex_terminal_view(
             .returning_terminal = true;
         completed
     };
+    let (directory, execution) =
+        match super::session_locations::verified_chat_directory(host, &session, handle) {
+            Ok(verified) => verified,
+            Err(message) => {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(record) = state
+                    .chats
+                    .get_mut(&chat_id)
+                    .filter(|record| record.handle.same_actor(handle))
+                {
+                    record.returning_terminal = false;
+                }
+                return Err(unavailable(message));
+            }
+        };
+    let mut recipe = recipe;
+    recipe.working_directory = directory;
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -1525,7 +1774,7 @@ fn codex_terminal_view(
         resume_hint: None,
         transcript_path: None,
     };
-    let spawned = super::state::spawn_terminal_view_owned(
+    let spawned = super::state::spawn_terminal_view_owned_at_directory(
         host,
         client,
         terminal,
@@ -1535,6 +1784,7 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         true,
+        execution,
     );
     let (descriptor, paired_terminal) = match spawned {
         Ok(pair) => pair,
@@ -1743,12 +1993,61 @@ impl Drop for AccountSwitchReservation {
     }
 }
 
+fn ensure_account_handoff_unowned(
+    state: &HostState,
+    source: &Session,
+    replacement: &Session,
+) -> Result<(), ProtocolError> {
+    let held = state.chats.iter().any(|(id, record)| {
+        let mut launch = record.session.launch.clone();
+        launch.session_id = record.handle.session_id();
+        *id != source.id
+            && record.handle.owns_work()
+            && same_conversation(&launch, &replacement.launch)
+    }) || state.chat_spawning.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.launch, &replacement.launch)
+    }) || state.chat_handoffs.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.source.launch, &replacement.launch)
+    }) || state.native_closing.iter().any(|(id, pending)| {
+        *id != source.id && same_conversation(&pending.source().launch, &replacement.launch)
+    });
+    if held {
+        return Err(error(
+            "This exact conversation has another live or unconfirmed owner; close it before changing accounts",
+        ));
+    }
+    if let Some(id) = replacement.launch.session_id.as_deref() {
+        for (&terminal_id, record) in &state.terminals {
+            if record.handle.is_completed() || terminal_id == source.id {
+                continue;
+            }
+            let hint = record
+                .session
+                .resume_hint
+                .as_deref()
+                .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+            let recipe = hint.as_ref().unwrap_or(&record.session.launch);
+            if recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id))
+            {
+                return Err(error(format!(
+                    "The exact conversation is already owned by CLI terminal {terminal_id}; close it before changing accounts"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn recover_account(
     host: &SharedHost,
     client: ClientId,
     source: Session,
     replacement: Session,
     idle_generation: Option<u64>,
+    explicit: bool,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
     if !chat::is_account_recovery(&source, &replacement)
@@ -1760,28 +2059,63 @@ fn recover_account(
         ));
     }
     let automatic = idle_generation.is_some();
+    if explicit
+        && replacement
+            .launch
+            .recipe
+            .environment
+            .contains_key(crate::account::routing::AUTOMATIC_MARKER)
+    {
+        return Err(error(
+            "An explicitly selected account must pin the conversation",
+        ));
+    }
     match check_launch_account(&source.launch) {
         Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
         Err(failure) => return Err(failure),
-        Ok(()) if automatic => {}
+        Ok(()) if automatic || explicit => {}
         Ok(()) => {
             return Err(error(
                 "The original account is available; retry the saved conversation normally",
             ));
         }
     }
-    let mut reservation = None;
-    if let Some(generation) = idle_generation {
-        if source
-            .launch
-            .recipe
-            .environment
-            .get(crate::account::routing::AUTOMATIC_MARKER)
-            .map(String::as_str)
-            != Some("1")
+    if automatic && !explicit
+            && source
+                .launch
+                .recipe
+                .environment
+                .get(crate::account::routing::AUTOMATIC_MARKER)
+                .map(String::as_str)
+                != Some("1")
         {
             return Err(error("This conversation has an explicitly pinned account"));
         }
+    // Check all other writers before touching either history or stopping the
+    // source. The final start guard is too late to protect a live target's files.
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_account_handoff_unowned(&state, &source, &replacement)?;
+    }
+    let source_handle = host.lock().unwrap_or_else(|p| p.into_inner())
+        .chats.get(&source.id).map(|record| record.handle.clone());
+    // Keep the original approved directory pinned before stopping its actor or
+    // copying history. The successor's issued recipe remains immutable.
+    let operational_directory = if let Some(handle) = &source_handle {
+        Some(super::session_locations::verified_chat_directory(host, &source, handle)
+            .map_err(unavailable)?)
+    } else {
+        let registry = super::agent_execution::registry(host).map_err(unavailable)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.session_location(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .map_err(unavailable)?.is_some() {
+            return Err(unavailable("The saved conversation has an operational directory binding but its original provider directory pin is unavailable. Reattach its original provider or continue in a new conversation explicitly."));
+        }
+        None
+    };
+    let mut reservation = None;
+    let mut current_options = source_handle.as_ref().and_then(Handle::completed_account_options);
+    if let Some(generation) = idle_generation {
         let handle = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(source.proof.as_ref(), state.proof())?;
@@ -1809,9 +2143,20 @@ fn recover_account(
         // The actor checks this generation after every previously admitted
         // command. A UI snapshot alone cannot prove a timed-out turn is idle.
         crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
-        handle
-            .close_if_idle_for_resume(generation)
+        current_options = handle
+            .close_for_account_switch(generation)
             .map_err(unavailable)?;
+        if current_options.is_none() {
+            return Err(if explicit {
+                ProtocolError::new(
+                    ProtocolErrorCode::AccountSwitchBusy,
+                    "A newer turn is using the original account; the switch remains queued until it is idle.",
+                    false,
+                )
+            } else {
+                unavailable("The original conversation changed before the automatic account switch")
+            });
+        }
         crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     {
@@ -1826,10 +2171,9 @@ fn recover_account(
             ));
         }
         if (!automatic && state.chat_spawning.contains_key(&source.id))
-            || state
-                .chats
-                .get(&source.id)
-                .is_some_and(|record| record.handle.owns_work())
+            || state.chats.get(&source.id).is_some_and(|record| {
+                record.handle.owns_work() || (!automatic && !record.handle.is_completed())
+            })
             || state
                 .terminals
                 .get(&source.id)
@@ -1840,6 +2184,9 @@ fn recover_account(
                 "The original conversation still owns work; reconnect or close it before changing accounts",
             ));
         }
+    }
+    if !automatic {
+        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
     }
     let id = replacement.id;
     // The checks above prove the candidate replaces the source, so it joins the
@@ -1868,15 +2215,12 @@ fn recover_account(
     // the source reservation before starting its successor, whose exact
     // conversation ID intentionally matches it.
     drop(reservation.take());
-    start(
-        host,
-        client,
-        replacement,
-        None,
-        false,
-        None,
-        execution_environment,
-    )?;
+    if let Some((directory, context)) = operational_directory {
+        start_at_execution_directory(host, client, replacement.clone(), execution_environment,
+            context, &directory)?;
+    } else {
+        start(host, client, replacement.clone(), None, false, None, execution_environment)?;
+    }
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1892,6 +2236,16 @@ fn recover_account(
         || crate::daemon::termination_requested(),
     );
     let response = confirmation.map_err(unavailable).and_then(|()| {
+        if let Some(options) = &current_options {
+            handle
+                .restore_account_options(options, Instant::now() + Duration::from_secs(15), || {
+                    crate::daemon::termination_requested()
+                })
+                .map_err(unavailable)?;
+        }
+        handle
+            .account_switch_notice(&source.launch, &replacement.launch)
+            .map_err(unavailable)?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, id)?;
         if !record.handle.same_actor(&handle)
@@ -2017,10 +2371,35 @@ fn process_inner(
             }
             Ok(ServerResponse::ChatResumePrepared { session })
         }
+        ClientRequest::ChatAccountSwitchGeneration { source } => {
+            let handle = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(source.proof.as_ref(), state.proof())?;
+                let record = state.chats.get(&source.id).ok_or_else(|| {
+                    unavailable("The queued switch's original conversation is no longer hosted")
+                })?;
+                if record.session.launch.provider != source.launch.provider
+                    || record.session.launch.recipe != source.launch.recipe
+                    || record.handle.confirmed_session_id() != source.launch.session_id
+                    || record.paired_terminal.is_some()
+                    || record.returning_terminal
+                    || state.chat_handoffs.contains_key(&source.id)
+                    || state.chat_spawning.contains_key(&source.id)
+                {
+                    return Err(error(
+                        "The original conversation changed before the queued account switch",
+                    ));
+                }
+                record.handle.clone()
+            };
+            let generation = handle.account_switch_generation().map_err(unavailable)?;
+            Ok(ServerResponse::ChatAccountSwitchGeneration { generation })
+        }
         ClientRequest::ChatRecoverAccount {
             source,
             replacement,
             idle_generation,
+            explicit,
             execution_environment,
         } => recover_account(
             host,
@@ -2028,6 +2407,7 @@ fn process_inner(
             source,
             replacement,
             idle_generation,
+            explicit,
             execution_environment,
         ),
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
@@ -2300,7 +2680,7 @@ fn process_inner(
             };
             session.launch.session_id = handle.confirmed_session_id();
             let snapshot = handle.snapshot(None).expect("unconditional snapshot");
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
+            let recipe = session.launch.terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
             if session.launch.provider == Provider::Codex
@@ -2319,6 +2699,14 @@ fn process_inner(
                     "A shared Codex source must be reattached, not replaced",
                 ));
             }
+            // Capture positive owned-process/approved directory evidence
+            // before stopping the native writer. A reused old pathname is
+            // never authority for the replacement's working directory.
+            let (directory, execution) =
+                super::session_locations::verified_chat_directory(host, &session, &handle)
+                    .map_err(unavailable)?;
+            let mut recipe = recipe;
+            recipe.working_directory = directory.clone();
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
@@ -2344,7 +2732,11 @@ fn process_inner(
                 // Another client can close this chat while the lock is released.
                 // Report that instead of panicking the per-client thread, which
                 // would take down every hosted PTY with it.
-                let Some(record) = state.chats.get_mut(&chat_id) else {
+                let Some(record) = state
+                    .chats
+                    .get_mut(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle))
+                else {
                     return Err(unavailable(
                         "The chat was closed while returning to terminal; no replacement terminal was started",
                     ));
@@ -2364,10 +2756,15 @@ fn process_inner(
             }
             // Autonomous policy changes can arrive while the native writer
             // shuts down. The final confirmed snapshot wins over launch flags.
-            let recipe = session
+            let mut recipe = session
                 .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
+            recipe.working_directory = directory;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                 recipe,
@@ -2394,7 +2791,7 @@ fn process_inner(
                     )
                     .map_err(unavailable)?;
             }
-            let descriptor = super::state::spawn_terminal_with_environment(
+            let (descriptor, _) = super::state::spawn_terminal_view_owned_at_directory(
                 host,
                 client,
                 terminal,
@@ -2403,6 +2800,8 @@ fn process_inner(
                     ..Default::default()
                 },
                 Some(handle.execution_environment()),
+                false,
+                execution,
             )?;
             let retired = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2410,10 +2809,9 @@ fn process_inner(
                 // it last held the lock. A concurrent close removes that key, and
                 // explicit recovery re-inserts a different actor under it; neither
                 // may donate its subscribers to this replacement terminal.
-                let retained = state
-                    .chats
-                    .get(&chat_id)
-                    .is_some_and(|record| record.returning_terminal);
+                let retained = state.chats.get(&chat_id).is_some_and(|record| {
+                    record.returning_terminal && record.handle.same_actor(&handle)
+                });
                 if !retained {
                     // The replacement has no receipt to commit and no source to be
                     // retried from, so retire it rather than leaving a PTY in the
@@ -2429,6 +2827,7 @@ fn process_inner(
                         "The chat was closed while returning to terminal; the replacement terminal was retired",
                     ));
                 }
+                state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
@@ -2470,13 +2869,15 @@ fn process_inner(
         }
         ClientRequest::ChatClose { chat_id } => {
             let handle = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                attached(&state, client, chat_id)?.handle.clone()
+                let handle = attached(&state, client, chat_id)?.handle.clone();
+                state.issued_chat_ids.insert(chat_id);
+                handle
             };
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
@@ -2850,6 +3251,14 @@ pub(super) fn restore_upgrade(
     } else {
         None
     };
+    let retained_sources = saved
+        .previous_sources
+        .iter()
+        .map(|previous| crate::agent_execution::HostedSession::Chat(previous.source.clone()))
+        .chain(std::iter::once(
+            crate::agent_execution::HostedSession::Chat(saved.source.clone()),
+        ))
+        .collect::<Vec<_>>();
     let response = start_with_execution(
         host,
         0,
@@ -2860,6 +3269,8 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        &retained_sources,
+        None,
     )
     .map_err(|error| error.message)?;
     let id = match response {
@@ -2980,6 +3391,7 @@ pub(super) fn close_terminal_actor(
         .get(&terminal_id)
         .is_some_and(|record| record.handle.same_actor(handle))
     {
+        state.issued_chat_ids.insert(terminal_id);
         state.inventory_generation += 1;
         state.chats.remove(&terminal_id)
     } else {
@@ -4012,13 +4424,43 @@ for line in sys.stdin:
     struct Echo(bool);
     #[test]
     fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
+        handoff_contract(false, false, false, false);
+    }
+    #[test]
+    fn explicit_handoff_accepts_a_pinned_account_and_records_a_transcript_notice() {
+        handoff_contract(true, false, false, false);
+    }
+
+    #[test]
+    fn relocated_account_handoff_retains_the_approved_inode_and_issued_recipe() {
+        for completed in [false, true] {
+            handoff_contract(true, true, completed, false);
+        }
+    }
+
+    #[test]
+    fn completed_account_handoff_refuses_a_replaced_operational_directory() {
+        handoff_contract(true, true, true, true);
+    }
+
+    fn handoff_contract(explicit: bool, moved: bool, completed: bool, replaced: bool) {
         use std::os::unix::fs::PermissionsExt;
         struct Idle;
         impl Adapter for Idle {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step::default())
             }
-            fn command(&mut self, _: Command) -> Result<Step, String> {
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if let Command::SetModel { model, reasoning } = command {
+                    return Ok(Step {
+                        events: vec![Event::Models {
+                            models: Vec::new(),
+                            selected: Some(model),
+                            reasoning,
+                        }],
+                        ..Step::default()
+                    });
+                }
                 Err("No work is issued by this fixture".into())
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
@@ -4035,15 +4477,20 @@ for line in sys.stdin:
             }
         }
         let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path().canonicalize().unwrap();
-        let provider = directory.path().join("claude");
+        let cwd = directory.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let provider = directory.path().join(if explicit {
+            "provider-wrapper"
+        } else {
+            "claude"
+        });
         let conversation = "12345678-1234-4234-8234-123456789abc";
         std::fs::write(&provider, format!(r#"#!/bin/sh
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{conversation}"}}'
 while IFS= read -r frame; do
     request=$(printf '%s' "$frame" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
     if [ -n "$request" ]; then
-        printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"commands":[],"models":[]}}}}}}\n' "$request"
+        printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"commands":[],"models":[{{"value":"competing-client-model","displayName":"Chosen model","supportedEffortLevels":["high"]}}]}}}}}}\n' "$request"
     fi
 done
 "#)).unwrap();
@@ -4077,7 +4524,7 @@ done
         let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
             proof.clone(),
         )));
-        let source = Session {
+        let mut source = Session {
             id: TerminalId::new(),
             owned_codex_listener: None,
             native_continuity: Default::default(),
@@ -4102,9 +4549,20 @@ done
                 },
             },
         };
+        if explicit {
+            source
+                .launch
+                .recipe
+                .environment
+                .remove(crate::account::routing::AUTOMATIC_MARKER);
+        }
         let mut process_recipe = source.launch.recipe.clone();
         process_recipe.program = "/bin/cat".into();
-        let spec = ProcessSpec::from(&process_recipe);
+        let mut spec = ProcessSpec::from(&process_recipe);
+        let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
+            std::fs::File::open(&process_recipe.working_directory).unwrap()))));
+        let identity = context.directory_identity().unwrap().unwrap();
+        spec.execution = Some(context);
         let mut initial = Step {
             writes: vec![json!({"ready": true})],
             events: vec![
@@ -4125,8 +4583,28 @@ done
             |_| {},
         )
         .unwrap();
+        let mut registry = super::super::model::Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: source.launch.recipe.working_directory.clone(), name: "Account project".into(),
+            kind: crate::model::ProjectKind::Folder,
+        }).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::SeedView {
+            scope: crate::workspace_model::Scope::Worktree {
+                repository: source.launch.recipe.working_directory.clone(),
+                path: source.launch.recipe.working_directory.clone(),
+            },
+            panes: vec![crate::workspace_model::views::Pane {
+                id: crate::model::CardId::new(), title: "Account fixture".into(), user_title: None,
+                pending_terminal_start: false, width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(source.clone()),
+                scope: Some(source.launch.recipe.working_directory.clone()),
+            }], closed: Vec::new(),
+        }).unwrap();
+        registry.bind_session_location(&crate::agent_execution::HostedSession::Chat(source.clone()),
+            None, &source.launch.recipe.working_directory, identity).unwrap();
         {
             let mut state = host.lock().unwrap();
+            state.install_model(registry);
             state.register_client(1);
             state.chats.insert(
                 source.id,
@@ -4156,7 +4634,84 @@ done
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
-        let generation = handle.snapshot(None).unwrap().generation;
+        let mut generation = handle.snapshot(None).unwrap().generation;
+        // A second actor (or an admitted start) with this provider UUID must
+        // refuse before either copying into its home or stopping this actor.
+        let mut other = replacement.clone();
+        other.id = TerminalId::new();
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.insert(
+                other.id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: other.clone(),
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: BTreeMap::new(),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let failure = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            explicit,
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .message
+                .contains("another live or unconfirmed owner")
+        );
+        assert!(!handle.is_completed());
+        assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.remove(&other.id);
+            state.chat_spawning.insert(other.id, other.clone());
+            assert!(ensure_account_handoff_unowned(&state, &source, &replacement).is_err());
+            state.chat_spawning.remove(&other.id);
+        }
+        if explicit {
+            let queried = handle.account_switch_generation().unwrap().unwrap();
+            handle
+                .command(Command::SetModel {
+                    model: "competing-client-model".into(),
+                    reasoning: Some("high".into()),
+                })
+                .unwrap();
+            generation = handle.account_switch_generation().unwrap().unwrap();
+            assert_ne!(
+                generation, queried,
+                "competing command must invalidate the queried generation"
+            );
+            let refusal = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                Some(queried),
+                true,
+                Default::default(),
+            )
+            .unwrap_err();
+            assert_eq!(refusal.code, ProtocolErrorCode::AccountSwitchBusy);
+            assert!(
+                !handle.is_completed(),
+                "proved refusal cannot close the original actor"
+            );
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+            assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
+        }
         let mut pinned = source.clone();
         pinned
             .launch
@@ -4176,6 +4731,7 @@ done
                 pinned,
                 pinned_replacement,
                 Some(generation),
+                false,
                 Default::default()
             )
             .unwrap_err()
@@ -4189,18 +4745,61 @@ done
                 source.clone(),
                 replacement.clone(),
                 Some(generation + 1),
+                explicit,
                 Default::default()
             )
             .is_err()
         );
         assert!(!handle.is_completed());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
+        let mut actual_directory = source.launch.recipe.working_directory.clone();
+        if moved {
+            let moved_directory = directory.path().join("moved-project");
+            std::fs::rename(&actual_directory, &moved_directory).unwrap();
+            std::fs::create_dir(&actual_directory).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
+                Some(generation), true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory"), "{}", failure.message);
+            assert!(!handle.is_completed(), "an unapproved path must not close the source");
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            let response = super::super::client::process_request(&host, 1,
+                ClientRequest::EditWorkspaceModel { edit: crate::workspace_model::ModelEdit::RelocateProject {
+                    relocation: crate::project_recovery::Relocation {
+                        repository: actual_directory.clone(), destination: moved_directory.clone(),
+                        old_root: actual_directory.clone(), new_root: moved_directory.clone(),
+                    },
+                }}).unwrap().0;
+            let ServerResponse::WorkspaceModel { model } = response else { panic!("Locate model reply"); };
+            assert!(model.session_location_refusals.is_empty());
+            actual_directory = moved_directory;
+            generation = handle.account_switch_generation().unwrap().unwrap();
+        }
+        if completed {
+            handle.close().unwrap();
+            let record = host.lock().unwrap().chats.remove(&source.id).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
+                None, true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory pin is unavailable"), "{}", failure.message);
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            host.lock().unwrap().chats.insert(source.id, record);
+        }
+        if replaced {
+            std::fs::rename(&actual_directory, directory.path().join("retired-project")).unwrap();
+            std::fs::create_dir(&actual_directory).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement,
+                None, true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory"), "{}", failure.message);
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
+            return;
+        }
         let response = recover_account(
             &host,
             1,
             source.clone(),
             replacement.clone(),
-            Some(generation),
+            (!completed).then_some(generation),
+            explicit,
             Default::default(),
         )
         .unwrap();
@@ -4209,6 +4808,24 @@ done
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
         assert_eq!(snapshot.session_id.as_deref(), Some(conversation));
+        let successor = host.lock().unwrap().chats[&session.id].handle.clone();
+        let proof = successor.capture_execution_directory(&actual_directory).unwrap();
+        assert_eq!(proof.identity, identity);
+        assert_eq!(session.launch.recipe.working_directory, source.launch.recipe.working_directory,
+            "operational relocation must not rewrite the issued account-switch recipe");
+
+        if explicit {
+            assert_eq!(
+                snapshot.selected_model.as_deref(),
+                Some("competing-client-model")
+            );
+            assert_eq!(snapshot.reasoning.as_deref(), Some("high"));
+            assert_eq!(
+                session.launch.recipe, replacement.launch.recipe,
+                "current controls must not mutate the issued launch descriptor"
+            );
+        }
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("Account switched") && text.contains(original_home.to_str().unwrap()) && text.contains(alternate_home.to_str().unwrap()))));
         assert_eq!(
             std::fs::read(
                 alternate_home

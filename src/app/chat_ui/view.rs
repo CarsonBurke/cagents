@@ -1380,6 +1380,33 @@ impl Runtime {
         {
             transcript.push(notice_entry(error, target));
         }
+        if let Some((_, name)) = &self.pending_account_switch {
+            content.push(
+                widget::row::with_children(vec![
+                    design::caption(if transitioning {
+                        format!("Switching to {name}…")
+                    } else {
+                        format!("Switches to {name} after this turn")
+                    })
+                    .into(),
+                    crate::ui_controls::button::quiet("Cancel switch")
+                        .on_press_maybe(
+                            (!transitioning).then_some(action(Action::CancelAccountSwitch(target))),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            );
+        } else if !transitioning && let Some((id, name)) = &self.account_switch_fallback {
+            content.push(
+                crate::ui_controls::button::secondary(format!(
+                    "Continue on {name} as a new conversation (cache lost)"
+                ))
+                .on_press(action(Action::ContinueOnAccount(target, id.clone())))
+                .into(),
+            );
+        }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
             content.push(
@@ -2699,8 +2726,7 @@ impl Runtime {
         controls
     }
 
-    /// A draft can explicitly pin its account. Started conversations display
-    /// their current account; automatic routing may hand off between turns.
+    /// Explicit choices pin drafts or switch started chats at an idle boundary.
     fn account_picker<'a>(
         &'a self,
         accounts: ChatAccounts,
@@ -2715,9 +2741,9 @@ impl Runtime {
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
         let icon = Icon::Avatar.handle();
-        if transitioning || !self.choosing() {
-            // Manual choices are made before the first message. Automatic
-            // routing can hand off later at a safe idle boundary.
+        if transitioning {
+            // Ownership transfer has already begun; a second selection must
+            // wait for its result rather than imply it can cancel teardown.
             return crate::interaction::tooltip(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
@@ -2738,7 +2764,7 @@ impl Runtime {
                     {
                         "Automatic can switch to another signed-in account between turns when needed."
                     } else {
-                        "This account is pinned. Start a new conversation to use another account."
+                        "This account is pinned. Wait for the current connection change before choosing another account."
                     }
                 ),
             );

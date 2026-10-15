@@ -16,6 +16,10 @@ pub enum Operation {
         kind: crate::model::ProjectKind,
     },
     AccountsRead,
+    /// Refresh stale alternates before an automatic send gives up on routing.
+    AccountRoute {
+        id: crate::account::AccountId,
+    },
     AccountLifecycle {
         operation: crate::account::remote::Operation,
     },
@@ -87,6 +91,8 @@ pub enum Reply {
             crate::agent::Provider,
             std::collections::BTreeMap<String, String>,
         >,
+        #[serde(default)]
+        shell_error: Option<String>,
     },
     Accounts(#[serde(with = "wire_json")] serde_json::Value),
     Skills(Vec<crate::chat::Skill>),
@@ -176,6 +182,38 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             navigation(repository, kind).map(Reply::ProjectNavigation)
         }
         Operation::AccountsRead => accounts(),
+        Operation::AccountRoute { id } => {
+            use crate::account::{cache::Cache, home::Homes, registry::Store};
+            let registry = Store::installation()
+                .ok_or("Account registry is unavailable")?
+                .load()
+                .map_err(|error| error.to_string())?;
+            let homes = Homes::installation();
+            let preferred = registry
+                .all_accounts(homes.as_ref())
+                .into_iter()
+                .find(|account| account.id() == id)
+                .ok_or("The source account was removed")?;
+            let cache = Cache::installation();
+            let now = crate::chat::now_ms().unwrap_or_default();
+            let mut entries = cache
+                .as_ref()
+                .map(|cache| cache.load(now))
+                .unwrap_or_default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(crate::account::routing_refresh::refresh(
+                &registry,
+                homes.as_ref(),
+                &preferred,
+                cache,
+                &mut entries,
+                now,
+            ));
+            accounts()
+        }
         Operation::AccountLifecycle { operation } => {
             crate::account::remote::execute(operation).map(Reply::AccountLifecycle)
         }
@@ -227,10 +265,14 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or("remote HOME is unavailable")?;
-            let shell = crate::model::login_shell().map_err(|error| error.to_string())?;
+            let (shell, shell_error) = match crate::model::terminal_shell_descriptor() {
+                Ok(shell) => (shell, None),
+                Err(error) => (String::new(), Some(error.to_string())),
+            };
             Ok(Reply::Home {
                 path,
                 shell,
+                shell_error,
                 environment: crate::agent::Provider::ALL
                     .into_iter()
                     .map(|provider| {
@@ -1282,6 +1324,9 @@ pub struct AccountSnapshot {
     pub catalogs:
         std::collections::BTreeMap<crate::agent::Provider, crate::account::cache::Catalog>,
     pub installed: std::collections::BTreeMap<crate::agent::Provider, bool>,
+    /// Existing provider homes, judged on this device rather than the window.
+    #[serde(default)]
+    pub present: std::collections::BTreeSet<crate::account::AccountId>,
 }
 #[cfg(feature = "host")]
 fn accounts() -> Result<Reply, String> {
@@ -1299,7 +1344,7 @@ fn accounts() -> Result<Reply, String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let search_path = runtime.block_on(probe::search_path());
+    let search_path = runtime.block_on(probe::refresh_search_path());
     let installed = [
         crate::agent::Provider::Claude,
         crate::agent::Provider::Codex,
@@ -1309,16 +1354,20 @@ fn accounts() -> Result<Reply, String> {
     .map(|provider| {
         (
             provider,
-            probe::find_executable(provider.executable(), search_path.as_deref()).is_some(),
+            probe::Cli::discover(provider, search_path.as_deref()).is_ok(),
         )
     })
     .collect();
-    let cache_keys = registry
-        .accounts(homes.as_ref())
+    let accounts = registry.accounts(homes.as_ref());
+    let present = accounts.iter()
+        .filter(|account| account.resolved_home().is_some_and(|home| home.is_dir()))
+        .map(|account| account.id()).collect();
+    let cache_keys = accounts
         .into_iter()
         .filter_map(|account| account.cache_key().map(|key| (account.id(), key)))
         .collect();
     let snapshot = AccountSnapshot {
+        present,
         cache_keys,
         registry,
         homes,
@@ -1395,7 +1444,6 @@ fn update_accounts(expected_revision: u64, proposal: serde_json::Value) -> Resul
 #[cfg(feature = "host")]
 fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     use crate::account::{home::Homes, probe, registry::Store};
-    use crate::agent::Provider;
     let homes = Homes::installation();
     let registry = Store::installation()
         .map(|store| store.load())
@@ -1409,49 +1457,15 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             registered.id() == account.id() && registered.resolved_home() == account.resolved_home()
         })
         .ok_or("account is not registered on this device")?;
-    let arguments = match account.provider {
-        Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-        Provider::Codex => vec!["login".into(), "--device-auth".into()],
-        Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
-    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
     let search_path = runtime.block_on(probe::search_path());
-    let program = probe::find_executable(account.provider.executable(), search_path.as_deref())
-        .ok_or_else(|| {
-            format!(
-                "{} is not installed on this device",
-                account.provider.label()
-            )
-        })?;
-    let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        crate::account::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.to_owned(), home.display().to_string());
-    }
-    if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
-        environment.insert("PATH".into(), path);
-    }
-    Ok(Reply::Login(crate::model::LaunchRecipe {
-        program: program
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "provider executable is not UTF-8")?,
-        arguments,
-        working_directory: std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("remote HOME is unavailable")?,
-        environment,
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-    }))
+    let cli = probe::Cli::discover(account.provider, search_path.as_deref())?;
+    Ok(Reply::Login(crate::account::remote::login_recipe(
+        &account, &cli,
+    )?))
 }
 
 #[cfg(feature = "host")]
@@ -1635,6 +1649,14 @@ mod navigation_contract_tests {
         assert!(parse_navigation(b"branch refs/heads/main\0").is_err());
         assert!(parse_navigation(b"worktree relative\0\0").is_err());
     }
+    #[test]
+    fn legacy_device_identity_defaults_to_no_terminal_policy_error() {
+        let reply: Reply = serde_json::from_value(serde_json::json!({"Home": {"path": "/remote", "shell": "/bin/sh", "environment": {}}})).unwrap();
+        assert!(matches!(reply, Reply::Home { shell_error: None, .. }));
+        let reply = Reply::Home { path: "/remote".into(), shell: String::new(), environment: Default::default(), shell_error: Some("Terminal preferences could not be read".into()) };
+        assert_eq!(postcard::from_bytes::<Reply>(&postcard::to_allocvec(&reply).unwrap()).unwrap(), reply);
+    }
+
     #[test]
     fn navigation_round_trips_on_binary_wire() {
         let operation = Operation::ProjectNavigation {

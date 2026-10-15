@@ -1,3 +1,5 @@
+pub mod agents;
+pub use agents::AgentLaunchSettings;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -11,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    design, instance,
-    sidebar::{EXPANDED_WIDTH_MAX, EXPANDED_WIDTH_MIN},
+    instance, layout_metrics,
+    layout_metrics::{
+        NAVIGATION_MAX_WIDTH as EXPANDED_WIDTH_MAX, NAVIGATION_MIN_WIDTH as EXPANDED_WIDTH_MIN,
+    },
 };
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
@@ -92,6 +96,7 @@ impl AppTheme {
 
     /// App surfaces use their own selection; terminal overrides and syntax
     /// palettes remain independent. COSMIC derives accessible component states.
+    #[cfg(feature = "ui")]
     pub fn resolve(self, system: &cosmic::Theme) -> cosmic::Theme {
         use crate::terminal::TerminalTheme;
         use cosmic::cosmic_theme::{
@@ -792,6 +797,10 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, AgentLaunchSettings>,
+    #[serde(default)]
+    pub default_shell: Option<String>,
     #[serde(default = "default_focus_follows_mouse")]
     pub focus_follows_mouse: bool,
     #[serde(default)]
@@ -930,6 +939,8 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
+            agents: Default::default(),
+            default_shell: None,
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
@@ -942,8 +953,8 @@ impl Default for AppSettings {
             custom_terminal_theme: None,
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
-            sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
-            inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
+            sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
+            inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
@@ -1541,7 +1552,7 @@ impl From<V2TomlSettings> for AppSettings {
             terminal_font_size: previous.terminal_font_size,
             terminal_font_family: previous.terminal_font_family,
             sidebar_width: previous.sidebar_width,
-            inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
+            inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
             terminal_scrollback_lines: previous.terminal_scrollback_lines,
             link_open_destination: previous.link_open_destination,
@@ -1585,7 +1596,36 @@ impl AppSettings {
             Some(_) => LinkOpenDestination::IntegratedBrowser,
         }
     }
-    pub fn validate(mut self) -> Result<Self, SettingsError> {
+    pub fn validate(self) -> Result<Self, SettingsError> {
+        self.validate_with_agent_launches(true)
+    }
+
+    /// Validate edited launch fields while retaining unavailable saved paths
+    /// and policy in other fields. Each selected launch still validates fully.
+    pub fn validate_transition(self, previous: &Self) -> Result<Self, SettingsError> {
+        if self.default_shell != previous.default_shell && self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) {
+            return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into()));
+        }
+        for provider in crate::agent::Provider::ALL {
+            let key = agents::provider_key(provider);
+            if let Some(configuration) = self.agents.get(key) {
+                configuration.validate_changes(previous.agents.get(key).unwrap_or(&AgentLaunchSettings::default()), provider).map_err(SettingsError::AgentLaunch)?;
+            }
+        }
+        self.validate_with_agent_launches(false)
+    }
+
+    fn validate_with_agent_launches(mut self, check_launches: bool) -> Result<Self, SettingsError> {
+        // Loading must retain pinned launch policy even if a binary disappears.
+        // New edits are validated here; each actual launch validates again.
+        if check_launches {
+            if self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) { return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into())); }
+            for (key, configuration) in &self.agents {
+                if let Some(provider) = crate::agent::Provider::ALL.into_iter().find(|provider| agents::provider_key(*provider) == key) {
+                    configuration.validate(provider).map_err(SettingsError::AgentLaunch)?;
+                }
+            }
+        }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1679,7 +1719,7 @@ impl AppSettings {
                 max: EXPANDED_WIDTH_MAX,
             });
         }
-        if !(design::INSPECTOR_MIN_WIDTH..=design::INSPECTOR_MAX_WIDTH)
+        if !(layout_metrics::INSPECTOR_MIN_WIDTH..=layout_metrics::INSPECTOR_MAX_WIDTH)
             .contains(&self.inspector_width)
         {
             return Err(SettingsError::Invalid(
@@ -1824,6 +1864,8 @@ fn is_relative_marker(marker: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
+    #[error("{0}")]
+    AgentLaunch(String),
     #[error("cagents configuration directory is unavailable")]
     DirectoryUnavailable,
     #[error("failed to access settings: {0}")]
@@ -1884,14 +1926,30 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
-    let current = load_unlocked(path)?.settings;
-    let mut current = toml::Value::try_from(current)?;
+    let previous = load_unlocked(path)?.settings;
+    let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
-        &toml::Value::try_from(base)?,
+        &merge_base_value(base, desired)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate_transition(&previous)?;
+    save_validated_unlocked(path, &settings)
+}
+
+/// A newly configured provider still has default-valued fields before its
+/// table first exists. Materialize those only in the merge baseline so two
+/// windows creating different fields do not overwrite each other's policy.
+/// Keep a removed provider absent in desired, preserving explicit table reset.
+pub(crate) fn merge_base_value(base: &AppSettings, desired: &AppSettings) -> Result<toml::Value, SettingsError> {
+    let mut value = toml::Value::try_from(base)?;
+    let defaults = toml::Value::try_from(&AgentLaunchSettings::default())?;
+    if let Some(agents) = value.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for provider in desired.agents.keys().filter(|provider| !base.agents.contains_key(*provider)) {
+            agents.insert(provider.clone(), defaults.clone());
+        }
+    }
+    Ok(value)
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -1951,6 +2009,10 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
+    save_validated_unlocked(path, &settings)
+}
+
+fn save_validated_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let directory = open_private_directory(parent)?;
@@ -2236,7 +2298,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         let (path, reason, error) = match decoded {
             Ok(settings) => {
                 let fault = settings.keyboard_shortcuts.fault();
-                match (settings.validate(), fault) {
+                match (settings.validate_with_agent_launches(false), fault) {
                     (Ok(settings), _) => {
                         foreign.extend(unknown.into_iter().map(|path| Foreign {
                             path,
@@ -2366,7 +2428,7 @@ fn invalid_setting(
             trial
                 .try_into::<AppSettings>()
                 .map_err(SettingsError::from)
-                .and_then(AppSettings::validate)
+                .and_then(|settings| settings.validate_with_agent_launches(false))
                 .map_or_else(|error| error.to_string() != failure, |_| true)
         })
 }
@@ -4175,6 +4237,7 @@ new_thread = "Alt+Shift+G"
         assert_eq!(load(&path).unwrap().terminal_scroll_speed, 2.5);
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
         use crate::sidebar::{SidebarMode, effective_width};
@@ -4230,9 +4293,9 @@ new_thread = "Alt+Shift+G"
     #[test]
     fn inspector_width_round_trips_only_within_rendered_bounds() {
         for width in [
-            design::INSPECTOR_MIN_WIDTH,
-            design::INSPECTOR_DEFAULT_WIDTH,
-            design::INSPECTOR_MAX_WIDTH,
+            layout_metrics::INSPECTOR_MIN_WIDTH,
+            layout_metrics::INSPECTOR_DEFAULT_WIDTH,
+            layout_metrics::INSPECTOR_MAX_WIDTH,
         ] {
             let settings = AppSettings {
                 inspector_width: width,
@@ -4246,8 +4309,8 @@ new_thread = "Alt+Shift+G"
             assert_eq!(load(&path).unwrap().inspector_width, width);
         }
         for width in [
-            design::INSPECTOR_MIN_WIDTH - 1.0,
-            design::INSPECTOR_MAX_WIDTH + 1.0,
+            layout_metrics::INSPECTOR_MIN_WIDTH - 1.0,
+            layout_metrics::INSPECTOR_MAX_WIDTH + 1.0,
             f32::NAN,
         ] {
             assert!(

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod annotations;
 pub mod pricing;
+
+pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -217,16 +220,41 @@ impl Launch {
         }
         Some(recipe)
     }
+    /// Carry provider-confirmed conversation choices back to its CLI recipe.
+    pub(crate) fn terminal_recipe_with_current_options(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        permission: Option<&str>,
+    ) -> Option<LaunchRecipe> {
+        let mut recipe = self.terminal_recipe_with_permission_mode(permission)?;
+        // A provider can omit a capability or its selected value. In that
+        // case retain the recorded choice instead of inventing an Automatic change.
+        crate::settings::AgentLaunchSettings::default().append_options(
+            self.provider,
+            &mut recipe.arguments,
+            crate::settings::agents::LaunchDefaults {
+                model,
+                effort,
+                permission_mode: (self.provider != Provider::Claude)
+                    .then_some(permission)
+                    .flatten(),
+            },
+        );
+        Some(recipe)
+    }
+
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
         let id = self.session_id.as_deref()?;
         if id.len() != 36
             || uuid::Uuid::parse_str(id).is_err()
-            || std::path::Path::new(&self.recipe.program)
+            || (std::path::Path::new(&self.recipe.program)
                 .file_name()?
                 .to_str()?
                 != self.provider.executable()
+                && !std::path::Path::new(&self.recipe.program).is_absolute())
         {
             return None;
         }
@@ -249,7 +277,7 @@ impl Launch {
         }
         self.provider.append_resume(&mut arguments, id.into());
         recipe.arguments = arguments;
-        crate::model::agent_recovery::resume_recipe(&recipe)
+        crate::model::agent_recovery::resume_recipe_for_provider(&recipe, self.provider)
     }
 }
 
@@ -308,6 +336,9 @@ pub struct StartFailure {
 /// What the reader can still do about a conversation that did not come back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
+    /// The daemon proved that a newer turn prevented account-switch admission;
+    /// the original actor is unchanged, so retain the chosen queued switch.
+    AccountSwitchBusy,
     /// The recorded managed home was removed; choose another account of this
     /// provider before attempting the exact conversation again.
     Account,
@@ -517,6 +548,9 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        recipe
+            .environment
+            .remove(crate::account::routing::AUTOMATIC_MARKER);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));
@@ -2144,6 +2178,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_handoff_keeps_configured_wrapper_and_exact_provider_identity() {
+        let launch = Launch {
+            provider: Provider::Claude,
+            recipe: LaunchRecipe {
+                program: "/home/example/bin/claude-wrapper".into(),
+                arguments: vec!["--model".into(), "fixture-model".into()],
+                working_directory: "/project".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
+        };
+        let recipe = launch
+            .terminal_recipe()
+            .expect("typed native provider supports its configured wrapper");
+        assert_eq!(recipe.program, launch.recipe.program);
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--model",
+                "fixture-model",
+                "--resume",
+                "d1714898-6c54-4727-8113-0d5b9db7aeb9"
+            ]
+        );
+        assert!(
+            crate::model::agent_recovery::resume_recipe(&recipe).is_none(),
+            "untyped arbitrary commands must remain unrecognized"
+        );
+    }
+
+    #[test]
     fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {
         let launch = Launch {
             provider: Provider::Claude,
@@ -2187,6 +2253,30 @@ mod tests {
         );
         assert_eq!(
             launch.terminal_recipe_with_permission_mode(None),
+            launch.terminal_recipe()
+        );
+        let updated = launch
+            .terminal_recipe_with_current_options(
+                Some("conversation-model"),
+                Some("high"),
+                Some("plan"),
+            )
+            .unwrap();
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "conversation-model"])
+        );
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--effort", "high"])
+        );
+        assert!(!updated.arguments.iter().any(|argument| argument == "opus"));
+        assert_eq!(
+            launch.terminal_recipe_with_current_options(None, None, None),
             launch.terminal_recipe()
         );
     }
@@ -2580,6 +2670,50 @@ pub(crate) fn fresh_session(
     working_directory: std::path::PathBuf,
     account: &crate::account::Account,
 ) -> Result<Session, String> {
+    let settings = crate::settings::default_path()
+        .map_err(|error| error.to_string())
+        .and_then(|path| crate::settings::load(path).map_err(|error| error.to_string()))?;
+    let configuration = settings
+        .agents
+        .get(crate::settings::agents::provider_key(provider))
+        .cloned()
+        .unwrap_or_default();
+    fresh_session_configured(
+        provider,
+        id,
+        working_directory,
+        account,
+        &configuration,
+        Default::default(),
+    )
+}
+
+/// One launch policy shared by native drafts, CLI runs and automations. All
+/// explicit per-conversation choices override provider defaults exactly once.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn fresh_session_configured(
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
+    configuration: &crate::settings::AgentLaunchSettings,
+    overrides: crate::settings::agents::LaunchDefaults<'_>,
+) -> Result<Session, String> {
+    // Explicit conversation choices supersede saved defaults, including a
+    // retained default from a newer build. Validate only the effective policy.
+    let mut effective = configuration.clone();
+    if overrides.model.is_some() { effective.model = None; }
+    if overrides.effort.is_some() { effective.effort = None; }
+    if overrides.permission_mode.is_some() { effective.permission_mode = None; }
+    effective.validate(provider)?;
+    for value in [overrides.model, overrides.effort, overrides.permission_mode].into_iter().flatten() {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err("Conversation model, effort and permission choices must be non-empty names without control characters.".into());
+        }
+    }
+    if let Some(mode) = overrides.permission_mode {
+        crate::settings::agents::validate_permission_override(provider, mode)?;
+    }
     let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()
@@ -2591,6 +2725,7 @@ pub(crate) fn fresh_session(
         working_directory,
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
+    configuration.apply_launch(&mut recipe);
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
@@ -2629,11 +2764,15 @@ pub(crate) fn fresh_session(
             // logins follow the current global default; independent homes
             // retain their own. Explicit environment choices and project
             // settings remain under Claude's own handling.
-            if let Some(mode) = claude_configured_default_mode(&recipe) {
+            if configuration.permission_mode.is_none()
+                && overrides.permission_mode.is_none()
+                && let Some(mode) = claude_configured_default_mode(&recipe)
+            {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }
     }
+    configuration.append_options(provider, &mut recipe.arguments, overrides);
     Ok(Session {
         native_continuity: Default::default(),
         owned_codex_listener: None,

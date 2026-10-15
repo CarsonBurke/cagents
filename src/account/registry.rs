@@ -393,6 +393,23 @@ impl Registry {
     /// Names `account`, or clears its name with `None`.
     pub fn set_label(&mut self, account: &Account, label: Option<String>) {
         let label = label.as_deref().and_then(super::clean_label);
+        if let Some(label) = &label
+            && (self.accounts.iter().any(|other| {
+                other.provider == account.provider
+                    && Some(other.key) != account.registry_key()
+                    && !self.is_archived(other.key)
+                    && other
+                        .label
+                        .as_ref()
+                        .is_some_and(|existing| existing.eq_ignore_ascii_case(label))
+            }) || (!account.is_system()
+                && self
+                    .system_labels
+                    .get(account.provider.executable())
+                    .is_some_and(|existing| existing.eq_ignore_ascii_case(label))))
+        {
+            return;
+        }
         match &account.home {
             AccountHome::Brokered { .. } => {}
             AccountHome::System | AccountHome::SystemAt { .. } => {
@@ -584,6 +601,22 @@ impl Registry {
             !choices.is_empty()
         });
         Some(removed)
+    }
+
+    /// Hide an account from new-work routing while retaining its durable home
+    /// and identity so saved transcripts can still be moved or restored.
+    pub fn archive(&mut self, key: Uuid) -> bool {
+        if self.find(key).is_none() || self.is_archived(key) {
+            return false;
+        }
+        let removed = key.hyphenated().to_string();
+        self.defaults.retain(|_, chosen| *chosen != removed);
+        self.project_defaults.retain(|_, choices| {
+            choices.retain(|_, chosen| *chosen != removed);
+            !choices.is_empty()
+        });
+        self.archived.push(key);
+        true
     }
 
     /// Hides a redundant home while preserving its files and saved-session
@@ -833,22 +866,38 @@ impl Store {
         key: Uuid,
         registered: bool,
     ) -> io::Result<(Registry, Option<String>)> {
+        self.remove_home_checked(homes, provider, key, registered, || Ok(()))
+    }
+
+    /// Prepare deletion while both the spawn lifecycle lock and the latest
+    /// registry lock are held. A refusal leaves registration and files intact.
+    /// The callback is skipped if another registered alias retains this home.
+    pub(crate) fn remove_home_checked(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        key: Uuid,
+        registered: bool,
+        before_removal: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(Registry, Option<String>)> {
         let (registry, error) = {
             let _lifecycle = homes.lifecycle_lock()?;
-            let (registry, ()) = self.update(|registry| {
+            let (registry, retained) = self.update_checked(|registry| {
                 if registered {
                     registry.unregister(key);
                 } else {
                     registry.abandon(key);
                 }
+                let retained = registry.contains_managed_home(homes, provider, key);
+                if !retained {
+                    before_removal()?;
+                }
+                Ok(retained)
             })?;
-            let error = if registry.contains_managed_home(homes, provider, key) {
-                None
+            let error = if retained {
+                Some("The files were retained because another account still uses this home".into())
             } else {
-                homes
-                    .park(provider, key)
-                    .err()
-                    .map(|error| error.to_string())
+                homes.park(provider, key).err().map(|error| error.to_string())
             };
             (registry, error)
         };
@@ -1056,6 +1105,33 @@ mod tests {
             .update(|registry| registry.set_automatic(Provider::Claude))
             .unwrap();
         assert!(store.load().unwrap().automatic(Provider::Claude));
+    }
+
+    #[test]
+    fn removal_preparation_refusal_keeps_registration_and_home_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = store.create_pending(&homes, Provider::Claude, 1,
+            || homes.create(Provider::Claude, None)).unwrap();
+        let transcript = home.join("history.jsonl");
+        fs::write(&transcript, "original conversation").unwrap();
+        let before = store.load().unwrap();
+        let result = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
+            assert!(home.is_dir(), "identity must still be provable before preparation");
+            Err(io::Error::other("retained prompt purge refused"))
+        });
+        assert!(result.unwrap_err().to_string().contains("purge refused"));
+        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
+        let (_, warning) = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
+            assert!(home.is_dir());
+            assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
+            Ok(())
+        }).unwrap();
+        assert!(warning.is_none());
+        assert!(!home.exists());
+        assert!(store.load().unwrap().pending().is_empty());
     }
 
     #[test]
@@ -1305,6 +1381,46 @@ mod tests {
             Err(Account::linked(Provider::Codex, linked, home).id())
         );
         assert_eq!(registry.registered().len(), 1);
+    }
+
+    #[test]
+    fn archiving_an_account_keeps_every_transcript_and_excludes_new_work_routing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let transcript = home.join("projects/fixture/11111111-1111-4111-8111-111111111111.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "saved conversation").unwrap();
+        let account = Account::managed(Provider::Claude, key, home.clone());
+        let project = directory.path().join("project");
+        store
+            .update(|registry| {
+                let mut registered = managed(Provider::Claude, "archived@example.invalid");
+                registered.key = key;
+                registry.register(registered, &[]).unwrap();
+                registry.set_default(&account);
+                registry.set_project_default(&project, &account);
+                assert!(registry.archive(key));
+            })
+            .unwrap();
+        let registry = store.load_and_sweep(&homes).unwrap();
+        assert!(home.is_dir());
+        assert_eq!(
+            fs::read_to_string(&transcript).unwrap(),
+            "saved conversation"
+        );
+        assert!(registry.is_archived(key));
+        assert!(registry.all_accounts(Some(&homes)).contains(&account));
+        assert!(!registry.accounts(Some(&homes)).contains(&account));
+        assert_eq!(
+            registry.default_account(Provider::Claude, Some(&homes)),
+            Account::system(Provider::Claude)
+        );
+        assert_eq!(
+            registry.project_default_account(&project, Provider::Claude, Some(&homes)),
+            Account::system(Provider::Claude)
+        );
     }
 
     #[test]

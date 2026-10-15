@@ -120,9 +120,31 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
                 .unwrap_or_default()
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
-            let entries = crate::account::cache::Cache::installation()
+            let cache = crate::account::cache::Cache::installation();
+            let mut entries = cache
+                .as_ref()
                 .map(|cache| cache.load(now))
                 .unwrap_or_default();
+            if preferred
+                .cache_key()
+                .and_then(|key| entries.get(&key))
+                .is_some_and(|entry| {
+                    crate::account::routing::needs_alternate_for(&preferred, &entry.snapshot, now)
+                })
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.block_on(crate::account::routing_refresh::refresh(
+                    &accounts,
+                    homes.as_ref(),
+                    &preferred,
+                    cache,
+                    &mut entries,
+                    now,
+                ));
+            }
             Ok(crate::account::routing::select_cached(
                 &accounts,
                 homes.as_ref(),
@@ -164,12 +186,35 @@ pub(super) fn submit(
     } else {
         None
     };
+    let pinned_directory = selected
+        .as_ref()
+        .map(|spec| {
+            chat::protocol::ExecutionContext::capture(&spec.target.directory)?
+                .directory_descriptor()
+                .ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
+        })
+        .transpose()?;
+    let directory_identity = pinned_directory
+        .as_ref()
+        .map(|directory| {
+            directory
+                .metadata()
+                .map(|metadata| crate::agent_execution::DirectoryIdentity::from_metadata(&metadata))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+        .submit_agent_with_directory(
+            &origin,
+            &request,
+            selected.as_ref(),
+            directory_identity,
+            now(),
+        )?;
     announce(host, &registry);
-    dispatch_accepted(host, accepted.clone())?;
+    dispatch_accepted_with_directory(host, accepted.clone(), pinned_directory)?;
     Ok(accepted)
 }
 
@@ -224,6 +269,7 @@ fn dispatch_accepted_with_directory(
 /// The provider's own launch arguments for a new agent's settings, in the
 /// spelling its native chat adapter translates. Each is applied before the
 /// provider can receive a prompt, so the first turn already runs with it.
+#[cfg(test)]
 fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     use crate::agent::Provider;
     let mut arguments = Vec::new();
@@ -270,9 +316,14 @@ fn dispatch(
     let gate = agent_gate(host, accepted.agent.id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
+    let operational_directory = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_execution_directory(accepted.agent.id)
+        .map_err(before)?;
     let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
-        .verify_directory(&accepted.agent.spec.target.directory)
+        .verify_directory(&operational_directory)
         .map_err(before)?;
     registry
         .lock()
@@ -295,7 +346,7 @@ fn dispatch(
         let directory = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&accepted.agent.spec.target.directory)
+            .open(&operational_directory)
             .map_err(|error| before(error.to_string()))?;
         context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
             directory,
@@ -306,7 +357,7 @@ fn dispatch(
             ));
         }
         context
-            .verify_directory(&accepted.agent.spec.target.directory)
+            .verify_directory(&operational_directory)
             .map_err(before)?;
     }
     if matches!(accepted.agent.origin, Origin::Automation { .. })
@@ -345,21 +396,31 @@ fn dispatch(
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let mut session = chat::fresh_session(
+        let settings = crate::settings::default_path()
+            .map_err(|error| before(error.to_string()))
+            .and_then(|path| {
+                crate::settings::load(path).map_err(|error| before(error.to_string()))
+            })?;
+        let configuration = settings
+            .agents
+            .get(crate::settings::agents::provider_key(
+                accepted.agent.spec.provider,
+            ))
+            .cloned()
+            .unwrap_or_default();
+        let mut session = chat::fresh_session_configured(
             accepted.agent.spec.provider,
             TerminalId::new(),
-            accepted.agent.spec.target.directory.clone(),
+            operational_directory.clone(),
             &account,
+            &configuration,
+            crate::settings::agents::LaunchDefaults {
+                model: accepted.agent.spec.model.as_deref(),
+                effort: accepted.agent.spec.reasoning_effort.as_deref(),
+                permission_mode: accepted.agent.spec.permission_mode.as_deref(),
+            },
         )
         .map_err(before)?;
-        // Use each provider's existing launch policy before it can receive a
-        // prompt. Post-start settings controls are unsupported by some adapters
-        // and an asynchronous acknowledgement must not race the first turn.
-        session
-            .launch
-            .recipe
-            .arguments
-            .extend(launch_options(&accepted.agent.spec));
         let proof = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -508,8 +569,11 @@ fn dispatch(
         create_console(host, &registry, accepted.agent.id, &session, &handle)
             .map_err(ConsoleError::run_failure)?;
     }
+    handle
+        .relocate_execution_directory(&operational_directory)
+        .map_err(before)?;
     context
-        .verify_directory(&accepted.agent.spec.target.directory)
+        .verify_directory(&operational_directory)
         .map_err(before)?;
     if matches!(accepted.agent.origin, Origin::Automation { .. }) {
         // Live interactive work may survive removal; each scheduled prompt
@@ -1037,13 +1101,17 @@ fn create_console(
     if !program.is_file() {
         return Err("The matched cagents CLI for the console is unavailable".into());
     }
+    let directory = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_execution_directory(agent)?;
     let recipe = crate::model::LaunchRecipe {
         program: program
             .into_os_string()
             .into_string()
             .map_err(|_| "Console executable path is not UTF-8")?,
         arguments: vec!["agent".into(), "console".into(), agent.to_string()],
-        working_directory: session.launch.recipe.working_directory.clone(),
+        working_directory: directory,
         environment: Default::default(),
         unset_environment: Default::default(),
     };
