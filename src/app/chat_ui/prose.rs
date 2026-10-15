@@ -1118,7 +1118,7 @@ pub(super) fn code_text(
                         font,
                         target,
                         find.as_deref(),
-                        logical,
+                        logical.clone(),
                     );
                 }
                 code_line(
