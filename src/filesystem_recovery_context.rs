@@ -33,7 +33,8 @@ impl FilesystemRecoveryContext {
         let descriptors = lease.retained_descriptor_count().checked_add(placement.retained_descriptor_count())
             .ok_or_else(|| io::Error::other("Recovery descriptor accounting overflow; no file was changed."))?;
         // Shared native placement/registry and Protection descriptors are
-        // measured once in this context, never charged as one zero-cost Arc or
+        // measured/bounded once in this context, including the registry lease
+        // reservation for future local payload handles; never as a zero-cost Arc or
         // hidden in each producer's separate <=16 private-descriptor allowance.
         let context = RecoveryContext::with_guard((protection, Arc::clone(&placement)), descriptors).map_err(io::Error::other)?;
         Ok(Self { placement, descriptors, context })
@@ -44,6 +45,21 @@ impl FilesystemRecoveryContext {
     /// Original retained outside parent and namespace. These are distinct from
     /// the source parent used for acquisition, putback and source fsync.
     pub fn placement(&self) -> &Arc<RecoveryPlacement> { &self.placement }
+    /// Enroll the actual newly Published holding before the first payload write
+    /// or source acquisition. Failure may follow a partial registry handoff:
+    /// keep this SAME context and publication in the pre-reserved owner.
+    pub fn register_payload_root(&self, payload: &Root) -> io::Result<()> {
+        self.placement.register_payload_root(payload)
+    }
+    /// Validate the actual live holding, not just its original parent. A public
+    /// move into any checkout refuses subsequent payload and cleanup effects.
+    /// Authenticated removed holdings need only complete retained-parent sync;
+    /// they must not try to rediscover ancestry after unlink.
+    pub fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
+        self.placement.validate_payload_root(payload)
+    }
+    /// Explicit Root handles and the lease's reserved maximum local handles.
+    /// Remote daemon reservations are accounted by their owning issuer.
     pub fn retained_descriptor_count(&self) -> usize { self.descriptors }
     /// Reserve before producer effects. The unresolved leaf retains the exact
     /// native context through failed retry and actual eventual resolution.
