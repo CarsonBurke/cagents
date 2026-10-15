@@ -94,6 +94,20 @@ impl Ledger {
         Ok(Self {_lock:lock, root:root.to_owned(), path, state, failed:false})
     }
 
+    pub(crate) fn begin_available(&mut self, credit_id: &str, now_ms: u64, fresh: &Allowance) -> Result<Admission, String> {
+        self.ensure_usable()?;
+        if !self.state.attempts.iter().any(|attempt| attempt.credit_id == credit_id) {
+            let matching = fresh.account.as_ref().is_some_and(|account| account.account_id == self.state.account_id && account.backend_origin == self.state.backend_origin);
+            let eligible = fresh.reset_credits.as_ref().filter(|credits| credits.available_count > 0)
+                .and_then(|credits| credits.details.as_ref()).is_some_and(|rows| rows.iter().any(|credit|
+                    credit.id == credit_id && credit.available && credit.supported_type && credit.expires_at_ms.is_none_or(|at| at > now_ms)));
+            if !matching || !eligible || now_ms.checked_sub(fresh.observed_at_ms).is_none_or(|age| age > 30_000) {
+                return Err("The selected reset credit is not freshly available on the exact provider account; no intent or effect was issued".into());
+            }
+        }
+        self.begin(credit_id, now_ms)
+    }
+
     pub(crate) fn begin(&mut self, credit_id: &str, now_ms: u64) -> Result<Admission, String> {
         self.ensure_usable()?;
         identifier_str(credit_id)?;

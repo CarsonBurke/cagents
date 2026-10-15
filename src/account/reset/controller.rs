@@ -1,0 +1,50 @@
+//! Off-HostLock orchestration for one authenticated, exact live source. The
+//! host supplies a current-record recheck; this module never selects by recipe.
+use super::{attempts::{Admission, Ledger}, request::{Action, Report, Request, Source}, transport};
+use crate::{agent::Provider, chat::runtime::Handle};
+use std::{path::Path, time::Instant};
+
+pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: Instant,
+    current: impl Fn() -> Result<(), String>) -> Result<Report, String> {
+    request.validate()?;
+    current()?;
+    let mut allowance = handle.read_allowance(expires)?;
+    current()?;
+    let mut outcome = None;
+    let mut reconciled = false;
+    if let Action::Redeem {expected, credit_id, authorized:_} = request.action {
+        if allowance.account.as_ref() != Some(&expected) {
+            return Err("The target's actual provider account differs from the requested reset account; no credit was consumed".into());
+        }
+        let mut ledger = Ledger::open(root, &expected)?;
+        // Re-read after acquiring the actual-account lease: a different
+        // session may have reset this shared allowance while we waited.
+        current()?;
+        allowance = handle.read_allowance(expires)?;
+        if allowance.account.as_ref() != Some(&expected) { return Err("Provider account changed before reset intent; no credit was consumed".into()); }
+        let now = crate::chat::now_ms().ok_or("System clock cannot timestamp reset intent")?;
+        match ledger.begin_available(&credit_id, now, &allowance)? {
+            Admission::Complete(prior) => { outcome = Some(prior); reconciled = true; }
+            Admission::Pending {idempotency_key, reconcile_first} => {
+                // That durable record is intentionally retained after EVERY
+                // error below, including missing RPC support and timeout.
+                current()?;
+                let (reply, response) = crossbeam_channel::bounded(1);
+                handle.consume_reset_credit(transport::Consume::prepared(expires, expected, credit_id.clone(), idempotency_key, reconcile_first, reply))?;
+                let consumed = response.recv_deadline(expires)
+                    .map_err(|_| "Provider reset outcome is uncertain; preserve and reconcile the original attempt before retrying".to_string())??;
+                current()?;
+                if Instant::now() >= expires { return Err("Reset response arrived after its deadline; reconcile the durable attempt".into()); }
+                ledger.finish(&credit_id, consumed.outcome, &consumed.allowance)?;
+                allowance = consumed.allowance;
+                outcome = Some(consumed.outcome);
+                reconciled = reconcile_first;
+            }
+        }
+    }
+    current()?;
+    if Instant::now() >= expires { return Err("Allowance operation deadline expired; the running source was preserved".into()); }
+    let report = Report {session:request.session, provider:Provider::Codex, source:Source::CodexAppServer, allowance, outcome, reconciled};
+    report.validate()?;
+    Ok(report)
+}

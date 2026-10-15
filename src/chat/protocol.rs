@@ -212,6 +212,9 @@ pub trait Adapter: Send {
     fn read_allowance(&mut self, _request: crate::account::reset::transport::Read) -> Result<Step, String> {
         Err("This provider transport has no supported read-only allowance/reset-inventory API; no provider command was sent".into())
     }
+    fn consume_reset_credit(&mut self, _request: crate::account::reset::transport::Consume) -> Result<Step, String> {
+        Err("This provider transport has no supported reset-credit redemption path; no credit was consumed".into())
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,

@@ -37,6 +37,7 @@ const FRAMES_PER_POLL: usize = 256;
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
     ReadAllowance(crate::account::reset::transport::Read),
+    ConsumeResetCredit(crate::account::reset::transport::Consume),
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -542,6 +543,19 @@ impl Handle {
         let result = response.recv_deadline(expires).map_err(|_| "Provider allowance read timed out".to_string())?;
         if Instant::now() >= expires { return Err("Provider allowance deadline expired".into()); }
         result
+    }
+
+    pub(crate) fn consume_reset_credit(&self, request: crate::account::reset::transport::Consume) -> Result<(), String> {
+        request.check()?;
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) || self.0.stop.load(Ordering::Acquire) {
+            return Err("The original provider actor is unavailable; reconcile its durable reset attempt before retrying".into());
+        }
+        let expires = request.expires;
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0.commands.try_send((ActorCommand::ConsumeResetCredit(request), reply))
+            .map_err(|e| format!("Reset command admission unavailable: {e}"))?;
+        self.wake();
+        response.recv_deadline(expires).map_err(|_| "Reset admission is uncertain; reconcile the durable attempt before retrying".to_string())?
     }
 
     pub fn command(&self, command: Command) -> Result<(), String> {
@@ -1932,6 +1946,14 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::ConsumeResetCredit(request) => {
+                    let result = request.check().and_then(|()| self.adapter.consume_reset_credit(request));
+                    match result {
+                        Ok(step) => { self.step(step)?; let _ = reply.send(Ok(())); }
+                        Err(error) => { let _ = reply.send(Err(error)); }
+                    }
+                    continue;
+                }
                 ActorCommand::ReadAllowance(request) => {
                     let result = request.check().and_then(|()| self.adapter.read_allowance(request));
                     match result {

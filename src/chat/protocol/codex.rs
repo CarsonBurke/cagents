@@ -16,6 +16,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 mod images;
 mod allowance;
+mod reset_credit;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -407,6 +408,7 @@ fn create_inner(
 #[derive(Clone)]
 enum Pending {
     Allowance(allowance::Read),
+    ResetCredit(reset_credit::Redemption),
     LoginRecovery {
         failure: String,
         expected: Option<crate::account::Identity>,
@@ -1532,6 +1534,9 @@ impl Adapter for Codex {
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
+    fn consume_reset_credit(&mut self, request: crate::account::reset::transport::Consume) -> Result<Step, String> {
+        reset_credit::start(self, request)
+    }
     fn read_allowance(&mut self, request: crate::account::reset::transport::Read) -> Result<Step, String> {
         allowance::start(self, request)
     }
@@ -1687,6 +1692,9 @@ impl Adapter for Codex {
                 .pending
                 .remove(&id)
                 .ok_or("Codex response has an unknown request ID")?;
+            if let Pending::ResetCredit(request) = pending {
+                return reset_credit::receive(self, request, &frame);
+            }
             if let Pending::Allowance(request) = pending {
                 return allowance::receive(self, request, &frame);
             }
@@ -1847,6 +1855,7 @@ impl Adapter for Codex {
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
                 Pending::Allowance(request) => return allowance::receive(self, request, &frame),
+                Pending::ResetCredit(request) => return reset_credit::receive(self, request, &frame),
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -2877,7 +2886,11 @@ impl Adapter for Codex {
                 // A login transition invalidates in-flight reads on this
                 // connection. Keep RPC IDs so their late replies are drained.
                 for pending in self.pending.values_mut() {
-                    if let Pending::Allowance(request) = pending { request.invalidated = true; }
+                    match pending {
+                        Pending::Allowance(request) => request.invalidated = true,
+                        Pending::ResetCredit(request) => request.invalidated = true,
+                        _ => {}
+                    }
                 }
                 step.events.push(Event::AccountUsage(LiveReport::CodexLogin(account::codex::parse_login_update(params))));
             }
@@ -4254,6 +4267,80 @@ mod tests {
             ),
             12000
         );
+    }
+
+    fn reset_request() -> (crate::account::reset::transport::Consume, crossbeam_channel::Receiver<Result<crate::account::reset::transport::Consumed, String>>) {
+        let (reply, receiver) = crossbeam_channel::bounded(1);
+        let request = crate::account::reset::transport::Consume::fixture(std::time::Instant::now()+std::time::Duration::from_secs(2),
+            crate::account::reset::ProviderAccount {account_id:"actual-account".into(),backend_origin:"https://chatgpt.com".into()}, reply);
+        (request, receiver)
+    }
+    fn reset_limits(used: u32, count: u32) -> Value {
+        json!({"accountId":"actual-account","rateLimits":{"primary":{"usedPercent":used,"resetsAt":4000000000u64}},
+            "rateLimitResetCredits":{"availableCount":count,"credits":if count>0 {json!([{"id":"actual-credit","resetType":"codexRateLimits","status":"available"}])} else {json!([])}}})
+    }
+    #[test]
+    fn reset_selected_credit_uses_original_key_once_and_requires_fresh_identity_inventory_readback() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        adapter.turn = Some("preserved-running-turn".into());
+        let (request, receiver) = reset_request();
+        let key = request.key.clone();
+        let mut step = adapter.consume_reset_credit(request).unwrap();
+        for (method, result) in [
+            ("account/read", allowance_account()),
+            ("account/rateLimits/read", reset_limits(96,1)),
+            ("account/rateLimitResetCredit/consume", json!({"outcome":"reset"})),
+            ("account/read", allowance_account()),
+            ("account/rateLimits/read", reset_limits(0,0)),
+        ] {
+            assert_eq!(step.writes.len(), 1);
+            assert!(step.events.is_empty());
+            assert_eq!(step.writes[0]["method"], method);
+            if method.ends_with("/consume") {
+                assert_eq!(step.writes[0]["params"]["idempotencyKey"], key);
+                assert_eq!(step.writes[0]["params"]["creditId"], "actual-credit");
+            }
+            assert!(receiver.try_recv().is_err());
+            step = adapter.receive(json!({"id":step.writes[0]["id"],"result":result})).unwrap();
+        }
+        assert!(step.events.is_empty() && step.writes.is_empty());
+        let verified = receiver.recv_timeout(std::time::Duration::from_millis(100)).unwrap().unwrap();
+        assert_eq!(verified.outcome, crate::account::reset::Outcome::Reset);
+        assert_eq!(verified.allowance.windows[0].used_percent, 0);
+        assert_eq!(verified.allowance.reset_credits.unwrap().available_count, 0);
+        assert!(adapter.busy);
+        assert_eq!(adapter.turn.as_deref(), Some("preserved-running-turn"));
+    }
+    #[test]
+    fn reset_refuses_changed_account_and_login_transition_before_the_consuming_rpc() {
+        for changed_event in [false, true] {
+            let mut adapter = adapter();
+            let (request, receiver) = reset_request();
+            let first = adapter.consume_reset_credit(request).unwrap();
+            let mut account = allowance_account();
+            if changed_event {
+                adapter.receive(json!({"method":"account/updated","params":{}})).unwrap();
+            } else { account["workspaceRouting"]["chatgptAccountId"] = json!("other-account"); }
+            let refused = adapter.receive(json!({"id":first.writes[0]["id"],"result":account})).unwrap();
+            assert!(refused.events.is_empty() && refused.writes.is_empty());
+            assert!(receiver.recv_timeout(std::time::Duration::from_millis(100)).unwrap().is_err());
+        }
+    }
+    #[test]
+    fn uncertain_reset_reply_cannot_be_replaced_by_a_second_reset_or_inspection_request() {
+        let mut adapter = adapter();
+        let (request, receiver) = reset_request();
+        let first = adapter.consume_reset_credit(request).unwrap();
+        let second = adapter.receive(json!({"id":first.writes[0]["id"],"result":allowance_account()})).unwrap();
+        let consume = adapter.receive(json!({"id":second.writes[0]["id"],"result":reset_limits(96,1)})).unwrap();
+        assert_eq!(consume.writes[0]["method"], "account/rateLimitResetCredit/consume");
+        drop(receiver); // caller lost its response, actor still owns exact RPC
+        let (retry, _) = reset_request();
+        assert!(adapter.consume_reset_credit(retry).unwrap_err().contains("still pending"));
+        let (inspect, _) = allowance_request();
+        assert!(adapter.read_allowance(inspect).unwrap_err().contains("already in flight"));
+        assert_eq!(adapter.pending.len(), 1);
     }
 
     fn allowance_request() -> (crate::account::reset::transport::Read, crossbeam_channel::Receiver<Result<crate::account::reset::Allowance, String>>) {

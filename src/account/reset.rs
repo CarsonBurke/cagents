@@ -9,6 +9,8 @@ pub(crate) mod attempts;
 #[cfg(feature = "host")]
 pub(crate) mod transport;
 pub(crate) mod request;
+#[cfg(feature = "host")]
+pub(crate) mod controller;
 
 const MAX_BUCKETS: usize = 128;
 const MAX_CREDIT_ROWS: usize = 128;
