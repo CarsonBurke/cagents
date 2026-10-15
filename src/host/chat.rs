@@ -2382,6 +2382,7 @@ fn process_inner(
                 (record.handle.clone(), record.session.clone())
             };
             session.launch.session_id = handle.confirmed_session_id();
+            session.native_continuity = handle.native_continuity();
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
             let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
@@ -2445,6 +2446,7 @@ fn process_inner(
                     "Provider identity changed during shutdown; retry the exact terminal handoff",
                 ));
             }
+            retained_actor::finish_close(host, &handle, &session).map_err(unavailable)?;
             // Autonomous policy changes can arrive while the native writer
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
@@ -3061,7 +3063,12 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
+    let source = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.chats.get(&terminal_id).filter(|record| record.handle.same_actor(handle)).map(|record| record.session.clone())
+    };
     handle.close().map_err(unavailable)?;
+    if let Some(source) = &source { retained_actor::finish_close(host, handle, source).map_err(unavailable)?; }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state
         .chats
