@@ -209,7 +209,7 @@ impl WindowRecoveryRoots {
         source: Arc<Root>,
         protection: Arc<Option<Protection>>,
         payload_capacity: u8,
-        custody: &crate::recovery_domain::RecoveryPlacementCustody,
+        work: &crate::edited_root_admission::PlacementWork,
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<IssuedRecoveryPlacement, WindowRecoveryIssueError> {
@@ -238,7 +238,7 @@ impl WindowRecoveryRoots {
         // deadline; connection setup cannot restart the operation timeout.
         let client = RecoveryPlacementClient::connect_local_until(resolved.endpoint, deadline)?;
         client.reserve_with_candidates_in_custody(inputs, source, protection, commons, payload_capacity,
-            custody, cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
+            work.custody(), cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
     }
 
     /// Blocking worker only. Every source is the original cached actor; no
@@ -290,6 +290,12 @@ mod tests {
     }
     fn capture(app: &Cagents) -> Result<WindowRecoveryRoots, String> {
         app.recovery_window_roots_for_endpoint(endpoint((app.workspace_model.identity != crate::workspace_model::NO_REGISTRY).then_some(app.workspace_model.identity)))
+    }
+
+    fn placement_work() -> (crate::edited_root_admission::EditedRootAdmissions, crate::edited_root_admission::PlacementWork) {
+        let mut admissions = crate::edited_root_admission::EditedRootAdmissions::default();
+        let work = admissions.reserve_placement().unwrap().begin_issue().unwrap();
+        (admissions, work)
     }
 
     #[tokio::test]
@@ -416,6 +422,7 @@ mod tests {
 
     #[test]
     fn actual_context_intake_requires_strong_original_protection_before_endpoint_io() {
+        let (_admissions, work) = placement_work();
         let files = tempfile::tempdir().unwrap();
         std::fs::write(files.path().join("unchanged"), b"original").unwrap();
         let source = Arc::new(Root::open(files.path()).unwrap());
@@ -424,15 +431,15 @@ mod tests {
             endpoint: endpoint(Some(registry)), registry: Some(registry),
             required_projects: Vec::new(), projects: Vec::new(), edited: vec![source.clone()],
         };
-        let result = input().issue_context(source.clone(), Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
+        let result = input().issue_context(source.clone(), Arc::new(None), 1, &work,
             &CancellationToken::new(), Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Unsupported
             && error.to_string().contains("strong source protection")));
         let cancelled = CancellationToken::new(); cancelled.cancel();
-        let result = input().issue_context(source.clone(), Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
+        let result = input().issue_context(source.clone(), Arc::new(None), 1, &work,
             &cancelled, Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Interrupted));
-        let result = input().issue_context(source, Arc::new(None), 1, &crate::recovery_domain::RecoveryPlacementCustody::new(),
+        let result = input().issue_context(source, Arc::new(None), 1, &work,
             &CancellationToken::new(), Instant::now() - Duration::from_millis(1));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error))
             if error.kind() == io::ErrorKind::Interrupted));
@@ -442,6 +449,7 @@ mod tests {
 
     #[test]
     fn actual_context_intake_contacts_only_the_captured_private_endpoint() {
+        let (_admissions, work) = placement_work();
         let files = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         std::fs::write(files.path().join("unchanged"), b"original").unwrap();
@@ -453,7 +461,7 @@ mod tests {
             endpoint: LocalRecoveryEndpoint::fixture(runtime.path().join("absent-daemon.sock"), Some(registry)).unwrap(),
             registry: Some(registry), required_projects: Vec::new(), projects: Vec::new(), edited: vec![source.clone()],
         };
-        let result = input.issue_context(source, protection, 1, &crate::recovery_domain::RecoveryPlacementCustody::new(), &CancellationToken::new(),
+        let result = input.issue_context(source, protection, 1, &work, &CancellationToken::new(),
             Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::NotFound));
         assert_eq!(std::fs::read(files.path().join("unchanged")).unwrap(), b"original");

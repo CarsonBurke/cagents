@@ -704,4 +704,43 @@ mod tests {
         drop(client); server.join().unwrap();
     }
 
+
+    #[test]
+    fn root_and_placement_tickets_share_one_preworker_capacity() {
+        let mut custody = EditedRootAdmissions::default();
+        for _ in 0..MAX_ADMISSIONS - 1 { custody.reserve().unwrap(); }
+        let placement = custody.reserve_placement().unwrap();
+        assert!(custody.reserve().is_err());
+        assert!(custody.reserve_placement().is_err());
+        placement.request_retirement();
+        custody.next_placement_retirement().unwrap().run(Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+        custody.collect_settled();
+        assert_eq!(custody.len(), MAX_ADMISSIONS - 1);
+        assert!(custody.reserve().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_placement_worker_keeps_slot_and_seals_lazy_client_after_positive_empty_settlement() {
+        use crate::fs_safety::Root;
+        use crate::recovery_domain::RecoveryPlacementInputs;
+        use std::time::Duration;
+        let (_runtime, client, server) = private_catalog_client();
+        let mut admissions = EditedRootAdmissions::default();
+        let ticket = admissions.reserve_placement().unwrap();
+        let work = ticket.begin_issue().unwrap();
+        let original_slot = work.custody().clone();
+        drop(work);
+        assert_eq!(ticket.phase(), AdmissionPhase::Interrupted);
+        admissions.next_placement_retirement().unwrap().run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(ticket.phase(), AdmissionPhase::Settled);
+        let files = tempfile::tempdir().unwrap();
+        let source = Arc::new(Root::open(files.path()).unwrap());
+        let error = client.reserve_with_candidates_in_custody(RecoveryPlacementInputs {
+            observed_registry: None, observed_projects: vec![], held_roots: vec![],
+        }, source, Arc::new(None), vec![], 1, &original_slot, &CancellationToken::new(), Instant::now() + Duration::from_secs(2)).unwrap_err();
+        assert!(error.to_string().contains("sealed"), "lazy worker must refuse before Prepare");
+        drop(client); server.join().unwrap();
+    }
+
 }
