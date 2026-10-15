@@ -223,11 +223,12 @@ pub(super) fn controls<'a>(
             configuration.model.as_deref(),
             models.iter().map(|model| model.id.clone()),
         )];
-        if let Some(reason) = &entry.launch_error {
+        let unavailable = "The configured executable is unavailable. Choose an executable path or use Detect.";
+        if let Some(reason) = entry.launch_error.as_deref().or(entry.executable_unavailable.then_some(unavailable)) {
             options.push(setting_field(
                 "Launch unavailable",
                 "Repair these preferences before starting a new conversation.",
-                design::caption(reason.as_str())
+                design::caption(reason)
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
                     .into(),
             ));

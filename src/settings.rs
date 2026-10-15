@@ -1603,11 +1603,20 @@ impl AppSettings {
     /// Validate edited launch fields while retaining unavailable saved paths
     /// and policy in other fields. Each selected launch still validates fully.
     pub fn validate_transition(self, previous: &Self) -> Result<Self, SettingsError> {
+        self.validate_transition_with_availability(previous, true)
+    }
+
+    /// Reducers check syntax; blocking save and launch workers check files.
+    pub(crate) fn validate_transition_syntax(self, previous: &Self) -> Result<Self, SettingsError> {
+        self.validate_transition_with_availability(previous, false)
+    }
+
+    fn validate_transition_with_availability(self, previous: &Self, availability: bool) -> Result<Self, SettingsError> {
         if self.default_shell != previous.default_shell
             && self
                 .default_shell
                 .as_deref()
-                .is_some_and(|path| !agents::executable_available(path))
+                .is_some_and(|path| if availability { !agents::executable_available(path) } else { !agents::executable_path_syntax(path) })
         {
             return Err(SettingsError::AgentLaunch(
                 "Default shell must be an absolute path to an executable file.".into(),
@@ -1616,14 +1625,12 @@ impl AppSettings {
         for provider in crate::agent::Provider::ALL {
             let key = agents::provider_key(provider);
             if let Some(configuration) = self.agents.get(key) {
-                configuration
-                    .validate_changes(
-                        previous
-                            .agents
-                            .get(key)
-                            .unwrap_or(&AgentLaunchSettings::default()),
-                        provider,
-                    )
+                let previous = previous.agents.get(key).cloned().unwrap_or_default();
+                (if availability {
+                    configuration.validate_changes(&previous, provider)
+                } else {
+                    configuration.validate_changes_syntax(&previous, provider)
+                })
                     .map_err(SettingsError::AgentLaunch)?;
             }
         }

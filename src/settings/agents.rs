@@ -81,7 +81,30 @@ pub fn validate_permission_override(provider: Provider, mode: &str) -> Result<()
 
 /// Executable paths are absolute so a launch in another worktree means the
 /// same thing. `access` checks the current user's actual execute permission.
+pub fn executable_path_syntax(path: &str) -> bool {
+    Path::new(path).is_absolute() && !path.contains('\0')
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXECUTABLE_CHECKS_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Prove reducer paths cannot acquire filesystem metadata; worker threads
+/// have their own guard state and still perform the real availability check.
+#[cfg(test)]
+pub(crate) fn without_executable_checks<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { EXECUTABLE_CHECKS_FORBIDDEN.set(self.0); }
+    }
+    let _restore = Restore(EXECUTABLE_CHECKS_FORBIDDEN.replace(true));
+    f()
+}
+
 pub fn executable_available(path: &str) -> bool {
+    #[cfg(test)]
+    EXECUTABLE_CHECKS_FORBIDDEN.with(|forbidden| assert!(!forbidden.get(), "filesystem availability check on reducer thread"));
     let path = Path::new(path);
     path.is_absolute()
         && path.is_file()
@@ -156,10 +179,14 @@ impl AgentLaunchSettings {
     }
 
     fn validate_execution_fields(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution_fields_with_availability(provider, true)
+    }
+
+    fn validate_execution_fields_with_availability(&self, provider: Provider, availability: bool) -> Result<(), String> {
         if self
             .executable
             .as_deref()
-            .is_some_and(|path| !executable_available(path))
+            .is_some_and(|path| if availability { !executable_available(path) } else { !executable_path_syntax(path) })
         {
             return Err(format!(
                 "{} executable must be an absolute path to an executable file.",
@@ -192,12 +219,8 @@ impl AgentLaunchSettings {
     /// Validate the recorded policy's syntax without probing a filesystem.
     /// Availability is checked by save/launch workers on the owning device.
     pub fn validate_syntax(&self, provider: Provider) -> Result<(), String> {
-        let mut syntax = self.clone();
-        syntax.executable = None;
-        syntax.validate_fields(provider)?;
-        if self.executable.as_deref().is_some_and(|path| {
-            !Path::new(path).is_absolute() || path.contains('\0')
-        }) {
+        self.validate_fields_with_availability(provider, false)?;
+        if self.executable.as_deref().is_some_and(|path| !executable_path_syntax(path)) {
             return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
         }
         self.validate_provider_path()
@@ -209,7 +232,11 @@ impl AgentLaunchSettings {
     }
 
     fn validate_fields(&self, provider: Provider) -> Result<(), String> {
-        self.validate_execution_fields(provider)?;
+        self.validate_fields_with_availability(provider, true)
+    }
+
+    fn validate_fields_with_availability(&self, provider: Provider, availability: bool) -> Result<(), String> {
+        self.validate_execution_fields_with_availability(provider, availability)?;
         for value in self.model.iter().chain(self.effort.iter()) {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
                 return Err(
@@ -233,6 +260,14 @@ impl AgentLaunchSettings {
     /// Validate changed fields independently so retained invalid siblings can
     /// be repaired one control at a time without weakening launch validation.
     pub fn validate_changes(&self, previous: &Self, provider: Provider) -> Result<(), String> {
+        self.validate_changes_with_availability(previous, provider, true)
+    }
+
+    pub fn validate_changes_syntax(&self, previous: &Self, provider: Provider) -> Result<(), String> {
+        self.validate_changes_with_availability(previous, provider, false)
+    }
+
+    fn validate_changes_with_availability(&self, previous: &Self, provider: Provider, availability: bool) -> Result<(), String> {
         Self {
             model: (self.model != previous.model)
                 .then(|| self.model.clone())
@@ -257,7 +292,7 @@ impl AgentLaunchSettings {
                 Default::default()
             },
         }
-        .validate_fields(provider)?;
+        .validate_fields_with_availability(provider, availability)?;
         if self.executable != previous.executable
             || self.environment.get("PATH") != previous.environment.get("PATH")
         {
