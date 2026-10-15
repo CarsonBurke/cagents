@@ -64,7 +64,10 @@ mod tests {
         app.browser_import.phase = Phase::Selection;
         let event = dialog_ui::tests::key_press(keyboard::key::Named::Escape);
         let (messages, captured) = dialog_ui::tests::key_control(
-            app.dialog().unwrap(), widget::Id::new("dialog.browser-import.filter"), event.clone());
+            app.dialog().unwrap(),
+            widget::Id::new("dialog.browser-import.filter"),
+            event.clone(),
+        );
         assert!(captured, "the actual focused COSMIC input captures Escape");
         assert!(messages.is_empty());
         drop(app.update(Message::KeyEvent { event, captured }));
@@ -74,9 +77,13 @@ mod tests {
         app.browser_import.phase = Phase::Selection;
         app.transient_work_close = Some(window::Id::unique());
         drop(app.update(Message::KeyEvent {
-            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape), captured: true,
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: true,
         }));
-        assert!(app.browser_import.open(), "an obscured import must not consume the upper owner's Escape");
+        assert!(
+            app.browser_import.open(),
+            "an obscured import must not consume the upper owner's Escape"
+        );
         assert!(app.transient_work_close.is_some());
     }
 

@@ -72,10 +72,7 @@ pub(super) fn overlay<'a>(
 pub(super) mod tests {
     use super::*;
     /// Feed Enter to the real mounted native control after its focus operation.
-    pub(in crate::app) fn enter_control(
-        element: Element<'_, Message>,
-        id: widget::Id,
-    ) -> Message {
+    pub(in crate::app) fn enter_control(element: Element<'_, Message>, id: widget::Id) -> Message {
         let (mut messages, _) = key_control(element, id, key_press(keyboard::key::Named::Enter));
         assert_eq!(
             messages.len(),
@@ -88,7 +85,9 @@ pub(super) mod tests {
         keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key.clone()),
             modified_key: keyboard::Key::Named(key),
-            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
             location: keyboard::Location::Standard,
             modifiers: keyboard::Modifiers::empty(),
             text: None,
@@ -134,5 +133,4 @@ pub(super) mod tests {
         let captured = shell.is_event_captured();
         (messages, captured)
     }
-
 }
