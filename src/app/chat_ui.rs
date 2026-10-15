@@ -6177,6 +6177,10 @@ impl Cagents {
     /// rather than the chat card converted: a conversion is only ever an
     /// exact handoff of one conversation; an unnamed chat starts a fresh CLI.
     fn return_chat_locally(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_ui.handoff_bindings.keys().any(|target| target.card == card) {
+            self.status = Some(TransientNotice::warning("The original Return is unconfirmed. Local conversion cannot replace its exact terminal receipt."));
+            return Task::none();
+        }
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
@@ -7072,6 +7076,12 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
+            && !matches!(&action, Action::Switch(_))
+            && self.chat_ui.handoff_bindings.keys().any(|target| target.card == card) {
+            self.status = Some(TransientNotice::warning("The original Return must settle before reconnecting or replacing this conversation."));
+            return Task::none();
+        }
+        if let Some(card) = action.starts_session()
             && self.refuse_for_deleting_card(card)
         {
             return Task::none();
@@ -7284,6 +7294,11 @@ impl Cagents {
                                 .handle()
                                 .is_some_and(|handle| handle.snapshot().session_id.is_some())
                         };
+                        if self.chat_ui.handoff_bindings.keys().any(|target| target.card == card)
+                            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.connected() && named(runtime)) {
+                            self.status = Some(TransientNotice::warning("The original Return connection ended before its receipt was confirmed. Its pane and recovery intent were kept; no local fallback was started."));
+                            return Task::none();
+                        }
                         let runtime = match self.cards.get(&card) {
                             Some(CardRuntime::Chat(runtime))
                                 if runtime.connected() && named(runtime) =>
@@ -16280,6 +16295,31 @@ mod tests {
         assert!(app.chat_ui.handoff_closes.contains_key(&card));
         assert!(!app.chat_ui.handoff_closes[&card].attached);
         assert!(app.recently_closed.is_empty());
+    }
+
+    #[test]
+    fn disconnected_ambiguous_return_cannot_fall_back_to_local_conversion_or_restart() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let captured = app.chat_ui.handoff_bindings[&target].clone();
+        request_end_chat(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, captured.operation, Err("framed EOF after possible Return effects".into())))));
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Disconnected("original reader EOF".into())))));
+        assert!(chat_runtime(&app, card).disconnected);
+        let source = app.card_state(card).unwrap().kind.clone();
+        for action in [Action::Switch(card), Action::Reconnect(target), Action::StartFresh(card)] {
+            drop(app.update(Message::ChatUi(action)));
+            assert_eq!(app.card_state(card).unwrap().kind, source);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.order().any(|id| id == card));
+            assert!(app.chat_ui.phases.is_empty(), "no local close/convert or replacement start");
+            assert!(app.chat_ui.end_requests.contains_key(&target));
+            assert_eq!(app.chat_ui.handoff_bindings[&target].binding, captured.binding);
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+            assert!(app.recently_closed.is_empty());
+        }
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
