@@ -1016,7 +1016,7 @@ fn save_file_with_hooks(
     save_file_at_with_hooks(&root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent)
 }
 
-fn save_file_at_with_hooks(
+pub(crate) fn save_file_at_with_hooks(
     root: &Root,
     relative_path: &Path,
     text: &str,

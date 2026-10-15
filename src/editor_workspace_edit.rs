@@ -180,13 +180,17 @@ pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
     publish_unopened_with_before_file(plan, |_| {})
 }
 
-fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(usize)) -> Result<PublicationReport, String> {
+fn publish_unopened_with_before_file(plan: &Plan, before_file: impl FnMut(usize)) -> Result<PublicationReport, String> {
+    publish_unopened_with_writer(plan, before_file, |root, path, text, hash| editor::save_file_at(root, path, text, hash, false))
+}
+
+fn publish_unopened_with_writer(plan: &Plan, mut before_file: impl FnMut(usize), mut write: impl FnMut(&fs_safety::Root, &Path, &str, blake3::Hash) -> Result<SaveOutcome, editor::FileIoError>) -> Result<PublicationReport, String> {
     verify_root(&plan.root)?;
     let mut report = PublicationReport::default();
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
         before_file(index);
-        let saved = verify_root(&plan.root).and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false).map_err(|error| error.to_string()));
+        let saved = verify_root(&plan.root).and_then(|()| write(&plan.root, &document.relative, &document.after, document.before_hash).map_err(|error| error.to_string()));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
                 if let SaveDurability::Unconfirmed { error } = durability { report.durability_warnings.push(format!("{} was replaced, but durability is unconfirmed: {error}", document.relative.display())); }
@@ -199,13 +203,29 @@ fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(us
             Err(error) => format!("{}: {error}", document.relative.display()),
         };
         let mut unrestored = Vec::new();
+        let mut rollback_durability = Vec::new();
         for previous in published.into_iter().rev() {
-            if !matches!(editor::save_file_at(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false), Ok(SaveOutcome::Saved { .. })) {
-                unrestored.push(previous.relative.display().to_string());
+            match write(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes())) {
+                Ok(SaveOutcome::Saved { durability: SaveDurability::Durable, .. }) => {},
+                Ok(SaveOutcome::Saved { durability: SaveDurability::Unconfirmed { error }, .. }) => {
+                    rollback_durability.push(format!("{}: {error}", previous.relative.display()));
+                }
+                _ => unrestored.push(previous.relative.display().to_string()),
             }
         }
-        return Err(if unrestored.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
-            else { format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", ")) });
+        let mut error = if unrestored.is_empty() {
+            if rollback_durability.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
+            else { format!("The workspace edit was canceled: {failure}. Earlier file contents were restored.") }
+        } else {
+            format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", "))
+        };
+        if !rollback_durability.is_empty() {
+            error.push_str(&format!(" Restored file contents have unconfirmed crash durability: {}", rollback_durability.join("; ")));
+        }
+        if !unrestored.is_empty() && !report.durability_warnings.is_empty() {
+            error.push_str(&format!(" Earlier publication warnings: {}", report.durability_warnings.join("; ")));
+        }
+        return Err(error);
     }
     Ok(report)
 }
@@ -217,6 +237,27 @@ mod tests {
     fn edit(start: u32, end: u32, new_text: &str) -> LspTextEdit {
         LspTextEdit { range: LspRange::new(LspPosition::new(0, start), LspPosition::new(0, end)), new_text: new_text.into() }
     }
+    #[test]
+    fn rollback_reports_restored_bytes_with_unconfirmed_parent_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] { std::fs::write(directory.path().join(name), "old").unwrap(); }
+        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
+        let plan = prepare(directory.path(), documents, &HashMap::new()).unwrap();
+        let error = publish_unopened_with_writer(&plan, |index| {
+            if index == 1 { std::fs::write(directory.path().join("b.rs"), "outside writer").unwrap(); }
+        }, |root, path, text, hash| {
+            if text == "old" {
+                editor::save_file_at_with_hooks(root, path, text, hash, false, || Ok(()), |_| Err(std::io::Error::other("injected rollback parent sync failure")))
+            } else { editor::save_file_at(root, path, text, hash, false) }
+        }).unwrap_err();
+        assert_eq!(std::fs::read_to_string(directory.path().join("a.rs")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(directory.path().join("b.rs")).unwrap(), "outside writer");
+        assert!(error.contains("file contents were restored"), "{error}");
+        assert!(error.contains("unconfirmed crash durability"), "{error}");
+        assert!(error.contains("a.rs: injected rollback parent sync failure"), "{error}");
+        assert!(!error.contains("Earlier writes were restored."), "no unconditional durability claim: {error}");
+    }
+
     #[test]
     fn target_resolution_captures_only_changed_open_files_and_keeps_aliases() {
         let directory = tempfile::tempdir().unwrap();
