@@ -525,8 +525,9 @@ impl Project {
                     change.worktrees.insert(worktree.id);
                     let name = path.file_name();
                     change.metadata = true;
-                    change.untracked |= name.is_some_and(|name|
-                        name == "index" || name == "config.worktree" || name == "exclude");
+                    change.untracked |= name.is_some_and(|name| {
+                        name == "index" || name == "config.worktree" || name == "exclude"
+                    });
                     change.membership |= name.is_some_and(|name| name == "HEAD");
                     change.topology |= path
                         .file_name()
@@ -538,9 +539,12 @@ impl Project {
                             .is_some_and(|parent| worktree.directories.contains(parent)))
                 {
                     change.worktrees.insert(worktree.id);
-                    change.untracked |= matches!(event.kind,
-                        EventKind::Create(_) | EventKind::Remove(_)
-                            | EventKind::Modify(notify::event::ModifyKind::Name(_)));
+                    change.untracked |= matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    );
                     // A removed/recreated ancestor needs new directory watches;
                     // simple file edits keep the existing tracked-path census.
                     change.membership |= worktree.directories.contains(path)
@@ -1235,22 +1239,33 @@ pub(crate) mod tests {
     fn index_and_file_membership_edges_refresh_counts_without_ref_fanout() {
         let project = project(Path::new("/fixture"));
         let first = &project.worktrees[0];
-        let index = project.change(&modified(first.git_dir.join("index"))).unwrap();
+        let index = project
+            .change(&modified(first.git_dir.join("index")))
+            .unwrap();
         assert_eq!(index.worktrees, BTreeSet::from([first.id]));
         assert!(index.untracked);
         assert!(!index.membership && !index.topology);
-        let refs = project.change(&modified(project.common_dir.join("refs/heads/main"))).unwrap();
+        let refs = project
+            .change(&modified(project.common_dir.join("refs/heads/main")))
+            .unwrap();
         assert_eq!(refs.worktrees, BTreeSet::from([first.id]));
         assert!(!refs.untracked && !refs.membership && !refs.topology);
-        for kind in [EventKind::Create(notify::event::CreateKind::File),
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
             EventKind::Remove(notify::event::RemoveKind::File),
-            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both))] {
-            let change = project.change(&Event::new(kind).add_path(first.root.join("new.txt"))).unwrap();
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+        ] {
+            let change = project
+                .change(&Event::new(kind).add_path(first.root.join("new.txt")))
+                .unwrap();
             assert_eq!(change.worktrees, BTreeSet::from([first.id]));
             assert!(change.untracked && !change.membership && !change.topology);
             let mut combined = refs.clone();
             combined.merge(change);
-            assert!(combined.untracked, "debouncing must preserve the full-count hint");
+            assert!(
+                combined.untracked,
+                "debouncing must preserve the full-count hint"
+            );
         }
     }
 

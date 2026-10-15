@@ -27866,9 +27866,14 @@ mod tests {
         };
         let model = SourceControlModel::ready(key.clone(), &snapshot);
         let followup = app.update(Message::SourceControlLoaded {
-            key: key.clone(), request: generation,
-            result: Ok(SourceControlRead { status: snapshot.status.display_summary(),
-                prepared: Some(Box::new((snapshot, model))), head_repository: None, read: git_ui::next_status_read() }),
+            key: key.clone(),
+            request: generation,
+            result: Ok(SourceControlRead {
+                status: snapshot.status.display_summary(),
+                prepared: Some(Box::new((snapshot, model))),
+                head_repository: None,
+                read: git_ui::next_status_read(),
+            }),
         });
         assert_eq!(
             app.sidebar_model
@@ -27889,8 +27894,15 @@ mod tests {
         assert!(app.refresh_ui.source_cancel.is_some());
         assert!(!active.is_cancelled());
         let next = app.refresh_ui.source_generation;
-        drop(app.update(Message::SourceControlLoaded { key, request: next, result: Ok(unchanged_source_control_proof()) }));
-        assert_eq!(app.refresh_ui.source_generation, next, "no trailing reload after the pending edge was consumed");
+        drop(app.update(Message::SourceControlLoaded {
+            key,
+            request: next,
+            result: Ok(unchanged_source_control_proof()),
+        }));
+        assert_eq!(
+            app.refresh_ui.source_generation, next,
+            "no trailing reload after the pending edge was consumed"
+        );
         assert!(app.refresh_ui.source_cancel.is_none());
     }
 
@@ -27905,9 +27917,20 @@ mod tests {
             let generation = app.refresh_ui.source_generation;
             app.refresh_ui.source_cancel = Some(CancellationToken::default());
             drop(app.reload_source_control_from_event(&key));
-            let result = if failed { Err("transient read failure".into()) } else { Ok(unchanged_source_control_proof()) };
-            let followup = app.update(Message::SourceControlLoaded { key, request: generation, result });
-            assert!(cosmic::iced::runtime::task::into_stream(followup).is_some(), "pending invalidation survives failed={failed}");
+            let result = if failed {
+                Err("transient read failure".into())
+            } else {
+                Ok(unchanged_source_control_proof())
+            };
+            let followup = app.update(Message::SourceControlLoaded {
+                key,
+                request: generation,
+                result,
+            });
+            assert!(
+                cosmic::iced::runtime::task::into_stream(followup).is_some(),
+                "pending invalidation survives failed={failed}"
+            );
             assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
             assert!(!app.refresh_ui.source_reload_pending);
             assert!(app.refresh_ui.source_cancel.is_some());
@@ -27934,8 +27957,15 @@ mod tests {
         assert!(active.is_cancelled());
         assert!(!app.refresh_ui.source_reload_pending);
         assert!(app.refresh_ui.source_cancel.is_none());
-        drop(app.update(Message::SourceControlLoaded { key, request: retired, result: Ok(unchanged_source_control_proof()) }));
-        assert!(app.refresh_ui.source_cancel.is_none(), "retired callback cannot start a new read");
+        drop(app.update(Message::SourceControlLoaded {
+            key,
+            request: retired,
+            result: Ok(unchanged_source_control_proof()),
+        }));
+        assert!(
+            app.refresh_ui.source_cancel.is_none(),
+            "retired callback cannot start a new read"
+        );
         assert!(!app.refresh_ui.source_reload_pending);
     }
 }

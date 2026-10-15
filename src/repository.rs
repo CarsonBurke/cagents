@@ -978,10 +978,14 @@ fn snapshot_count_admin_changed(
 }
 
 impl SnapshotCache {
-    pub fn status_attempt_failed(&self) -> bool { self.status_attempt_failed }
+    pub fn status_attempt_failed(&self) -> bool {
+        self.status_attempt_failed
+    }
 
     /// Last successful display proof, including unchanged reads; never mutation authority.
-    pub fn row_status(&self) -> Option<&StatusSnapshot> { self.last_status.as_ref() }
+    pub fn row_status(&self) -> Option<&StatusSnapshot> {
+        self.last_status.as_ref()
+    }
 
     /// The publication remote proven by the last successful snapshot read.
     /// This display identity never grants permission to mutate a worktree.
@@ -4676,8 +4680,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if unchanged && root_unchanged {
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
-                    return Err(process_failure(&CommandSpec::new(&self.git),
-                        ProcessFailureKind::Cancelled, "source-control read cancelled", false).into());
+                    return Err(process_failure(
+                        &CommandSpec::new(&self.git),
+                        ProcessFailureKind::Cancelled,
+                        "source-control read cancelled",
+                        false,
+                    )
+                    .into());
                 }
                 return Ok(None);
             }
@@ -8661,7 +8670,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn snapshot_cache_status_or_content_change_reuses_metadata() {

@@ -81,8 +81,11 @@ impl Snapshot {
             } else {
                 self.status_errors.remove(&id);
             }
-            if let Some(head) = current.heads.get(&id) { self.heads.insert(id, head.clone()); }
-            else { self.heads.remove(&id); }
+            if let Some(head) = current.heads.get(&id) {
+                self.heads.insert(id, head.clone());
+            } else {
+                self.heads.remove(&id);
+            }
             if let Some(latest) = current_rows.get(&id) {
                 *row = (**latest).clone();
                 true
@@ -118,8 +121,11 @@ impl Snapshot {
             } else {
                 self.status_errors.remove(&id);
             }
-            if let Some(head) = current.heads.get(&id) { self.heads.insert(id, head.clone()); }
-            else { self.heads.remove(&id); }
+            if let Some(head) = current.heads.get(&id) {
+                self.heads.insert(id, head.clone());
+            } else {
+                self.heads.remove(&id);
+            }
         }
         preserved
     }
@@ -292,7 +298,12 @@ impl State {
     }
 
     pub(super) fn cached_head_repository(&self, key: &ActiveWorktreeKey) -> Option<GitHubRepoKey> {
-        self.entries.get(&key.project_id)?.snapshot.heads.get(&key.worktree_id).cloned()
+        self.entries
+            .get(&key.project_id)?
+            .snapshot
+            .heads
+            .get(&key.worktree_id)
+            .cloned()
     }
 
     pub fn forget(&mut self, project: ProjectId) {
@@ -987,8 +998,7 @@ fn read_local_with_plan(
         // A membership edge replaces the cached full count in this same
         // coalesced status process. Tracked-only writes do not rescan untracked
         // trees; the bounded topology fallback repairs incomplete watch coverage.
-        let include_untracked =
-            change.topology || change.membership || change.untracked;
+        let include_untracked = change.topology || change.membership || change.untracked;
         snapshot.status_updates.insert(record.id);
         snapshot.status_reads.insert(record.id, next_status_read());
         let current = match git.status_with_untracked(
@@ -1889,19 +1899,36 @@ mod tests {
         app.refresh_ui.git.entries.get_mut(&project).unwrap().plan = Some(old.clone());
         app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
         let prior_repository = GitHubRepoKey::new("github.com", None, "old-fork", "repo").unwrap();
-        app.refresh_ui.git.entries.get_mut(&project).unwrap().snapshot.heads.insert(key.worktree_id, prior_repository.clone());
+        app.refresh_ui
+            .git
+            .entries
+            .get_mut(&project)
+            .unwrap()
+            .snapshot
+            .heads
+            .insert(key.worktree_id, prior_repository.clone());
         app.sidebar_model.projects[0].worktrees[0].head_repository = Some(prior_repository);
-        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state =
+            Some(sidebar::WorktreePullRequestState::Open);
         let delayed_watch = app.refresh_ui.git.entries[&project].snapshot.clone();
         drop(app.update(bound_status_message(&key, 7, full, read)));
         let row = &app.sidebar_model.projects[0].worktrees[0];
         assert_eq!(row.branch.as_deref(), Some("learned"));
-        assert_eq!(row.label(), "learned", "bound-only success repairs the visible branch too");
+        assert_eq!(
+            row.label(),
+            "learned",
+            "bound-only success repairs the visible branch too"
+        );
         assert_eq!(row.id, key.worktree_id);
         assert_eq!(row.path, key.canonical_path);
         assert!(row.head_repository.is_none());
         assert!(row.pull_request_state.is_none());
-        assert!(!app.refresh_ui.git.entries[&project].snapshot.heads.contains_key(&key.worktree_id));
+        assert!(
+            !app.refresh_ui.git.entries[&project]
+                .snapshot
+                .heads
+                .contains_key(&key.worktree_id)
+        );
         let entry = &app.refresh_ui.git.entries[&project];
         let current = entry.plan.as_ref().unwrap().clone();
         assert!(
@@ -1925,7 +1952,10 @@ mod tests {
             .unwrap()
             .display_summary();
         let mut stale_status = status.clone();
-        stale_status.head = HeadState::Branch { name: "stale-branch".into(), oid: "a".repeat(40) };
+        stale_status.head = HeadState::Branch {
+            name: "stale-branch".into(),
+            oid: "a".repeat(40),
+        };
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: 7,
@@ -1943,15 +1973,42 @@ mod tests {
             ),
             "unchanged proof must not clone/rebuild coverage"
         );
-        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
-            result: Ok(SourceControlRead { prepared: None, status: stale_status, head_repository: None, read: read.saturating_sub(1) }) }));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].label(), "learned",
-            "an older accepted-generation callback cannot rewind the visible head");
-        drop(app.update(Message::GitUi(Action::Read { project, generation: 9, result: Ok((delayed_watch, None)) })));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].label(), "learned");
-        assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none(),
-            "old watcher cannot restore revoked fork/PR identity");
-        assert!(!app.refresh_ui.git.entries[&project].snapshot.heads.contains_key(&key.worktree_id));
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: 7,
+            result: Ok(SourceControlRead {
+                prepared: None,
+                status: stale_status,
+                head_repository: None,
+                read: read.saturating_sub(1),
+            }),
+        }));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].label(),
+            "learned",
+            "an older accepted-generation callback cannot rewind the visible head"
+        );
+        drop(app.update(Message::GitUi(Action::Read {
+            project,
+            generation: 9,
+            result: Ok((delayed_watch, None)),
+        })));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].label(),
+            "learned"
+        );
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .is_none(),
+            "old watcher cannot restore revoked fork/PR identity"
+        );
+        assert!(
+            !app.refresh_ui.git.entries[&project]
+                .snapshot
+                .heads
+                .contains_key(&key.worktree_id)
+        );
         let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

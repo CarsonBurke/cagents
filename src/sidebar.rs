@@ -873,8 +873,8 @@ impl SidebarWorktree {
         // count. Reuse it until a full read replaces it or a failed read makes
         // that old count explicitly last-known rather than current.
         let mut dirty = status.dirty.clone();
-        let untracked_omitted = status.untracked_omitted
-            && (!self.untracked_complete || self.status_error.is_some());
+        let untracked_omitted =
+            status.untracked_omitted && (!self.untracked_complete || self.status_error.is_some());
         if status.untracked_omitted && !untracked_omitted {
             dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
         }
@@ -15839,8 +15839,8 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_status_revokes_full_untracked_count_until_a_new_full_read() {
-        let mut row = SidebarWorktree::from_durable(
-            WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut row =
+            SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
         let mut status = StatusSnapshot::default();
         status.dirty.untracked = 12;
         row.apply_status(&status);
@@ -15850,8 +15850,14 @@ pub(crate) mod tests {
         status.untracked_omitted = true;
         status.dirty.untracked = 0;
         row.apply_status(&status);
-        assert!(row.status_error.is_none(), "successful tracked read clears its error");
-        assert!(row.untracked_omitted, "the stale full count is no longer authoritative");
+        assert!(
+            row.status_error.is_none(),
+            "successful tracked read clears its error"
+        );
+        assert!(
+            row.untracked_omitted,
+            "the stale full count is no longer authoritative"
+        );
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
         status.untracked_omitted = false;
         status.dirty.untracked = 3;
@@ -15861,7 +15867,10 @@ pub(crate) mod tests {
         status.untracked_omitted = true;
         status.dirty.untracked = 0;
         row.apply_status(&status);
-        assert!(!row.untracked_omitted, "ordinary tracked reads preserve a trustworthy full count");
+        assert!(
+            !row.untracked_omitted,
+            "ordinary tracked reads preserve a trustworthy full count"
+        );
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 3);
     }
 
