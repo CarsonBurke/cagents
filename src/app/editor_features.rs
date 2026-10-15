@@ -1615,7 +1615,7 @@ impl Cagents {
             let error = "An edited buffer is already closing; cancel Close and prepare this edit again";
             self.reject_server_edit(&operation, error);
             self.feature_failure(operation.card, error);
-            return Task::none();
+            return self.save_after_feature(&operation);
         }
         // Publication authority and the server response move together. An
         // expired/canceled preview must fail before any buffer freezes or I/O.
