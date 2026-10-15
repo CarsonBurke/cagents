@@ -13927,33 +13927,57 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
             }
-            Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity,line }) => {
-                if self.modal_is_open() { return Task::none(); }
-                let (descriptor,review) = match self.cards.get(&identity.card) {
-                    Some(CardRuntime::Repository(runtime)) => (runtime.diff_working_file_target(&identity),false),
-                    Some(CardRuntime::PullRequests(pane)) => (pane.runtime.diff_working_file_target(&identity),true),
+            Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity, line }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let (descriptor, review) = match self.cards.get(&identity.card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        (runtime.diff_working_file_target(&identity), false)
+                    }
+                    Some(CardRuntime::PullRequests(pane)) => {
+                        (pane.runtime.diff_working_file_target(&identity), true)
+                    }
                     _ => return Task::none(),
                 };
-                let Some(descriptor) = descriptor else { return Task::none(); };
+                let Some(descriptor) = descriptor else {
+                    return Task::none();
+                };
                 let mut tasks = Vec::new();
                 let destination = if review {
                     let existing = self.repository_card_for(&descriptor.worktree).filter(|card| matches!(self.cards.get(card),Some(CardRuntime::Repository(runtime)) if !(runtime.is_dirty() || runtime.is_saving()) || runtime.selected_path() == Some(identity.path.as_path())));
                     match existing {
                         Some(card) => card,
                         None => {
-                            tasks.push(self.add_repository_card(descriptor.project,descriptor.repository,descriptor.worktree));
-                            let Some(card) = self.workspace.focused() else { return Task::batch(tasks); };
+                            tasks.push(self.add_repository_card(
+                                descriptor.project,
+                                descriptor.repository,
+                                descriptor.worktree,
+                            ));
+                            let Some(card) = self.workspace.focused() else {
+                                return Task::batch(tasks);
+                            };
                             card
                         }
                     }
-                } else { identity.card };
+                } else {
+                    identity.card
+                };
                 // PR snapshots stay read-only in their review card. The working
                 // file opens in a repository card with normal save/LSP/close
                 // ownership, and its native coordinates are clamped on load.
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&destination) {
-                    tasks.push(repository_task(runtime.open_file_location(destination,identity.path,line,0,0)));
+                    tasks.push(repository_task(runtime.open_file_location(
+                        destination,
+                        identity.path,
+                        line,
+                        0,
+                        0,
+                    )));
                 }
-                if let Ok(update) = self.workspace.focus(destination) { tasks.push(self.apply_viewport(update,true,false)); }
+                if let Ok(update) = self.workspace.focus(destination) {
+                    tasks.push(self.apply_viewport(update, true, false));
+                }
                 tasks.push(self.drain_lsp_intents(destination));
                 Task::batch(tasks)
             }
@@ -24978,27 +25002,45 @@ mod tests {
 
     #[test]
     fn opening_pr_diff_working_file_preserves_review_and_uses_editor_owned_card() {
-        let (mut app,_) = pull_request_test_app(&[]);
+        let (mut app, _) = pull_request_test_app(&[]);
         let directory = tempfile::tempdir().unwrap();
-        let (origin,task) = app.add_pull_requests_card(directory.path().to_path_buf());
+        let (origin, task) = app.add_pull_requests_card(directory.path().to_path_buf());
         drop(task);
-        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else { panic!("review card") };
-        let (mut runtime,mut identity) = RepositoryRuntime::diff_snapshot_fixture(origin,"source.rs","old\nkept\n","new\nkept\n");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else {
+            panic!("review card")
+        };
+        let (mut runtime, mut identity) = RepositoryRuntime::diff_snapshot_fixture(
+            origin,
+            "source.rs",
+            "old\nkept\n",
+            "new\nkept\n",
+        );
         runtime.descriptor.worktree = directory.path().to_path_buf();
         runtime.descriptor.repository = directory.path().to_path_buf();
         identity.worktree = directory.path().to_path_buf();
         pane.runtime = runtime;
         let mut stale = identity.clone();
         stale.generation += 1;
-        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity:stale,line:1 })));
-        assert_eq!(app.workspace.focused(),Some(origin));
-        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity,line:1 })));
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation {
+                identity: stale,
+                line: 1,
+            },
+        )));
+        assert_eq!(app.workspace.focused(), Some(origin));
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation { identity, line: 1 },
+        )));
         let target = app.workspace.focused().unwrap();
-        assert_ne!(target,origin);
-        assert!(matches!(app.cards.get(&origin),Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() && pane.runtime.selected_path() == Some(Path::new("source.rs"))));
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&target) else { panic!("working source belongs to a repository editor") };
-        assert_eq!(runtime.selected_path(),Some(Path::new("source.rs")));
-        assert_eq!(runtime.navigation().unwrap().editor.unwrap().caret.line,1);
+        assert_ne!(target, origin);
+        assert!(
+            matches!(app.cards.get(&origin),Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() && pane.runtime.selected_path() == Some(Path::new("source.rs")))
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&target) else {
+            panic!("working source belongs to a repository editor")
+        };
+        assert_eq!(runtime.selected_path(), Some(Path::new("source.rs")));
+        assert_eq!(runtime.navigation().unwrap().editor.unwrap().caret.line, 1);
     }
 
     #[test]

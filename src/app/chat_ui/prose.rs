@@ -783,7 +783,9 @@ mod tests {
                     Some(lines) => spans.extend(
                         crate::diff_view::syntax_spans(
                             line,
-                            lines[index].get(number).map_or(&[][..], |spans| spans.as_ref()),
+                            lines[index]
+                                .get(number)
+                                .map_or(&[][..], |spans| spans.as_ref()),
                         )
                         .into_iter()
                         .map(|span| {

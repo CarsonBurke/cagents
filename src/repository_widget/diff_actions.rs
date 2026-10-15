@@ -51,6 +51,7 @@ impl RepositoryRuntime {
     }
 
     pub fn selected_diff_hunk(&self) -> Option<usize> {
+        self.selected_diff_range()?;
         let model = self.diff_model()?;
         let head = self.diff_interaction.selection?.head;
         model
@@ -230,10 +231,20 @@ impl RepositoryRuntime {
                 })
             }
             DiffCommand::OpenInEditor { row, side } => {
-                let Some(line) = model.new_line_at_row(self.diff_mode,row).or_else(|| Selection::new(self.diff_mode,side,row).line_reference(model)) else { return Task::none(); };
+                let Some(line) = model
+                    .new_line_at_row(self.diff_mode, row)
+                    .or_else(|| Selection::new(self.diff_mode, side, row).line_reference(model))
+                else {
+                    return Task::none();
+                };
                 if !matches!(self.document, DocumentState::Editable(_)) {
-                    let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
-                    return cosmic::task::message(RepositoryAction::OpenWorkingFileLocation { identity:self.current_identity(card,path),line:line.saturating_sub(1) as usize });
+                    let Some(path) = self.selected_path().map(Path::to_path_buf) else {
+                        return Task::none();
+                    };
+                    return cosmic::task::message(RepositoryAction::OpenWorkingFileLocation {
+                        identity: self.current_identity(card, path),
+                        line: line.saturating_sub(1) as usize,
+                    });
                 }
                 self.viewports.editor = text_editor::ScrollPosition {
                     line: line.saturating_sub(1) as usize,
@@ -552,8 +563,16 @@ impl<'a> RowContext<'a> {
                 command(DiffCommand::CopyLineReference { row, side }),
             ));
             let open = command(DiffCommand::OpenInEditor { row, side });
-            let label = if editable { "Open in editor at line" } else { "Open working file in editor at line" };
-            items.push(if can_open { Item::Button(label,None,open) } else { Item::ButtonDisabled(label,None,open) });
+            let label = if editable {
+                "Open in editor at line"
+            } else {
+                "Open working file in editor at line"
+            };
+            items.push(if can_open {
+                Item::Button(label, None, open)
+            } else {
+                Item::ButtonDisabled(label, None, open)
+            });
             widget::menu::items(&bindings, items)
         })
     }
@@ -698,14 +717,38 @@ mod tests {
     async fn historical_diff_open_editor_requests_its_actual_working_path_and_line() {
         use cosmic::iced::futures::StreamExt;
         let card = CardId::new();
-        let (mut runtime,identity) = RepositoryRuntime::diff_snapshot_fixture(card,"source.rs","old\nkept\n","new\nkept\n");
-        let row = runtime.diff_model().unwrap().row_at_new_line(DiffMode::Inline,2).unwrap();
-        let task = runtime.copy_diff(card,DiffCommand::OpenInEditor { row,side:Side::New });
+        let (mut runtime, identity) = RepositoryRuntime::diff_snapshot_fixture(
+            card,
+            "source.rs",
+            "old\nkept\n",
+            "new\nkept\n",
+        );
+        let row = runtime
+            .diff_model()
+            .unwrap()
+            .row_at_new_line(DiffMode::Inline, 2)
+            .unwrap();
+        let task = runtime.copy_diff(
+            card,
+            DiffCommand::OpenInEditor {
+                row,
+                side: Side::New,
+            },
+        );
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let iced::runtime::Action::Output(RepositoryAction::OpenWorkingFileLocation { identity:request,line }) = stream.next().await.unwrap() else { panic!("working file request") };
-        assert_eq!(request,identity);
-        assert_eq!(line,1);
-        assert!(runtime.shows_diff(),"the app chooses the working file owner without replacing the snapshot first");
+        let iced::runtime::Action::Output(RepositoryAction::OpenWorkingFileLocation {
+            identity: request,
+            line,
+        }) = stream.next().await.unwrap()
+        else {
+            panic!("working file request")
+        };
+        assert_eq!(request, identity);
+        assert_eq!(line, 1);
+        assert!(
+            runtime.shows_diff(),
+            "the app chooses the working file owner without replacing the snapshot first"
+        );
         assert!(runtime.diff_working_file_target(&request).is_some());
         runtime.generation += 1;
         assert!(runtime.diff_working_file_target(&request).is_none());

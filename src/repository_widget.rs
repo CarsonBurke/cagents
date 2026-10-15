@@ -542,7 +542,10 @@ pub enum RepositoryAction {
         card: CardId,
         editor_id: String,
     },
-    OpenWorkingFileLocation { identity:AsyncIdentity,line:usize },
+    OpenWorkingFileLocation {
+        identity: AsyncIdentity,
+        line: usize,
+    },
     StageSelected {
         card: CardId,
         stage: bool,
@@ -731,7 +734,8 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
-            Self::SelectDiffRow { identity, .. } | Self::OpenWorkingFileLocation { identity,.. } => identity.card,
+            Self::SelectDiffRow { identity, .. }
+            | Self::OpenWorkingFileLocation { identity, .. } => identity.card,
             Self::EndDiffSelection { card }
             | Self::MoveDiffSelection { card, .. }
             | Self::ClearDiffSelection { card }
@@ -6171,9 +6175,9 @@ impl RepositoryRuntime {
                 }
                 self.expand_diff_fold(fold, expansion)
             }
-            RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } | RepositoryAction::OpenWorkingFileLocation { .. } => {
-                Task::none()
-            }
+            RepositoryAction::MarkdownLink { .. }
+            | RepositoryAction::OpenExternal { .. }
+            | RepositoryAction::OpenWorkingFileLocation { .. } => Task::none(),
             RepositoryAction::WorkingDiffDue { card, ticket } => {
                 self.start_working_diff(card, ticket)
             }
@@ -6588,48 +6592,100 @@ impl RepositoryRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn diff_snapshot_fixture(card:CardId,path:&str,before:&str,after:&str)->(Self,AsyncIdentity) {
-        let (mut runtime,identity) = Self::open_fixture(card,path,after);
+    pub(crate) fn diff_snapshot_fixture(
+        card: CardId,
+        path: &str,
+        before: &str,
+        after: &str,
+    ) -> (Self, AsyncIdentity) {
+        let (mut runtime, identity) = Self::open_fixture(card, path, after);
         runtime.document = DocumentState::None;
         runtime.source_surface = SourceSurface::Diff;
-        runtime.set_diff_state(runtime.diff_basis.clone(),DiffState::ready(RenderedDiff::Text {
-            model:crate::diff_view::build_diff(before,after),old_label:"Before".into(),new_label:"After".into(),
-        }));
-        (runtime,identity)
+        runtime.set_diff_state(
+            runtime.diff_basis.clone(),
+            DiffState::ready(RenderedDiff::Text {
+                model: crate::diff_view::build_diff(before, after),
+                old_label: "Before".into(),
+                new_label: "After".into(),
+            }),
+        );
+        (runtime, identity)
     }
 
-    pub(crate) fn diff_working_file_target(&self, identity:&AsyncIdentity)->Option<RepositoryView> {
+    pub(crate) fn diff_working_file_target(
+        &self,
+        identity: &AsyncIdentity,
+    ) -> Option<RepositoryView> {
         (self.accepts_selected(identity) && self.shows_diff()).then(|| self.descriptor.clone())
     }
 
     /// Open a repository-relative location, even before the directory listing
     /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
     /// The requested range is clamped when the asynchronous file read finishes.
-    pub fn open_file_location(&mut self, card: CardId, path: PathBuf, line: usize, column: usize, selection_bytes: usize) -> Task<RepositoryAction> {
-        if crate::repository::RepoPath::parse(&path).is_err() { return Task::none(); }
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
         let caret = text_editor::Position { line, column };
-        let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
-            document.content.set_cursor(text_editor::Cursor { position: caret, selection });
-            document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
             return self.focus_editor(card);
         }
-        if self.blocks_navigation() { return Task::none(); }
-        let loading_same = self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading);
-        let task = if loading_same { Task::none() } else {
-            let file = self.file(&path).cloned().unwrap_or(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
-            if file.directory { return Task::none(); }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
             self.open_file_entry(card, file)
         };
-        self.pending_editor_navigation = Some((path, crate::model::EditorNavigation {
-            caret: crate::model::EditorPosition { line, column },
-            selection: selection.map(|position| crate::model::EditorPosition { line: position.line, column: position.column }),
-            scroll_line: line.saturating_sub(10), scroll_vertical: 0.0, scroll_horizontal: 0.0,
-        }));
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
         task
     }
 
@@ -8560,10 +8616,19 @@ fn find_strip<'a>(
                 .into(),
         );
     }
-    strips.push(widget::row::with_children(options).spacing(space::S).align_y(Alignment::Center).into());
+    strips.push(
+        widget::row::with_children(options)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+    );
     if let Some(error) = &runtime.find_error {
-        strips.push(widget::text::body(format!("Invalid expression: {error}")).size(12)
-            .class(cosmic::theme::Text::Custom(crate::design::destructive_text)).into());
+        strips.push(
+            widget::text::body(format!("Invalid expression: {error}"))
+                .size(12)
+                .class(cosmic::theme::Text::Custom(crate::design::destructive_text))
+                .into(),
+        );
     }
     if runtime.replace_open && !runtime.shows_diff() {
         strips.push(

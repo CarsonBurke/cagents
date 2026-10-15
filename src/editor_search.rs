@@ -17,8 +17,16 @@ pub fn pattern(query: &str, options: FindOptions) -> Result<regex::Regex, String
         .build()
         .map_err(|error| {
             let message = error.to_string();
-            let line = message.lines().last().unwrap_or("Invalid regular expression").trim();
-            line.strip_prefix("error: ").unwrap_or(line).chars().take(240).collect()
+            let line = message
+                .lines()
+                .last()
+                .unwrap_or("Invalid regular expression")
+                .trim();
+            line.strip_prefix("error: ")
+                .unwrap_or(line)
+                .chars()
+                .take(240)
+                .collect()
         })
 }
 
