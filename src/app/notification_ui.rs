@@ -251,10 +251,17 @@ impl Cagents {
     /// Explicit reads acknowledge the durable journal as well as local badges.
     pub(super) fn acknowledge_card_notices(&mut self, card: CardId) {
         let session = self.card_state(card).and_then(card_session);
-        let ids: Vec<_> = self.notification_ui.snapshot.notices.iter()
+        let ids: Vec<_> = self
+            .notification_ui
+            .snapshot
+            .notices
+            .iter()
             .filter(|notice| session.is_some() && notice.event.source_session() == session)
-            .map(|notice| notice.id).collect();
-        for id in ids { self.notification_ui.acknowledge(id); }
+            .map(|notice| notice.id)
+            .collect();
+        for id in ids {
+            self.notification_ui.acknowledge(id);
+        }
     }
 
     pub(super) fn sync_notification_presence(&mut self) {
@@ -810,21 +817,51 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let session = card_session(&app.durable.cards[0]).unwrap();
         let channel = crate::model::ChannelId::new();
-        Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel {
-            title_source: Default::default(), id: channel, project_id: ProjectId::new(), title: "Read fixture".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
-        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: ProjectId::new(),
+                title: "Read fixture".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
         let id = uuid::Uuid::new_v4();
-        let snapshot = Snapshot { notices: vec![crate::notifications::Notice {
-            id, event: crate::notifications::Event {
-                target: Target::Session(session), source_session: Some(session), provider: Some(Provider::Claude), directory: Some("/tmp".into()), destination: None,
-                evidence: crate::notifications::Evidence { key: "channel-complete".into(), kind: crate::notifications::Kind::Succeeded },
-            }, delivered: true, acknowledged: false, window: None,
-        }], diagnostic: None };
+        let snapshot = Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event {
+                    target: Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Claude),
+                    directory: Some("/tmp".into()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "channel-complete".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
         drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
         assert!(app.sidebar_state.has_card_update(card));
         drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(app.notification_ui.pending.lock().unwrap().acknowledged.contains(&id));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .contains(&id)
+        );
         drop(app.update_notifications(Action::Snapshot(snapshot)));
         assert!(!app.sidebar_state.has_card_update(card));
     }
