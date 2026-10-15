@@ -11756,7 +11756,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
                 crate::ui_controls::button::destructive("Discard")
                     .id(discard_confirm_id())
                     .on_press(pending.confirm_action()),
-            ),
+            ]).into(),
         ])
         .spacing(space::M),
         520.0,
