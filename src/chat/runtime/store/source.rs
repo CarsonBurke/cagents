@@ -1,6 +1,6 @@
 //! Original text reads share the ingestion cache, independently of UI paging.
 use super::*;
-use crate::chat::cache::{PAGE_BYTES, SOURCE_BYTES, SourceError, SourcePage, SourceQuery, SourceMetadata};
+use crate::chat::cache::{PAGE_BYTES, SOURCE_BYTES, SourceError, SourcePage, SourceQuery, SourceMetadata, SourceEpoch};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const SCHEMA: &str = "CREATE TABLE source_epochs(id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE, epoch INTEGER NOT NULL);
@@ -12,8 +12,8 @@ pub(super) struct PendingChildSource {
     text:String,
     metadata:SourceMetadata,
 }
-// Unique across every Store in this daemon; deleting/recreating an ID or replacing
-// an actor cannot accidentally validate an older read from another cache.
+// Revisions distinguish rewrites within this process. SourceEpoch also binds
+// them to the Store incarnation, including across execed actor replacements.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 fn epoch() -> Result<u64, String> {
     NEXT_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1).filter(|n| *n <= i64::MAX as u64)).map_err(|_| "Source epoch capacity exhausted".into())
@@ -59,7 +59,7 @@ impl Store {
             if !changed && let Some(part)=cached.get(&key){parts.push((**part).clone());continue;}
             let Some((source_len,metadata,epoch))=lengths.get(&key).cloned() else {continue;};
             let replacement=source_len!=visible_len;
-            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement,epoch,metadata});
+            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement,epoch:SourceEpoch{incarnation:self.source_incarnation,revision:epoch},metadata});
         }
         drop(cached);
         state.source_parts.retain(|part|part.source.agent_id.is_none());
@@ -83,6 +83,7 @@ impl Store {
             (epoch,length,SourceMetadata::from_item(&item))
         };
         let metadata=metadata.ok_or(SourceError::Unsupported)?;
+        let epoch=SourceEpoch{incarnation:self.source_incarnation,revision:epoch};
         if query.expected_epoch.is_some_and(|expected|expected!=epoch) { return Err(SourceError::Changed); }
         let until=query.until.unwrap_or(length);
         if until>length || query.offset>until { return Err(SourceError::InvalidRange); }
@@ -257,6 +258,34 @@ mod tests {
         assert_eq!(page.metadata,part.metadata);assert_eq!(page.text,text);
         let before=state.source_parts.clone();
         store.publish_source_parts(&mut state).unwrap();assert_eq!(state.source_parts,before);
+    }
+
+    #[test]
+    fn replaced_store_rejects_same_revision_and_identical_source_prefix() {
+        for agent in [None,Some("child")] {
+            let mut old=Store::new().unwrap();
+            let mut replacement=Store::new().unwrap();
+            let text="same original bytes".repeat(PAGE_BYTES/4);
+            for store in [&mut old,&mut replacement] {
+                let event=if let Some(agent)=agent {Event::SubagentItem{id:agent.into(),item:item("root",&text)}} else {Event::Item(item("root",&text))};
+                store.apply(event).unwrap();
+            }
+            let first=old.source_page(query(agent,"root")).unwrap();
+            // An execed replacement can restart its process-local revision
+            // counter. Simulate that exact collision without relying on globals.
+            if let Some(agent)=agent {
+                replacement.db.execute("UPDATE child_sources SET epoch=?1 WHERE agent=?2 AND id='root'",params![first.epoch.revision,agent]).unwrap();
+            } else {
+                replacement.db.execute("UPDATE source_epochs SET epoch=?1 WHERE id='root'",[first.epoch.revision]).unwrap();
+            }
+            let current=replacement.source_page(query(agent,"root")).unwrap();
+            assert_eq!(current.epoch.revision,first.epoch.revision);
+            assert_ne!(current.epoch.incarnation,first.epoch.incarnation);
+            assert_eq!(current.source_len,first.source_len);
+            assert_eq!(current.text,first.text);
+            assert_eq!(replacement.source_page(next(&first)),Err(SourceError::Changed));
+            assert_eq!(old.source_page(next(&first)).unwrap().epoch,first.epoch);
+        }
     }
 
     #[test]
