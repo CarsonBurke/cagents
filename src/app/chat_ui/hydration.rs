@@ -156,7 +156,10 @@ impl State {
             if let Some(loaded)=&entry.loaded {return Some(loaded.item.clone());}
             let mut loading=(**item).clone();loading.id=root.into();
             if let ItemContent::Text {text,thinking,..}=&mut loading.content {
-                *text=entry.error.clone().unwrap_or_else(||"Loading message…".into());*thinking=false;
+                // Transport state is not authored content. Keep the logical
+                // source empty until complete; notice() renders status outside
+                // the selectable/searchable conversation document.
+                text.clear();*thinking=false;
             }
             Some(Arc::new(loading))
         }).collect()
@@ -396,7 +399,11 @@ pub(super) fn retry(runtime:&mut Runtime) {
 
 pub(super) fn notice(runtime:&Runtime)->Option<Element<'static,Message>> {
     let errors=runtime.logical_sources.entries.values().filter_map(|entry|entry.error.as_ref()).collect::<Vec<_>>();
-    if errors.is_empty() {return None;}
+    if errors.is_empty() {
+        let loading=runtime.logical_sources.entries.values().filter(|entry|entry.loaded.is_none() && !entry.complete).count();
+        return (loading>0).then(||design::caption(if loading==1 {"Loading complete message…".into()}
+            else {format!("Loading {loading} complete messages…")}).into());
+    }
     Some(widget::row::with_children(vec![design::caption(errors[0].clone()).width(Length::Fill).into(),
         widget::button::text("Retry loading").on_press(action(Action::RetryLogicalSources(runtime.target))).into()])
         .spacing(GAP_S).width(Length::Fill).into())
@@ -437,7 +444,7 @@ mod tests {
             source_len:full.len(),replacement:false,metadata:chat::cache::SourceMetadata::from_item(&suffix).unwrap(),epoch:7}],..Snapshot::default()});
         let mut state=State::default();let loading=state.project(raw.clone(),None);
         assert_eq!(loading.items.len(),1);assert_eq!(loading.items[0].id,"root");
-        assert_eq!(body(&loading.items[0]),"Loading message…");
+        assert_eq!(body(&loading.items[0]),"");
         let key=Key {agent_id:None,source_id:"root".into()};let attempt=state.entries[&key].attempt;
         assert!(state.complete(&key,attempt,Ok(Loaded {item:text("root",&full),epoch:7})));
         let ready=state.project(raw.clone(),None);
@@ -554,7 +561,7 @@ mod tests {
         // Ready/forget_transcript clear even when both actors lack session IDs
         // and begin at identical publication/source revisions.
         state.clear();let projected=state.project(raw,None);
-        assert_eq!(body(&projected.items[0]),"Loading message…");
+        assert_eq!(body(&projected.items[0]),"");
         let new=state.requests().remove(0);assert_ne!(old.1,new.1);
         assert!(!state.complete(&old.0,old.1,Ok(Loaded {item:text("same-root","stale"),epoch:1})));
         assert!(state.complete(&new.0,new.1,Ok(Loaded {item,epoch:1})));
@@ -609,7 +616,7 @@ mod tests {
         assert!(weak.upgrade().is_none(),"hidden snapshot/cache/state must release full Item owners");
         assert_eq!(body(&runtime.snapshot.items[0]),"pref");assert!(runtime.logical_sources.requests().is_empty());
         let _=runtime.set_visible(true);runtime.refresh();
-        assert_eq!(body(&runtime.snapshot.items[0]),"Loading message…");assert_eq!(runtime.logical_sources.requests().len(),1);
+        assert_eq!(body(&runtime.snapshot.items[0]),"");assert_eq!(runtime.logical_sources.requests().len(),1);
     }
 
     fn page(query:chat::cache::SourceQuery,text:&str,epoch:u64,metadata:chat::cache::SourceMetadata)->Result<chat::cache::SourcePage,chat::cache::SourceError> {
