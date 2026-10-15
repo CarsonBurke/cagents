@@ -10729,7 +10729,9 @@ impl Cagents {
         if self.workspace.focused() != Some(card) { return None; }
         let from = self.capture_editor_location(card)?;
         let target = self.editor_features.location_history.peek(forward, |entry| {
-            matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&entry.source)
+            self.workspace.card(entry.card).is_some()
+                && self.workspace.pending_close().is_none_or(|closing| closing.unmounting != entry.card)
+                && matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&entry.source)
                 && runtime.editor_navigation_anchor().is_some() && !runtime.is_saving())
         })?;
         let previous = match self.cards.get_mut(&target.location.card)? {
@@ -10740,13 +10742,18 @@ impl Cagents {
             }
             _ => return None,
         };
-        if !self.editor_features.location_history.navigate(from, &target) {
+        let Ok(update) = self.workspace.focus(target.location.card) else {
             if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
             return None;
+        };
+        let from_card = from.card;
+        if !self.editor_features.location_history.navigate(from, &target) {
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
+            let rollback = self.workspace.focus(from_card).unwrap_or_else(|_| ViewportUpdate::unchanged());
+            return Some(self.apply_viewport(rollback, true, false));
         }
         let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else { return None; };
         let focus = repository_task(runtime.focus_editor(target.location.card));
-        let update = self.workspace.focus(target.location.card).unwrap_or_else(|_| ViewportUpdate::unchanged());
         Some(Task::batch([focus, self.apply_viewport(update, true, false)]))
     }
 
@@ -24049,6 +24056,14 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(target));
         assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
         assert!(matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n")));
+        // A retained runtime in another strip/channel is not a focus target.
+        app.workspace.request_close(origin).unwrap();
+        app.workspace.commit_close(origin).unwrap();
+        assert!(app.cards.contains_key(&origin));
+        assert!(app.navigate_cross_card_location(target, false).is_none());
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.editor_features.location_history.peek(false, |_| true).unwrap().location.card, origin);
+        app.workspace.add_card(WorkspaceCard::new(origin, "Origin", CardWidth::Fraction(0.7)).unwrap(), 0, false).unwrap();
         // Reusing the old card for another file never authorizes history to
         // replace its current buffer or restore an anchor from another source.
         let (other, _) = RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
