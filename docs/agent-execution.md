@@ -200,3 +200,9 @@ If the deadline expires before a run’s first status arrives, `agent wait` keep
 any statuses already received and reports the unread IDs in `data.unresolved_runs`.
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
+
+### Repair an unverified ended presentation
+
+`cagents agent close AGENT_ID --repair-stale-presentation` is explicit consent to remove the currently shown ended pane of an already-closed agent when its historical generation cannot be verified. It inspects the current pane and confirms that exact registry, agent, placement, revision and pane together; a replacement or changed pane fails the comparison. It preserves saved results and never contacts or stops a provider. The flag requires one agent.
+
+This does not claim that the pane belongs to a verified historical generation. Ordinary `agent close` retains its refusal when historical ownership cannot be proven. A running or otherwise live presentation cannot be repaired through this command. If the confirmation reply is lost, the CLI reports the transport error instead of guessing whether removal completed or replaying the mutation.
