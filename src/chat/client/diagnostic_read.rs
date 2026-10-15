@@ -572,7 +572,7 @@ impl ClientHandle {
         card: CardId,
         generation: u64,
         turn: u64,
-        log: super::super::ProviderExitLog,
+        log: &super::super::ProviderExitLog,
         disclosed: bool,
         copy: bool,
         authority: DiagnosticAuthority,
@@ -586,6 +586,8 @@ impl ClientHandle {
         let queued = lane().queued.clone().try_acquire_owned().map_err(|_| {
             "Too many saved output requests; close another output panel and try again".to_owned()
         })?;
+        let metadata = Charge::reserve_capacity(0)?;
+        let log = super::super::ProviderExitLog { id:log.id.as_str().to_owned(),bytes:log.bytes,omitted:log.omitted };
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         let request = DiagnosticReadRequest(Arc::new(Job {
             source: DiagnosticSource {
@@ -608,7 +610,7 @@ impl ClientHandle {
             cancel_tx,
             cancel_rx,
             _queued: queued,
-            _metadata: Charge::reserve_capacity(0)?,
+            _metadata: metadata,
         }));
         request.check()?;
         if !disclosed && !copy {
@@ -1073,7 +1075,7 @@ impl ClientHandle {
             return Err("Fixture body/log size mismatch".into());
         }
         let request =
-            self.diagnostic_request(card, generation, turn, log, true, false, authority)?;
+            self.diagnostic_request(card, generation, turn, &log, true, false, authority)?;
         let worker = Arc::new(Worker {
             _permit: lane()
                 .workers
@@ -1510,7 +1512,7 @@ mod tests {
                 card,
                 7,
                 3,
-                log.clone(),
+                &log,
                 true,
                 false,
                 Arc::new(move || original_check.load(Ordering::Acquire)),
@@ -1528,14 +1530,14 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         assert!(old.check().is_err());
         let fresh = original
-            .diagnostic_request(card, 7, 3, log.clone(), false, true, Arc::new(|| true))
+            .diagnostic_request(card, 7, 3, &log, false, true, Arc::new(|| true))
             .unwrap();
         assert!(
             output.current_for(&fresh),
             "fresh copy may reuse immutable body on the SAME proved source without the old deadline"
         );
         let substituted = replacement
-            .diagnostic_request(card, 7, 3, log, false, true, Arc::new(|| true))
+            .diagnostic_request(card, 7, 3, &log, false, true, Arc::new(|| true))
             .unwrap();
         assert_eq!(fresh.source(), substituted.source());
         assert!(!output.current_for(&substituted));
@@ -1565,7 +1567,7 @@ mod tests {
                 CardId::new(),
                 1,
                 1,
-                super::super::super::ProviderExitLog {
+                &super::super::super::ProviderExitLog {
                     id: "ready-copy".into(),
                     bytes: 4,
                     omitted: 0,
@@ -1583,4 +1585,17 @@ mod tests {
         drop(owners);
         wait_capacity(0);
     }
+    #[test]
+    fn short_log_id_cannot_import_arbitrary_input_capacity_into_queued_metadata() {
+        let _guard=diagnostic_test_guard();wait_capacity(0);
+        let handle=ClientHandle::fixture(super::super::tests::omp_card(None,None),Snapshot::default());
+        let mut id=String::with_capacity(8*1024*1024);id.push_str("short");
+        let log=super::super::super::ProviderExitLog { id,bytes:4,omitted:0 };
+        let request=handle.diagnostic_request(CardId::new(),1,1,&log,false,true,Arc::new(||true)).unwrap();
+        assert_eq!(request.source().log.id,"short");
+        assert!(request.source().log.id.capacity()<=256);
+        assert_eq!(log.id.capacity(),8*1024*1024,"the original remains caller-owned, never captured by queued request");
+        drop(log);drop(request);wait_capacity(0);
+    }
+
 }

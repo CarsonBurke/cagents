@@ -1077,7 +1077,7 @@ impl ClientHandle {
                             drop(ownership); // Original error allocation is gone; only <=512-byte metadata remains.
                             Err(compact)
                         }
-                        _ => { drop(ownership); Err("Unexpected provider output reply".into()) },
+                        unexpected => { drop(unexpected); drop(ownership); Err("Unexpected provider output reply".into()) },
                     };
                     if let Some(reply) = pending.reply { let _ = reply.try_send(result); }
                     // With no waiter, result drops here on the reader. Its
