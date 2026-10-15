@@ -244,8 +244,9 @@ impl RecoveryPlacement {
     }
     pub fn directory(&self) -> &Root { &self.parent }
     pub fn namespace(&self) -> &DirectoryNamespace { &self.namespace }
-    /// Distinct explicit native Root handles plus the callback's measured lease
-    /// budget. Transient ancestry/metadata inspection needs at most three extra
+    /// Distinct explicit native Root handles plus the opaque lease's hard
+    /// descriptor budget (including reserved future local enrollment handles).
+    /// Transient ancestry/metadata inspection needs at most three extra
     /// native descriptors and must also fit the owning worker's admission.
     pub fn retained_descriptor_count(&self) -> usize { self.retained_descriptors }
 }
@@ -337,6 +338,42 @@ mod tests {
         fs::rename(tree.path().join("foreign/moved"), tree.path().join("outside/holding")).unwrap();
         placement.validate_payload_root(publication.directory()).unwrap();
         assert!(placement.validate_payload_against_roots(publication.directory(), &[root(tree.path())]).is_err());
+    }
+
+    #[test]
+    fn owned_payload_enrollment_retains_unknown_handoff_and_refuses_budget_growth() {
+        struct Lease {
+            payload: std::sync::Mutex<Option<Root>>,
+            uncertain: AtomicBool,
+        }
+        impl RecoveryRegistrationLease for Lease {
+            fn validate(&self) -> io::Result<()> { Ok(()) }
+            fn descriptor_budget(&self) -> usize { 1 }
+            fn register_payload(&self, payload: &Root) -> io::Result<()> {
+                let mut owned = self.payload.lock().unwrap();
+                match owned.as_ref() {
+                    Some(root) if recovery_directory_stamp(root)? != recovery_directory_stamp(payload)? => return Err(unsupported("fixture payload descriptor reservation exhausted")),
+                    Some(_) => {}
+                    None => *owned = Some(payload.try_clone()?),
+                }
+                if self.uncertain.load(Ordering::Acquire) { Err(io::Error::other("fixture uncertain handoff")) } else { Ok(()) }
+            }
+        }
+        let tree = tempfile::tempdir().unwrap();
+        for path in ["source", "outside"] { fs::create_dir(tree.path().join(path)).unwrap(); }
+        let lease = Arc::new(Lease { payload: std::sync::Mutex::new(None), uncertain: AtomicBool::new(true) });
+        let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), root(&tree.path().join("source")), Arc::from([]), RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
+        assert_eq!(placement.retained_descriptor_count(), 4, "future local enrollment descriptor is reserved before effects");
+        let DirectoryCreation::Published(publication) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("holding"), 0o700).unwrap() else { panic!("fixture must own the holding"); };
+        assert!(placement.register_payload_root(publication.directory()).is_err());
+        assert_eq!(recovery_directory_stamp(lease.payload.lock().unwrap().as_ref().unwrap()).unwrap(), recovery_directory_stamp(publication.directory()).unwrap());
+        assert!(publication.directory().read_dir().unwrap().next().is_none());
+        lease.uncertain.store(false, Ordering::Release);
+        placement.register_payload_root(publication.directory()).unwrap();
+        placement.register_payload_root(publication.directory()).unwrap();
+        let DirectoryCreation::Published(other) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("other"), 0o700).unwrap() else { panic!("fixture must own the second holding"); };
+        assert!(placement.register_payload_root(other.directory()).is_err());
+        assert_eq!(recovery_directory_stamp(lease.payload.lock().unwrap().as_ref().unwrap()).unwrap(), recovery_directory_stamp(publication.directory()).unwrap());
     }
 
     #[test]
