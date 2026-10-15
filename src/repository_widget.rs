@@ -2388,6 +2388,8 @@ impl Drop for FindJob {
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
+    // Captured once by the actual window before any initial file task.
+    recovery_endpoint: Option<crate::recovery_domain::LocalRecoveryEndpoint>,
     directory_only: bool,
     external_source: Option<PathBuf>,
     standalone: bool,
@@ -2650,6 +2652,7 @@ impl RepositoryRuntime {
             external_source: None,
             descriptor,
             worktree_protection: None,
+            recovery_endpoint: None,
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             editor_tab_width: 4,
@@ -3633,6 +3636,13 @@ impl RepositoryRuntime {
             selected_file: self.external_source.is_none().then(|| file.path.clone()),
             editor,
         })
+    }
+
+    /// Capture the original authenticated local endpoint before initial load.
+    /// This only configures future worker admission; it grants no filesystem
+    /// effect or edited-root lease. Retargeting must keep the original endpoint.
+    pub fn set_recovery_endpoint(&mut self, endpoint: crate::recovery_domain::LocalRecoveryEndpoint) {
+        if self.recovery_endpoint.is_none() { self.recovery_endpoint = Some(endpoint); }
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
