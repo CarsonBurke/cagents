@@ -1311,7 +1311,7 @@ fn keyboard_groups<'a>(
             );
         }
         if !rows.is_empty() {
-            groups.push(settings_group(group, "Action · Keys · Source", rows).compact());
+            groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact());
         }
     }
     groups
@@ -1410,10 +1410,26 @@ fn shortcut_input<'a>(
             .width(Length::FillPortion(4))
             .into(),
         design::caption(source).width(64).into(),
+        {
+            let scope = workspace_widget::shortcut_descriptor(action).scope;
+            if scope.applies_to(workspace_widget::FocusedPane::Terminal) || scope == workspace_widget::ShortcutScope::OutsideTerminal {
+                crate::interaction::tooltip(
+                    crate::ui_controls::field::checkbox(draft.terminal_passthrough_actions.iter().any(|id| id == action.id()))
+                        .label("Terminal")
+                        .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough { action: action.id().to_owned(), enabled }),
+                    "Send these keys to the terminal instead of running this workspace action",
+                ).into()
+            } else {
+                crate::interaction::tooltip(design::caption("Scoped"), "Applies in its own pane; terminals keep these keys").into()
+            }
+        },
     ])
     .spacing(space::S)
     .align_y(Alignment::Center);
     let mut children = vec![row.into()];
+    if chords.iter().any(|chord| settings::parse_shortcut(chord).is_ok_and(|binding| settings::native_text_editing_advisory(action.id(), binding).is_some())) {
+        children.push(design::caption("Reserved while editing text").into());
+    }
     if let Some(reason) = &error {
         children.push(
             design::caption(reason.clone())

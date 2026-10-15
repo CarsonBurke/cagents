@@ -2507,6 +2507,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsSearchChanged(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::ShortcutTerminalPassthrough { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -2571,6 +2572,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+        | Message::ShortcutTerminalPassthrough { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -3038,6 +3040,7 @@ enum SettingsFeedback {
 /// typed it. The parsed form lives in `AppSettings`; this is only the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
+    terminal_passthrough_actions: Vec<String>,
     toggle_projects: String,
     rename_pane: String,
     command_palette: String,
@@ -3081,6 +3084,7 @@ struct ShortcutDraft {
 impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
+            terminal_passthrough_actions: shortcuts.terminal_passthrough_actions.clone(),
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4279,6 +4283,7 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
+    ShortcutTerminalPassthrough { action: String, enabled: bool },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -15734,6 +15739,16 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::ShortcutTerminalPassthrough { action, enabled } => {
+                if !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().any(|descriptor| descriptor.action.id() == action && descriptor.scope.applies_to(workspace_widget::FocusedPane::Terminal))
+                    && !workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().any(|descriptor| descriptor.action.id() == action && descriptor.scope == workspace_widget::ShortcutScope::OutsideTerminal)
+                { return Task::none(); }
+                let actions = &mut self.settings.keyboard_shortcuts.terminal_passthrough_actions;
+                actions.retain(|name| name != &action);
+                if enabled { actions.push(action); }
+                self.settings_draft.keyboard_shortcuts.terminal_passthrough_actions = actions.clone();
+                self.save_settings_task(false)
+            }
             Message::KeyEvent { event, captured } => {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
