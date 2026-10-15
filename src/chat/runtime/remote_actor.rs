@@ -2816,6 +2816,24 @@ done"#;
         assert_eq!(snapshot.generation, generation);
     }
     #[test]
+    fn installed_actor_publications_preserve_valid_continuity_before_provider_id() {
+        let fixture=resident_fixture();let server=&fixture.server;
+        let resident=server.resident().unwrap();
+        assert_eq!(resident.native_continuity,chat::NativeContinuity::RetainedClaudeActor {protocol:PROTOCOL});
+        let mut snapshot=server.actor.snapshot(None).unwrap();
+        confirm_installed_snapshot(&mut snapshot);
+        assert_eq!(snapshot.native_continuity,resident.native_continuity);
+        let source=published_source(&server.source,None,&resident.native_continuity);
+        assert!(source.launch.session_id.is_none());
+        assert!(source.has_valid_native_continuity());
+        assert!(!source.is_unstarted(),"installed pre-ID helper must never become an editable unstarted draft");
+        let mut invalid=source.clone();invalid.launch.provider=crate::agent::Provider::Codex;
+        assert!(!invalid.has_valid_native_continuity());
+        invalid=source;invalid.native_continuity=chat::NativeContinuity::RetainedClaudeActor {protocol:PROTOCOL+1};
+        assert!(!invalid.has_valid_native_continuity());
+    }
+
+    #[test]
     fn missing_install_commit_cannot_advertise_durable_continuity() {
         let actor = RemoteActor::fixture();
         actor.0.installed.store(false, Ordering::Release);
