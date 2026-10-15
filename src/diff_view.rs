@@ -134,6 +134,8 @@ pub struct SplitDiffRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffModel {
+    /// Set only by an original scoped read, or retained from its working baseline.
+    pub(crate) git_read_receipt: Option<crate::repository::GitReadReceipt>,
     /// Complete line extents, retained for constant-time review anchor checks.
     pub line_counts: [usize; 2],
     /// Whether each side exists; an empty file differs from an absent side.
@@ -1207,6 +1209,10 @@ fn measure_diff_with_font(
 }
 
 impl DiffModel {
+    pub fn git_read_receipt(&self) -> Option<&crate::repository::GitReadReceipt> {
+        self.git_read_receipt.as_ref()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.additions == 0 && self.deletions == 0
     }
@@ -1457,6 +1463,22 @@ pub fn load_repository_diff_with_options_and_font(
     font: cosmic::iced::Font,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
+    load_repository_diff_with_read_source(worktree, relative_path, basis, previous_path, theme,
+        ignore_whitespace, font, cancellation, None)
+}
+
+/// The optional source is fixed by the original runtime owner before this worker starts.
+pub fn load_repository_diff_with_read_source(
+    worktree: &Path,
+    relative_path: &Path,
+    basis: &DiffBasis,
+    previous_path: Option<&Path>,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    font: cosmic::iced::Font,
+    cancellation: &CancellationToken,
+    source: Option<&crate::repository::GitReadSource>,
+) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
     // `..`, an empty component and an interior NUL, which is what makes the
     // pathspec safe to hand to Git.
@@ -1474,15 +1496,19 @@ pub fn load_repository_diff_with_options_and_font(
         path,
         old_path,
     };
-    match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content_with_options_and_font(
-            content,
-            relative_path,
-            theme,
-            ignore_whitespace,
-            font,
-            cancellation,
-        ),
+    let read = match source {
+        Some(source) => source.diff(&request, cancellation).map(|(content, receipt)| (content, Some(receipt))),
+        None => RepositoryService::system("git").diff(&request, cancellation).map(|content| (content, None)),
+    };
+    match read {
+        Ok((content, receipt)) => {
+            let mut rendered = RenderedDiff::from_content_with_options_and_font(
+                content, relative_path, theme, ignore_whitespace, font, cancellation);
+            if let RenderedDiff::Text { model, .. } = &mut rendered {
+                Arc::make_mut(model).git_read_receipt = receipt;
+            }
+            rendered
+        }
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
@@ -1614,6 +1640,7 @@ fn build_diff_rows_from_sources(
             line_counts: [lines.len(); 2],
             present: [true; 2],
             source_head: None,
+            git_read_receipt: None,
             modes: [None; 2],
             before: Arc::clone(before),
             after: Arc::clone(after_source),
@@ -1830,6 +1857,7 @@ fn build_diff_rows_from_sources(
         line_counts: [before_lines.len(), after_lines.len()],
         present: [true; 2],
         source_head: None,
+        git_read_receipt: None,
         modes: [None; 2],
         before: Arc::clone(before),
         after: Arc::clone(after_source),

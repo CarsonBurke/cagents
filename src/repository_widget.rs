@@ -45,7 +45,7 @@ use crate::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
         InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan,
         build_document_diff_sources_with_font, build_line_changes, highlighter_settings,
-        load_repository_diff_with_options_and_font,
+        load_repository_diff_with_read_source,
     },
     editor::{
         FileContent, FileIoError, FileRestoration, LinkRefusal, LoadedFile, OversizeKind,
@@ -2645,6 +2645,9 @@ pub struct RepositoryRuntime {
     /// [`DiffBasis`] is deliberately neither `Ord` nor `Hash` — it owns a ref
     /// name and an object id.
     diffs: Vec<(DiffBasis, DiffState)>,
+    git_read_source: Option<crate::repository::GitReadSource>,
+    #[cfg(test)]
+    git_read_fixture: Option<Arc<tempfile::TempDir>>,
     working_diff: WorkingDiffRefresh,
     diff_surface_visible: bool,
     source_surface: SourceSurface,
@@ -2794,9 +2797,23 @@ impl RepositoryRuntime {
     }
 
     pub fn new(descriptor: RepositoryView) -> Self {
+        Self::new_with_git_read_source(descriptor, None)
+    }
+
+    pub fn git_read_source(&self) -> Option<&crate::repository::GitReadSource> {
+        self.git_read_source.as_ref()
+    }
+
+    pub fn new_with_git_read_source(
+        descriptor: RepositoryView,
+        git_read_source: Option<crate::repository::GitReadSource>,
+    ) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
             command_incarnation: Arc::new(()),
+            git_read_source,
+            #[cfg(test)]
+            git_read_fixture: None,
             directory_only: descriptor.selected_file.is_some(),
             external_source: None,
             descriptor,
@@ -6545,6 +6562,7 @@ impl RepositoryRuntime {
             .diff_model()
             .and_then(|model| model.source_head.clone());
         let modes = self.diff_model().map_or([None; 2], |model| model.modes);
+        let git_read_receipt = self.diff_model().and_then(|model| model.git_read_receipt.clone());
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
@@ -6565,6 +6583,7 @@ impl RepositoryRuntime {
                     model.present = present;
                     model.source_head = source_head;
                     model.modes = modes;
+                    model.git_read_receipt = git_read_receipt;
                     Some(model)
                 } else { None };
                 let additions = if let Some(model) = &model { added_source_lines(model) }
@@ -9647,6 +9666,7 @@ impl RepositoryRuntime {
             },
         );
         diff_task(
+            self.git_read_source.clone(),
             identity,
             basis,
             request,
@@ -10764,6 +10784,7 @@ fn pdf_page_task(
 }
 
 fn diff_task(
+    git_read_source: Option<crate::repository::GitReadSource>,
     identity: AsyncIdentity,
     basis: DiffBasis,
     request: u64,
@@ -10778,7 +10799,7 @@ fn diff_task(
     let requested = basis.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
-            load_repository_diff_with_options_and_font(
+            load_repository_diff_with_read_source(
                 &worktree,
                 &pathspec,
                 &requested,
@@ -10787,6 +10808,7 @@ fn diff_task(
                 ignore_whitespace,
                 font,
                 &cancellation,
+                git_read_source.as_ref(),
             )
         })
         .await
@@ -20334,6 +20356,7 @@ mod tests {
                 line_counts: [0; 2],
                 present: [true; 2],
                 source_head: None,
+                git_read_receipt: None,
                 modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
@@ -21284,6 +21307,7 @@ mod tests {
                 line_counts: [0; 2],
                 present: [true; 2],
                 source_head: None,
+                git_read_receipt: None,
                 modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
@@ -21865,6 +21889,7 @@ mod tests {
                 line_counts: [0; 2],
                 present: [true; 2],
                 source_head: None,
+                git_read_receipt: None,
                 modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
@@ -25240,6 +25265,7 @@ mod tests {
             line_counts: [0; 2],
             present: [true; 2],
             source_head: None,
+            git_read_receipt: None,
             modes: [None; 2],
             before: Arc::from(""),
             after: Arc::from(""),

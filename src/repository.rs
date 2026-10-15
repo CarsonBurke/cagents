@@ -19,6 +19,8 @@ use std::{
 };
 
 mod authority;
+pub(crate) mod read_source;
+pub use read_source::{GitReadReceipt, GitReadSource};
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod browse_reveal;
 mod creation_authority;
@@ -3301,7 +3303,7 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// size comes from the same descriptor the bytes come from, and the read is
 /// bounded — so a classification and the read that acts on it cannot describe
 /// different objects.
-fn read_worktree_side(worktree: &Path, path: &RepoPath) -> (DiffSide, Option<u32>) {
+fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> (DiffSide, Option<u32>) {
     use std::os::unix::fs::PermissionsExt;
     let unreadable = |error: &dyn fmt::Display| {
         (
@@ -3310,10 +3312,6 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> (DiffSide, Option<u32
             },
             None,
         )
-    };
-    let root = match fs_safety::Root::open(worktree) {
-        Ok(root) => root,
-        Err(error) => return unreadable(&error),
     };
     let relative = path.as_path();
     let metadata = match fs_safety::metadata_beneath(&root, relative) {
@@ -5794,8 +5792,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
         match &request.basis {
             DiffBasis::IndexToWorktree => {
+                // Retain before the Git read: an executor may finish against
+                // A and then its mutable pathname may be replaced by B. The
+                // filesystem side must keep the same captured root as Git.
+                let root = self.captured_worktree_root(worktree)?;
                 let stages = self.index_entries(worktree, old_path, cancellation)?;
-                let (worktree_side, worktree_mode) = read_worktree_side(worktree, &request.path);
+                let (worktree_side, worktree_mode) = read_worktree_side(&root, &request.path);
                 let stage = |number: u8| stages.iter().find(|entry| entry.stage == number);
                 if stage(0).is_none() && (1..=3).any(|number| stage(number).is_some()) {
                     return Ok(DiffContent::Unmerged {

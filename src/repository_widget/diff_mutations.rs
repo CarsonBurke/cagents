@@ -43,6 +43,10 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    pub fn git_read_receipt(&self) -> Option<&crate::repository::GitReadReceipt> {
+        self.model.git_read_receipt()
+    }
+
     pub fn identity(&self) -> &AsyncIdentity {
         &self.identity
     }
@@ -90,6 +94,10 @@ impl Prepared {
             )?;
             Ok(None)
         } else {
+            let receipt = self.model.git_read_receipt().ok_or("Reload the Git source before applying this change")?;
+            if !receipt.is_current() || !runtime.git_read_source().is_some_and(|source| receipt.matches_source(source)) {
+                return Err("The original Git reader changed; reload this source before applying changes".into());
+            }
             Ok(Some(crate::repository::GitOperation::ApplyPatch {
                 patch: patch.patch,
                 cached: patch.cached,
@@ -101,6 +109,10 @@ impl Prepared {
 }
 
 impl Capture {
+    pub fn git_read_receipt(&self) -> Option<&crate::repository::GitReadReceipt> {
+        self.model.git_read_receipt()
+    }
+
     /// This capture edits only the open document through native Undo.
     pub fn applies_to_buffer(&self) -> bool {
         self.buffer_revision.is_some()
@@ -297,7 +309,10 @@ impl RepositoryRuntime {
         else {
             return false;
         };
-        !model.is_empty()
+        (buffer_revert || model.git_read_receipt().is_some_and(|receipt| {
+            self.git_read_source().is_some_and(|source| receipt.matches_source(source))
+        }))
+            && !model.is_empty()
             && (kind == git_patch::Kind::Unstage) == model.source_head.is_some()
             && model
                 .present
@@ -1097,7 +1112,7 @@ mod tests {
         runtime.working_diff.desired = runtime.wanted_working_diff();
         let request = runtime.diff_mutation_request(card, 0..1).unwrap();
         let capture = runtime
-            .capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request))
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
             .unwrap();
         assert_eq!(capture.identity, identity);
         assert_eq!(capture.new_path.as_path(), Path::new("target.sh"));
@@ -1156,17 +1171,38 @@ mod tests {
     pub(super) fn selected_mutation_fixture(card: CardId) -> RepositoryRuntime {
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\nkeep\n");
         runtime.source_surface = SourceSurface::Diff;
-        let mut model = crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");
-        model.present = [true; 2];
-        model.modes = [Some(0o100644); 2];
-        runtime.set_diff_state(
-            DiffBasis::IndexToWorktree,
-            DiffState::ready(RenderedDiff::Text {
-                model: Arc::new(model),
-                old_label: "Index".into(),
-                new_label: "Working tree".into(),
-            }),
-        );
+        // Geometry and action tests use an actual original scoped read rather
+        // than manufacturing a receipt for their in-memory model.
+        #[cfg(target_os = "linux")]
+        let content = {
+            let directory = Arc::new(tempfile::tempdir().unwrap());
+            crate::repository::read_source::tests::git(directory.path(), &["init", "-b", "main"]);
+            std::fs::write(directory.path().join("file.txt"), "original\nkeep\n").unwrap();
+            crate::repository::read_source::tests::git(directory.path(), &["add", "file.txt"]);
+            std::fs::write(directory.path().join("file.txt"), "changed\nkeep\n").unwrap();
+            let source = crate::repository::GitReadSource::new(
+                crate::model::OperationId::new(),
+                crate::repository::WorktreeAuthority::capture(directory.path()).unwrap(),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            );
+            runtime.descriptor.worktree = directory.path().to_owned();
+            let content = crate::diff_view::load_repository_diff_with_read_source(
+                directory.path(), Path::new("file.txt"), &DiffBasis::IndexToWorktree, None,
+                crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+                &CancellationToken::default(), Some(&source),
+            );
+            runtime.git_read_source = Some(source);
+            runtime.git_read_fixture = Some(directory);
+            content
+        };
+        #[cfg(not(target_os = "linux"))]
+        let content = {
+            let mut model = crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");
+            model.present = [true; 2];
+            model.modes = [Some(0o100644); 2];
+            RenderedDiff::Text { model: Arc::new(model), old_label: "Index".into(), new_label: "Working tree".into() }
+        };
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
         runtime.working_diff.applied_rich = true;
@@ -1174,6 +1210,7 @@ mod tests {
         runtime
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn disk_comparison_refuses_hidden_git_hunks_selection_and_prepared_effects() {
         for kind in [
@@ -1185,20 +1222,15 @@ mod tests {
                 let card = CardId::new();
                 let mut runtime = selected_mutation_fixture(card);
                 if kind == git_patch::Kind::Unstage {
-                    let mut model =
-                        crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");
-                    model.present = [true; 2];
-                    model.modes = [Some(0o100644); 2];
-                    model.source_head = Some(crate::repository::GitHeadGuard::Unborn);
-                    runtime.diff_basis = DiffBasis::HeadToIndex;
-                    runtime.set_diff_state(
-                        DiffBasis::HeadToIndex,
-                        DiffState::ready(RenderedDiff::Text {
-                            model: Arc::new(model),
-                            old_label: "HEAD".into(),
-                            new_label: "Index".into(),
-                        }),
+                    let source = runtime.git_read_source().unwrap();
+                    crate::repository::read_source::tests::git(source.authority().path(), &["add", "file.txt"]);
+                    let content = crate::diff_view::load_repository_diff_with_read_source(
+                        source.authority().path(), Path::new("file.txt"), &DiffBasis::HeadToIndex, None,
+                        crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+                        &CancellationToken::default(), Some(source),
                     );
+                    runtime.diff_basis = DiffBasis::HeadToIndex;
+                    runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(content));
                 }
                 assert!(runtime.can_apply_diff_hunk(kind));
                 let hidden = runtime.current_diff_model_snapshot().unwrap();
@@ -1251,6 +1283,60 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn original_git_read_receipt_survives_diff_loaded_working_rebuild_and_preparation() {
+        use cosmic::iced::futures::StreamExt;
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let source = runtime.git_read_source().unwrap().clone();
+        let identity = runtime.current_identity(card, "file.txt".into());
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::Loading { request: 42, cancellation: CancellationToken::default() });
+        let task = diff_task(Some(source.clone()), identity, DiffBasis::IndexToWorktree, 42, None,
+            "file.txt".into(), crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE, CancellationToken::default());
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else { panic!("actual read result") };
+        drop(runtime.update(action));
+        assert!(runtime.current_diff_model_snapshot().unwrap().git_read_receipt().unwrap().matches_source(&source));
+        runtime.working_diff.applied = None;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        let task = runtime.start_working_diff(card, ticket);
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let iced::runtime::Action::Output(action) = stream.next().await.unwrap() else { panic!("actual working result") };
+        drop(runtime.update(action));
+        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
+        assert!(prepared.git_read_receipt().unwrap().matches_source(&source));
+        assert!(prepared.apply(&mut runtime).unwrap().is_some());
+        // Same pathname and even the same physical directories do not bind A's
+        // bytes to a newly accepted reader actor B.
+        let old = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
+        runtime.git_read_source = Some(crate::repository::GitReadSource::new(
+            crate::model::OperationId::new(), source.authority().clone(), Arc::new(std::sync::atomic::AtomicU64::new(0))));
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        assert!(old.apply(&mut runtime).is_err());
+        runtime.git_read_source = Some(source.clone());
+        assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        source.invalidate();
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+    }
+
+    #[test]
+    fn unqualified_git_diff_keeps_display_and_native_buffer_revert_only() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        runtime.git_read_source = None;
+        assert!(runtime.current_diff_model_snapshot().is_some());
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).is_none());
+        assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Revert, None).unwrap().prepare().unwrap().apply(&mut runtime).unwrap().is_none());
+        assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");
+    }
+
     #[test]
     fn read_only_git_runtime_disables_git_writes_but_keeps_buffer_revert_edit_and_undo() {
         let card = CardId::new();
@@ -1293,6 +1379,7 @@ mod tests {
         assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn opaque_prepared_diff_refuses_selection_and_same_content_model_replacement() {
         let card = CardId::new();
@@ -1345,6 +1432,7 @@ mod tests {
         assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn selection_mutation_commands_require_selected_rows_and_capture_their_source() {
         let card = CardId::new();
@@ -1395,6 +1483,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn selection_mutation_commands_disable_unchanged_context_only_ranges() {
         let card = CardId::new();
@@ -1418,6 +1507,7 @@ mod tests {
         assert!(runtime.can_apply_diff_selection(git_patch::Kind::Revert));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn diff_mutation_controls_capture_the_rendered_hunk_and_disable_context_only_selections() {
         let card = CardId::new();
@@ -1471,6 +1561,7 @@ mod tests {
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn selection_mutation_commands_share_basis_mode_and_current_annotation_guards() {
         let card = CardId::new();
@@ -1487,19 +1578,15 @@ mod tests {
         runtime.working_diff.applied = None;
         assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
         runtime.working_diff.applied = runtime.wanted_working_diff();
-        let mut model = crate::diff_view::build_diff("original\n", "changed\n");
-        model.present = [true; 2];
-        model.modes = [Some(0o100644); 2];
-        model.source_head = Some(crate::repository::GitHeadGuard::Unborn);
-        runtime.diff_basis = DiffBasis::HeadToIndex;
-        runtime.set_diff_state(
-            DiffBasis::HeadToIndex,
-            DiffState::ready(RenderedDiff::Text {
-                model: Arc::new(model),
-                old_label: "HEAD".into(),
-                new_label: "Index".into(),
-            }),
+        let source = runtime.git_read_source().unwrap();
+        crate::repository::read_source::tests::git(source.authority().path(), &["add", "file.txt"]);
+        let content = crate::diff_view::load_repository_diff_with_read_source(
+            source.authority().path(), Path::new("file.txt"), &DiffBasis::HeadToIndex, None,
+            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+            &CancellationToken::default(), Some(source),
         );
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(content));
         runtime.diff_interaction.selection = Some(selection);
         assert!(runtime.can_apply_diff_selection(git_patch::Kind::Unstage));
         assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));

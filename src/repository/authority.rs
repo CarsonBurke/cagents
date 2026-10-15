@@ -7,6 +7,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 pub struct WorktreeAuthority {
     root: Arc<fs_safety::Root>,
     identity: (u64, u64),
+    git_identity: (u64, u64),
+    common_identity: (u64, u64),
     git_dir: Arc<fs_safety::Root>,
     common_dir: Arc<fs_safety::Root>,
     child_root: Arc<fs::File>,
@@ -58,6 +60,17 @@ impl WorktreeAuthority {
 
     pub fn path(&self) -> &Path {
         self.root.path()
+    }
+
+    /// Compare the originally held scopes without touching the filesystem.
+    /// Workers must still call `validate` before performing IO.
+    pub fn same_scope(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.git_identity == other.git_identity
+            && self.common_identity == other.common_identity
+            && self.path() == other.path()
+            && self.git_dir.path() == other.git_dir.path()
+            && self.common_dir.path() == other.common_dir.path()
     }
 
     pub fn validate(&self) -> Result<(), RepositoryError> {
@@ -119,6 +132,8 @@ impl WorktreeAuthority {
         let metadata = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let git_metadata = git_dir.metadata().map_err(metadata_error)?;
+        let common_metadata = common_dir.metadata().map_err(metadata_error)?;
         let (_, child_root) = inherited_directory_scope(&root)?;
         let (_, child_git) = inherited_directory_scope(&git_dir)?;
         let child_common = if same_directory(&git_dir, &common_dir)? {
@@ -129,6 +144,8 @@ impl WorktreeAuthority {
         let authority = Self {
             root: Arc::new(root),
             identity: (metadata.dev(), metadata.ino()),
+            git_identity: (git_metadata.dev(), git_metadata.ino()),
+            common_identity: (common_metadata.dev(), common_metadata.ino()),
             git_dir: Arc::new(git_dir),
             common_dir: Arc::new(common_dir),
             child_root,
@@ -826,6 +843,35 @@ mod authority_tests {
         assert!(actual_git(&root, &["ls-files", "-z"]).stdout.is_empty());
         assert_eq!(std::fs::read(root.join("-C")).unwrap(), b"replacement\n");
         assert_eq!(std::fs::read(parked.join("-C")).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn captured_authority_diff_keeps_original_filesystem_side_after_index_read() {
+        struct ReplaceAfterIndex { root: PathBuf, parked: PathBuf }
+        impl ProcessExecutor for ReplaceAfterIndex {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                let output = SystemProcessExecutor.execute(&isolated_spec(command.clone()), cancel)?;
+                if command.arguments.iter().any(|arg| arg == "ls-files") {
+                    std::fs::rename(&self.root, &self.parked).unwrap();
+                    std::fs::create_dir(&self.root).unwrap();
+                    actual_git(&self.root, &["init", "-b", "main"]);
+                    std::fs::write(self.root.join("file"), "foreign work\n").unwrap();
+                }
+                Ok(output)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worktree");
+        let parked = directory.path().join("original");
+        std::fs::create_dir(&root).unwrap();
+        actual_git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("file"), "original work\n").unwrap();
+        let service = RepositoryService::new("git", Arc::new(ReplaceAfterIndex { root: root.clone(), parked: parked.clone() }))
+            .with_worktree_authority(WorktreeAuthority::capture(&root).unwrap()).unwrap();
+        let content = service.diff(&DiffRequest { worktree: root.clone(), path: RepoPath::parse("file").unwrap(), old_path: None, basis: DiffBasis::IndexToWorktree }, &CancellationToken::default()).unwrap();
+        assert!(matches!(content, DiffContent::Comparison { old: DiffSide::Absent, new: DiffSide::Text { ref text, .. }, .. } if text == "original work\n"));
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"foreign work\n");
+        assert_eq!(std::fs::read(parked.join("file")).unwrap(), b"original work\n");
     }
 
     #[test]
