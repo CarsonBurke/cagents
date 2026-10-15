@@ -172,6 +172,11 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    /// Exact private discovery identity; observing it grants no release authority.
+    pub(crate) fn record(&self) -> &Record {
+        &self.identity.record
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }

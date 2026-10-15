@@ -139,6 +139,10 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+
+    pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
+        self.0.native_holder_record.as_ref()
+    }
     /// Local actors publish their metadata directly. Retained-actor builds
     /// replace this with the authenticated remote refresh before close fences.
     pub(crate) fn refresh_retained_state(&self) -> Result<(), String> {
@@ -171,6 +175,7 @@ struct Inner {
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
+    native_holder_record: Option<crate::daemon::holder_registry::Record>,
     native_reconciling: AtomicBool,
     native_reconcile_error: Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
@@ -334,6 +339,7 @@ impl Handle {
         ));
         let provider_process = Arc::new(Mutex::new(None));
         let inner = Arc::new(Inner {
+            native_holder_record: native_holder.as_ref().map(|holder| holder.record().clone()),
             provider_process: provider_process.clone(),
             pinned_directory: pinned_directory.clone(),
             commands,
