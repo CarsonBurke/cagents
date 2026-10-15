@@ -325,6 +325,11 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    pub(super) fn account_terminal_in_use(&self, id: TerminalId) -> bool {
+        self.terminals.get(&id).is_some_and(|record| !record.handle.is_completed())
+            || self.subscriptions.by_terminal.get(&id).is_some_and(|clients| !clients.is_empty())
+    }
+
     pub(super) fn account_cleanup_evidence(&self) -> Option<Arc<crate::upgrade::handoff::Store>> {
         self.upgrade_evidence.clone()
     }

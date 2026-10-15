@@ -368,12 +368,12 @@ fn ensure_account_homes_unused(
         };
         // Copy small ownership metadata under HostState. Resolving aliases and
         // reading retained checkpoints happens after releasing that mutex.
-        let (paths, scopes, closing, upgrade) = {
+        let (mut paths, scopes, closing, upgrade, registry) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut paths = Vec::new();
             let mut scopes = Vec::new();
             let mut unresolved_native = false;
-            for record in state.terminals.values().filter(|record| !record.handle.is_completed()) {
+            for (_id, record) in state.terminals.iter().filter(|(id, _)| state.account_terminal_in_use(**id)) {
                 for provider in crate::account::Account::PROVIDERS {
                     paths.extend(selected_recipe(provider, &record.session.launch));
                     if let Some(environment) = &record.execution_environment {
@@ -381,7 +381,7 @@ fn ensure_account_homes_unused(
                     }
                 }
             }
-            for record in state.chats.values().filter(|record| record.handle.owns_work()) {
+            for record in state.chats.values().filter(|record| record.handle.owns_work() || !record.subscribers.is_empty()) {
                 paths.extend(selected_recipe(record.session.launch.provider, &record.session.launch.recipe));
                 match record.handle.launch_account_scope() {
                     Ok(scope) => scopes.push(scope.clone()),
@@ -399,8 +399,24 @@ fn ensure_account_homes_unused(
                 }
             }
             (paths, scopes, unresolved_native || state.native_closing.values()
-                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence())
+                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence(), state.execution_registry.clone())
         };
+        // Shared model membership also covers another window's parked or
+        // completed panes. Read the independent connection outside HostState.
+        if let Some(registry) = registry {
+            let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()
+                .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                    format!("Cannot verify open account panes: {message}"), false))?;
+            for pane in model.views.into_iter().flat_map(|view| view.panes) {
+                match pane.kind {
+                    crate::model::CardKind::Chat(session) => paths.extend(selected_recipe(session.launch.provider, &session.launch.recipe)),
+                    crate::model::CardKind::Terminal(session) => {
+                        for provider in crate::account::Account::PROVIDERS { paths.extend(selected_recipe(provider, &session.launch)); }
+                    },
+                    _ => {},
+                }
+            }
+        }
         use std::os::unix::fs::MetadataExt;
         let identity = std::fs::metadata(&home).ok().filter(|metadata| metadata.is_dir())
             .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -532,6 +548,27 @@ pub(super) fn process_request(
         super::account_lifecycle::ensure_idle(host)?;
     }
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    match &request {
+        ClientRequest::Attach {terminal_id, ..} => super::account_lifecycle::ensure_terminal(host,*terminal_id)?,
+        ClientRequest::ChatAttach {session} => {
+            let actual = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&session.id)
+                .and_then(|record| record.handle.launch_account_scope().ok()).map(|scope| scope.canonical_home.clone());
+            super::account_lifecycle::ensure_paths(host,actual)?;
+            super::account_lifecycle::ensure_launch(host,&session.launch.recipe.working_directory,
+                &session.launch.recipe.environment,&session.launch.recipe.unset_environment,false)?;
+        }
+        ClientRequest::EditWorkspaceModel {edit: crate::workspace_model::ModelEdit::SeedView {panes,..}} => {
+            for pane in panes { super::account_lifecycle::ensure_pane(host,pane)?; }
+        }
+        ClientRequest::EditWorkspaceModel {edit: crate::workspace_model::ModelEdit::ChangeView {change,..}} => {
+            use crate::workspace_model::views::Change;
+            match change {
+                Change::Insert {pane,..} | Change::InsertIfEmpty {pane} | Change::Update {pane,..} => super::account_lifecycle::ensure_pane(host,pane)?,
+                _ => {},
+            }
+        }
+        _ => {},
+    }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -1359,6 +1396,7 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
+        if super::account_lifecycle::ensure_terminal(host,cursor.terminal_id).is_err() { continue; }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {

@@ -212,6 +212,7 @@ mod tests {
     }
     fn close(host: &SharedHost, id: TerminalId) {
         request(host, ClientRequest::CloseTerminalChecked { terminal_id: id, allow_active: true }).unwrap();
+        request(host, ClientRequest::Detach { terminal_id: id }).unwrap();
     }
 
     /// A subprocess owns all environment/config/cache/provider fixtures. The
@@ -330,7 +331,9 @@ mod tests {
         drop(reader);
         assert!(pending.join().unwrap().is_err());
         assert!(!race.resolved_home().unwrap().join("logout-started").exists());
-        close(&host,racing_id);
+        request(&host,ClientRequest::CloseTerminalChecked {terminal_id:racing_id,allow_active:true}).unwrap();
+        assert!(lifecycle(&host,crate::account::remote::Operation::Remove {id:race.id()}).is_err(),"a completed but still attached pane retains its home");
+        request(&host,ClientRequest::Detach {terminal_id:racing_id}).unwrap();
 
         // Linked descendants, including another provider, retain the entire
         // containing managed tree when its owner explicitly deletes files.
@@ -342,4 +345,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(nested.join("history")).unwrap(),"keep");
         assert!(race.resolved_home().unwrap().is_dir());
     }
+}
+
+/// Reattaching a completed pane must not add a reader while its retained
+/// account history is being deleted. Copy only nonsecret home metadata.
+pub(super) fn ensure_terminal(host: &SharedHost, id: crate::model::TerminalId) -> Result<(), ProtocolError> {
+    let selected = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.terminals.get(&id).map(|record| {
+            let environment = record.execution_environment.as_ref().map(|value| &value.0)
+                .unwrap_or(&record.session.launch.environment);
+            let environment = ["HOME","CLAUDE_CONFIG_DIR","CODEX_HOME"].into_iter()
+                .filter_map(|name| environment.get(name).map(|value| (name.into(),value.clone()))).collect();
+            (record.session.launch.working_directory.clone(),environment,
+                crate::account::launch_credential_overrides(&record.session.launch),record.execution_environment.is_none())
+        })
+    };
+    if let Some((cwd,environment,unset,inherit)) = selected { ensure_launch(host,&cwd,&environment,&unset,inherit)?; }
+    Ok(())
+}
+
+pub(super) fn ensure_pane(host: &SharedHost, pane: &crate::workspace_model::views::Pane) -> Result<(),ProtocolError> {
+    let recipe = match &pane.kind {
+        crate::model::CardKind::Chat(session) => &session.launch.recipe,
+        crate::model::CardKind::Terminal(session) => &session.launch,
+        _ => return Ok(()),
+    };
+    ensure_launch(host,&recipe.working_directory,&recipe.environment,&recipe.unset_environment,false)
 }
