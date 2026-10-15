@@ -28,6 +28,7 @@ mod monospace;
 mod permissions;
 mod prose;
 mod provider_exit;
+mod clipboard_intent;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -461,6 +462,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    copy_intents: clipboard_intent::Intents,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -502,6 +504,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            copy_intents: clipboard_intent::Intents::default(),
             image_viewer: None,
             files: HashMap::new(),
             sender,
