@@ -123,7 +123,7 @@ struct Holding {
     publication: fs_safety::DirectoryPublication,
     slot: Option<RecoverySlot>,
     // Keep authenticated file identities alive with an unresolved holding.
-    // This producer retains at most three file FDs plus the receipt's bounded
+    // This producer retains at most four file FDs plus the receipt's bounded
     // directory handles, below MAX_RECOVERY_DESCRIPTORS (16).
     files: Vec<File>,
 }
@@ -174,9 +174,16 @@ impl Holding {
         };
         Ok(Self { root, parent: retained_parent, publication, slot: Some(slot), files: vec![retained_source] })
     }
-    fn keep_file(&mut self, file: &File) -> Result<(), FileIoError> {
-        self.files.push(file.try_clone().map_err(io_error)?);
-        Ok(())
+    fn keep_file(&mut self, file: File) -> Result<File, FileIoError> {
+        match file.try_clone() {
+            Ok(retained) => { self.files.push(retained); Ok(file) }
+            Err(error) => {
+                // Even descriptor exhaustion must not drop the actual newly
+                // created/acquired file before returning its recovery carrier.
+                self.files.push(file);
+                Err(io_error(error))
+            }
+        }
     }
     fn remove_empty(&mut self, _parent: &Root) -> Result<(), FileIoError> {
         self.publication.cleanup_empty().map_err(resolve_error)
@@ -275,7 +282,7 @@ fn publish_in_holding(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    let (mut temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600)
+    let (temporary, temporary_name) = match fs_safety::create_temporary_in(&holding.root, 0o600)
     {
         Ok(value) => value,
         Err(error) => {
@@ -283,6 +290,9 @@ fn publish_in_holding(
             return Err(append_cleanup(resolve_error(error), cleanup));
         }
     };
+    // Pin the actual O_WRONLY created inode before ownership/ACL/write/sync or
+    // readable-open can fail. Never depend on later successful preparation.
+    let mut temporary = holding.keep_file(temporary)?;
     let mut temporary_baseline = None;
     let mut readable_temporary = None;
     let prepare = (|| {
@@ -303,7 +313,7 @@ fn publish_in_holding(
         if !same_file(&written, &opened) || full_version(&written) != full_version(&opened) {
             return Err(changed());
         }
-        holding.keep_file(&readable)?;
+        let readable = holding.keep_file(readable)?;
         let mut prepared = SaveBaseline::capture(&readable, Some(blake3::hash(bytes)))?;
         prepared.hash_limit = bytes.len() as u64;
         temporary_baseline = Some(prepared);
@@ -348,7 +358,7 @@ fn publish_in_holding(
         after_acquire(parent, &holding.root).map_err(io_error)?;
         let acquired =
             fs_safety::open_beneath(&holding.root, Path::new(previous)).map_err(resolve_error)?;
-        holding.keep_file(&acquired)?;
+        let acquired = holding.keep_file(acquired)?;
         baseline.verify(&acquired, true)?;
         let acquired_version = acquired.metadata().map_err(io_error)?;
         // Sync the acquired directory entry before the replacement is exposed.
@@ -807,18 +817,30 @@ mod tests {
         let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
         let holding = Holding::create(&root, &source).unwrap();
         let descriptor = holding.files[0].as_raw_fd();
+        let expected = source.metadata().unwrap();
+        let expected = (expected.dev(), expected.ino());
+        let descriptor_identity = |fd| {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                return None;
+            }
+            let metadata = unsafe { metadata.assume_init() };
+            Some((metadata.st_dev as u64, metadata.st_ino as u64))
+        };
         fs::write(holding.root.path().join("unresolved"), b"preserve").unwrap();
         drop(source);
         let private_path = holding.root.path().to_owned();
         let authority = holding.retain();
-        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0, "the returned authority must own the authenticated file descriptor");
+        assert_eq!(descriptor_identity(descriptor), Some(expected), "the returned authority must own the authenticated file descriptor");
         assert!(authority.retry().is_err());
-        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0, "failed retry must retain all owned authority");
+        assert_eq!(descriptor_identity(descriptor), Some(expected), "failed retry must retain all owned authority");
         fs::remove_file(private_path.join("unresolved")).unwrap();
         authority.retry().unwrap();
         assert!(authority.is_resolved());
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1, "actual resolution releases the captured file descriptor");
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        // Another parallel test may reuse the numeric FD. The fixture's
+        // still-linked unique inode cannot be reused, so compare identity.
+        assert_ne!(descriptor_identity(descriptor), Some(expected), "actual resolution releases the captured file descriptor");
         assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"base");
     }
 
