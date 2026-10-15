@@ -341,6 +341,9 @@ pub enum Recovery {
     /// The daemon proved that a newer turn prevented account-switch admission;
     /// the original actor is unchanged, so retain the chosen queued switch.
     AccountSwitchBusy,
+    /// Exact handoff is unsupported and the daemon proved no source/history
+    /// mutation occurred. Keep its attachment and offer cache-loss continuation.
+    AccountSwitchUnavailable,
     /// The recorded managed home was removed; choose another account of this
     /// provider before attempting the exact conversation again.
     Account,

@@ -907,6 +907,9 @@ pub enum ProtocolErrorCode {
     ViewConflict,
     /// Exact account switch refused before closing or spawning any provider.
     AccountSwitchBusy,
+    /// The original actor was not changed: its provider cannot prove a safe
+    /// conditional live handoff. Offer a separate conversation explicitly.
+    AccountSwitchUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

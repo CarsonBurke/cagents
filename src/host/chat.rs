@@ -2133,6 +2133,24 @@ fn recover_account(
         .chats
         .get(&source.id)
         .map(|record| record.handle.clone());
+    // An idle observation cannot authorize stopping provider-owned work.
+    // Refuse before history preflight/copy or source teardown. The typed
+    // response lets the UI preserve its healthy original attachment.
+    if let (Some(generation), Some(handle)) = (idle_generation, source_handle.as_ref())
+        && !handle.is_completed()
+    {
+        validate_proof(source.proof.as_ref(), host.lock().unwrap_or_else(|p| p.into_inner()).proof())?;
+        if handle.account_switch_generation().map_err(unavailable)? != Some(generation) {
+            return Err(if explicit {
+                ProtocolError::new(ProtocolErrorCode::AccountSwitchBusy,
+                    "A newer turn is using the original account; the switch remains queued until it is idle.", false)
+            } else {
+                unavailable("The original conversation changed before the automatic account switch")
+            });
+        }
+        return Err(ProtocolError::new(ProtocolErrorCode::AccountSwitchUnavailable,
+            "This provider cannot prove a safe exact account handoff while the original session is running. Continue on the selected account as a new conversation (cache lost); the original is kept.", false));
+    }
     // Keep the original approved directory pinned before stopping its actor or
     // copying history. The successor's issued recipe remains immutable.
     let operational_directory = if let Some(handle) = &source_handle {
@@ -2183,8 +2201,7 @@ fn recover_account(
             });
             handle
         };
-        // The actor checks this generation after every previously admitted
-        // command. A UI snapshot alone cannot prove a timed-out turn is idle.
+        // Completed actors still require their exact generation/cleanup proof.
         crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
         current_options = handle
             .close_for_account_switch(generation)
@@ -4504,11 +4521,11 @@ for line in sys.stdin:
 
     struct Echo(bool);
     #[test]
-    fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
+    fn automatic_handoff_preserves_a_live_source_then_confirms_its_completed_conversation() {
         handoff_contract(false, false, false, false);
     }
     #[test]
-    fn explicit_handoff_accepts_a_pinned_account_and_records_a_transcript_notice() {
+    fn explicit_completed_handoff_accepts_a_pinned_account_and_records_a_transcript_notice() {
         handoff_contract(true, false, false, false);
     }
 
@@ -4852,6 +4869,9 @@ done
         assert!(host.lock().unwrap().chat_spawning.is_empty());
         let mut actual_directory = source.launch.recipe.working_directory.clone();
         if moved {
+            if completed {
+                handle.close().unwrap();
+            }
             let moved_directory = directory.path().join("moved-project");
             std::fs::rename(&actual_directory, &moved_directory).unwrap();
             std::fs::create_dir(&actual_directory).unwrap();
@@ -4865,11 +4885,12 @@ done
                 Default::default(),
             )
             .unwrap_err();
-            assert!(failure.message.contains("directory"), "{}", failure.message);
-            assert!(
-                !handle.is_completed(),
-                "an unapproved path must not close the source"
-            );
+            if completed {
+                assert!(failure.message.contains("directory"), "{}", failure.message);
+            } else {
+                assert_eq!(failure.code,ProtocolErrorCode::AccountSwitchUnavailable);
+            }
+            assert_eq!(handle.is_completed(),completed,"refusal must not close the source");
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
             let response = super::super::client::process_request(
                 &host,
@@ -4892,10 +4913,20 @@ done
             };
             assert!(model.session_location_refusals.is_empty());
             actual_directory = moved_directory;
-            generation = handle.account_switch_generation().unwrap().unwrap();
         }
-        if completed {
+        if !handle.is_completed() {
+            generation = handle.account_switch_generation().unwrap().unwrap();
+            let refusal = recover_account(&host,1,source.clone(),replacement.clone(),Some(generation),explicit,Default::default()).unwrap_err();
+            assert_eq!(refusal.code,ProtocolErrorCode::AccountSwitchUnavailable);
+            assert!(!handle.is_completed(),"choosing another account never grants whole-session stop consent");
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+            assert_eq!(std::fs::read(&transcript).unwrap(),b"{}\n");
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            // The fixture user separately ends the complete original session.
             handle.close().unwrap();
+        }
+        generation = handle.account_switch_generation().unwrap().unwrap();
+        if completed {
             let record = host.lock().unwrap().chats.remove(&source.id).unwrap();
             let failure = recover_account(
                 &host,

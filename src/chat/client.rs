@@ -1124,6 +1124,8 @@ impl ClientHandle {
                             super::Recovery::Account
                         } else if error.code == ipc::ProtocolErrorCode::AccountSwitchBusy {
                             super::Recovery::AccountSwitchBusy
+                        } else if error.code == ipc::ProtocolErrorCode::AccountSwitchUnavailable {
+                            super::Recovery::AccountSwitchUnavailable
                         } else {
                             super::Recovery::Retry
                         },
@@ -1522,6 +1524,20 @@ impl ClientHandle {
     /// The durable descriptor for this chat, with the conversation the
     /// provider has confirmed.
     ///
+    #[test]
+    fn exact_account_refusals_keep_typed_pre_admission_dispositions_across_ipc() {
+        for (code,recovery) in [
+            (ipc::ProtocolErrorCode::AccountSwitchBusy,super::Recovery::AccountSwitchBusy),
+            (ipc::ProtocolErrorCode::AccountSwitchUnavailable,super::Recovery::AccountSwitchUnavailable),
+        ] {
+            let failure=restore_against(omp_card(Some(CONVERSATION),Some(host_proof("before-update"))),move |_| {
+                ServerMessage::Error(ipc::ProtocolError::new(code,"typed account refusal",false))
+            }).err().expect("daemon refused before provider effects");
+            assert_eq!(failure.recovery,recovery);
+            assert_eq!(failure.message,"typed account refusal");
+        }
+    }
+
     /// A conversation the provider has not named yet is not evidence that the
     /// saved one is gone: a start that is still loading reports nothing, and
     /// so does one that failed to resume. Overwriting the saved identifier
