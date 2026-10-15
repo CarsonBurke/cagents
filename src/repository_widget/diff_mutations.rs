@@ -48,8 +48,12 @@ impl RepositoryRuntime {
     }
 
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
+        // A hunk edit keeps the current document open. Unsaved working
+        // text is a valid source while its annotations match that revision;
+        // saving and unresolved durability still fence the operation.
         if !self.shows_diff() || self.directory_only || self.mutation_refresh_pending
-            || self.blocks_navigation() || self.basis_resolution.is_some()
+            || self.is_saving() || self.has_durability_warning() || self.basis_resolution.is_some()
+            || kind == git_patch::Kind::Unstage && self.is_dirty()
             || self.editable_working_diff() && !self.working_annotations_current()
         { return false; }
         match (kind, &self.diff_basis) {
@@ -87,8 +91,11 @@ impl RepositoryRuntime {
         let path = self.selected_path()?.to_owned();
         let file = self.subject_file()?;
         let old_path = file.previous_path(&self.diff_basis).unwrap_or_else(|| path.clone());
-        let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert && self.is_dirty() {
-            match &self.document { DocumentState::Editable(document) => (Some(document.revision), Some(document.content.text_snapshot())), _ => return None }
+        let (buffer_revision, buffer_snapshot) = if kind == git_patch::Kind::Revert {
+            match &self.document {
+                DocumentState::Editable(document) => (Some(document.revision), Some(document.content.text_snapshot())),
+                _ => (None, None),
+            }
         } else { (None, None) };
         Some(Capture { identity: self.current_identity(card, path.clone()), model, kind,
             mode: self.diff_mode, rows, old_path: RepoPath::parse(old_path).ok()?,
@@ -219,6 +226,41 @@ pub(super) fn gutter<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_change_revert_captures_clean_and_dirty_live_buffers_for_one_undo() {
+        for dirty in [false, true] {
+            let card = CardId::new();
+            let before = "original\r\nkeep\r\n";
+            let after = "changed\r\nkeep\r\n";
+            let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.txt", after);
+            runtime.source_surface = SourceSurface::Diff;
+            let mut model = crate::diff_view::build_diff(before, after);
+            model.present = [true; 2];
+            model.modes = [Some(0o100644); 2];
+            let rows = 0..model.row_count(runtime.diff_mode);
+            runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text {
+                model: Arc::new(model), old_label: "Index".into(), new_label: "Working tree".into(),
+            }));
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+            document.dirty = dirty;
+            runtime.working_diff.applied = runtime.wanted_working_diff();
+            runtime.working_diff.desired = runtime.wanted_working_diff();
+            runtime.working_diff.applied_rich = true;
+            runtime.working_diff.desired_rich = true;
+            let request = runtime.diff_mutation_request(card, rows).unwrap();
+            assert!(runtime.can_mutate_diff(git_patch::Kind::Stage));
+            let capture = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap();
+            let (_, revision, mut patch) = capture.build().unwrap();
+            runtime.apply_diff_buffer_revert(&identity, revision.unwrap(), patch.buffer_change.take().unwrap()).unwrap();
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+            assert_eq!(document.content.text(), before);
+            assert!(document.dirty);
+            assert!(document.step_history(false).is_some());
+            assert_eq!(document.content.text(), after);
+            assert!(!document.history.can_undo());
+        }
+    }
 
     #[test]
     fn partial_change_buffer_revert_is_one_undo_step_with_exact_crlf_and_caret() {
