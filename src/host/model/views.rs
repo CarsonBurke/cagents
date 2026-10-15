@@ -112,6 +112,55 @@ pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
         .collect()
 }
 
+/// Retire only the pane still presenting this execution agent's resource.
+/// The current owner can differ from the agent's original placement after a
+/// transfer. A replacement conversation in the same card belongs to its owner.
+pub(super) fn retire_agent(
+    db: &Connection,
+    agent: &crate::agent_execution::Agent,
+) -> Result<bool, String> {
+    use crate::{
+        agent_execution::HostedSession,
+        model::{CardId, CardKind},
+    };
+    let id = CardId::from_uuid(agent.id.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(false);
+    };
+    let mut view = read(db, &scope)?;
+    let Some(pane) = view.panes.iter().find(|pane| pane.id == id) else {
+        return Ok(false);
+    };
+    let current = match &pane.kind {
+        CardKind::Chat(session) => HostedSession::Chat(session.clone()),
+        CardKind::Terminal(session) => HostedSession::Terminal(session.clone()),
+        _ => return Ok(false),
+    };
+    let retained = agent
+        .session
+        .as_ref()
+        .is_some_and(|source| source.same_process(&current))
+        || agent
+            .console
+            .as_ref()
+            .is_some_and(|source| HostedSession::Terminal(source.clone()).same_process(&current));
+    if !retained {
+        return Ok(false);
+    }
+    view.apply(&Change::Remove { id })?;
+    view.revision = view
+        .revision
+        .checked_add(1)
+        .ok_or("view revision exhausted")?;
+    db.execute(
+        "DELETE FROM shared_view_panes WHERE id=?1",
+        [id.to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    write(db, &view)?;
+    Ok(true)
+}
+
 pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",

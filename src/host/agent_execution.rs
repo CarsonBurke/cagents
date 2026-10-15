@@ -696,6 +696,14 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         return Err("This caller does not own the agent".into());
     }
     if agent.closed {
+        // Older daemons closed the worker without retiring its shared pane.
+        // Repeating close repairs only that retained presentation; it does not
+        // start or contact a provider, and keeps the completed run history.
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_agent(&origin, id)?;
+        announce(host, &registry);
         return Ok(agent);
     }
     let pending = registry

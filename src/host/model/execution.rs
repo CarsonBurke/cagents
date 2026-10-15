@@ -1200,6 +1200,11 @@ impl Registry {
         if active {
             return Err("The agent still has an unfinished run".into());
         }
+        let pane_retired = super::views::retire_agent(&tx, &agent)?;
+        if agent.closed && !pane_retired {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(agent);
+        }
         agent.closed = true;
         tx.execute(
             "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -1454,6 +1459,223 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    fn closed_pane_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        crate::workspace_model::views::Pane,
+    ) {
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let session = source();
+        registry
+            .bind_agent(accepted.agent.id, None, session.clone())
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "confirmed".into(),
+                },
+                2,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: ResultSummary {
+                        text: "Preserved review report".into(),
+                        ..Default::default()
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let HostedSession::Chat(session) = session else {
+            unreachable!()
+        };
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+            title: "Review".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(session),
+            scope: None,
+        };
+        (registry, directory, accepted, pane)
+    }
+
+    #[test]
+    fn close_retires_only_its_current_shared_pane_and_keeps_report_durably() {
+        use crate::workspace_model::views::{Change, Scope};
+        let (mut registry, directory, accepted, pane) = closed_pane_fixture();
+        let source = Scope::Channel(accepted.agent.channel().unwrap());
+        let target = Scope::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        let mut other = pane.clone();
+        other.id = crate::model::CardId::new();
+        let crate::model::CardKind::Chat(session) = &mut other.kind else {
+            unreachable!()
+        };
+        session.id = crate::model::TerminalId::new();
+        for (scope, panes) in [
+            (source.clone(), vec![pane.clone()]),
+            (target.clone(), vec![other.clone()]),
+        ] {
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope,
+                    panes,
+                    closed: vec![],
+                })
+                .unwrap();
+        }
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: source.clone(),
+                expected_revision: registry.view_revision(&source).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id: pane.id,
+                    destination: target.clone(),
+                    before: None,
+                },
+            })
+            .unwrap();
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        let view = super::super::views::read(&registry.db, &target).unwrap();
+        assert_eq!(view.panes, vec![other]);
+        assert!(view.retired.contains(&pane.id));
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        let sequence = registry.execution_sequence().unwrap();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert_eq!(registry.execution_sequence().unwrap(), sequence);
+        // An old window cannot republish the retired descriptor on reconnect.
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: target.clone(),
+                panes: vec![pane],
+                closed: vec![],
+            })
+            .unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            super::super::views::read(&registry.db, &target).unwrap(),
+            view
+        );
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+    }
+
+    #[test]
+    fn repeated_close_repairs_old_stale_panes_but_keeps_replacement_resources() {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        // Simulate the older close implementation, which left no pane tombstone.
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        assert!(
+            registry
+                .close_agent(
+                    &Origin::Child {
+                        parent: Lineage(crate::model::TerminalId::new())
+                    },
+                    accepted.agent.id
+                )
+                .is_err()
+        );
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(
+            super::super::views::read(&registry.db, &scope)
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+
+        for replacement in 0..3 {
+            let (mut registry, _directory, accepted, mut pane) = closed_pane_fixture();
+            let scope = Scope::Channel(accepted.agent.channel().unwrap());
+            let crate::model::CardKind::Chat(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            match replacement {
+                0 => session.id = crate::model::TerminalId::new(),
+                1 => {
+                    session.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("successor")
+                }
+                2 => session
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-owner".into()),
+                _ => unreachable!(),
+            }
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .unwrap();
+            assert_eq!(
+                super::super::views::read(&registry.db, &scope)
+                    .unwrap()
+                    .panes,
+                vec![pane]
+            );
+        }
+    }
+
+    #[test]
+    fn pane_retirement_and_agent_close_roll_back_together() {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope,
+                panes: vec![pane],
+                closed: vec![],
+            })
+            .unwrap();
+        let before = registry.model().unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_agent_close BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+        assert!(
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .is_err()
+        );
+        assert_eq!(registry.model().unwrap(), before);
     }
 
     #[test]
