@@ -969,13 +969,14 @@ fn start_with_execution(
     // values nor normalized restart arguments rewrite the issued descriptor.
     // Saved read-only history receives recorded removals, never fresh defaults
     // or transient execution credentials.
+    let empty_execution_environment = BTreeMap::new();
     let process_launch = prepare_native_process_launch(
         restart_launch.unwrap_or(&session.launch),
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
         }),
         if saved_history_only {
-            &BTreeMap::new()
+            &empty_execution_environment
         } else {
             &execution_environment.0
         },
