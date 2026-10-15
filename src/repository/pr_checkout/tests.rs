@@ -1225,7 +1225,10 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
                     .unwrap()
                     .map(Result::unwrap)
                     .find(|entry| {
-                        entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("cagents-pr-checkout-")
                     })
                     .unwrap()
                     .path();
