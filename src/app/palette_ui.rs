@@ -3989,7 +3989,7 @@ mod tests {
         let publish = |app: &mut Cagents, generation| {
             let loaded = super::super::load_repository(&root, Some(key.project_id), CancellationToken::new()).unwrap();
             app.repository_generations.insert(key.project_id, generation);
-            drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation, open_cards: false, result: Ok(loaded) }));
+            drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation, open_cards: false, result: Ok(Box::new(loaded)) }));
         };
         publish(&mut app, 1);
         drop(app.update_palette(Action::Open));

@@ -175,3 +175,56 @@ impl Cagents {
 
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use cosmic::iced::futures::StreamExt;
+
+    #[tokio::test]
+    async fn explicit_failed_project_retry_retires_original_actor_before_reading_replacement() {
+        const TEST: &str = "app::project_creation::tests::explicit_failed_project_retry_retires_original_actor_before_reading_replacement";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        let parent = files.path().canonicalize().unwrap();
+        let root = parent.join("repository");
+        super::super::git_binding::tests::init(&root, "original\n");
+        let (mut app, key) = super::super::git_binding::tests::app_for(&root);
+        let loaded = super::super::load_repository(&root, Some(key.project_id), CancellationToken::new()).unwrap();
+        app.repository_generations.insert(key.project_id, 1);
+        drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation: 1, open_cards: false, result: Ok(Box::new(loaded)) }));
+        let original = app.project_creation_source(key.project_id).unwrap();
+        let old_target = sidebar::commands::ProjectCreationTarget::capture(&app.sidebar_model, key.project_id, None, false).unwrap();
+        std::fs::rename(&root, parent.join("original")).unwrap();
+        super::super::git_binding::tests::init(&root, "replacement\n");
+        // Automatic reads retain A and refuse its changed public name.
+        let result = super::super::load_project_with_source(&root, Some(key.project_id), CancellationToken::new(), None, Some(original.clone()));
+        assert!(result.is_err());
+        app.repository_generations.insert(key.project_id, 2);
+        app.repository_load_sequence = 2;
+        drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation: 2, open_cards: false, result: result.map(Box::new) }));
+        assert!(app.project_creation_source(key.project_id).is_none());
+        assert!(original.is_available(), "a failed read cannot silently mint B or revoke another operation's source");
+        let repository = app.sidebar_model.project(key.project_id).unwrap().repository.clone();
+        let retry = app.update(Message::Sidebar(SidebarAction::RefreshProject { project_id: key.project_id, repository }));
+        assert!(!original.is_available(), "explicit retry retires A before its worker can discover B");
+        let mut stream = iced::runtime::task::into_stream(retry).unwrap();
+        let mut installed = false;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::RepositoryLoaded { .. })) = action {
+                drop(app.update(message));
+                installed = true;
+            }
+        }
+        assert!(installed, "run the actual retry read task");
+        let replacement = app.project_creation_source(key.project_id).unwrap();
+        assert_ne!(original.id(), replacement.id());
+        drop(app.update(Message::Sidebar(SidebarAction::CreateProjectWorktree(old_target))));
+        assert!(app.worktree_dialog.is_none());
+        let fresh = sidebar::commands::ProjectCreationTarget::capture(&app.sidebar_model, key.project_id, None, false).unwrap();
+        drop(app.update(Message::Sidebar(SidebarAction::CreateProjectWorktree(fresh))));
+        assert!(app.worktree_dialog.is_some());
+        assert_eq!(std::fs::read_to_string(parent.join("original/file.txt")).unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "replacement\n");
+    }
+}
