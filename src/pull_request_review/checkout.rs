@@ -29,8 +29,8 @@ use crate::{
     github::GitHubService,
     repository::{
         CommandSpec, ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, LocalRefRecord,
-        PrCheckoutDisposition, PrCheckoutTracking, ProcessExecutor, RemoteRecord, SystemProcessExecutor,
-        ValidatedBranchName, VerifiedPrCheckout, WorktreeRecord,
+        PrCheckoutDisposition, PrCheckoutTracking, ProcessExecutor, RemoteRecord,
+        SystemProcessExecutor, ValidatedBranchName, VerifiedPrCheckout, WorktreeRecord,
     },
 };
 use std::path::{Path, PathBuf};
@@ -56,7 +56,11 @@ pub fn verified_existing_path(
     receipt: &VerifiedPrCheckout,
 ) -> Result<PathBuf, String> {
     let request = plan.request();
-    let expected_local_head = if matches!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal | PrCheckoutDisposition::RepairTrackingPreservingLocal) {
+    let expected_local_head = if matches!(
+        plan.disposition(),
+        PrCheckoutDisposition::OpenPreservingLocal
+            | PrCheckoutDisposition::RepairTrackingPreservingLocal
+    ) {
         plan.local_head()
     } else {
         &request.expected_head
@@ -177,7 +181,9 @@ pub fn prepare(
     )?;
     if let Some(request) = &prepared.existing_request {
         let reconciliation = prepare_existing_confirmation(
-            &RepositoryService::system("git"), request, cancellation,
+            &RepositoryService::system("git"),
+            request,
+            cancellation,
         )?;
         prepared.notice = format!("{} {}", prepared.notice, reconciliation.notice());
         prepared.reconciliation = Some(reconciliation);

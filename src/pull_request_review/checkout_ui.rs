@@ -69,12 +69,19 @@ impl State {
             })
     }
 
-    fn existing_checkout_plan_is_current(&self, target: &CheckoutTarget, plan: &ExistingPrCheckoutPlan) -> bool {
+    fn existing_checkout_plan_is_current(
+        &self,
+        target: &CheckoutTarget,
+        plan: &ExistingPrCheckoutPlan,
+    ) -> bool {
         self.existing_checkout_target_is_current(target)
             && plan.request().expected_head == target.head
             && plan.request().repository == target.repository
             && plan.request().head_branch.as_str() == target.head_ref_name
-            && self.target.as_ref().and_then(|review| review.pull_request.head_repository_key())
+            && self
+                .target
+                .as_ref()
+                .and_then(|review| review.pull_request.head_repository_key())
                 .is_some_and(|source| source.same_repository(&plan.request().head_repository))
     }
 
@@ -88,7 +95,10 @@ impl State {
             return;
         }
         if !self.existing_checkout_plan_is_current(&target, &plan) {
-            self.notice = Some("The PR branch, source or head changed. Refresh the review before checking it out.".into());
+            self.notice = Some(
+                "The PR branch, source or head changed. Refresh the review before checking it out."
+                    .into(),
+            );
             return;
         }
         self.existing_checkout.reset();
@@ -224,7 +234,10 @@ impl State {
             .into(),
         ];
         if !current {
-            rows.push(design::caption("The PR branch, source or head changed. Prepare checkout again.").into());
+            rows.push(
+                design::caption("The PR branch, source or head changed. Prepare checkout again.")
+                    .into(),
+            );
         }
         if let Some(error) = &self.existing_checkout.error {
             rows.push(design::caption(error).into());
@@ -247,7 +260,9 @@ impl State {
             } else {
                 match plan.disposition() {
                     PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
-                    PrCheckoutDisposition::RepairTrackingPreservingLocal => "Configure upstream and open local work",
+                    PrCheckoutDisposition::RepairTrackingPreservingLocal => {
+                        "Configure upstream and open local work"
+                    }
                     PrCheckoutDisposition::AlreadyCurrent => "Verify existing checkout",
                     PrCheckoutDisposition::FastForward => "Update checkout",
                     PrCheckoutDisposition::RepairTracking => "Set PR upstream",
@@ -514,10 +529,23 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         let remote = directory.path().join("remote.git");
-        git(directory.path(), &["init", "--bare", remote.to_str().unwrap()]);
-        git(directory.path(), &["init", "--initial-branch=main", repository.to_str().unwrap()]);
+        git(
+            directory.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            directory.path(),
+            &[
+                "init",
+                "--initial-branch=main",
+                repository.to_str().unwrap(),
+            ],
+        );
         git(&repository, &["config", "user.name", "Fixture"]);
-        git(&repository, &["config", "user.email", "fixture@example.invalid"]);
+        git(
+            &repository,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
         std::fs::write(repository.join("README"), "Reviewed content\n").unwrap();
         git(&repository, &["add", "README"]);
         git(&repository, &["commit", "-m", "Reviewed fixture"]);
@@ -525,10 +553,23 @@ mod tests {
         git(&repository, &["checkout", "-b", "feature"]);
         let url = "https://fixture.invalid/owner/repo.git";
         git(&repository, &["remote", "add", "origin", url]);
-        git(&repository, &["config", &format!("url.{}.insteadOf", remote.display()), url]);
-        git(&repository, &["push", "--set-upstream", "origin", "feature"]);
+        git(
+            &repository,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                url,
+            ],
+        );
+        git(
+            &repository,
+            &["push", "--set-upstream", "origin", "feature"],
+        );
         if repair_tracking {
-            git(&repository, &["config", "--remove-section", "branch.feature"]);
+            git(
+                &repository,
+                &["config", "--remove-section", "branch.feature"],
+            );
         }
         std::fs::write(repository.join("README"), "A committed local fix\n").unwrap();
         git(&repository, &["add", "README"]);
@@ -542,38 +583,71 @@ mod tests {
         let index = std::fs::read(repository.join(".git/index")).unwrap();
         let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
         let request = ExistingPrCheckoutRequest {
-            repository: repository.clone(), worktree: repository.clone(),
+            repository: repository.clone(),
+            worktree: repository.clone(),
             branch: ValidatedBranchName::parse("feature").unwrap(),
-            head_repository: key.clone(), head_branch: ValidatedBranchName::parse("feature").unwrap(),
-            expected_head: reviewed.clone(), remote: "origin".into(), tracking: PrCheckoutTracking::RemoteBranch,
+            head_repository: key.clone(),
+            head_branch: ValidatedBranchName::parse("feature").unwrap(),
+            expected_head: reviewed.clone(),
+            remote: "origin".into(),
+            tracking: PrCheckoutTracking::RemoteBranch,
         };
         let service = RepositoryService::system("git");
         let cancel = CancellationToken::new();
-        assert!(service.prepare_existing_pr_checkout(&request, &cancel).is_err());
+        assert!(
+            service
+                .prepare_existing_pr_checkout(&request, &cancel)
+                .is_err()
+        );
         let plan = checkout::prepare_existing_confirmation(&service, &request, &cancel).unwrap();
-        let disposition = if repair_tracking { PrCheckoutDisposition::RepairTrackingPreservingLocal } else { PrCheckoutDisposition::OpenPreservingLocal };
+        let disposition = if repair_tracking {
+            PrCheckoutDisposition::RepairTrackingPreservingLocal
+        } else {
+            PrCheckoutDisposition::OpenPreservingLocal
+        };
         assert_eq!(plan.disposition(), disposition);
         assert_eq!(plan.local_head(), &local);
-        let target = CheckoutTarget { repository: repository.clone(), number: 7, head: reviewed.clone(),
-            pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()), head_ref_name: "feature".into() };
+        let target = CheckoutTarget {
+            repository: repository.clone(),
+            number: 7,
+            head: reviewed.clone(),
+            pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()),
+            head_ref_name: "feature".into(),
+        };
         let pr: PullRequest = serde_json::from_value(serde_json::json!({
             "number":7,"title":"Fixture","state":"OPEN","headRefName":"feature","headRefOid":reviewed.as_str(),
             "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
         })).unwrap();
-        let mut state = State::new(Arc::new(crate::github::GitHubService::system("gh")), RepositoryService::system("git"));
-        state.target = Some(ReviewTarget { repository:key, worktree:repository.clone(), pull_request:Arc::new(pr) });
+        let mut state = State::new(
+            Arc::new(crate::github::GitHubService::system("gh")),
+            RepositoryService::system("git"),
+        );
+        state.target = Some(ReviewTarget {
+            repository: key,
+            worktree: repository.clone(),
+            pull_request: Arc::new(pr),
+        });
         state.range = Some(crate::repository::PullRequestRange {
-            number:7, base_branch:ValidatedBranchName::parse("main").unwrap(),
-            head_mirror:ValidatedRefName::parse("refs/cagents/fixture/head").unwrap(),
-            base_mirror:ValidatedRefName::parse("refs/cagents/fixture/base").unwrap(),
-            head:reviewed.clone(), base_tip:reviewed.clone(), merge_base:reviewed,
+            number: 7,
+            base_branch: ValidatedBranchName::parse("main").unwrap(),
+            head_mirror: ValidatedRefName::parse("refs/cagents/fixture/head").unwrap(),
+            base_mirror: ValidatedRefName::parse("refs/cagents/fixture/base").unwrap(),
+            head: reviewed.clone(),
+            base_tip: reviewed.clone(),
+            merge_base: reviewed,
         });
         state.load = LoadState::Ready;
         state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into());
-        assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config,
-            "offering the explicit upstream repair does not authorize configuration writes");
+        assert_eq!(
+            std::fs::read(repository.join(".git/config")).unwrap(),
+            config,
+            "offering the explicit upstream repair does not authorize configuration writes"
+        );
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
-        assert!(state.take_effects().is_empty(), "preparing or opening before confirmation grants no navigation");
+        assert!(
+            state.take_effects().is_empty(),
+            "preparing or opening before confirmation grants no navigation"
+        );
         let original_pr = Arc::clone(&state.target.as_ref().unwrap().pull_request);
         for source_change in [false, true] {
             let current = Arc::make_mut(&mut state.target.as_mut().unwrap().pull_request);
@@ -583,47 +657,95 @@ mod tests {
                 current.head_ref_name = "renamed-branch".into();
             }
             drop(state.update(super::super::Action::ExistingCheckout(Action::Confirm)));
-            assert!(!state.existing_checkout.busy(), "known branch/source changes cannot authorize an old plan at the same OID");
+            assert!(
+                !state.existing_checkout.busy(),
+                "known branch/source changes cannot authorize an old plan at the same OID"
+            );
             state.target.as_mut().unwrap().pull_request = Arc::clone(&original_pr);
         }
         let task = state.update(super::super::Action::ExistingCheckout(Action::Confirm));
-        let reply = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let mut stream = iced::runtime::task::into_stream(task).unwrap();
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(action @ super::super::Action::ExistingCheckout(Action::Finished { .. })) = action { return action; }
-            }
-            panic!("confirmation produced no receipt");
-        });
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(
+                        action @ super::super::Action::ExistingCheckout(Action::Finished { .. }),
+                    ) = action
+                    {
+                        return action;
+                    }
+                }
+                panic!("confirmation produced no receipt");
+            });
         drop(state.update(reply));
         let receipt = state.existing_checkout.completed.as_ref().unwrap();
         assert_eq!(receipt.head(), &local);
         assert_eq!(receipt.disposition(), disposition);
         let mut writer_request = request;
         writer_request.expected_head = local.clone();
-        let writer_plan = service.prepare_existing_pr_checkout(&writer_request, &cancel).unwrap();
+        let writer_plan = service
+            .prepare_existing_pr_checkout(&writer_request, &cancel)
+            .unwrap();
         let mut writer_target = target;
         writer_target.head = local.clone();
-        assert!(checkout::verified_existing_path(&writer_target, &writer_plan, receipt).is_err(),
-            "a preserve-local receipt cannot masquerade as a strict writer receipt even with the same head");
+        assert!(
+            checkout::verified_existing_path(&writer_target, &writer_plan, receipt).is_err(),
+            "a preserve-local receipt cannot masquerade as a strict writer receipt even with the same head"
+        );
         assert!(state.take_effects().is_empty());
-        Arc::make_mut(&mut state.target.as_mut().unwrap().pull_request).head_ref_name = "renamed-branch".into();
+        Arc::make_mut(&mut state.target.as_mut().unwrap().pull_request).head_ref_name =
+            "renamed-branch".into();
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
-        assert!(state.take_effects().is_empty(), "a verified receipt cannot override a newly observed PR branch identity");
+        assert!(
+            state.take_effects().is_empty(),
+            "a verified receipt cannot override a newly observed PR branch identity"
+        );
         state.target.as_mut().unwrap().pull_request = original_pr;
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
-        assert_eq!(state.take_effects(), vec![Effect::OpenCheckout(repository.canonicalize().unwrap())]);
+        assert_eq!(
+            state.take_effects(),
+            vec![Effect::OpenCheckout(repository.canonicalize().unwrap())]
+        );
         assert_eq!(git(&repository, &["rev-parse", "HEAD"]), local.as_str());
         if repair_tracking {
-            assert_eq!(git(&repository, &["config", "--local", "--get", "branch.feature.remote"]), "origin");
-            assert_eq!(git(&repository, &["config", "--local", "--get", "branch.feature.merge"]), "refs/heads/feature");
+            assert_eq!(
+                git(
+                    &repository,
+                    &["config", "--local", "--get", "branch.feature.remote"]
+                ),
+                "origin"
+            );
+            assert_eq!(
+                git(
+                    &repository,
+                    &["config", "--local", "--get", "branch.feature.merge"]
+                ),
+                "refs/heads/feature"
+            );
             let after = git(&repository, &["config", "--local", "--list"]);
-            let unrelated = after.lines().filter(|line| !line.starts_with("branch.feature.remote=") && !line.starts_with("branch.feature.merge=")).collect::<Vec<_>>().join("\n");
+            let unrelated = after
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("branch.feature.remote=")
+                        && !line.starts_with("branch.feature.merge=")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             assert_eq!(unrelated, config_values);
         } else {
-            assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config);
+            assert_eq!(
+                std::fs::read(repository.join(".git/config")).unwrap(),
+                config
+            );
         }
         assert_eq!(std::fs::read(repository.join(".git/index")).unwrap(), index);
-        assert_eq!(std::fs::read_to_string(repository.join("README")).unwrap(), "Unstaged local work\n");
+        assert_eq!(
+            std::fs::read_to_string(repository.join("README")).unwrap(),
+            "Unstaged local work\n"
+        );
     }
 
     #[test]

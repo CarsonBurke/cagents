@@ -22,9 +22,15 @@ impl ProcessExecutor for NativeExecutor {
             interceptor(command);
         }
         if command.arguments.iter().any(|argument| argument == "fetch") {
-            if let Some(failure) = self.fetch_failure.lock().unwrap().take() { return failure; }
+            if let Some(failure) = self.fetch_failure.lock().unwrap().take() {
+                return failure;
+            }
         }
-        let inherited_count = command.environment.get(OsStr::new("GIT_CONFIG_COUNT")).cloned().unwrap_or_else(|| "0".into());
+        let inherited_count = command
+            .environment
+            .get(OsStr::new("GIT_CONFIG_COUNT"))
+            .cloned()
+            .unwrap_or_else(|| "0".into());
         let command = command
             .clone()
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1022,29 +1028,60 @@ fn explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch
     let index = fs::read(fixture.root.join(".git/index")).unwrap();
     let config = fs::read(fixture.root.join(".git/config")).unwrap();
     let request = fixture.request(fixture.original.clone());
-    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).is_err());
-    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap();
-    assert_eq!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+            .is_err()
+    );
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default())
+        .unwrap();
+    assert_eq!(
+        plan.disposition(),
+        PrCheckoutDisposition::OpenPreservingLocal
+    );
     assert_eq!(plan.local_head().as_str(), local);
     assert_eq!(plan.request().expected_head, fixture.original);
     assert!(plan.notice().contains(&local));
     assert!(plan.notice().contains(fixture.original.as_str()));
     fixture.intercept(|command| {
-        assert!(!command.arguments.iter().any(|arg| arg == "fetch" || arg == "--add" || arg == "read-tree"));
+        assert!(
+            !command
+                .arguments
+                .iter()
+                .any(|arg| arg == "fetch" || arg == "--add" || arg == "read-tree")
+        );
         if command.arguments.iter().any(|arg| arg == "update-ref") {
-            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_MODE")), Some(&OsString::from("probe")));
+            assert_eq!(
+                command.environment.get(OsStr::new("CAGENTS_PR_MODE")),
+                Some(&OsString::from("probe"))
+            );
         }
     });
     let verified = fixture.apply(&plan).unwrap();
-    assert_eq!(verified.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+    assert_eq!(
+        verified.disposition(),
+        PrCheckoutDisposition::OpenPreservingLocal
+    );
     assert_eq!(verified.head(), plan.local_head());
     assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
     assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), local);
     assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), index);
     assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), config);
-    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"staged local\n");
-    assert_eq!(fs::read(fixture.root.join("other")).unwrap(), b"unstaged local\n");
-    assert_eq!(fs::read(fixture.root.join("untracked")).unwrap(), b"untracked local\n");
+    assert_eq!(
+        fs::read(fixture.root.join("file")).unwrap(),
+        b"staged local\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("other")).unwrap(),
+        b"unstaged local\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("untracked")).unwrap(),
+        b"untracked local\n"
+    );
 }
 
 #[test]
@@ -1053,16 +1090,33 @@ fn explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_ref
     fs::write(fixture.root.join("file"), "local divergent commit\n").unwrap();
     run_git(&fixture.root, &["commit", "-qam", "local divergence"]);
     let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
-    let reviewed = fixture.advance(|root| fs::write(root.join("file"), "PR divergent commit\n").unwrap());
+    let reviewed =
+        fixture.advance(|root| fs::write(root.join("file"), "PR divergent commit\n").unwrap());
     run_git(&fixture.root, &["fetch", "origin"]);
     let request = fixture.request(reviewed.clone());
-    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).unwrap_err().detail.contains("diverged"));
-    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap();
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+            .unwrap_err()
+            .detail
+            .contains("diverged")
+    );
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default())
+        .unwrap();
     let verified = fixture.apply(&plan).unwrap();
     assert_eq!(verified.head().as_str(), local);
     assert_ne!(verified.head(), &reviewed);
-    assert_eq!(verified.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
-    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"local divergent commit\n");
+    assert_eq!(
+        verified.disposition(),
+        PrCheckoutDisposition::OpenPreservingLocal
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("file")).unwrap(),
+        b"local divergent commit\n"
+    );
 }
 
 #[test]
@@ -1070,21 +1124,47 @@ fn preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation
     let missing = Fixture::new(false);
     let request = missing.request(missing.original.clone());
     let config = fs::read(missing.root.join(".git/config")).unwrap();
-    assert!(missing.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).unwrap_err().detail.contains("no PR upstream"));
+    assert!(
+        missing
+            .service
+            .prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default())
+            .unwrap_err()
+            .detail
+            .contains("no PR upstream")
+    );
     assert_eq!(fs::read(missing.root.join(".git/config")).unwrap(), config);
     let fixture = Fixture::new(true);
-    let plan = fixture.service.prepare_existing_pr_checkout_preserving_local(&fixture.request(fixture.original.clone()), &CancellationToken::default()).unwrap();
-    run_git(&fixture.root, &["config", "branch.feature.merge", "refs/heads/different"]);
-    assert_eq!(fixture.apply(&plan).unwrap_err().kind, PrCheckoutFailureKind::Refused);
-    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.merge"]), "refs/heads/different");
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_preserving_local(
+            &fixture.request(fixture.original.clone()),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    run_git(
+        &fixture.root,
+        &["config", "branch.feature.merge", "refs/heads/different"],
+    );
+    assert_eq!(
+        fixture.apply(&plan).unwrap_err().kind,
+        PrCheckoutFailureKind::Refused
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "branch.feature.merge"]),
+        "refs/heads/different"
+    );
 }
-
 
 #[derive(Clone)]
 struct PrivateFetchLogSink(Arc<Mutex<Vec<u8>>>);
 impl std::io::Write for PrivateFetchLogSink {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -1092,52 +1172,126 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
     const CHILD: &str = "CAGENTS_PRIVATE_FETCH_LOG_TEST";
     if std::env::var_os(CHILD).is_none() {
         let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", "repository::pr_checkout::tests::private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr", "--nocapture"]).env(CHILD, "1").output().unwrap();
-        assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     for timeout in [false, true] {
         let fixture = Fixture::new(false);
         let token = "synthetic-private-transport-token";
-        run_git(&fixture.root, &["config", "remote.origin.url", &format!("https://{token}@fixture.invalid/owner/repo.git")]);
+        run_git(
+            &fixture.root,
+            &[
+                "config",
+                "remote.origin.url",
+                &format!("https://{token}@fixture.invalid/owner/repo.git"),
+            ],
+        );
         let request = fixture.request(fixture.original.clone());
         let plan = fixture.prepare(&request);
-        let stderr = format!("fatal: transport failed for https://{token}@fixture.invalid/owner/repo.git\n").into_bytes();
+        let stderr =
+            format!("fatal: transport failed for https://{token}@fixture.invalid/owner/repo.git\n")
+                .into_bytes();
         *fixture.executor.fetch_failure.lock().unwrap() = Some(if timeout {
-            Err(ProcessFailure { kind: ProcessFailureKind::TimedOut, program: "git".into(), exit_code: None, signal: Some(15), stdout: vec![], stderr: stderr.clone(), message: "synthetic private timeout".into(), started: true })
-        } else { Ok(ProcessOutput { exit_code: Some(128), signal: None, success: false, stdout: vec![], stderr: stderr.clone() }) });
+            Err(ProcessFailure {
+                kind: ProcessFailureKind::TimedOut,
+                program: "git".into(),
+                exit_code: None,
+                signal: Some(15),
+                stdout: vec![],
+                stderr: stderr.clone(),
+                message: "synthetic private timeout".into(),
+                started: true,
+            })
+        } else {
+            Ok(ProcessOutput {
+                exit_code: Some(128),
+                signal: None,
+                success: false,
+                stdout: vec![],
+                stderr: stderr.clone(),
+            })
+        });
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_hook = observed.clone();
-        fixture.intercept(move |command| if command.arguments.iter().any(|argument| argument == "fetch") {
-            assert!(!command.arguments.iter().any(|argument| argument.to_string_lossy().contains(token)));
-            assert!(command.arguments.iter().any(|argument| argument.to_string_lossy().starts_with("cagents-pr-fetch-")));
-            assert!(command.environment.iter().any(|(key, value)| key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_") && value.to_string_lossy().contains(token)));
-            observed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture.intercept(move |command| {
+            if command.arguments.iter().any(|argument| argument == "fetch") {
+                assert!(
+                    !command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument.to_string_lossy().contains(token))
+                );
+                assert!(
+                    command.arguments.iter().any(|argument| argument
+                        .to_string_lossy()
+                        .starts_with("cagents-pr-fetch-"))
+                );
+                assert!(command.environment.iter().any(|(key, value)| {
+                    key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_")
+                        && value.to_string_lossy().contains(token)
+                }));
+                observed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         });
-        let sink = Arc::new(Mutex::new(Vec::new())); let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt().with_writer(move || PrivateFetchLogSink(writer.clone())).with_ansi(false).with_max_level(tracing::Level::TRACE).finish();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || PrivateFetchLogSink(writer.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
         let failure = tracing::subscriber::with_default(subscriber, || {
             tracing::warn!("private_fetch_capture_ready");
             fixture.apply(&plan).unwrap_err()
         });
         let logs = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("private_fetch_capture_ready"));
-        assert!(!logs.contains(token), "transport secrets must not reach tracing");
+        assert!(
+            !logs.contains(token),
+            "transport secrets must not reach tracing"
+        );
         assert!(!failure.detail.contains(token));
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
-        let private = fs::read_dir(fixture.root.join(".git")).unwrap().map(Result::unwrap).find(|entry| entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")).unwrap().path();
+        let private = fs::read_dir(fixture.root.join(".git"))
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cagents-pr-checkout-")
+            })
+            .unwrap()
+            .path();
         assert_eq!(fs::metadata(&private).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::read(private.join("fetch.stderr")).unwrap(), stderr);
-        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+        assert_eq!(
+            git_text(&fixture.root, &["rev-parse", "HEAD"]),
+            fixture.original.as_str()
+        );
     }
 }
-
 
 #[test]
 fn captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once() {
     let fixture = Fixture::new(false);
     let missing = fixture.temporary.path().join("must-not-be-used");
-    run_git(&fixture.root, &["config", &format!("url.file://{}/.insteadOf", missing.display()), &format!("file://{}/", fixture.bare.display())]);
-    let verified = fixture.apply(&fixture.prepare(&fixture.request(fixture.original.clone()))).unwrap();
+    run_git(
+        &fixture.root,
+        &[
+            "config",
+            &format!("url.file://{}/.insteadOf", missing.display()),
+            &format!("file://{}/", fixture.bare.display()),
+        ],
+    );
+    let verified = fixture
+        .apply(&fixture.prepare(&fixture.request(fixture.original.clone())))
+        .unwrap();
     assert_eq!(verified.head(), &fixture.original);
     assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
     assert!(!missing.exists());
@@ -1158,33 +1312,97 @@ fn explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs() {
     let refs = run_git(&fixture.root, &["show-ref"]).stdout;
     let original_config = fs::read(fixture.root.join(".git/config")).unwrap();
     let request = fixture.request(fixture.original.clone());
-    assert!(fixture.service.prepare_existing_pr_checkout(&request, &CancellationToken::default()).is_err());
-    assert!(fixture.service.prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default()).is_err());
-    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
-    assert_eq!(plan.disposition(), PrCheckoutDisposition::RepairTrackingPreservingLocal);
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout_preserving_local(&request, &CancellationToken::default())
+            .is_err()
+    );
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+            &request,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        plan.disposition(),
+        PrCheckoutDisposition::RepairTrackingPreservingLocal
+    );
     assert_eq!(plan.local_head().as_str(), local);
-    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), original_config, "preparing the explicit choice must not configure tracking");
+    assert_eq!(
+        fs::read(fixture.root.join(".git/config")).unwrap(),
+        original_config,
+        "preparing the explicit choice must not configure tracking"
+    );
     fixture.intercept(|command| {
-        assert!(!command.arguments.iter().any(|argument| argument == "fetch" || argument == "read-tree"));
-        if command.arguments.iter().any(|argument| argument == "update-ref") {
-            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_MODE")), Some(&OsString::from("probe")));
-            assert_eq!(command.environment.get(OsStr::new("CAGENTS_PR_UPDATE_REMOTE")), Some(&OsString::from("0")));
+        assert!(
+            !command
+                .arguments
+                .iter()
+                .any(|argument| argument == "fetch" || argument == "read-tree")
+        );
+        if command
+            .arguments
+            .iter()
+            .any(|argument| argument == "update-ref")
+        {
+            assert_eq!(
+                command.environment.get(OsStr::new("CAGENTS_PR_MODE")),
+                Some(&OsString::from("probe"))
+            );
+            assert_eq!(
+                command
+                    .environment
+                    .get(OsStr::new("CAGENTS_PR_UPDATE_REMOTE")),
+                Some(&OsString::from("0"))
+            );
         }
     });
     let verified = fixture.apply(&plan).unwrap();
-    assert_eq!(verified.disposition(), PrCheckoutDisposition::RepairTrackingPreservingLocal);
+    assert_eq!(
+        verified.disposition(),
+        PrCheckoutDisposition::RepairTrackingPreservingLocal
+    );
     assert_eq!(verified.head().as_str(), local);
     assert_eq!(verified.upstream(), Some("refs/remotes/origin/feature"));
     assert_eq!(run_git(&fixture.root, &["show-ref"]).stdout, refs);
     assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), index);
-    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"staged local\n");
-    assert_eq!(fs::read(fixture.root.join("other")).unwrap(), b"unstaged local\n");
-    assert_eq!(fs::read(fixture.root.join("untracked")).unwrap(), b"untracked local\n");
-    assert_eq!(git_text(&fixture.root, &["config", "fixture.unrelated"]), "preserved");
-    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.remote"]), "origin");
-    assert_eq!(git_text(&fixture.root, &["config", "branch.feature.merge"]), "refs/heads/feature");
+    assert_eq!(
+        fs::read(fixture.root.join("file")).unwrap(),
+        b"staged local\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("other")).unwrap(),
+        b"unstaged local\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("untracked")).unwrap(),
+        b"untracked local\n"
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "fixture.unrelated"]),
+        "preserved"
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "branch.feature.remote"]),
+        "origin"
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "branch.feature.merge"]),
+        "refs/heads/feature"
+    );
     run_git(&fixture.root, &["push"]);
-    assert_eq!(git_text(&fixture.bare, &["rev-parse", "refs/heads/feature"]), local);
+    assert_eq!(
+        git_text(&fixture.bare, &["rev-parse", "refs/heads/feature"]),
+        local
+    );
 }
 
 #[test]
@@ -1196,20 +1414,55 @@ fn tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking
     let reviewed = fixture.advance(|root| fs::write(root.join("file"), "PR divergent\n").unwrap());
     let request = fixture.request(reviewed.clone());
     let configuration = fs::read(fixture.root.join(".git/config")).unwrap();
-    assert!(fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap_err().detail.contains("Fetch and review"));
-    assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), configuration);
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+                &request,
+                &CancellationToken::default()
+            )
+            .unwrap_err()
+            .detail
+            .contains("Fetch and review")
+    );
+    assert_eq!(
+        fs::read(fixture.root.join(".git/config")).unwrap(),
+        configuration
+    );
     run_git(&fixture.root, &["fetch", "origin"]);
-    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+            &request,
+            &CancellationToken::default(),
+        )
+        .unwrap();
     let refs = run_git(&fixture.root, &["show-ref"]).stdout;
     let verified = fixture.apply(&plan).unwrap();
     assert_eq!(verified.head().as_str(), local);
     assert_eq!(run_git(&fixture.root, &["show-ref"]).stdout, refs);
-    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"local divergent\n");
+    assert_eq!(
+        fs::read(fixture.root.join("file")).unwrap(),
+        b"local divergent\n"
+    );
 
     let missing = Fixture::new(false);
-    run_git(&missing.root, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+    run_git(
+        &missing.root,
+        &["update-ref", "-d", "refs/remotes/origin/feature"],
+    );
     let config = fs::read(missing.root.join(".git/config")).unwrap();
-    assert!(missing.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&missing.request(missing.original.clone()), &CancellationToken::default()).unwrap_err().detail.contains("Fetch and review"));
+    assert!(
+        missing
+            .service
+            .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+                &missing.request(missing.original.clone()),
+                &CancellationToken::default()
+            )
+            .unwrap_err()
+            .detail
+            .contains("Fetch and review")
+    );
     assert_eq!(fs::read(missing.root.join(".git/config")).unwrap(), config);
 }
 
@@ -1217,12 +1470,42 @@ fn tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking
 fn tracking_only_preserve_requires_absent_pair_and_fresh_confirmation() {
     let fixture = Fixture::new(false);
     let request = fixture.request(fixture.original.clone());
-    let plan = fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).unwrap();
-    run_git(&fixture.root, &["config", "branch.feature.merge", "refs/heads/different"]);
+    let plan = fixture
+        .service
+        .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+            &request,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    run_git(
+        &fixture.root,
+        &["config", "branch.feature.merge", "refs/heads/different"],
+    );
     let config = fs::read(fixture.root.join(".git/config")).unwrap();
-    assert!(fixture.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&request, &CancellationToken::default()).is_err());
-    assert_eq!(fixture.apply(&plan).unwrap_err().kind, PrCheckoutFailureKind::Refused);
+    assert!(
+        fixture
+            .service
+            .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+                &request,
+                &CancellationToken::default()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        fixture.apply(&plan).unwrap_err().kind,
+        PrCheckoutFailureKind::Refused
+    );
     assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), config);
     let configured = Fixture::new(true);
-    assert!(configured.service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(&configured.request(configured.original.clone()), &CancellationToken::default()).unwrap_err().detail.contains("wholly absent"));
+    assert!(
+        configured
+            .service
+            .prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(
+                &configured.request(configured.original.clone()),
+                &CancellationToken::default()
+            )
+            .unwrap_err()
+            .detail
+            .contains("wholly absent")
+    );
 }

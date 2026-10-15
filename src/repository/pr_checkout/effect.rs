@@ -501,31 +501,55 @@ fn settle_descendants(observer: &fs::File) -> bool {
 }
 
 fn fetch_captured_head<E: ProcessExecutor>(
-    service: &RepositoryService<E>, plan: &ExistingPrCheckoutPlan,
-    pinned: &PinnedDirectories, private: &Path, private_ref: &str,
-    lease: &Arc<fs::File>, cancellation: &CancellationToken,
+    service: &RepositoryService<E>,
+    plan: &ExistingPrCheckoutPlan,
+    pinned: &PinnedDirectories,
+    private: &Path,
+    private_ref: &str,
+    lease: &Arc<fs::File>,
+    cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let count = match std::env::var_os("GIT_CONFIG_COUNT") {
         None => 0,
-        Some(value) => value.to_str().and_then(|value| value.parse::<u32>().ok())
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
             .ok_or("Git environment configuration count is invalid")?,
     };
-    if count >= i32::MAX as u32 { return Err("Git environment configuration count cannot be extended safely".into()); }
+    if count >= i32::MAX as u32 {
+        return Err("Git environment configuration count cannot be extended safely".into());
+    }
     let alias = format!("cagents-pr-fetch-{}", Uuid::new_v4().simple());
-    let endpoint = plan.remote.fetch_url.as_ref().ok_or("PR remote has no fetch URL")?;
+    let endpoint = plan
+        .remote
+        .fetch_url
+        .as_ref()
+        .ok_or("PR remote has no fetch URL")?;
     // A synthetic remote carries the captured RAW endpoint in environment
     // configuration. Git applies its usual URL rewrite once, while neither a
     // credential-bearing URL nor a rewritten secret enters process argv.
-    let fetch = pinned.command(service, false)?.args([
-        OsString::from("fetch"), "--quiet".into(), "--no-tags".into(),
-        "--no-recurse-submodules".into(), "--no-write-fetch-head".into(),
-        "--refmap=".into(), "--end-of-options".into(), alias.clone().into(),
-        format!("+{}:{private_ref}", plan.request.head_branch.full_ref()).into(),
-    ]).env("GIT_CONFIG_COUNT", (count + 1).to_string())
-      .env(format!("GIT_CONFIG_KEY_{count}"), format!("remote.{alias}.url"))
-      .env(format!("GIT_CONFIG_VALUE_{count}"), endpoint)
-      .env("GIT_NO_REPLACE_OBJECTS", "1")
-      .inherit_file(lease.clone()).map_err(|error| error.to_string())?;
+    let fetch = pinned
+        .command(service, false)?
+        .args([
+            OsString::from("fetch"),
+            "--quiet".into(),
+            "--no-tags".into(),
+            "--no-recurse-submodules".into(),
+            "--no-write-fetch-head".into(),
+            "--refmap=".into(),
+            "--end-of-options".into(),
+            alias.clone().into(),
+            format!("+{}:{private_ref}", plan.request.head_branch.full_ref()).into(),
+        ])
+        .env("GIT_CONFIG_COUNT", (count + 1).to_string())
+        .env(
+            format!("GIT_CONFIG_KEY_{count}"),
+            format!("remote.{alias}.url"),
+        )
+        .env(format!("GIT_CONFIG_VALUE_{count}"), endpoint)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .inherit_file(lease.clone())
+        .map_err(|error| error.to_string())?;
     // Generic repository failure logging includes both argv and stderr.
     // Transport stderr may repeat credentials even with a safe alias, so
     // capture it privately and return only typed status metadata to the UI.
@@ -533,12 +557,30 @@ fn fetch_captured_head<E: ProcessExecutor>(
     drop(fetch);
     let (stdout, stderr, detail) = match outcome {
         Ok(output) if output.success => return Ok(()),
-        Ok(output) => (output.stdout, output.stderr, format!("Fetching the reviewed PR head failed (status {:?}, signal {:?})", output.exit_code, output.signal)),
-        Err(failure) => (failure.stdout, failure.stderr, format!("Fetching the reviewed PR head failed ({:?}, status {:?}, signal {:?})", failure.kind, failure.exit_code, failure.signal)),
+        Ok(output) => (
+            output.stdout,
+            output.stderr,
+            format!(
+                "Fetching the reviewed PR head failed (status {:?}, signal {:?})",
+                output.exit_code, output.signal
+            ),
+        ),
+        Err(failure) => (
+            failure.stdout,
+            failure.stderr,
+            format!(
+                "Fetching the reviewed PR head failed ({:?}, status {:?}, signal {:?})",
+                failure.kind, failure.exit_code, failure.signal
+            ),
+        ),
     };
-    fs::write(private.join("fetch.stdout"), stdout).map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
-    fs::write(private.join("fetch.stderr"), stderr).map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
-    Err(format!("{detail}; transport diagnostics are retained in the private operation directory"))
+    fs::write(private.join("fetch.stdout"), stdout)
+        .map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
+    fs::write(private.join("fetch.stderr"), stderr)
+        .map_err(|_| "Private fetch diagnostics could not be retained".to_owned())?;
+    Err(format!(
+        "{detail}; transport diagnostics are retained in the private operation directory"
+    ))
 }
 
 pub(super) fn reconcile<E: ProcessExecutor>(
@@ -559,7 +601,15 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         disposition: plan.disposition,
         path: plan.path().to_owned(),
         branch: plan.request.branch.clone(),
-        head: if matches!(plan.disposition, PrCheckoutDisposition::OpenPreservingLocal | PrCheckoutDisposition::RepairTrackingPreservingLocal) { plan.current_head.clone() } else { plan.request.expected_head.clone() },
+        head: if matches!(
+            plan.disposition,
+            PrCheckoutDisposition::OpenPreservingLocal
+                | PrCheckoutDisposition::RepairTrackingPreservingLocal
+        ) {
+            plan.current_head.clone()
+        } else {
+            plan.request.expected_head.clone()
+        },
         upstream: (plan.request.tracking == PrCheckoutTracking::RemoteBranch).then(|| {
             format!(
                 "refs/remotes/{}/{}",
@@ -612,12 +662,23 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             true,
             cancellation,
         )?;
-        if matches!(plan.disposition, PrCheckoutDisposition::AlreadyCurrent | PrCheckoutDisposition::OpenPreservingLocal) {
+        if matches!(
+            plan.disposition,
+            PrCheckoutDisposition::AlreadyCurrent | PrCheckoutDisposition::OpenPreservingLocal
+        ) {
             return Ok(());
         }
         if plan.disposition == PrCheckoutDisposition::RepairTrackingPreservingLocal {
-            repair_tracking(service, plan, &pinned, private.path(), cancellation, &mut changed)?;
-            let current = service.recheck_existing_pr_checkout(plan, cancellation)
+            repair_tracking(
+                service,
+                plan,
+                &pinned,
+                private.path(),
+                cancellation,
+                &mut changed,
+            )?;
+            let current = service
+                .recheck_existing_pr_checkout(plan, cancellation)
                 .map_err(|error| error.to_string())?;
             if current.disposition != PrCheckoutDisposition::OpenPreservingLocal
                 || current.worktree != plan.worktree
@@ -630,11 +691,27 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             {
                 return Err("The local checkout changed during tracking-only repair; inspect the retained operation before opening".into());
             }
-            transaction(service, &current, &pinned, private.path(), &lease, true, cancellation)?;
+            transaction(
+                service,
+                &current,
+                &pinned,
+                private.path(),
+                &lease,
+                true,
+                cancellation,
+            )?;
             expected_final = current;
             return Ok(());
         }
-        fetch_captured_head(service, plan, &pinned, private.path(), &private_ref, &lease, cancellation)?;
+        fetch_captured_head(
+            service,
+            plan,
+            &pinned,
+            private.path(),
+            &private_ref,
+            &lease,
+            cancellation,
+        )?;
         let head = pinned.command(service, true)?.args([
             "rev-parse",
             "--verify",
@@ -806,8 +883,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     // The prior native proof may precede the last owned policy child's
     // effects. Re-read only after all inherited leases have truly retired,
     // including children that exited before the first observer flock.
-    let final_state =
-        service.recheck_existing_pr_checkout(plan, &CancellationToken::default());
+    let final_state = service.recheck_existing_pr_checkout(plan, &CancellationToken::default());
     if !matches!(&final_state, Ok(current) if current == &expected_final) {
         let detail = match final_state {
             Ok(_) => "The checkout changed after its last policy hook; refresh it before opening"

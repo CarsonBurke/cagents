@@ -3290,7 +3290,8 @@ fn load_review<E: crate::repository::ProcessExecutor>(
             .map(|metadata| metadata.updated_at.clone());
         if let Some(metadata) = initial.metadata {
             if !metadata_matches_context(&metadata, initial_context)
-                || metadata.number != target.pull_request.number {
+                || metadata.number != target.pull_request.number
+            {
                 return Err("The pull request identity changed while refreshing its metadata. Refresh to retry.".into());
             }
             // The lightweight query omits rollups and counts, but its current
@@ -3893,34 +3894,63 @@ pub(crate) mod tests {
     fn unchanged_diff_refresh_installs_current_branch_source_and_base_identity_without_git() {
         struct NoGit;
         impl crate::repository::ProcessExecutor for NoGit {
-            fn execute(&self, _: &crate::repository::CommandSpec, _: &CancellationToken)
-                -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure> {
+            fn execute(
+                &self,
+                _: &crate::repository::CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure>
+            {
                 panic!("metadata-only refresh must retain the loaded diff without Git work");
             }
         }
         let api = ScriptedApi::new();
-        let mut previous = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![remote_file("file.rs", true)]);
+        let mut previous = loaded(
+            vec![entry("file.rs", ChangeKind::Modified)],
+            vec![remote_file("file.rs", true)],
+        );
         previous.pull_request.additions = Some(17);
-        previous.pull_request.head_repository = Some(crate::github::GitHubHeadRepository { name:"old-fork".into() });
-        previous.pull_request.head_repository_owner = Some(crate::github::GitHubActor { login:"old-owner".into(), name:None, is_bot:false });
+        previous.pull_request.head_repository = Some(crate::github::GitHubHeadRepository {
+            name: "old-fork".into(),
+        });
+        previous.pull_request.head_repository_owner = Some(crate::github::GitHubActor {
+            login: "old-owner".into(),
+            name: None,
+            is_bot: false,
+        });
         let mut metadata = previous.pull_request.clone();
         metadata.title = "Fresh identity without new objects".into();
         metadata.head_ref_name = "renamed-feature".into();
-        metadata.head_repository = Some(crate::github::GitHubHeadRepository { name:"new-fork".into() });
-        metadata.head_repository_owner = Some(crate::github::GitHubActor { login:"new-owner".into(), name:None, is_bot:false });
+        metadata.head_repository = Some(crate::github::GitHubHeadRepository {
+            name: "new-fork".into(),
+        });
+        metadata.head_repository_owner = Some(crate::github::GitHubActor {
+            login: "new-owner".into(),
+            name: None,
+            is_bot: false,
+        });
         metadata.base_ref_name = "release".into();
         metadata.base_ref_oid = Some(previous.context.base_oid.clone());
         metadata.updated_at = "2026-10-15T00:00:00Z".into();
         metadata.additions = None; // Omitted by the lightweight query.
         *api.context.lock().unwrap() = Some(previous.context.clone());
         *api.page.lock().unwrap() = Some(crate::github::PullRequestFilePage {
-            files:previous.files.files.clone(), next_cursor:None,
-            viewer:previous.context.viewer.clone(), pull_request_id:previous.context.pull_request_id.clone(),
-            head_oid:previous.context.head_oid.clone(), base_oid:previous.context.base_oid.clone(),
+            files: previous.files.files.clone(),
+            next_cursor: None,
+            viewer: previous.context.viewer.clone(),
+            pull_request_id: previous.context.pull_request_id.clone(),
+            head_oid: previous.context.head_oid.clone(),
+            base_oid: previous.context.base_oid.clone(),
         });
         *api.refresh_metadata.lock().unwrap() = Some(metadata.clone());
         let git = RepositoryService::new("git", Arc::new(NoGit));
-        let refreshed = load_review(&api, &git, &target(1), Some(&previous), &CancellationToken::new()).unwrap();
+        let refreshed = load_review(
+            &api,
+            &git,
+            &target(1),
+            Some(&previous),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(refreshed.entries, previous.entries);
         assert_eq!(refreshed.range.basis(), previous.range.basis());
         assert_eq!(refreshed.range.base_branch.as_str(), "release");
@@ -3930,19 +3960,39 @@ pub(crate) mod tests {
         state.selected = Some(path("file.rs"));
         state.pages.offset = 37.0;
         state.refreshing = true;
-        drop(state.update(Action::Loaded { generation:state.generation, load:state.load_generation, result:Ok(refreshed) }));
+        drop(state.update(Action::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Ok(refreshed),
+        }));
         let current = &state.target.as_ref().unwrap().pull_request;
         assert_eq!(current.head_ref_name, "renamed-feature");
-        assert_eq!(current.head_repository_key(), metadata.head_repository_key());
+        assert_eq!(
+            current.head_repository_key(),
+            metadata.head_repository_key()
+        );
         assert_eq!(current.base_ref_name, "release");
-        assert_eq!(current.additions, Some(17), "unqueried display counts are retained");
+        assert_eq!(
+            current.additions,
+            Some(17),
+            "unqueried display counts are retained"
+        );
         assert_eq!(state.selected.as_ref(), Some(&path("file.rs")));
         assert_eq!(state.pages.offset, 37.0);
         assert!(!state.refreshing);
         metadata.head_ref_oid = "d".repeat(40);
         *api.refresh_metadata.lock().unwrap() = Some(metadata);
-        assert!(load_review(&api, &git, &target(1), Some(&previous), &CancellationToken::new()).is_err(),
-            "fresh metadata cannot contradict the unchanged authority snapshot");
+        assert!(
+            load_review(
+                &api,
+                &git,
+                &target(1),
+                Some(&previous),
+                &CancellationToken::new()
+            )
+            .is_err(),
+            "fresh metadata cannot contradict the unchanged authority snapshot"
+        );
     }
 
     #[tokio::test]

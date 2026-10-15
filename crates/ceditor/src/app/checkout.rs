@@ -4,8 +4,8 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, PrCheckoutDisposition, VerifiedPrCheckout, WorktreeInput, WorktreeOperationReport,
-        WorktreeOperationState,
+        CreateWorktreeRequest, PrCheckoutDisposition, VerifiedPrCheckout, WorktreeInput,
+        WorktreeOperationReport, WorktreeOperationState,
     },
 };
 
@@ -537,11 +537,15 @@ impl Editor {
                 } else {
                     match plan.disposition() {
                         PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
-                        PrCheckoutDisposition::RepairTrackingPreservingLocal => "Configure upstream and open local work",
+                        PrCheckoutDisposition::RepairTrackingPreservingLocal => {
+                            "Configure upstream and open local work"
+                        }
                         PrCheckoutDisposition::AlreadyCurrent => "Verify existing worktree",
                         PrCheckoutDisposition::FastForward => "Update existing worktree",
                         PrCheckoutDisposition::RepairTracking => "Set PR upstream",
-                        PrCheckoutDisposition::FastForwardAndRepair => "Update worktree and set PR upstream",
+                        PrCheckoutDisposition::FastForwardAndRepair => {
+                            "Update worktree and set PR upstream"
+                        }
                     }
                 })
                 .on_press_maybe(
