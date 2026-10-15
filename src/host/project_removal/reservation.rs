@@ -121,9 +121,14 @@ impl ReservedProject {
     }
     fn edit(&self, edit: &ModelEdit) -> bool {
         match edit {
-            ModelEdit::OpenProject { repository, .. }
-            | ModelEdit::ReopenProject { repository, .. }
-            | ModelEdit::CloseProject { repository }
+            ModelEdit::OpenProject { repository, checkout, primary_checkout, .. }
+            | ModelEdit::ReopenProject { repository, checkout, primary_checkout, .. } => {
+                *repository == self.project.repository
+                    || self.destination.as_ref() == Some(repository)
+                    || self.directory(repository)
+                    || checkout.iter().chain(primary_checkout.iter()).any(|root| self.directory(root))
+            }
+            ModelEdit::CloseProject { repository }
             | ModelEdit::ResetNavigation { repository }
             | ModelEdit::ReorderNavigation { repository, .. }
             | ModelEdit::CreateChannel { repository, .. } => {
@@ -520,4 +525,41 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
         _ => {}
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_foreign_project_cannot_change_reserved_checkout_metadata() {
+        let scope = ReservedProject {
+            project: ProjectInstance { registry: uuid::Uuid::new_v4(), repository: "/project/.git".into(), ordinal: 1 },
+            destination: Some("/located/.git".into()),
+            roots: vec!["/project".into(), "/located".into()],
+            protected: vec!["/project/foreign".into()],
+            channels: HashSet::new(), panes: HashSet::new(), sessions: HashSet::new(),
+            protected_sessions: HashSet::new(), protected_sources: Vec::new(), infer_directory: true,
+        };
+        for reopen in [false, true] {
+            for (checkout, primary, blocked) in [
+                (Some("/project/worktree"), None, true),
+                (None, Some("/located"), true),
+                (Some("/project/foreign"), None, false),
+                (Some("/unrelated"), None, false),
+                (None, None, false),
+            ] {
+                let repository = "/foreign/.git".into();
+                let checkout = checkout.map(PathBuf::from);
+                let primary_checkout = primary.map(PathBuf::from);
+                let edit = if reopen {
+                    ModelEdit::ReopenProject { repository, checkout, primary_checkout, name: "Foreign".into(), kind: crate::model::ProjectKind::Git }
+                } else {
+                    ModelEdit::OpenProject { repository, checkout, primary_checkout, name: "Foreign".into(), kind: crate::model::ProjectKind::Git }
+                };
+                assert_eq!(scope.edit(&edit), blocked, "{edit:?}");
+            }
+        }
+    }
 }
