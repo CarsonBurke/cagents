@@ -898,7 +898,7 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
-        let return_endpoint = stream.peer_addr().ok().and_then(|address| address.as_pathname().map(std::path::Path::to_path_buf));
+        let return_endpoint = stream.peer_addr().ok().and_then(|address| address.as_pathname().filter(|path| path.is_absolute()).map(std::path::Path::to_path_buf));
         stream
             .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -1569,6 +1569,9 @@ impl ClientHandle {
             Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return Err("The original Return retry is already in progress".into()),
         };
+        if self.source_binding().as_ref().is_some_and(|current| current != expected) {
+            return Err("The original Return owner changed before its retry; no retry was sent".into());
+        }
         let endpoint = self.inner.return_endpoint.as_ref().ok_or("The original authenticated Return endpoint is unavailable; no retry was sent")?;
         let deadline = Instant::now() + Duration::from_secs(40);
         let stream = crate::control::connect_control_socket(endpoint, Duration::from_secs(5)).map_err(|error| error.to_string())?;
