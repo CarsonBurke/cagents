@@ -464,6 +464,10 @@ fn conflict_blocks(text: &str) -> Vec<ConflictBlock> {
 
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
+    PasteCaptured {
+        target: Arc<RepositoryCommandTarget>,
+        text: Arc<String>,
+    },
     CapturedCommand {
         target: Arc<RepositoryCommandTarget>,
         action: Box<RepositoryAction>,
@@ -865,6 +869,7 @@ impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
             Self::CapturedCommand { action, .. } => action.card(),
+            Self::PasteCaptured { target, .. } => target.identity.card,
             Self::SelectDiffRow { identity, .. }
             | Self::OpenWorkingFileLocation { identity, .. } => identity.card,
             Self::EndDiffSelection { card }
@@ -2930,12 +2935,12 @@ impl RepositoryRuntime {
             }
             // `clipboard::read` yields nothing at all for an empty clipboard,
             // so there is no empty paste to guard against here.
-            ClipboardOp::Paste => iced::clipboard::read().and_then(move |text: String| {
-                cosmic::task::message(RepositoryAction::EditorAction {
-                    card,
-                    action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text))),
+            ClipboardOp::Paste => {
+                let target = Arc::new(self.command_target(card));
+                iced::clipboard::read().and_then(move |text: String| {
+                    cosmic::task::message(RepositoryAction::PasteCaptured { target: target.clone(), text: Arc::new(text) })
                 })
-            }),
+            },
             ClipboardOp::SelectAll => self.update(RepositoryAction::EditorAction {
                 card,
                 action: text_editor::Action::SelectAll,
@@ -5723,6 +5728,11 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::PasteCaptured { target, text } => {
+                let card = target.identity.card;
+                if text.is_empty() || self.command_target(card) != *target || self.editor_command_capabilities() & (1 << 4) == 0 { return Task::none(); }
+                self.update_inner(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Paste(text)) })
+            }
             RepositoryAction::CapturedCommand { target, action } => {
                 self.resolve_captured_command(&target, *action).map_or_else(Task::none, |action| self.update_inner(action))
             }
@@ -18916,6 +18926,31 @@ mod tests {
             drop(runtime.update(RepositoryAction::Redo { card }));
             assert_eq!(runtime.editor_text().as_deref(), Some(captured.as_str()));
             assert!(!runtime.is_dirty());
+        }
+    }
+
+    #[test]
+    fn asynchronous_clipboard_reply_keeps_the_admitted_document_and_native_selection() {
+        let card = CardId::new();
+        for replacement in 0..4 {
+            let mut runtime = RepositoryRuntime::word_selection_fixture(card);
+            let target = Arc::new(runtime.command_target(card));
+            // Admit the actual menu/registry paste path, then deliver its read
+            // result deterministically after another user action.
+            drop(runtime.update(RepositoryAction::Clipboard { card, op: ClipboardOp::Paste }));
+            match replacement {
+                1 => { drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::SelectLine })); }
+                2 => { runtime = RepositoryRuntime::dirty_fixture_at(card, "replacement.md".into()); }
+                3 => { drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) })); }
+                _ => {}
+            }
+            let before = runtime.editor_text().unwrap();
+            drop(runtime.update(RepositoryAction::PasteCaptured { target, text: Arc::new("PASTED".into()) }));
+            if replacement == 0 {
+                assert_eq!(runtime.editor_text().as_deref(), Some("play the PASTED\nnext\n"));
+            } else {
+                assert_eq!(runtime.editor_text().as_deref(), Some(before.as_str()));
+            }
         }
     }
 
