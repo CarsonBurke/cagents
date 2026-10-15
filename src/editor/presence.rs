@@ -314,6 +314,7 @@ fn replace_or_remove_document_file(
         ));
     }
     let mut holding = PresenceHolding::create(parent, name)?;
+    holding.pin_source(source);
     let acquired_name = std::ffi::OsStr::new("file");
     if let Err(error) = before_acquire().map_err(io_error).and_then(|()| {
         fs_safety::rename_new_between(parent, name, holding.directory(), acquired_name).map_err(resolve_error)
