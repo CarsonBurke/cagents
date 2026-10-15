@@ -271,6 +271,22 @@ impl std::fmt::Debug for Protection {
 }
 
 impl Protection {
+    /// Actual retained native descriptors, including every discovered Git
+    /// ancestor's two locks and held directory. Does no filesystem work.
+    pub(crate) fn retained_descriptor_count(&self) -> usize { self._locks.len() + self._directories.len() }
+
+    /// Worker-side proof that this already-acquired lease protects the exact
+    /// model-open root; lexical path equality is insufficient after replacement.
+    pub(crate) fn protects_root(&self, root: &crate::fs_safety::Root) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let expected = root.metadata()?;
+        for directory in &self._directories {
+            let actual = directory.metadata()?;
+            if (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()) { return Ok(true); }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
