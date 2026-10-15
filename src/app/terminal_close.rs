@@ -632,6 +632,30 @@ impl Cagents {
         }
         cosmic::task::message(Message::CloseQueuedCard(queued))
     }
+    /// Called only by the exact Target-owned successful actor cleanup phase.
+    /// This projects its independently observed parked actor to absent; it does
+    /// not change the issued shared source or capture another terminal worker.
+    pub(super) fn resume_captured_card_close_after_chat_cleanup(
+        &mut self,mut queued:QueuedCardClose,closed:&crate::chat::Session,
+    )->Task<Message> {
+        let pair=closed.terminal.as_ref();
+        if self.chat_has_parked_runtime(queued.card) || self.chat_start_pending(queued.card)
+            || matches!(self.cards.get(&queued.card),Some(CardRuntime::Chat(_)))
+            || !matches!((pair,queued.kind.as_ref()),(Some(pair),Some(CardKind::Terminal(source))) if same_removal_source(&CardKind::Terminal(pair.clone()),&CardKind::Terminal(source.clone()))) {
+            self.stop_pane_close_batch(queued.batch);
+            self.status=Some(TransientNotice::warning("The parked conversation or paired terminal changed during cleanup. Its pane was kept."));
+            return Task::none();
+        }
+        queued.shared=match queued.shared {
+            Ok(Some(source))=>match source.after_observed_chat_cleanup(closed) {
+                Some(source)=>Ok(Some(source)),
+                None=>{self.stop_pane_close_batch(queued.batch);self.status=Some(TransientNotice::warning("The original shared source cannot authorize this cleanup continuation. Its pane was kept."));return Task::none();}
+            },
+            Ok(None)=>Ok(None),
+            Err(error)=>{self.stop_pane_close_batch(queued.batch);self.status=Some(TransientNotice::warning(error));return Task::none();}
+        };
+        self.resume_captured_card_close(queued)
+    }
     pub(super) fn resume_card_close_for(
         &mut self,
         card: CardId,

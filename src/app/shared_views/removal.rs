@@ -19,6 +19,18 @@ impl RemovalSource {
             execution_instance: self.execution_instance,
         }
     }
+    /// Project only an authenticated, source-owned parked actor cleanup.
+    /// The issued wire pane and all worker/registry authority stay unchanged.
+    pub(in crate::app) fn after_observed_chat_cleanup(mut self,closed:&crate::chat::Session)->Option<Self> {
+        let expected=self.observed_chat.as_ref()?;
+        let pair=closed.terminal.as_ref()?;
+        if !super::super::terminal_close::same_chat_removal_source(expected,closed)
+            || !matches!(&self.before.kind,CardKind::Terminal(source) if views::same_card_source(&CardKind::Terminal(pair.clone()),&CardKind::Terminal(source.clone()))) {
+            return None;
+        }
+        self.observed_chat=None;
+        Some(self)
+    }
     pub(super) fn current(&self, model: &crate::workspace_model::WorkspaceModel) -> bool {
         removal_current(model, &self.scope, &self.change())
     }
@@ -190,5 +202,22 @@ impl Cagents {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_projection_tests {
+    use super::*;
+    #[test]
+    fn successful_parked_cleanup_changes_only_captured_observation_not_wire_source() {
+        let launch=LaunchRecipe {program:"fixture".into(),arguments:vec![],working_directory:"/repo".into(),environment:Default::default(),unset_environment:Default::default()};
+        let terminal=TerminalSession {id:TerminalId::new(),launch:launch.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe:launch.clone(),last_exit:None}};
+        let closed=crate::chat::Session {id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:launch,session_id:Some("original".into())},proof:None,terminal:Some(terminal.clone()),owned_codex_listener:None,native_continuity:Default::default()};
+        let source=RemovalSource {registry:uuid::Uuid::new_v4(),repository:"/repo".into(),scope:Scope::Worktree {repository:"/repo".into(),path:"/repo".into()},before:Pane {id:CardId::new(),title:"CLI".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Terminal(terminal),scope:None},execution_instance:Some(uuid::Uuid::new_v4()),observed_chat:Some(closed.clone())};
+        let wire=source.change();let projected=source.clone().after_observed_chat_cleanup(&closed).unwrap();
+        assert!(projected.observed_chat.is_none());assert_eq!(projected.change(),wire);
+        let mut replacement=closed.clone();replacement.launch.session_id=Some("replacement".into());assert!(source.clone().after_observed_chat_cleanup(&replacement).is_none());
+        replacement=closed.clone();replacement.terminal.as_mut().unwrap().id=TerminalId::new();assert!(source.clone().after_observed_chat_cleanup(&replacement).is_none());
+        replacement=closed;replacement.terminal=None;assert!(source.after_observed_chat_cleanup(&replacement).is_none());
     }
 }
