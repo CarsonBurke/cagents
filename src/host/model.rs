@@ -647,7 +647,7 @@ mod tests {
                     .unwrap();
                 transaction
                     .execute(
-                        "INSERT INTO sqlite_wal_contract VALUES(?1, ?2, ?3)",
+                        "INSERT INTO wal_reset_contract VALUES(?1, ?2, ?3)",
                         params![lane, turn, vec![(lane * 32 + turn) as u8; 8192]],
                     )
                     .unwrap();
@@ -667,7 +667,7 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "CREATE TABLE sqlite_wal_contract(lane INTEGER, turn INTEGER, payload BLOB, PRIMARY KEY(lane, turn));",
+                "CREATE TABLE wal_reset_contract(lane INTEGER, turn INTEGER, payload BLOB, PRIMARY KEY(lane, turn));",
             )
             .unwrap();
         let execution = registry.execution_connection().unwrap();
@@ -688,7 +688,7 @@ mod tests {
         let (rows, bytes): (i64, i64) = registry
             .db
             .query_row(
-                "SELECT count(*), sum(length(payload)) FROM sqlite_wal_contract",
+                "SELECT count(*), sum(length(payload)) FROM wal_reset_contract",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -725,7 +725,7 @@ mod tests {
         );
         let mut statement = reopened
             .db
-            .prepare("SELECT lane, turn, payload FROM sqlite_wal_contract ORDER BY lane, turn")
+            .prepare("SELECT lane, turn, payload FROM wal_reset_contract ORDER BY lane, turn")
             .unwrap();
         let rows: Vec<(i64, i64, Vec<u8>)> = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
