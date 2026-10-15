@@ -19,67 +19,74 @@ pub(crate) struct CreatedStartRecord {
     pub(crate) requirement: CreatedStartRequirement,
     pub(crate) state: CreatedStartState,
     // Presence is not a startup proof. Only the owning host receipt decoder
-    // may authenticate this private record against its actual worker/grant.
-    pub(crate) started_receipt: Option<String>,
+    // may authenticate its separately bounded private record against the actor/grant.
+    pub(crate) started_receipt_present: bool,
 }
 
+// At most1024 active first-start obligations enter any shared model push.
+// Settled/retired history remains independently addressable and is not pruned.
+const MAX_REQUIRED_STARTS: usize = 1024;
+const RECORD_COLUMNS: &str = "session_id,card_id,intent_operation,generation,attempt,kind,phase,started_receipt IS NOT NULL";
+
+fn invalid_column(index: usize, message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text,
+        Box::new(io::Error::other(message)))
+}
+fn bounded_text<'a>(row: &'a rusqlite::Row<'_>, index: usize, limit: usize) -> rusqlite::Result<&'a str> {
+    let text = row.get_ref(index)?.as_str().map_err(|_| invalid_column(index, "Invalid directory-start text"))?;
+    if text.len() > limit { return Err(invalid_column(index, "Directory-start metadata is too large")); }
+    Ok(text)
+}
+fn identifier<T: std::str::FromStr<Err=uuid::Error>>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+    let text = bounded_text(row, index, 36)?;
+    if text.len() != 36 { return Err(invalid_column(index, "Invalid directory-start identifier")); }
+    text.parse().map_err(|error| rusqlite::Error::FromSqlConversionFailure(index,
+        rusqlite::types::Type::Text, Box::new(error)))
+}
+fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CreatedStartRecord> {
+    let generation = row.get::<_, i64>(3)?;
+    let requirement = CreatedStartRequirement {
+        session: identifier(row, 0)?, card: identifier(row, 1)?, operation: identifier(row, 2)?,
+        generation: u64::try_from(generation).map_err(|_| invalid_column(3, "Invalid directory-start generation"))?,
+        attempt: identifier(row, 4)?,
+        kind: match bounded_text(row, 5, 11)? {
+            "terminal" => CreatedStartKind::Terminal, "native_chat" => CreatedStartKind::NativeChat,
+            _ => return Err(invalid_column(5, "Invalid directory-start kind")),
+        },
+    };
+    requirement.validate().map_err(|_| invalid_column(0, "Invalid directory-start tuple"))?;
+    // Inspect presence only. The actual host-issued receipt decoder owns its
+    // separate bounded codec; model reads never clone an unbounded JSON body.
+    let started_receipt_present = row.get::<_, bool>(7)?;
+    let state = match (bounded_text(row, 6, 8)?, started_receipt_present) {
+        ("required", false) => CreatedStartState::Required,
+        ("started", true) => CreatedStartState::Started,
+        ("retired", _) => CreatedStartState::Retired,
+        _ => return Err(invalid_column(6, "Invalid directory-start phase or receipt")),
+    };
+    Ok(CreatedStartRecord { requirement, state, started_receipt_present })
+}
 fn read(db: &Connection, session: TerminalId) -> Result<Option<CreatedStartRecord>, String> {
-    let row = db.query_row(
-        "SELECT card_id, intent_operation, generation, attempt, kind, phase, started_receipt
-         FROM created_start_requirements WHERE session_id=?1",
-        [session.to_string()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?)),
-    ).optional().map_err(|error| error.to_string())?;
-    row.map(|(card, operation, generation, attempt, kind, phase, receipt)| {
-        let requirement = CreatedStartRequirement {
-            card: card.parse::<CardId>().map_err(|error| error.to_string())?,
-            session,
-            operation: operation.parse().map_err(|error: uuid::Error| error.to_string())?,
-            generation: u64::try_from(generation).map_err(|_| "Invalid created-start generation")?,
-            attempt: attempt.parse::<Uuid>().map_err(|error| error.to_string())?,
-            kind: match kind.as_str() {
-                "terminal" => CreatedStartKind::Terminal,
-                "native_chat" => CreatedStartKind::NativeChat,
-                _ => return Err("Invalid created-start kind".to_owned()),
-            },
-        };
-        requirement.validate().map_err(str::to_owned)?;
-        let state = match (phase.as_str(), receipt.as_ref()) {
-            ("required", None) => CreatedStartState::Required,
-            ("started", Some(_)) => CreatedStartState::Started,
-            ("retired", _) => CreatedStartState::Retired,
-            _ => return Err("Invalid created-start phase or receipt".to_owned()),
-        };
-        Ok(CreatedStartRecord { requirement, state, started_receipt: receipt })
-    }).transpose()
+    db.query_row(&format!("SELECT {RECORD_COLUMNS} FROM created_start_requirements WHERE session_id=?1"),
+        [session.to_string()], record).optional().map_err(|error| error.to_string())
 }
 
 fn required_for_card(db: &Connection, card: CardId) -> Result<Option<CreatedStartRecord>, String> {
-    let session: Option<String> = db.query_row(
-        "SELECT session_id FROM created_start_requirements WHERE card_id=?1 AND phase='required'",
-        [card.to_string()], |row| row.get(0),
-    ).optional().map_err(|error| error.to_string())?;
-    session.map(|session| {
-        let session = session.parse::<TerminalId>().map_err(|error| error.to_string())?;
-        read(db, session)?.ok_or_else(|| "Created-start requirement disappeared".to_owned())
-    }).transpose()
+    db.query_row(&format!("SELECT {RECORD_COLUMNS} FROM created_start_requirements WHERE card_id=?1 AND phase='required'"),
+        [card.to_string()], record).optional().map_err(|error| error.to_string())
 }
 
 pub(super) fn active(db: &Connection) -> Result<Vec<CreatedStartRequirement>, String> {
-    let mut statement = db.prepare(
-        "SELECT session_id FROM created_start_requirements WHERE phase='required' ORDER BY session_id",
-    ).map_err(|error| error.to_string())?;
-    let sessions = statement.query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
+    let mut statement = db.prepare(&format!(
+        "SELECT {RECORD_COLUMNS} FROM created_start_requirements WHERE phase='required' ORDER BY session_id LIMIT {}",
+        MAX_REQUIRED_STARTS + 1,
+    )).map_err(|error| error.to_string())?;
+    let records = statement.query_map([], record).map_err(|error| error.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(|error| error.to_string())?;
-    sessions.into_iter().map(|session| {
-        let session = session.parse::<TerminalId>().map_err(|error| error.to_string())?;
-        read(db, session)?.map(|record| record.requirement)
-            .ok_or_else(|| "Created-start requirement disappeared".to_owned())
-    }).collect()
+    if records.len() > MAX_REQUIRED_STARTS {
+        return Err("The registry exceeds its active directory-start limit; obligations were preserved".into());
+    }
+    Ok(records.into_iter().map(|record| record.requirement).collect())
 }
 
 /// Ordinary descriptor edits cannot substitute a different actor for a
@@ -128,6 +135,12 @@ pub(super) fn require(
     }
     if required_for_card(tx, requirement.card)?.is_some() {
         return Err("The pane already has a required original-created start".into());
+    }
+    let active_count: i64 = tx.query_row(
+        "SELECT count(*) FROM created_start_requirements WHERE phase='required'", [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if active_count >= MAX_REQUIRED_STARTS as i64 {
+        return Err("Too many required directory starts; finish or explicitly cancel an original pending start before creating another".into());
     }
     let attempt_exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM created_start_requirements WHERE attempt=?1)",
@@ -292,7 +305,7 @@ mod tests {
         let record = registry.created_start_requirement(required.card, required.session).unwrap().unwrap();
         assert_eq!(record.requirement, required);
         assert_eq!(record.state, CreatedStartState::Required);
-        assert!(record.started_receipt.is_none(), "restart does not invent an FD or startup receipt");
+        assert!(!record.started_receipt_present, "restart does not invent an FD or startup receipt");
     }
     #[test]
     fn directory_start_forked_card_session_attempt_and_generation_do_not_replace_history() {
@@ -380,5 +393,42 @@ mod tests {
         assert_eq!(retired.state, CreatedStartState::Retired);
         assert!(registry.model().unwrap().created_start_requirements.is_empty());
         assert!(registry.require_created_start(&required).is_err(), "retirement never renews the old attempt");
+    }
+
+    #[test]
+    fn directory_start_active_quota_refuses_new_admission_without_hiding_existing_obligations() {
+        let (mut registry, _directory, _, _) = setup();
+        let first = requirement();
+        let tx = registry.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        require(&tx, &first).unwrap();
+        for _ in 1..MAX_REQUIRED_STARTS { require(&tx, &requirement()).unwrap(); }
+        tx.commit().unwrap();
+        let before = registry.model().unwrap();
+        assert_eq!(before.created_start_requirements.len(), MAX_REQUIRED_STARTS);
+        let encoded = postcard::to_stdvec(&before.created_start_requirements).unwrap();
+        assert!(encoded.len() < 256 * 1024, "bounded requirement carrier alone; not a whole-model or RSS ceiling");
+        let error = registry.require_created_start(&requirement()).unwrap_err();
+        assert!(error.contains("Too many required directory starts"));
+        assert_eq!(registry.model().unwrap(), before);
+        assert!(!registry.require_created_start(&first).unwrap().changed, "exact replay still works at capacity");
+        assert_eq!(registry.created_start_requirement(first.card, first.session).unwrap().unwrap().requirement, first);
+    }
+
+    #[test]
+    fn directory_start_metadata_reader_refuses_oversized_identity_without_copying_receipt_body() {
+        let (mut registry, _directory, _, _) = setup();
+        let required = requirement();
+        registry.require_created_start(&required).unwrap();
+        // Deliberately corrupt a private fixture record. SQL keeps a large
+        // receipt outside the Rust model carrier; presence alone is not proof.
+        registry.db.execute("UPDATE created_start_requirements SET phase='started',started_receipt=?1 WHERE session_id=?2",
+            params!["x".repeat(1024*1024), required.session.to_string()]).unwrap();
+        let record = registry.created_start_requirement(required.card, required.session).unwrap().unwrap();
+        assert!(record.started_receipt_present);
+        assert_eq!(record.state, CreatedStartState::Started);
+        assert!(registry.model().unwrap().created_start_requirements.is_empty());
+        registry.db.execute("UPDATE created_start_requirements SET card_id=?1 WHERE session_id=?2",
+            params!["x".repeat(1024*1024), required.session.to_string()]).unwrap();
+        assert!(registry.created_start_requirement(required.card, required.session).is_err());
     }
 }
