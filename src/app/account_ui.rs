@@ -4311,6 +4311,25 @@ impl Cagents {
         self.account_ui.account_readiness(&selected)
     }
 
+    #[cfg(test)]
+    pub(super) fn deliver_ready_draft_setup_for_test(&mut self, provider: Provider) {
+        let action = Action::Located {
+            generation: self.account_ui.discovery_generation,
+            restored: vec![Restored { id: Account::system(provider).id(), present: true,
+                entry: Some(Entry { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()) }) }],
+            installed: BTreeMap::from([(provider, true)]),
+        };
+        drop(self.update(Message::AccountUi(action)));
+    }
+
+    /// A launch just proved this selected home absent. Invalidate only the
+    /// cached presence; a later asynchronous discovery may establish it again.
+    pub(super) fn note_missing_draft_account_home(&mut self, id: &AccountId) {
+        if let Some(account) = self.account_ui.account_mut(id) {
+            account.present = false;
+        }
+    }
+
     pub(super) fn usable_default_account_for_directory(
         &self,
         provider: Provider,

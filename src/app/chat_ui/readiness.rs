@@ -20,9 +20,6 @@ impl Cagents {
         if !runtime.is_draft() || !Account::PROVIDERS.contains(&runtime.session.launch.provider) { return None; }
         let launch = &runtime.session.launch;
         let selected = self.chat_account(launch.provider, &launch.recipe);
-        if runtime.error.as_deref() == Some("Codex's account setup isn't available. Sign in or choose another account.") {
-            return Some(ProviderReadiness::MissingHome(selected.unwrap_or_else(|| Account::system(launch.provider).id())));
-        }
         Some(self.draft_account_readiness(launch.provider, &launch.recipe.working_directory, selected.as_ref()))
     }
 
@@ -54,6 +51,21 @@ impl Cagents {
             .on_press(Message::ChatUi(Action::ModelPicker(target, true))).into());
         Some(widget::container(widget::row::with_children(controls).spacing(step::GAP_S).align_y(Alignment::Center))
             .padding(step::GAP_M).width(Length::Fill).into())
+    }
+
+    pub(super) fn reconcile_ready_draft_setup(&mut self) {
+        let recovered = self.cards.iter().filter_map(|(card, runtime)| {
+            let CardRuntime::Chat(runtime) = runtime else { return None; };
+            (runtime.error.as_deref() == Some("Codex's account setup isn't available. Sign in or choose another account.")
+                && matches!(self.chat_draft_readiness(runtime), Some(ProviderReadiness::Ready(_))))
+                .then_some(*card)
+        }).collect::<Vec<_>>();
+        for card in recovered {
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+                runtime.error = None;
+            }
+            self.notices.resolve(&format!("chat-setup:{card}"));
+        }
     }
 
     /// Reconsider only untouched automatic placeholders. Typing, explicit model

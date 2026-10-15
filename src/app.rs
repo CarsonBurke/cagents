@@ -16176,6 +16176,7 @@ impl Application for Cagents {
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => {
                 let update = self.update_account_ui(action);
+                self.reconcile_ready_draft_setup();
                 Task::batch([update, self.reconcile_usable_default_chats()])
             },
             Message::ResumeConversation(action) => self.update_resume(action),

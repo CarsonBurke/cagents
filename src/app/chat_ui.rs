@@ -6291,6 +6291,9 @@ impl Cagents {
                     && failure.message.starts_with("Cannot verify Codex account directory ")
                     && failure.message.contains("os error 2")
                 {
+                    let account = self.chat_account(Provider::Codex, &attempt.session.launch.recipe)
+                        .unwrap_or_else(|| Account::system(Provider::Codex).id());
+                    self.note_missing_draft_account_home(&account);
                     let raw = std::mem::replace(&mut failure.message,
                         "Codex's account setup isn't available. Sign in or choose another account.".into());
                     self.notices.record(TransientNotice::warning(failure.message.clone())
@@ -6522,7 +6525,10 @@ impl Cagents {
                             runtime.unqueue();
                             runtime.error = Some(failure.message);
                         }
-                        return self.retire_chat(target.card, None, Some(attempt.session));
+                        return Task::batch([
+                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            self.refresh_draft_accounts(),
+                        ]);
                     }
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
@@ -12898,6 +12904,16 @@ mod tests {
         let notice = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}"))).unwrap();
         assert_eq!(notice.notice.details.as_deref(), Some(raw));
         assert_eq!(notice.notice.targets, vec![card]);
+        let retirement = retired(&mut app, card);
+        drop(app.handle_chat_ui(Action::Retired(retirement, Ok(()))));
+        app.deliver_ready_draft_setup_for_test(Provider::Codex);
+        let runtime = chat_runtime(&app, card);
+        assert!(matches!(app.chat_draft_readiness(runtime), Some(account_ui::ProviderReadiness::Ready(_))));
+        assert!(runtime.error.is_none(), "completed new discovery clears only the setup failure");
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}"))));
+        submit(&mut app, card);
+        assert!(app.chat_ui.attempt(card).is_some(), "the same draft can send after sign-in; the old error cannot veto it");
     }
 
     #[test]
