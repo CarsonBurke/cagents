@@ -23,6 +23,14 @@ def wait_until(predicate, timeout=10, description="condition"):
     raise AssertionError(f"Timed out waiting for {description}")
 
 
+def process_is_current(identity):
+    try:
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19]) == identity["start"]
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 class Instance:
     def __init__(self, root, binaries, *, idle=60, retention=1):
         self.root = root
@@ -95,63 +103,68 @@ def main():
     checks = []
     with tempfile.TemporaryDirectory(prefix="cagents-lifecycle-", dir="/var/tmp") as temporary:
         root = Path(temporary)
-        instance = Instance(root / "retention", binaries)
         try:
-            terminal = instance.spawn("/bin/true")
-            holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
-            holders = [json.loads(path.read_text())["holder"] for path in holder_paths]
-            wait_until(lambda: not instance.terminals(), description="exited terminal retirement")
-            for holder in holders:
-                wait_until(lambda: not Path(f"/proc/{holder['pid']}").exists(),
-                           description="retired terminal holder exit")
-            checks.append({"contract": "exited_unattached_terminal_and_holder_retire", "terminal": terminal,
-                           "holders": holders})
-        finally:
-            instance.close()
-        instance = Instance(root / "idle", binaries, idle=1)
-        try:
-            instance.process.wait(timeout=10)
-            assert instance.process.returncode == 0
-            checks.append({"contract": "empty_development_daemon_exits", "exit_code": 0})
-        finally:
-            instance.close()
-        instance = Instance(root / "busy", binaries, idle=1)
-        try:
-            terminal = instance.spawn("/bin/sleep", "60")
-            time.sleep(2)
-            assert instance.process.poll() is None, "idle policy stopped a detached live terminal"
-            instance.cli("terminal", "close", terminal)
-            instance.process.wait(timeout=10)
-            checks.append({"contract": "detached_terminal_prevents_idle_exit_until_closed", "terminal": terminal})
-        finally:
-            instance.close()
-        for busy in (False, True):
-            version = root / f"version-{busy}"
-            version.mkdir()
-            for product in ("cagents", "cagentsd"):
-                try:
-                    os.link(binaries / product, version / product)
-                except OSError:
-                    shutil.copy2(binaries / product, version / product)
-            instance = Instance(root / f"stale-{busy}", version)
+            instance = Instance(root / "retention", binaries)
             try:
-                terminal = instance.spawn("/bin/sleep", "60") if busy else None
-                (version / "cagentsd").unlink()
-                result = instance.cli("daemon", "cleanup-stale-development")
-                if busy:
-                    assert not result["stopped"], result
-                    assert instance.process.poll() is None
-                    assert instance.terminals(), "cleanup discarded a hosted terminal"
-                else:
-                    assert result["stopped"], result
-                    instance.process.wait(timeout=5)
-                    assert instance.process.returncode == 0
-                checks.append({"contract": "stale_executable_cleanup", "busy": busy, "stopped": result["stopped"],
-                               "terminal": terminal})
+                terminal = instance.spawn("/bin/true")
+                holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
+                holders = [json.loads(path.read_text())["holder"] for path in holder_paths]
+                assert holders, "the completed terminal never published a retained holder"
+                wait_until(lambda: not instance.terminals(), description="exited terminal retirement")
+                for holder in holders:
+                    wait_until(lambda: not process_is_current(holder),
+                               description="retired terminal holder exit")
+                checks.append({"contract": "exited_unattached_terminal_and_holder_retire", "terminal": terminal,
+                               "holders": holders})
             finally:
                 instance.close()
-        shutil.copytree(root, args.evidence / "instances", ignore=shutil.ignore_patterns("*.sock", "cagents", "cagentsd"))
-    (args.evidence / "result.json").write_text(json.dumps({"checks": checks}, indent=2) + "\n")
+            instance = Instance(root / "idle", binaries, idle=1)
+            try:
+                instance.process.wait(timeout=10)
+                assert instance.process.returncode == 0
+                checks.append({"contract": "empty_development_daemon_exits", "exit_code": 0})
+            finally:
+                instance.close()
+            instance = Instance(root / "busy", binaries, idle=1)
+            try:
+                terminal = instance.spawn("/bin/sleep", "60")
+                time.sleep(2)
+                assert instance.process.poll() is None, "idle policy stopped a detached live terminal"
+                instance.cli("terminal", "close", terminal)
+                instance.process.wait(timeout=10)
+                checks.append({"contract": "detached_terminal_prevents_idle_exit_until_closed", "terminal": terminal})
+            finally:
+                instance.close()
+            for busy in (False, True):
+                version = root / f"version-{busy}"
+                version.mkdir()
+                for product in ("cagents", "cagentsd"):
+                    try:
+                        os.link(binaries / product, version / product)
+                    except OSError:
+                        shutil.copy2(binaries / product, version / product)
+                instance = Instance(root / f"stale-{busy}", version)
+                try:
+                    terminal = instance.spawn("/bin/sleep", "60") if busy else None
+                    (version / "cagentsd").unlink()
+                    result = instance.cli("daemon", "cleanup-stale-development")
+                    if busy:
+                        assert not result["stopped"], result
+                        assert instance.process.poll() is None
+                        assert instance.terminals(), "cleanup discarded a hosted terminal"
+                    else:
+                        assert result["stopped"], result
+                        instance.process.wait(timeout=5)
+                        assert instance.process.returncode == 0
+                    checks.append({"contract": "stale_executable_cleanup", "busy": busy, "stopped": result["stopped"],
+                                   "terminal": terminal})
+                finally:
+                    instance.close()
+        finally:
+            # Preserve failure evidence before TemporaryDirectory removes the
+            # isolated state; no fixture binary copies are retained.
+            shutil.copytree(root, args.evidence / "instances", ignore=shutil.ignore_patterns("*.sock", "cagents", "cagentsd"))
+            (args.evidence / "result.json").write_text(json.dumps({"checks": checks, "completed": len(checks) == 5}, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
 
 
