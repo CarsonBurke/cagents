@@ -760,8 +760,9 @@ fn recovery_parent(
         // protected checkout top cannot authorize mkdir in a writable nested
         // directory. Published parents stay private while descendants need it;
         // their archived mode is restored by the component-ordered frontier.
+        let temporary_mode = 0o700 | (mode & 0o2000);
         let result = fs_safety::create_directory_beneath(
-            &parent, Path::new(component.as_os_str()), 0o700,
+            &parent, Path::new(component.as_os_str()), temporary_mode,
         ).map_err(|error| error.to_string())?;
         parent = match result {
             fs_safety::DirectoryCreation::Existing(directory) => directory,
@@ -779,7 +780,7 @@ fn recovery_parent(
                 // the exact created inode for final mode restoration.
                 created.owned.insert(key.clone(), (publication, mode));
                 let publication = &created.owned[&key].0;
-                set_exact_directory_mode(publication.directory(), 0o700).map_err(|error| error.to_string())?;
+                set_exact_directory_mode(publication.directory(), temporary_mode).map_err(|error| error.to_string())?;
                 created.held_parent(root, &key)?.ok_or("the created parent authority is unavailable")?
             }
         };
@@ -1406,6 +1407,26 @@ mod directory_frontier_tests {
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(fs::metadata(dir.path().join("shared")).unwrap().mode() & 0o7777, 0o775);
         assert_eq!(fs::metadata(dir.path().join("shared/nested")).unwrap().mode() & 0o7777, 0o750);
+    }
+
+    #[test]
+    fn recovery_directory_frontier_preserves_setgid_inheritance_while_parents_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(dir.path()).unwrap();
+        let mut state = RecoveryDirectoryFrontier::new(&root);
+        let modes = BTreeMap::from([(path("parent"), 0o2775), (path("parent/nested"), 0o2750)]);
+        let (parent, _) = recovery_parent(&root, &path("parent/nested/file"), &modes, &mut state).unwrap();
+        let outer = fs::metadata(dir.path().join("parent")).unwrap();
+        let inner = parent.metadata().unwrap();
+        assert_eq!(outer.mode() & 0o7777, 0o2700);
+        assert_eq!(inner.mode() & 0o7777, 0o2700);
+        assert_eq!(inner.gid(), outer.gid(), "nested creation must retain the parent's actual SGID inheritance");
+        drop(parent);
+        let mut failures = vec![];
+        state.flush_before(None, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(fs::metadata(dir.path().join("parent")).unwrap().mode() & 0o7777, 0o2775);
+        assert_eq!(fs::metadata(dir.path().join("parent/nested")).unwrap().mode() & 0o7777, 0o2750);
     }
 
     #[test]
