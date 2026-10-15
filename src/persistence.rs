@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -2280,55 +2280,162 @@ pub enum SavedSessionOwner {
     Directory(PathBuf),
 }
 
-/// Read exact open session descriptors without migrating or updating a source
-/// window's database. Upgrade preflight must fail on an unreadable session,
-/// rather than quietly omit the pane that needs recovery.
-pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+/// One budget spans all source windows. Per-row bounds alone would allow
+/// thousands of individually valid descriptors to exhaust updater memory.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct MigrationInspectionBudget {
+    remaining_rows: usize,
+    remaining_bytes: u64,
+    deadline: Instant,
+}
+
+#[cfg(any(feature = "host", test))]
+impl MigrationInspectionBudget {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            remaining_rows: 4096,
+            remaining_bytes: 64 * 1024 * 1024,
+            deadline,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(StoreError::InvalidState(
+                "Saved pane inspection exceeded its bounded budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, bytes: u64) -> Result<()> {
+        self.check_deadline()?;
+        if self.remaining_rows == 0 || bytes > self.remaining_bytes {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        self.remaining_rows -= 1;
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+    read_open_migration_sessions_with_budget(
+        path,
+        &mut MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30)),
+    )
+}
+
+/// Read exact open descriptors without migrating or writing a source database.
+/// Refuse unreadable or over-budget rows instead of omitting recovery work.
+#[cfg(any(feature = "host", test))]
+pub(crate) fn read_open_migration_sessions_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<(CardId, CardKind)>> {
+    budget.check_deadline()?;
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    connection.busy_timeout(Duration::from_millis(100))?;
     let transaction = connection.transaction()?;
+    let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
     let mut statement = transaction.prepare(
-        "SELECT c.card_id, c.kind_tag, c.content_json, c.existence_json, w.existence_json
+        "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
+         CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
+         CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
+         CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END,
+         CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
+         ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+               FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
+         END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
+    let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
-    for row in rows {
-        let (card, kind, content, existence, workspace) = row?;
+    while let Some(row) = rows.next()? {
+        budget.check_deadline()?;
+        let existence: String = row.get(3)?;
+        let workspace: String = row.get(4)?;
         if !from_json::<Existence>("migration card existence", &existence)?.is_open()
             || !from_json::<Existence>("migration workspace existence", &workspace)?.is_open()
         {
             continue;
         }
+        let bytes: u64 = row.get(5)?;
+        // Reserve before allocating the descriptor's JSON or normalized fields.
+        budget.reserve(bytes)?;
+        let card: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
-        let session = match kind.as_str() {
-            "terminal" => CardKind::Terminal(load_terminal_record(&transaction, card)?),
-            "chat" => CardKind::Chat(from_json(
-                "migration chat",
-                content.as_deref().ok_or_else(|| {
-                    StoreError::corrupt_row(
-                        format!("migration chat card {card}"),
-                        "missing session descriptor",
-                    )
-                })?,
-            )?),
-            _ => unreachable!("query restricts session kinds"),
-        };
+        let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
         sessions.push((card, session));
     }
+    budget.check_deadline()?;
     Ok(sessions)
+}
+
+/// Decode the exact row inside an existing read-only inspection transaction.
+/// Terminal ownership lives in normalized tables, not cards.content_json.
+/// The caller must read and validate this card's kind/existence in that same
+/// transaction; this helper never opens a store or changes its schema/state.
+pub(crate) fn read_migration_session_at(
+    connection: &Connection,
+    card: CardId,
+    kind: &str,
+    content: Option<&str>,
+) -> Result<CardKind> {
+    const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
+    match kind {
+        "terminal" => {
+            // Check lengths in SQLite before allocating any descriptor fields
+            // in Rust, including the nullable provenance and transcript path.
+            let bounded:Option<bool>=connection.query_row(
+                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
+                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
+            if bounded != Some(true) {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            }
+            load_terminal_record(connection, card).map(CardKind::Terminal)
+        }
+        "chat" => from_json(
+            "migration chat",
+            content
+                .filter(|value| value.len() <= MAX_DESCRIPTOR_BYTES)
+                .ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing or oversized session descriptor",
+                    )
+                })?,
+        )
+        .map(CardKind::Chat),
+        _ => Err(StoreError::InvalidState(
+            "Migration inspection requires a saved native or terminal pane".into(),
+        )),
+    }
 }
 
 /// Read one consistent snapshot without migrating or writing another window's
@@ -6343,6 +6450,192 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn migration_session_inventory_budget_spans_windows_and_precedes_json_decode() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("source-{index}.sqlite3"));
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            workspace.cards[0].kind = CardKind::Chat(source);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            drop(store);
+            paths.push(path);
+        }
+        let before = paths
+            .iter()
+            .map(std::fs::read)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let connection =
+            Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let descriptor_bytes: u64 = connection
+            .query_row(
+                "SELECT length(CAST(content_json AS BLOB)) FROM cards WHERE kind_tag='chat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        for row_limited in [false, true] {
+            let mut budget =
+                MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            if row_limited {
+                budget.remaining_rows = 1;
+            } else {
+                budget.remaining_bytes = descriptor_bytes;
+            }
+            assert_eq!(
+                read_open_migration_sessions_with_budget(&paths[0], &mut budget)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inventory exceeds")
+            );
+        }
+        for (path, original) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+
+        let connection = Connection::open(&paths[1]).unwrap();
+        connection
+            .execute(
+                "UPDATE cards SET content_json='not valid JSON' WHERE kind_tag='chat'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        budget.remaining_bytes = 0;
+        assert!(
+            read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory exceeds"),
+            "budget must refuse before decoding the oversized inventory"
+        );
+        let missing = directory.path().join("must-not-open.sqlite3");
+        let mut expired = MigrationInspectionBudget::new(Instant::now());
+        assert!(
+            read_open_migration_sessions_with_budget(&missing, &mut expired)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded budget")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn migration_session_inspection_refuses_future_window_schema_without_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("future-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        let error = read_open_migration_sessions(&path).unwrap_err();
+        assert!(
+            matches!(error, StoreError::UnsupportedSchema { found, supported }
+            if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_session_sql_bounds_all_normalized_fields_before_decoding() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bounded-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        let card = workspace.cards[0].id;
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT content_json IS NULL FROM cards WHERE card_id=?1",
+                    [card.to_string()],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
+        // Non-ASCII forces a byte limit rather than a character-count limit.
+        let oversized = "🦀".repeat(1024 * 1024 + 1);
+        // Deliberately corrupt a referenced terminal identity only inside this
+        // rollback-only fixture transaction. Otherwise SQLite correctly refuses
+        // the UPDATE before the read-only allocation guard can inspect it.
+        connection
+            .execute_batch("BEGIN; PRAGMA defer_foreign_keys=ON;")
+            .unwrap();
+        for column in [
+            "terminal_id",
+            "recipe_json",
+            "continuity_json",
+            "resume_hint",
+            "recovery_origin",
+            "owned_codex_listener",
+            "predecessor",
+        ] {
+            let original: Option<String> = connection
+                .query_row(
+                    &format!("SELECT {column} FROM terminal_recipes WHERE card_id=?1"),
+                    [card.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), &oversized],
+                )
+                .unwrap();
+            let error = read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("oversized immutable descriptor"),
+                "field {column}: {error}"
+            );
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), original],
+                )
+                .unwrap();
+        }
+        let original:String=connection.query_row("SELECT path_json FROM transcript_metadata WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",[card.to_string()],|row|row.get(0)).unwrap();
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),&oversized]).unwrap();
+        assert!(
+            read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string()
+                .contains("oversized immutable descriptor")
+        );
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),original]).unwrap();
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
+        connection.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]

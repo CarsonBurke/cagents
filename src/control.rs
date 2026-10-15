@@ -468,7 +468,7 @@ pub struct ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -547,6 +547,14 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, None)
+    }
+
+    pub(crate) fn from_stream_with_deadline(stream: UnixStream, deadline: Instant) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, Some(deadline))
+    }
+
+    fn from_stream_inner(stream: UnixStream, deadline: Option<Instant>) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -561,7 +569,7 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake()?;
+        let proof = client.handshake(deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
@@ -1663,25 +1671,22 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self) -> Result<HostSessionProof, ControlError> {
+    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        write_frame(
-            &mut self.stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id,
-                proof: None,
-                request: ClientRequest::Connect {
-                    expected_host: None,
-                    resume: Vec::new(),
-                },
-            },
-        )?;
+        let request = ClientEnvelope {
+            version: PROTOCOL_VERSION, request_id, proof: None,
+            request: ClientRequest::Connect { expected_host: None, resume: Vec::new() },
+        };
+        match deadline {
+            Some(deadline) => write_frame(&mut DeadlineWriter { stream: &mut self.stream, deadline }, &request)?,
+            None => write_frame(&mut self.stream, &request)?,
+        }
         let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = read_frame(&mut self.stream)
-            .map_err(|error| reply_error(error, timeout))?
-            .ok_or(ControlError::ConnectionClosed)?;
+        let envelope: ServerEnvelope = match deadline {
+            Some(deadline) => read_frame(&mut DeadlineReader { stream: &mut self.stream, deadline }),
+            None => read_frame(&mut self.stream),
+        }.map_err(|error| reply_error(error, timeout))?.ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
