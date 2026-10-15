@@ -68,8 +68,8 @@ fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
     Arc::new(values)
 }
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
-struct Entry {part:RawSourcePart,revision:u64,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
-impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,attempt:None,loaded:None,restored:None,error:None}}}
+struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
 pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
@@ -84,8 +84,8 @@ impl State {
         let mut changed=false;
         for entry in self.entries.values_mut() {
             changed |=entry.attempt.take().is_some();
-            if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);changed=true;}
-            if let Some(text)=entry.restored.take() {retire(text);changed=true;}
+            if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;retire_loaded(loaded);changed=true;}
+            if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);changed=true;}
             if changed {entry.revision=next_revision();}
         }
         if changed {self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);}
@@ -133,7 +133,7 @@ impl State {
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
             match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
+        } else {entry.rehydrating=false;entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
         entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
@@ -154,7 +154,7 @@ impl State {
     pub(super) fn pending_paths(&self,item:&str)->Vec<[u32;2]> {
         [RawSourceField::ToolInput,RawSourceField::CommandCall].into_iter().filter_map(|field| {
             let key=self.key(item,field)?;let entry=self.entries.get(&key)?;
-            (entry.opened && entry.loaded.is_none() && entry.attempt.is_some()).then_some([10,field_index(field)])
+            (entry.rehydrating && entry.opened && entry.loaded.is_none() && entry.attempt.is_some()).then_some([10,field_index(field)])
         }).collect()
     }
     pub(super) fn complete_for_find(&self,item:&str)->bool {
@@ -261,7 +261,7 @@ pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceFiel
         Ok(pending) if record(&pending.part)==record(&entry.part) && pending.deadline>Instant::now() && chat::source_owners::resident_raw(&pending.text).as_ref()==Some(&record(&entry.part))=>{
             let view=tool_text::ToolText::from_captured(pending.text.clone(),pending.key);
             if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view,prefixes:pending.prefixes.clone()}) {retire_loaded(old);}
-            entry.restored=None;retire(pending);
+            entry.restored=None;entry.rehydrating=false;retire(pending);
         }
         Ok(pending)=>{retire(pending);entry.error=Some("The original call changed before it was displayed. Retry its current source.".into());}
         Err(error)=>entry.error=Some(error),
