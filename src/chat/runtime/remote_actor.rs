@@ -164,6 +164,19 @@ impl RemoteActor {
     pub fn identity(&self)->ActorIdentity {self.0.identity.clone()}
     pub fn owns_work(&self)->bool {!self.0.preserved.load(Ordering::Acquire)&&self.state().owns_work}
     pub fn state(&self)->Arc<Resident> {self.0.state.lock().unwrap_or_else(|p|p.into_inner()).clone()}
+    pub fn refresh_state(&self)->Result<(),String> {
+        let closed=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).is_some();
+        if self.0.stop.load(Ordering::Acquire)&&!closed {return Err("This retained actor attachment is unavailable; authenticate a new attachment before refreshing".into());}
+        if let Some(mut resident)=self.call::<Option<Resident>>("state",json!([self.state().changed]))? {
+            let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+            if self.0.stop.load(Ordering::Acquire) {
+                if !closed||!resident.close.completed {return Err("Closed actor metadata changed provider ownership unexpectedly".into());}
+                resident.completed=true;resident.owns_work=false;
+            }
+            *state=Arc::new(resident);
+        }
+        Ok(())
+    }
     pub fn set_visible(&self,visible:bool) {*self.0.desired_visible.lock().unwrap_or_else(|p|p.into_inner())=Some(visible);}
     pub fn observe_next_update(&self)->u64 {self.0.desired_observe.store(true,Ordering::Release);self.state().generation}
     pub fn attachment_snapshot(&self)->Snapshot {
@@ -676,9 +689,9 @@ impl Server {
                 self.lineage=lineage;self.source=source;self.execution_console=console;self.paired_holder=pair;
                 Ok(Value::Null)
             },
-            "close_if_revision"=>{let (revision,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_revision(revision)?;reap_orphans()?;}value!(self.publish_close()?)},
-            "close_if_idle"=>{let (generation,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_idle(generation)?;reap_orphans()?;}value!(self.publish_close()?)},
-            "close"=>{if self.closed_snapshot.is_none() {self.actor.close()?;reap_orphans()?;}value!(self.publish_close()?)},
+            "close_if_revision"=>{let (revision,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_revision(revision)?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
+            "close_if_idle"=>{let (generation,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_idle(generation)?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
+            "close"=>{if self.closed_snapshot.is_none() {self.actor.close()?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "retire"=>{
                 if self.closed_snapshot.is_none() {return Err("Stop the exact retained provider before retiring its helper".into());}
                 let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
