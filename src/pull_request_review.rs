@@ -3023,6 +3023,10 @@ pub(crate) struct ScriptedApi {
     pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
     pub search_pages: std::sync::Mutex<std::collections::VecDeque<PullRequestPage>>,
     pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    pub controls: std::sync::Mutex<Option<crate::github::review_controls::ReviewControls>>,
+    pub control_context: std::sync::Mutex<Option<ReviewContext>>,
+    pub controls_written: std::sync::Mutex<Vec<crate::github::review_controls::ReviewControlMutation>>,
+    pub control_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
 }
 
 #[cfg(test)]
@@ -3035,6 +3039,10 @@ impl ScriptedApi {
             submitted: std::sync::Mutex::new(Vec::new()),
             search_pages: Default::default(),
             searches: Default::default(),
+            controls: Default::default(),
+            control_context: Default::default(),
+            controls_written: Default::default(),
+            control_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
         }
     }
 }
@@ -3059,6 +3067,8 @@ impl GitHubReviewApi for ScriptedApi {
             .pop_front()
             .expect("scripted search page"))
     }
+    fn review_controls(&self,_:&PullRequestKey,_:&CancellationToken)->Result<crate::github::review_controls::ReviewControls,crate::github::GitHubError>{self.controls.lock().unwrap().clone().ok_or_else(||crate::github::GitHubError::Inspection("No scripted controls".into()))}
+    fn mutate_review_control(&self,_:&GitHubRepoKey,_:&str,mutation:&crate::github::review_controls::ReviewControlMutation,_:&CancellationToken)->Result<ReviewMutationOutcome<()>,crate::github::GitHubError>{self.controls_written.lock().unwrap().push(mutation.clone());Ok(self.control_outcome.lock().unwrap().clone())}
 
     fn pull_request(
         &self,
@@ -3080,7 +3090,7 @@ impl GitHubReviewApi for ScriptedApi {
         _key: &PullRequestKey,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewContext, crate::github::GitHubError> {
-        unreachable!("tests install loads directly")
+        self.control_context.lock().unwrap().clone().ok_or_else(||crate::github::GitHubError::Inspection("No scripted review context".into()))
     }
 
     fn pull_request_file_page(

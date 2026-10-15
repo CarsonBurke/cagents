@@ -294,4 +294,39 @@ mod tests {
         drop(state.update_completion(Action::Finished{generation:state.generation.wrapping_add(1),result:Ok(ReviewMutationOutcome::Applied(()))}));
         assert!(state.completion.busy);
     }
+    fn controls_fixture()->ReviewControls {
+        ReviewControls{pull_request_id:"PR_1".into(),head_oid:"a".repeat(40),allowed_methods:vec![MergeMethod::Merge,MergeMethod::Squash,MergeMethod::Rebase],merge_blocked:None,auto_merge_allowed:true,auto_merge_enabled:false,can_enable_auto_merge:true,can_disable_auto_merge:true,can_update:true,is_draft:false,is_open:true,merged:false,requested_reviewers:Vec::new(),reviewers_complete:true,suggested_title:"Fixture title".into(),suggested_body:String::new()}
+    }
+    fn receipt(task:ActionTask)->Action {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async{
+            let mut stream=iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action)=stream.next().await{if let iced::runtime::Action::Output(super::super::Action::Completion(action@Action::Finished{..}))=action{return action;}}
+            panic!("completion worker returned no receipt");
+        })
+    }
+    #[test]
+    fn every_control_mutation_reports_api_refusal_inline_without_changing_the_requested_action() {
+        let mutations=vec![
+            ReviewControlMutation::Draft(true),ReviewControlMutation::Draft(false),
+            ReviewControlMutation::Merge{method:MergeMethod::Merge,title:"Merge".into(),body:String::new(),expected_head:"a".repeat(40)},
+            ReviewControlMutation::Merge{method:MergeMethod::Squash,title:"Squash".into(),body:"Message".into(),expected_head:"a".repeat(40)},
+            ReviewControlMutation::Merge{method:MergeMethod::Rebase,title:String::new(),body:String::new(),expected_head:"a".repeat(40)},
+            ReviewControlMutation::AutoMerge{enabled:true,method:MergeMethod::Squash},ReviewControlMutation::AutoMerge{enabled:false,method:MergeMethod::Merge},
+            ReviewControlMutation::Reviewers(vec![Reviewer{id:"U_fixture".into(),label:"fixture".into(),team:false,bot:false}]),ReviewControlMutation::Reviewers(Vec::new()),
+            ReviewControlMutation::EditReviewBody{review:"R_fixture".into(),body:"updated".into()},
+            ReviewControlMutation::EditIssueComment{comment:"C_fixture".into(),body:"updated".into()},
+        ];
+        for mutation in mutations {
+            let (mut state,api)=state();let data=controls_fixture();state.target=Some(target(1));state.context=Some(loaded(Vec::new(),Vec::new()).context);state.completion.data=Some(data.clone());
+            *api.controls.lock().unwrap()=Some(data);*api.control_context.lock().unwrap()=state.context.clone();
+            let comment=|id:&str|serde_json::from_value::<crate::github::PullRequestComment>(serde_json::json!({"id":id,"author":{"login":"me"},"viewerDidAuthor":true,"viewerCanUpdate":true,"body":"original","createdAt":"now","url":"https://github.com/o/r/pull/1#comment"})).unwrap();
+            {let mut conversation=api.conversation.lock().unwrap();conversation.comments.push(comment("C_fixture"));conversation.reviews.push(crate::github::PullRequestReview{comment:comment("R_fixture"),state:crate::github::RemoteValue("COMMENTED".into())});}
+            if matches!(mutation,ReviewControlMutation::EditReviewBody{..}|ReviewControlMutation::EditIssueComment{..}){state.completion.published=Some(PublishedEdit{review:matches!(mutation,ReviewControlMutation::EditReviewBody{..}),id:"unused".into(),original:"original".into(),content:text_editor::Content::with_text("updated")});}
+            *api.control_outcome.lock().unwrap()=ReviewMutationOutcome::NotApplied{failure:crate::process::ProcessFailure{kind:crate::process::ProcessFailureKind::Exit,program:"gh".into(),exit_code:Some(1),signal:None,stdout:Vec::new(),stderr:b"permission denied".to_vec(),message:"permission denied".into(),started:true}};
+            let task=state.mutate_completion(mutation.clone());assert!(state.completion.busy);let outcome=receipt(task);drop(state.update_completion(outcome));
+            assert_eq!(*api.controls_written.lock().unwrap(),vec![mutation]);assert!(!state.completion.busy);assert!(state.completion.error.as_ref().unwrap().contains("permission denied"));
+        }
+    }
+
 }
