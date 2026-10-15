@@ -12407,7 +12407,7 @@ mod tests {
                     request_id: Some(start.request_id), proof: proof.clone(),
                     message: ServerMessage::Response { response: ServerResponse::ChatAttached {
                         session, snapshot: attached_snapshot, account_home: None } } }).unwrap();
-                for _ in 0..2 {
+                for _ in 0..3 {
                     let (state, generation) = emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
                         message: ServerMessage::ChatActivity { chat_id, state, generation } }).unwrap();
@@ -12467,7 +12467,20 @@ mod tests {
             assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
             assert!(!app.chat_start_pending(card));
             assert!(app.chat_ui.retiring.is_empty());
-            // Without another activity edge, a second None must not spin.
+            // A provider may finish applying a model/permission control while
+            // remaining Idle. Its newer body-free Activity generation must
+            // survive an older still-unready query, including while parked.
+            emit_tx.send((ActivityState::Idle, 4)).unwrap();
+            let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(wake, Wake::Activity));
+            drop(app.handle_chat_ui(Action::Wake(target, wake)));
+            assert!(app.chat_runtime_mut(target).unwrap().account_switch_recheck);
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(runtime.account_switch_checking);
+            assert_eq!(runtime.account_switch_checked_idle, Some(4));
+            assert!(!runtime.account_switch_recheck);
+            // Without another activity edge, a further None must not spin.
             drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Ok(None))));
             assert!(!app.chat_runtime_mut(target).unwrap().account_switch_checking);
             assert!(handle.snapshot().busy);
