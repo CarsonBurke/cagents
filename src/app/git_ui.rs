@@ -1063,6 +1063,10 @@ mod tests {
             basis: DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: head.clone(), merge_base: head } });
         app.cards.insert(comparison, CardRuntime::Repository(Box::new(runtime)));
         finish(&mut app, repository_task(load)).await;
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&comparison) else { panic!("comparison mounted"); };
+        assert!(!runtime.comparison_refresh_pending(), "initial comparison read has settled before the watcher edge");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&editor) else { panic!("editor mounted"); };
+        assert_eq!(runtime.editor_text().as_deref(), Some("before\n"));
         fs::write(root.join("file.rs"), "outside edit\n").unwrap();
         app.refresh_ui.git.monitor = Some(git_watch::Monitor::queued_fixture(BTreeMap::from([(key.project_id,
             git_watch::Change { worktrees: [key.worktree_id].into(), metadata: true, ..Default::default() })])));
