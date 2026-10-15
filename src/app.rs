@@ -1770,6 +1770,17 @@ pub struct LoadedRepository {
     status_order: git_ui::LoadedStatusOrder,
 }
 
+impl LoadedRepository {
+    /// Both new-project and duplicate-load publication use the same observed
+    /// row facts. Existing rows are still left to their own freshness owner.
+    fn sidebar_worktree(&self, record: &WorktreeRecord, status: Option<&StatusSnapshot>) -> SidebarWorktree {
+        let mut row = SidebarWorktree::from_repository(record, status);
+        row.head_repository = self.head_repositories.get(&record.id).cloned();
+        row.apply_status_error(self.status_order.errors.get(&record.id).map(String::as_str));
+        row
+    }
+}
+
 type WorktreePrCacheKey = (GitHubRepoKey, GitHubRepoKey, String, String);
 static WORKTREE_PR_CACHE: LazyLock<
     Mutex<HashMap<WorktreePrCacheKey, (Instant, Option<crate::github::PullRequest>)>>,
@@ -13743,10 +13754,7 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                existing.worktrees.push(SidebarWorktree::from_repository(
-                                    record,
-                                    status.as_ref(),
-                                ));
+                                existing.worktrees.push(loaded.sidebar_worktree(record, status.as_ref()));
                             }
                             let existing_id = existing.id;
                             self.refresh_ui.git.forget(project_id);
@@ -13796,20 +13804,7 @@ impl Application for Cagents {
                         let worktrees = loaded
                             .worktrees
                             .iter()
-                            .map(|(record, status)| {
-                                let mut row =
-                                    SidebarWorktree::from_repository(record, status.as_ref());
-                                row.head_repository =
-                                    loaded.head_repositories.get(&record.id).cloned();
-                                row.apply_status_error(
-                                    loaded
-                                        .status_order
-                                        .errors
-                                        .get(&record.id)
-                                        .map(String::as_str),
-                                );
-                                row
-                            })
+                            .map(|(record, status)| loaded.sidebar_worktree(record, status.as_ref()))
                             .collect();
                         let pull_requests = match &loaded.github {
                             GitHubAvailability::Ready { pull_requests, .. } => pull_requests
