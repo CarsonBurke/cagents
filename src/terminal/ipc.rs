@@ -145,6 +145,9 @@ use crate::{
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 /// Version 78 adds AwaitingApproval to tool states delivered to existing native
 /// chat subscribers. Older postcard peers must be rejected before receiving it.
+/// This unreleased branch additionally appends immutable original-query
+/// commands/replies. The campaign integration must assign a distinct final wire
+/// version before release; other intermediate version-78 peers are incompatible.
 pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

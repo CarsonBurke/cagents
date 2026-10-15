@@ -1222,13 +1222,6 @@ pub enum Command {
     },
     /// Read the next bounded window of already cached transcript history.
     LoadLater,
-    /// Read only an immutable, provider-confirmed original command.
-    LoadOriginal {
-        user_id: Option<String>,
-        expected_session: Option<String>,
-        offset: usize,
-        limit: usize,
-    },
     /// Read cached provider edit metadata; never asks the provider to do work.
     LoadFileChanges {
         request_id: u64,
@@ -1239,6 +1232,13 @@ pub enum Command {
         key: FileChangeKey,
         cursor: Option<FilePatchCursor>,
         revision: u64,
+    },
+    /// Read only an immutable, provider-confirmed original command.
+    LoadOriginal {
+        user_id: Option<String>,
+        expected_session: Option<String>,
+        offset: usize,
+        limit: usize,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
