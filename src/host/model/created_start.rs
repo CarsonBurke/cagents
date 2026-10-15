@@ -237,6 +237,36 @@ pub(super) fn require(
     Ok(true)
 }
 
+/// Resolve the negative obligation from the SAME transaction as an already
+/// source/consent-validated removal. The before pane supplies lookup identities,
+/// never launch or close authority; no client requirement is accepted here.
+/// A started native recipient may now be its proved console presentation. Keep
+/// the original stored target kind/tuple, rather than rebinding it to that view.
+pub(super) fn retirement_requirement(
+    tx: &rusqlite::Transaction<'_>,
+    before: &crate::workspace_model::views::Pane,
+) -> Result<Option<CreatedStartRequirement>, String> {
+    let target = match &before.kind {
+        crate::model::CardKind::Terminal(session) => Some((session.id, CreatedStartKind::Terminal)),
+        crate::model::CardKind::Chat(session) => Some((session.id, CreatedStartKind::NativeChat)),
+        _ => None,
+    };
+    let by_card = required_for_card(tx, before.id)?;
+    let by_session = target
+        .map(|(session, _)| read(tx, session))
+        .transpose()?
+        .flatten();
+    if by_card.as_ref().is_some_and(|record| {
+        target != Some((record.requirement.session, record.requirement.kind))
+    }) || by_session
+        .as_ref()
+        .is_some_and(|record| record.requirement.card != before.id)
+    {
+        return Err("The removed pane does not match its original directory-start obligation".into());
+    }
+    Ok(by_session.or(by_card).map(|record| record.requirement))
+}
+
 /// Only an owning host's already-validated close/replacement transaction may
 /// call this. There is intentionally no public client-controlled retire edit.
 /// The tombstone remains permanently bound to this session and attempt.
@@ -605,6 +635,72 @@ mod tests {
             CreatedStartState::Required
         );
     }
+    #[test]
+    fn directory_start_retirement_lookup_uses_transactional_original_target_not_client_metadata() {
+        let (mut registry, _directory, _, _) = setup();
+        let original = requirement();
+        registry.require_created_start(&original).unwrap();
+        let native = CreatedStartRequirement {
+            kind: CreatedStartKind::NativeChat,
+            ..requirement()
+        };
+        registry.require_created_start(&native).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let before = pane(&original);
+        assert_eq!(
+            retirement_requirement(&tx, &before).unwrap(),
+            Some(original.clone())
+        );
+        let mut replacement = before.clone();
+        let CardKind::Terminal(session) = &mut replacement.kind else {
+            panic!()
+        };
+        session.id = TerminalId::new();
+        assert!(
+            retirement_requirement(&tx, &replacement).is_err(),
+            "required card cannot omit its original session"
+        );
+        let mut alias = before.clone();
+        alias.id = CardId::new();
+        assert!(
+            retirement_requirement(&tx, &alias).is_err(),
+            "same-session alias cannot retire the original card"
+        );
+        let mut ordinary = before.clone();
+        ordinary.id = CardId::new();
+        let CardKind::Terminal(session) = &mut ordinary.kind else {
+            panic!()
+        };
+        session.id = TerminalId::new();
+        assert!(retirement_requirement(&tx, &ordinary).unwrap().is_none());
+        let console = pane(&native);
+        assert!(
+            retirement_requirement(&tx, &console).is_err(),
+            "a required native target cannot yet be a console presentation"
+        );
+        tx.rollback().unwrap();
+
+        // State/receipt presence here is only a metadata fixture, not a start
+        // or close proof. The actual owning caller still proves its console.
+        registry.db.execute(
+            "UPDATE created_start_requirements SET phase='started',started_receipt='opaque-fixture' WHERE session_id=?1",
+            [native.session.to_string()],
+        ).unwrap();
+        let tx = registry
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let stored = retirement_requirement(&tx, &console).unwrap().unwrap();
+        assert_eq!(stored, native, "console view cannot rewrite the stored target");
+        let mut console_alias = console;
+        console_alias.id = CardId::new();
+        assert!(retirement_requirement(&tx, &console_alias).is_err());
+        tx.rollback().unwrap();
+    }
+
     #[test]
     fn directory_start_retirement_checks_current_source_and_retains_a_refusal_tombstone() {
         let (mut registry, _directory, a, _) = setup();
