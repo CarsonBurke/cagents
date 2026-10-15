@@ -532,6 +532,10 @@ impl Snapshot {
         self.text.get_or_init(|| self.native.as_ref().expect("lazy snapshot has native source").text())
     }
 
+    fn wire_text(&self)->String {
+        self.native.as_ref().map_or_else(||self.full_text().to_string(),TextSnapshot::to_string_uncached)
+    }
+
     fn byte_len(&self) -> usize {
         self.native.as_ref().map_or_else(|| self.full_text().len(), TextSnapshot::len)
     }
@@ -2599,7 +2603,7 @@ impl SessionState {
                                 uri: (*uri).clone(),
                                 language_id,
                                 version,
-                                text: text.full_text().to_string(),
+                                text: text.wire_text(),
                             },
                         },
                     );
@@ -2910,7 +2914,7 @@ impl SessionState {
         let full_content = || lsp_types::TextDocumentContentChangeEvent {
             range: None,
             range_length: None,
-            text: change.full.full_text().to_string(),
+            text: change.full.wire_text(),
         };
         let content_changes = match self.sync.change {
             SyncKind::None => return,
@@ -6617,7 +6621,8 @@ mod tests {
             let fake = handle_of(&slot).await;
             let opened = fake.wait_for("textDocument/didOpen").await;
             assert_eq!(opened.params["textDocument"]["text"],"after");
-            assert!(!initial.is_materialized());assert!(changed.is_materialized());
+            assert!(!initial.is_materialized());assert!(!changed.is_materialized());
+            assert_eq!(initial.serialization_count(),0);assert_eq!(changed.serialization_count(),1);
             manager.shutdown();manager.wait_for_shutdown().await;
         });
     }
@@ -6645,6 +6650,7 @@ mod tests {
             let changes = fake.wait_for_count("textDocument/didChange",2).await;
             assert_eq!(changes[1].params["contentChanges"][0]["text"],"zero\n");
             assert!(!source.is_materialized());assert!(!next.is_materialized());
+            assert_eq!(source.serialization_count(),0);assert_eq!(next.serialization_count(),0);
             manager.shutdown(); manager.wait_for_shutdown().await;
         });
     }
@@ -6667,8 +6673,9 @@ mod tests {
             let change = fake.wait_for("textDocument/didChange").await;
             assert_eq!(change.params["contentChanges"][0]["text"],"aaaaaaa");
             assert_eq!(fake.entries("textDocument/didChange").len(),1);
-            assert!(sources.last().unwrap().is_materialized());
-            assert!(sources[..sources.len()-1].iter().all(|source| !source.is_materialized()));
+            assert_eq!(sources.last().unwrap().serialization_count(),1);
+            assert!(sources.iter().all(|source| !source.is_materialized()));
+            assert!(sources[..sources.len()-1].iter().all(|source| source.serialization_count()==0));
             manager.shutdown(); manager.wait_for_shutdown().await;
         });
     }

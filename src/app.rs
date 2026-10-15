@@ -10283,10 +10283,11 @@ impl Cagents {
                         repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
                         repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
                     }
+                    let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
                         crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
-                        state.diagnostics_version = Some(version);
+                        state.diagnostics_version = synchronized_version;
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                         if let Some(state) = self.lsp_contexts.get(&card) {

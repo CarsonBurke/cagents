@@ -1968,11 +1968,12 @@ impl Editor {
                             cagents::repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
                         }
                     }
+                    let synchronized_version = self.tab(id).and_then(|tab| tab.runtime.lsp_document()).and_then(|doc| self.lsp.document_version(doc));
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
                         cagents::lsp::shift_diagnostics(&mut tab.diagnostics,&edits);
-                        tab.diagnostics_version = Some(version);
+                        tab.diagnostics_version = synchronized_version;
                     }
                 }
                 LspIntent::Save { text } => {
