@@ -1446,6 +1446,8 @@ impl Editor {
         };
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -4086,6 +4088,8 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
+                        tab.runtime.set_editor_auto_close(self.settings.editor_auto_close);
+                        tab.runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
@@ -6378,6 +6382,28 @@ mod tests {
                 .map(|pending| pending.path.clone()),
             Some(selected),
         );
+    }
+
+    #[test]
+    fn opening_a_file_honors_saved_auto_close_and_fallback_tab_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.settings.editor_auto_close = false;
+        app.settings.editor_tab_width = 8;
+        let task = app.add(Opened { root: root.into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('(')) })));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("("));
+        drop(app.update(Message::ResetSettings));
+        drop(app.update(Message::ResetSettings));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('[')) })));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("([]"));
     }
 
     #[test]
