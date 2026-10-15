@@ -2288,7 +2288,10 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
     let transaction = connection.transaction()?;
     let mut statement = transaction.prepare(
-        "SELECT c.card_id, c.kind_tag, c.content_json, c.existence_json, w.existence_json
+        "SELECT c.card_id, c.kind_tag,
+         CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
+         CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
+         CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
     )?;
@@ -2312,6 +2315,7 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
         let card = parse_id("migration card", &card)?;
         let session=read_migration_session_at(&transaction,card,&kind,content.as_deref())?;
         sessions.push((card, session));
+        if sessions.len()>4096 {return Err(StoreError::InvalidState("Saved pane inventory exceeds the migration inspection limit".into()));}
     }
     Ok(sessions)
 }
@@ -2323,9 +2327,22 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
 pub(crate) fn read_migration_session_at(
     connection:&Connection,card:CardId,kind:&str,content:Option<&str>,
 )->Result<CardKind>{
+    const MAX_DESCRIPTOR_BYTES:usize=4*1024*1024;
     match kind {
-        "terminal"=>load_terminal_record(connection,card).map(CardKind::Terminal),
-        "chat"=>from_json("migration chat",content.ok_or_else(||StoreError::corrupt_row(format!("migration chat card {card}"),"missing session descriptor"))?).map(CardKind::Chat),
+        "terminal"=>{
+            // Check lengths in SQLite before allocating any descriptor fields
+            // in Rust, including the nullable provenance and transcript path.
+            let bounded:Option<bool>=connection.query_row(
+                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
+                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
+            if bounded!=Some(true) {return Err(StoreError::corrupt_row(format!("migration terminal card {card}"),"missing or oversized immutable descriptor"));}
+            load_terminal_record(connection,card).map(CardKind::Terminal)
+        },
+        "chat"=>from_json("migration chat",content.filter(|value|value.len()<=MAX_DESCRIPTOR_BYTES).ok_or_else(||StoreError::corrupt_row(format!("migration chat card {card}"),"missing or oversized session descriptor"))?).map(CardKind::Chat),
         _=>Err(StoreError::InvalidState("Migration inspection requires a saved native or terminal pane".into())),
     }
 }
@@ -6348,6 +6365,31 @@ mod tests {
             lane.save(&store, &workspace).unwrap();
             assert!(read_open_migration_sessions(&path).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn migration_session_sql_bounds_all_normalized_fields_before_decoding() {
+        let directory=tempdir().unwrap();let path=directory.path().join("bounded-source.sqlite3");
+        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
+        let workspace=workspace_with_terminal(&boot("chat-boot"));let card=workspace.cards[0].id;
+        SaveLane::default().save(&store,&workspace).unwrap();drop(store);
+        let connection=Connection::open(&path).unwrap();
+        assert!(connection.query_row("SELECT content_json IS NULL FROM cards WHERE card_id=?1",[card.to_string()],|row|row.get::<_,bool>(0)).unwrap());
+        assert_eq!(read_migration_session_at(&connection,card,"terminal",None).unwrap(),workspace.cards[0].kind);
+        // Non-ASCII forces a byte limit rather than a character-count limit.
+        let oversized="🦀".repeat(1024*1024+1);
+        for column in ["terminal_id","recipe_json","continuity_json","resume_hint","recovery_origin","owned_codex_listener","predecessor"] {
+            let original:Option<String>=connection.query_row(&format!("SELECT {column} FROM terminal_recipes WHERE card_id=?1"),[card.to_string()],|row|row.get(0)).unwrap();
+            connection.execute(&format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),params![card.to_string(),&oversized]).unwrap();
+            let error=read_migration_session_at(&connection,card,"terminal",None).unwrap_err().to_string();
+            assert!(error.contains("oversized immutable descriptor"),"field {column}: {error}");
+            connection.execute(&format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),params![card.to_string(),original]).unwrap();
+        }
+        let original:String=connection.query_row("SELECT path_json FROM transcript_metadata WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",[card.to_string()],|row|row.get(0)).unwrap();
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),&oversized]).unwrap();
+        assert!(read_migration_session_at(&connection,card,"terminal",None).unwrap_err().to_string().contains("oversized immutable descriptor"));
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),original]).unwrap();
+        assert_eq!(read_migration_session_at(&connection,card,"terminal",None).unwrap(),workspace.cards[0].kind);
     }
 
     #[test]
