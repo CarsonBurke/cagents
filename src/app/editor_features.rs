@@ -559,7 +559,7 @@ impl Cagents {
         if let Some(card) = existing {
             let Ok(update) = self.workspace.focus(card) else { return Task::none(); };
             let focus = self.apply_viewport(update, true, false);
-            if self.lsp_document(card).is_none() {
+            if !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.workspace_edit_source().is_some()) {
                 self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
                 return focus;
             }

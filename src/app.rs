@@ -10714,33 +10714,24 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
-        let open_path = self
-            .lsp_contexts
-            .get(&card)
-            .and_then(|state| state.path.clone());
-        if open_path.as_deref() == Some(path.as_path()) {
-            // Already the open buffer, so the column is placeable now. A
-            // `Utf16` location for the open file cannot occur - the manager
-            // converts against every document it holds - but it is refused
-            // rather than trusted, because placing protocol code units as
-            // scalars silently lands the caret in the wrong column.
-            return match coordinates {
-                LspCoordinates::Scalar => self.move_lsp_caret(card, at),
-                LspCoordinates::Utf16 => {
-                    let Some(doc) = self.lsp_document(card) else {
-                        return Task::none();
-                    };
-                    match self.lsp.scalar_position(doc, at) {
-                        Ok(at) => return self.move_lsp_caret(card, at),
-                        Err(error) => {
-                            self.status = Some(TransientNotice::warning(format!(
-                                "could not place the caret: {error}"
-                            )));
-                        }
-                    }
-                    Task::none()
-                }
+        let open_path = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.workspace_edit_source(),
+            _ => None,
+        };
+        if open_path.as_ref() == Some(&path) {
+            let at = match coordinates {
+                LspCoordinates::Scalar => Some(at),
+                LspCoordinates::Utf16 => match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.scalar_position_for_utf16(at),
+                    _ => None,
+                },
             };
+            let Some(at) = at else {
+                self.status = Some(TransientNotice::warning("The source position is no longer valid"));
+                return Task::none();
+            };
+            if self.modal_is_open() || self.workspace.focused() != Some(card) { return Task::none(); }
+            return self.move_lsp_caret(card, at);
         }
         let (view, read_only, dirty) = match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) => (runtime.descriptor.clone(), runtime.is_read_only_source(), runtime.blocks_navigation()),
@@ -23970,6 +23961,23 @@ mod tests {
             )),
         );
         card
+    }
+
+    #[test]
+    fn an_existing_loaded_readonly_target_places_utf16_without_a_language_server() {
+        let (mut app, card) = editing_repository_app();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "std.rs", "a😀éX\n");
+        let path = PathBuf::from("/dependencies/std.rs");
+        runtime.set_external_source(path.clone());
+        let view = runtime.descriptor.clone();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp_contexts.remove(&card);
+        let count = app.cards.len();
+        drop(app.open_lsp_source_tab(view, path, LspPosition::new(0, 4), LspCoordinates::Utf16, true));
+        assert_eq!(app.cards.len(), count);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source()));
     }
 
     #[test]
