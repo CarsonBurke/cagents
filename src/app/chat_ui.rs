@@ -5209,6 +5209,9 @@ impl Cagents {
     }
 
     fn finish_chat_reconnect(&mut self, card: CardId, succeeded: bool, outcome: Option<&crate::agent::ActivityOutcome>) {
+        // Manual retry after the automatic budget has expired has no batch.
+        // Its confirmed attachment still resolves this card's failure alone.
+        if succeeded { self.notices.resolve_target("daemon-chat-reconnect", card); }
         let Some(batch) = self.chat_ui.reconnecting.as_mut() else {
             return;
         };
@@ -5216,7 +5219,6 @@ impl Cagents {
             return;
         };
         if succeeded {
-            self.notices.resolve_target("daemon-chat-reconnect", card);
             batch.reconnected += 1;
             if matches!(outcome, Some(crate::agent::ActivityOutcome::Interrupted { .. })) {
                 batch.interrupted.push(card);
@@ -12899,7 +12901,7 @@ mod tests {
             assert!(targets.contains(&cards[0]), "another chat's success/failure cannot erase this failure");
             assert!(!targets.contains(&cards[1]));
         }
-        app.begin_chat_reconnect(chat_runtime(&app, cards[0]).target);
+        assert!(app.chat_ui.reconnecting.is_none());
         app.finish_chat_reconnect(cards[0], true, None);
         assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![cards[2]]);
         app.chat_discard(cards[2]);
