@@ -384,13 +384,23 @@ fn attached_mut(
     }
     Ok(record)
 }
-pub(super) fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
     changed_from(host, id, Some(instance), update);
 }
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     changed_from(host, id, None, update);
 }
-fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uuid>, update: Update) {
+fn changed_from(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: Option<uuid::Uuid>,
+    update: Update,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -423,7 +433,13 @@ fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uu
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(instance) = instance {
-        if !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance) { return; }
+        if !state
+            .chats
+            .get(&id)
+            .is_some_and(|record| record.execution_instance == instance)
+        {
+            return;
+        }
         if let Err(error) = state.observe_chat_directory_thread(id, instance) {
             tracing::warn!(%error, "cannot retain the owned provider's confirmed thread");
         }
@@ -746,12 +762,27 @@ pub(super) fn start_execution(
 /// Trusted handoffs supply a pin proved from the original hosted source before
 /// stopping it. The new descriptor retains its issued recipe independently.
 pub(super) fn start_at_execution_directory(
-    host: &SharedHost, client: ClientId, session: Session,
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
     environment: crate::terminal_ipc::ChatExecutionEnvironment,
-    context: Arc<chat::protocol::ExecutionContext>, directory: &std::path::Path,
+    context: Arc<chat::protocol::ExecutionContext>,
+    directory: &std::path::Path,
 ) -> Result<ServerResponse, ProtocolError> {
     context.verify_directory(directory).map_err(unavailable)?;
-    start_with_execution(host, client, session, None, false, None, environment, Some(context), None, &[], Some(directory))
+    start_with_execution(
+        host,
+        client,
+        session,
+        None,
+        false,
+        None,
+        environment,
+        Some(context),
+        None,
+        &[],
+        Some(directory),
+    )
 }
 
 /// Discovery can route an old presentation descriptor to recovery, but grants
@@ -784,7 +815,9 @@ fn start_with_execution(
     if source.is_none() && retained_sources.is_empty() {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.issued_chat_ids.contains(&session.id) && !state.chats.contains_key(&session.id) {
-            return Err(error("This native session ID was retired by this daemon. Open a new pane to start another provider; the old pane cannot identify a replacement actor"));
+            return Err(error(
+                "This native session ID was retired by this daemon. Open a new pane to start another provider; the old pane cannot identify a replacement actor",
+            ));
         }
     }
     // A managed CLI is a second view of the thread that this daemon owns.
@@ -953,30 +986,69 @@ fn start_with_execution(
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
     let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
-    let binding_registry = host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone();
-    let operational_binding = binding_registry.as_ref().map(|registry| {
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        registry.session_location(&binding_source).or_else(|error| {
-            if retained_sources.is_empty() { Err(error) } else { registry.retained_session_location(retained_sources) }
+    let binding_registry = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_registry
+        .clone();
+    let operational_binding = binding_registry
+        .as_ref()
+        .map(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.session_location(&binding_source).or_else(|error| {
+                if retained_sources.is_empty() {
+                    Err(error)
+                } else {
+                    registry.retained_session_location(retained_sources)
+                }
+            })
         })
-    }).transpose().map_err(unavailable)?.flatten();
-    let previous_binding_source = operational_binding.as_ref().map(|binding| binding.source.clone()).unwrap_or_else(|| binding_source.clone());
+        .transpose()
+        .map_err(unavailable)?
+        .flatten();
+    let previous_binding_source = operational_binding
+        .as_ref()
+        .map(|binding| binding.source.clone())
+        .unwrap_or_else(|| binding_source.clone());
     if let Some(binding) = &operational_binding {
-        if let Some(reason) = &binding.refusal { return Err(unavailable(reason.clone())); }
+        if let Some(reason) = &binding.refusal {
+            return Err(unavailable(reason.clone()));
+        }
         let approved = binding.approved.ok_or_else(|| unavailable("The original conversation has no proven directory; recover its exact provider or close it before restarting"))?;
         if execution.is_none() {
-            execution = Some(Arc::new(chat::protocol::ExecutionContext::capture(&binding.directory).map_err(unavailable)?));
+            execution = Some(Arc::new(
+                chat::protocol::ExecutionContext::capture(&binding.directory)
+                    .map_err(unavailable)?,
+            ));
         }
-        if execution.as_ref().unwrap().directory_identity().map_err(unavailable)? != Some(approved) {
-            return Err(unavailable("The original conversation directory was replaced; close it and create a new session for this folder"));
+        if execution
+            .as_ref()
+            .unwrap()
+            .directory_identity()
+            .map_err(unavailable)?
+            != Some(approved)
+        {
+            return Err(unavailable(
+                "The original conversation directory was replaced; close it and create a new session for this folder",
+            ));
         }
     }
     let mut operational_launch = restart_launch.unwrap_or(&session.launch).clone();
-    if let Some(binding) = &operational_binding { operational_launch.recipe.working_directory = binding.directory.clone(); }
+    if let Some(binding) = &operational_binding {
+        operational_launch.recipe.working_directory = binding.directory.clone();
+    }
     if let Some(directory) = execution_directory {
-        let context = execution.as_ref().ok_or_else(|| unavailable("An operational directory override requires its original approved descriptor"))?;
+        let context = execution.as_ref().ok_or_else(|| {
+            unavailable(
+                "An operational directory override requires its original approved descriptor",
+            )
+        })?;
         context.verify_directory(directory).map_err(unavailable)?;
-        if context.directory_descriptor().is_none() { return Err(unavailable("An operational directory override requires its original approved descriptor")); }
+        if context.directory_descriptor().is_none() {
+            return Err(unavailable(
+                "An operational directory override requires its original approved descriptor",
+            ));
+        }
         operational_launch.recipe.working_directory = directory.to_owned();
     }
     let saved_history_only = operational_launch.needs_read_only_history();
@@ -1106,21 +1178,38 @@ fn start_with_execution(
     if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
         let binding = operational_binding;
         if let Some(binding) = &binding {
-            if let Some(reason) = &binding.refusal { return Err(unavailable(reason.clone())); }
+            if let Some(reason) = &binding.refusal {
+                return Err(unavailable(reason.clone()));
+            }
             if binding.directory != spec.working_directory {
-                adapter.relocate_directory(&binding.directory).map_err(unavailable)?;
+                adapter
+                    .relocate_directory(&binding.directory)
+                    .map_err(unavailable)?;
                 spec.working_directory = binding.directory.clone();
             }
         }
-        if execution.is_none() && source.is_none()
-            && !matches!(spec.transport, chat::protocol::TransportSpec::UnixWebSocket { .. }) {
-            execution = Some(Arc::new(chat::protocol::ExecutionContext::capture(&spec.working_directory).map_err(unavailable)?));
+        if execution.is_none()
+            && source.is_none()
+            && !matches!(
+                spec.transport,
+                chat::protocol::TransportSpec::UnixWebSocket { .. }
+            )
+        {
+            execution = Some(Arc::new(
+                chat::protocol::ExecutionContext::capture(&spec.working_directory)
+                    .map_err(unavailable)?,
+            ));
         }
         if let Some(context) = &execution {
-            context.verify_directory(&spec.working_directory).map_err(unavailable)?;
+            context
+                .verify_directory(&spec.working_directory)
+                .map_err(unavailable)?;
             if let Some(expected) = binding.and_then(|binding| binding.approved)
-                && context.directory_identity().map_err(unavailable)? != Some(expected) {
-                return Err(unavailable("The original native conversation directory was replaced; close it and create a new session for this folder"));
+                && context.directory_identity().map_err(unavailable)? != Some(expected)
+            {
+                return Err(unavailable(
+                    "The original native conversation directory was replaced; close it and create a new session for this folder",
+                ));
             }
         }
     }
@@ -1435,19 +1524,43 @@ fn start_with_execution(
             }
         }
         if let Some(context) = &execution
-            && let Some(identity) = context.directory_identity().map_err(unavailable)? {
-            let directory = context.directory_descriptor().ok_or_else(|| unavailable("Native startup requires the approved directory descriptor"))?;
+            && let Some(identity) = context.directory_identity().map_err(unavailable)?
+        {
+            let directory = context.directory_descriptor().ok_or_else(|| {
+                unavailable("Native startup requires the approved directory descriptor")
+            })?;
             // Recheck the actual opened descriptor, not a path reopened after
             // spawn. Agent contexts and ordinary contexts share this contract.
-            if crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata().map_err(|error| unavailable(error.to_string()))?) != identity {
+            if crate::agent_execution::DirectoryIdentity::from_metadata(
+                &directory
+                    .metadata()
+                    .map_err(|error| unavailable(error.to_string()))?,
+            ) != identity
+            {
                 let _ = handle.close();
-                return Err(unavailable("The approved provider directory descriptor changed during startup"));
+                return Err(unavailable(
+                    "The approved provider directory descriptor changed during startup",
+                ));
             }
-            let registry = host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone();
+            let registry = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .execution_registry
+                .clone();
             if let Some(registry) = registry {
-                let result = registry.lock().unwrap_or_else(|p| p.into_inner())
-                    .bind_session_location(&crate::agent_execution::HostedSession::Chat(session.clone()), Some(&previous_binding_source), &operational_directory, identity);
-                if let Err(reason) = result { let _ = handle.close(); return Err(unavailable(reason)); }
+                let result = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .bind_session_location(
+                        &crate::agent_execution::HostedSession::Chat(session.clone()),
+                        Some(&previous_binding_source),
+                        &operational_directory,
+                        identity,
+                    );
+                if let Err(reason) = result {
+                    let _ = handle.close();
+                    return Err(unavailable(reason));
+                }
             }
         }
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1563,17 +1676,21 @@ fn codex_terminal_view(
             .returning_terminal = true;
         completed
     };
-    let (directory, execution) = match super::session_locations::verified_chat_directory(host, &session, handle) {
-        Ok(verified) => verified,
-        Err(message) => {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(record) = state.chats.get_mut(&chat_id)
-                .filter(|record| record.handle.same_actor(handle)) {
-                record.returning_terminal = false;
+    let (directory, execution) =
+        match super::session_locations::verified_chat_directory(host, &session, handle) {
+            Ok(verified) => verified,
+            Err(message) => {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(record) = state
+                    .chats
+                    .get_mut(&chat_id)
+                    .filter(|record| record.handle.same_actor(handle))
+                {
+                    record.returning_terminal = false;
+                }
+                return Err(unavailable(message));
             }
-            return Err(unavailable(message));
-        }
-    };
+        };
     let mut recipe = recipe;
     recipe.working_directory = directory;
     if let Some((source, terminal, proof)) = completed {
@@ -2441,8 +2558,9 @@ fn process_inner(
             // Capture positive owned-process/approved directory evidence
             // before stopping the native writer. A reused old pathname is
             // never authority for the replacement's working directory.
-            let (directory, execution) = super::session_locations::verified_chat_directory(host, &session, &handle)
-                .map_err(unavailable)?;
+            let (directory, execution) =
+                super::session_locations::verified_chat_directory(host, &session, &handle)
+                    .map_err(unavailable)?;
             let mut recipe = recipe;
             recipe.working_directory = directory.clone();
             let terminal_id = crate::model::TerminalId::new();
@@ -2470,8 +2588,11 @@ fn process_inner(
                 // Another client can close this chat while the lock is released.
                 // Report that instead of panicking the per-client thread, which
                 // would take down every hosted PTY with it.
-                let Some(record) = state.chats.get_mut(&chat_id)
-                    .filter(|record| record.handle.same_actor(&handle)) else {
+                let Some(record) = state
+                    .chats
+                    .get_mut(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle))
+                else {
                     return Err(unavailable(
                         "The chat was closed while returning to terminal; no replacement terminal was started",
                     ));
@@ -2540,10 +2661,9 @@ fn process_inner(
                 // it last held the lock. A concurrent close removes that key, and
                 // explicit recovery re-inserts a different actor under it; neither
                 // may donate its subscribers to this replacement terminal.
-                let retained = state
-                    .chats
-                    .get(&chat_id)
-                    .is_some_and(|record| record.returning_terminal && record.handle.same_actor(&handle));
+                let retained = state.chats.get(&chat_id).is_some_and(|record| {
+                    record.returning_terminal && record.handle.same_actor(&handle)
+                });
                 if !retained {
                     // The replacement has no receipt to commit and no source to be
                     // retried from, so retire it rather than leaving a PTY in the
@@ -2983,8 +3103,14 @@ pub(super) fn restore_upgrade(
     } else {
         None
     };
-    let retained_sources = saved.previous_sources.iter().map(|previous| crate::agent_execution::HostedSession::Chat(previous.source.clone()))
-        .chain(std::iter::once(crate::agent_execution::HostedSession::Chat(saved.source.clone()))).collect::<Vec<_>>();
+    let retained_sources = saved
+        .previous_sources
+        .iter()
+        .map(|previous| crate::agent_execution::HostedSession::Chat(previous.source.clone()))
+        .chain(std::iter::once(
+            crate::agent_execution::HostedSession::Chat(saved.source.clone()),
+        ))
+        .collect::<Vec<_>>();
     let response = start_with_execution(
         host,
         0,

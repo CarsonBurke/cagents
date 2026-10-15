@@ -26,8 +26,8 @@ use crate::{
 
 mod agent_locations;
 mod session_locations;
+pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
 pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
-pub(crate) use agent_locations::{Location as AgentLocation, AgentMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -218,21 +218,39 @@ impl Registry {
         self.apply_with_session_moves(edit, &[])
     }
 
-    pub(crate) fn apply_with_session_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove]) -> Result<Applied, String> {
+    pub(crate) fn apply_with_session_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+    ) -> Result<Applied, String> {
         // Direct registry users own no HostState lock. The live host route uses
         // apply_with_location_moves with evidence prepared outside every lock.
         let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
-            self.agent_relocation_inputs(relocation)?.into_iter().map(|input| input.verify()).collect::<Vec<_>>()
-        } else { Vec::new() };
+            self.agent_relocation_inputs(relocation)?
+                .into_iter()
+                .map(|input| input.verify())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         self.apply_with_location_moves(edit, moves, &agent_moves)
     }
 
-    pub(crate) fn apply_with_location_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove], agent_moves: &[AgentMove]) -> Result<Applied, String> {
+    pub(crate) fn apply_with_location_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+        agent_moves: &[AgentMove],
+    ) -> Result<Applied, String> {
         if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
-            return Err("Session directory proofs may only accompany their project relocation".into());
+            return Err(
+                "Session directory proofs may only accompany their project relocation".into(),
+            );
         }
         if let ModelEdit::RelocateProject { relocation } = edit
-            && moves.iter().any(|movement| movement.repository != relocation.destination)
+            && moves
+                .iter()
+                .any(|movement| movement.repository != relocation.destination)
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
@@ -419,8 +437,19 @@ impl Registry {
         };
         if !moves.is_empty() {
             if let ModelEdit::RelocateProject { relocation } = edit {
-                let open: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [repository_key(&relocation.destination)?], |row| row.get(0)).map_err(|error| error.to_string())?;
-                if !open { return Err("The located project is no longer open; no session authority changed".into()); }
+                let open: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",
+                        [repository_key(&relocation.destination)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !open {
+                    return Err(
+                        "The located project is no longer open; no session authority changed"
+                            .into(),
+                    );
+                }
             }
             session_locations::apply(&transaction, moves)?;
         }

@@ -20,12 +20,12 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-mod execution;
 mod directory;
+mod execution;
 mod store;
 mod websocket;
-use store::Store;
 pub(crate) use directory::DirectoryProof;
+use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -309,7 +309,11 @@ impl Handle {
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
-        let pinned_directory = Arc::new(Mutex::new(spec.execution.as_ref().and_then(|context| context.directory_descriptor())));
+        let pinned_directory = Arc::new(Mutex::new(
+            spec.execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor()),
+        ));
         let inner = Arc::new(Inner {
             pinned_directory: pinned_directory.clone(),
             commands,
@@ -613,8 +617,13 @@ impl Handle {
             })?
             .map_err(Rejection::Refused)
     }
-    pub(crate) fn relocate_execution_directory(&self, directory: &std::path::Path) -> Result<(), String> {
-        self.ownership_command(ActorCommand::RelocateExecutionDirectory(directory.to_path_buf()))
+    pub(crate) fn relocate_execution_directory(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        self.ownership_command(ActorCommand::RelocateExecutionDirectory(
+            directory.to_path_buf(),
+        ))
     }
 
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
@@ -1937,13 +1946,26 @@ impl Actor {
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::RelocateExecutionDirectory(directory) => {
                     let result: Result<(), String> = (|| {
-                        let context = self.launch_context.as_ref().ok_or("The provider has no approved directory identity")?;
-                        if context.directory_identity()?.is_none() { return Err("The provider has no approved directory identity".into()); }
-                        crate::secure_file::reject_symlink_components(&directory).map_err(|error| error.to_string())?;
+                        let context = self
+                            .launch_context
+                            .as_ref()
+                            .ok_or("The provider has no approved directory identity")?;
+                        if context.directory_identity()?.is_none() {
+                            return Err("The provider has no approved directory identity".into());
+                        }
+                        crate::secure_file::reject_symlink_components(&directory)
+                            .map_err(|error| error.to_string())?;
                         context.verify_directory(&directory)?;
-                        if self.working_directory == directory { return Ok(()); }
+                        if self.working_directory == directory {
+                            return Ok(());
+                        }
                         self.adapter.relocate_directory(&directory)?;
-                        if let Err(error) = self.store.lock().unwrap_or_else(|p| p.into_inner()).relocate_file_directory(&directory) {
+                        if let Err(error) = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .relocate_file_directory(&directory)
+                        {
                             let _ = self.adapter.relocate_directory(&self.working_directory);
                             return Err(error);
                         }
@@ -3290,32 +3312,98 @@ mod tests {
 
     #[test]
     fn same_inode_project_move_updates_actor_paths_without_new_process_authority() {
-        struct PathAware { directory: std::path::PathBuf, calls: Arc<Mutex<Vec<std::path::PathBuf>>> }
+        struct PathAware {
+            directory: std::path::PathBuf,
+            calls: Arc<Mutex<Vec<std::path::PathBuf>>>,
+        }
         impl Adapter for PathAware {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
-            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.directory = directory.into(); Ok(()) }
-            fn command(&mut self, _command: Command) -> Result<Step, String> { self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default()) }
-            fn command_for_run(&mut self, _run: crate::model::RunId, command: Command) -> Result<Step, String> { self.command(command) }
-            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+                self.directory = directory.into();
+                Ok(())
+            }
+            fn command(&mut self, _command: Command) -> Result<Step, String> {
+                self.calls.lock().unwrap().push(self.directory.clone());
+                Ok(Step::default())
+            }
+            fn command_for_run(
+                &mut self,
+                _run: crate::model::RunId,
+                command: Command,
+            ) -> Result<Step, String> {
+                self.command(command)
+            }
+            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         let fixture = tempfile::tempdir().unwrap();
-        let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
+        let old = fixture.path().join("old");
+        std::fs::create_dir(&old).unwrap();
         let original = Arc::new(std::fs::File::open(&old).unwrap());
-        let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(original)));
-        let spec = ProcessSpec { execution: Some(context), messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
+        let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(
+            original,
+        )));
+        let spec = ProcessSpec {
+            execution: Some(context),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: old.clone(),
+            environment: BTreeMap::new(),
+        };
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut initial = Step { events: vec![Event::Ready(true)], ..Default::default() };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(PathAware { directory: old.clone(), calls: calls.clone() }), initial, store, None, |_| {}).unwrap();
-        let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(PathAware {
+                directory: old.clone(),
+                calls: calls.clone(),
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let moved = fixture.path().join("moved");
+        std::fs::rename(&old, &moved).unwrap();
         std::fs::create_dir(&old).unwrap();
         handle.relocate_execution_directory(&moved).unwrap();
-        handle.command_for_run(crate::model::RunId::new(), Command::Prompt { text: "fixture".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).unwrap();
+        handle
+            .command_for_run(
+                crate::model::RunId::new(),
+                Command::Prompt {
+                    text: "fixture".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send,
+                },
+            )
+            .unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
-        assert!(handle.relocate_execution_directory(&old).is_err(), "reused path is another inode, not the approved process directory");
+        assert!(
+            handle.relocate_execution_directory(&old).is_err(),
+            "reused path is another inode, not the approved process directory"
+        );
         std::fs::rename(&moved, fixture.path().join("retained")).unwrap();
         std::fs::create_dir(&moved).unwrap();
-        assert!(handle.command(Command::Prompt { text: "replacement must refuse".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).is_err());
+        assert!(
+            handle
+                .command(Command::Prompt {
+                    text: "replacement must refuse".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send
+                })
+                .is_err()
+        );
         assert_eq!(calls.lock().unwrap().len(), 1);
         handle.close().unwrap();
     }

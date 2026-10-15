@@ -441,21 +441,45 @@ impl HostState {
 
     /// Called under HostLock with the callback's private actor incarnation.
     /// A late callback cannot enrich a successor that reused its numeric ID.
-    pub(super) fn observe_chat_directory_thread(&mut self, id: TerminalId, instance: uuid::Uuid) -> Result<(), String> {
-        let Some(record) = self.chats.get(&id).filter(|record| record.execution_instance == instance) else { return Ok(()); };
-        let Some(thread) = record.handle.confirmed_session_id() else { return Ok(()); };
-        if record.session.launch.session_id.as_ref() == Some(&thread) { return Ok(()); }
-        if self.directory_thread_retry.is_some_and(|deadline| Instant::now() < deadline) { return Ok(()); }
+    pub(super) fn observe_chat_directory_thread(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+    ) -> Result<(), String> {
+        let Some(record) = self
+            .chats
+            .get(&id)
+            .filter(|record| record.execution_instance == instance)
+        else {
+            return Ok(());
+        };
+        let Some(thread) = record.handle.confirmed_session_id() else {
+            return Ok(());
+        };
+        if record.session.launch.session_id.as_ref() == Some(&thread) {
+            return Ok(());
+        }
+        if self
+            .directory_thread_retry
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Ok(());
+        }
         let mut source = record.session.clone();
         source.launch.session_id = Some(thread);
         if let Some(registry) = self.model.as_mut() {
-            if let Err(error) = registry.observe_owned_session_thread(&crate::agent_execution::HostedSession::Chat(source.clone())) {
+            if let Err(error) = registry.observe_owned_session_thread(
+                &crate::agent_execution::HostedSession::Chat(source.clone()),
+            ) {
                 self.directory_thread_retry = Some(Instant::now() + Duration::from_secs(1));
                 return Err(error);
             }
         }
         self.directory_thread_retry = None;
-        self.chats.get_mut(&id).expect("actor held under HostLock").session = source;
+        self.chats
+            .get_mut(&id)
+            .expect("actor held under HostLock")
+            .session = source;
         Ok(())
     }
 
@@ -652,9 +676,16 @@ impl HostState {
 
     /// Provider evidence was prepared without this mutex. The caller owns
     /// exclusive control admission and publishes after actor-local completion.
-    pub(super) fn apply_session_relocation(&mut self, edit: &ModelEdit, moves: &[super::model::SessionMove], agent_moves: &[super::model::AgentMove]) -> Result<WorkspaceModel, ProtocolError> {
-        self.registry()?.apply_with_location_moves(edit, moves, agent_moves)
-            .map(|applied| applied.model).map_err(model_unavailable)
+    pub(super) fn apply_session_relocation(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[super::model::SessionMove],
+        agent_moves: &[super::model::AgentMove],
+    ) -> Result<WorkspaceModel, ProtocolError> {
+        self.registry()?
+            .apply_with_location_moves(edit, moves, agent_moves)
+            .map(|applied| applied.model)
+            .map_err(model_unavailable)
     }
 
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
@@ -3442,16 +3473,20 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
     context: Arc<crate::chat::protocol::ExecutionContext>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     use std::os::unix::fs::MetadataExt;
-    let directory = context.directory_descriptor().ok_or_else(|| ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
-        "The native handoff has no verified working-directory descriptor".into(),
-        false,
-    ))?;
-    let metadata = directory.metadata().map_err(|error| ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
-        format!("Inspect the native handoff directory: {error}"),
-        false,
-    ))?;
+    let directory = context.directory_descriptor().ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The native handoff has no verified working-directory descriptor".into(),
+            false,
+        )
+    })?;
+    let metadata = directory.metadata().map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Inspect the native handoff directory: {error}"),
+            false,
+        )
+    })?;
     if !metadata.is_dir() || metadata.nlink() == 0 {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,
@@ -3460,8 +3495,16 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
         ));
     }
     start_terminal_view_owned(
-        shared, client_id, session, options, execution_environment, paired,
-        None, None, None, Some(directory),
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        None,
+        None,
+        None,
+        Some(directory),
     )
 }
 

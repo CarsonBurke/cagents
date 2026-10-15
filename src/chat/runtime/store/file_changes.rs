@@ -98,12 +98,22 @@ fn kind_bytes(kind: &crate::chat::ChangeKind) -> usize {
 fn resolve_file(cwd: Option<&std::path::Path>, source: &str, path: &str) -> Option<String> {
     use std::path::{Component, Path, PathBuf};
     let path = Path::new(path);
-    let absolute = if path.is_absolute() { path.to_owned() }
-        else if source.is_empty() { cwd?.join(path) } else { return None; };
-    if !absolute.is_absolute() { return None; }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else if source.is_empty() {
+        cwd?.join(path)
+    } else {
+        return None;
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
-        match component { Component::CurDir => {}, other => normalized.push(other.as_os_str()) }
+        match component {
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
     }
     Some(normalized.to_string_lossy().into_owned())
 }
@@ -118,28 +128,66 @@ impl Store {
     /// Operational path changes must also rebase relative change summaries.
     /// Patch bytes and provider-supplied identities remain untouched. Stream
     /// metadata rows rather than hydrating the transcript or all patch chunks.
-    pub(in crate::chat::runtime) fn relocate_file_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
-        if self.file_cwd.as_deref() == Some(directory) { return Ok(()); }
+    pub(in crate::chat::runtime) fn relocate_file_directory(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        if self.file_cwd.as_deref() == Some(directory) {
+            return Ok(());
+        }
         let revision = self.file_revision.saturating_add(1);
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         {
-            let mut rows = tx.prepare("SELECT source,path FROM file_totals WHERE source='' AND substr(path,1,1)<>'/'").map_err(|error| error.to_string())?;
-            for row in rows.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(|error| error.to_string())? {
-                let (source,path) = row.map_err(|error| error.to_string())?;
+            let mut rows = tx
+                .prepare(
+                    "SELECT source,path FROM file_totals WHERE source='' AND substr(path,1,1)<>'/'",
+                )
+                .map_err(|error| error.to_string())?;
+            for row in rows
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?
+            {
+                let (source, path) = row.map_err(|error| error.to_string())?;
                 let resolved = resolve_file(Some(directory), &source, &path);
-                tx.execute("UPDATE file_totals SET resolved=?3,revision=?4 WHERE source=?1 AND path=?2", params![source,path,resolved,revision]).map_err(|error| error.to_string())?;
+                tx.execute(
+                    "UPDATE file_totals SET resolved=?3,revision=?4 WHERE source=?1 AND path=?2",
+                    params![source, path, resolved, revision],
+                )
+                .map_err(|error| error.to_string())?;
             }
         }
-        tx.execute("DELETE FROM file_paths", []).map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM file_paths", [])
+            .map_err(|error| error.to_string())?;
         {
-            let mut rows = tx.prepare("SELECT source,path,resolved FROM file_totals WHERE succeeded>0").map_err(|error| error.to_string())?;
-            for row in rows.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).map_err(|error| error.to_string())? {
-                let (source,path,resolved) = row.map_err(|error| error.to_string())?;
-                let identity = match resolved { Some(path) => format!("p:{path}"), None => format!("u:{}", serde_json::to_string(&(source,path)).map_err(|error| error.to_string())?) };
+            let mut rows = tx
+                .prepare("SELECT source,path,resolved FROM file_totals WHERE succeeded>0")
+                .map_err(|error| error.to_string())?;
+            for row in rows
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+            {
+                let (source, path, resolved) = row.map_err(|error| error.to_string())?;
+                let identity = match resolved {
+                    Some(path) => format!("p:{path}"),
+                    None => format!(
+                        "u:{}",
+                        serde_json::to_string(&(source, path)).map_err(|error| error.to_string())?
+                    ),
+                };
                 tx.execute("INSERT INTO file_paths(identity,applied) VALUES(?1,1) ON CONFLICT(identity) DO UPDATE SET applied=applied+1", [identity]).map_err(|error| error.to_string())?;
             }
         }
-        let applied: usize = tx.query_row("SELECT count(*) FROM file_paths", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+        let applied: usize = tx
+            .query_row("SELECT count(*) FROM file_paths", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         self.file_cwd = Some(directory.to_owned());
         self.applied_files = applied;

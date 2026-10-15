@@ -448,7 +448,8 @@ impl Registry {
             )
             .map_err(|error| error.to_string())?;
         let agent = read_agent(&tx, accepted.agent.id)?;
-        if decode::<Run>(&stored)? != accepted.run || !same_dispatch_agent(&agent, &accepted.agent) {
+        if decode::<Run>(&stored)? != accepted.run || !same_dispatch_agent(&agent, &accepted.agent)
+        {
             return Err(
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
             );
@@ -682,12 +683,29 @@ impl Registry {
         directory: Option<crate::agent_execution::DirectoryIdentity>,
         now_ms: u64,
     ) -> Result<Accepted, String> {
-        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let accepted = Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms)?;
         if accepted.created && matches!(request.destination, Destination::New(_)) {
             if let Some(directory) = directory {
-                let stored: Option<String> = tx.query_row("SELECT directory FROM agent_policies WHERE agent=?1", [accepted.agent.id.to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?.flatten();
-                if stored.map(|value| decode::<crate::agent_execution::DirectoryIdentity>(&value)).transpose()?.is_some_and(|stored| stored != directory) { return Err("The selected agent directory changed during acceptance".into()); }
+                let stored: Option<String> = tx
+                    .query_row(
+                        "SELECT directory FROM agent_policies WHERE agent=?1",
+                        [accepted.agent.id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .flatten();
+                if stored
+                    .map(|value| decode::<crate::agent_execution::DirectoryIdentity>(&value))
+                    .transpose()?
+                    .is_some_and(|stored| stored != directory)
+                {
+                    return Err("The selected agent directory changed during acceptance".into());
+                }
                 tx.execute("INSERT INTO agent_policies(agent,directory) VALUES (?1,?2) ON CONFLICT(agent) DO UPDATE SET directory=excluded.directory", params![accepted.agent.id.to_string(), encode(&directory)?]).map_err(|error| error.to_string())?;
             }
         }
