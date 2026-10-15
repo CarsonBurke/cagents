@@ -2,6 +2,7 @@
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
 mod adapter_items;
+mod child_tools;
 pub(super) use adapter_items::reader as adapter_item_reader;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -80,6 +81,8 @@ pub(crate) struct Store {
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
     pending_input: Option<(String, usize, String)>,
+    pending_child_tool: Option<child_tools::Pending>,
+    child_tools_unavailable: Option<&'static str>,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -150,6 +153,7 @@ impl Store {
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            db.execute_batch(child_tools::SCHEMA).map_err(|e| e.to_string())?;
             Ok(Self {
                 canonical_generation: uuid::Uuid::new_v4(),
                 file_revision: 0,
@@ -179,6 +183,8 @@ impl Store {
                 presented_children: Default::default(),
                 pending_text: None,
                 pending_input: None,
+                pending_child_tool: None,
+                child_tools_unavailable: None,
             })
         })();
         if result.is_err() {
@@ -657,8 +663,8 @@ impl Store {
                 _ => {}
             }
         }
+        let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
         self.index_child_event(&event)?;
-        let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?
