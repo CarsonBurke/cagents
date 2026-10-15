@@ -55,9 +55,11 @@ tasks require fresh update confirmation.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
-Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status and single-handle wait return `data.agent`, `data.run`, and `data.timed_out`; a multi-handle wait returns `data.results` (each with `agent` and `run`) and `data.timed_out`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
+Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status returns `data.agent`, `data.run`, and `data.timed_out`; wait always returns `data.results` (each with `agent`, `run`, and `outcome`), `data.timed_out`, `data.ended_by`, and the aggregate `data.outcome`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
 
 `wait` returns once every handle has settled or is waiting for input, or with `--any` once one has. `--wait` on spawn or send does the same for the run just accepted. Both are bounded by `--timeout` seconds (60 by default) and report the last known state when it passes; a waiting run is polled until then, so one answered meanwhile is not reported stale.
+
+Waiting commands use exit code **0** for success, **3** for timeout, **4** for failed, cancelled or interrupted work, and **5** for input, approval or an arrived message requiring attention. General errors remain **1** and usage errors **2**. This applies to `agent wait`, `agent spawn --wait`, `agent send --wait`, and `automation propose --wait` / `automation proposal --wait` (pending at the deadline is 3; declined is 4). `terminal wait` timeout also returns 3. An uncompleted wait never returns success. With `--any`, the first ready run in polling order determines the outcome. With all handles, failure outranks input/approval, which outranks timeout, which outranks success. Results retain each run's individual outcome.
 
 `requests` lists what an agent is waiting on: each request's ID, its actions, and its fields with their choices. `answer` sends one of the listed actions, with `--field FIELD=VALUE` repeated for several fields or values; the daemon rejects a request, action, or field the agent did not ask for. Field values are command arguments, visible to other local processes, so do not pass secrets this way. `interrupt` stops the active run. Both act only while the agent's latest run is active, and as its owner rather than as a person taking it over, so the agent stays under its owner's control. Once a person has taken the agent over in cagents or its console, they are refused: its turns and the questions they raise are that person's. Secret field values the provider prefilled are never returned.
 
@@ -182,3 +184,67 @@ A personal `cagents` skill takes precedence over the bundled fallback. Managed C
 Launch also removes the retired `cagents-agents` bundle only when its directory contains nothing but a regular, single-link `SKILL.md` matching a recorded legacy hash; edited copies, links, and additional resources are preserved. Provider discovery opt-outs still apply.
 
 These locations follow the providers' documented skill discovery: [Claude skills](https://code.claude.com/docs/en/skills), [Codex skills](https://learn.chatgpt.com/docs/build-skills), and [OMP skills](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md). The same installed instructions appear in cagents' native filesystem skill catalog and provider terminal sessions.
+
+## CLI compatibility changes
+
+Agent waits now always return `data.results`, including a single handle; consumers
+that previously read `data.agent` / `data.run` for a one-handle wait should read
+`data.results[0].agent` / `data.results[0].run`. Each result includes an `outcome`;
+a run still active when `--any` returns has `pending`, while an active run at the
+deadline has `timed_out`. Waiting commands now return the nonzero exit codes
+above while retaining their normal JSON success envelope and last known results.
+The envelope's `ok` means the command was processed; use the exit code or
+`data.outcome` to determine whether the work completed successfully.
+
+If the deadline expires before a run’s first status arrives, `agent wait` keeps
+any statuses already received and reports the unread IDs in `data.unresolved_runs`.
+Spawn/send retain their durable acceptance when that first status is unavailable.
+No run outcome is invented from missing status evidence.
+
+## Shell use and configuration
+
+`cagents completions bash`, `zsh`, `fish`, `elvish`, or `powershell` writes the
+matching completion script without starting services. For example, install fish
+completions with `cagents completions fish > ~/.config/fish/completions/cagents.fish`.
+Every command and argument is described by `--help`. Automation pages accept
+1–100 results; continue `automation list` with `--after` and the last returned ID.
+
+List commands share aligned headers and explicit empty messages. Terminal lists
+show live sessions by default; `terminal list --all` includes retained completed
+sessions and `--exited` selects completed sessions. List JSON contains only
+identity, state, title, exit status, attachment state, program, directory and
+generation; use `terminal show ID`
+for the full descriptor, including the launch environment and recovery recipe.
+Provider, surface and state values in CLI JSON use snake_case; provider arguments
+accept both `Claude` and `claude`.
+
+Pass `--no-start` (or set `CAGENTS_NO_START=1`) to connect without starting a
+daemon, including on a selected remote device. An absent daemon reports
+`daemon_not_running`. `daemon stop` on an absent daemon succeeds with
+`{"state":"already_stopped"}` in its data envelope.
+
+`cagents settings get terminal_font_size` reads a typed value;
+`settings set terminal_font_size 15` validates and saves through the app's own
+settings code. Values use TOML syntax, unquoted strings are accepted, and `null`
+clears optional settings. Dots select nested keys. `settings path` prints the
+configuration path and `settings open` creates the file if needed and opens it.
+Running windows reload valid file changes. Settings commands target `--device`
+when supplied; open the printed path on that device for remote editing.
+
+`account list` shows registered accounts and defaults. Select a default with
+`account default claude claude/UUID`, `account default claude system`, or
+`account default claude automatic`. `account sign-in claude` runs the official
+provider login in a new isolated account home and registers its verified identity
+on success. Provider login output goes to stderr so JSON stdout remains parseable.
+`account remove PROVIDER/UUID` uses the same daemon safety checks as the app and
+retains managed transcript files; it is refused under an inherited agent token.
+
+`agent transcript ID --format md` exports readable cached messages and tools.
+Use `--format json` for JSON Lines pages containing `parts`, `cursor`, `at_end`,
+`closed` and `partial_history`; large items are split into bounded parts with
+byte offsets. `--follow` streams newly appended cached text and items, then exits
+when the agent closes. Each connection retains only a read lease on the cache,
+so following never moves a window's history cursor or keeps a provider running.
+If a restored provider has older history outside the cache, `partial_history`
+reports that gap and Markdown prints a notice. Open the export before closing
+an agent; a cache already discarded by closure reports it is unavailable.

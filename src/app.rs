@@ -17522,7 +17522,7 @@ fn load_repository(
         .discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
     let worktrees = service
-        .list_worktrees(&repository.common_dir, &cancellation)
+        .list_worktrees_for_repository(&repository, &cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))

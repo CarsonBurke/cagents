@@ -11,94 +11,134 @@ pub enum AutomationCommand {
     /// Save exact launch settings for approval in cagents, without creating a schedule.
     Propose {
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
-        /// Wait for the user's decision so the requesting tool call resumes.
+        /// Wait for the decision. Exit: 0 approved, 3 timeout, 4 declined.
         #[arg(long)]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Read only this conversation's immutable approval request.
     Proposal {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Wait for the user decision before returning.")]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
-    /// List definitions, with a cursor for the next page.
+    /// List definitions; continue with --after using the last returned ID.
     List {
         #[arg(long)]
+        #[arg(help = "Continue after the last automation UUID in the previous page.")]
         after: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
+    /// Read one definition and its current revisions.
     Show {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
     },
     /// Replace a definition at the exact revision shown by `show`.
     Edit {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
     /// Confirm unattended execution of the displayed definition revision.
     Enable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Pause future firings without changing the definition.
     Disable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Remove a definition. Past runs remain in history.
     Remove {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Run the exact execution revision once; reuse request-id for safe retry.
     RunNow {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact approved execution revision to run.")]
         execution_revision: u64,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Request cancellation of one active firing.
     Cancel {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+    /// List durable firings, including outcomes and skip reasons.
     History {
         /// Omit to include all automations, including removed definitions.
         id: Option<Uuid>,
         #[arg(long, requires = "before_id")]
+        #[arg(help = "Creation time from the last history row; pair with --before-id.")]
         before_ms: Option<u64>,
         #[arg(long, requires = "before_ms")]
+        #[arg(help = "ID from the last history row; pair with --before-ms.")]
         before_id: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
     /// Read one immutable firing, including its bounded execution result.
     Run {
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+}
+
+fn parse_page_limit(value: &str) -> Result<usize, String> {
+    let value = value.parse::<usize>().map_err(|_| "limit must be between 1 and 100")?;
+    if !(1..=100).contains(&value) { return Err("limit must be between 1 and 100".into()); }
+    Ok(value)
 }
 
 impl ControlClient {
@@ -157,7 +197,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let mut reply = client
@@ -178,16 +218,17 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             if Instant::now() >= deadline {
                 break;
             }
-            reply = client
-                .automation_until(
-                    authority.clone(),
-                    Request::Proposal { id },
-                    deadline.min(Instant::now() + IO_TIMEOUT),
-                )
-                .map_err(protocol_error)?;
+            match poll_proposal(&mut client, authority.clone(), id, deadline)? {
+                Some(current) => reply = current,
+                None => break,
+            }
         }
     }
-    let (data, human) = match reply {
+    let outcome = match (&reply, wait) {
+        (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
+        _ => None,
+    };
+    let (mut data, human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
                 crate::automations::ProposalState::Pending => format!(
@@ -212,18 +253,10 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Automation approval requests".into(),
         ),
         Response::Listed(entries) => {
-            let human = entries
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "{}\t{}\t{}",
-                        entry.id,
-                        if entry.enabled { "enabled" } else { "paused" },
-                        entry.name
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["ID", "STATE", "NAME", "PROVIDER", "NEXT"], entries.iter().map(|entry| vec![
+                entry.id.to_string(), if entry.enabled { "enabled".into() } else { "paused".into() }, entry.name.clone(),
+                entry.provider.executable().into(), entry.next.as_ref().map(|next| format::relative_time(next.due_ms)).unwrap_or_else(|| "unscheduled".into()),
+            ]).collect(), "No automations");
             (json!({"automations": entries}), human)
         }
         Response::Automation(automation) => {
@@ -241,23 +274,21 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"automation": automation}), human)
         }
         Response::Firing(firing) => {
-            let human = format!("{}\t{:?}", firing.id, firing.state);
+            let human = format!("{}\t{}", firing.id, format::label(firing.state));
             (json!({"firing": firing}), human)
         }
         Response::History(history) => {
-            let human = history
-                .firings
-                .iter()
-                .map(|run| format!("{}\t{:?}", run.id, run.state))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["ID", "NAME", "STATE", "CREATED", "DETAIL"], history.firings.iter().map(|run| vec![
+                run.id.to_string(), run.name.clone(), format::label(run.state), format::relative_time(run.created_ms),
+                run.skip.as_ref().map(format::label).or_else(|| run.diagnostic.clone()).unwrap_or_default(),
+            ]).collect(), "No automation runs");
             (json!({"history": history}), human)
         }
         Response::Detail(detail) => {
             let human = format!(
-                "{}\t{:?}\n{}",
+                "{}\t{}\n{}",
                 detail.firing.id,
-                detail.firing.state,
+                format::label(detail.firing.state),
                 detail
                     .run
                     .as_ref()
@@ -276,11 +307,39 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Cancellation requested; inspect the run for its confirmed outcome.".into(),
         ),
     };
+    if let Some(outcome) = outcome {
+        data["outcome"] = json!(outcome);
+    }
     Ok(CommandOutput {
         command: name,
         data,
         human,
     })
+}
+
+fn poll_proposal(
+    client: &mut ControlClient,
+    authority: crate::agent_execution::Authority,
+    id: Uuid,
+    deadline: Instant,
+) -> Result<Option<Response>, AppError> {
+    match client.automation_until(
+        authority,
+        Request::Proposal { id },
+        deadline.min(Instant::now() + IO_TIMEOUT),
+    ) {
+        Ok(reply) => Ok(Some(reply)),
+        Err(error) if is_timeout_error(&error) && Instant::now() >= deadline => Ok(None),
+        Err(error) => Err(protocol_error(error)),
+    }
+}
+
+fn proposal_outcome(state: &crate::automations::ProposalState) -> WaitOutcome {
+    match state {
+        crate::automations::ProposalState::Pending => WaitOutcome::TimedOut,
+        crate::automations::ProposalState::Declined => WaitOutcome::Failed,
+        crate::automations::ProposalState::Approved { .. } => WaitOutcome::Succeeded,
+    }
 }
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
@@ -408,6 +467,71 @@ fn read_definition(path: &Path) -> Result<Definition, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_pending_proposal_poll_preserves_pending_timeout_outcome() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("proposal-wait"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        let id = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            let connected: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connected.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(request.request, ClientRequest::Automation { operation: Request::Proposal { id: received }, .. } if received == id)
+            );
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(
+            poll_proposal(
+                &mut client,
+                Authority::default(),
+                id,
+                Instant::now() + Duration::from_millis(25)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let outcome = proposal_outcome(&crate::automations::ProposalState::Pending);
+        assert_eq!(outcome.exit_code(), 3);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proposal_wait_uses_the_shared_exit_contract() {
+        use crate::automations::ProposalState;
+        for (state, code) in [
+            (ProposalState::Pending, 3),
+            (ProposalState::Declined, 4),
+            (ProposalState::Approved { automation: Uuid::new_v4(), execution_revision: 1 }, 0),
+        ] {
+            assert_eq!(CommandOutput {
+                command: "automation.propose",
+                data: json!({"outcome": proposal_outcome(&state)}),
+                human: String::new(),
+            }.exit_code(), ExitCode::from(code));
+        }
+    }
 
     fn parse(arguments: &[&str]) -> Result<AutomationCommand, clap::Error> {
         match Cli::try_parse_from(arguments)?.command {

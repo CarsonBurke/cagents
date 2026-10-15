@@ -109,6 +109,15 @@ pub(crate) enum Update {
 }
 
 #[derive(Clone)]
+pub(crate) struct TranscriptReader(Arc<Mutex<Store>>);
+impl TranscriptReader {
+    pub(crate) fn read(&self, cursor: Option<crate::agent_execution::TranscriptCursor>)
+        -> Result<crate::agent_execution::TranscriptPage, String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).export(cursor)
+    }
+}
+
+#[derive(Clone)]
 pub struct Handle(Arc<Inner>);
 
 struct OwnedSocket(std::path::PathBuf);
@@ -732,6 +741,11 @@ impl Handle {
             .usage
             .clone()
     }
+    /// Retain only the transcript cache, never the provider process or resident UI window.
+    pub(crate) fn transcript_reader(&self) -> TranscriptReader {
+        TranscriptReader(Arc::clone(&self.0.store))
+    }
+
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());

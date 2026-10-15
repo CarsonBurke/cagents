@@ -65,6 +65,7 @@ pub struct ReplyArgs {
     /// Wait for the answer to this reply, as `ask` does.
     #[arg(long)]
     pub(super) wait: bool,
+    /// Maximum seconds to wait before returning without a message or reply.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -78,6 +79,7 @@ pub struct InboxArgs {
     /// Wait for a message if none is new.
     #[arg(long, conflicts_with = "all")]
     pub(super) wait: bool,
+    /// Maximum seconds to wait before returning without a message or reply.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -367,7 +369,7 @@ struct Mailbox {
 impl Mailbox {
     fn connect() -> Result<Self, AppError> {
         let socket =
-            terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+            control_daemon_socket()?;
         let client =
             ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
         Ok(Self {

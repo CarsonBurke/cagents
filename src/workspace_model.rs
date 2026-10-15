@@ -35,6 +35,12 @@ pub const PENDING_ORDINAL: u32 = u32::MAX;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProject {
     pub repository: PathBuf,
+    /// Verified checkout used to discover this project; identity stays repository.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// Verified primary checkout, retained when a linked checkout becomes current.
+    #[serde(default)]
+    pub primary_checkout: Option<PathBuf>,
     pub name: String,
     #[serde(default)]
     pub kind: ProjectKind,
@@ -213,11 +219,15 @@ impl WorkspaceModel {
             | ModelEdit::ChangeView { .. } => {}
             ModelEdit::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             }
             | ModelEdit::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => {
@@ -227,8 +237,13 @@ impl WorkspaceModel {
                     .iter_mut()
                     .find(|project| project.repository == *repository)
                 {
-                    Some(project) => project.name = name.clone(),
+                    Some(project) => {
+                        project.name = name.clone();
+                        if let Some(checkout) = checkout { project.checkout = Some(checkout.clone()); }
+                        if let Some(primary) = primary_checkout { project.primary_checkout = Some(primary.clone()); }
+                    },
                     None => self.projects.push(ModelProject {
+                        checkout: checkout.clone(), primary_checkout: primary_checkout.clone(),
                         repository: repository.clone(),
                         name: name.clone(),
                         kind: *kind,
@@ -323,6 +338,10 @@ pub enum ModelEdit {
     /// Upsert by path. A repeat updates the name and keeps the kind and rank.
     OpenProject {
         repository: PathBuf,
+        #[serde(default)]
+        checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
         name: String,
         #[serde(default)]
         kind: ProjectKind,
@@ -331,6 +350,10 @@ pub enum ModelEdit {
     /// sync upserts cannot, because one may have been queued before the close.
     ReopenProject {
         repository: PathBuf,
+        #[serde(default)]
+        checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
         name: String,
         #[serde(default)]
         kind: ProjectKind,
@@ -384,6 +407,15 @@ pub enum ModelEdit {
     },
 }
 
+fn verified_primary_checkout(repository: &Path, primary: Option<PathBuf>, checkout: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let repository = canonical_repository(repository)?;
+    // Retained discovery metadata may become stale after a checkout is removed,
+    // unmounted, or reused. An unavailable primary must not block a valid linked
+    // open; absent updates preserve the registry's prior discovery information.
+    Ok(primary.as_deref().and_then(|root| crate::project_location::primary_checkout(root, &repository))
+        .or_else(|| checkout.and_then(|root| crate::project_location::primary_checkout(root, &repository))))
+}
+
 impl ModelEdit {
     /// Resolves this edit's repository key, once, at the boundary.
     ///
@@ -394,19 +426,27 @@ impl ModelEdit {
         Ok(match self {
             Self::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => Self::OpenProject {
                 repository: canonical_repository(&repository)?,
+                primary_checkout: verified_primary_checkout(&repository, primary_checkout, checkout.as_deref())?,
+                checkout: checkout.map(|path| std::fs::canonicalize(&path).map_err(|error| error.to_string())).transpose()?,
                 name,
                 kind,
             },
             Self::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             } => Self::ReopenProject {
                 repository: canonical_repository(&repository)?,
+                primary_checkout: verified_primary_checkout(&repository, primary_checkout, checkout.as_deref())?,
+                checkout: checkout.map(|path| std::fs::canonicalize(&path).map_err(|error| error.to_string())).transpose()?,
                 name,
                 kind,
             },
@@ -524,6 +564,34 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn legacy_project_metadata_defaults_checkout_and_none_updates_preserve_it() {
+        let legacy: ModelProject = serde_json::from_value(serde_json::json!({
+            "repository": "/metadata/project.git", "name": "project", "ordinal": 7
+        })).unwrap();
+        assert_eq!(legacy.checkout, None);
+        assert_eq!(legacy.primary_checkout, None);
+        let mut model = WorkspaceModel { projects: vec![legacy], ..Default::default() };
+        model.fold(1, &ModelEdit::OpenProject {
+            repository: "/metadata/project.git".into(), checkout: Some("/checkouts/project".into()), primary_checkout: Some("/checkouts/project".into()),
+            name: "project".into(), kind: ProjectKind::Git,
+        });
+        let legacy_edit: ModelEdit = serde_json::from_value(serde_json::json!({
+            "OpenProject": { "repository": "/metadata/project.git", "name": "renamed", "kind": "Git" }
+        })).unwrap();
+        model.fold(2, &legacy_edit);
+        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/project")));
+        assert_eq!(model.projects[0].name, "renamed");
+        model.fold(3, &ModelEdit::OpenProject {
+            repository: "/metadata/project.git".into(), checkout: Some("/checkouts/linked".into()), primary_checkout: None,
+            name: "project".into(), kind: ProjectKind::Git,
+        });
+        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/linked")));
+        assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/checkouts/project")));
+        assert_eq!(model.projects[0].ordinal, 7);
+        assert_eq!(model.projects[0].name, "project");
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {

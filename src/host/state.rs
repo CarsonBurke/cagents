@@ -69,6 +69,7 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    terminal_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
 }
 
@@ -254,6 +255,7 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    pub(super) transcript_readers: BTreeMap<(ClientId, crate::model::AgentId), crate::chat::runtime::TranscriptReader>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
@@ -332,6 +334,7 @@ impl HostState {
             model: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            transcript_readers: BTreeMap::new(),
             automations: None,
             mailbox: None,
             mailbox_seal: None,
@@ -395,7 +398,7 @@ impl HostState {
 
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
-    pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+    pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) -> Vec<crate::chat::runtime::TranscriptReader> {
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -406,6 +409,12 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.take_transcript_readers(client_id)
+    }
+
+    fn take_transcript_readers(&mut self, client_id: ClientId) -> Vec<crate::chat::runtime::TranscriptReader> {
+        let keys = self.transcript_readers.keys().filter(|(reader, _)| *reader == client_id).copied().collect::<Vec<_>>();
+        keys.into_iter().filter_map(|key| self.transcript_readers.remove(&key)).collect()
     }
 
     /// Installs the durable shared sidebar model.
@@ -676,7 +685,7 @@ impl HostState {
         }
     }
 
-    pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+    pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> (Vec<TerminalHandle>, Vec<crate::chat::runtime::TranscriptReader>) {
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -722,7 +731,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
-        handles
+        (handles, self.take_transcript_readers(client_id))
     }
 
     pub(crate) fn attach(
@@ -948,6 +957,9 @@ impl HostState {
             }
         };
         Ok(TerminalDescriptor {
+            title: record.conversation_title().or(record.terminal_title.as_deref()).unwrap_or(&record.session.launch.program).to_owned(),
+            visibility: self.subscriptions.visibility(terminal_id),
+            completed: record.handle.is_completed(),
             screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),
@@ -1167,6 +1179,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                terminal_title: None,
                 working_directory: None,
             },
         );
@@ -3966,6 +3979,9 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
+        if let WireTerminalEvent::TitleChanged { title } = &wire_event {
+            record.terminal_title = Some(title.clone());
+        }
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }
@@ -4130,6 +4146,7 @@ mod tests {
             super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: repository.clone(),
                 name: "test".into(),
                 kind: Default::default(),

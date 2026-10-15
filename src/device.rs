@@ -90,6 +90,20 @@ const MULTIPLEX_RETRY: Duration = Duration::from_secs(300);
 /// answer would hold process exit for `ConnectTimeout` and then log in afresh.
 const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+pub(crate) const BRIDGE_ABSENT_EXIT: u8 = 69;
+const BRIDGE_ABSENT_MARKER: &str = "cagents daemon bridge: daemon_not_running";
+#[derive(Debug)]
+struct DaemonNotRunning;
+impl std::fmt::Display for DaemonNotRunning {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("The selected device daemon is not running; omit --no-start to start it")}
+}
+impl std::error::Error for DaemonNotRunning {}
+pub(crate) fn daemon_absent(error:&io::Error)->bool {error.get_ref().is_some_and(|error|error.is::<DaemonNotRunning>())}
+pub(crate) fn report_absent_bridge(){eprintln!("{BRIDGE_ABSENT_MARKER}");}
+fn selected_daemon_absent()->bool {
+    SELECTED.get().and_then(|context|context.bridge.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|bridge|bridge.transport.daemon_missing.load(std::sync::atomic::Ordering::Acquire))).unwrap_or(false)
+}
+
 pub fn selected() -> Option<&'static Device> {
     SELECTED.get().map(|context| &context.device)
 }
@@ -265,6 +279,7 @@ struct Transport {
     pool: Arc<Mutex<Vec<Master>>>,
     paused: Mutex<Option<Instant>>,
     last_error: Mutex<Option<String>>,
+    daemon_missing: std::sync::atomic::AtomicBool,
     cancelled: Cancellation,
 }
 impl Drop for Transport {
@@ -360,7 +375,8 @@ fn ssh(control: Option<&str>) -> Command {
 fn bridge_command(device: &Device, control: Option<&str>) -> Command {
     let mut command = ssh(control);
     command.args(["--", &device.host]);
-    command.arg(format!("{} daemon bridge", quote(&device.executable)));
+    let policy = if crate::control::daemon_autostart_disabled() { " --no-start" } else { "" };
+    command.arg(format!("{}{policy} daemon bridge", quote(&device.executable)));
     command
 }
 /// The control socket of one master, or `None` where SSH could not use it:
@@ -446,6 +462,7 @@ impl ConnectionContext {
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
             last_error: Mutex::new(None),
+            daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled,
         });
         fs::set_permissions(&transport.directory, fs::Permissions::from_mode(0o700))?;
@@ -596,7 +613,7 @@ struct Forwarding {
     stream: UnixStream,
     upstream: Option<thread::JoinHandle<io::Result<u64>>>,
     downstream: Option<thread::JoinHandle<io::Result<u64>>>,
-    diagnostics: Option<thread::JoinHandle<String>>,
+    diagnostics: Option<thread::JoinHandle<ForwardingDiagnostics>>,
     stop_diagnostics: Arc<Cancellation>,
     received_output: Arc<std::sync::atomic::AtomicBool>,
     settled: bool,
@@ -608,6 +625,9 @@ impl Forwarding {
         stream: UnixStream,
         transport: Option<Arc<Transport>>,
     ) -> io::Result<Self> {
+        if let Some(transport) = &transport {
+            transport.daemon_missing.store(false, std::sync::atomic::Ordering::Release);
+        }
         let stop = match Cancellation::new() {
             Ok(stop) => Arc::new(stop),
             Err(error) => {
@@ -693,11 +713,13 @@ impl Forwarding {
             .unwrap_or_else(|_| Err(io::Error::other("SSH output worker panicked")));
         // EOF and copy failure must wake the input worker before waiting for
         // the child, whose remote command may itself be waiting for stdin EOF.
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        // Wake the input copier (and remote stdin) while retaining our output
+        // half until the child's typed failure is recorded. A caller seeing EOF
+        // can then classify absence without racing the SSH teardown worker.
+        let _ = self.stream.shutdown(std::net::Shutdown::Read);
         if result.is_err() {
             let _ = self.child.kill();
         }
-        self.stop_diagnostics.cancel();
         let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
         let status = loop {
             if let Some(status) = self.child.try_wait()? {
@@ -726,12 +748,14 @@ impl Forwarding {
             && let Some(transport) = &self.transport
             && !transport.cancelled.is_cancelled()
         {
+            transport.daemon_missing.store(status.code()==Some(i32::from(BRIDGE_ABSENT_EXIT)) && detail.daemon_absent,std::sync::atomic::Ordering::Release);
             *transport
                 .last_error
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) =
-                Some(format!("SSH to {} exited {status}: {detail}", device.host));
+                Some(format!("SSH to {} exited {status}: {}", device.host,detail.text));
         }
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         result.map(|_| ())
     }
 }
@@ -866,41 +890,51 @@ fn copy_transport(
     Ok(total)
 }
 
-fn capture_diagnostics(mut stderr: std::process::ChildStderr, stop: &Cancellation) -> String {
+#[derive(Default)]
+struct ForwardingDiagnostics {text:String,daemon_absent:bool}
+fn capture_diagnostics(mut stderr: std::process::ChildStderr, stop: &Cancellation) -> ForwardingDiagnostics {
     use std::io::Read;
     let mut captured = Vec::new();
     let mut chunk = [0u8; 1024];
+    let marker=BRIDGE_ABSENT_MARKER.as_bytes();
+    let mut marker_progress=Some(0usize);
+    let mut daemon_absent=false;
+    let mut cancelled_bytes=0usize;
     loop {
         match stderr.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
                 let remaining = 4096usize.saturating_sub(captured.len());
                 captured.extend_from_slice(&chunk[..count.min(remaining)]);
-                // Drain an already available diagnostic prefix after child
-                // exit, while bounding cancellation of a continuously busy
-                // descriptor inherited by the persistent master.
-                if stop.is_cancelled() && captured.len() == 4096 {
-                    break;
+                // Parse the receipt independently of the bounded diagnostic
+                // prefix, including markers split across pipe reads.
+                for byte in &chunk[..count] {
+                    if *byte==b'\n' {
+                        daemon_absent |= marker_progress==Some(marker.len());
+                        marker_progress=Some(0);
+                    } else {
+                        marker_progress=marker_progress.and_then(|index|(index<marker.len() && marker[index]==*byte).then_some(index+1));
+                    }
                 }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                // Drain available bytes after settlement, but a persistent SSH
+                // master retaining a busy descriptor cannot prevent teardown.
                 if stop.is_cancelled() {
-                    break;
+                    cancelled_bytes=cancelled_bytes.saturating_add(count);
+                    if cancelled_bytes>=64*1024 {break;}
                 }
-                continue;
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.is_cancelled() {
-                    break;
-                }
-                if wait_transport_io(&stderr, libc::POLLIN, stop, None).is_err() {
-                    break;
-                }
+                if stop.is_cancelled() {break;}
+                if wait_transport_io(&stderr, libc::POLLIN, stop, None).is_err() && !stop.is_cancelled() {break;}
+                // On cancellation try one final nonblocking drain: data and
+                // cancellation may become ready in the same scheduling slice.
             }
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&captured).trim().to_owned()
+    daemon_absent |= marker_progress==Some(marker.len());
+    ForwardingDiagnostics{text:String::from_utf8_lossy(&captured).trim().to_owned(),daemon_absent}
 }
 
 fn lock_starting<'a>(
@@ -956,8 +990,16 @@ pub fn serve_stdio() -> io::Result<()> {
             "XDG_RUNTIME_DIR is missing; configure an owned private runtime directory for the remote daemon",
         ));
     }
-    let path = crate::terminal::ensure_daemon_ready().map_err(io::Error::other)?;
-    let stream = UnixStream::connect(path)?;
+    let path = if crate::control::daemon_autostart_disabled() {
+        crate::terminal::ipc::daemon_socket_path()?
+    } else {
+        crate::terminal::ensure_daemon_ready().map_err(io::Error::other)?
+    };
+    let stream = UnixStream::connect(path).map_err(|error| {
+        if crate::control::daemon_autostart_disabled() && matches!(error.kind(),io::ErrorKind::NotFound|io::ErrorKind::ConnectionRefused) {
+            io::Error::new(io::ErrorKind::NotConnected,DaemonNotRunning)
+        } else {error}
+    })?;
     let mut upstream = stream.try_clone()?;
     let input = thread::spawn(move || {
         let result = copy_flushed(&mut io::stdin().lock(), &mut upstream);
@@ -1027,6 +1069,7 @@ mod tests {
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
             last_error: Mutex::new(None),
+            daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled: Cancellation::new().unwrap(),
         })
     }
@@ -1089,6 +1132,25 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!path.exists());
         assert!(context.socket_path().is_err());
+    }
+
+    #[test]
+    fn remote_absence_is_published_before_eof_and_requires_both_typed_receipts() {
+        use std::io::Read;
+        for (code,diagnostic,missing,delayed) in [(69,BRIDGE_ABSENT_MARKER,true,false),(255,BRIDGE_ABSENT_MARKER,false,false),(69,"ordinary SSH failure",false,false),(69,BRIDGE_ABSENT_MARKER,true,true)] {
+            let directory=tempfile::tempdir().unwrap();
+            let transport=fixture_transport(Device{name:"fixture".into(),host:"unused-fixture".into(),executable:"cagents".into()},directory.path().to_path_buf());
+            let script=if delayed {"exec 1>&-; printf '%s\n' \"$3\" >&2; sleep .05; printf '%s\n' \"$1\" >&2; exit \"$2\""} else {"printf '%s\n' \"$1\" >&2; exit \"$2\""};
+            let child=Command::new("/bin/sh").arg("-c").arg(script).arg("fixture").arg(diagnostic).arg(code.to_string()).arg("banner".repeat(1000)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let (mut client,server)=UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let forwarding=Forwarding::start(child,server,Some(transport.clone())).unwrap();
+            let device=transport.device.clone();
+            let worker=thread::spawn(move ||forwarding.finish(&device));
+            let mut output=Vec::new();client.read_to_end(&mut output).unwrap();
+            assert_eq!(transport.daemon_missing.load(std::sync::atomic::Ordering::Acquire),missing,"EOF must observe the settled remote receipt");
+            worker.join().unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -1591,6 +1653,7 @@ pub fn prepare() -> io::Result<()> {
         Ok(_) => Err(io::Error::other(
             "remote daemon returned an unexpected device identity",
         )),
+        Err(_) if selected_daemon_absent()=>Err(io::Error::new(io::ErrorKind::NotConnected,DaemonNotRunning)),
         Err(error) => Err(io::Error::other(
             format!(
                 "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",

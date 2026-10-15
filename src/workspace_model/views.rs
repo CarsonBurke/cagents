@@ -8,7 +8,9 @@ use std::path::PathBuf;
 /// the path distinguishes linked worktrees and ordinary folder strips.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Scope {
+    #[serde(alias = "channel")]
     Channel(ChannelId),
+    #[serde(alias = "worktree")]
     Worktree { repository: PathBuf, path: PathBuf },
 }
 

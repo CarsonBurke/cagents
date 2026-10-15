@@ -61,7 +61,8 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn command(&self, args: &[&str]) -> Command {
+    fn command(&self, args: &[&str]) -> Command { self.command_with_format(args, true) }
+    fn command_with_format(&self, args: &[&str], json: bool) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_cagents"));
         c.env_clear()
             .env("HOME", self.path())
@@ -72,9 +73,9 @@ impl Fixture {
             .env("LINEAR_FIXTURE", self.path())
             .env("LINEAR_API_KEY", KEY)
             .env("CAGENTS_LINEAR_API_KEY_WORK", KEY)
-            .current_dir(self.path())
-            .arg("--json")
-            .args(args);
+            .current_dir(self.path());
+        if json { c.arg("--json"); }
+        c.args(args);
         c
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -343,4 +344,19 @@ fn uncertain_relation_deletion_identifies_relation_without_mistaking_it_for_issu
     assert_eq!(error["details"]["writeContext"]["objectId"], TEAM_ID);
     assert!(error["details"]["writeContext"]["issueId"].is_null());
     assert!(error["message"].as_str().unwrap().contains(TEAM_ID));
+}
+
+#[test]
+fn linear_lists_have_human_headers_and_explicit_empty_output() {
+    let fixture = Fixture::new();
+    fixture.read(json!({"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}));
+    let empty = fixture.command_with_format(&["linear", "list"], false).output().unwrap();
+    assert!(empty.status.success(), "{empty:?}");
+    assert_eq!(String::from_utf8(empty.stdout).unwrap().trim(), "No Linear results");
+    fixture.read(json!({"issues":{"nodes":[{"id":ISSUE_ID,"identifier":"ENG-12","title":"Fixture issue","state":{"name":"In Progress"},"url":"https://linear.app/team/issue/ENG-12"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}));
+    let listed = fixture.command_with_format(&["linear", "list"], false).output().unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let output = String::from_utf8(listed.stdout).unwrap();
+    let cells = output.lines().map(|line| line.split("  ").filter(|cell| !cell.is_empty()).map(str::trim).collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(cells, vec![vec!["ID", "TITLE / NAME", "STATE", "DETAIL"], vec!["ENG-12", "Fixture issue", "In Progress", "https://linear.app/team/issue/ENG-12"]]);
 }

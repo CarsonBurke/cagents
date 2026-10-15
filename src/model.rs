@@ -1060,7 +1060,9 @@ pub struct ProjectState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectKind {
     #[default]
+    #[serde(alias = "git")]
     Git,
+    #[serde(alias = "folder")]
     Folder,
 }
 
@@ -1112,9 +1114,12 @@ pub struct ProjectChannel {
 /// only until a provider supplies a title or a person explicitly renames it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChannelTitleSource {
+    #[serde(alias = "prompt")]
     Prompt,
+    #[serde(alias = "provider")]
     Provider,
     #[default]
+    #[serde(alias = "manual")]
     Manual,
 }
 

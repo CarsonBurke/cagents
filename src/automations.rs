@@ -139,11 +139,14 @@ pub struct Proposal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalState {
+    #[serde(alias = "pending")]
     Pending,
+    #[serde(alias = "approved")]
     Approved {
         automation: Uuid,
         execution_revision: u64,
     },
+    #[serde(alias = "declined")]
     Declined,
 }
 

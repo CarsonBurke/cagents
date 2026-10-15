@@ -807,6 +807,35 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
+pub(super) fn process_for_client(host: &SharedHost, client: super::state::ClientId,
+    authority: Authority, operation: crate::agent_execution::Operation) -> Result<crate::agent_execution::Reply, String> {
+    if let crate::agent_execution::Operation::Transcript { agent: id, cursor } = &operation {
+        let id = *id;
+        let (agent, _) = status(host, &authority, id)?;
+        let existing = host.lock().unwrap_or_else(|p| p.into_inner()).transcript_readers.get(&(client, id)).cloned();
+        let handle = match existing {
+            Some(handle) => handle,
+            None => {
+                let Some(HostedSession::Chat(session)) = &agent.session else { return Err("The agent has no native transcript".into()); };
+                let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&session.id)
+                    .filter(|record| HostedSession::Chat(session.clone()).same_process(&HostedSession::Chat(record.session.clone())))
+                    .map(|record| record.handle.clone()).ok_or("The agent transcript cache is unavailable")?;
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state.transcript_readers.keys().filter(|(reader, _)| *reader == client).count() >= crate::agent_execution::MAX_CHILDREN {
+                    return Err("Too many transcript reads on one connection".into());
+                }
+                let reader = handle.transcript_reader();
+                state.transcript_readers.insert((client, id), reader.clone());
+                reader
+            }
+        };
+        let mut page = handle.read(cursor.clone())?;
+        page.closed = agent.closed;
+        return Ok(crate::agent_execution::Reply::Transcript(page));
+    }
+    process(host, authority, operation)
+}
+
 pub(super) fn process(
     host: &SharedHost,
     authority: Authority,
@@ -814,6 +843,7 @@ pub(super) fn process(
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
+        Operation::Transcript { .. } => Err("Transcript reads require a live client connection".into()),
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
         Operation::Status(id) => {
@@ -843,6 +873,7 @@ pub(super) fn process(
                         agent,
                         run: run.id,
                         state: run.state,
+                        reason: run.result.diagnostic,
                     })
                 })
                 .collect::<Result<_, String>>()?;

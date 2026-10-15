@@ -88,11 +88,14 @@ impl std::fmt::Display for Lineage {
 /// no authority to address another session's children.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
+    #[serde(alias = "user")]
     User,
     /// Started by a session; every session of its lineage owns it.
+    #[serde(alias = "child")]
     Child {
         parent: Lineage,
     },
+    #[serde(alias = "automation")]
     Automation {
         id: uuid::Uuid,
     },
@@ -101,7 +104,9 @@ pub enum Origin {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Surface {
     #[default]
+    #[serde(alias = "chat")]
     Chat,
+    #[serde(alias = "terminal")]
     Terminal,
 }
 
@@ -278,7 +283,9 @@ pub fn valid_reasoning_effort(effort: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostedSession {
+    #[serde(alias = "chat")]
     Chat(chat::Session),
+    #[serde(alias = "terminal")]
     Terminal(TerminalSession),
 }
 
@@ -358,14 +365,21 @@ impl DirectoryIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
+    #[serde(alias = "accepted")]
     Accepted,
+    #[serde(alias = "running")]
     Running,
+    #[serde(alias = "waiting")]
     Waiting,
+    #[serde(alias = "succeeded")]
     Succeeded,
+    #[serde(alias = "failed")]
     Failed,
+    #[serde(alias = "cancelled")]
     Cancelled,
     /// Ownership or delivery evidence was lost. This is not permission to
     /// retry a prompt: its effects may already have occurred.
+    #[serde(alias = "interrupted")]
     Interrupted,
 }
 
@@ -434,6 +448,28 @@ pub struct Accepted {
     pub created: bool,
 }
 
+/// Independent cache cursor; never changes the UI's history window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptCursor { pub id: String, pub ordinal: i64, pub offset: usize, pub emitted_empty: bool }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPart {
+    pub item: chat::Item,
+    pub offset: usize,
+    pub complete: bool,
+    pub attachment_omitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPage {
+    pub parts: Vec<TranscriptPart>,
+    pub next: Option<TranscriptCursor>,
+    pub at_end: bool,
+    pub closed: bool,
+    /// The provider has older history which has not entered the owned cache.
+    pub partial_history: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Submit(Submit),
@@ -464,6 +500,8 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Stream the owned cache through a connection-scoped read lease.
+    Transcript { agent: AgentId, cursor: Option<TranscriptCursor> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -509,6 +547,8 @@ pub struct Summary {
     pub agent: Agent,
     pub run: RunId,
     pub state: State,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +568,7 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    Transcript(TranscriptPage),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
@@ -644,6 +685,20 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("placement");
         legacy["channel"] = serde_json::Value::Null;
         assert_eq!(serde_json::from_value::<Target>(legacy).unwrap(), target);
+    }
+
+    #[test]
+    fn transcript_pages_and_stable_cursors_roundtrip_the_binary_protocol() {
+        let cursor = TranscriptCursor { id: "message".into(), ordinal: 1, offset: 3, emitted_empty: false };
+        let request = Operation::Transcript { agent: AgentId::new(), cursor: Some(cursor.clone()) };
+        assert_eq!(postcard::from_bytes::<Operation>(&postcard::to_allocvec(&request).unwrap()).unwrap(), request);
+        let page = TranscriptPage { parts: vec![TranscriptPart {
+            item: chat::Item { id: "message".into(), role: chat::Role::Assistant,
+                content: chat::ItemContent::Text { text: "界".into(), thinking: false, phase: chat::Phase::Final }, at: None, started_at: None },
+            offset: 0, complete: true, attachment_omitted: false,
+        }], next: Some(cursor), at_end: true, closed: false, partial_history: false };
+        let reply = Reply::Transcript(page);
+        assert_eq!(postcard::from_bytes::<Reply>(&postcard::to_allocvec(&reply).unwrap()).unwrap(), reply);
     }
 
     #[test]

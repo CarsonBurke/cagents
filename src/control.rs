@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+pub(crate) mod format;
+mod settings;
+pub use settings::SettingsCommand;
+mod completions;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
@@ -77,7 +81,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[command(
     name = "cagents",
     version = crate::VERSION,
-    about = "Control cagents terminals and processes"
+    about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear, accounts and settings"
 )]
 pub struct Cli {
     /// Backend device from devices.json; local is the default.
@@ -86,6 +90,9 @@ pub struct Cli {
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Connect to an existing daemon without starting one (also CAGENTS_NO_START=1).
+    #[arg(long, global = true)]
+    pub no_start: bool,
 
     #[command(subcommand)]
     pub command: TopCommand,
@@ -93,13 +100,24 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Generate a shell completion script without contacting services.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Read, validate, change or open the application configuration.
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
+    },
     /// Read bounded private diagnostics without starting services.
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
     /// Show this session, its parent and agents, and peers in the same checkout.
     Whoami,
-    /// Inspect account plan allowances and the calling session’s context.
+    /// Manage provider accounts and defaults, and inspect plan allowances and context.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -160,34 +178,44 @@ pub enum TopCommand {
     },
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
-    UpdateWorker { job_id: String },
+    UpdateWorker {
+        #[arg(help = "Detached update job ID.")]
+        job_id: String,
+    },
     /// Cooperatively fence application windows around an external installer.
     #[command(hide = true)]
     CoordinateInstall {
         #[arg(long)]
+        #[arg(help = "Installation destination prefix.")]
         prefix: PathBuf,
         #[arg(long)]
+        #[arg(help = "Installer executable to run.")]
         installer: PathBuf,
         /// Publish files while preserving running windows and the daemon.
         #[arg(long)]
         stage_only: bool,
         #[arg(last = true)]
+        #[arg(help = "Arguments passed to the installer after --.")]
         arguments: Vec<OsString>,
     },
     /// Validate a launch fence inherited from the update coordinator.
     #[command(hide = true)]
     VerifyInstallGuard {
         #[arg(long)]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
     RecordDeferredInstall {
         #[arg(long, requires_all = ["prefix", "version_root"])]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Installation destination prefix.")]
         prefix: Option<PathBuf>,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
     },
     /// Save, close and reopen every window with this installation's executables.
@@ -225,8 +253,10 @@ pub enum DaemonCommand {
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown while hosted sessions remain.")]
         require_empty: bool,
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown if the observed session inventory generation changed.")]
         expected_generation: Option<u64>,
         /// Confirm termination of the counted hosted sessions. Bare, this
         /// prompts on the terminal. A service unit or script has no terminal,
@@ -269,8 +299,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List live terminals; use --all to include retained completed sessions.
+    List {
+        /// Include running, hibernated and exited sessions.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only completed sessions.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Show one complete terminal descriptor, including its launch environment.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -282,17 +324,27 @@ pub enum TerminalCommand {
     },
     /// Write UTF-8 text to a terminal.
     Write {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
+        #[arg(help = "UTF-8 text to write.")]
         text: String,
     },
     /// Explicitly terminate a terminal.
-    Close { terminal_id: TerminalId },
+    Close {
+        #[arg(help = "The daemon terminal ID.")]
+        terminal_id: TerminalId,
+    },
     /// Read a current immutable terminal snapshot.
-    Snapshot { terminal_id: TerminalId },
+    Snapshot {
+        #[arg(help = "The daemon terminal ID.")]
+        terminal_id: TerminalId,
+    },
     /// Wait until a current terminal snapshot contains text.
     Wait {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
         #[arg(long)]
+        #[arg(help = "Text that must appear in the terminal snapshot.")]
         text: String,
         /// Maximum time to wait, in seconds.
         #[arg(long, default_value_t = 30.0, value_parser = parse_positive_seconds)]
@@ -342,7 +394,10 @@ pub enum ChannelCommand {
         repository: Option<PathBuf>,
     },
     /// Delete a channel everywhere.
-    Close { channel_id: ChannelId },
+    Close {
+        #[arg(help = "The shared channel ID.")]
+        channel_id: ChannelId,
+    },
 }
 
 /// A `--project` value: a path, made absolute, or the name of an open
@@ -1890,6 +1945,43 @@ struct CommandOutput {
     human: String,
 }
 
+/// Scriptable outcomes shared by commands that wait for work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WaitOutcome {
+    Succeeded,
+    Pending,
+    TimedOut,
+    Failed,
+    Waiting,
+}
+
+impl WaitOutcome {
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Succeeded => 0,
+            Self::Pending | Self::TimedOut => 3,
+            Self::Failed => 4,
+            Self::Waiting => 5,
+        }
+    }
+}
+
+impl CommandOutput {
+    fn exit_code(&self) -> ExitCode {
+        if !matches!(self.command, "agent.wait" | "agent.spawn" | "agent.send" | "automation.propose" | "automation.proposal") {
+            return ExitCode::SUCCESS;
+        }
+        let code = match self.data.get("outcome").and_then(Value::as_str) {
+            Some("pending" | "timed_out") => WaitOutcome::TimedOut.exit_code(),
+            Some("failed") => WaitOutcome::Failed.exit_code(),
+            Some("waiting") => WaitOutcome::Waiting.exit_code(),
+            _ => WaitOutcome::Succeeded.exit_code(),
+        };
+        ExitCode::from(code)
+    }
+}
+
 #[derive(Debug)]
 struct AppError {
     kind: &'static str,
@@ -1904,6 +1996,45 @@ impl AppError {
             message: error.to_string(),
             details: None,
         }
+    }
+}
+
+static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn daemon_autostart_disabled() -> bool {
+    NO_START.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct StartPolicy(bool);
+impl Drop for StartPolicy {
+    fn drop(&mut self) {
+        NO_START.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn control_daemon_socket() -> Result<PathBuf, AppError> {
+    if !daemon_autostart_disabled() {
+        return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
+    }
+    let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
+    match UnixStream::connect(&socket) {
+        Ok(_) => Ok(socket),
+        Err(error) if daemon_missing(&error) => Err(AppError::new(
+            "daemon_not_running", "The daemon is not running; omit --no-start to start it",
+        )),
+        Err(error) => Err(AppError::new("daemon_connection", error)),
+    }
+}
+
+fn daemon_missing(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+}
+
+fn already_stopped() -> CommandOutput {
+    CommandOutput {
+        command: "daemon.stop",
+        data: json!({"state": "already_stopped"}),
+        human: "Daemon already stopped".into(),
     }
 }
 
@@ -1933,6 +2064,16 @@ where
         }
     };
 
+    let stopping_daemon=matches!(&cli.command,TopCommand::Daemon{command:DaemonCommand::Stop{..}});
+    let no_start = stopping_daemon || cli.no_start || std::env::var("CAGENTS_NO_START")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
+
+    if let TopCommand::Completions { shell } = cli.command {
+        emit_success(cli.json, completions::execute(shell));
+        return ExitCode::SUCCESS;
+    }
+
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
     if matches!(cli.command, TopCommand::Diagnostics) {
@@ -1958,6 +2099,13 @@ where
         };
     }
 
+    if matches!(&cli.command, TopCommand::Account { command: AccountCommand::Remove { .. } })
+        && Authority::from_environment().token().is_some()
+    {
+        emit_error(cli.json, &AppError::new("account_authority", "Account removal is refused under an agent capability; run it from your own shell"));
+        return ExitCode::FAILURE;
+    }
+
     let _device_cleanup = crate::device::Cleanup;
     if let Err(error) = crate::device::select(cli.device.as_deref()) {
         emit_error(cli.json, &AppError::new("device", error));
@@ -1974,7 +2122,7 @@ where
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
-        let recover = staged_command_requires_daemon(&cli.command);
+        let recover = !no_start && staged_command_requires_daemon(&cli.command);
         match crate::install_guard::staged_owner_bin(
             &std::env::current_exe().unwrap_or_default(),
             recover,
@@ -2004,6 +2152,10 @@ where
     ) {
         return match crate::device::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) if crate::device::daemon_absent(&error)=>{
+                crate::device::report_absent_bridge();
+                ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
+            }
             Err(error) => {
                 eprintln!("cagents daemon bridge: {error}");
                 ExitCode::FAILURE
@@ -2012,18 +2164,30 @@ where
     }
     if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
         if let Err(error) = crate::device::prepare() {
+            if crate::device::daemon_absent(&error) {
+                if stopping_daemon {emit_success(cli.json,already_stopped());return ExitCode::SUCCESS;}
+                emit_error(cli.json,&AppError::new("daemon_not_running",error));
+                return ExitCode::FAILURE;
+            }
             emit_error(cli.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
     }
+    if let TopCommand::Agent { command: AgentCommand::Transcript { agent, follow, format } } = &cli.command {
+        return match agents::stream_transcript(agent, *follow, format, cli.json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { emit_error(cli.json || format == "json", &error); ExitCode::FAILURE }
+        };
+    }
     match execute(cli.command) {
         Ok(output) => {
+            let code = output.exit_code();
             emit_success(cli.json, output);
-            ExitCode::SUCCESS
+            code
         }
         Err(error) => {
             emit_error(cli.json, &error);
-            ExitCode::FAILURE
+            ExitCode::from(if error.kind == "timeout" { 3 } else { 1 })
         }
     }
 }
@@ -2076,6 +2240,8 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Completions { shell } => Ok(completions::execute(shell)),
+        TopCommand::Settings { command } => settings::execute(command),
         TopCommand::Diagnostics => {
             let report = crate::diagnostics::inspect().map_err(|_| {
                 AppError::new(
@@ -2549,9 +2715,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket =
-                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let socket = daemon_socket_path().map_err(|error|AppError::new("socket_path",error))?;
+            let mut client = match ControlClient::connect(&socket) {
+                Ok(client) => client,
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(error) => return Err(protocol_error(error)),
+            };
             let outcome = match confirm {
                 // A capability is already a counted, daemon-bound, expiring
                 // authority over one observed inventory, so a script that
@@ -2838,8 +3007,7 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     // Inside a hosted session the daemon lets these commands change only the
@@ -2856,18 +3024,21 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
-            let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
-                .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
+        TerminalCommand::List { all, exited } => {
+            let terminals = client.list().map_err(protocol_error)?.into_iter()
+                .filter(|terminal| all || if exited { terminal.completed } else { !terminal.completed })
+                .collect::<Vec<_>>();
+            let human = format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], terminals.iter().map(terminal_row).collect(), "No terminals");
             Ok(CommandOutput {
                 command: "terminal.list",
-                data: json!({ "terminals": terminals }),
+                data: json!({ "terminals": terminals.iter().map(terminal_list_value).collect::<Vec<_>>() }),
                 human,
             })
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminal = client.list().map_err(protocol_error)?.into_iter().find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| AppError::new("terminal_not_found", format!("No terminal {terminal_id}")))?;
+            Ok(CommandOutput { command: "terminal.show", human: format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], vec![terminal_row(&terminal)], "No terminals"), data: json!({"terminal": terminal}) })
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3000,8 +3171,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3017,6 +3187,8 @@ enum ResolvedProject {
     Open {
         repository: PathBuf,
         kind: crate::model::ProjectKind,
+        checkout: Option<PathBuf>,
+        primary_checkout: Option<PathBuf>,
     },
     List,
     Close {
@@ -3041,6 +3213,8 @@ impl ProjectCommand {
                 ResolvedProject::Open {
                     repository: location.key,
                     kind: location.kind,
+                    checkout: location.checkout,
+                    primary_checkout: location.primary_checkout,
                 }
             }
             Self::List => ResolvedProject::List,
@@ -3057,7 +3231,7 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository, kind } => {
+        ResolvedProject::Open { repository, kind, checkout, primary_checkout } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
@@ -3066,7 +3240,9 @@ fn project_output(
                 .edit_workspace_model(ModelEdit::ReopenProject {
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(&repository),
+                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    checkout,
+                    primary_checkout,
                 })
                 .map_err(protocol_error)?;
             let project = model.project(&repository).cloned().ok_or_else(|| {
@@ -3088,11 +3264,9 @@ fn project_output(
             // the sidebar renders.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = projects
-                .iter()
-                .map(|project| project_line(project))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["PATH", "NAME"], projects.iter().map(|project| vec![
+                project_display_path(project), project.name.clone(),
+            ]).collect(), "No open projects");
             Ok(CommandOutput {
                 command: "project.list",
                 data: json!({ "projects": projects, "sequence": model.sequence }),
@@ -3174,13 +3348,29 @@ fn close_project(
     })
 }
 
-/// One project per line: repository, name.
-///
-/// The key comes first, following `channel_line`, so the `cut -f1` that names a
-/// channel names a project - and names it in the spelling `project close`
-/// takes.
+/// The verified checkout is presentation metadata, separate from Git identity.
+fn project_display_path(project: &ModelProject) -> String {
+    if let Some(path)=project.checkout.as_deref().or(project.primary_checkout.as_deref()).or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path())) {
+        return path.display().to_string();
+    }
+    // Legacy rows only persisted Git identity. An ordinary .git spelling gives
+    // a candidate, never proof: verify it against the selected device before
+    // displaying it. Separate metadata directories have no reversible mapping.
+    if project.repository.file_name()==Some(OsStr::new(".git")) && let Some(candidate)=project.repository.parent() {
+        let verified=if crate::device::is_remote() {
+            match crate::device_service::request(crate::device_service::Operation::Discover{path:candidate.to_path_buf()}) {
+                Ok(crate::device_service::Reply::Project{key,checkout,..}) if key==project.repository=>checkout,
+                _=>None,
+            }
+        } else {
+            crate::project_location::discover(candidate).ok().filter(|location|location.key==project.repository).and_then(|location|location.checkout)
+        };
+        if let Some(checkout)=verified {return checkout.display().to_string();}
+    }
+    "(checkout unavailable)".into()
+}
 fn project_line(project: &ModelProject) -> String {
-    format!("{}\t{}", project.repository.display(), project.name)
+    format!("{}\t{}", project_display_path(project), project.name)
 }
 
 /// Runs a shared-channel verb against the daemon's registry.
@@ -3198,8 +3388,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3219,6 +3408,8 @@ enum ResolvedChannel {
         repository: PathBuf,
         title: String,
         kind: crate::model::ProjectKind,
+        checkout: Option<PathBuf>,
+        primary_checkout: Option<PathBuf>,
     },
     List {
         repository: Option<PathBuf>,
@@ -3244,6 +3435,8 @@ impl ChannelCommand {
                 ResolvedChannel::Spawn {
                     repository: location.key,
                     kind: location.kind,
+                    checkout: location.checkout,
+                    primary_checkout: location.primary_checkout,
                     title,
                 }
             }
@@ -3269,6 +3462,8 @@ fn channel_output(
             repository,
             title,
             kind,
+            checkout,
+            primary_checkout,
         } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
@@ -3277,7 +3472,9 @@ fn channel_output(
                 .edit_workspace_model(ModelEdit::OpenProject {
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(&repository),
+                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    checkout,
+                    primary_checkout,
                 })
                 .map_err(protocol_error)?;
             // The id is minted here, exactly as `terminal spawn` mints its
@@ -3320,11 +3517,9 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = channels
-                .iter()
-                .map(|channel| channel_line(channel))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["ID", "PROJECT", "TITLE"], channels.iter().map(|channel| vec![
+                channel.id.to_string(), model.project(&channel.repository).map(project_display_path).unwrap_or_else(||"(checkout unavailable)".into()), channel.title.clone(),
+            ]).collect(), "No channels");
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3406,13 +3601,15 @@ fn resolve_project_location(
             return Ok(crate::project_location::ProjectLocation {
                 key: from,
                 kind: project.kind,
+                checkout: project.checkout.clone(),
+                primary_checkout: project.primary_checkout.clone(),
             });
         }
         return match crate::device_service::request(crate::device_service::Operation::Discover {
             path: from,
         }) {
-            Ok(crate::device_service::Reply::Project { key, kind, .. }) => {
-                Ok(crate::project_location::ProjectLocation { key, kind })
+            Ok(crate::device_service::Reply::Project { key, kind, checkout, primary_checkout, .. }) => {
+                Ok(crate::project_location::ProjectLocation { key, kind, checkout, primary_checkout })
             }
             Ok(_) => Err(AppError::new(
                 "repository",
@@ -3481,19 +3678,43 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
     canonical_repository(Path::new(key))
 }
 
-fn descriptor_line(terminal: &TerminalDescriptor) -> String {
-    format!(
-        "{}\t{}\t{}\t{}",
-        terminal.session.id,
-        if terminal.attached {
-            "attached"
-        } else {
-            "detached"
-        },
-        terminal.session.launch.program,
-        terminal.session.launch.working_directory.display(),
-    )
+fn terminal_state(terminal: &TerminalDescriptor) -> String {
+    if terminal.completed {
+        let exit = match &terminal.session.continuity {
+            TerminalContinuity::Exited { last_exit } => Some(last_exit),
+            TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.as_ref(),
+            _ => None,
+        };
+        match exit {
+            Some(exit) if exit.code.is_some() => format!("exited({})", exit.code.unwrap()),
+            Some(exit) if exit.signal.is_some() => format!("exited({})", exit.signal.as_deref().unwrap()),
+            _ => "exited".into(),
+        }
+    } else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated".into() }
+    else { "running".into() }
 }
+
+fn terminal_row(terminal: &TerminalDescriptor) -> Vec<String> {
+    vec![terminal.session.id.to_string(), terminal_state(terminal), terminal.title.clone(),
+        terminal.session.launch.program.clone(), terminal.session.launch.working_directory.display().to_string()]
+}
+
+fn terminal_list_value(terminal: &TerminalDescriptor) -> Value {
+    let state = if terminal.completed { "exited" }
+        else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated" }
+        else { "running" };
+    let exit = match &terminal.session.continuity {
+        TerminalContinuity::Exited { last_exit } => Some(last_exit),
+        TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.as_ref(),
+        _ => None,
+    };
+    json!({"id": terminal.session.id, "state": state, "title": terminal.title,
+        "exit_code": exit.and_then(|exit| exit.code), "signal": exit.and_then(|exit| exit.signal.as_deref()),
+        "attached": terminal.attached, "program": terminal.session.launch.program,
+        "directory": terminal.session.launch.working_directory, "generation": terminal.generation})
+}
+
+fn descriptor_line(terminal: &TerminalDescriptor) -> String { terminal_row(terminal).join("\t") }
 
 fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     if crate::device::is_remote() {
@@ -3518,7 +3739,8 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn emit_success(json_output: bool, output: CommandOutput) {
+fn emit_success(json_output: bool, mut output: CommandOutput) {
+    format::normalize(&mut output.data);
     if json_output {
         println!(
             "{}",
@@ -3549,6 +3771,32 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_list_json_is_lean_while_show_retains_recovery_detail() {
+        let mut recipe = LaunchRecipe { program: "bash".into(), arguments: Vec::new(),
+            working_directory: "/tmp".into(), environment: BTreeMap::new(), unset_environment: Default::default() };
+        recipe.environment.insert("FIXTURE_PRIVATE".into(), "retained only in show".into());
+        let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+        terminal.session.resume_hint = Some("fixture recipe".into());
+        let value = terminal_list_value(&terminal);
+        let text = value.to_string();
+        for forbidden in ["environment", "resume_hint", "continuity", "FIXTURE_PRIVATE"] { assert!(!text.contains(forbidden)); }
+        assert!(serde_json::to_value(&terminal).unwrap()["session"]["launch"]["environment"].get("FIXTURE_PRIVATE").is_some());
+        terminal.completed = false;
+        terminal.visibility = TerminalVisibility::Hidden;
+        assert_eq!(terminal_state(&terminal), "running");
+        terminal.visibility = TerminalVisibility::Hibernated;
+        assert_eq!(terminal_state(&terminal), "hibernated");
+        terminal.completed = true;
+        assert_eq!(terminal_state(&terminal), "exited");
+        terminal.session.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
+            code: Some(3), signal: None, occurred_at_unix_ms: 0,
+        } };
+        assert_eq!(terminal_state(&terminal), "exited(3)");
+        assert_eq!(terminal_list_value(&terminal)["state"], "exited");
+        assert_eq!(terminal_list_value(&terminal)["exit_code"], 3);
+    }
+
     #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {
@@ -3981,6 +4229,8 @@ mod tests {
                     edit: ModelEdit::OpenProject {
                         kind: Default::default(),
                         repository: server_repository.clone(),
+                        checkout: server_repository.parent().map(Path::to_path_buf),
+                        primary_checkout: server_repository.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: expected_name.clone(),
@@ -4115,6 +4365,54 @@ mod tests {
     /// checkout one project per worktree the user ever ran the verb from, and
     /// the sidebar would fill with duplicates of the same repository.
     #[test]
+    fn separate_git_directory_open_and_list_show_verified_checkout() {
+        let root=tempfile::tempdir().unwrap();
+        let checkout=root.path().join("checkout");
+        let metadata=root.path().join("metadata");
+        std::fs::create_dir(&checkout).unwrap();
+        git(&checkout,&["init","--quiet","--separate-git-dir",metadata.to_str().unwrap()]);
+        let checkout=checkout.canonicalize().unwrap();
+        let metadata=metadata.canonicalize().unwrap();
+        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),primary_checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
+        let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
+        let peer_proof=proof("session","boot","incarnation");
+        let served=project.clone();
+        let server=thread::spawn(move || {
+            let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
+            let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
+            let mut model=WorkspaceModel::default();model.projects.push(served);
+            write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
+            let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(listed.request,ClientRequest::ReadWorkspaceModel);
+            write_frame(&mut server_stream,&model_envelope(listed.request_id,peer_proof,model)).unwrap();
+        });
+        let resolved=ProjectCommand::Open{path:Some(checkout.clone())}.resolved().unwrap();
+        let mut client=ControlClient::from_stream(client_stream).unwrap();
+        let opened=project_output(&mut client,resolved).unwrap();
+        let listed=project_output(&mut client,ResolvedProject::List).unwrap();
+        server.join().unwrap();
+        assert_eq!(opened.human,format!("{}\tcheckout",checkout.display()));
+        assert_eq!(listed.human,format::table(&["PATH","NAME"],vec![vec![checkout.display().to_string(),"checkout".into()]],"No open projects"));
+        assert_eq!(opened.data["project"]["repository"],json!(metadata));
+        assert_eq!(opened.data["project"]["checkout"],json!(checkout));
+        assert!(!opened.human.contains("metadata"));
+    }
+
+    #[test]
+    fn legacy_project_checkout_fallback_requires_verified_repository_identity() {
+        let Some(checkout)=git_checkout() else {return;};
+        let root=checkout.path().canonicalize().unwrap();
+        let mut project=ModelProject{kind:crate::model::ProjectKind::Git,repository:root.join(".git"),checkout:None,primary_checkout:None,name:"legacy".into(),ordinal:0};
+        assert_eq!(project_display_path(&project),root.display().to_string());
+        let unrelated=tempfile::tempdir().unwrap();
+        std::fs::create_dir(unrelated.path().join(".git")).unwrap();
+        project.repository=unrelated.path().canonicalize().unwrap().join(".git");
+        assert_eq!(project_display_path(&project),"(checkout unavailable)");
+    }
+
+    #[test]
     fn project_open_keys_one_project_from_every_worktree_of_one_checkout() {
         let Some(checkout) = git_checkout() else {
             return;
@@ -4161,6 +4459,8 @@ mod tests {
         model.projects.push(ModelProject {
             kind: crate::model::ProjectKind::Folder,
             repository: root.clone(),
+            checkout: Some(root.clone()),
+            primary_checkout: None,
             name: "Folder".into(),
             ordinal: 0,
         });
@@ -4260,6 +4560,8 @@ mod tests {
                     edit: ModelEdit::ReopenProject {
                         kind: Default::default(),
                         repository: served.clone(),
+                        checkout: served.parent().map(Path::to_path_buf),
+                        primary_checkout: served.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: served_name.clone(),
@@ -4273,6 +4575,8 @@ mod tests {
                 sequence: 4,
                 projects: vec![ModelProject {
                     kind: Default::default(),
+                    checkout: served.parent().map(Path::to_path_buf),
+                    primary_checkout: served.parent().map(Path::to_path_buf),
                     repository: served,
                     name: served_name,
                     ordinal: 2,
@@ -4301,8 +4605,8 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", expected.display()),
-            "one tab-separated line: repository, name"
+            format!("{}\t{name}", checkout.path().canonicalize().unwrap().display()),
+            "one tab-separated line: checkout path, name"
         );
     }
 
@@ -4316,12 +4620,16 @@ mod tests {
         let window_opened = ModelProject {
             kind: Default::default(),
             repository: PathBuf::from("/window/.git"),
+            checkout: Some(PathBuf::from("/window")),
+            primary_checkout: Some(PathBuf::from("/window")),
             name: "window".into(),
             ordinal: 1,
         };
         let cli_opened = ModelProject {
             kind: Default::default(),
             repository: PathBuf::from("/shell/.git"),
+            checkout: Some(PathBuf::from("/shell")),
+            primary_checkout: Some(PathBuf::from("/shell")),
             name: "shell".into(),
             ordinal: 2,
         };
@@ -4356,8 +4664,8 @@ mod tests {
         server.join().unwrap();
         assert_eq!(output.command, "project.list");
         assert_eq!(
-            output.human, "/shell/.git\tshell\n/window/.git\twindow",
-            "newest first, one tab-separated line each, whoever opened them"
+            output.human, "PATH     NAME\n/shell   shell\n/window  window",
+            "newest first, with readable checkout paths and headers"
         );
         assert_eq!(output.data["projects"], json!([cli_opened, window_opened]));
     }
@@ -4487,7 +4795,7 @@ mod tests {
         assert_eq!(output.data["closed"], json!(true));
         assert_eq!(
             output.human,
-            format!("/repo/.git\trepo\n{newer}\t/repo/.git\tnewer\n{older}\t/repo/.git\tolder"),
+            format!("/repo\trepo\n{newer}\t/repo/.git\tnewer\n{older}\t/repo/.git\tolder"),
             "the project's line, then every channel it took, newest first"
         );
         let channels = output.data["channels"].as_array().unwrap();
@@ -4513,6 +4821,8 @@ mod tests {
             projects: vec![ModelProject {
                 kind: Default::default(),
                 repository: repository.to_path_buf(),
+                checkout: repository.parent().map(Path::to_path_buf),
+                primary_checkout: repository.parent().map(Path::to_path_buf),
                 name: repository_display_name(repository),
                 ordinal: 1,
             }],
