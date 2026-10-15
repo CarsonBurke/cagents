@@ -1,6 +1,8 @@
 Based on crates.io cosmic-text 0.19.0, checksum
 be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73.
-Source and licenses are unchanged except for the additive prototype API below.
+Source, upstream test targets, font fixtures and licenses are retained. Source
+differs only by the additive prototype API below. Screenshot documentation is
+omitted.
 
 Local prototype: immutable full-context LayoutSnapshot and visual projections.
 This is not an incremental shaper. Creating a snapshot requires existing complete
