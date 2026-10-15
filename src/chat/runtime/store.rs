@@ -3073,4 +3073,21 @@ mod tests {
             .unwrap();
         assert_eq!(store.window().unwrap().items[0].as_ref(), &original);
     }
+    #[test]
+    fn actual_store_history_pages_omit_changes_capability_without_deleting_its_source() {
+        let mut store=Store::new().unwrap();let make=|patch:&str|Item {id:"paged-changes".into(),role:Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Changes {status:crate::chat::ToolStatus::Succeeded,changes:vec![crate::chat::FileChange {
+                path:"file.rs".into(),kind:crate::chat::ChangeKind::Updated,diff:patch.into()}]}};
+        store.apply(Event::Item(make("@@ -1 +1 @@\n-old\n+new\n"))).unwrap();
+        let original=store.window().unwrap().changes_parts.into_iter().find(|part|part.item_id=="paged-changes").unwrap();
+        for index in 0..WINDOW_ITEMS+1 {store.apply(Event::Item(history_item(&format!("later-{index}"),"later message"))).unwrap();}
+        let away=store.window().unwrap();assert!(!away.items.iter().any(|item|item.id=="paged-changes"));assert!(!away.changes_parts.iter().any(|part|part.source==original.source));
+        let query=crate::chat::cache::changes::ManifestQuery {source:original.source.clone(),offset:0,limit:128,expected_epoch:Some(original.epoch)};
+        assert_eq!(store.changes_manifest(query.clone()).unwrap().files.len(),1,"off-window source remains indexed");
+        assert!(store.earlier().unwrap());let returned=store.window().unwrap();
+        assert_eq!(returned.changes_parts.iter().find(|part|part.item_id=="paged-changes"),Some(&original));
+        store.apply(Event::Item(make("@@ -1 +1 @@\n-old\n+different\n"))).unwrap();
+        assert!(matches!(store.changes_manifest(query),Err(crate::chat::cache::SourceError::Changed)));
+    }
+
 }
