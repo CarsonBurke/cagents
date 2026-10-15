@@ -11212,7 +11212,7 @@ fn editable_document_view<'a>(
     if let Some(value) = &runtime.go_to_line {
         let valid = crate::editor_navigation::parse_line_column(value).is_some();
         error_rows.push(widget::container(widget::column::with_children(vec![
-            crate::ui_controls::field::text("Line or line:column", value).id(widget::Id::new(format!("repository.{card}.go-to-line"))).on_input(move |value| RepositoryAction::GoToLineChanged { card, value }).on_submit(RepositoryAction::SubmitGoToLine { card }).into(),
+            crate::ui_controls::field::text("Line or line:column", value).id(widget::Id::new(format!("repository.{card}.go-to-line"))).on_input(move |value| RepositoryAction::GoToLineChanged { card, value }).on_submit(move |_| RepositoryAction::SubmitGoToLine { card }).into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Go").on_press_maybe(valid.then_some(RepositoryAction::SubmitGoToLine { card })).into(),
                 crate::ui_controls::button::secondary("Cancel").on_press(RepositoryAction::CloseGoToLine { card }).into(),

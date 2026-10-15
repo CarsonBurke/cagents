@@ -9486,7 +9486,8 @@ fn files_section<'a>(
         let candidate = PathBuf::from(path);
         let relative = if candidate.is_absolute() { candidate.strip_prefix(&key.canonical_path).ok().map(Path::to_path_buf) } else { Some(candidate) };
         if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
-            filter = filter.on_submit(SidebarAction::OpenFile { key: key.clone(), path });
+            let key = key.clone();
+            filter = filter.on_submit(move |_| SidebarAction::OpenFile { key: key.clone(), path: path.clone() });
         }
     }
     let folded = fold(&crate::editor_navigation::file_query(state.files_query().trim()));
