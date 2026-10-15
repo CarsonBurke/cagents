@@ -13270,26 +13270,52 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Resolve only the currently authorized invocation's checkout. Callers
+    /// still bind its physical marker to retained metadata before using it.
+    pub(crate) fn invocation_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.worktree_root_command(repository);
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "worktree_root"), &output)
+    }
+
     /// A separate primary Git directory has no portable checkout backlink.
     /// Read its explicit common-local worktree setting through this service's
     /// existing executor; a linked-worktree invocation must not rediscover or
     /// grant command authority to a foreign checkout just to resolve it.
-    pub(crate) fn configured_primary_worktree(&self, repository: &Path,
-        cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError>
-    {
-        let command=self.git_read(repository,["config","--local","--path","--get","core.worktree"]);
-        let output=self.run_checked(&command,cancellation)?;
-        attach_repository_process(parse_path_line(&output.stdout,"primary_worktree"),&output)
+    pub(crate) fn configured_primary_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--path", "--get", "core.worktree"],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "primary_worktree"), &output)
     }
 
-    pub(crate) fn uses_files_ref_storage(&self, repository: &Path,
-        cancellation: &CancellationToken) -> Result<bool, RepositoryError>
-    {
-        let command=self.git_read(repository,["config","--local","--get","extensions.refStorage"]);
-        let output=self.run(&command,cancellation)?;
-        if output.exit_code==Some(1) { return Ok(true); }
-        if output.success { return Ok(trim_one_line_ending(&output.stdout)==b"files"); }
-        Err(git_failure(&command,output).into())
+    pub(crate) fn uses_files_ref_storage(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--get", "extensions.refStorage"],
+        );
+        let output = self.run(&command, cancellation)?;
+        if output.exit_code == Some(1) {
+            return Ok(true);
+        }
+        if output.success {
+            return Ok(trim_one_line_ending(&output.stdout) == b"files");
+        }
+        Err(git_failure(&command, output).into())
     }
 
     /// The canonical common directory of `repository`, the one a creation
