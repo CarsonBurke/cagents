@@ -177,7 +177,7 @@ impl ReservedProject {
                         Change::Update { before, pane } => self.pane(before) || self.pane(pane),
                         Change::RemoveSource {
                             before, repository, ..
-                        } => self.pane(before) || self.directory(repository),
+                        } | Change::RemoveArchivedAutomationSource {before,repository,..} => self.pane(before) || self.directory(repository),
                         Change::Remove { id } | Change::Move { id, .. } => self.panes.contains(id),
                     }
             }
