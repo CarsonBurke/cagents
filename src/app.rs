@@ -12569,9 +12569,13 @@ impl Cagents {
 
     fn synchronize_diff_whitespace(&mut self, origin: Option<CardId>) -> Task<Message> {
         let enabled = self.settings.diff_ignore_whitespace;
-        let visible = self.durable.cards.iter()
+        let visible = self
+            .durable
+            .cards
+            .iter()
             .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
-            .map(|card| card.id).collect::<HashSet<_>>();
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
         let mut tasks = Vec::new();
         for (&card, runtime) in self.cards.iter_mut() {
             let runtime = match runtime {
@@ -14086,7 +14090,10 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: origin }) => {
                 self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
-                Task::batch([self.synchronize_diff_whitespace(Some(origin)), self.save_settings_task(false)])
+                Task::batch([
+                    self.synchronize_diff_whitespace(Some(origin)),
+                    self.save_settings_task(false),
+                ])
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -21435,7 +21442,8 @@ mod tests {
         state.id = repository;
         state.kind = CardKind::Repository(runtime.descriptor.clone());
         Arc::make_mut(&mut app.durable).cards.push(state);
-        app.cards.insert(repository, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(repository, CardRuntime::Repository(Box::new(runtime)));
         let preferences = |app: &Cagents| {
             [repository, pr].map(|card| match app.cards.get(&card).unwrap() {
                 CardRuntime::Repository(runtime) => runtime.diff_ignores_whitespace(),
@@ -21450,7 +21458,9 @@ mod tests {
         assert_eq!(preferences(&app), [false; 2]);
         // The very next real toolbar action follows the restored preference.
         for enabled in [true, false] {
-            drop(app.update(Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: pr })));
+            drop(app.update(Message::Repository(
+                RepositoryAction::ToggleDiffWhitespace { card: pr },
+            )));
             assert_eq!(app.settings.diff_ignore_whitespace, enabled);
             assert_eq!(preferences(&app), [enabled; 2]);
         }
