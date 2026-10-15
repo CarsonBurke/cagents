@@ -10964,6 +10964,7 @@ impl Cagents {
             .cloned()
             .collect::<Vec<_>>();
         cosmic::task::future(async move {
+            let started = Instant::now();
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
                 let mut snapshot = service
@@ -11085,6 +11086,7 @@ impl Cagents {
         + 'static,
     ) -> Task<Message> {
         cosmic::task::future(async move {
+            let started = Instant::now();
             let joined = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
                 run(&service, &CancellationToken::default())
