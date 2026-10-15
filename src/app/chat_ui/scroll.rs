@@ -215,6 +215,8 @@ pub(super) struct HorizontalLocation {
     offset: f32,
 }
 
+struct LogicalScope(bool);
+
 struct LocateLogical {
     scroll: Id,
     item: Id,
@@ -224,6 +226,8 @@ struct LocateLogical {
     viewport: Option<Rectangle>,
     found: Option<(Rectangle, u8)>,
     horizontal: Vec<(Id, Rectangle, Rectangle)>,
+    active: bool,
+    scopes: Vec<bool>,
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
@@ -248,6 +252,7 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         _: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
+        if !self.active { return; }
         if id == Some(&self.scroll) {
             self.content = Some(content);
             self.viewport = Some(viewport);
@@ -258,11 +263,21 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         }
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&self.item) {
+        if self.active && id == Some(&self.item) {
             self.candidate(bounds, 0);
         }
     }
-    fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+    fn custom(&mut self, id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(scope) = state.downcast_ref::<LogicalScope>() {
+            if scope.0 {
+                self.scopes.push(self.active);
+                self.active = id == Some(&self.scroll);
+            } else {
+                self.active = self.scopes.pop().unwrap_or(false);
+            }
+            return;
+        }
+        if !self.active { return; }
         if let Some((bounds, stage)) =
             virtualized::logical_bounds(state, bounds, self.identity, self.byte)
         {
@@ -332,6 +347,8 @@ pub(super) fn locate_logical(
         viewport: None,
         found: None,
         horizontal: Vec::new(),
+        active: false,
+        scopes: Vec::new(),
     })
 }
 
@@ -1075,9 +1092,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut before,
             );
         }
+        if let Some(target) = self.target {
+            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(true));
+        }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
+        if let Some(target) = self.target {
+            operation.custom(Some(&card_control_id(target.card, "chat-transcript")), layout.bounds(), &mut LogicalScope(false));
+        }
         if self.target.is_some() {
             let mut after = ReadTop::default();
             self.content.as_widget_mut().operate(
@@ -1497,6 +1520,45 @@ mod tests {
     }
 
     #[test]
+    fn logical_find_geometry_is_scoped_to_its_transcript_when_source_ids_repeat() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let other = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x5517;
+        let make = |target, prefix: f32| transcript(widget::column::with_children(vec![
+            widget::Space::new().height(prefix).into(),
+            item("shared-source", selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new("same imported source".to_owned())].into(),
+                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+                selectable_prose::Logical { identity, start: 0, paint: None })),
+            widget::Space::new().height(2000).into(),
+        ]), target, None, vec![], false, vec![]);
+        let mut first = make(target, 0.0);
+        let mut decoy = make(other, 1500.0);
+        let mut first_tree = Tree::new(&first);
+        let mut other_tree = Tree::new(&decoy);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let first_node = first.as_widget_mut().layout(&mut first_tree, &renderer, &limits);
+        let other_node = decoy.as_widget_mut().layout(&mut other_tree, &renderer, &limits);
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let sink = result.clone();
+        let mut locate = operation::map(LocateLogical {
+            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("shared-source"),
+            identity, byte: 0, content: None, viewport: None, found: None,
+            horizontal: vec![], active: false, scopes: vec![],
+        }, move |location| { *sink.lock().unwrap() = location; });
+        first.as_widget_mut().operate(&mut first_tree, Layout::new(&first_node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let expected = result.lock().unwrap().take().expect("target transcript has an exact glyph");
+        assert!(expected.exact);
+        decoy.as_widget_mut().operate(&mut other_tree, Layout::new(&other_node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let after = result.lock().unwrap().take().unwrap();
+        assert_eq!(after.offset, expected.offset,
+            "another pane displaying identical source IDs cannot replace the target glyph geometry");
+    }
+
+    #[test]
     fn logical_find_reveals_a_far_right_code_glyph_without_changing_vertical_scroll() {
         let renderer = crate::app::tests::headless_renderer();
         for byte in [400, 4000] {
@@ -1555,6 +1617,8 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
+        active: false,
+        scopes: Vec::new(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;
@@ -1799,6 +1863,8 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
+        active: false,
+        scopes: Vec::new(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;
