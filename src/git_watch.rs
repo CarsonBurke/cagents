@@ -564,7 +564,7 @@ impl Registrations {
         // little room for the selected workspaces. When both fit, keep every
         // project's admin edges before allocating any background content.
         let oversubscribed = reserved.len() > limit;
-        for (&id, project) in &metadata_order {
+        for (&id, project) in metadata_order.iter().copied() {
             if let Some(reason) = &project.polling {
                 registrations.failures.insert(id, reason.clone());
             }
