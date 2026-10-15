@@ -36,6 +36,10 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
+        self.requested_transfers.get(&operation).copied()
+    }
+
     pub(super) fn is_requested_transfer(&self, operation: uuid::Uuid) -> bool {
         self.requested_transfers.contains_key(&operation)
     }
@@ -662,7 +666,36 @@ impl Cagents {
         }
     }
 
+    /// A transfer can commit before a later metadata edit reaches the daemon.
+    /// Keep that edit over the new owner and give its retry a distinct receipt:
+    /// the original old-scope operation can still acknowledge a harmless no-op.
+    pub(super) fn retarget_transferred_pane_updates(&mut self, acknowledged: Option<CardId>) {
+        let moving: HashSet<_> = self.shared_views.requested_transfers.values().copied()
+            .chain(acknowledged).collect();
+        if moving.is_empty() { return; }
+        let mut edits = Vec::new();
+        for (operation, scope, change) in &mut self.shared_views.pending {
+            let Change::Update { pane, .. } = change else { continue; };
+            let card = pane.id;
+            if !moving.contains(&card) { continue; }
+            let mut owners = self.workspace_model.views.iter()
+                .filter(|view| view.panes.iter().any(|candidate| candidate.id == card));
+            let Some(owner) = owners.next() else { continue; };
+            if owners.next().is_some() || owner.scope == *scope { continue; }
+            *operation = uuid::Uuid::new_v4();
+            *scope = owner.scope.clone();
+            edits.push(ModelEdit::ChangeView {
+                scope: scope.clone(), expected_revision: owner.revision,
+                operation: *operation, change: change.clone(),
+            });
+        }
+        for edit in edits { self.publish_model_edit(edit); }
+    }
+
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        // A watcher snapshot can announce the destination before the explicit
+        // transfer response arrives. Rebase before either snapshot projects.
+        self.retarget_transferred_pane_updates(None);
         self.shared_views.prune_restoration_requests(&self.durable);
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
@@ -1430,7 +1463,12 @@ mod tests {
     }
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
-        let (mut app, source, destination, pane) = fixture();
+        channel_move_fixture_with_kind(None)
+    }
+
+    fn channel_move_fixture_with_kind(kind: Option<CardKind>) -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, source, destination, mut pane) = fixture();
+        if let Some(kind) = kind { pane.kind = kind; }
         app.workspace_model.channels = [source, destination].into_iter().map(|id| crate::workspace_model::ModelChannel {
             id, repository: PathBuf::from("/repo/.git"), title: "Channel".into(),
             title_source: Default::default(), ordinal: 1,
@@ -1442,6 +1480,151 @@ mod tests {
         Arc::make_mut(&mut app.durable).active_channel = Some(source);
         drop(app.reconcile_shared_views());
         (app, source, destination, pane)
+    }
+
+    fn edit_moving_terminal(app: &mut Cagents, card: CardId, source: ChannelId) -> Pane {
+        use super::super::chrome_ui::Action;
+        drop(app.update_chrome(Action::Rename(card)));
+        drop(app.update_chrome(Action::RenameChanged("Renamed while moving".into())));
+        drop(app.update_chrome(Action::RenameSubmit));
+        app.workspace.resize_viewport(1000.0);
+        drop(app.update(Message::ResizeCard { card, width: 640.0 }));
+        drop(app.update(Message::ResizeCardFinished(card)));
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("terminal"); };
+        // This is the durable descriptor boundary written by ResumeHintChanged.
+        session.resume_hint = Some("observed-provider-session-while-moving".into());
+        app.persist();
+        let pane = app.local_view_panes(&Scope::Channel(source)).into_iter()
+            .find(|pane| pane.id == card).unwrap();
+        assert_eq!(pane.user_title.as_deref(), Some("Renamed while moving"));
+        assert_ne!(pane.width_fraction, 0.5);
+        pane
+    }
+
+    fn assert_moving_metadata(app: &Cagents, expected: &Pane) {
+        let card = app.card_state(expected.id).unwrap();
+        assert_eq!(card.title, expected.title);
+        assert_eq!(app.chrome_ui.user_titles.get(&expected.id), expected.user_title.as_ref());
+        assert_eq!(card.width_fraction, expected.width_fraction);
+        assert_eq!(card.kind, expected.kind);
+    }
+
+    #[test]
+    fn accepted_channel_move_retargets_user_and_observed_descriptor_edits_before_projection() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for watcher_first in [false, true] {
+            let kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap()));
+            let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.move_pane_to_channel(pane.id, destination));
+            let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else { panic!("transfer"); };
+            let expected = edit_moving_terminal(&mut app, pane.id, source);
+            let mut old = Vec::new();
+            while let Ok(edit) = rx.try_recv() {
+                if let ModelEdit::ChangeView { scope, operation, change: Change::Update { before, pane: after }, .. } = edit {
+                    assert_eq!(scope, Scope::Channel(source));
+                    old.push((operation, Change::Update { before, pane: after }));
+                }
+            }
+            assert!(old.len() >= 3, "rename, resize and observed descriptor are separate real publications");
+            let mut model = app.workspace_model.clone();
+            views::transfer(&mut model.views, &Scope::Channel(source), pane.id, &Scope::Channel(destination), None).unwrap();
+            model.sequence += 1;
+            model.views.iter_mut().find(|view| view.scope == Scope::Channel(destination)).unwrap().revision = 1;
+            if watcher_first {
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                assert!(app.pane_transfer_pending(pane.id));
+                assert_moving_metadata(&app, &expected);
+            }
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(source), operation: Some(transfer), model: model.clone(),
+            }));
+            assert_moving_metadata(&app, &expected);
+            assert!(!app.pane_transfer_pending(pane.id));
+            assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id));
+            let mut retried = Vec::new();
+            while let Ok(edit) = rx.try_recv() {
+                if let ModelEdit::ChangeView { scope, expected_revision, operation, change: Change::Update { before, pane: after } } = edit {
+                    assert_eq!(scope, Scope::Channel(destination));
+                    assert_eq!(expected_revision, 1);
+                    assert!(!old.iter().any(|(previous, _)| *previous == operation));
+                    retried.push((operation, Change::Update { before, pane: after }));
+                }
+            }
+            assert_eq!(retried.len(), old.len(), "watcher and transfer acknowledgment must not duplicate retries");
+            for (operation, change) in old {
+                assert!(!model.views.iter_mut().find(|view| view.scope == Scope::Channel(source)).unwrap().apply(&change).unwrap());
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: Scope::Channel(source), operation: Some(operation), model: model.clone(),
+                }));
+                assert_moving_metadata(&app, &expected);
+                assert!(!app.shared_views.pending.is_empty(), "an old-scope acknowledgment cannot retire its retargeted intent");
+            }
+            for (operation, change) in retried {
+                model.views.iter_mut().find(|view| view.scope == Scope::Channel(destination)).unwrap().apply(&change).unwrap();
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: Scope::Channel(destination), operation: Some(operation), model: model.clone(),
+                }));
+                assert_moving_metadata(&app, &expected);
+            }
+            assert!(app.shared_views.pending.is_empty());
+            assert!(rx.try_recv().is_err(), "settled updates do not publish a feedback loop");
+        }
+    }
+
+    #[test]
+    fn refused_channel_move_keeps_metadata_edits_in_the_original_scope() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap()));
+        let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.move_pane_to_channel(pane.id, destination));
+        let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else { panic!("transfer"); };
+        let expected = edit_moving_terminal(&mut app, pane.id, source);
+        let pending = app.shared_views.pending.clone();
+        assert!(pending.len() >= 3);
+        while rx.try_recv().is_ok() {}
+        drop(app.apply_workspace_model_update(ModelUpdate::PaneTransferFailed {
+            operation: transfer, error: "destination removed".into(),
+        }));
+        assert_moving_metadata(&app, &expected);
+        assert_eq!(app.shared_views.pending, pending);
+        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
+        assert!(rx.try_recv().is_err(), "a refused transfer must not retarget or duplicate metadata operations");
+    }
+
+    #[test]
+    fn channel_move_does_not_retarget_another_panes_pending_update() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let mut other = pane.clone();
+        other.id = CardId::new();
+        let CardKind::Browser(session) = &mut other.kind else { panic!("browser"); };
+        session.id = BrowserId::new();
+        app.workspace_model.views.iter_mut().find(|view| view.scope == Scope::Channel(source)).unwrap().panes.push(other.clone());
+        drop(app.reconcile_shared_views());
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.move_pane_to_channel(pane.id, destination));
+        let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else { panic!("transfer"); };
+        let unrelated = uuid::Uuid::new_v4();
+        let mut renamed = other.clone();
+        renamed.title = "Keep another pane's edit".into();
+        let intent = (unrelated, Scope::Channel(source), Change::Update { before: other.clone(), pane: renamed });
+        app.shared_views.pending.push(intent.clone());
+        let mut model = app.workspace_model.clone();
+        views::transfer(&mut model.views, &Scope::Channel(source), pane.id, &Scope::Channel(destination), None).unwrap();
+        model.sequence += 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(source), operation: Some(transfer), model,
+        }));
+        assert_eq!(app.shared_views.pending, vec![intent]);
+        assert_eq!(app.card_state(other.id).unwrap().title, "Keep another pane's edit");
+        assert!(rx.try_recv().is_err(), "unrelated intentions retain their existing operation receipt");
     }
 
     #[test]
