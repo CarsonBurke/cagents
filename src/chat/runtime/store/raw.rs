@@ -290,8 +290,8 @@ impl Store {
         if command>0{parts.push(RawSourcePart{item_id:id.into(),source:key("",id),field:RawSourceField::CommandCall,epoch,source_len:command,metadata:RawSourceMetadata{tool_name:name,representation:RawRepresentation::CommandMetadataJson,complete_call:true}});}
         Ok(parts)
     }
+    /// Called only while the parent canonical reader holds its read snapshot.
     pub(super) fn raw_command(&self,source:&SourceKey)->Result<Option<RawCommandCall>,String>{
-        let _read=self.db.unchecked_transaction().map_err(err)?;
         self.raw_guard()?;if let Some(reason)=&self.raw_sources.blocked{return Err(reason.clone());}
         if self.raw_revoked(source)?{return Err("Original command was removed".into());}
         let len:Option<usize>=self.db.query_row("SELECT command_len FROM raw_tool_sources WHERE agent=?1 AND id=?2 AND state=1",params![agent(source),source.source_id],|r|r.get(0)).optional().map_err(err)?;

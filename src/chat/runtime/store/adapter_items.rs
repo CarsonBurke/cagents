@@ -52,10 +52,15 @@ impl Store {
     pub(super) fn adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         self.flush_input()?;self.flush_text()?;
         self.raw_guard()?;
-        if key.agent_id.is_none()&&self.raw_revoked(&crate::chat::cache::SourceKey{agent_id:None,source_id:key.item_id.clone()})?{return Err("Original tool identity was explicitly removed; replay is refused until reset".into());}
         if key.agent_id.is_some() {
             return self.child_adapter_item(key);
         }
+        // Keep owner/revocation and every canonical field read in one SQLite
+        // snapshot; a reopened handle cannot replace rows between the proof
+        // check and body hydration.
+        let _read=self.db.unchecked_transaction().map_err(|error|error.to_string())?;
+        self.raw_guard()?;
+        if self.raw_revoked(&crate::chat::cache::SourceKey{agent_id:None,source_id:key.item_id.clone()})?{return Err("Original tool identity was explicitly removed; replay is refused until reset".into());}
         let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END,source_shortened FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,bool>(5)?))).optional().map_err(|error|error.to_string())?;
         let Some((metadata,len0,len1,len2,spans,shortened))=record else {return Ok(None);};
         let metadata=metadata.ok_or("Original tool metadata exceeds its canonical limit")?;
