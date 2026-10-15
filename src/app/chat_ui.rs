@@ -5256,11 +5256,16 @@ impl Cagents {
             )).key(key).targets(targets));
         }
         if !batch.failed.is_empty() {
+            let key = "daemon-chat-reconnect";
+            let mut targets = self.notices.entries.iter()
+                .filter(|entry| entry.notice.key.as_deref() == Some(key))
+                .flat_map(|entry| entry.notice.targets.iter().copied())
+                .chain(batch.failed).collect::<Vec<_>>();
+            targets.sort();
+            targets.dedup();
             self.notices.record(TransientNotice::warning(format!(
-                "{} chats could not reconnect automatically. Open an affected chat to retry.", batch.failed.len()
-            )).key("daemon-chat-reconnect").targets(batch.failed));
-        } else {
-            self.notices.resolve("daemon-chat-reconnect");
+                "{} chats could not reconnect automatically. Open an affected chat to retry.", targets.len()
+            )).key(key).targets(targets));
         }
         if batch.reconnected > 0 {
             self.status = Some(TransientNotice::success(format!(
@@ -12876,6 +12881,29 @@ mod tests {
         assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect") && entry.notice.targets == vec![failed]));
         app.notices.resolve_target(key, first);
         assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![second]);
+    }
+
+    #[test]
+    fn reconnect_failures_remain_until_each_failed_chat_recovers_or_is_discarded() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let cards = [live_chat(&mut app, Some(KNOWN_THREAD)), live_chat(&mut app, Some(KNOWN_THREAD)), live_chat(&mut app, Some(KNOWN_THREAD))];
+        for card in cards {
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target).unwrap().disconnected = true;
+        }
+        let key = "daemon-chat-reconnect";
+        for (index, succeeded) in [(0, false), (1, true), (2, false)] {
+            app.begin_chat_reconnect(chat_runtime(&app, cards[index]).target);
+            app.finish_chat_reconnect(cards[index], succeeded, None);
+            let targets = &app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets;
+            assert!(targets.contains(&cards[0]), "another chat's success/failure cannot erase this failure");
+            assert!(!targets.contains(&cards[1]));
+        }
+        app.begin_chat_reconnect(chat_runtime(&app, cards[0]).target);
+        app.finish_chat_reconnect(cards[0], true, None);
+        assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![cards[2]]);
+        app.chat_discard(cards[2]);
+        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some(key)));
     }
 
     #[test]
