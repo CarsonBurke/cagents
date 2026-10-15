@@ -32,6 +32,13 @@ def process_is_current(identity):
         return False
 
 
+def evidence_ignores(directory, names):
+    # Holder sockets use the terminal UUID as their basename, without a suffix.
+    # A failed teardown must still preserve its log and registry evidence.
+    return {name for name in names if name in ("cagents", "cagentsd")
+            or (Path(directory) / name).is_socket()}
+
+
 class Instance:
     def __init__(self, root, binaries, *, idle=60, retention=1):
         self.root = root
@@ -173,7 +180,7 @@ def main():
         finally:
             # Preserve failure evidence before TemporaryDirectory removes the
             # isolated state; no fixture binary copies are retained.
-            shutil.copytree(root, args.evidence / "instances", ignore=shutil.ignore_patterns("*.sock", "cagents", "cagentsd"))
+            shutil.copytree(root, args.evidence / "instances", ignore=evidence_ignores)
             (args.evidence / "result.json").write_text(json.dumps({"products": products, "checks": checks, "completed": len(checks) == 5}, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
 
