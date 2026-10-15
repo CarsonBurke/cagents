@@ -205,6 +205,14 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
+    match crate::transcript_cache::sweep(&paths.directory) {
+        Ok(removed) => tracing::info!(
+            count = removed.count,
+            bytes = removed.bytes,
+            "reclaimed orphan transcript caches"
+        ),
+        Err(error) => tracing::warn!(%error, "could not sweep orphan transcript caches"),
+    }
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
     host.lock()
         .unwrap_or_else(|p| p.into_inner())

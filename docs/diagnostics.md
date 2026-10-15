@@ -66,3 +66,27 @@ only chooses its filter and does not enable raw capture on its own. Raw debug
 output can contain application data: its caller-selected file has caller-managed
 retention and is never returned by `cagents diagnostics`. No support upload or
 network telemetry is performed.
+
+`cagents diagnostics` also reports the current transcript-cache directory count
+and total regular-file bytes under this instance's runtime directory. This is a
+filesystem observation, separate from recorded product health, and never starts
+or contacts the daemon. A missing runtime directory reports zero; an unreadable
+one reports unavailable. It counts active and orphaned caches together.
+
+Chat caches hold an exclusive per-directory lease while live. Daemon startup
+reclaims unlocked caches; legacy caches without a lease are retained while a
+same-user process has an open descriptor beneath them, or procfs cannot establish
+that safely. Creation and sweeping share a gate, so the interval between mkdir
+and lease acquisition cannot expose a live new cache to deletion.
+
+The cache remains in the private runtime directory: history and decoded images
+are ephemeral and are removed at Store drop or following daemon restart. Its
+SQLite connection is actor-private, so it uses DELETE journaling with a zero
+retained-journal limit and synchronous writes disabled. Journals exist only for
+an active transaction and disappear at commit; a large transaction can still
+need a transient rollback journal proportional to pages changed. Transaction
+failure retains rollback semantics; process-crash recovery is unnecessary because
+the next daemon removes the entire orphaned cache. The page-cache budget is
+1 MiB per connection. Moving long transcripts to disk-backed cache storage remains
+a possible separate change: active transcript size still consumes runtime tmpfs,
+but stale generations and historical WAL rewrite volume no longer accumulate.

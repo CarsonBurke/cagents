@@ -112,6 +112,7 @@ pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;
 pub mod terminal;
+pub mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]
