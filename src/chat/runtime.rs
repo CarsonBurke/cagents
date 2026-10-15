@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod native_reconcile;
 mod store;
 mod websocket;
 use store::Store;
@@ -149,6 +150,8 @@ struct Inner {
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
+    native_reconciling:AtomicBool,
+    native_reconcile_error:Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
     stderr_lease: Arc<Mutex<Option<super::stderr_log::Lease>>>,
@@ -330,6 +333,8 @@ impl Handle {
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
+            native_reconciling:AtomicBool::new(false),
+            native_reconcile_error:Mutex::new(None),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             stderr_lease: stderr_lease.clone(),
@@ -1275,43 +1280,60 @@ impl Handle {
         // Never hold a worker mutex while waiting for provider code. Only
         // join after is_finished proves that its user cleanup has returned.
         self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
+        if let Some(deadline)=deadline {return self.reconcile_native_until(deadline);}
         {
-            let mut retained = if deadline.is_some() {
-                match self.0.retained_native.try_lock() {
-                    Ok(retained)=>retained,
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner(),
-                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Native provider reconciliation is still pending; its owner is retained".into()),
-                }
-            } else {self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner())};
-            if deadline.is_some() && retained.is_some() {
-                return Err("Retained provider reconciliation requires a separate close retry; its exact owner is retained".into());
-            }
-            if let Some(holder) = retained.as_mut() {
+            let mut retained=self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner());
+            if let Some(holder)=retained.as_mut() {
                 holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
                 retained.take();
-                self.0.completed.store(true, Ordering::Release);
+                self.0.completed.store(true,Ordering::Release);
             }
         }
         if !preserving && self.0.native_installed.load(Ordering::Acquire) {
-            let mut detached = if deadline.is_some() {
-                match self.0.detached_native.try_lock() {
-                    Ok(detached)=>detached,
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner(),
-                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Detached provider reconciliation is still pending; its owner is retained".into()),
-                }
-            } else {self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner())};
-            if deadline.is_some() && detached.is_some() {
-                return Err("Detached provider reconciliation requires a separate close retry; its exact owner is retained".into());
-            }
-            if let Some(owner) = detached.as_ref() {
-                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
-                    owner.close_retaining_receipt()?;
-                } else {
-                    owner.close()?;
-                }
+            let mut detached=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner());
+            if let Some(owner)=detached.as_ref() {
+                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {owner.close_retaining_receipt()?;} else {owner.close()?;}
                 detached.take();
             }
         }
+        self.close_result()
+    }
+
+    fn reconcile_native_until(&self,deadline:Instant)->Result<(),String> {
+        let mut attempted=false;
+        loop {
+            let retained=match self.0.retained_native.try_lock() {
+                Ok(owner)=>Some(owner.is_some()),
+                Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
+                Err(std::sync::TryLockError::WouldBlock)=>None,
+            };
+            let detached=if self.0.native_installed.load(Ordering::Acquire) {
+                match self.0.detached_native.try_lock() {
+                    Ok(owner)=>Some(owner.is_some()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
+                    Err(std::sync::TryLockError::WouldBlock)=>None,
+                }
+            } else {Some(false)};
+            if retained==Some(false) && detached==Some(false) && !self.0.native_reconciling.load(Ordering::Acquire) {
+                return self.close_result();
+            }
+            if retained==Some(true) || detached==Some(true) {
+                if !attempted {
+                    native_reconcile::request(self)?;
+                    attempted=true;
+                } else if !self.0.native_reconciling.load(Ordering::Acquire) {
+                    let reason=self.0.native_reconcile_error.try_lock().ok().and_then(|error|error.clone());
+                    return Err(format!("Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",reason.map(|reason|format!(": {reason}")).unwrap_or_default()));
+                }
+            }
+            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native cleanup is still pending; its exact owner and bounded reconciliation task are retained for retry".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_result(&self)->Result<(),String> {
         if self.is_completed() {
             return Ok(());
         }
@@ -6231,6 +6253,55 @@ mod tests {
         handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
         assert!(handle.is_completed());
         assert!(handle.0.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+        const CHILD:&str="CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+            let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
+                .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let mut source=super::super::native_holder::fixture_source();
+        let boot=crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id=boot.clone();
+        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id=boot;
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
+        let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
+        assert!(record.root.is_current());
+        let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
+        let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+        invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        handle.close().unwrap();
+        *handle.0.retained_native.lock().unwrap()=Some(holder);
+        handle.0.completed.store(false,Ordering::Release);
+        *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
+        assert!(handle.close_until(Instant::now()+Duration::from_secs(2)).is_err());
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while handle.0.native_reconciling.load(Ordering::Acquire) {
+            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.0.retained_native.lock().unwrap().is_some());
+        assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
+        assert!(!handle.is_completed());assert!(handle.owns_work());
+        std::fs::remove_file(&receipt).unwrap();
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
+        assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
     }
 
     #[test]
