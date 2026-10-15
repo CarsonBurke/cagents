@@ -12,17 +12,30 @@ pub(crate) struct DirectoryProof {
     pub(crate) path: std::path::PathBuf,
 }
 
+impl DirectoryProof {
+    /// The caller must have obtained this exact process from an authenticated
+    /// original holder or retained child, never by rediscovering a numeric ID.
+    pub(crate) fn capture_owned_process(process: &Process, candidate: &Path, approved: Option<DirectoryIdentity>) -> Result<Self, String> {
+        prove(process, candidate, approved)
+    }
+}
+
 impl Handle {
     /// Call outside HostState: this is serialized with the owning actor and
     /// may wait behind provider work. An unavailable proof never authorizes a
     /// guessed relocation or a replacement provider.
     pub(crate) fn capture_execution_directory(&self, candidate: &Path) -> Result<DirectoryProof, String> {
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) || self.0.stop.load(Ordering::Acquire) {
+            return Err("The original provider actor has stopped; its directory cannot be relocated".into());
+        }
         let (proof, response) = crossbeam_channel::bounded(1);
-        self.ownership_command(ActorCommand::CaptureExecutionDirectory {
+        let (reply, _) = crossbeam_channel::bounded(1);
+        self.0.commands.try_send((ActorCommand::CaptureExecutionDirectory {
             directory: candidate.to_owned(),
             proof,
-        })?;
-        response.recv_timeout(Duration::from_secs(1))
+        }, reply)).map_err(|error| format!("Provider directory verification queue unavailable: {error}"))?;
+        self.wake();
+        response.recv_timeout(Duration::from_secs(2))
             .map_err(|_| "The provider did not return a directory ownership proof; retry Locate after it is ready".to_owned())?
     }
 }

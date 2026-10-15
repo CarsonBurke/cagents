@@ -19333,6 +19333,7 @@ mod tests {
                 views: Vec::new(),
                 agents: Vec::new(),
                 agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             match frame {
                 // One adopted row.

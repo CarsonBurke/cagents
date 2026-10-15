@@ -4028,6 +4028,7 @@ mod tests {
                 views: Vec::new(),
                 agents: Vec::new(),
                 agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4283,6 +4284,7 @@ mod tests {
                 views: Vec::new(),
                 agents: Vec::new(),
                 agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4347,6 +4349,7 @@ mod tests {
                 views: Vec::new(),
                 agents: Vec::new(),
                 agent_locations: Vec::new(),
+                session_location_refusals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4472,6 +4475,7 @@ mod tests {
                         views: Vec::new(),
                         agents: Vec::new(),
                         agent_locations: Vec::new(),
+                        session_location_refusals: Vec::new(),
                     },
                 ),
             )
@@ -4534,6 +4538,7 @@ mod tests {
             views: Vec::new(),
             agents: Vec::new(),
             agent_locations: Vec::new(),
+            session_location_refusals: Vec::new(),
         }
     }
 

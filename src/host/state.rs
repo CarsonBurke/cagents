@@ -622,6 +622,13 @@ impl HostState {
         Ok(applied.model)
     }
 
+    /// Provider evidence was prepared without this mutex. The caller owns
+    /// exclusive control admission and publishes after actor-local completion.
+    pub(super) fn apply_session_relocation(&mut self, edit: &ModelEdit, moves: &[super::model::SessionMove]) -> Result<WorkspaceModel, ProtocolError> {
+        self.registry()?.apply_with_session_moves(edit, moves)
+            .map(|applied| applied.model).map_err(model_unavailable)
+    }
+
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
         self.model.as_mut().ok_or_else(missing_registry)
     }
@@ -2522,9 +2529,6 @@ fn restore_terminal_execution_authority(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retained_agent_authority_source(source.id)?;
-    if !matches!(authority, Some(HostedSession::Terminal(_))) {
-        return Ok(());
-    }
     let successor = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2549,10 +2553,12 @@ fn restore_terminal_execution_authority(
             retained.push(HostedSession::Terminal(attached));
         }
     }
-    registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let successor = HostedSession::Terminal(successor);
+    if matches!(authority, Some(HostedSession::Terminal(_))) {
+        registry.adopt_authenticated_agent_session(&retained, &successor)?;
+    }
+    registry.adopt_session_location(&retained, &successor)?;
     Ok(())
 }
 

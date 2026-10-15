@@ -1,0 +1,202 @@
+//! Private operational locations for exact hosted sessions. Issued recipes and
+//! holder recovery sources remain immutable; a logical project move cannot
+//! grant an old provider authority over a replacement directory.
+use super::*;
+use crate::{agent_execution::{DirectoryIdentity, HostedSession}, daemon::holder_registry::Process, model::TerminalId};
+
+#[derive(Clone, Debug)]
+pub(crate) struct Location {
+    pub(crate) source: HostedSession,
+    pub(crate) repository: Option<PathBuf>,
+    pub(crate) directory: PathBuf,
+    pub(crate) approved: Option<DirectoryIdentity>,
+    pub(crate) process: Option<Process>,
+    pub(crate) blocked_directory: Option<PathBuf>,
+    pub(crate) refusal: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionMove {
+    pub(crate) source: HostedSession,
+    pub(crate) repository: PathBuf,
+    pub(crate) candidate: PathBuf,
+    pub(crate) proof: Result<(DirectoryIdentity, Process), String>,
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
+    serde_json::from_str(value).map_err(|error| error.to_string())
+}
+fn issued_directory(source: &HostedSession) -> &Path {
+    match source {
+        HostedSession::Chat(session) => &session.launch.recipe.working_directory,
+        HostedSession::Terminal(session) => &session.launch.working_directory,
+    }
+}
+
+pub(super) fn migrate(db: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS session_locations (
+        session TEXT PRIMARY KEY, source TEXT NOT NULL, repository TEXT,
+        directory TEXT NOT NULL, approved TEXT, process TEXT,
+        blocked_directory TEXT, refusal TEXT
+    ) STRICT;").map_err(|error| error.to_string())?;
+    tx.pragma_update(None, "user_version", 14).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn read(db: &Connection, id: TerminalId) -> Result<Option<Location>, String> {
+    let row = db.query_row("SELECT source,repository,directory,approved,process,blocked_directory,refusal FROM session_locations WHERE session=?1", [id.to_string()], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,String>(2)?, row.get::<_,Option<String>>(3)?, row.get::<_,Option<String>>(4)?, row.get::<_,Option<String>>(5)?, row.get::<_,Option<String>>(6)?))
+    }).optional().map_err(|error| error.to_string())?;
+    row.map(|(source, repository, directory, approved, process, blocked, refusal)| Ok(Location {
+        source: decode(&source)?, repository: repository.map(PathBuf::from), directory: directory.into(),
+        approved: approved.map(|value| decode(&value)).transpose()?,
+        process: process.map(|value| decode(&value)).transpose()?,
+        blocked_directory: blocked.map(PathBuf::from), refusal,
+    })).transpose()
+}
+
+fn write(db: &Connection, location: &Location) -> Result<(), String> {
+    db.execute("INSERT INTO session_locations(session,source,repository,directory,approved,process,blocked_directory,refusal) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(session) DO UPDATE SET source=excluded.source,repository=excluded.repository,directory=excluded.directory,approved=excluded.approved,process=excluded.process,blocked_directory=excluded.blocked_directory,refusal=excluded.refusal", params![
+        location.source.id().to_string(), encode(&location.source)?,
+        location.repository.as_deref().map(repository_key).transpose()?, repository_key(&location.directory)?,
+        location.approved.as_ref().map(encode).transpose()?, location.process.as_ref().map(encode).transpose()?,
+        location.blocked_directory.as_deref().map(repository_key).transpose()?, location.refusal,
+    ]).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(super) fn refusals(db: &Connection) -> Result<Vec<crate::workspace_model::SessionLocationRefusal>, String> {
+    db.prepare("SELECT session,blocked_directory,refusal FROM session_locations WHERE blocked_directory IS NOT NULL AND refusal IS NOT NULL ORDER BY session")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?
+        .into_iter().map(|(session, directory, reason)| Ok(crate::workspace_model::SessionLocationRefusal {
+            session: session.parse().map_err(|_| "Invalid saved session identity".to_owned())?, directory: directory.into(), reason,
+        })).collect()
+}
+
+/// Only server-prepared evidence enters this transaction. No process, actor or
+/// filesystem operations run while HostState or the database writer is held.
+pub(super) fn apply(db: &Connection, moves: &[SessionMove]) -> Result<(), String> {
+    for movement in moves {
+        let previous = read(db, movement.source.id())?;
+        if let Some(previous) = &previous
+            && !previous.source.same_process(&movement.source)
+        {
+            return Err("The hosted session changed while its project was being located; no relocation was committed".into());
+        }
+        let mut location = previous.unwrap_or_else(|| Location {
+            source: movement.source.clone(), repository: None,
+            directory: issued_directory(&movement.source).to_owned(), approved: None, process: None,
+            blocked_directory: None, refusal: None,
+        });
+        location.repository = Some(movement.repository.clone());
+        match &movement.proof {
+            Ok((identity, process)) => {
+                if location.approved.is_some_and(|approved| approved != *identity) {
+                    return Err("The approved session directory changed during Locate; no relocation was committed".into());
+                }
+                location.directory = movement.candidate.clone();
+                location.approved = Some(*identity);
+                location.process = Some(process.clone());
+                location.blocked_directory = None;
+                location.refusal = None;
+            }
+            Err(reason) => {
+                location.blocked_directory = Some(movement.candidate.clone());
+                location.refusal = Some(reason.chars().filter(|character| !character.is_control()).take(1024).collect());
+            }
+        }
+        write(db, &location)?;
+    }
+    Ok(())
+}
+
+/// A legacy agent can acquire its first directory pin only from its exact
+/// already-bound hosted session. An ID, spec path, or public pane is not proof.
+pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result<(), String> {
+    if moves.is_empty() { return Ok(()); }
+    let records = db.prepare("SELECT record FROM agents").map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_,String>(0)).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?;
+    for record in records {
+        let agent: crate::agent_execution::Agent = decode(&record)?;
+        let Some(source) = &agent.session else { continue; };
+        let Some(identity) = moves.iter().find_map(|movement| {
+            source.same_process(&movement.source).then(|| movement.proof.as_ref().ok().map(|(identity,_)| *identity)).flatten()
+        }) else { continue; };
+        db.execute("INSERT INTO agent_policies(agent,directory) VALUES (?1,?2) ON CONFLICT(agent) DO UPDATE SET directory=excluded.directory WHERE agent_policies.directory IS NULL", params![agent.id.to_string(), encode(&identity)?]).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+impl Registry {
+    pub(crate) fn refuse_session_location(&mut self, source: &HostedSession, candidate: &Path, reason: &str) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let mut location = read(&tx, source.id())?.ok_or("The session directory binding disappeared during Locate")?;
+        if !location.source.same_process(source) { return Err("The session incarnation changed during Locate".into()); }
+        location.blocked_directory = Some(candidate.to_owned());
+        location.refusal = Some(reason.chars().filter(|character| !character.is_control()).take(1024).collect());
+        write(&tx, &location)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Called only after holder authentication and installation proved this
+    /// exact successor. A public UUID/recipe never establishes this lineage.
+    pub(crate) fn adopt_session_location(&mut self, retained: &[HostedSession], successor: &HostedSession) -> Result<(), String> {
+        let Some(first) = retained.first() else { return Ok(()); };
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let Some(mut location) = read(&tx, first.id())? else { return Ok(()); };
+        if successor.id() != first.id() || retained.iter().any(|source| source.id() != first.id())
+            || !retained.iter().any(|source| location.source.same_process(source))
+        { return Err("Authenticated holder sources do not prove this session directory successor".into()); }
+        // A process proof can change during authenticated adoption, while the
+        // original approved inode, refusal and operational spelling cannot.
+        location.source = successor.clone();
+        write(&tx, &location)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn session_location(&self, source: &HostedSession) -> Result<Option<Location>, String> {
+        let location = read(&self.db, source.id())?;
+        if location.as_ref().is_some_and(|location| !location.source.same_process(source)) {
+            return Err("The saved operational directory belongs to another session incarnation".into());
+        }
+        Ok(location)
+    }
+
+    pub(crate) fn bind_session_location(&mut self, source: &HostedSession, previous: Option<&HostedSession>, directory: &Path, approved: DirectoryIdentity) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let old = read(&tx, source.id())?;
+        if old.as_ref().is_some_and(|location| !location.source.same_process(source)
+            && previous.is_none_or(|previous| !location.source.same_process(previous))) {
+            return Err("A different original session still owns this directory binding".into());
+        }
+        if old.as_ref().is_some_and(|location| location.approved.is_some_and(|identity| identity != approved)) {
+            return Err("The original session directory was replaced; start a new session for the replacement folder".into());
+        }
+        write(&tx, &Location {
+            source: source.clone(), repository: old.as_ref().and_then(|location| location.repository.clone()),
+            directory: directory.to_owned(), approved: Some(approved), process: None,
+            blocked_directory: None, refusal: None,
+        })?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Holder authentication must supply the exact private retained sources.
+    /// A matching terminal ID or filesystem path alone never restores a pin.
+    pub(crate) fn retained_session_location(&self, retained: &[HostedSession]) -> Result<Option<Location>, String> {
+        let Some(first) = retained.first() else { return Ok(None); };
+        let Some(location) = read(&self.db, first.id())? else { return Ok(None); };
+        if retained.iter().any(|source| source.id() != first.id())
+            || !retained.iter().any(|source| location.source.same_process(source)) {
+            return Err("Retained provider sources do not authenticate the saved directory binding".into());
+        }
+        if let Some(reason) = &location.refusal { return Err(reason.clone()); }
+        if location.approved.is_none() { return Err("The retained session has no proven directory identity; locate its original provider or close it explicitly".into()); }
+        Ok(Some(location))
+    }
+}
