@@ -10622,10 +10622,18 @@ fn binary_file_view(
             .into(),
             crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
             actions.into(),
-            widget::scrollable(widget::text(hex).font(cosmic::iced::Font::MONOSPACE))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
+            widget::scrollable(
+                widget::text(hex)
+                    .font(cosmic::iced::Font::MONOSPACE)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .direction(iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
         ])
         .spacing(space::M),
     )
