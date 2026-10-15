@@ -159,9 +159,11 @@ impl Cagents {
             && self.update_ui.confirmation.is_none()
             && !self.automation_approval.deciding
             && self.automation_approval.generation == generation
-            && self.automation_approval.proposal.as_ref().is_some_and(|proposal| {
-                proposal.id == id && proposal.revision == revision
-            })
+            && self
+                .automation_approval
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.id == id && proposal.revision == revision)
     }
 
     fn close_automation_approval(&mut self) -> Task<Message> {
@@ -175,10 +177,12 @@ impl Cagents {
             return Task::none();
         }
         iced::widget::operation::focus(
-            self.workspace.focused()
+            self.workspace
+                .focused()
                 .map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-        ).map(cosmic::Action::App)
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn update_automation_approval(&mut self, action: Action) -> Task<Message> {
@@ -263,7 +267,10 @@ impl Cagents {
                 Task::none()
             }
             Action::Open { id, revision } => {
-                if self.update_prepared || self.modal_is_open() || self.chrome_ui.workspace_preview_since.is_some() {
+                if self.update_prepared
+                    || self.modal_is_open()
+                    || self.chrome_ui.workspace_preview_since.is_some()
+                {
                     return Task::none();
                 }
                 let Some(proposal) = self
@@ -290,7 +297,11 @@ impl Cagents {
                 self.core.set_keyboard_nav(false);
                 approval_focus(0)
             }
-            Action::Dismiss { id, revision, generation } => {
+            Action::Dismiss {
+                id,
+                revision,
+                generation,
+            } => {
                 if !self.approval_action_is_current(id, revision, generation) {
                     return Task::none();
                 }
@@ -403,7 +414,11 @@ impl Cagents {
         let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
             return Some(Task::none());
         };
-        if !self.approval_action_is_current(proposal.id, proposal.revision, self.automation_approval.generation) {
+        if !self.approval_action_is_current(
+            proposal.id,
+            proposal.revision,
+            self.automation_approval.generation,
+        ) {
             return Some(Task::none());
         }
         let key = match key {
@@ -413,7 +428,8 @@ impl Cagents {
         use keyboard::key::Named;
         if matches!(key, Named::Tab | Named::ArrowLeft | Named::ArrowRight) {
             let backwards = *key == Named::ArrowLeft || (*key == Named::Tab && modifiers.shift());
-            self.automation_approval.focus = (self.automation_approval.focus + if backwards { 2 } else { 1 }) % 3;
+            self.automation_approval.focus =
+                (self.automation_approval.focus + if backwards { 2 } else { 1 }) % 3;
             return Some(approval_focus(self.automation_approval.focus));
         }
         if *key == Named::Escape
@@ -519,11 +535,14 @@ impl Cagents {
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Decline")
                     .id(widget::Id::new("automation-approval.decline"))
-                    .on_press_maybe((!state.deciding).then(|| decision(false))).into(),
+                    .on_press_maybe((!state.deciding).then(|| decision(false)))
+                    .into(),
                 crate::ui_controls::button::primary("Approve and enable")
                     .id(widget::Id::new("automation-approval.approve"))
-                    .on_press_maybe((!state.deciding).then(|| decision(true))).into(),
-            ]).spacing(space::S),
+                    .on_press_maybe((!state.deciding).then(|| decision(true)))
+                    .into(),
+            ])
+            .spacing(space::S),
         );
         let surface = widget::column::with_children(vec![
             widget::scrollable(content)
@@ -709,15 +728,26 @@ mod tests {
 
     fn reviewing() -> (Cagents, Proposal) {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.sidebar_model.projects.push(SidebarProject::new(
-            ProjectId::new(), RepositoryId::new(), "Fixture".into(), "/fixture".into(), Vec::new(), Vec::new(),
-        ).with_kind(ProjectKind::Folder));
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "Fixture".into(),
+                "/fixture".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
         app.active_workspace = Some("/fixture".into());
         app.refresh_ui.focused = true;
         app.core.set_keyboard_nav(true);
         let proposal = proposal();
         app.automation_approval.available = Some(proposal.clone());
-        drop(app.update(Message::AutomationApproval(Action::Open { id: proposal.id, revision: proposal.revision })));
+        drop(app.update(Message::AutomationApproval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        })));
         assert!(app.automation_approval_open());
         (app, proposal)
     }
@@ -725,27 +755,58 @@ mod tests {
     // Deliver real pointer events to the production dialog, including its
     // backdrop and all three buttons, rather than substituting reducer calls.
     fn dialog_click(app: &Cagents, control: Option<&str>) -> Vec<Message> {
-        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::{Operation, Tree, operation::Focusable}};
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
         use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
         struct Bounds(HashMap<String, Rectangle>);
         impl Operation for Bounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
-                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
             }
         }
         let renderer = super::super::tests::headless_renderer();
         let mut element = app.automation_approval_dialog().unwrap();
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(1000.0, 900.0));
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
         let mut bounds = Bounds(HashMap::new());
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
-        let point = control.map(|id| bounds.0[id].center()).unwrap_or(Point::new(4.0, 4.0));
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let point = control
+            .map(|id| bounds.0[id].center())
+            .unwrap_or(Point::new(4.0, 4.0));
         let mut messages = Vec::new();
-        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
-            element.as_widget_mut().update(&mut tree, &Event::Mouse(event), Layout::new(&node),
-                mouse::Cursor::Available(point), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
         }
         messages
     }
@@ -754,14 +815,25 @@ mod tests {
     fn approval_escape_and_default_enter_keep_the_proposal_pending_and_reopenable() {
         for named in [keyboard::key::Named::Escape, keyboard::key::Named::Enter] {
             let (mut app, proposal) = reviewing();
-            assert_eq!(super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), approval_focus(0)),
-                Some(widget::Id::new("automation-approval.dismiss")));
-            drop(app.update(Message::KeyEvent { event: key(named), captured: false }));
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.automation_approval_dialog().unwrap(),
+                    approval_focus(0)
+                ),
+                Some(widget::Id::new("automation-approval.dismiss"))
+            );
+            drop(app.update(Message::KeyEvent {
+                event: key(named),
+                captured: false,
+            }));
             assert!(!app.automation_approval_open());
             assert!(!app.automation_approval.deciding);
             assert_eq!(app.automation_approval.available, Some(proposal.clone()));
             assert!(app.core.keyboard_nav());
-            drop(app.update(Message::AutomationApproval(Action::Open { id: proposal.id, revision: proposal.revision })));
+            drop(app.update(Message::AutomationApproval(Action::Open {
+                id: proposal.id,
+                revision: proposal.revision,
+            })));
             assert_eq!(app.automation_approval.proposal, Some(proposal));
             assert_eq!(app.automation_approval.focus, 0);
         }
@@ -774,9 +846,13 @@ mod tests {
             let generation = app.automation_approval.generation;
             let messages = dialog_click(&app, control);
             assert_eq!(messages.len(), 1);
-            assert!(matches!(&messages[0], Message::AutomationApproval(Action::Dismiss { id, revision, generation: shown })
-                if *id==proposal.id && *revision==proposal.revision && *shown==generation));
-            for message in messages { drop(app.update(message)); }
+            assert!(
+                matches!(&messages[0], Message::AutomationApproval(Action::Dismiss { id, revision, generation: shown })
+                if *id==proposal.id && *revision==proposal.revision && *shown==generation)
+            );
+            for message in messages {
+                drop(app.update(message));
+            }
             assert!(!app.automation_approval_open());
             assert!(!app.automation_approval.deciding);
             assert_eq!(app.automation_approval.available, Some(proposal));
@@ -785,30 +861,58 @@ mod tests {
 
     #[test]
     fn approval_explicit_buttons_and_keyboard_decisions_keep_the_exact_review() {
-        for (index, control, approved) in [(1, "automation-approval.decline", false), (2, "automation-approval.approve", true)] {
-          for use_keyboard in [false,true] {
-            let (mut app, proposal) = reviewing();
-            let generation = app.automation_approval.generation;
-            let messages = dialog_click(&app, Some(control));
-            assert_eq!(messages.len(), 1);
-            assert!(matches!(&messages[0], Message::AutomationApproval(Action::Decide { id, revision, generation: shown, approved: choice })
-                if *id==proposal.id && *revision==proposal.revision && *shown==generation && *choice==approved));
-            if use_keyboard {
-                for _ in 0..index { drop(app.update(Message::KeyEvent { event:key(keyboard::key::Named::Tab), captured:false })); }
-                assert_eq!(app.automation_approval.focus,index);
-                drop(app.update(Message::KeyEvent { event:key(keyboard::key::Named::Enter), captured:false }));
-            } else {
-                for message in messages { drop(app.update(message)); }
+        for (index, control, approved) in [
+            (1, "automation-approval.decline", false),
+            (2, "automation-approval.approve", true),
+        ] {
+            for use_keyboard in [false, true] {
+                let (mut app, proposal) = reviewing();
+                let generation = app.automation_approval.generation;
+                let messages = dialog_click(&app, Some(control));
+                assert_eq!(messages.len(), 1);
+                assert!(
+                    matches!(&messages[0], Message::AutomationApproval(Action::Decide { id, revision, generation: shown, approved: choice })
+                if *id==proposal.id && *revision==proposal.revision && *shown==generation && *choice==approved)
+                );
+                if use_keyboard {
+                    for _ in 0..index {
+                        drop(app.update(Message::KeyEvent {
+                            event: key(keyboard::key::Named::Tab),
+                            captured: false,
+                        }));
+                    }
+                    assert_eq!(app.automation_approval.focus, index);
+                    drop(app.update(Message::KeyEvent {
+                        event: key(keyboard::key::Named::Enter),
+                        captured: false,
+                    }));
+                } else {
+                    for message in messages {
+                        drop(app.update(message));
+                    }
+                }
+                assert!(app.automation_approval.deciding);
+                drop(app.update(Message::CancelDialog));
+                assert!(
+                    app.automation_approval_open(),
+                    "an in-flight decision owns its receipt"
+                );
+                let mut receipt = proposal;
+                receipt.state = if approved {
+                    ProposalState::Approved {
+                        automation: uuid::Uuid::new_v4(),
+                        execution_revision: 1,
+                    }
+                } else {
+                    ProposalState::Declined
+                };
+                drop(app.update(Message::AutomationApproval(Action::Finished {
+                    generation,
+                    result: Arc::new(Ok(receipt)),
+                })));
+                assert!(!app.automation_approval_open());
+                assert!(app.automation_approval.available.is_none());
             }
-            assert!(app.automation_approval.deciding);
-            drop(app.update(Message::CancelDialog));
-            assert!(app.automation_approval_open(), "an in-flight decision owns its receipt");
-            let mut receipt = proposal;
-            receipt.state = if approved { ProposalState::Approved { automation:uuid::Uuid::new_v4(), execution_revision:1 } } else { ProposalState::Declined };
-            drop(app.update(Message::AutomationApproval(Action::Finished { generation, result:Arc::new(Ok(receipt)) })));
-            assert!(!app.automation_approval_open());
-            assert!(app.automation_approval.available.is_none());
-          }
         }
     }
 
@@ -818,31 +922,63 @@ mod tests {
         let old = app.automation_approval.generation;
         drop(app.update(Message::CancelDialog));
         assert_eq!(app.automation_approval.available, Some(proposal.clone()));
-        drop(app.update(Message::AutomationApproval(Action::Open { id:proposal.id, revision:proposal.revision })));
-        let current=app.automation_approval.generation;
-        assert_ne!(old,current);
-        for generation in [old,current] {
-            app.update_prepared=generation==current;
-            for action in [Action::Dismiss {id:proposal.id,revision:proposal.revision,generation},
-                Action::Decide {id:proposal.id,revision:proposal.revision,generation,approved:false}] {
+        drop(app.update(Message::AutomationApproval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        })));
+        let current = app.automation_approval.generation;
+        assert_ne!(old, current);
+        for generation in [old, current] {
+            app.update_prepared = generation == current;
+            for action in [
+                Action::Dismiss {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation,
+                },
+                Action::Decide {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation,
+                    approved: false,
+                },
+            ] {
                 drop(app.update(Message::AutomationApproval(action)));
-                assert_eq!(app.automation_approval.proposal,Some(proposal.clone()));
+                assert_eq!(app.automation_approval.proposal, Some(proposal.clone()));
                 assert!(!app.automation_approval.deciding);
             }
         }
-        app.update_prepared=false;
-        for (id,revision) in [(uuid::Uuid::new_v4(),proposal.revision),(proposal.id,proposal.revision+1)] {
-            drop(app.update(Message::AutomationApproval(Action::Decide {id,revision,generation:current,approved:true})));
+        app.update_prepared = false;
+        for (id, revision) in [
+            (uuid::Uuid::new_v4(), proposal.revision),
+            (proposal.id, proposal.revision + 1),
+        ] {
+            drop(app.update(Message::AutomationApproval(Action::Decide {
+                id,
+                revision,
+                generation: current,
+                approved: true,
+            })));
             assert!(!app.automation_approval.deciding);
         }
         drop(app.update(Message::AutomationApproval(Action::Decide {
-            id:proposal.id,revision:proposal.revision,generation:current,approved:true,
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: current,
+            approved: true,
         })));
         assert!(app.automation_approval.deciding);
-        let mut stale=proposal.clone();stale.state=ProposalState::Declined;
-        drop(app.update(Message::AutomationApproval(Action::Finished {generation:old,result:Arc::new(Ok(stale))})));
-        assert!(app.automation_approval.deciding, "an old completion cannot retire the new decision");
-        assert_eq!(app.automation_approval.proposal,Some(proposal));
+        let mut stale = proposal.clone();
+        stale.state = ProposalState::Declined;
+        drop(app.update(Message::AutomationApproval(Action::Finished {
+            generation: old,
+            result: Arc::new(Ok(stale)),
+        })));
+        assert!(
+            app.automation_approval.deciding,
+            "an old completion cannot retire the new decision"
+        );
+        assert_eq!(app.automation_approval.proposal, Some(proposal));
     }
 
     #[test]
