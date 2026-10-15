@@ -32,6 +32,14 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             Ok(Reply::Listed { worktrees })
         }
         Operation::Create { repository,branch,base,linear,no_setup } => {
+            let records=service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
+            let primary=records.first().filter(|record|!record.bare).map(|record|record.path.clone()).ok_or("A non-bare primary checkout is required")?;
+            let setup_plan=if no_setup {None} else {crate::worktree_setup::load(&primary).map_err(|error|error.to_string())?};
+            if let Some(plan)=&setup_plan {
+                if plan.requires_trust()&&!crate::worktree_setup::is_trusted(&primary,plan,&cancellation).map_err(|error|error.to_string())? {
+                    return Err("This project's setup command has not been trusted. Review and trust it in the new-worktree dialog, or pass --no-setup".into());
+                }
+            }
             let settings_path=crate::instance::settings_path().ok_or("Settings directory is unavailable")?;
             let settings=crate::settings::load(settings_path).map_err(|error|error.to_string())?;
             let mut request=service.resolve_worktree_request(&WorktreeInput {
@@ -45,9 +53,18 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             let report=service.create_worktree_journaled_sync(&store,&request,0,&cancellation, |_|{});
             match report.outcome {
                 Some(WorktreeCreationOutcome::Created {worktree,warnings}) => {
-                    // Setup integration is shared with the dialog; skipping is explicit.
-                    let _ = no_setup;
-                    Ok(Reply::Created { worktree:entry(&service,&worktree,false,&cancellation)?,warnings:warnings.into_iter().map(|warning|warning.reported_detail()).collect() })
+                    let mut warnings=warnings.into_iter().map(|warning|warning.reported_detail()).collect::<Vec<_>>();
+                    let setup=if let Some(plan)=setup_plan {
+                        match crate::worktree_setup::prepare(&primary,&worktree.path,&plan,false,&cancellation) {
+                            Ok(prepared)=> {
+                                for missing in prepared.missing_patterns { warnings.push(format!("No setup source matched {missing}")); }
+                                for skipped in prepared.skipped_paths { warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason)); }
+                                prepared.command.map(|command|Setup {command,terminal:None,error:None})
+                            }
+                            Err(error)=> { let error=error.to_string(); warnings.push(format!("Worktree was created, but setup failed: {error}")); Some(Setup {command:String::new(),terminal:None,error:Some(error)}) }
+                        }
+                    } else {None};
+                    Ok(Reply::Created { worktree:entry(&service,&worktree,false,&cancellation)?,warnings,setup })
                 }
                 _ => Err(report.detail),
             }

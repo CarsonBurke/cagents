@@ -68,10 +68,16 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
     let response=client.device_operation(crate::device_service::Operation::Worktree {operation}).map_err(protocol_error)?;
     let crate::device_service::Reply::Worktree(reply)=response else {return Err(AppError::new("protocol","Unexpected worktree response"));};
     let (command,data,human)=match reply {
-        Reply::Created {worktree,warnings}=>{
-            let mut data=json!({"worktree":worktree,"warnings":warnings});
+        Reply::Created {worktree,warnings,setup}=>{
+            let mut data=json!({"schema_version":1,"worktree":worktree,"warnings":warnings,"setup":setup});
             let mut human=format!("Created {} at {}",worktree.branch.as_deref().unwrap_or("detached"),worktree.path.display());
             if let Some((provider,prompt,model,reasoning_effort))=spawn {
+                if let Some(error)=setup.as_ref().and_then(|setup|setup.error.as_ref()) {
+                    return Err(AppError {kind:"worktree_setup",message:format!("Worktree was created at {}, but setup failed and its agent was not started: {error}",worktree.path.display()),details:Some(data)});
+                }
+                if let Some(terminal)=setup.as_ref().and_then(|setup|setup.terminal.as_ref()) {
+                    wait_for_setup(&mut client,terminal.id).map_err(|error|AppError { kind:"worktree_setup",message:format!("Worktree was created at {}, but its agent was not started: {error}",worktree.path.display()),details:Some(data.clone()) })?;
+                }
                 use crate::agent_execution::{Destination,Operation as AgentOperation,Reply as AgentReply,Spec,Submit,Surface,Target};
                 // The new project and exact worktree view must exist before the
                 // delegated agent is accepted, including calls made without a UI.
@@ -90,9 +96,28 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
         }
         Reply::Listed {worktrees}=>{
             let human=worktrees.iter().map(|entry|format!("{}\t{}\t{}\t{}\t{}\t{}",entry.path.display(),entry.branch.as_deref().unwrap_or("(detached)"),if entry.dirty {"dirty"}else{"clean"},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len())).collect::<Vec<_>>().join("\n");
-            ("worktree.list",json!({"worktrees":worktrees}),human)
+            ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
-        Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),
+        Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),
     };
     Ok(CommandOutput {command,data,human})
+}
+
+fn wait_for_setup(client:&mut ControlClient,id:TerminalId)->Result<(),String> {
+    let deadline=Instant::now()+Duration::from_secs(120);
+    loop {
+        let terminals=client.list().map_err(|error|error.to_string())?;
+        let terminal=terminals.into_iter().find(|terminal|terminal.session.id==id).ok_or("The setup terminal is no longer available; inspect its card before starting an agent")?;
+        let exit=match terminal.session.continuity {
+            TerminalContinuity::Exited {last_exit}=>Some(last_exit),
+            TerminalContinuity::RelaunchAvailable {last_exit,..}=>last_exit,
+            TerminalContinuity::Failed {typed_error,..}=>return Err(format!("Setup terminal failed: {typed_error:?}")),
+            _=>None,
+        };
+        if let Some(exit)=exit {
+            return if exit.code==Some(0)&&exit.signal.is_none() {Ok(())} else {Err(format!("Setup failed (exit {:?}, signal {:?}); inspect Worktree setup",exit.code,exit.signal))};
+        }
+        if Instant::now()>=deadline {return Err("Setup is still running; inspect Worktree setup and start the agent after it finishes".into());}
+        thread::sleep(Duration::from_millis(100));
+    }
 }

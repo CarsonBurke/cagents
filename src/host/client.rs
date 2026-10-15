@@ -320,6 +320,32 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
     Ok(())
 }
 
+fn start_worktree_setup(
+    host:&SharedHost,
+    repository:&std::path::Path,
+    path:&std::path::Path,
+    command:&str,
+)->Result<crate::model::TerminalSession,ProtocolError> {
+    use crate::{model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalId,TerminalSession},workspace_model::{ModelEdit,views::{Scope,Pane,Change}}};
+    let recipe=LaunchRecipe {
+        program:"/bin/sh".into(),arguments:vec!["-c".into(),command.into()],working_directory:path.to_path_buf(),
+        environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),uuid::Uuid::new_v4().to_string())]),unset_environment:Default::default(),
+    };
+    let session=TerminalSession {id:TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:recipe.clone(),transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable {recipe,last_exit:None}};
+    // An internal, immediately detached owner cannot interleave terminal frames
+    // with the CLI's unrelated device-operation response.
+    let terminal=spawn_terminal(host,0,session,crate::terminal::TerminalSpawnOptions::default())?;
+    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+    state.detach(0,terminal.session.id)?;
+    state.edit_model(0,ModelEdit::ReopenProject {repository:repository.to_path_buf(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git})?;
+    let scope=Scope::Worktree {repository:repository.to_path_buf(),path:path.to_path_buf()};
+    let revision=state.read_model()?.views.iter().find(|view|view.scope==scope).map_or(0,|view|view.revision);
+    state.edit_model(0,ModelEdit::ChangeView {scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:Change::Insert {
+        pane:Pane {id:CardId::new(),title:"Worktree setup".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Terminal(terminal.session.clone()),scope:Some(path.to_path_buf())},before:None,
+    }})?;
+    Ok(terminal.session)
+}
+
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
@@ -417,7 +443,15 @@ pub(super) fn process_request(
             // A later setup/branch failure can follow a committed Git mutation.
             // Refresh on either outcome so a retained worktree is never hidden.
             if mutates { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(&repository); }
-            let reply=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
+            let mut reply=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
+            if let crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=&mut reply {
+                if setup.error.is_none() {
+                    match start_worktree_setup(host,&repository,&worktree.path,&setup.command) {
+                        Ok(session)=>setup.terminal=Some(session),
+                        Err(error)=> { warnings.push(format!("Worktree was created, but its setup terminal could not start: {error}")); setup.error=Some(error.to_string()); }
+                    }
+                }
+            }
             Ok((ServerResponse::DeviceOperation { reply:crate::device_service::Reply::Worktree(reply) },Vec::new(),false))
         }
         ClientRequest::DeviceOperation { operation } => {

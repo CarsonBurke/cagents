@@ -49,9 +49,16 @@ pub struct Entry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
-    Created { worktree: Entry, warnings: Vec<String> },
+    Created { worktree: Entry, warnings: Vec<String>, setup: Option<Setup> },
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setup {
+    pub command: String,
+    pub terminal: Option<crate::model::TerminalSession>,
+    pub error: Option<String>,
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
