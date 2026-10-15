@@ -1258,6 +1258,7 @@ impl Cagents {
         { return self.prepare_pr_agent_context(worktree, prompt); }
         if let Action::AgentContext(target, generation, Ok(prompt)) = &action
             && self.nested_modal_focus_target().is_none()
+            && !self.focused_repository_is_saving()
             && self.pull_request_inspector.accepts(target, *generation)
         {
             let worktree = target.worktree.clone();

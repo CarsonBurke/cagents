@@ -2621,7 +2621,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
-                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
+                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_) | pull_request_ui::Action::OpenPreparedContext
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
