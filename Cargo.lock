@@ -1239,6 +1239,7 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "two-face",
+ "unicase",
  "unicode-casefold",
  "unicode-linebreak",
  "unicode-segmentation",

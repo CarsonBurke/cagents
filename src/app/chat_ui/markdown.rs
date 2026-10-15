@@ -26,6 +26,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 use cosmic::iced::widget::{span, text};
 use cosmic::iced::{Font, font};
+use unicase::UniCase;
 pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
 use std::{
     borrow::BorrowMut,
@@ -58,7 +59,7 @@ pub struct Content {
 #[derive(Debug, Clone)]
 struct Section {
     content: String,
-    broken_links: HashSet<String>,
+    references: HashSet<ReferenceLabel>,
 }
 
 impl Content {
@@ -143,16 +144,18 @@ impl Content {
         }
         // Retain only enough prior parser state to prove a rendered styled
         // prefix after reparsing. Raw-source append alone is insufficient.
-        let reparse = self.reparse_items.max(1).min(self.items.len());
+        let reparse = self.reparse_items.min(self.items.len());
         let previous_index = self.items.len().saturating_sub(reparse);
         let previous = (reparse == 1).then(|| self.items.pop()).flatten();
         self.items.truncate(previous_index);
         self.incomplete.retain(|index, _| *index < previous_index);
         let mut table_tail = None;
+        let input_origin = self.state.leftover_origin;
+        let previous_references = self.state.references.clone();
 
         // Re-parse the unfinished source, including a table whose next row
         // was not yet recognizable at the preceding publication boundary.
-        for (item, source, broken_links) in parse_with(&mut self.state, input) {
+        for (item, source, references) in parse_with(&mut self.state, input, Some(input_origin)) {
             let start = source.as_ptr().addr() - input.as_ptr().addr();
             if matches!(&item, Item::Table { .. }) {
                 table_tail = Some((self.items.len(), start));
@@ -166,24 +169,28 @@ impl Content {
                     table_tail = None;
                 }
             }
-            if !broken_links.is_empty() {
-                let _ = self.incomplete.insert(
-                    self.items.len(),
-                    Section {
-                        content: source.to_owned(),
-                        broken_links,
-                    },
-                );
+            if !references.is_empty() {
+                let _ = self.incomplete.insert(self.items.len(), Section {
+                    content: source.to_owned(), references,
+                });
             }
 
             self.items.push(item);
         }
 
-        self.reparse_items = 1;
+        self.reparse_items = usize::from(self.items.len() > previous_index);
+        if self.reparse_items == 0 {
+            // Definitions and metadata can consume raw source without
+            // producing a widget. Keep that tail, but do not remove a prior
+            // completed block when the next provider delta arrives.
+            self.state.leftover = input.to_owned();
+            self.state.leftover_origin = input_origin;
+        }
         if let Some((index, start)) = table_tail {
             let count = self.items.len() - index;
             if count > 1 {
                 self.state.leftover = input[start..].to_owned();
+                self.state.leftover_origin = input_origin + start;
                 self.reparse_items = count;
             }
         }
@@ -207,38 +214,42 @@ impl Content {
             && self.state.leftover.chars().all(plain_character)
             && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(rendered_source));
 
-        // Re-parse incomplete sections if new references are available
-        if !self.incomplete.is_empty() {
-            self.incomplete.retain(|index, section| {
-                if self.items.len() <= *index {
-                    return false;
-                }
-
-                let broken_links_before = section.broken_links.len();
-
-                section
-                    .broken_links
-                    .retain(|link| !self.state.references.contains_key(link));
-
-                if broken_links_before != section.broken_links.len() {
-                    let mut state = State {
-                        leftover: String::new(),
-                        references: self.state.references.clone(),
-                        images: HashSet::new(),
-                    };
-
-                    if let Some((item, _source, _broken_links)) =
-                        parse_with(&mut state, &section.content).next()
-                    {
-                        self.items[*index] = item;
+        // A reference destination/title may grow, disappear, or be shadowed
+        // while its definition is unfinished. Keep dependent sections even
+        // after their first resolution and update them from exact current
+        // definitions, including changes in their number of rendered items.
+        let changed = previous_references.keys().chain(self.state.references.keys())
+            .filter(|label| previous_references.get(*label) != self.state.references.get(*label))
+            .cloned().collect::<HashSet<_>>();
+        let mut previous_index = previous_index;
+        if !changed.is_empty() {
+            let old_tail = previous_index;
+            let mut sections = std::mem::take(&mut self.incomplete);
+            let mut rebuilt = Vec::with_capacity(self.items.len());
+            for (index, item) in std::mem::take(&mut self.items).into_iter().enumerate() {
+                let section = sections.remove(&index);
+                if index < old_tail && section.as_ref().is_some_and(|section|
+                    section.references.iter().any(|label| changed.contains(label))) {
+                    let section = section.unwrap();
+                    #[cfg(test)]
+                    { self.parsed_bytes += section.content.len(); }
+                    let mut state = State { references: self.state.references.clone(), ..State::default() };
+                    let before = rebuilt.len();
+                    for (item, source, references) in parse_with(&mut state, &section.content, None) {
+                        if !references.is_empty() { self.incomplete.insert(rebuilt.len(), Section {
+                            content: source.to_owned(), references,
+                        }); }
+                        rebuilt.push(item);
                     }
-
-                    self.state.images.extend(state.images.drain());
-                    drop(state);
+                    previous_index = previous_index + rebuilt.len() - before - 1;
+                } else {
+                    if let Some(section) = section { self.incomplete.insert(rebuilt.len(), section); }
+                    rebuilt.push(item);
                 }
-
-                !section.broken_links.is_empty()
-            });
+            }
+            self.items = rebuilt;
+            self.state.images.clear();
+            collect_images(&self.items, &mut self.state.images);
         }
         if let (Some(previous), Some(current)) =
             (previous.as_ref(), self.items.get_mut(previous_index))
@@ -753,17 +764,41 @@ impl Bullet {
     }
 }
 
+type ReferenceLabel = UniCase<String>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reference {
+    origin: usize,
+    destination: String,
+    title: String,
+}
 #[derive(Debug, Default, Clone)]
 struct State {
     leftover: String,
-    references: HashMap<String, String>,
+    leftover_origin: usize,
+    references: Arc<HashMap<ReferenceLabel, Reference>>,
     images: HashSet<Uri>,
+}
+
+fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
+    for item in items {
+        match item {
+            Item::Image { url, .. } => { images.insert(url.clone()); }
+            Item::Quote(items) => collect_images(items, images),
+            Item::List { bullets, .. } => for bullet in bullets { collect_images(bullet.items(), images); },
+            Item::Table { columns, rows } => {
+                for column in columns { collect_images(&column.header, images); }
+                for row in rows { for cell in &row.cells { collect_images(cell, images); } }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_with<'a>(
     mut state: impl BorrowMut<State> + 'a,
     markdown: &'a str,
-) -> impl Iterator<Item = (Item, &'a str, HashSet<String>)> + 'a {
+    origin: Option<usize>,
+) -> impl Iterator<Item = (Item, &'a str, HashSet<ReferenceLabel>)> + 'a {
     enum Scope {
         List(List),
         Quote(Vec<Item>),
@@ -780,7 +815,7 @@ fn parse_with<'a>(
         bullets: Vec<Bullet>,
     }
 
-    let broken_links = Rc::new(RefCell::new(HashSet::new()));
+    let reference_labels = Rc::new(RefCell::new(HashSet::new()));
 
     let mut spans = Vec::new();
     let mut code = String::new();
@@ -795,6 +830,12 @@ fn parse_with<'a>(
     let mut image = None;
     let mut stack = Vec::new();
 
+    let inherited: Arc<HashMap<ReferenceLabel, Reference>> = match origin {
+        Some(origin) => Arc::new(state.borrow().references.iter()
+            .filter(|(_, reference)| reference.origin < origin)
+            .map(|(label, reference)| (label.clone(), reference.clone())).collect()),
+        None => state.borrow().references.clone(),
+    };
     let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
         markdown,
         pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
@@ -803,31 +844,34 @@ fn parse_with<'a>(
             | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
             | pulldown_cmark::Options::ENABLE_TASKLISTS,
         {
-            let references = state.borrow().references.clone();
-            let broken_links = broken_links.clone();
+            let references = inherited.clone();
+            let reference_labels = reference_labels.clone();
 
             Some(move |broken_link: pulldown_cmark::BrokenLink<'_>| {
-                if let Some(reference) = references.get(broken_link.reference.as_ref()) {
-                    Some((
-                        pulldown_cmark::CowStr::from(reference.to_owned()),
-                        broken_link.reference.into_static(),
-                    ))
-                } else {
-                    let _ = RefCell::borrow_mut(&broken_links)
-                        .insert(broken_link.reference.into_string());
-
-                    None
-                }
+                let label = UniCase::new(broken_link.reference.into_string());
+                RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                references.get(&label).map(|reference| (
+                    pulldown_cmark::CowStr::from(reference.destination.clone()),
+                    pulldown_cmark::CowStr::from(reference.title.clone()),
+                ))
             })
         },
     );
 
-    let references = &mut state.borrow_mut().references;
-
-    for reference in parser.reference_definitions().iter() {
-        let _ = references.insert(reference.0.to_owned(), reference.1.dest.to_string());
+    if let Some(origin) = origin {
+        let mut references = inherited.as_ref().clone();
+        for (label, definition) in parser.reference_definitions().iter() {
+            references.entry(UniCase::new(label.to_owned())).or_insert_with(|| Reference {
+                origin: origin + definition.span.start,
+                destination: definition.dest.to_string(),
+                title: definition.title.as_deref().unwrap_or("").to_owned(),
+            });
+        }
+        state.borrow_mut().references = Arc::new(references);
     }
+    let references = state.borrow().references.clone();
 
+    let produced_references = reference_labels.clone();
     let produce = move |state: &mut State, stack: &mut Vec<Scope>, item, source: Range<usize>| {
         if let Some(scope) = stack.last_mut() {
             match scope {
@@ -845,11 +889,12 @@ fn parse_with<'a>(
             None
         } else {
             state.leftover = markdown[source.start..].to_owned();
+            if let Some(origin) = origin { state.leftover_origin = origin + source.start; }
 
             Some((
                 item,
                 &markdown[source.start..source.end],
-                broken_links.take(),
+                produced_references.take(),
             ))
         }
     };
@@ -872,14 +917,25 @@ fn parse_with<'a>(
                 strikethrough = true;
                 None
             }
-            pulldown_cmark::Tag::Link { dest_url, .. } if !metadata => {
-                link = Some(dest_url.into_string());
+            pulldown_cmark::Tag::Link { dest_url, id, .. } if !metadata => {
+                let definition = if id.is_empty() { None } else {
+                    let label = UniCase::new(id.into_string());
+                    RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                    references.get(&label)
+                };
+                link = Some(definition.map_or_else(|| dest_url.into_string(), |reference| reference.destination.clone()));
                 None
             }
             pulldown_cmark::Tag::Image {
-                dest_url, title, ..
+                dest_url, title, id, ..
             } if !metadata => {
-                image = Some((dest_url.into_string(), title.into_string()));
+                let definition = if id.is_empty() { None } else {
+                    let label = UniCase::new(id.into_string());
+                    RefCell::borrow_mut(&reference_labels).insert(label.clone());
+                    references.get(&label)
+                };
+                image = Some(definition.map_or_else(|| (dest_url.into_string(), title.into_string()),
+                    |reference| (reference.destination.clone(), reference.title.clone())));
                 None
             }
             pulldown_cmark::Tag::List(first_item) if !metadata => {
@@ -1414,6 +1470,58 @@ mod tests {
                 previous = end;
             }
         }
+    }
+
+    fn reference_text(items: &[Item]) -> Vec<(char, Option<String>)> {
+        let mut output = Vec::new();
+        for item in items {
+            match item {
+                Item::Paragraph(text) | Item::Heading(_, text) | Item::Image { alt: text, .. } => {
+                    for span in text.spans.iter() {
+                        let Span::Standard { text, link, .. } = span;
+                        output.extend(text.chars().map(|ch| (ch, link.clone())));
+                    }
+                }
+                Item::Quote(items) => output.extend(reference_text(items)),
+                Item::List { bullets, .. } => for bullet in bullets { output.extend(reference_text(bullet.items())); },
+                Item::Table { columns, rows } => {
+                    for column in columns { output.extend(reference_text(&column.header)); }
+                    for row in rows { for cell in &row.cells { output.extend(reference_text(cell)); } }
+                }
+                _ => {}
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn reference_definitions_match_full_prefixes_without_losing_prior_items_or_targets() {
+        for source in [
+            "![alternative](https://example.com/a.png \"title\")\n\n[label][ref]\n\n[ref]: https://example.com\n",
+            "[label][ref]\n\n[ref]: https://example.com \"growing title\"\n",
+            "[ref]: https://first.example\n\n[label][REF]\n\n[ref]: https://second.example\n",
+            "[Straße][strasse]\n\n[STRASSE]: /destination\n",
+            "[label][ref]\n\n[ref]: <https://example.com>\n",
+            "![alt][img]\n\n[img]: /one \"caption\"\n\n[img]: /two\n",
+            "before ![alt][img] after\n\n[img]: /image.png\n",
+            "- [label][ref]\n\n| H |\n|---|\n| [label][ref] |\n\n[ref]: /destination\n",
+        ] {
+            let mut streamed = Content::new();
+            let mut previous = 0;
+            for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                streamed.push_str(&source[previous..end]);
+                let full = Content::parse(&source[..end]);
+                assert_eq!(native_outline(streamed.items()), native_outline(full.items()), "source prefix {:?}", &source[..end]);
+                assert_eq!(reference_text(streamed.items()), reference_text(full.items()), "link prefix {:?}", &source[..end]);
+                assert_eq!(streamed.images(), full.images(), "image prefix {:?}", &source[..end]);
+                previous = end;
+            }
+        }
+        let content = Content::parse("[ref]: https://first.example\n\n[label][REF]\n\n[ref]: https://second.example\n");
+        assert!(reference_text(content.items()).iter().filter_map(|(_, link)| link.as_deref()).all(|link| link == "https://first.example"));
+        assert!(reference_text(content.items()).iter().any(|(_, link)| link.as_deref() == Some("https://first.example")));
+        let folded = Content::parse("[Straße][strasse]\n\n[STRASSE]: /destination\n");
+        assert!(reference_text(folded.items()).iter().any(|(_, link)| link.as_deref() == Some("/destination")));
     }
 
     #[test]
