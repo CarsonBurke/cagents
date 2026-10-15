@@ -1365,6 +1365,43 @@ mod tests {
     }
 
     #[test]
+    fn copied_account_history_cannot_restore_another_roots_draft_model_or_channel() {
+        let (mut app, card, _directory) = fixture();
+        let mut a = app.chat_return_session(card).unwrap();
+        let variable = crate::account::home_variable(a.launch.provider).unwrap();
+        a.launch.recipe.environment.insert(variable.into(), "/recorded/accounts/A".into());
+        a.launch.recipe.unset_environment.remove(variable);
+        let mut b = a.clone();
+        b.launch.recipe.environment.insert(variable.into(), "/recorded/accounts/B".into());
+        let a_key = draft_key(&a).unwrap();
+        let b_key = draft_key(&b).unwrap();
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.conversation_drafts.insert(a_key.clone(), "private account A draft".into());
+        durable.conversation_models.insert(a_key.clone(), "account-A-model".into());
+        durable.conversation_channels.insert(a_key.clone(), channel);
+        // Legacy keys remain stored for recovery, but have no owner evidence
+        // and must never become a fallback for an unknown/new account.
+        let legacy = format!("{}:{}", a.launch.provider.label(), a.launch.session_id.as_deref().unwrap());
+        durable.conversation_drafts.insert(legacy.clone(), "unattributed legacy draft".into());
+        assert!(!durable.conversation_models.contains_key(&b_key));
+        assert!(!durable.conversation_channels.contains_key(&b_key));
+        drop(app.insert_chat_card(b.clone(), None, None));
+        let other = app.workspace.focused().unwrap();
+        assert!(!app.chat_ui.drafts.contains_key(&other));
+        b.launch.recipe.environment.remove(variable);
+        b.launch.recipe.environment.remove("HOME");
+        assert!(draft_key(&b).is_none());
+        drop(app.insert_chat_card(b, None, None));
+        let unknown = app.workspace.focused().unwrap();
+        assert!(!app.chat_ui.drafts.contains_key(&unknown));
+        drop(app.insert_chat_card(a, None, None));
+        let original = app.workspace.focused().unwrap();
+        assert_eq!(app.chat_ui.drafts[&original], "private account A draft");
+        assert_eq!(app.durable.conversation_drafts[&legacy], "unattributed legacy draft");
+    }
+
+    #[test]
     fn confirmed_end_saves_draft_for_session_and_recreated_card_restores_it() {
         let (mut app, card, _directory) = fixture();
         write(&mut app, card, "keep across cards", true);

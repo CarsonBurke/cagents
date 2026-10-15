@@ -4,7 +4,7 @@ use super::Session;
 use std::os::unix::ffi::OsStrExt;
 use sha2::{Digest, Sha256};
 
-pub(super) fn metadata_key(session: &Session) -> Option<String> {
+pub(crate) fn metadata_key(session: &Session) -> Option<String> {
     let id = session.launch.session_id.as_deref()?.trim();
     if id.is_empty() { return None; }
     let recipe = &session.launch.recipe;
