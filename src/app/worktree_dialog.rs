@@ -265,6 +265,7 @@ pub struct WorktreeDialog {
     project_id: ProjectId,
     repository: PathBuf,
     source: Option<WorktreeCreationSource>,
+    project_creation_id: Option<OperationId>,
     draft: WorktreeDraft,
     advanced: bool,
     resolving: Option<Resolution>,
@@ -285,6 +286,7 @@ impl WorktreeDialog {
             project_id,
             repository,
             source: None,
+            project_creation_id: None,
             advanced: draft.uses_options(),
             draft,
             resolving: None,
@@ -374,7 +376,33 @@ impl Cagents {
         draft: WorktreeDraft,
         error: Option<WorktreeInputError>,
     ) -> Task<Message> {
-        self.open_worktree_dialog_with_source(project_id, repository, draft, error, None, None)
+        if !self.sidebar_model.project(project_id).is_some_and(|project| project.repository == repository) {
+            self.status = Some(TransientNotice::warning("The project source changed. Reload the project before creating a worktree."));
+            return Task::none();
+        }
+        let Some(source) = self.project_creation_source(project_id) else {
+            self.status = Some(TransientNotice::warning("The project source is loading or unavailable. Reload the project before creating a worktree."));
+            return Task::none();
+        };
+        let focus = self.open_worktree_dialog_project_bound(project_id, source, draft, None);
+        match error {
+            Some(error) => self.worktree_dialog.as_mut().map_or(focus, |dialog| dialog.show_error(error)),
+            None => focus,
+        }
+    }
+
+    /// Generic project creation consumes the exact asynchronously published
+    /// project capability. The caller's action must already carry this ID.
+    pub(super) fn open_worktree_dialog_project_bound(
+        &mut self, project_id: ProjectId, source: WorktreeCreationSource,
+        draft: WorktreeDraft, replaces: Option<OperationId>,
+    ) -> Task<Message> {
+        let id = source.id();
+        if !source.is_available() || !self.current_project_creation_source(project_id, id) {
+            self.status = Some(TransientNotice::warning("The displayed project source changed. Reload the project before creating a worktree."));
+            return Task::none();
+        }
+        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, Some(id))
     }
 
     /// Opens History creation against the authority the displayed source already
@@ -387,7 +415,7 @@ impl Cagents {
         replaces: Option<OperationId>,
     ) -> Task<Message> {
         let source = WorktreeCreationSource::new(authority);
-        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces)
+        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces, None)
     }
 
     fn open_worktree_dialog_with_source(
@@ -398,12 +426,14 @@ impl Cagents {
         error: Option<WorktreeInputError>,
         source: Option<WorktreeCreationSource>,
         replaces: Option<OperationId>,
+        project_creation_id: Option<OperationId>,
     ) -> Task<Message> {
         if let Some(replaced) = self.worktree_dialog.take() {
             replaced.cancel();
         }
         let mut opened = WorktreeDialog::new(project_id, repository, draft);
         opened.source = source;
+        opened.project_creation_id = project_creation_id;
         opened.replaces = replaces;
         let dialog = self.worktree_dialog.insert(opened);
         match error {
@@ -414,6 +444,13 @@ impl Cagents {
 
     /// Resolves the dialog's request, keeping it open until Git answers.
     pub(super) fn submit_worktree_dialog(&mut self) -> Task<Message> {
+        let stale = self.worktree_dialog.as_ref().is_some_and(|dialog| {
+            dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(dialog.project_id, id))
+        });
+        if stale {
+            return self.worktree_dialog.as_mut().expect("dialog checked").show_error(WorktreeInputError::general(
+                "The displayed project source changed. Reload the project before creating a worktree."));
+        }
         if self.session.is_none() {
             if let Some(dialog) = &mut self.worktree_dialog {
                 dialog.error = Some(WorktreeInputError::general(
@@ -486,6 +523,14 @@ impl Cagents {
         operation_id: OperationId,
         result: Result<CreateWorktreeRequest, WorktreeInputError>,
     ) -> Task<Message> {
+        let stale = self.worktree_dialog.as_ref().filter(|dialog| {
+            dialog.project_id == project_id && dialog.resolving.as_ref().is_some_and(|resolution| resolution.id == operation_id)
+        }).is_some_and(|dialog| dialog.project_creation_id.is_some_and(|id| !self.current_project_creation_source(project_id, id)));
+        if stale {
+            let dialog = self.worktree_dialog.as_mut().expect("dialog checked");
+            dialog.resolving = None;
+            return dialog.show_error(WorktreeInputError::general("The project source changed while resolving this request. Reload the project before creating a worktree."));
+        }
         let Some(dialog) = self.worktree_dialog.as_mut().filter(|dialog| {
             dialog.project_id == project_id
                 && dialog
@@ -502,13 +547,14 @@ impl Cagents {
                     return dialog.show_error(WorktreeInputError::general("The resolved source differs from the original displayed worktree. No creation was started."));
                 }
                 let source = dialog.source.clone();
+                let project_creation_id = dialog.project_creation_id;
                 let draft = dialog.draft.clone();
                 let replaces = dialog.replaces;
                 self.worktree_dialog = None;
                 if let Some(replaced) = replaces {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
-                let start = self.start_worktree_operation_with_source(project_id, request, Some(draft), source);
+                let start = self.start_worktree_operation_with_project_source(project_id, request, Some(draft), source, project_creation_id);
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
                     None => self.focus_context_overlay_if_exposed(),
@@ -530,7 +576,7 @@ impl Cagents {
         if self.worktree_dialog.is_some() {
             return Task::none();
         }
-        let Some((project_id, repository, draft, failure, source)) =
+        let Some((project_id, repository, draft, failure, source, project_creation_id)) =
             self.worktree_operations.get(&id).and_then(|operation| {
                 operation.reopenable_draft().map(|draft| {
                     (
@@ -539,6 +585,7 @@ impl Cagents {
                         draft.clone(),
                         operation.failure().map(WorktreeInputError::recorded),
                         operation.source(),
+                        operation.project_creation_id(),
                     )
                 })
             })
@@ -554,8 +601,12 @@ impl Cagents {
         }) else {
             return Task::none();
         };
+        if project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
+            self.status = Some(TransientNotice::warning("The original project source is no longer displayed. Reload the project and create a new request."));
+            return Task::none();
+        }
         let error = failure.filter(|_| !submit);
-        let focus = self.open_worktree_dialog_with_source(project_id, repository, draft, error, source, Some(id));
+        let focus = self.open_worktree_dialog_with_source(project_id, repository, draft, error, source, Some(id), project_creation_id);
         if let Some(dialog) = &mut self.worktree_dialog {
             dialog.replaces = Some(id);
         }
@@ -779,10 +830,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             ));
-        let _ = app.update(Message::Sidebar(SidebarAction::NewWorktree {
-            project_id: project,
-            repository: PathBuf::from("/repo"),
-        }));
+        drop(app.open_worktree_dialog_with_source(project, PathBuf::from("/repo"), WorktreeDraft::default(), None, None, None, None));
         Fixture {
             app,
             project,

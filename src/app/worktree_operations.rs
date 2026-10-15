@@ -14,6 +14,7 @@ pub(super) struct ActiveWorktreeOperation {
     generation: u64,
     request: Option<CreateWorktreeRequest>,
     source: Option<WorktreeCreationSource>,
+    project_creation_id: Option<OperationId>,
     token: Option<CancellationToken>,
     receiver: Option<async_channel::Receiver<WorktreeProgressEvent>>,
     stage: Option<WorktreeProgressStage>,
@@ -34,6 +35,8 @@ pub(super) struct ActiveWorktreeOperation {
 }
 
 impl ActiveWorktreeOperation {
+    pub(super) fn project_creation_id(&self) -> Option<OperationId> { self.project_creation_id }
+
     pub(super) fn source(&self) -> Option<WorktreeCreationSource> { self.source.clone() }
 
     pub(super) fn project(&self) -> ProjectId {
@@ -184,6 +187,20 @@ impl Cagents {
         draft: Option<WorktreeDraft>,
         source: Option<WorktreeCreationSource>,
     ) -> Task<Message> {
+        self.start_worktree_operation_with_project_source(project, request, draft, source, None)
+    }
+
+    pub(super) fn start_worktree_operation_with_project_source(
+        &mut self, project: ProjectId, request: CreateWorktreeRequest,
+        draft: Option<WorktreeDraft>, source: Option<WorktreeCreationSource>,
+        project_creation_id: Option<OperationId>,
+    ) -> Task<Message> {
+        if project_creation_id.is_some_and(|id| {
+            !self.current_project_creation_source(project, id) || source.as_ref().is_none_or(|source| source.id() != id || !source.is_available())
+        }) {
+            self.status = Some(TransientNotice::warning("The original project source changed. No worktree creation was started; reload the project."));
+            return Task::none();
+        }
         let Some(session) = self.session.as_ref() else {
             self.status = Some(TransientNotice::error(
                 "Worktree creation requires an available durable journal. No Git mutation was started.",
@@ -203,6 +220,7 @@ impl Cagents {
                 label: worktree_operation_label(Some(&request)),
                 request: Some(request.clone()),
                 source: source.clone(),
+                project_creation_id,
                 token: Some(token.clone()),
                 receiver: Some(receiver),
                 stage: None,
@@ -340,6 +358,7 @@ impl Cagents {
         operation.token = None;
         operation.receiver = None;
         let project_id = operation.project;
+        let project_creation_id = operation.project_creation_id;
         let repository = operation
             .request
             .as_ref()
@@ -363,6 +382,10 @@ impl Cagents {
             }
         };
         self.sync_worktree_operation_rows();
+        if project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
+            self.status = Some(TransientNotice::warning("Creation settled against its original source after the displayed project changed. Its journal receipt was retained; reload the original project to inspect the result."));
+            return Task::none();
+        }
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
@@ -431,6 +454,7 @@ impl Cagents {
                             label: worktree_operation_label(report.request.as_ref()),
                             request: report.request,
                             source: None,
+                            project_creation_id: None,
                             token: None,
                             receiver: None,
                             stage: None,
@@ -534,6 +558,7 @@ mod tests {
                     generation: 2,
                     request: None,
                     source: None,
+                    project_creation_id: None,
                     token: Some(token.clone()),
                     receiver: None,
                     stage,
@@ -604,6 +629,7 @@ mod tests {
             generation: 1,
             request: None,
             source: None,
+            project_creation_id: None,
             token: None,
             receiver: None,
             stage: Some(WorktreeProgressStage::Finished),
