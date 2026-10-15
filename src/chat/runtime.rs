@@ -5280,7 +5280,7 @@ mod tests {
                         self.settled = false;
                         Ok(Step { writes: vec![serde_json::json!({"settled":true})], ..Step::default() })
                     }
-                    Command::Compact => Ok(Step::default()),
+                    Command::ListModels => Ok(Step::default()),
                     _ => Err("unexpected control fixture command".into()),
                 }
             }
@@ -5339,7 +5339,7 @@ mod tests {
         assert!(handle.0.state.lock().unwrap().items.is_empty());
         // Neither a read-only query nor unchanged housekeeping creates an
         // unbounded stream of new idle notifications.
-        handle.command(Command::Compact).unwrap();
+        handle.command(Command::ListModels).unwrap();
         assert!(!receive.try_iter().any(|update| matches!(update, Update::Activity { .. })));
         handle.close().unwrap();
     }
