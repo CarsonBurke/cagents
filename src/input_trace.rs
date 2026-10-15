@@ -165,6 +165,23 @@ pub fn observe_keyboard_events<'a, Message: 'a>(
     })
 }
 
+/// Global application dialogs live above the application's main view. Wrap
+/// their final surface too, after mapping child messages to the modal owner,
+/// so captured keys still carry one immutable native focus sample.
+pub fn observe_dialog_keyboard_events<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    trace: &InputTrace,
+    on_key: KeyboardCallback<Message>,
+) -> Element<'a, Message> {
+    let id = cosmic::iced::widget::Id::new("dialog.keyboard-region");
+    observe_keyboard_events(
+        cosmic::widget::container(content).id(id.clone()),
+        trace,
+        vec![(id, FocusedPane::OutsideWorkspace.into())],
+        on_key,
+    )
+}
+
 pub(crate) struct ScopedKeyboardRegion {
     focus: Rc<Cell<Option<KeyboardRegion>>>,
     previous: Option<KeyboardRegion>,
