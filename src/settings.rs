@@ -366,6 +366,24 @@ pub struct KeyboardShortcuts {
     pub open_file: Vec<String>,
     pub reveal_in_files: Vec<String>,
     pub ignore_change_path: Vec<String>,
+    pub git_fetch: Vec<String>,
+    pub git_push: Vec<String>,
+    pub git_publish: Vec<String>,
+    pub git_sync: Vec<String>,
+    pub git_sync_rebase: Vec<String>,
+    pub git_stash: Vec<String>,
+    pub git_stash_untracked: Vec<String>,
+    pub git_stashes: Vec<String>,
+    pub git_apply_stash: Vec<String>,
+    pub git_pop_stash: Vec<String>,
+    pub git_drop_stash: Vec<String>,
+    pub git_commit: Vec<String>,
+    pub git_amend: Vec<String>,
+    pub git_refresh: Vec<String>,
+    pub git_abort: Vec<String>,
+    pub git_continue: Vec<String>,
+    pub git_output: Vec<String>,
+
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -498,6 +516,24 @@ impl Default for KeyboardShortcuts {
             open_file: vec![],
             reveal_in_files: vec![],
             ignore_change_path: vec![],
+            git_fetch: Vec::new(),
+            git_push: Vec::new(),
+            git_publish: Vec::new(),
+            git_sync: Vec::new(),
+            git_sync_rebase: Vec::new(),
+            git_stash: Vec::new(),
+            git_stash_untracked: Vec::new(),
+            git_stashes: Vec::new(),
+            git_apply_stash: Vec::new(),
+            git_pop_stash: Vec::new(),
+            git_drop_stash: Vec::new(),
+            git_commit: Vec::new(),
+            git_amend: Vec::new(),
+            git_refresh: Vec::new(),
+            git_abort: Vec::new(),
+            git_continue: Vec::new(),
+            git_output: Vec::new(),
+
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -530,7 +566,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 119] {
+    pub fn actions(&self) -> [&Vec<String>; 136] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -656,13 +692,31 @@ impl KeyboardShortcuts {
             &self.open_file,
             &self.reveal_in_files,
             &self.ignore_change_path,
+            &self.git_fetch,
+            &self.git_push,
+            &self.git_publish,
+            &self.git_sync,
+            &self.git_sync_rebase,
+            &self.git_stash,
+            &self.git_stash_untracked,
+            &self.git_stashes,
+            &self.git_apply_stash,
+            &self.git_pop_stash,
+            &self.git_drop_stash,
+            &self.git_commit,
+            &self.git_amend,
+            &self.git_refresh,
+            &self.git_abort,
+            &self.git_continue,
+            &self.git_output,
+
 
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 119] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 136] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -783,6 +837,24 @@ impl KeyboardShortcuts {
             &mut self.open_file,
             &mut self.reveal_in_files,
             &mut self.ignore_change_path,
+            &mut self.git_fetch,
+            &mut self.git_push,
+            &mut self.git_publish,
+            &mut self.git_sync,
+            &mut self.git_sync_rebase,
+            &mut self.git_stash,
+            &mut self.git_stash_untracked,
+            &mut self.git_stashes,
+            &mut self.git_apply_stash,
+            &mut self.git_pop_stash,
+            &mut self.git_drop_stash,
+            &mut self.git_commit,
+            &mut self.git_amend,
+            &mut self.git_refresh,
+            &mut self.git_abort,
+            &mut self.git_continue,
+            &mut self.git_output,
+
         ]
     }
 
@@ -832,7 +904,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 119] = [
+const SHORTCUT_ACTIONS: [&str; 136] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -957,6 +1029,24 @@ const SHORTCUT_ACTIONS: [&str; 119] = [
     "open_file",
     "reveal_in_files",
     "ignore_change_path",
+    "git_fetch",
+    "git_push",
+    "git_publish",
+    "git_sync",
+    "git_sync_rebase",
+    "git_stash",
+    "git_stash_untracked",
+    "git_stashes",
+    "git_apply_stash",
+    "git_pop_stash",
+    "git_drop_stash",
+    "git_commit",
+    "git_amend",
+    "git_refresh",
+    "git_abort",
+    "git_continue",
+    "git_output",
+
 
 ];
 
@@ -2139,7 +2229,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 114] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 131] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2259,6 +2349,24 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 114] = [
     "open_file",
     "reveal_in_files",
     "ignore_change_path",
+    "git_fetch",
+    "git_push",
+    "git_publish",
+    "git_sync",
+    "git_sync_rebase",
+    "git_stash",
+    "git_stash_untracked",
+    "git_stashes",
+    "git_apply_stash",
+    "git_pop_stash",
+    "git_drop_stash",
+    "git_commit",
+    "git_amend",
+    "git_refresh",
+    "git_abort",
+    "git_continue",
+    "git_output",
+
 
 ];
 

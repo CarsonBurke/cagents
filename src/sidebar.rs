@@ -43,6 +43,7 @@ use crate::{
 use row_interaction::RowInteraction;
 
 pub mod commands;
+pub mod git_commands;
 mod selection;
 mod change_selection;
 pub use change_selection::Row as ChangeSelectionRow;

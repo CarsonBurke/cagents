@@ -472,3 +472,11 @@ The command registry also exposes `keyboard_shortcuts.mark_all_read` and
 `keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
 uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
 attention navigation bindings. All of these appear in Keyboard settings.
+
+The unbound Git command settings are `git_fetch`, `git_push`, `git_publish`,
+`git_sync`, `git_sync_rebase`, `git_stash`, `git_stash_untracked`, `git_stashes`,
+`git_apply_stash`, `git_pop_stash`, `git_drop_stash`, `git_commit`, `git_amend`,
+`git_refresh`, `git_abort`, `git_continue` and `git_output`, under
+`[keyboard_shortcuts]`. They use the active worktree's existing Git controls;
+commit uses that worktree's subject, description and amend choice. Stash
+commands open a target picker and retain its exact stash object identity.

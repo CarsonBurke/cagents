@@ -12,6 +12,9 @@ pub(super) struct State {
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
     move_pane: Option<CardId>,
+    git_target: Option<sidebar::git_commands::GitTarget>,
+    git_captured: bool,
+    stash_picker: Option<Command>,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -27,6 +30,7 @@ pub enum Action {
     OpenPanes,
     ClosePane(CardId),
     MovePane(CardId),
+    RunGitStash(sidebar::git_commands::GitTarget, Command, crate::repository::StashEntry),
     MovePaneToChannel(CardId, crate::model::ChannelId),
     Close,
     Query(String),
@@ -75,6 +79,7 @@ fn entry_category(message: &Message) -> char {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::RunCommand(command) => format!("command:{}", command.id()),
+        Message::Palette(Action::RunGitStash(_, command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::MovePaneToChannel(_, _)) => format!("command:{}", Command::MovePaneToChannel.id()),
         Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) | Message::FocusAttention(id) => format!("pane:{id}"),
         Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => {
@@ -249,6 +254,9 @@ impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Record(field) => {
+                self.palette.git_target = None;
+                self.palette.git_captured = false;
+                self.palette.stash_picker = None;
                 self.palette.recording = Some(field);
                 self.palette.filtering_key = false;
                 self.palette.query = None;
@@ -261,6 +269,9 @@ impl Cagents {
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.sidebar_target = None;
+                self.palette.git_target = None;
+                self.palette.git_captured = false;
+                self.palette.stash_picker = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
                 Task::none()
@@ -350,6 +361,9 @@ impl Cagents {
                     return Task::none();
                 }
                 self.palette.sidebar_target = self.capture_sidebar_command_target();
+                self.palette.git_target = sidebar::git_commands::GitTarget::capture(&self.sidebar_model, &self.sidebar_state);
+                self.palette.git_captured = true;
+                self.palette.stash_picker = None;
                 self.palette.panes_only = matches!(action, Action::OpenPanes);
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
@@ -358,6 +372,17 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::RunGitStash(target, command, entry) => {
+                if self.focused_repository_is_saving() || self.workspace_inputs_blocked() { return Task::none(); }
+                match target.stash_action(&self.sidebar_model, &self.sidebar_state, command, &entry) {
+                    Some(action) if !crate::device::is_remote() || device_ui::supports_sidebar_action(&action) => {
+                        let open = command == Command::GitDropStash;
+                        let task = self.update(Message::Sidebar(action));
+                        if open { Task::batch([task, self.update(Message::SelectContextTab(ContextTab::Changes))]) } else { task }
+                    }
+                    _ => { self.status = Some(TransientNotice::warning("The original stash is no longer available")); Task::none() }
+                }
             }
             Action::MovePaneToChannel(card, channel) => self.update(Message::MovePaneToChannel { card, channel }),
             Action::MovePane(card) => {
@@ -369,6 +394,9 @@ impl Cagents {
                 task
             }
             Action::Close => {
+                self.palette.git_target = None;
+                self.palette.git_captured = false;
+                self.palette.stash_picker = None;
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
@@ -452,8 +480,13 @@ impl Cagents {
         self.settings.palette_recents.truncate(24);
         self.palette.query = None;
         self.palette.move_pane = None;
+        self.palette.stash_picker = None;
         let command = self.update(message);
         self.palette.sidebar_target = None;
+        if self.palette.query.is_none() {
+            self.palette.git_target = None;
+            self.palette.git_captured = false;
+        }
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
         } else {
@@ -615,7 +648,7 @@ impl Cagents {
     }
 
     fn palette_section(&self, message: &Message) -> Option<&'static str> {
-        if self.palette.panes_only || self.palette.move_pane.is_some() || !self.palette.query.as_deref().unwrap_or("").trim().is_empty() {
+        if self.palette.panes_only || self.palette.move_pane.is_some() || self.palette.stash_picker.is_some() || !self.palette.query.as_deref().unwrap_or("").trim().is_empty() {
             return None;
         }
         Some(if self.settings.palette_recents.contains(&entry_key(message)) {
@@ -686,6 +719,16 @@ impl Cagents {
     }
 
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
+        if let Some(command) = self.palette.stash_picker {
+            let Some(target) = self.palette.git_target.as_ref() else { return Vec::new(); };
+            let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
+            let mut entries: Vec<_> = target.stashes(&self.sidebar_model, &self.sidebar_state).iter().filter_map(|entry| {
+                let label = format!("{} · {}", entry.reference, entry.message);
+                match_score(&label, query).map(|score| (score, label, Message::Palette(Action::RunGitStash(target.clone(), command, entry.clone()))))
+            }).collect();
+            if !query.is_empty() { entries.sort_by_key(|entry| entry.0); }
+            return entries.into_iter().map(|(_, label, message)| (label, String::new(), message)).collect();
+        }
         if let Some(card) = self.palette.move_pane {
             let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
             let mut entries: Vec<_> = self.pane_move_destinations(card).into_iter().filter_map(|channel| {
@@ -854,7 +897,9 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input = crate::ui_controls::field::search(
-            if self.palette.move_pane.is_some() {
+            if self.palette.stash_picker.is_some() {
+                "Choose the exact stash"
+            } else if self.palette.move_pane.is_some() {
                 "Move pane to channel…"
             } else if self.palette.panes_only {
                 "Search open panes"
@@ -940,7 +985,9 @@ impl Cagents {
             .collect();
         let rows = if rows.is_empty() {
             widget::column::with_children(vec![
-                design::caption(if self.palette.move_pane.is_some() {
+                design::caption(if self.palette.stash_picker.is_some() {
+                    "No matching stashes"
+                } else if self.palette.move_pane.is_some() {
                     "No matching channels"
                 } else if self.palette.panes_only {
                     "No matching panes"
@@ -1040,6 +1087,25 @@ impl Cagents {
         self.palette.sidebar_target.clone().or_else(|| self.capture_sidebar_command_target())
     }
 
+    fn git_command_target(&self) -> Option<sidebar::git_commands::GitTarget> {
+        if self.palette.git_captured { self.palette.git_target.clone() }
+        else { sidebar::git_commands::GitTarget::capture(&self.sidebar_model, &self.sidebar_state) }
+    }
+
+    fn git_command_mask(&self) -> u32 {
+        let Some(target) = self.git_command_target() else { return 0; };
+        workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| {
+            let bit = workspace_widget::git_command_bit(descriptor.action)?;
+            if !target.available(&self.sidebar_model, &self.sidebar_state, descriptor.action) { return None; }
+            if crate::device::is_remote() {
+                let action = target.action(&self.sidebar_model, &self.sidebar_state, descriptor.action)
+                    .or_else(|| target.stashes(&self.sidebar_model, &self.sidebar_state).first().and_then(|entry| target.stash_action(&self.sidebar_model, &self.sidebar_state, descriptor.action, entry)))?;
+                if !device_ui::supports_sidebar_action(&action) { return None; }
+            }
+            Some(bit)
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
     fn sidebar_command_mask(&self, target: &sidebar::commands::CommandTarget) -> u64 {
         workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| {
             let bit = descriptor.action.sidebar_command_bit()?;
@@ -1095,6 +1161,7 @@ impl Cagents {
         workspace_widget::CommandContext {
             save_in_flight,
             sidebar_commands: self.sidebar_command_target().as_ref().map(|target| self.sidebar_command_mask(target)),
+            git_commands: self.git_command_mask(),
             // The palette's search field owns native keyboard focus. Command
             // availability instead describes the originating pane's content.
             focused: match card.and_then(|id| self.cards.get(&id)) {
@@ -1209,6 +1276,21 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::git_command_bit(command).is_some() {
+            let Some(target) = self.git_command_target() else { return Task::none(); };
+            if !target.available(&self.sidebar_model, &self.sidebar_state, command) { return Task::none(); }
+            if sidebar::git_commands::is_stash_picker(command) {
+                let task = self.update_palette(Action::Open);
+                self.palette.git_target = Some(target);
+                self.palette.stash_picker = Some(command);
+                return task;
+            }
+            let task = target.action(&self.sidebar_model, &self.sidebar_state, command)
+                .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+            return if matches!(command, Command::GitStashes | Command::GitAmend | Command::GitOutput) {
+                Task::batch([task, self.update(Message::SelectContextTab(ContextTab::Changes))])
+            } else { task };
+        }
         if command.sidebar_command_bit().is_some()
             && let Some(target) = self.sidebar_command_target()
         {
@@ -1417,6 +1499,23 @@ impl Cagents {
             | Command::OpenFile
             | Command::RevealInFiles
             | Command::IgnoreChangePath
+            | Command::GitFetch
+            | Command::GitPush
+            | Command::GitPublish
+            | Command::GitSync
+            | Command::GitSyncRebase
+            | Command::GitStash
+            | Command::GitStashUntracked
+            | Command::GitStashes
+            | Command::GitApplyStash
+            | Command::GitPopStash
+            | Command::GitDropStash
+            | Command::GitCommit
+            | Command::GitAmend
+            | Command::GitRefresh
+            | Command::GitAbort
+            | Command::GitContinue
+            | Command::GitOutput
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1670,6 +1769,23 @@ impl SettingsField {
             Self::ShortcutOpenFile => Some(Command::OpenFile),
             Self::ShortcutRevealInFiles => Some(Command::RevealInFiles),
             Self::ShortcutIgnoreChangePath => Some(Command::IgnoreChangePath),
+            Self::ShortcutGitFetch => Some(Command::GitFetch),
+            Self::ShortcutGitPush => Some(Command::GitPush),
+            Self::ShortcutGitPublish => Some(Command::GitPublish),
+            Self::ShortcutGitSync => Some(Command::GitSync),
+            Self::ShortcutGitSyncRebase => Some(Command::GitSyncRebase),
+            Self::ShortcutGitStash => Some(Command::GitStash),
+            Self::ShortcutGitStashUntracked => Some(Command::GitStashUntracked),
+            Self::ShortcutGitStashes => Some(Command::GitStashes),
+            Self::ShortcutGitApplyStash => Some(Command::GitApplyStash),
+            Self::ShortcutGitPopStash => Some(Command::GitPopStash),
+            Self::ShortcutGitDropStash => Some(Command::GitDropStash),
+            Self::ShortcutGitCommit => Some(Command::GitCommit),
+            Self::ShortcutGitAmend => Some(Command::GitAmend),
+            Self::ShortcutGitRefresh => Some(Command::GitRefresh),
+            Self::ShortcutGitAbort => Some(Command::GitAbort),
+            Self::ShortcutGitContinue => Some(Command::GitContinue),
+            Self::ShortcutGitOutput => Some(Command::GitOutput),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1827,6 +1943,23 @@ impl ShortcutDraft {
             (Command::OpenFile, self.open_file.as_str()),
             (Command::RevealInFiles, self.reveal_in_files.as_str()),
             (Command::IgnoreChangePath, self.ignore_change_path.as_str()),
+            (Command::GitFetch, self.git_fetch.as_str()),
+            (Command::GitPush, self.git_push.as_str()),
+            (Command::GitPublish, self.git_publish.as_str()),
+            (Command::GitSync, self.git_sync.as_str()),
+            (Command::GitSyncRebase, self.git_sync_rebase.as_str()),
+            (Command::GitStash, self.git_stash.as_str()),
+            (Command::GitStashUntracked, self.git_stash_untracked.as_str()),
+            (Command::GitStashes, self.git_stashes.as_str()),
+            (Command::GitApplyStash, self.git_apply_stash.as_str()),
+            (Command::GitPopStash, self.git_pop_stash.as_str()),
+            (Command::GitDropStash, self.git_drop_stash.as_str()),
+            (Command::GitCommit, self.git_commit.as_str()),
+            (Command::GitAmend, self.git_amend.as_str()),
+            (Command::GitRefresh, self.git_refresh.as_str()),
+            (Command::GitAbort, self.git_abort.as_str()),
+            (Command::GitContinue, self.git_continue.as_str()),
+            (Command::GitOutput, self.git_output.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
@@ -2937,6 +3070,27 @@ mod settings_recorder_tests {
         assert!(app.settings_invalid.is_empty());
         assert!(app.settings.clone().validate().is_ok());
     }
+    #[test]
+    fn registered_stash_picker_keeps_its_captured_worktree_after_nested_palette_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        app.sidebar_model.source_control.as_mut().unwrap().stashes = vec![crate::repository::StashEntry {
+            reference: "stash@{2}".into(), oid: crate::repository::Oid::parse(&"a".repeat(40)).unwrap(), message: "selected work".into(),
+        }];
+        drop(app.update_palette(Action::Open));
+        assert!(app.command_available(Command::GitApplyStash));
+        drop(app.run_palette_command(Message::RunCommand(Command::GitApplyStash)));
+        assert!(app.palette.query.is_some());
+        assert!(app.palette.git_captured);
+        assert_eq!(app.palette.stash_picker, Some(Command::GitApplyStash));
+        assert_eq!(app.palette_entries().len(), 1);
+        app.sidebar_model.source_control.as_mut().unwrap().branch = Some(crate::repository::ValidatedBranchName::parse("replacement").unwrap());
+        assert!(app.palette_entries().is_empty(), "a branch switch cannot substitute another stash source");
+        drop(app.update_palette(Action::Close));
+        assert!(!app.palette.git_captured);
+    }
+
     #[test]
     fn sidebar_palette_keeps_original_row_after_focus_and_selection_change() {
         let mut app = crate::app::tests::context_inspector_test_app(true);

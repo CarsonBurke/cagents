@@ -144,6 +144,11 @@ determine which models and permission modes are available.
   highlighted. With an empty query, recent actions appear first and survive
   restarts. Panes include inactive workspaces, show their activity status, and
   switch to their workspace when selected.
+- Git commands such as **Fetch**, **Push**, **Sync**, **Stash changes** and
+  **Commit changes** are also available in the palette and Keyboard settings,
+  unbound by default. **Apply stash**, **Pop stash** and **Drop stash** open a
+  searchable list of stashes from the captured worktree; dropping still asks
+  for confirmation. Changing the worktree or branch retires the old selection.
 - Pane actions such as **Copy path**, **Close other panes**, **Close panes to
   the right**, **Fork conversation**, and **Reveal in Projects** are available
   in the palette and **Settings → Keyboard**. Their context menus use the same

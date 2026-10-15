@@ -2930,12 +2930,29 @@ pub enum SettingsField {
     ShortcutOpenFile,
     ShortcutRevealInFiles,
     ShortcutIgnoreChangePath,
+    ShortcutGitFetch,
+    ShortcutGitPush,
+    ShortcutGitPublish,
+    ShortcutGitSync,
+    ShortcutGitSyncRebase,
+    ShortcutGitStash,
+    ShortcutGitStashUntracked,
+    ShortcutGitStashes,
+    ShortcutGitApplyStash,
+    ShortcutGitPopStash,
+    ShortcutGitDropStash,
+    ShortcutGitCommit,
+    ShortcutGitAmend,
+    ShortcutGitRefresh,
+    ShortcutGitAbort,
+    ShortcutGitContinue,
+    ShortcutGitOutput,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 119] = [
+    const SHORTCUTS: [Self; 136] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3060,6 +3077,23 @@ impl SettingsField {
         Self::ShortcutOpenFile,
         Self::ShortcutRevealInFiles,
         Self::ShortcutIgnoreChangePath,
+        Self::ShortcutGitFetch,
+        Self::ShortcutGitPush,
+        Self::ShortcutGitPublish,
+        Self::ShortcutGitSync,
+        Self::ShortcutGitSyncRebase,
+        Self::ShortcutGitStash,
+        Self::ShortcutGitStashUntracked,
+        Self::ShortcutGitStashes,
+        Self::ShortcutGitApplyStash,
+        Self::ShortcutGitPopStash,
+        Self::ShortcutGitDropStash,
+        Self::ShortcutGitCommit,
+        Self::ShortcutGitAmend,
+        Self::ShortcutGitRefresh,
+        Self::ShortcutGitAbort,
+        Self::ShortcutGitContinue,
+        Self::ShortcutGitOutput,
 
     ];
 
@@ -3189,6 +3223,23 @@ impl SettingsField {
             Self::ShortcutOpenFile => "Open file",
             Self::ShortcutRevealInFiles => "Reveal in Files",
             Self::ShortcutIgnoreChangePath => "Add to .gitignore",
+            Self::ShortcutGitFetch => "Fetch",
+            Self::ShortcutGitPush => "Push",
+            Self::ShortcutGitPublish => "Publish branch…",
+            Self::ShortcutGitSync => "Sync",
+            Self::ShortcutGitSyncRebase => "Sync with rebase",
+            Self::ShortcutGitStash => "Stash changes",
+            Self::ShortcutGitStashUntracked => "Stash including new files",
+            Self::ShortcutGitStashes => "Show or hide stashes",
+            Self::ShortcutGitApplyStash => "Apply stash…",
+            Self::ShortcutGitPopStash => "Pop stash…",
+            Self::ShortcutGitDropStash => "Drop stash…",
+            Self::ShortcutGitCommit => "Commit changes",
+            Self::ShortcutGitAmend => "Toggle amend commit",
+            Self::ShortcutGitRefresh => "Refresh Git status",
+            Self::ShortcutGitAbort => "Abort Git operation",
+            Self::ShortcutGitContinue => "Continue Git operation",
+            Self::ShortcutGitOutput => "Show or hide Git output",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3372,6 +3423,23 @@ impl SettingsField {
             | Self::ShortcutOpenFile
             | Self::ShortcutRevealInFiles
             | Self::ShortcutIgnoreChangePath
+            | Self::ShortcutGitFetch
+            | Self::ShortcutGitPush
+            | Self::ShortcutGitPublish
+            | Self::ShortcutGitSync
+            | Self::ShortcutGitSyncRebase
+            | Self::ShortcutGitStash
+            | Self::ShortcutGitStashUntracked
+            | Self::ShortcutGitStashes
+            | Self::ShortcutGitApplyStash
+            | Self::ShortcutGitPopStash
+            | Self::ShortcutGitDropStash
+            | Self::ShortcutGitCommit
+            | Self::ShortcutGitAmend
+            | Self::ShortcutGitRefresh
+            | Self::ShortcutGitAbort
+            | Self::ShortcutGitContinue
+            | Self::ShortcutGitOutput
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3518,6 +3586,23 @@ struct ShortcutDraft {
     open_file: String,
     reveal_in_files: String,
     ignore_change_path: String,
+    git_fetch: String,
+    git_push: String,
+    git_publish: String,
+    git_sync: String,
+    git_sync_rebase: String,
+    git_stash: String,
+    git_stash_untracked: String,
+    git_stashes: String,
+    git_apply_stash: String,
+    git_pop_stash: String,
+    git_drop_stash: String,
+    git_commit: String,
+    git_amend: String,
+    git_refresh: String,
+    git_abort: String,
+    git_continue: String,
+    git_output: String,
 
 
     command_palette: String,
@@ -3652,6 +3737,23 @@ impl ShortcutDraft {
             open_file: settings::format_chords(&shortcuts.open_file),
             reveal_in_files: settings::format_chords(&shortcuts.reveal_in_files),
             ignore_change_path: settings::format_chords(&shortcuts.ignore_change_path),
+            git_fetch: settings::format_chords(&shortcuts.git_fetch),
+            git_push: settings::format_chords(&shortcuts.git_push),
+            git_publish: settings::format_chords(&shortcuts.git_publish),
+            git_sync: settings::format_chords(&shortcuts.git_sync),
+            git_sync_rebase: settings::format_chords(&shortcuts.git_sync_rebase),
+            git_stash: settings::format_chords(&shortcuts.git_stash),
+            git_stash_untracked: settings::format_chords(&shortcuts.git_stash_untracked),
+            git_stashes: settings::format_chords(&shortcuts.git_stashes),
+            git_apply_stash: settings::format_chords(&shortcuts.git_apply_stash),
+            git_pop_stash: settings::format_chords(&shortcuts.git_pop_stash),
+            git_drop_stash: settings::format_chords(&shortcuts.git_drop_stash),
+            git_commit: settings::format_chords(&shortcuts.git_commit),
+            git_amend: settings::format_chords(&shortcuts.git_amend),
+            git_refresh: settings::format_chords(&shortcuts.git_refresh),
+            git_abort: settings::format_chords(&shortcuts.git_abort),
+            git_continue: settings::format_chords(&shortcuts.git_continue),
+            git_output: settings::format_chords(&shortcuts.git_output),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4001,6 +4103,23 @@ impl SettingsDraft {
             SettingsField::ShortcutOpenFile => self.keyboard_shortcuts.open_file = value,
             SettingsField::ShortcutRevealInFiles => self.keyboard_shortcuts.reveal_in_files = value,
             SettingsField::ShortcutIgnoreChangePath => self.keyboard_shortcuts.ignore_change_path = value,
+            SettingsField::ShortcutGitFetch => self.keyboard_shortcuts.git_fetch = value,
+            SettingsField::ShortcutGitPush => self.keyboard_shortcuts.git_push = value,
+            SettingsField::ShortcutGitPublish => self.keyboard_shortcuts.git_publish = value,
+            SettingsField::ShortcutGitSync => self.keyboard_shortcuts.git_sync = value,
+            SettingsField::ShortcutGitSyncRebase => self.keyboard_shortcuts.git_sync_rebase = value,
+            SettingsField::ShortcutGitStash => self.keyboard_shortcuts.git_stash = value,
+            SettingsField::ShortcutGitStashUntracked => self.keyboard_shortcuts.git_stash_untracked = value,
+            SettingsField::ShortcutGitStashes => self.keyboard_shortcuts.git_stashes = value,
+            SettingsField::ShortcutGitApplyStash => self.keyboard_shortcuts.git_apply_stash = value,
+            SettingsField::ShortcutGitPopStash => self.keyboard_shortcuts.git_pop_stash = value,
+            SettingsField::ShortcutGitDropStash => self.keyboard_shortcuts.git_drop_stash = value,
+            SettingsField::ShortcutGitCommit => self.keyboard_shortcuts.git_commit = value,
+            SettingsField::ShortcutGitAmend => self.keyboard_shortcuts.git_amend = value,
+            SettingsField::ShortcutGitRefresh => self.keyboard_shortcuts.git_refresh = value,
+            SettingsField::ShortcutGitAbort => self.keyboard_shortcuts.git_abort = value,
+            SettingsField::ShortcutGitContinue => self.keyboard_shortcuts.git_continue = value,
+            SettingsField::ShortcutGitOutput => self.keyboard_shortcuts.git_output = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4343,6 +4462,23 @@ fn settings_update(
         SettingsField::ShortcutOpenFile => { next.keyboard_shortcuts.open_file = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutRevealInFiles => { next.keyboard_shortcuts.reveal_in_files = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutIgnoreChangePath => { next.keyboard_shortcuts.ignore_change_path = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitFetch => { next.keyboard_shortcuts.git_fetch = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitPush => { next.keyboard_shortcuts.git_push = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitPublish => { next.keyboard_shortcuts.git_publish = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitSync => { next.keyboard_shortcuts.git_sync = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitSyncRebase => { next.keyboard_shortcuts.git_sync_rebase = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStash => { next.keyboard_shortcuts.git_stash = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStashUntracked => { next.keyboard_shortcuts.git_stash_untracked = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStashes => { next.keyboard_shortcuts.git_stashes = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitApplyStash => { next.keyboard_shortcuts.git_apply_stash = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitPopStash => { next.keyboard_shortcuts.git_pop_stash = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitDropStash => { next.keyboard_shortcuts.git_drop_stash = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitCommit => { next.keyboard_shortcuts.git_commit = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitAmend => { next.keyboard_shortcuts.git_amend = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitRefresh => { next.keyboard_shortcuts.git_refresh = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitAbort => { next.keyboard_shortcuts.git_abort = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitContinue => { next.keyboard_shortcuts.git_continue = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitOutput => { next.keyboard_shortcuts.git_output = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

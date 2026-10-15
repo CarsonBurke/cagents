@@ -132,6 +132,23 @@ pub enum GlobalShortcut {
     OpenFile,
     RevealInFiles,
     IgnoreChangePath,
+    GitFetch,
+    GitPush,
+    GitPublish,
+    GitSync,
+    GitSyncRebase,
+    GitStash,
+    GitStashUntracked,
+    GitStashes,
+    GitApplyStash,
+    GitPopStash,
+    GitDropStash,
+    GitCommit,
+    GitAmend,
+    GitRefresh,
+    GitAbort,
+    GitContinue,
+    GitOutput,
 
 
     CommandPalette,
@@ -177,6 +194,29 @@ pub enum GlobalShortcut {
     ReviewPreviousChange,
 }
 
+pub const fn git_command_bit(command: GlobalShortcut) -> Option<u32> {
+    match command {
+        GlobalShortcut::GitFetch => Some(1 << 0),
+        GlobalShortcut::GitPush => Some(1 << 1),
+        GlobalShortcut::GitPublish => Some(1 << 2),
+        GlobalShortcut::GitSync => Some(1 << 3),
+        GlobalShortcut::GitSyncRebase => Some(1 << 4),
+        GlobalShortcut::GitStash => Some(1 << 5),
+        GlobalShortcut::GitStashUntracked => Some(1 << 6),
+        GlobalShortcut::GitStashes => Some(1 << 7),
+        GlobalShortcut::GitApplyStash => Some(1 << 8),
+        GlobalShortcut::GitPopStash => Some(1 << 9),
+        GlobalShortcut::GitDropStash => Some(1 << 10),
+        GlobalShortcut::GitCommit => Some(1 << 11),
+        GlobalShortcut::GitAmend => Some(1 << 12),
+        GlobalShortcut::GitRefresh => Some(1 << 13),
+        GlobalShortcut::GitAbort => Some(1 << 14),
+        GlobalShortcut::GitContinue => Some(1 << 15),
+        GlobalShortcut::GitOutput => Some(1 << 16),
+        _ => None,
+    }
+}
+
 impl GlobalShortcut {
     pub const fn sidebar_command_bit(self) -> Option<u64> {
         match self {
@@ -218,7 +258,7 @@ impl GlobalShortcut {
     /// Native editing and focus-only sidebar actions can continue during saves.
     pub fn blocked_during_save(self) -> bool {
         let id = self.id();
-        id.starts_with("settings_") || id.starts_with("focus_project_")
+        (id.starts_with("git_") && !matches!(self, Self::GitStashes | Self::GitOutput | Self::GitRefresh | Self::GitAmend)) || id.starts_with("settings_") || id.starts_with("focus_project_")
             || id.starts_with("focus_pane_")
             || matches!(self, Self::NewTerminal | Self::NewThread | Self::NewBrowser
                 | Self::NewChannel | Self::NewWorktree | Self::ClonePane | Self::ReopenPane
@@ -316,6 +356,23 @@ impl GlobalShortcut {
             Self::OpenFile => "open_file",
             Self::RevealInFiles => "reveal_in_files",
             Self::IgnoreChangePath => "ignore_change_path",
+            Self::GitFetch => "git_fetch",
+            Self::GitPush => "git_push",
+            Self::GitPublish => "git_publish",
+            Self::GitSync => "git_sync",
+            Self::GitSyncRebase => "git_sync_rebase",
+            Self::GitStash => "git_stash",
+            Self::GitStashUntracked => "git_stash_untracked",
+            Self::GitStashes => "git_stashes",
+            Self::GitApplyStash => "git_apply_stash",
+            Self::GitPopStash => "git_pop_stash",
+            Self::GitDropStash => "git_drop_stash",
+            Self::GitCommit => "git_commit",
+            Self::GitAmend => "git_amend",
+            Self::GitRefresh => "git_refresh",
+            Self::GitAbort => "git_abort",
+            Self::GitContinue => "git_continue",
+            Self::GitOutput => "git_output",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -448,6 +505,7 @@ pub struct ShortcutDescriptor {
 pub struct CommandContext {
     /// Some mask records an originating sidebar target, including a stale target with no actions.
     pub sidebar_commands: Option<u64>,
+    pub git_commands: u32,
     pub save_in_flight: bool,
     pub focused: FocusedPane,
     pub pane_index: Option<usize>,
@@ -486,6 +544,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
+        if git_command_bit(self.action).is_some() { return "Git"; }
         if self.scope == ShortcutScope::Sidebar { return "Navigation"; }
         let id = self.id();
         if id.starts_with("settings_")
@@ -534,6 +593,7 @@ impl ShortcutDescriptor {
 
     pub fn available(self, context: &CommandContext) -> bool {
         if context.save_in_flight && self.action.blocked_during_save() { return false; }
+        if let Some(bit) = git_command_bit(self.action) { return context.git_commands & bit != 0; }
         if let Some(mask) = context.sidebar_commands
             && let Some(bit) = self.action.sidebar_command_bit()
         { return mask & bit != 0; }
@@ -1213,6 +1273,23 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::OpenFile, label: "Open file", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::RevealInFiles, label: "Reveal in Files", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::IgnoreChangePath, label: "Add to .gitignore", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitFetch, label: "Fetch", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitPush, label: "Push", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitPublish, label: "Publish branch…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitSync, label: "Sync", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitSyncRebase, label: "Sync with rebase", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitStash, label: "Stash changes", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitStashUntracked, label: "Stash including new files", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitStashes, label: "Show or hide stashes", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitApplyStash, label: "Apply stash…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitPopStash, label: "Pop stash…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitDropStash, label: "Drop stash…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitCommit, label: "Commit changes", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitAmend, label: "Toggle amend commit", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitRefresh, label: "Refresh Git status", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitAbort, label: "Abort Git operation", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitContinue, label: "Continue Git operation", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitOutput, label: "Show or hide Git output", repeatable: false, scope: ShortcutScope::Workspace },
 
 ];
 
@@ -1317,6 +1394,23 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::OpenFile => &shortcuts.open_file,
         GlobalShortcut::RevealInFiles => &shortcuts.reveal_in_files,
         GlobalShortcut::IgnoreChangePath => &shortcuts.ignore_change_path,
+        GlobalShortcut::GitFetch => &shortcuts.git_fetch,
+        GlobalShortcut::GitPush => &shortcuts.git_push,
+        GlobalShortcut::GitPublish => &shortcuts.git_publish,
+        GlobalShortcut::GitSync => &shortcuts.git_sync,
+        GlobalShortcut::GitSyncRebase => &shortcuts.git_sync_rebase,
+        GlobalShortcut::GitStash => &shortcuts.git_stash,
+        GlobalShortcut::GitStashUntracked => &shortcuts.git_stash_untracked,
+        GlobalShortcut::GitStashes => &shortcuts.git_stashes,
+        GlobalShortcut::GitApplyStash => &shortcuts.git_apply_stash,
+        GlobalShortcut::GitPopStash => &shortcuts.git_pop_stash,
+        GlobalShortcut::GitDropStash => &shortcuts.git_drop_stash,
+        GlobalShortcut::GitCommit => &shortcuts.git_commit,
+        GlobalShortcut::GitAmend => &shortcuts.git_amend,
+        GlobalShortcut::GitRefresh => &shortcuts.git_refresh,
+        GlobalShortcut::GitAbort => &shortcuts.git_abort,
+        GlobalShortcut::GitContinue => &shortcuts.git_continue,
+        GlobalShortcut::GitOutput => &shortcuts.git_output,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
