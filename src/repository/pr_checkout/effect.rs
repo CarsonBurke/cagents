@@ -625,6 +625,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         .map_err(|error| refuse(error.to_string()))?;
     let private = tempfile::Builder::new()
         .prefix("cagents-pr-checkout-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(pinned.path(2))
         .map_err(|error| refuse(error.to_string()))?;
     let private_name = private
