@@ -28,7 +28,7 @@ impl ArchivedPaneReadiness {
                 archive.agent.origin,
                 crate::agent_execution::Origin::Automation { .. }
             )
-            || !native_descriptor_matches(&archive.agent, session)
+            || !receipt_native_descriptor_matches(archive, session)
             || archive
                 .agent
                 .session
@@ -85,7 +85,7 @@ impl ArchivedPaneReadiness {
         kind: &crate::model::CardKind,
         archive: &ArchivedConversation,
     ) -> Result<Self, String> {
-        if !closed_pane_matches(&archive.agent, kind) {
+        if !closed_pane_candidate_matches(&archive.agent, kind) {
             return Err("The saved automation pane has a different exact descriptor".into());
         }
         match kind {
@@ -101,6 +101,75 @@ impl ArchivedPaneReadiness {
             _ => Err("This pane is not a saved automation conversation".into()),
         }
     }
+}
+
+fn supported_archive_continuity(session: &Session) -> bool {
+    session.has_valid_native_continuity() && match &session.native_continuity {
+        crate::chat::NativeContinuity::ReconnectOnly => false,
+        crate::chat::NativeContinuity::Durable { provider_version } => {
+            session.launch.provider == crate::agent::Provider::Codex
+                && crate::chat::VERIFIED_CODEX_VERSIONS.contains(&provider_version.as_str())
+        }
+    }
+}
+
+/// A metadata candidate authorizes only a private archive read/Loading fence.
+/// It never proves readiness or grants provider attach/start permission. Only
+/// a fully qualified private snapshot below can prove the promoted marker.
+pub(crate) fn native_archive_candidate_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &Session,
+) -> bool {
+    if !agent.closed || !matches!(agent.origin, crate::agent_execution::Origin::Automation { .. }) {
+        return false;
+    }
+    if native_descriptor_matches(agent, current) {
+        return true;
+    }
+    let Some(HostedSession::Chat(canonical)) = &agent.session else { return false; };
+    match (&canonical.native_continuity, &current.native_continuity) {
+        (crate::chat::NativeContinuity::ReconnectOnly, _) if supported_archive_continuity(current) => {
+            let mut promoted = agent.clone();
+            let Some(HostedSession::Chat(source)) = &mut promoted.session else { unreachable!() };
+            source.native_continuity = current.native_continuity.clone();
+            native_descriptor_matches(&promoted, current)
+        }
+        (_, crate::chat::NativeContinuity::ReconnectOnly) if supported_archive_continuity(canonical) => {
+            let mut old = current.clone();
+            old.native_continuity = canonical.native_continuity.clone();
+            native_descriptor_matches(agent, &old)
+        }
+        _ => false,
+    }
+}
+
+fn receipt_native_descriptor_matches(archive: &ArchivedConversation, current: &Session) -> bool {
+    let Some(HostedSession::Chat(canonical)) = &archive.agent.session else { return false; };
+    let supported = |source: &Session| matches!(source.native_continuity, crate::chat::NativeContinuity::ReconnectOnly)
+        || supported_archive_continuity(source);
+    let mut reported = canonical.clone();
+    reported.native_continuity = archive.snapshot.native_continuity.clone();
+    if !supported(canonical) || !supported(current) || !supported(&reported)
+        || !matches!(canonical.native_continuity, crate::chat::NativeContinuity::ReconnectOnly)
+            && !matches!(reported.native_continuity, crate::chat::NativeContinuity::ReconnectOnly)
+            && canonical.native_continuity != reported.native_continuity
+    {
+        return false;
+    }
+    if native_descriptor_matches(&archive.agent, current) {
+        return true;
+    }
+    if !native_archive_candidate_matches(&archive.agent, current) {
+        return false;
+    }
+    let marker = if matches!(canonical.native_continuity, crate::chat::NativeContinuity::ReconnectOnly) {
+        &current.native_continuity
+    } else {
+        &canonical.native_continuity
+    };
+    // The writer captures this marker from the exact proved Handle. Metadata
+    // candidates and caller-supplied versions cannot substitute for that row.
+    &archive.snapshot.native_continuity == marker
 }
 
 pub(crate) fn native_descriptor_matches(
@@ -159,7 +228,7 @@ pub(crate) fn native_descriptor_matches(
     }
 }
 
-fn closed_pane_matches(
+fn closed_pane_candidate_matches(
     agent: &crate::agent_execution::Agent,
     kind: &crate::model::CardKind,
 ) -> bool {
@@ -172,7 +241,7 @@ fn closed_pane_matches(
         return false;
     }
     match kind {
-        crate::model::CardKind::Chat(current) => native_descriptor_matches(agent, current),
+        crate::model::CardKind::Chat(current) => native_archive_candidate_matches(agent, current),
         crate::model::CardKind::Terminal(current) => {
             agent.console.as_ref().is_some_and(|original| {
                 let Some(HostedSession::Chat(native)) = &agent.session else {
@@ -298,7 +367,7 @@ pub fn inspect_completed_automation_pane(
     };
     let agent =
         serde_json::from_str(&owner).map_err(|_| "The source automation owner is invalid")?;
-    if !closed_pane_matches(&agent, kind) {
+    if !closed_pane_candidate_matches(&agent, kind) {
         return if claim.is_some() {
             Err("The claimed automation descriptor changed".into())
         } else {
@@ -394,6 +463,93 @@ mod tests {
             },
         )
     }
+    fn promoted_archive_fixture() -> (AgentId, Session, Session, ArchivedConversation) {
+        let (id, original, mut archive) = fixture();
+        let mut source = crate::chat::fresh_session(Provider::Codex, original.id,
+            original.launch.recipe.working_directory.clone(), &crate::account::Account::system(Provider::Codex)).unwrap();
+        source.proof = original.proof;
+        let proof = source.proof.clone().unwrap();
+        assert!(source.claim_owned_codex_listener(&std::env::temp_dir(), &proof));
+        source.launch.session_id = original.launch.session_id;
+        archive.agent.spec.provider = Provider::Codex;
+        archive.agent.session = Some(HostedSession::Chat(source.clone()));
+        archive.snapshot.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: "0.162.0".into() };
+        let mut promoted = source.clone();
+        promoted.native_continuity = archive.snapshot.native_continuity.clone();
+        (id,source,promoted,archive)
+    }
+
+    #[test]
+    fn archived_native_promotion_requires_the_exact_supported_private_snapshot_marker() {
+        let (id,source,promoted,archive) = promoted_archive_fixture();
+        assert!(!native_descriptor_matches(&archive.agent, &promoted), "global strict matcher stays unchanged");
+        for saved in [&source,&promoted] {
+            assert!(native_archive_candidate_matches(&archive.agent, saved));
+            assert!(ArchivedPaneReadiness::qualify(id,saved,&archive).unwrap().matches(id,saved));
+        }
+        let mut missing = archive.clone();
+        missing.snapshot.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        assert!(ArchivedPaneReadiness::qualify(id,&promoted,&missing).is_err(), "metadata candidate alone is not a receipt");
+        let mut different = promoted.clone();
+        different.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: "0.160.1".into() };
+        assert!(native_archive_candidate_matches(&archive.agent,&different));
+        assert!(ArchivedPaneReadiness::qualify(id,&different,&archive).is_err());
+        let mut canonical = archive.clone();
+        canonical.agent.session = Some(HostedSession::Chat(promoted.clone()));
+        assert!(ArchivedPaneReadiness::qualify(id,&source,&canonical).is_ok(), "an issued default source can learn the same snapshot-proved marker");
+        assert!(!native_archive_candidate_matches(&canonical.agent,&different), "different known markers never match");
+        canonical.snapshot.native_continuity = different.native_continuity;
+        assert!(ArchivedPaneReadiness::qualify(id,&source,&canonical).is_err());
+        assert!(ArchivedPaneReadiness::qualify(id,&promoted,&canonical).is_err(), "snapshot and known canonical markers cannot disagree");
+        for field in 0..5 {
+            let mut changed = promoted.clone();
+            match field {
+                0 => changed.owned_codex_listener.as_mut().unwrap().socket = "/unrelated/control.sock".into(),
+                1 => changed.launch.session_id = Some("unrelated-confirmed-thread".into()),
+                2 => changed.proof = None,
+                3 => { changed.launch.recipe.environment.insert("CHANGED_ACCOUNT".into(),"other".into()); }
+                _ => changed.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: "999.999.999".into() },
+            }
+            let mut forged = archive.clone();
+            forged.snapshot.native_continuity = changed.native_continuity.clone();
+            assert!(ArchivedPaneReadiness::qualify(id,&changed,&forged).is_err(), "invalid source field {field}");
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn persisted_default_and_promoted_archive_panes_qualify_without_rewriting_source() {
+        use rusqlite::{Connection,params};
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry.sqlite3");
+        let (id,source,promoted,archive) = promoted_archive_fixture();
+        let model = Connection::open(&registry).unwrap();
+        model.execute_batch("CREATE TABLE agents(id TEXT,closed INTEGER,record TEXT);CREATE TABLE automation_snapshots(agent TEXT,snapshot TEXT);").unwrap();
+        model.pragma_update(None,"user_version",ARCHIVE_REGISTRY_SCHEMA_FLOOR).unwrap();
+        model.execute("INSERT INTO agents VALUES(?1,1,?2)",params![id.to_string(),serde_json::to_string(&archive.agent).unwrap()]).unwrap();
+        model.execute("INSERT INTO automation_snapshots VALUES(?1,?2)",params![id.to_string(),serde_json::to_string(&archive.snapshot).unwrap()]).unwrap();
+        drop(model);
+        let card = crate::model::CardId::from_uuid(id.as_uuid());
+        for (index,saved) in [source,promoted].into_iter().enumerate() {
+            for claim in [false,true] {
+                let path = directory.path().join(format!("source-{index}-{claim}.sqlite3"));
+                let store = crate::persistence::StateStore::open(&path,crate::model::BootId::new("archive-boot")).unwrap();
+                let mut workspace = crate::model::WorkspaceState::default();
+                workspace.cards.push(crate::model::CardState {
+                    id: card,generation:0,title:"Saved native result".into(),width_fraction:0.6,
+                    existence:crate::model::Existence::Open,exposure:crate::model::Exposure::Offscreen,
+                    residency:crate::model::Residency::Cold,kind:CardKind::Chat(saved.clone()),
+                });
+                if claim { workspace.automation_archives.insert(card,id); }
+                store.save_workspace(&workspace,crate::persistence::SnapshotBase { workspace:0,cards:&Default::default() }).unwrap();
+                let before = (std::fs::read(&path).unwrap(),std::fs::read(&registry).unwrap());
+                assert!(inspect_completed_automation_pane(&path,&registry,card,&CardKind::Chat(saved.clone())).unwrap().unwrap().matches(id,&saved));
+                assert!(inspect_archived_pane(&path,&registry,card,&saved).unwrap().unwrap().matches(id,&saved));
+                assert_eq!(before,(std::fs::read(&path).unwrap(),std::fs::read(&registry).unwrap()),"read-only source qualification");
+            }
+        }
+    }
+
     #[test]
     fn archive_receipt_requires_exact_closed_read_only_history() {
         let (id, session, archive) = fixture();

@@ -4722,7 +4722,9 @@ impl Cagents {
             return false;
         };
         let exact = |current: &chat::Session| {
-            crate::automations::archive::native_descriptor_matches(agent, current)
+            // Metadata only fences execution while the private archive is read.
+            // It is never a readiness or descriptor-rebinding receipt.
+            crate::automations::archive::native_archive_candidate_matches(agent, current)
         };
         match self.chat_ui.phases.get(&card) {
             Some(Phase::Starting(attempt)) if !exact(&attempt.session) => return false,
@@ -6593,9 +6595,9 @@ impl Cagents {
                     return Task::none();
                 };
                 // A saved result cannot rebind a pane changed while its read
-                // was in flight. Only learning a confirmed thread is mutable;
-                // proof, recipe, listener, terminal pairing and continuity stay
-                // exact. The receipt below qualifies the current descriptor.
+                // was in flight. Learning a confirmed thread is mutable; an
+                // exact private receipt may also prove the native promotion for
+                // BOTH descriptors. Proof, recipe, listener and pairing stay exact.
                 if current.launch.session_id.is_some()
                     && session.launch.session_id.is_some()
                     && current.launch.session_id != session.launch.session_id
@@ -6607,7 +6609,17 @@ impl Cagents {
                 asked.launch.session_id = None;
                 observed.launch.session_id = None;
                 if asked != observed {
-                    return Task::none();
+                    let mut promoted = asked.clone();
+                    promoted.native_continuity = observed.native_continuity.clone();
+                    if promoted != observed {
+                        return Task::none();
+                    }
+                    let Ok(archive) = result.as_ref() else { return Task::none(); };
+                    if crate::automations::archive::ArchivedPaneReadiness::qualify(archive.agent.id, &session, archive).is_err()
+                        || crate::automations::archive::ArchivedPaneReadiness::qualify(archive.agent.id, current, archive).is_err()
+                    {
+                        return Task::none();
+                    }
                 }
                 let session = current.clone();
                 let history_revoked = self
@@ -17508,6 +17520,60 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+    #[test]
+    fn native_archive_candidate_stays_unready_until_private_promotion_receipt_arrives() {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target as AgentTarget};
+        for promoted_saved in [false,true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let id = crate::model::AgentId::from_uuid(card.as_uuid());
+            let CardKind::Chat(initial) = app.card_state(card).unwrap().kind.clone() else { unreachable!() };
+            let mut source = chat::fresh_session(Provider::Codex,initial.id,
+                initial.launch.recipe.working_directory.clone(),&crate::account::Account::system(Provider::Codex)).unwrap();
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("archive-ui-source"),
+                boot_id: crate::model::BootId::new("archive-ui-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("archive-ui-instance"),
+            };
+            source.proof = Some(proof.clone());
+            assert!(source.claim_owned_codex_listener(&std::env::temp_dir(),&proof));
+            source.launch.session_id = Some(KNOWN_THREAD.into());
+            let marker = chat::NativeContinuity::Durable { provider_version: "0.162.0".into() };
+            let mut current = source.clone();
+            if promoted_saved { current.native_continuity = marker.clone(); }
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(current.clone());
+            let directory = source.launch.recipe.working_directory.clone();
+            let agent = Agent {
+                name:None,id,origin:Origin::Automation { id:uuid::Uuid::new_v4() },
+                spec:Spec { provider:Provider::Codex,account:None,target:AgentTarget {
+                    repository:directory.clone(),directory:directory.clone(),placement:None,
+                },surface:Surface::Chat,model:None,permission_mode:None,reasoning_effort:None },
+                placement:Placement::Worktree {repository:directory.clone(),path:directory},
+                session:Some(HostedSession::Chat(source.clone())),console:None,created_ms:1,closed:true,
+            };
+            Arc::make_mut(&mut app.durable).automation_archives.insert(card,id);
+            assert!(app.can_present_automation_archive(card,&agent));
+            assert!(app.prepare_automation_archive(card,&agent));
+            assert_eq!(app.archived_pane_readiness(card),Ok(Some(false)),"metadata grants no readiness");
+            let target = app.chat_ui.next_target(card);
+            // In the promoted case the current pane learned the marker while
+            // this older default-source read was still in flight.
+            app.chat_ui.phases.insert(card,Phase::ReadingArchive { target,session:source });
+            drop(app.handle_chat_ui(Action::Archived(target,Arc::new(Ok(crate::automations::ArchivedConversation {
+                agent,
+                snapshot:Snapshot { generation:7,session_id:Some(KNOWN_THREAD.into()),
+                    native_continuity:marker,exited:true,
+                    read_only_reason:Some("Completed scheduled conversation".into()),..Default::default() },
+            })))));
+            assert_eq!(app.archived_pane_readiness(card),Ok(Some(true)));
+            let runtime = chat_runtime(&app,card);
+            assert!(matches!(runtime.connection,Connection::Archived));
+            assert!(runtime.handle().is_none(),"a qualified saved result never creates a provider connection");
+            assert_eq!(runtime.session,current);
+            assert!(!matches!(app.chat_ui.phases.get(&card),Some(Phase::Starting(_))));
+        }
+    }
+
     #[test]
     fn a_late_live_attachment_cannot_replace_an_archived_automation_pane() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
