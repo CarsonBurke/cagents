@@ -120,6 +120,7 @@ impl Capture {
 impl RepositoryRuntime {
     /// A gutter action names the exact row coordinates that were rendered.
     pub fn diff_mutation_request(&self, card: CardId, rows: Range<usize>) -> Option<Arc<Request>> {
+        if self.disk_comparison.is_some() { return None; }
         let path = self.selected_path()?.to_owned();
         Some(Arc::new(Request {
             identity: self.current_identity(card, path),
@@ -233,6 +234,10 @@ impl RepositoryRuntime {
         let buffer_revert = kind == git_patch::Kind::Revert && self.editable_working_diff();
         if self.git_mutation_unavailable_reason.is_some() && !buffer_revert
             || !self.shows_diff()
+            // Compare with disk owns visible row coordinates. Its overlay may
+            // coexist with a Ready Git model; never apply those coordinates to
+            // the hidden model, including a request prepared before Compare.
+            || self.disk_comparison.is_some()
             || self.directory_only
             || self.mutation_refresh_pending
             || self.is_saving()
@@ -1123,6 +1128,46 @@ mod tests {
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
         runtime
+    }
+
+    #[test]
+    fn disk_comparison_refuses_hidden_git_hunks_selection_and_prepared_effects() {
+        for kind in [git_patch::Kind::Stage,git_patch::Kind::Unstage,git_patch::Kind::Revert] {
+            for loading in [false,true] {
+                let card=CardId::new();let mut runtime=selected_mutation_fixture(card);
+                if kind==git_patch::Kind::Unstage {
+                    let mut model=crate::diff_view::build_diff("original\nkeep\n","changed\nkeep\n");
+                    model.present=[true;2];model.modes=[Some(0o100644);2];
+                    model.source_head=Some(crate::repository::GitHeadGuard::Unborn);
+                    runtime.diff_basis=DiffBasis::HeadToIndex;
+                    runtime.set_diff_state(DiffBasis::HeadToIndex,DiffState::ready(RenderedDiff::Text{
+                        model:Arc::new(model),old_label:"HEAD".into(),new_label:"Index".into(),
+                    }));
+                }
+                assert!(runtime.can_apply_diff_hunk(kind));
+                let hidden=runtime.current_diff_model_snapshot().unwrap();
+                let request=runtime.diff_mutation_request(card,0..2).unwrap();
+                let prepared=runtime.capture_diff_mutation(card,kind,Some(&request)).unwrap().prepare().unwrap();
+                runtime.disk_comparison=Some(if loading {
+                    DiffState::Loading{request:0,cancellation:CancellationToken::new()}
+                } else {
+                    DiffState::ready(RenderedDiff::Text{
+                        model:Arc::new(crate::diff_view::build_diff("external disk\n","entirely different visible buffer\n")),
+                        old_label:"Disk".into(),new_label:"Buffer".into(),
+                    })
+                });
+                assert!(!runtime.can_mutate_diff(kind));
+                assert!(!runtime.can_apply_diff_hunk(kind));
+                assert!(runtime.diff_mutation_request(card,0..2).is_none());
+                assert!(runtime.capture_diff_mutation(card,kind,Some(&request)).is_none());
+                assert!(prepared.apply(&mut runtime).is_err(),"Compare must fence an already prepared Git/buffer mutation");
+                assert!(Arc::ptr_eq(&hidden,&runtime.current_diff_model_snapshot().unwrap()));
+                assert_eq!(runtime.editor_text().unwrap(),"changed\nkeep\n");
+                runtime.diff_interaction.selection=Some(crate::diff_interaction::Selection::new(runtime.diff_mode,crate::diff_interaction::Side::New,0));
+                assert!(!runtime.can_apply_diff_selection(kind));
+                assert!(runtime.diff_selection_mutation_action(card,kind).is_none());
+            }
+        }
     }
 
     #[test]
