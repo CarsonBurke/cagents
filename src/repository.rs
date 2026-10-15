@@ -1198,6 +1198,7 @@ pub enum GitOperation {
         oid: Oid,
         name: ValidatedBranchName,
     },
+    IgnorePath { path: RepoPath },
 }
 
 impl GitOperation {
@@ -1216,6 +1217,7 @@ impl GitOperation {
             Self::RevertCommit { .. } => "Revert commit",
             Self::CherryPick { .. } => "Cherry-pick",
             Self::CreateBranch { .. } => "Create branch",
+            Self::IgnorePath { .. } => "Add to .gitignore",
         }
     }
 }
@@ -4162,7 +4164,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     pub fn ignore_path(&self, worktree: &Path, path: &RepoPath, cancellation: &CancellationToken) -> Result<(), RepositoryError> {
         let _protection = crate::worktree_cleanup::protect(worktree).map_err(|error| ValidationError::Io(error.to_string()))?;
-        if cancellation.is_cancelled() { return Err(ValidationError::Io("operation was cancelled".into()).into()); }
+        if cancellation.is_cancelled() { return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled, "termination requested before updating .gitignore", false).into()); }
         ignore_path::add(worktree, path).map_err(|error| ValidationError::Io(error).into())
     }
 
@@ -4790,6 +4792,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             GitOperation::CreateBranch { oid, name } => {
                 self.git_mutation(worktree, ["branch", "--", name.as_str(), oid.as_str()])
+            }
+            GitOperation::IgnorePath { path } => {
+                self.ignore_path(worktree, path, cancellation)?;
+                return Ok(MutationOutcome::Applied { paths: vec![path.clone()] });
             }
         };
         command = command.without_timeout();
