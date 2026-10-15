@@ -7,6 +7,7 @@ use std::ops::Range;
 #[cfg(test)]
 const PART_BYTES: usize = 128 * 1024;
 use chat::source_owners::{Admission,SOURCE_BYTES};
+use chat::cache::SourceEpoch;
 
 pub(super) use chat::cache::SourceKey as Key;
 
@@ -17,14 +18,14 @@ struct Part {
     source_len:usize,
     replacement:bool,
     metadata:chat::cache::SourceMetadata,
-    epoch:u64,
+    epoch:SourceEpoch,
 }
 
 
 #[derive(Clone)]
 pub(super) struct Loaded {
     item:Arc<chat::Item>,
-    epoch:u64,
+    epoch:SourceEpoch,
 }
 
 struct Entry {
@@ -258,7 +259,7 @@ pub(super) fn live_source_bytes()->usize {chat::source_owners::usage().admitted_
 
 use chat::source_owners::ReaderCapacity;
 pub(super) fn reader_source_capacity()->usize {chat::source_owners::reader_capacity()}
-fn admit(item:&Arc<chat::Item>,key:&Key,epoch:u64,replaced:Option<&Arc<chat::Item>>)->Admission {
+fn admit(item:&Arc<chat::Item>,key:&Key,epoch:SourceEpoch,replaced:Option<&Arc<chat::Item>>)->Admission {
     chat::source_owners::admit(item,key,epoch,replaced)
 }
 
@@ -367,7 +368,7 @@ where F:FnMut(chat::cache::SourceQuery)->Fut,
     let item=Arc::new(chat::Item {id:key.source_id.clone(),role:metadata.role,
         started_at:metadata.started_at,at:metadata.at,
         content:ItemContent::Text {text,thinking:metadata.thinking,phase:metadata.phase}});
-    Ok(Loaded {item,epoch:epoch.unwrap_or_default()})
+    Ok(Loaded {item,epoch:epoch.ok_or_else(||"Message source epoch is missing.".to_owned())?})
 }
 
 pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
@@ -420,6 +421,7 @@ pub(super) fn notice(runtime:&Runtime)->Option<Element<'static,Message>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn source_epoch(revision:u64)->SourceEpoch {SourceEpoch {incarnation:uuid::Uuid::from_u128(1),revision}}
     fn text(id:&str,body:&str)->Arc<chat::Item> {
         Arc::new(chat::Item {id:id.into(),role:chat::Role::Assistant,started_at:Some(10),at:Some(20),
             content:ItemContent::Text {text:body.into(),thinking:false,phase:chat::Phase::Final}})
@@ -429,7 +431,7 @@ mod tests {
     }
     fn source_snapshot(mut snapshot:Snapshot)->Arc<Snapshot> {
         if snapshot.source_parts.is_empty() {
-            let epoch=snapshot.source_revision;
+            let epoch=source_epoch(snapshot.source_revision);
             snapshot.source_parts=std::iter::once((None,&snapshot.items))
                 .chain(snapshot.subagents.iter().map(|agent|(Some(agent.id.clone()),&agent.items)))
                 .flat_map(|(agent_id,items)|items.iter().filter_map(move |item| {
@@ -449,7 +451,7 @@ mod tests {
         let suffix=text(&format!("root:native-part:1:text:{cut}-{}:0-0",full.len()),&full[cut..]);
         let raw=source_snapshot(Snapshot {generation:3,items:vec![suffix.clone()],source_parts:vec![chat::cache::SourcePart {
             item_id:suffix.id.clone(),source:Key {agent_id:None,source_id:"root".into()},start:cut,end:full.len(),
-            source_len:full.len(),replacement:false,metadata:chat::cache::SourceMetadata::from_item(&suffix).unwrap(),epoch:7}],..Snapshot::default()});
+            source_len:full.len(),replacement:false,metadata:chat::cache::SourceMetadata::from_item(&suffix).unwrap(),epoch:source_epoch(7)}],..Snapshot::default()});
         let mut state=State::default();let loading=state.project(raw.clone(),None);
         assert_eq!(loading.items.len(),1);assert_eq!(loading.items[0].id,"root");
         assert_eq!(body(&loading.items[0]),"");
@@ -457,7 +459,7 @@ mod tests {
         assert_eq!(state.logical_item_id(Some("other-child"),&suffix.id),None);
         assert_eq!(state.logical_item_id(None,"unproven:native-part:1:2"),None);
         let key=Key {agent_id:None,source_id:"root".into()};let attempt=state.entries[&key].attempt;
-        assert!(state.complete(&key,attempt,Ok(Loaded {item:text("root",&full),epoch:7})));
+        assert!(state.complete(&key,attempt,Ok(Loaded {item:text("root",&full),epoch:source_epoch(7)})));
         let ready=state.project(raw.clone(),None);
         assert_eq!(ready.items.len(),1);assert_eq!(body(&ready.items[0]),full);
         assert!(!Arc::ptr_eq(&loading,&ready),"same-generation hydration must invalidate presentation");
@@ -475,7 +477,7 @@ mod tests {
         state.project(source_snapshot(Snapshot {generation:1,items:vec![text("root",&"x".repeat(PART_BYTES))],..Snapshot::default()}),None);
         let key=Key {agent_id:None,source_id:"root".into()};let attempt=state.entries[&key].attempt;
         state.clear();
-        assert!(!state.complete(&key,attempt,Ok(Loaded {item:text("root","old"),epoch:1})));
+        assert!(!state.complete(&key,attempt,Ok(Loaded {item:text("root","old"),epoch:source_epoch(1)})));
         assert_eq!(state.retained_bytes(),0);assert_eq!(state.alias_count(),0);
     }
 
@@ -487,27 +489,43 @@ mod tests {
         let key=Key {agent_id:None,source_id:"root".into()};
         let first_attempt=state.entries[&key].attempt;
         let previous=text("root","prefix");let weak=Arc::downgrade(&previous);
-        assert!(state.complete(&key,first_attempt,Ok(Loaded {item:previous.clone(),epoch:7})));
+        assert!(state.complete(&key,first_attempt,Ok(Loaded {item:previous.clone(),epoch:source_epoch(7)})));
         state.project(raw(2,7,"prefix appended"),None);
         let next_attempt=state.entries[&key].attempt;let current=text("root","prefix appended suffix");
-        assert!(state.complete(&key,next_attempt,Ok(Loaded {item:current.clone(),epoch:7})));
+        assert!(state.complete(&key,next_attempt,Ok(Loaded {item:current.clone(),epoch:source_epoch(7)})));
         assert!(state.append_proven(&previous,&current));
         assert!(!state.append_proven(&text("root","prefix"),&current),"equal text is not immutable identity proof");
-        assert!(!state.complete(&key,first_attempt,Ok(Loaded {item:text("root","stale"),epoch:7})));
+        assert!(!state.complete(&key,first_attempt,Ok(Loaded {item:text("root","stale"),epoch:source_epoch(7)})));
         assert!(state.append_proven(&previous,&current),"a stale completion cannot revoke current proof");
         drop(previous);assert!(weak.upgrade().is_none(),"proof cannot keep old bodies resident");
         state.project(raw(3,8,"rewritten root"),None);
         let rewritten=text("root","rewritten root is longer");let attempt=state.entries[&key].attempt;
-        assert!(state.complete(&key,attempt,Ok(Loaded {item:rewritten.clone(),epoch:8})));
+        assert!(state.complete(&key,attempt,Ok(Loaded {item:rewritten.clone(),epoch:source_epoch(8)})));
         assert!(!state.append_proven(&current,&rewritten));
         state.project(raw(4,8,"rewritten root is longer"),None);
         let mut changed=(*rewritten).clone();
         let ItemContent::Text {thinking,..}=&mut changed.content else {unreachable!()};*thinking=true;
         let changed=Arc::new(changed);let attempt=state.entries[&key].attempt;
-        assert!(state.complete(&key,attempt,Ok(Loaded {item:changed.clone(),epoch:8})));
+        assert!(state.complete(&key,attempt,Ok(Loaded {item:changed.clone(),epoch:source_epoch(8)})));
         assert!(!state.append_proven(&rewritten,&changed),"rendering kind changes require a parse reset");
         state.clear();assert!(!state.append_proven(&current,&rewritten));
     }
+    #[test]
+    fn a_new_store_incarnation_cannot_reuse_same_revision_body_or_append_proof() {
+        let raw=source_snapshot(Snapshot {generation:1,source_revision:7,items:vec![text("root","part")],..Default::default()});
+        let key=Key {agent_id:None,source_id:"root".into()};let mut state=State::default();state.project(raw.clone(),None);
+        let request=state.requests().remove(0);let previous=text("root","old-A");
+        assert!(state.complete(&key,request.1,Ok(Loaded {item:previous.clone(),epoch:source_epoch(7)})));
+        state.project(raw.clone(),None);
+        let mut replaced=(*raw).clone();let changed_epoch=SourceEpoch {incarnation:uuid::Uuid::from_u128(2),revision:7};
+        replaced.source_parts[0].epoch=changed_epoch;
+        state.project(Arc::new(replaced),None);
+        assert_eq!(state.presentation_coverage(None).pending_sources,1);
+        let request=state.requests().remove(0);let current=text("root","new-B");
+        assert!(state.complete(&key,request.1,Ok(Loaded {item:current.clone(),epoch:changed_epoch})));
+        assert!(!state.append_proven(&previous,&current),"same revision/length/metadata is not proof across Store recreation");
+    }
+
     #[test]
     fn per_source_rewrites_revalidate_without_cancelling_inflight_reads() {
         let item=text("root",&"x".repeat(PART_BYTES));let mut state=State::default();
@@ -515,11 +533,11 @@ mod tests {
         let key=Key {agent_id:None,source_id:"root".into()};let first=state.entries[&key].attempt;
         state.project(source_snapshot(Snapshot {generation:2,source_revision:2,items:vec![item.clone()],..Snapshot::default()}),None);
         assert_eq!(state.entries[&key].attempt,first);
-        assert!(state.complete(&key,first,Ok(Loaded {item:item.clone(),epoch:2})));
+        assert!(state.complete(&key,first,Ok(Loaded {item:item.clone(),epoch:source_epoch(2)})));
         assert!(!state.entries[&key].complete);
         let probe=state.entries[&key].attempt;assert_ne!(probe,first);
-        assert!(!state.complete(&key,first,Ok(Loaded {item:item.clone(),epoch:1})));
-        assert!(state.complete(&key,probe,Ok(Loaded {item,epoch:2})));
+        assert!(!state.complete(&key,first,Ok(Loaded {item:item.clone(),epoch:source_epoch(1)})));
+        assert!(state.complete(&key,probe,Ok(Loaded {item,epoch:source_epoch(2)})));
         assert!(state.entries[&key].complete);
     }
     #[test]
@@ -527,7 +545,7 @@ mod tests {
         let complete=text("complete","whole");let tail=text("tail-alias","tail");
         let key=Key {agent_id:None,source_id:"opaque-root:native-part:looks-real".into()};
         let part=|item:&Arc<chat::Item>,source:Key,start,len|chat::cache::SourcePart {item_id:item.id.clone(),source,
-            start,end:start+body(item).len(),source_len:len,replacement:false,epoch:7,
+            start,end:start+body(item).len(),source_len:len,replacement:false,epoch:source_epoch(7),
             metadata:chat::cache::SourceMetadata::from_item(item).unwrap()};
         let raw=Arc::new(Snapshot {generation:8,source_revision:12,items:vec![complete.clone(),tail.clone()],
             source_parts:vec![part(&complete,Key {agent_id:None,source_id:complete.id.clone()},0,5),part(&tail,key.clone(),6,10)],
@@ -537,10 +555,10 @@ mod tests {
         assert!(coverage.known);assert_eq!((coverage.sources,coverage.complete_sources,coverage.expected_bytes,coverage.complete_bytes,coverage.pending_sources),(2,1,15,5,1));
         assert_eq!((coverage.generation,coverage.source_revision),(Some(8),Some(12)));
         let request=state.requests().remove(0);
-        state.complete(&key,request.1,Ok(Loaded {item:text(&key.source_id,"whole tail"),epoch:7}));
+        state.complete(&key,request.1,Ok(Loaded {item:text(&key.source_id,"whole tail"),epoch:source_epoch(7)}));
         state.project(raw.clone(),None);
         let coverage=state.presentation_coverage(None);assert_eq!((coverage.complete_sources,coverage.complete_bytes,coverage.pending_sources),(2,15,0));
-        let mut changed=(*raw).clone();changed.generation+=1;changed.source_revision+=1;changed.source_parts[1].epoch=8;
+        let mut changed=(*raw).clone();changed.generation+=1;changed.source_revision+=1;changed.source_parts[1].epoch=source_epoch(8);
         state.project(Arc::new(changed),None);
         assert_eq!(state.presentation_coverage(None).pending_sources,1,"old full body does not qualify a replacement epoch");
         assert!(!state.presentation_coverage(Some("not-selected")).known);
@@ -565,11 +583,11 @@ mod tests {
         // A's in-flight read spans source revisions; B still has an independent
         // request and is admitted by the same fair two-worker semaphore.
         state.project(source_snapshot(Snapshot {generation:2,source_revision:2,items:items.clone(),..Snapshot::default()}),None);
-        assert!(state.complete(&pending[0].0,pending[0].1,Ok(Loaded {item:items[0].clone(),epoch:1})));
+        assert!(state.complete(&pending[0].0,pending[0].1,Ok(Loaded {item:items[0].clone(),epoch:source_epoch(1)})));
         assert_eq!(state.requests().len(),2);
-        assert!(state.complete(&pending[1].0,pending[1].1,Ok(Loaded {item:items[1].clone(),epoch:2})));
+        assert!(state.complete(&pending[1].0,pending[1].1,Ok(Loaded {item:items[1].clone(),epoch:source_epoch(2)})));
         for (key,attempt,item,_) in state.requests() {
-            assert!(state.complete(&key,attempt,Ok(Loaded {item,epoch:2})));
+            assert!(state.complete(&key,attempt,Ok(Loaded {item,epoch:source_epoch(2)})));
         }
         assert!(state.requests().is_empty());
         state.project(source_snapshot(Snapshot {generation:3,source_revision:2,detail:"Account usage changed".into(),
@@ -582,14 +600,14 @@ mod tests {
         let mut state=State::default();let item=text("same-root",&"x".repeat(PART_BYTES));
         let raw=source_snapshot(Snapshot {items:vec![item.clone()],..Snapshot::default()});
         state.project(raw.clone(),None);let old=state.requests().remove(0);
-        assert!(state.complete(&old.0,old.1,Ok(Loaded {item:text("same-root","old actor"),epoch:1})));
+        assert!(state.complete(&old.0,old.1,Ok(Loaded {item:text("same-root","old actor"),epoch:source_epoch(1)})));
         // Ready/forget_transcript clear even when both actors lack session IDs
         // and begin at identical publication/source revisions.
         state.clear();let projected=state.project(raw,None);
         assert_eq!(body(&projected.items[0]),"");
         let new=state.requests().remove(0);assert_ne!(old.1,new.1);
-        assert!(!state.complete(&old.0,old.1,Ok(Loaded {item:text("same-root","stale"),epoch:1})));
-        assert!(state.complete(&new.0,new.1,Ok(Loaded {item,epoch:1})));
+        assert!(!state.complete(&old.0,old.1,Ok(Loaded {item:text("same-root","stale"),epoch:source_epoch(1)})));
+        assert!(state.complete(&new.0,new.1,Ok(Loaded {item,epoch:source_epoch(1)})));
     }
 
     #[test]
@@ -601,7 +619,7 @@ mod tests {
         state.project(raw.clone(),None);assert!(state.requests().is_empty());assert_eq!(state.retained_bytes(),0);
         state.project(raw.clone(),Some("child-0"));let request=state.requests().remove(0);
         assert_eq!(request.0.agent_id.as_deref(),Some("child-0"));
-        assert!(state.complete(&request.0,request.1,Ok(Loaded {item:text("root","complete first child"),epoch:1})));
+        assert!(state.complete(&request.0,request.1,Ok(Loaded {item:text("root","complete first child"),epoch:source_epoch(1)})));
         assert!(state.retained_bytes()>0);
         state.project(raw.clone(),Some("child-1"));assert_eq!(state.retained_bytes(),0);
         let requests=state.requests();assert_eq!(requests.len(),1);assert_eq!(requests[0].0.agent_id.as_deref(),Some("child-1"));
@@ -614,8 +632,8 @@ mod tests {
         let fragment_id=format!("{opaque}:cache-alias:1");
         let original=text(opaque,"real");let fragment=text(&fragment_id,"tail");
         let raw=Arc::new(Snapshot {items:vec![fragment.clone(),original.clone()],source_parts:vec![
-            chat::cache::SourcePart {item_id:fragment_id,source:Key {agent_id:None,source_id:"root".into()},start:3,end:7,source_len:7,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&fragment).unwrap(),epoch:1},
-            chat::cache::SourcePart {item_id:opaque.into(),source:Key {agent_id:None,source_id:opaque.into()},start:0,end:4,source_len:4,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&original).unwrap(),epoch:1},
+            chat::cache::SourcePart {item_id:fragment_id,source:Key {agent_id:None,source_id:"root".into()},start:3,end:7,source_len:7,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&fragment).unwrap(),epoch:source_epoch(1)},
+            chat::cache::SourcePart {item_id:opaque.into(),source:Key {agent_id:None,source_id:opaque.into()},start:0,end:4,source_len:4,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&original).unwrap(),epoch:source_epoch(1)},
         ],..Snapshot::default()});
         let mut state=State::default();let projected=state.project(raw,None);
         assert_eq!(projected.items.len(),2);assert_eq!(projected.items[0].id,"root");
@@ -627,14 +645,14 @@ mod tests {
     fn hiding_releases_full_projected_items_and_reveal_rehydrates_from_bounded_raw_window() {
         let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
         let raw=Snapshot {ready:true,items:vec![text("root","pref")],source_parts:vec![chat::cache::SourcePart {
-            item_id:"root".into(),source:Key {agent_id:None,source_id:"root".into()},start:0,end:4,source_len:8,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&text("root","pref")).unwrap(),epoch:1}],
+            item_id:"root".into(),source:Key {agent_id:None,source_id:"root".into()},start:0,end:4,source_len:8,replacement:false,metadata:chat::cache::SourceMetadata::from_item(&text("root","pref")).unwrap(),epoch:source_epoch(1)}],
             ..Snapshot::default()};
         let handle=Arc::new(ClientHandle::fixture(session.clone(),raw));
         let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,
             crate::settings::EditorSyntaxTheme::default());
         let request=runtime.logical_sources.requests().remove(0);
         let full=text("root","prefbody");let weak=Arc::downgrade(&full);
-        assert!(runtime.logical_sources.complete(&request.0,request.1,Ok(Loaded {item:full,epoch:1})));
+        assert!(runtime.logical_sources.complete(&request.0,request.1,Ok(Loaded {item:full,epoch:source_epoch(1)})));
         runtime.refresh();assert_eq!(body(&runtime.snapshot.items[0]),"prefbody");
         assert!(runtime.cache.contains_key("root"));
         let _=runtime.set_visible(false);
@@ -644,7 +662,8 @@ mod tests {
         assert_eq!(body(&runtime.snapshot.items[0]),"");assert_eq!(runtime.logical_sources.requests().len(),1);
     }
 
-    fn page(query:chat::cache::SourceQuery,text:&str,epoch:u64,metadata:chat::cache::SourceMetadata)->Result<chat::cache::SourcePage,chat::cache::SourceError> {
+    fn page(query:chat::cache::SourceQuery,text:&str,revision:u64,metadata:chat::cache::SourceMetadata)->Result<chat::cache::SourcePage,chat::cache::SourceError> {
+        let epoch=source_epoch(revision);
         if query.expected_epoch.is_some_and(|expected|expected!=epoch) {return Err(chat::cache::SourceError::Changed);}
         let boundary=query.until.unwrap_or(text.len());
         let mut end=(query.offset+query.limit).min(boundary);
@@ -655,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn append_proof_reads_only_new_suffix_and_uses_original_source_metadata() {
         let key=Key {agent_id:Some("child".into()),source_id:"original".into()};
-        let previous=text("original","prefix 🦀");let known=Loaded {item:previous.clone(),epoch:7};
+        let previous=text("original","prefix 🦀");let known=Loaded {item:previous.clone(),epoch:source_epoch(7)};
         let original=chat::Item {id:"original".into(),role:chat::Role::Assistant,started_at:Some(100),at:Some(900),
             content:ItemContent::Text {text:"prefix 🦀 appended tail".into(),thinking:true,phase:chat::Phase::Commentary}};
         let metadata=chat::cache::SourceMetadata::from_item(&original).unwrap();let mut queries=Vec::new();
@@ -663,21 +682,21 @@ mod tests {
         let loaded=read_counted(&key,Some(&known),|query| {
             queries.push(query.clone());std::future::ready(page(query,body(&original),7,metadata.clone()))
         },&capacity).await.unwrap();
-        assert!(capacity.0.load(Ordering::Relaxed)>=body(&original).len());
+        assert!(capacity.bytes()>=body(&original).len());
         assert_eq!(*loaded.item,original);assert_eq!(queries.len(),2);
         assert_eq!(queries[0].offset,0);assert_eq!(queries[0].limit,4);
         assert_eq!(queries[1].offset,body(&previous).len());assert_eq!(queries[1].until,Some(body(&original).len()));
-        assert_eq!(queries[1].expected_epoch,Some(7));
+        assert_eq!(queries[1].expected_epoch,Some(source_epoch(7)));
         let mut probes=0;
         let reused_capacity=ReaderCapacity::default();
         let retained=read_counted(&key,Some(&loaded),|query| {probes+=1;std::future::ready(page(query,body(&original),7,metadata.clone()))},&reused_capacity).await.unwrap();
         assert_eq!(probes,1);assert!(Arc::ptr_eq(&retained.item,&loaded.item));
-        assert_eq!(reused_capacity.0.load(Ordering::Relaxed),0,"known shared Item adds no new reader allocation");
+        assert_eq!(reused_capacity.bytes(),0,"known shared Item adds no new reader allocation");
     }
     #[tokio::test]
     async fn a_rewrite_epoch_reloads_the_prefix_and_rejects_mid_read_rewrites() {
         let key=Key {agent_id:None,source_id:"original".into()};let old=text("original","stale prefix");
-        let known=Loaded {item:old,epoch:1};let original=text("original","new root body 🦀");
+        let known=Loaded {item:old,epoch:source_epoch(1)};let original=text("original","new root body 🦀");
         let metadata=chat::cache::SourceMetadata::from_item(&original).unwrap();let mut queries=Vec::new();
         let loaded=read(&key,Some(&known),|query| {queries.push(query.clone());std::future::ready(page(query,body(&original),2,metadata.clone()))}).await.unwrap();
         assert_eq!(*loaded.item,*original);assert_eq!(queries[1].offset,4);
@@ -693,9 +712,9 @@ mod tests {
         let raw=source_snapshot(Snapshot {generation:1,source_revision:1,items:vec![text("parent","parent prefix")],
             subagents:vec![child],..Snapshot::default()});
         let mut state=State::default();state.project(raw.clone(),None);let request=state.requests().remove(0);
-        assert!(state.complete(&request.0,request.1,Ok(Loaded {item:text("parent","parent complete"),epoch:1})));
+        assert!(state.complete(&request.0,request.1,Ok(Loaded {item:text("parent","parent complete"),epoch:source_epoch(1)})));
         let mut changed=(*raw).clone();changed.generation=2;changed.source_revision=2;
-        for part in &mut changed.source_parts {if part.source.agent_id.is_some() {part.epoch=2;part.source_len+=100;}}
+        for part in &mut changed.source_parts {if part.source.agent_id.is_some() {part.epoch=source_epoch(2);part.source_len+=100;}}
         state.project(Arc::new(changed),None);
         assert!(state.requests().is_empty(),"another source revision must not invalidate unchanged parent proof");
     }
