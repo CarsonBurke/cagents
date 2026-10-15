@@ -58,3 +58,7 @@ If the source group cannot be preserved, setup stops and keeps the worktree.
 Glob traversal is bounded to 64 directory levels as well as the existing entry
 and copy limits. A deeper selection fails setup before copying files; the new
 checkout remains available.
+
+`worktree_setup_creation` reads one settled creation through the same identity
+checks without reconciling or rewriting it. It returns no row when absent and
+an error for invalid evidence; resume callers verify the current checkout too.

@@ -29,7 +29,52 @@ pub struct WorktreeSetupIntent {
     pub copy_done: bool,
 }
 
+fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
+    let creation_id = operation.id;
+    let invalid = || StoreError::InvalidState(format!(
+        "worktree creation {creation_id} is not a valid settled creation"
+    ));
+    let journal: WorktreeJournal = serde_json::from_value(operation.payload.clone())?;
+    let paths = [&journal.common_dir, &journal.request.managed_root, &journal.request.destination];
+    if operation.status != PendingOperationStatus::Applied
+        || operation.entity_kind != "worktree_creation"
+        || operation.action != "create"
+        || journal.version != 1
+        || journal.state != WorktreeOperationState::Created
+        || !matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { .. }))
+        || journal.request.operation_id != creation_id
+        || journal.generation != operation.base_generation
+        || operation.entity_id != journal_identity(&journal.common_dir, &journal.request)
+        || journal.lease_path != journal.common_dir.join(format!("cagents-operation-{creation_id}.lease"))
+        || !destination_within_managed_root(&journal.request.destination, &journal.request.managed_root)
+        || paths.iter().any(|path| !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)))
+        || journal.base_oid.as_ref().is_none_or(|oid| !is_hex_oid(oid))
+        || journal.existing_branch_oid.as_ref().is_some_and(|oid| !is_hex_oid(oid))
+        || !journal.effects_started
+        || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
+        || journal.request.base.validate().is_err()
+    {
+        return Err(invalid());
+    }
+    Ok(journal)
+}
+
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Read one settled creation without reconciling or executing effects.
+    /// Missing rows return None; unsupported or identity-mismatched rows fail
+    /// closed. Callers still verify current checkout identity before resuming.
+    pub fn worktree_setup_creation(
+        &self,
+        store: &StateStore,
+        creation_id: OperationId,
+    ) -> Result<Option<WorktreeOperationReport>, StoreError> {
+        let Some(operation) = store.journaled_worktree_operation(creation_id)? else {
+            return Ok(None);
+        };
+        let journal = settled_setup_journal(&operation)?;
+        Ok(Some(journal.report(operation.created_at_unix_ms)))
+    }
+
     /// Update metadata on a settled creation without reconciling or executing
     /// any filesystem, Git or shell effects. The expected intent also rejects
     /// callbacks from an older setup run after an explicit resume.
@@ -40,32 +85,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         expected: Option<&WorktreeSetupIntent>,
         updated: WorktreeSetupIntent,
     ) -> Result<WorktreeOperationReport, StoreError> {
-        let invalid = || StoreError::InvalidState(format!(
-            "worktree creation {creation_id} is not a valid settled creation"
-        ));
-        let operation = store.journaled_worktree_operation(creation_id)?.ok_or_else(invalid)?;
-        let mut journal: WorktreeJournal = serde_json::from_value(operation.payload.clone())?;
-        let paths = [&journal.common_dir, &journal.request.managed_root, &journal.request.destination];
-        if operation.status != PendingOperationStatus::Applied
-            || operation.entity_kind != "worktree_creation"
-            || operation.action != "create"
-            || journal.version != 1
-            || journal.state != WorktreeOperationState::Created
-            || !matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { .. }))
-            || journal.request.operation_id != creation_id
-            || journal.generation != operation.base_generation
-            || operation.entity_id != journal_identity(&journal.common_dir, &journal.request)
-            || journal.lease_path != journal.common_dir.join(format!("cagents-operation-{creation_id}.lease"))
-            || !destination_within_managed_root(&journal.request.destination, &journal.request.managed_root)
-            || paths.iter().any(|path| !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)))
-            || journal.base_oid.as_ref().is_none_or(|oid| !is_hex_oid(oid))
-            || journal.existing_branch_oid.as_ref().is_some_and(|oid| !is_hex_oid(oid))
-            || !journal.effects_started
-            || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
-            || journal.request.base.validate().is_err()
-        {
-            return Err(invalid());
-        }
+        let operation = store.journaled_worktree_operation(creation_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!("worktree creation {creation_id} is missing"))
+        })?;
+        let mut journal = settled_setup_journal(&operation)?;
         if journal.request.setup_intent.as_ref() != expected {
             return Err(StoreError::InvalidState(format!(
                 "stale setup intent for worktree creation {creation_id}"
@@ -179,8 +202,15 @@ mod tests {
         let reopened = StateStore::open(path, crate::model::BootId::new("setup-intent-restart")).unwrap();
         let row = reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
         let saved: WorktreeJournal = serde_json::from_value(row.payload).unwrap();
-        assert_eq!(saved.request.setup_intent, Some(copied));
+        assert_eq!(saved.request.setup_intent, Some(copied.clone()));
         assert_eq!(row.status, PendingOperationStatus::Applied);
+        let service = RepositoryService::system("must-not-execute-git");
+        let before = reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload;
+        let read = service.worktree_setup_creation(&reopened, request.operation_id).unwrap().unwrap();
+        assert_eq!(read.request.unwrap().setup_intent, Some(copied));
+        assert_eq!(read.state, WorktreeOperationState::Created);
+        assert_eq!(read.created_at_unix_ms, 42);
+        assert_eq!(reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
         assert!(!request.destination.exists());
     }
 
@@ -225,5 +255,8 @@ mod tests {
             .update_worktree_setup_intent(&store, request.operation_id, None, intent(&request)).is_err());
         assert_eq!(store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, malformed);
         assert!(store.journaled_worktree_operation(OperationId::new()).unwrap().is_none());
+        let service = RepositoryService::system("must-not-execute-git");
+        assert!(service.worktree_setup_creation(&store, request.operation_id).is_err());
+        assert!(service.worktree_setup_creation(&store, OperationId::new()).unwrap().is_none());
     }
 }
