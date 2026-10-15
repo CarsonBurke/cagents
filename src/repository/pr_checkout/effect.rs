@@ -83,9 +83,41 @@ impl PinnedDirectories {
 
 /// Build a Git lock below an already-open administrative directory. Names in
 /// `.git` are not trusted to remain beneath it through a second path lookup.
-fn lock_at(root: &fs_safety::Root, relative: &Path) -> Result<GitFileLock, String> {
-    let (parent, mut name) =
-        fs_safety::open_parent_beneath(root, relative).map_err(|error| error.to_string())?;
+pub(super) fn lock_at(root: &fs_safety::Root, relative: &Path) -> Result<GitFileLock, String> {
+    let (parent, mut name) = match fs_safety::open_parent_beneath(root, relative) {
+        Ok(parent) => parent,
+        Err(error) if error.is_not_found() && relative.starts_with("refs/heads") => {
+            // Packed branches need not have any loose-ref parent directory.
+            // Build only the validated branch namespace, one retained parent
+            // at a time, never following a symlink or replacing an entry.
+            let mut current = root.try_clone().map_err(|error| error.to_string())?;
+            let directory = relative.parent().ok_or("Branch reference has no parent")?;
+            for component in directory.components() {
+                let std::path::Component::Normal(name) = component else { return Err("Invalid branch reference namespace".into()); };
+                let child = Path::new(name).join(".cagents-parent-probe");
+                match fs_safety::open_parent_beneath(&current, &child) {
+                    Ok((next, _)) => current = next,
+                    Err(error) if error.is_not_found() => {
+                        use std::os::unix::ffi::OsStrExt;
+                        let name = std::ffi::CString::new(name.as_bytes()).map_err(|error| error.to_string())?;
+                        let held = current.retained_directory().map_err(|error| error.to_string())?;
+                        // SAFETY: held owns the parent descriptor, name is one
+                        // validated NUL-terminated component; mode respects
+                        // the caller's umask, like an ordinary Git directory.
+                        if unsafe { libc::mkdirat(held.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::AlreadyExists { return Err(error.to_string()); }
+                        }
+                        current = fs_safety::open_parent_beneath(&current, &child).map_err(|error| error.to_string())?.0;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            let name = relative.file_name().ok_or("Branch reference has no name")?.to_owned();
+            (current, name)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     name.push(".lock");
     let (file, temporary) =
         fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;

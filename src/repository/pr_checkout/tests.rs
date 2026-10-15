@@ -930,3 +930,34 @@ fi
     assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), new.as_str());
     assert!(String::from_utf8(fs::read(fixture.root.join(".git/config")).unwrap()).unwrap().contains("changed-by-child"));
 }
+
+#[test]
+fn packed_nested_branches_repair_absent_tracking_and_can_fast_forward() {
+    for advance in [false, true] {
+        let fixture = Fixture::new(false);
+        run_git(&fixture.root, &["branch", "-m", "nested/feature"]);
+        run_git(&fixture.root, &["push", "origin", "nested/feature"]);
+        run_git(&fixture.bare, &["symbolic-ref", "HEAD", "refs/heads/nested/feature"]);
+        let expected = if advance { fixture.advance(|root| fs::write(root.join("file"), "nested new\n").unwrap()) } else { fixture.original.clone() };
+        run_git(&fixture.root, &["pack-refs", "--all", "--prune"]);
+        assert!(!fixture.root.join(".git/refs/heads/nested").exists());
+        let mut request = fixture.request(expected.clone());
+        request.branch = ValidatedBranchName::parse("nested/feature").unwrap();
+        request.head_branch = request.branch.clone();
+        let verified = fixture.apply(&fixture.prepare(&request)).unwrap();
+        assert_eq!(verified.head(), &expected);
+        assert_eq!(verified.upstream(), Some("refs/remotes/origin/nested/feature"));
+        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), expected.as_str());
+    }
+}
+
+#[test]
+fn missing_ref_namespace_never_follows_a_foreign_symlink_parent() {
+    let fixture = Fixture::new(false);
+    let external = fixture.temporary.path().join("external-ref-storage");
+    fs::create_dir(&external).unwrap();
+    std::os::unix::fs::symlink(&external, fixture.root.join(".git/refs/heads/foreign")).unwrap();
+    let root = fs_safety::Root::open(&fixture.root.join(".git")).unwrap();
+    assert!(effect::lock_at(&root, Path::new("refs/heads/foreign/nested/feature")).is_err());
+    assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+}
