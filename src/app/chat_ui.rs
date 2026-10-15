@@ -293,6 +293,7 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
+    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -1606,6 +1607,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -2170,6 +2172,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -4361,11 +4364,13 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
+            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
+        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -4471,15 +4476,17 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: chat_card_title(session.launch.provider).into(),
-            width_fraction: beside
-                .and_then(|(source, _)| self.card_state(source))
-                .map_or(self.settings.default_native_pane_fraction, |source| {
-                    if matches!(source.kind, CardKind::Chat(_)) {
-                        source.width_fraction
-                    } else {
-                        self.settings.default_native_pane_fraction
-                    }
-                }),
+            width_fraction: self.new_pane_fraction(
+                beside
+                    .and_then(|(source, _)| self.card_state(source))
+                    .map_or(self.settings.default_native_pane_fraction, |source| {
+                        if matches!(source.kind, CardKind::Chat(_)) {
+                            source.width_fraction
+                        } else {
+                            self.settings.default_native_pane_fraction
+                        }
+                    }),
+            ),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -5950,6 +5957,7 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
+            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
@@ -6042,6 +6050,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -6428,7 +6437,7 @@ impl Cagents {
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
                         let channel_name = self.observe_channel_name(target, &snapshot);
-                        let title = snapshot.title.clone();
+                        let title = channel_name.as_ref().map(|(title, _)| title.clone());
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -6802,11 +6811,12 @@ impl Cagents {
                         };
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
-                        let channel_name = needs_name
-                            .then(|| self.observe_channel_name(target, &snapshot))
-                            .flatten();
-                        let title = snapshot.title.clone();
-                        if let Some((name, source)) = channel_name {
+                        // Pane names use the same bounded observation cache as
+                        // channel names, including secondary conversations. Only
+                        // the current primary may publish a channel suggestion.
+                        let observed_name = self.observe_channel_name(target, &snapshot);
+                        let title = observed_name.as_ref().map(|(title, _)| title.clone());
+                        if needs_name && let Some((name, source)) = observed_name {
                             self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
@@ -7352,12 +7362,23 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::FooterPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.footer_picker = open;
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                    runtime.account_picker = false;
+                    runtime.permission_picker = false;
+                    runtime.composer_actions = false;
+                }
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
+                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -7416,6 +7437,7 @@ impl Cagents {
                     runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -8203,6 +8225,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -8605,6 +8628,7 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -8630,6 +8654,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
         }
@@ -12970,12 +12995,10 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
         assert_eq!(app.durable.channels[0].title, "First conversation");
-        assert!(
-            app.chat_ui
-                .channel_names
-                .get(&target)
-                .is_none_or(|observation| observation.title.is_none()),
-            "the secondary wake deliberately did not cache a channel candidate"
+        assert_eq!(
+            app.chat_ui.channel_names[&target].title.as_ref().map(|(title, _)| title.as_str()),
+            Some("Secondary encryption review"),
+            "the secondary pane caches its own title without renaming the primary channel"
         );
         // These are the accepted host projection values after its primary
         // changed and its automatic old name was cleared in the same TX.
@@ -12995,6 +13018,144 @@ mod tests {
             app.card_state(b).unwrap().kind,
             original,
             "naming does not change launch or conversation identity"
+        );
+    }
+
+    #[test]
+    fn prompt_and_provider_titles_name_the_chat_tab_and_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = Snapshot {
+            ready: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("Implement conversation titles"),
+            started_at: None,
+            at: None,
+        }));
+        for title in [None, Some("Provider summary".to_owned())] {
+            snapshot.title = title.clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            drop(app.sync_chrome());
+            let expected = title.as_deref().unwrap_or("Implement conversation titles");
+            assert_eq!(
+                app.card_display_title(app.card_state(card).unwrap()),
+                expected
+            );
+            assert_eq!(app.card_chrome[&card].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+            assert_eq!(
+                app.title(window::Id::RESERVED),
+                format!("{expected}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+            );
+        }
+    }
+
+    #[test]
+    fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.card_state_mut(card).unwrap().title = "Provider conversation summary".into();
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(sibling);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "My renamed conversation"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        drop(app.sync_chrome());
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+    }
+
+    #[test]
+    fn manual_channel_title_survives_provider_updates_after_utility_and_closing_panes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let terminal = crate::app::tests::terminal_card_state();
+        let terminal_id = terminal.id;
+        let mut closing = app.card_state(card).unwrap().clone();
+        closing.id = CardId::new();
+        closing.existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        let closing_id = closing.id;
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([terminal, closing, sibling]);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![CardId::new(), terminal_id, closing_id, card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.channel_primary_chat(app.durable.channels.last().unwrap()),
+            Some(card)
+        );
+        let snapshot = Snapshot {
+            ready: true,
+            title: Some("New provider conversation summary".into()),
+            generation: 1,
+            ..Snapshot::default()
+        };
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.card_state(card).unwrap().title,
+            "New provider conversation summary"
+        );
+        assert_eq!(app.card_chrome[&card].title, "My renamed conversation");
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+        assert_eq!(
+            app.title(window::Id::RESERVED),
+            format!("My renamed conversation{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        app.chrome_ui
+            .user_titles
+            .insert(card, "Explicit pane name".into());
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "Explicit pane name"
         );
     }
 
