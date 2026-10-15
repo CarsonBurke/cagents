@@ -2336,6 +2336,17 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     }
 }
 
+/// Whether `event` ends a pointer gesture, as the strip ends its own drags:
+/// the release, losing focus, or Escape. Captured events count too.
+fn pane_drag_gesture_ended(event: &iced::Event) -> bool {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))
+        | iced::Event::Window(window::Event::Unfocused) => true,
+        iced::Event::Keyboard(event) => is_escape_press(event),
+        _ => false,
+    }
+}
+
 /// The first native size is reported as Opened, before any resize. Both
 /// events carry logical dimensions and replace the pre-map estimate.
 fn window_geometry_message(event: &window::Event) -> Option<Message> {
@@ -4126,6 +4137,9 @@ pub enum Message {
         generation: u64,
         card: Option<CardId>,
     },
+    /// The gesture behind an armed pane drop ended in `window`, whatever
+    /// became of the strip that announced it.
+    PaneDragGestureEnded(window::Id),
     MovePaneToChannel {
         card: CardId,
         channel: crate::model::ChannelId,
@@ -15130,6 +15144,14 @@ impl Application for Cagents {
                 self.arm_pane_drop(card.filter(|_| generation == self.workspace_view_generation));
                 Task::none()
             }
+            // Only the main window holds the strip; a popup's focus is not the
+            // gesture's.
+            Message::PaneDragGestureEnded(window) => {
+                if self.core.main_window_id() == Some(window) {
+                    self.arm_pane_drop(None);
+                }
+                Task::none()
+            }
             Message::MovePaneToChannel { card, channel } => self.move_pane_to_channel(card, channel),
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -16609,6 +16631,15 @@ impl Application for Cagents {
             .map(Message::Lsp),
         );
         subscriptions.extend(operation_subscriptions);
+        // A strip remounted mid-drag never reports the end of its drag, so
+        // the gesture itself disarms the channels. Subscription output lands
+        // after the batch's widget messages, so the release that drops the
+        // pane is still honoured.
+        if self.sidebar_state.pane_drop_active() {
+            subscriptions.push(event::listen_with(|event, _, window| {
+                pane_drag_gesture_ended(&event).then_some(Message::PaneDragGestureEnded(window))
+            }));
+        }
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.context_inspector_transition.is_some())
         {
@@ -26758,6 +26789,34 @@ mod tests {
 
         assert!(is_escape_press(&event(false)));
         assert!(!is_escape_press(&event(true)));
+    }
+
+    #[test]
+    fn a_pane_drag_gesture_ends_on_release_unfocus_or_escape_only() {
+        use cosmic::iced::mouse;
+        let escape = keyboard::Key::Named(keyboard::key::Named::Escape);
+        let ends = |event| pane_drag_gesture_ended(&event);
+
+        assert!(ends(iced::Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left
+        ))));
+        assert!(ends(iced::Event::Window(window::Event::Unfocused)));
+        assert!(ends(iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: escape.clone(),
+            modified_key: escape,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })));
+        assert!(!ends(iced::Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Right
+        ))));
+        assert!(!ends(iced::Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left
+        ))));
+        assert!(!ends(iced::Event::Window(window::Event::Focused)));
     }
 
     #[test]

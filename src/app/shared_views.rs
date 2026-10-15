@@ -2565,6 +2565,27 @@ mod tests {
             channel_id: b,
         })));
         assert_eq!(members(&app, a), vec![pane.id], "a cancelled drag drops nothing");
+        // A strip remounted mid-drag never reports the end; the gesture does.
+        drop(app.update(Message::PaneDrag {
+            generation,
+            card: Some(pane.id),
+        }));
+        assert!(app.sidebar_state.pane_drop_active());
+        app.core.set_main_window_id(Some(window::Id::unique()));
+        drop(app.update(Message::PaneDragGestureEnded(window::Id::unique())));
+        assert!(
+            app.sidebar_state.pane_drop_active(),
+            "another window's gesture is not the strip's"
+        );
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        drop(app.update(Message::PaneDragGestureEnded(main)));
+        assert!(!app.sidebar_state.pane_drop_active());
+        drop(app.update(Message::Sidebar(SidebarAction::DropPane {
+            card: pane.id,
+            channel_id: b,
+        })));
+        assert_eq!(members(&app, a), vec![pane.id], "a later release drops nothing");
         drop(app.update(Message::PaneDrag {
             generation,
             card: Some(pane.id),

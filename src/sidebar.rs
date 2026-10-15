@@ -2919,6 +2919,11 @@ impl SidebarState {
         self.pane_drop = drop.filter(|(_, channels)| !channels.is_empty());
     }
 
+    /// Whether any channel is armed to take a dragged pane.
+    pub fn pane_drop_active(&self) -> bool {
+        self.pane_drop.is_some()
+    }
+
     /// Whether `channel` is armed to take `card`.
     pub fn pane_drop_armed(&self, card: CardId, channel: ChannelId) -> bool {
         self.pane_drop
