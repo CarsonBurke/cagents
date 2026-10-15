@@ -272,7 +272,11 @@ impl CreationSession {
             destination: request.destination.clone(),
             ancestor,
             witness: evidence.ancestor.clone(),
+            // Durable witnesses do not reconstruct private receipt owners.
             publications: Mutex::new(Vec::new()),
+            preparations: Mutex::new(Vec::new()),
+            pending_publications: std::sync::atomic::AtomicUsize::new(0),
+            pending_preparations: std::sync::atomic::AtomicUsize::new(0),
         };
         let destination = match (&evidence.parent, &evidence.checkout) {
             (Some(parent), Some(checkout)) => {
