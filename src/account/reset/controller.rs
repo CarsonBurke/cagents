@@ -4,7 +4,7 @@ use super::{attempts::{Admission, Ledger}, request::{Action, Report, Request, So
 use crate::{agent::Provider, chat::runtime::Handle};
 use std::{path::Path, time::Instant};
 
-pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: Instant,
+pub(crate) fn execute(handle: &Handle, request: Request, root: Option<&Path>, expires: Instant,
     current: impl Fn() -> Result<(), String>) -> Result<Report, String> {
     request.validate()?;
     current()?;
@@ -16,7 +16,7 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
         if allowance.account.as_ref() != Some(&expected) {
             return Err("The target's actual provider account differs from the requested reset account; no credit was consumed".into());
         }
-        let mut ledger = Ledger::open(root, &expected)?;
+        let mut ledger = Ledger::open(root.ok_or("Durable reset-attempt storage is unavailable; no credit was consumed")?, &expected)?;
         // Re-read after acquiring the actual-account lease: a different
         // session may have reset this shared allowance while we waited.
         current()?;

@@ -8,7 +8,7 @@ use serde_json::Value;
 pub(crate) mod attempts;
 #[cfg(feature = "host")]
 pub(crate) mod transport;
-pub(crate) mod request;
+pub mod request;
 #[cfg(feature = "host")]
 pub(crate) mod controller;
 
@@ -18,7 +18,7 @@ const MAX_IDENTIFIER_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Outcome { Reset, AlreadyRedeemed, NothingToReset, NoCredit }
+pub enum Outcome { Reset, AlreadyRedeemed, NothingToReset, NoCredit }
 
 impl Outcome {
     pub(crate) fn parse(value: &Value) -> Result<Self, String> {
@@ -34,13 +34,13 @@ impl Outcome {
 
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProviderAccount {
+pub struct ProviderAccount {
     pub account_id: String,
     pub backend_origin: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Window {
+pub struct Window {
     pub bucket: String,
     pub period: Period,
     pub used_percent: u32,
@@ -49,13 +49,13 @@ pub(crate) struct Window {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Period {
+pub enum Period {
     Primary,
     Secondary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ResetCredit {
+pub struct ResetCredit {
     pub id: String,
     pub supported_type: bool,
     pub available: bool,
@@ -63,14 +63,14 @@ pub(crate) struct ResetCredit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ResetCredits {
+pub struct ResetCredits {
     /// Authoritative count; detail rows may be capped or unavailable.
     pub available_count: u64,
     pub details: Option<Vec<ResetCredit>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Allowance {
+pub struct Allowance {
     pub observed_at_ms: u64,
     pub account: Option<ProviderAccount>,
     pub account_binding_detail: Option<String>,

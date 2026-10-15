@@ -5,13 +5,13 @@ use crate::{agent::Provider, model::TerminalId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Request {
+pub struct Request {
     pub session: TerminalId,
     pub action: Action,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Action {
+pub enum Action {
     Inspect,
     Redeem {
         /// Requested identity, freshly checked on the actual actor before
@@ -25,16 +25,16 @@ pub(crate) enum Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Threshold {
+pub struct Threshold {
     pub used_percent: u8,
     pub max_age_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Source { CodexAppServer }
+pub enum Source { CodexAppServer }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Report {
+pub struct Report {
     pub session: TerminalId,
     pub provider: Provider,
     pub source: Source,

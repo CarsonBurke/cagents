@@ -41,7 +41,7 @@ pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod remote;
-pub(crate) mod reset;
+pub mod reset;
 pub mod routing;
 pub mod schedule;
 

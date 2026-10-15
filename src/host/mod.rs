@@ -1,4 +1,5 @@
 mod activity;
+mod account_allowance;
 mod agent_execution;
 mod automations;
 mod chat;
