@@ -23072,7 +23072,7 @@ fn load_project_with_source(
     if crate::device::is_remote() {
         return Err("Use Device files for remote browsing and Git operations".into());
     }
-    if let Some(source) = creation_source {
+    if let Some(source) = creation_source.filter(|_| kind != Some(ProjectKind::Folder)) {
         // A routine refresh keeps the original physical consent and never
         // rediscovers a replacement through this request's pathname.
         let service = source.service().map_err(|error| error.to_string())?;
