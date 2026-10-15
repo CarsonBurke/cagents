@@ -622,7 +622,7 @@ mod tests {
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
         checked_record(&request).unwrap();
-        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\n").unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), ".env\ntarget/\nnode_modules/\n").unwrap();
         std::fs::write(worktree.join(".env"), "preserve secret").unwrap();
         assert!(checked_record(&request).unwrap_err().contains("ignored files .env"));
         // Exercise the production preparation entrypoint: ignored user data
@@ -632,6 +632,8 @@ mod tests {
         std::fs::remove_file(worktree.join(".env")).unwrap();
         std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
         std::fs::write(worktree.join("target/nested/generated"), "disposable").unwrap();
+        std::fs::create_dir_all(worktree.join("node_modules/package/nested")).unwrap();
+        std::fs::write(worktree.join("node_modules/package/nested/output.js"), "disposable").unwrap();
         checked_record(&request).unwrap();
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());
