@@ -27,10 +27,10 @@ pub struct OriginalSettings {
 }
 impl OriginalSettings {
     pub fn is_exact(&self) -> bool {
-        !matches!(self.model, Setting::Unknown)
-            && !matches!(self.reasoning, Setting::Unknown)
-            && !matches!(self.fast, Setting::Unknown)
-            && !matches!(self.permission, Setting::Unknown)
+        !matches!(self.model, Setting::Unknown|Setting::Default)
+            && !matches!(self.reasoning, Setting::Unknown|Setting::Default)
+            && !matches!(self.fast, Setting::Unknown|Setting::Default)
+            && !matches!(self.permission, Setting::Unknown|Setting::Default)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,4 +79,11 @@ pub(crate) enum ApprovalDecision {
     Awaiting,
     Allowed,
     Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalUpdate {
+    pub key: ApprovalKey,
+    pub request_id: String,
+    pub decision: ApprovalDecision,
 }
