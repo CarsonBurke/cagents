@@ -85,7 +85,7 @@ pub(crate) fn save_document_file_at_in_context(root: &Root, path: &Path, text: &
         return save_file_at_in_context(root, path, text, expected_hash, overwrite, context);
     }
     if !presence.expected_present && presence.desired_present && presence.external_missing_recreate && presence.restoration.is_none() {
-        return save_missing_file_at(root, path, text);
+        return recreate_missing_document_file(root, path, text, context);
     }
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
     if presence.expected_present && presence.desired_present {
@@ -119,6 +119,25 @@ pub(crate) fn save_document_file_at_in_context(root: &Root, path: &Path, text: &
         )
     })?;
     restore_document_file(&parent, &name, text, &restoration, context)
+}
+
+// Explicit confirmation of an external deletion may create a fresh private
+// file; owned absence still requires its immutable restoration template.
+fn recreate_missing_document_file(root: &Root, path: &Path, text: &str, context: &RecoveryContext) -> Result<SaveOutcome, FileIoError> {
+    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
+    require_new_destination(&parent, Path::new(&name))?;
+    let mut holding = PresenceHolding::create_in_context(&parent, &name, context)?;
+    if let Err(error) = holding.create_temporary() { return Err(holding.finish_error(error)); }
+    let written = (|| {
+        let temporary = holding.temporary_mut();
+        temporary.set_permissions(Permissions::from_mode(0o600)).map_err(io_error)?;
+        temporary.write_all(text.as_bytes()).map_err(io_error)?;
+        temporary.sync_all().map_err(io_error)?;
+        holding.publish_temporary()
+    })();
+    if let Err(error) = written { return Err(holding.finish_error(error)); }
+    let durability = match holding.finish() { Ok(()) => sync_durability(&parent), Err(error) => recovery_durability(error, "The recreated file is now published.") };
+    Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
 }
 
 fn restore_document_file(
