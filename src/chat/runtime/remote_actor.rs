@@ -3426,7 +3426,7 @@ done"#;
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
-        proof.host_incarnation = HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
         let _replacement_lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let replacement =
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();
