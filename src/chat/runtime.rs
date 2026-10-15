@@ -3038,6 +3038,13 @@ impl Actor {
         while self.source_claim.is_some() && !self.stop.load(Ordering::Acquire) {
             self.drain_commands(false)?;
             if self.source_claim.is_none() || self.stop.load(Ordering::Acquire) { break; }
+            // Wake bytes coalesce and the bounded turn above may consume an
+            // urgent command in addition to the normal queue's capacity. Never
+            // sleep while an already-admitted disposition/control remains.
+            if !self.incoming.is_empty() || !self.urgent_incoming.is_empty()
+                || self.session_stop.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                continue;
+            }
             let mut fd = libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
                 let error = std::io::Error::last_os_error();
