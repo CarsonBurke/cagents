@@ -54,18 +54,19 @@ struct Loaded {record:ResidentRaw,view:tool_text::ToolText}
 struct Entry {part:RawSourcePart,revision:u64,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
-pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
+pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
     pub(super) fn clear(&mut self) {
-        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
+        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.incarnation=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
         self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
     }
     fn sync(&mut self,snapshot:&Snapshot,selected:Option<&str>,actor:Option<&Arc<ClientHandle>>) {
         let same_actor=match (&self.actor,actor) {(None,None)=>true,(Some(old),Some(new))=>old.as_ptr()==Arc::as_ptr(new),_=>false};
-        if !same_actor || self.session!=snapshot.session_id || self.selected.as_deref()!=selected {self.clear();}
-        self.actor=actor.map(Arc::downgrade);self.session=snapshot.session_id.clone();self.selected=selected.map(str::to_owned);
+        if !same_actor || self.session!=snapshot.session_id || self.incarnation!=snapshot.source_incarnation || self.selected.as_deref()!=selected {self.clear();}
+        self.actor=actor.map(Arc::downgrade);self.session=snapshot.session_id.clone();self.incarnation=snapshot.source_incarnation;self.selected=selected.map(str::to_owned);
         let mut present=HashSet::new();let mut aliases:HashMap<String,Vec<Key>>=HashMap::new();
-        for part in snapshot.raw_source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected) {
+        for part in snapshot.raw_source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected
+            && snapshot.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation)) {
             let key=Key::of(part);present.insert(key.clone());
             // Both aliases are Store-authored. No native-part grammar or path
             // spelling is used to infer a source identity.
@@ -437,6 +438,18 @@ mod tests {
         drop(app.handle_chat_ui(match completed {Message::ChatUi(action)=>action,_=>unreachable!()}));
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
         assert!(app.chat_runtime_mut(target).unwrap().raw_original.entries[&Key::of(&part)].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_reset_invalidates_loaded_call_and_old_same_session_reply() {
+        let text=r#"{ "old": "input" }"#;let(mut runtime,part)=runtime_fixture(text);
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();let old=reply(part.clone(),text).await;
+        Arc::make_mut(&mut runtime.snapshot).source_incarnation=Some(uuid::Uuid::from_u128(99));
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,old);
+        assert_ne!(runtime.raw_original.context,context);assert!(runtime.raw_original.entries.is_empty());
+        assert_eq!(runtime.raw_original.retained_bytes(),0);
+        assert!(runtime.snapshot.raw_source_parts.iter().any(|old|old.epoch==part.epoch),"old unchanged aliases cannot authorize the new source lifetime");
     }
 
     #[test]
