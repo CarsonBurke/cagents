@@ -4772,6 +4772,25 @@ impl Cagents {
         }
         Subscription::batch(subscriptions)
     }
+    /// Configured drafts carry private per-window choices, not a shared recipe.
+    /// Keep even malformed saved choices local so restore can refuse explicitly.
+    /// This derived exclusion ends on issued adoption without clearing unrelated
+    /// retained/local-only markers (for example unsaved peer withdrawals).
+    pub(super) fn configured_chat_is_local(&self, card: CardId) -> bool {
+        if !self.card_state(card).is_some_and(|state| {
+            state.existence.is_open()
+                && matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())
+        }) {
+            return false;
+        }
+        self.durable.configured_chat_drafts.contains_key(&card)
+            || match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+                _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+            }
+            .is_some_and(|runtime| runtime.draft_configured)
+    }
+
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
@@ -4789,6 +4808,7 @@ impl Cagents {
     pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
         !self.chat_ui.phases.contains_key(&alias)
             && !self.chat_ui.parked.contains_key(&alias)
+            && !self.configured_chat_is_local(canonical)
             && !self.shared_chat_has_local_work(canonical)
     }
 
@@ -13601,6 +13621,7 @@ mod tests {
         );
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let card = app.workspace.focused().unwrap();
+        assert!(app.configured_chat_is_local(card));
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("new draft")
         };
@@ -13627,8 +13648,15 @@ mod tests {
                 },
             )
             .unwrap();
-        let reopened = StateStore::open(&database, boot).unwrap();
+        let reopened = StateStore::open(&database, boot.clone()).unwrap();
         let restored = reopened.load_workspace(saved.id, None).unwrap().unwrap();
+        assert_eq!(restored.configured_chat_drafts[&card], expected);
+        // New Window uses this same read-only snapshot operation, so the
+        // private choices travel with the backup without entering pane IPC.
+        let backup = directory.path().join("new-window.sqlite3");
+        StateStore::copy_snapshot(&database, &backup).unwrap();
+        let new_window = StateStore::open(&backup, boot).unwrap();
+        let restored = new_window.load_workspace(saved.id, None).unwrap().unwrap();
         assert_eq!(restored.configured_chat_drafts[&card], expected);
         let CardKind::Chat(session) = restored
             .cards
@@ -13655,6 +13683,7 @@ mod tests {
         another_window.chat_ui = State::with_drafts(restored.chat_drafts.clone());
         another_window.durable = Arc::new(restored);
         drop(another_window.open_chat_draft(card, session));
+        assert!(another_window.configured_chat_is_local(card));
         let Some(CardRuntime::Chat(runtime)) = another_window.cards.get(&card) else {
             panic!("restored draft")
         };
@@ -13681,6 +13710,7 @@ mod tests {
         let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
         let ready = Message::ChatUi(Action::Ready(pending.target, ready));
         drop(another_window.update(ready));
+        assert!(!another_window.configured_chat_is_local(card));
         assert!(
             !another_window
                 .durable
@@ -13693,6 +13723,27 @@ mod tests {
                 .configured_chat_drafts
                 .contains_key(&card)
         );
+    }
+
+    #[test]
+    fn settings_failed_configured_start_keeps_private_intent_and_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Claude, Some(PathBuf::from(FIXTURE_DIRECTORY))));
+        let card = app.workspace.focused().unwrap();
+        write(&mut app, card, "keep the configured first message");
+        submit(&mut app, card);
+        let pending = app.chat_ui.attempt(card).unwrap();
+        let target = pending.target;
+        let expected = app.persistent_workspace().configured_chat_drafts[&card].clone();
+        assert!(app.configured_chat_is_local(card));
+        answer_start(&mut app, target, Err(chat::StartFailure::retry("private fixture refusal")));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing());
+        assert_eq!(runtime.composer.text().trim(), "keep the configured first message");
+        assert_eq!(runtime.error.as_deref(), Some("private fixture refusal"));
+        assert_eq!(runtime.configured_start().unwrap().unwrap(), expected);
+        assert!(app.configured_chat_is_local(card));
+        assert_eq!(app.persistent_workspace().configured_chat_drafts[&card], expected);
     }
 
     #[test]
@@ -13747,6 +13798,7 @@ mod tests {
             .unwrap()
             .id = TerminalId::new();
         drop(app.open_chat_draft(card, session.clone()));
+        assert!(app.configured_chat_is_local(card), "invalid saved intent must stay private");
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("typed draft")
         };
@@ -13774,6 +13826,7 @@ mod tests {
         };
         assert!(!runtime.draft_configured);
         assert!(runtime.configured_start().unwrap().is_none());
+        assert!(!app.configured_chat_is_local(card));
         assert!(
             !app.persistent_workspace()
                 .configured_chat_drafts
