@@ -29,9 +29,10 @@ impl Capture {
         let mut patch = git_patch::selected_patch(&self.model, &self.old_path, &self.new_path,
             self.mode, self.rows, self.kind)?;
         if let Some(snapshot) = self.buffer_snapshot {
-            if snapshot.text().as_ref() != self.model.after.as_ref() { return None; }
+            let before = snapshot.text();
+            if before.as_ref() != self.model.after.as_ref() { return None; }
             let replacement = patch.working_text.take()?;
-            patch.buffer_change = Some(Arc::new(buffer_change(&snapshot, replacement.as_str())?));
+            patch.buffer_change = Some(Arc::new(buffer_change(&snapshot, &before, replacement.as_str())?));
         }
         patch.working_text = None;
         Some((self.identity, self.buffer_revision, patch))
@@ -125,13 +126,38 @@ impl RepositoryRuntime {
 /// Preserve the native line map in the removed fragments, including adjacent
 /// CR/LF endings retained by earlier edits. CPU scanning and text copies stay
 /// on the worker; the application receives only the minimal replacement.
-fn buffer_change(snapshot: &text_editor::TextSnapshot, replacement: &str) -> Option<TextChange> {
+fn buffer_change(snapshot: &text_editor::TextSnapshot, old: &str, replacement: &str) -> Option<TextChange> {
+    if old == replacement { return None; }
+    let mut prefix = old.bytes().zip(replacement.bytes()).take_while(|(old, new)| old == new).count();
+    while !old.is_char_boundary(prefix) || !replacement.is_char_boundary(prefix) { prefix -= 1; }
+    let suffix = old[prefix..].bytes().rev().zip(replacement[prefix..].bytes().rev())
+        .take_while(|(old, new)| old == new).count();
+    let offset = |line| snapshot.byte_offset(text_editor::Position { line, column: 0 });
+    let line_at = |byte| {
+        let (mut low, mut high) = (0, snapshot.line_count());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if offset(mid)? <= byte { low = mid + 1; } else { high = mid; }
+        }
+        Some(low.saturating_sub(1))
+    };
+    // Keep one neighbouring native line on either side. In particular, a
+    // preceding CR must not be accidentally paired with a newly inserted LF.
+    // The editor's noncanonical-ending fallback then stays local to this edit.
+    let first = line_at(prefix)?.saturating_sub(1);
+    let end = line_at(old.len() - suffix)?.saturating_add(2).min(snapshot.line_count());
+    let start_byte = offset(first)?;
+    let end_byte = if end == snapshot.line_count() { old.len() } else { offset(end)? };
+    let new_end = replacement.len().checked_sub(old.len() - end_byte)?;
     let mut before = crate::editor_history::Excerpt::new(0);
-    for index in 0..snapshot.line_count() {
+    for index in first..end {
         let line = snapshot.line(index)?;
         before.push_line(&line.text, line.ending.as_str());
     }
-    crate::editor_history::replacement(&before, &crate::editor_history::Excerpt::document(replacement), usize::MAX)
+    let after = crate::editor_history::Excerpt::document(replacement.get(start_byte..new_end)?);
+    let mut change = crate::editor_history::replacement(&before, &after, usize::MAX)?;
+    change.start.line += first;
+    Some(change)
 }
 
 pub(super) const GUTTER_WIDTH: f32 = 44.0;
@@ -204,7 +230,7 @@ mod tests {
         let cursor = text_editor::Cursor { position: text_editor::Position { line: 2, column: 4 }, selection: None };
         document.content.set_cursor(cursor);
         let revision = document.revision;
-        let change = buffer_change(&document.content.text_snapshot(), desired).unwrap();
+        let change = buffer_change(&document.content.text_snapshot(), &document.content.text(), desired).unwrap();
         assert_eq!(change.start.line, 1);
         assert!(!change.removed.contains("first") && !change.removed.contains("another hunk"));
         assert!(!document.history.can_undo());
@@ -226,10 +252,51 @@ mod tests {
         let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\n");
         let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
         let revision = document.revision;
-        let change = buffer_change(&document.content.text_snapshot(), "original\n").unwrap();
+        let change = buffer_change(&document.content.text_snapshot(), &document.content.text(), "original\n").unwrap();
         document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
         let typed = document.content.text();
         assert!(runtime.apply_diff_buffer_revert(&identity, revision, Arc::new(change)).is_err());
         assert_eq!(runtime.editor_text().unwrap(), typed);
     }
+    #[test]
+    fn partial_change_buffer_revert_keeps_distant_noncanonical_breaks_out_of_the_transaction() {
+        let card = CardId::new();
+        let source = (0..200).map(|line| format!("row {line}\n")).collect::<String>();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.txt", &source);
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+        let at = text_editor::Position { line: 5, column: 0 };
+        document.content.replace_range_with_breaks(at, at, "\n\r", &[1, 2]);
+        let snapshot = document.content.text_snapshot();
+        let before = snapshot.text();
+        let desired = before.replace("row 100\n", "original\n");
+        let revision = document.revision;
+        let change = buffer_change(&snapshot, &before, &desired).unwrap();
+        assert!(change.start.line >= 100);
+        assert!(change.removed.len() < 100 && change.inserted.len() < 100);
+        runtime.apply_diff_buffer_revert(&identity, revision, Arc::new(change)).unwrap();
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+        assert_eq!(document.content.text(), desired);
+        let after = document.content.text_snapshot();
+        for line in 0..10 {
+            assert_eq!(after.line(line).unwrap().ending, snapshot.line(line).unwrap().ending);
+        }
+        assert!(document.step_history(false).is_some());
+        assert_eq!(document.content.text(), before.as_ref());
+        let undone = document.content.text_snapshot();
+        assert_eq!(undone.line_count(), snapshot.line_count());
+        for line in 0..snapshot.line_count() {
+            assert_eq!(undone.line(line).unwrap().ending, snapshot.line(line).unwrap().ending);
+        }
+    }
+
+    #[test]
+    fn partial_change_buffer_revert_measures_utf8_at_character_boundaries() {
+        let content: text_editor::Content<cosmic::Renderer> = text_editor::Content::with_text("α\ncafé\nend");
+        let snapshot = content.text_snapshot();
+        let change = buffer_change(&snapshot, &snapshot.text(), "α\ncafê\nend").unwrap();
+        assert_eq!(change.start, text_editor::Position { line: 1, column: 3 });
+        assert_eq!(change.removed, "é");
+        assert_eq!(change.inserted, "ê");
+    }
+
 }
