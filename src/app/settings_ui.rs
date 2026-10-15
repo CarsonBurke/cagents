@@ -1031,6 +1031,13 @@ fn settings_category_controls<'a>(
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(
+                    "Focus last pane",
+                    "Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.focus_last_pane,
+                    SettingsField::ShortcutFocusLastPane,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
                     "New terminal",
                     "Creates a terminal column.",
                     &draft.keyboard_shortcuts.new_terminal,

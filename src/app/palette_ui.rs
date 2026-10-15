@@ -6,6 +6,7 @@ pub(super) struct State {
     recording: Option<SettingsField>,
     query: Option<String>,
     selected: usize,
+    panes_only: bool,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -16,6 +17,8 @@ impl State {
 pub enum Action {
     Record(SettingsField),
     Open,
+    OpenPanes,
+    ClosePane(CardId),
     Close,
     Query(String),
     Run(MessageBox),
@@ -35,7 +38,9 @@ impl Cagents {
                 self.palette.recording = Some(field);
                 Task::none()
             }
-            Action::Open => {
+            Action::ClosePane(card) => self.run_palette_command(Message::CloseCard(card)),
+            Action::Open | Action::OpenPanes => {
+                self.palette.panes_only = matches!(action, Action::OpenPanes);
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -199,6 +204,18 @@ impl Cagents {
         )
     }
 
+    fn pane_attention_label(&self, card: CardId) -> &'static str {
+        if self.sidebar_state.has_card_update(card) {
+            "Unread"
+        } else {
+            match self.sidebar_state.card_activity(card).map(|activity| activity.state) {
+                Some(crate::agent::ActivityState::Working) => "Working",
+                Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
+                _ => "Idle",
+            }
+        }
+    }
+
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
         let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
@@ -215,20 +232,29 @@ impl Cagents {
                 )
             })
             .collect();
+        if self.palette.panes_only {
+            entries.clear();
+        }
+        if !self.palette.panes_only {
         entries.push((
             "Resume conversation".into(),
             "Search saved native chats".into(),
             Message::ResumeConversation(resume_ui::Action::Open),
         ));
+        }
         for id in self.workspace.order() {
             if let Some(card) = self.card_state(id) {
                 entries.push((
-                    format!("Focus pane: {}", self.card_display_title(card)),
-                    String::new(),
+                    self.card_chrome.get(&id).map_or_else(
+                        || self.card_display_title(card).to_owned(),
+                        |chrome| chrome.title.clone(),
+                    ),
+                    self.pane_attention_label(id).to_owned(),
                     Message::FocusCard(id),
                 ));
             }
         }
+        if !self.palette.panes_only {
         for project in &self.sidebar_model.projects {
             for channel in &project.channels {
                 entries.push((
@@ -250,6 +276,7 @@ impl Cagents {
                     }),
                 ));
             }
+        }
         }
         let query = self
             .palette
@@ -281,7 +308,8 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input =
-            crate::ui_controls::field::search("Search commands, panes and workspaces", query)
+            crate::ui_controls::field::search(
+                if self.palette.panes_only { "Search open panes" } else { "Search commands, panes and workspaces" }, query)
                 .id(widget::Id::new("palette.query"))
                 .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
@@ -289,10 +317,14 @@ impl Cagents {
             .into_iter()
             .enumerate()
             .map(|(index, (label, chord, message))| {
-                let row = widget::row::with_children(vec![
-                    design::body(label).width(Length::Fill).into(),
-                    design::caption(chord).into(),
-                ])
+                let pane = match &message { Message::FocusCard(card) => Some(*card), _ => None };
+                let mut children = Vec::new();
+                if let Some(card) = pane {
+                    children.push(self.card_icon(card).icon().size(design::ROW_ICON_SIZE).into());
+                }
+                children.push(design::body(label).width(Length::Fill).into());
+                children.push(design::caption(chord).into());
+                let row = widget::row::with_children(children)
                 .spacing(space::M)
                 .align_y(Alignment::Center);
                 let button = if index == self.palette.selected {
@@ -300,15 +332,23 @@ impl Cagents {
                 } else {
                     widget::button::custom(row)
                 };
-                button
+                let focus: Element<'_, Message> = button
                     .width(Length::Fill)
                     .height(ROW_HEIGHT)
                     .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
-                    .into()
+                    .into();
+                if self.palette.panes_only {
+                    if let Some(card) = pane {
+                        return widget::row::with_children(vec![focus,
+                            super::chrome_ui::command(Icon::Close, "Close pane", widget::Id::new(format!("pane-list.close.{card}")), Some(Message::Palette(Action::ClosePane(card))))
+                        ]).align_y(Alignment::Center).into();
+                    }
+                }
+                focus
             })
             .collect();
         let rows = if rows.is_empty() {
-            widget::column::with_children(vec![design::caption("No matching commands").into()])
+            widget::column::with_children(vec![design::caption(if self.palette.panes_only { "No matching panes" } else { "No matching commands" }).into()])
         } else {
             widget::column::with_children(rows)
         };
@@ -453,6 +493,10 @@ impl Cagents {
                     self.duplicate_pane_in_scope(card, owner)
                 }
             }
+            Command::FocusLastPane => {
+                let card = self.workspace.order().last();
+                card.map_or_else(Task::none, |id| self.update(Message::FocusCard(id)))
+            }
             Command::FocusPane1
             | Command::FocusPane2
             | Command::FocusPane3
@@ -556,6 +600,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => Some(Command::FocusPane7),
             Self::ShortcutFocusPane8 => Some(Command::FocusPane8),
             Self::ShortcutFocusPane9 => Some(Command::FocusPane9),
+            Self::ShortcutFocusLastPane => Some(Command::FocusLastPane),
             _ => None,
         }
     }
@@ -628,12 +673,38 @@ impl ShortcutDraft {
             (Command::FocusPane7, self.focus_pane_7.as_str()),
             (Command::FocusPane8, self.focus_pane_8.as_str()),
             (Command::FocusPane9, self.focus_pane_9.as_str()),
+            (Command::FocusLastPane, self.focus_last_pane.as_str()),
         ]
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pane_list_filters_selects_and_focuses_the_chosen_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let cards: Vec<_> = (1..=20).map(|index| {
+            let mut card = crate::app::tests::terminal_card_state();
+            card.title = format!("Pane {index}");
+            card
+        }).collect();
+        let chosen = cards[13].id;
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        drop(app.update_palette(Action::OpenPanes));
+        assert_eq!(app.palette_entries().len(), 20);
+        drop(app.update_palette(Action::Query("pane14".into())));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].2, Message::FocusCard(id) if id == chosen));
+        drop(app.update_palette(Action::Submit));
+        assert!(!app.palette.is_open());
+        assert_eq!(app.workspace.focused(), Some(chosen));
+        drop(app.run_workspace_command(Command::FocusLastPane, keyboard::Modifiers::empty()));
+        assert_eq!(app.workspace.focused(), app.workspace.order().last());
+    }
     use super::*;
 
     /// Run a real scroll operation against the retained native widget tree.

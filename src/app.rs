@@ -2796,13 +2796,14 @@ pub enum SettingsField {
     ShortcutFocusPane7,
     ShortcutFocusPane8,
     ShortcutFocusPane9,
+    ShortcutFocusLastPane,
     ShortcutToggleProjects,
     ShortcutRenamePane,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2839,6 +2840,7 @@ impl SettingsField {
         Self::ShortcutFocusPane7,
         Self::ShortcutFocusPane8,
         Self::ShortcutFocusPane9,
+        Self::ShortcutFocusLastPane,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
     ];
@@ -2901,6 +2903,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => "Focus pane 7",
             Self::ShortcutFocusPane8 => "Focus pane 8",
             Self::ShortcutFocusPane9 => "Focus pane 9",
+            Self::ShortcutFocusLastPane => "Focus last pane",
             Self::ChatExpandToolGroups => "Expand tool groups by default",
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
@@ -3001,6 +3004,7 @@ impl SettingsField {
             | Self::ShortcutFocusPane7
             | Self::ShortcutFocusPane8
             | Self::ShortcutFocusPane9
+            | Self::ShortcutFocusLastPane
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
@@ -3059,6 +3063,7 @@ struct ShortcutDraft {
     focus_pane_7: String,
     focus_pane_8: String,
     focus_pane_9: String,
+    focus_last_pane: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -3102,6 +3107,7 @@ impl ShortcutDraft {
             focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
             focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
             focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
+            focus_last_pane: settings::format_chords(&shortcuts.focus_last_pane),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -3336,6 +3342,7 @@ impl SettingsDraft {
             SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
             SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
             SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
+            SettingsField::ShortcutFocusLastPane => self.keyboard_shortcuts.focus_last_pane = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -3486,6 +3493,10 @@ fn settings_update(
         }
         SettingsField::ShortcutFocusPane9 => {
             next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusLastPane => {
+            next.keyboard_shortcuts.focus_last_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::Notifications(field) => value
@@ -4579,6 +4590,7 @@ struct CardChrome {
     tooltip: String,
     focus_id: widget::Id,
     title_id: widget::Id,
+    tab_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
     resize_id: widget::Id,
@@ -4591,6 +4603,7 @@ struct CardChrome {
     browser_address_id: widget::Id,
     type_label: &'static str,
     title: String,
+    title_width: f32,
     focused_name: String,
     caption: String,
     unfocused_name: String,
@@ -4608,6 +4621,7 @@ impl CardChrome {
             },
             focus_id: workspace_widget::card_focus_id(id),
             title_id: card_control_id(id, "title"),
+            tab_id: card_control_id(id, "tab"),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
             resize_id: card_control_id(id, "resize"),
@@ -4620,6 +4634,7 @@ impl CardChrome {
             browser_address_id: card_control_id(id, "browser.address"),
             type_label,
             title: title.to_owned(),
+            title_width: chrome_ui::measure_tab_title(title),
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
@@ -5733,6 +5748,11 @@ impl Cagents {
         }
     }
 
+    fn new_pane_fraction(&self, configured: f32) -> f32 {
+        let width = self.workspace.viewport_width();
+        if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH { 1.0 } else { configured }
+    }
+
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
         let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
@@ -5816,7 +5836,7 @@ impl Cagents {
                 .file_name()
                 .and_then(|name| normalize_card_name(&name.to_string_lossy()))
                 .unwrap_or_else(|| "Terminal".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating { epoch: 1 },
@@ -6363,7 +6383,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6391,7 +6411,7 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_native_pane_fraction)),
                 )
                 .expect("pull request card is valid"),
                 index,
@@ -6834,7 +6854,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6852,7 +6872,7 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_native_pane_fraction)),
                 )
                 .expect("repository card is valid"),
                 index,
@@ -6935,7 +6955,7 @@ impl Cagents {
                 .host_str()
                 .and_then(normalize_card_name)
                 .unwrap_or_else(|| "Browser".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating {
@@ -6963,7 +6983,7 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     "Browser",
-                    CardWidth::Fraction(self.settings.default_column_fraction),
+                    CardWidth::Fraction(self.new_pane_fraction(self.settings.default_column_fraction)),
                 )
                 .expect("browser card is valid"),
                 index,
@@ -7358,28 +7378,6 @@ impl Cagents {
         if self.chrome_ui.user_titles.contains_key(&id) {
             return false;
         }
-        let title = if title.starts_with('/') || title.starts_with("~/") {
-            self.card_state(id)
-                .and_then(|state| match &state.kind {
-                    CardKind::Terminal(session) => {
-                        let process = Path::new(&session.launch.program)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        let directory = session
-                            .launch
-                            .working_directory
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        Some(format!("{process} · {directory}"))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(title)
-        } else {
-            title
-        };
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
@@ -7418,6 +7416,17 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        for card in &self.durable.cards {
+            if matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+            {
+                let scope = self.unchanneled_card_worktree(card)
+                    .unwrap_or_else(|| Path::new("")).to_owned();
+                let next = self.chrome_ui.terminal_next_ordinals.entry(scope).or_default();
+                *next += 1;
+                self.chrome_ui.terminal_ordinals.insert(card.id, *next);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
@@ -7483,7 +7492,23 @@ impl Cagents {
                 )),
             );
         }
-        (Cow::Borrowed(self.card_display_title(card)), None)
+        let title = self.card_display_title(card);
+        if let CardKind::Terminal(session) = &card.kind
+            && !self.chrome_ui.user_titles.contains_key(&card.id)
+        {
+            let directory = self.terminal_working_directories.get(&card.id)
+                .unwrap_or(&session.launch.working_directory);
+            let basename = directory.file_name().unwrap_or_default().to_string_lossy();
+            let title = if title.is_empty() || title == "Terminal" || title == basename {
+                let process = Path::new(&session.launch.program).file_name().unwrap_or_default().to_string_lossy();
+                Cow::Owned(format!("{process} · {basename}"))
+            } else { Cow::Borrowed(title) };
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id) {
+                return (Cow::Owned(format!("{title} ({ordinal})")), None);
+            }
+            return (title, None);
+        }
+        (Cow::Borrowed(title), None)
     }
 
     /// Provider activity belongs in the status icon, including restored titles.
@@ -7493,6 +7518,15 @@ impl Cagents {
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
+        }
+        if let CardKind::Chat(session) = &card.kind
+            && let Some(channel) = self.durable.channels.iter()
+                .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
+            && (card.title == chat_ui::chat_card_title(session.launch.provider)
+                || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && channel.cards.first() == Some(&card.id)))
+        {
+            return &channel.title;
         }
         let title = crate::agent::codex_title_without_status(&card.title);
         // Provider recognition can only change an empty or status-prefixed
@@ -7538,13 +7572,11 @@ impl Cagents {
     /// unchanged title costs one string comparison and no allocation.
     fn sync_window_title(&mut self) -> Task<Message> {
         let header = {
-            let showing = self
-                .durable
-                .focused
-                .and_then(|id| self.card_state(id))
-                .map(|card| self.card_display_title(card).trim())
-                .filter(|title| !title.is_empty())
-                .unwrap_or(APPLICATION_NAME);
+            let showing = self.durable.focused.and_then(|id| self.card_state(id))
+                .map(|card| self.repository_chrome(card).0)
+                .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
+            let showing = showing.trim();
+            let showing = if showing.is_empty() { APPLICATION_NAME } else { showing };
             if self.core.window.header_title == showing {
                 return Task::none();
             }
@@ -12077,7 +12109,7 @@ impl Cagents {
             id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -18529,6 +18561,22 @@ mod tests {
             arguments: Vec::new(),
             working_directory: working_directory.into(),
             environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn new_pane_width_adapts_without_rewriting_existing_panes() {
+        let mut app = context_inspector_test_app(true);
+        let existing = app.workspace.focused().unwrap();
+        let width = app.card_state(existing).unwrap().width_fraction;
+        for (viewport, expected) in [(900.0, 1.0), (1100.0, 0.5), (1600.0, 0.5)] {
+            app.workspace.resize_viewport(viewport);
+            assert_eq!(app.new_pane_fraction(0.5), expected);
+            drop(app.add_utility_card(CardKind::Settings));
+            let added = app.workspace.focused().unwrap();
+            assert_eq!(app.card_state(added).unwrap().width_fraction,
+                app.new_pane_fraction(app.settings.default_native_pane_fraction));
+            assert_eq!(app.card_state(existing).unwrap().width_fraction, width);
         }
     }
 
