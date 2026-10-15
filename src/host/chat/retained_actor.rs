@@ -644,18 +644,14 @@ pub(in crate::host) fn finish_close(
 }
 
 /// Transfer the exact final proof before native cleanup consumes its temporary
-/// file. Missing account/confirmed identity keeps session deletion unavailable;
-/// ordinary close can still release an actor that never established that scope.
+/// file. Unknown account/confirmed identity remains explicit in this actor-only
+/// proof and never creates session read/delete authority.
 fn publish_retirement(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
     handle.finish_retained_close()?;
     let identity = handle.actor_identity().ok_or("Final retirement lost its exact retained actor identity")?;
-    let Ok(scope) = handle.launch_account_scope() else {
-        tracing::debug!(id=%source.id, "closed retained actor has no qualified account/session deletion evidence");
-        return Ok(());
-    };
     let registry = super::super::agent_execution::registry(host)?;
     registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_retirement(
-        identity.instance, &identity.record, source, scope, handle.confirmed_session_id().as_deref(),
+        identity.instance, &identity.record, source, handle.launch_account_scope(), handle.confirmed_session_id().as_deref(),
     )
 }
 

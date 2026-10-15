@@ -1019,6 +1019,6 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     let retirement=registry.lock().unwrap().native_actor_retirement(identity.instance).unwrap().unwrap();
     assert_eq!(retirement.owner(), &identity.record);
     assert_eq!(retirement.confirmed_session(), handle.confirmed_session_id().as_deref());
-    assert_eq!(retirement.scope(), handle.launch_account_scope().unwrap());
+    assert_eq!(retirement.scope().unwrap(), handle.launch_account_scope().unwrap());
     drop(lease);
 }

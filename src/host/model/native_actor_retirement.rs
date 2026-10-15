@@ -29,7 +29,7 @@ pub(in crate::host) struct NativeActorRetirement {
     actor: Uuid,
     owner: Record,
     source: chat::Session,
-    scope: LaunchAccountScope,
+    scope: Result<LaunchAccountScope, String>,
     confirmed_session: Option<String>,
 }
 
@@ -37,7 +37,7 @@ impl NativeActorRetirement {
     pub(in crate::host) fn actor(&self) -> Uuid { self.actor }
     pub(in crate::host) fn owner(&self) -> &Record { &self.owner }
     pub(in crate::host) fn source(&self) -> &chat::Session { &self.source }
-    pub(in crate::host) fn scope(&self) -> &LaunchAccountScope { &self.scope }
+    pub(in crate::host) fn scope(&self) -> Result<&LaunchAccountScope, &str> { self.scope.as_ref().map_err(String::as_str) }
     pub(in crate::host) fn confirmed_session(&self) -> Option<&str> { self.confirmed_session.as_deref() }
 
     fn validate(&self) -> Result<(), String> {
@@ -46,17 +46,24 @@ impl NativeActorRetirement {
             || !crate::daemon::holder_registry::record_application_matches(&self.owner)
             || self.owner.terminal != self.source.id
             || !self.source.proof.as_ref().is_some_and(|proof| proof.is_complete() && proof.boot_id == self.owner.boot)
-            || self.scope.provider != crate::agent::Provider::Claude
-            || self.source.launch.provider != self.scope.provider
+            || self.source.launch.provider != crate::agent::Provider::Claude
+            || self.scope.as_ref().is_ok_and(|scope| scope.provider != self.source.launch.provider || !scope.canonical_home.is_absolute())
             || !matches!(self.source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { protocol: 1 })
             || !self.source.has_valid_native_continuity()
             || self.confirmed_session.as_ref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
             || self.source.launch.session_id.as_ref().is_some_and(|id| Some(id) != self.confirmed_session.as_ref())
-            || !self.scope.canonical_home.is_absolute()
         {
             return Err("Retained actor retirement has invalid exact source or physical account identity".into());
         }
         Ok(())
+    }
+}
+
+fn same_scope(left:&Result<LaunchAccountScope,String>,right:&Result<LaunchAccountScope,String>) -> bool {
+    match (left,right) {
+        (Ok(old),Ok(new)) => old.provider==new.provider && old.canonical_home==new.canonical_home && old.device==new.device && old.inode==new.inode,
+        (Err(old),Err(new)) => old==new,
+        _ => false,
     }
 }
 
@@ -138,10 +145,11 @@ impl Registry {
         actor: Uuid,
         owner: &Record,
         source: &chat::Session,
-        scope: &LaunchAccountScope,
+        scope: Result<&LaunchAccountScope, &str>,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
-        let receipt = NativeActorRetirement { actor, owner: owner.clone(), source: source.clone(), scope: scope.clone(), confirmed_session: confirmed_session.map(str::to_owned) };
+        let scope = scope.map(Clone::clone).map_err(|reason| reason.chars().take(4096).collect::<String>());
+        let receipt = NativeActorRetirement { actor, owner: owner.clone(), source: source.clone(), scope, confirmed_session: confirmed_session.map(str::to_owned) };
         receipt.validate()?;
         // Preserve the original captured physical tuple even if its pathname
         // was externally removed/replaced after startup. This records process
@@ -152,7 +160,7 @@ impl Registry {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let known:Option<String>=tx.query_row("SELECT ownership FROM native_actor_ownerships WHERE actor=?1",[actor.to_string()],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
         let known:NativeActorOwnership=serde_json::from_str(&known.ok_or("The retiring actor has no authenticated durable census registration")?).map_err(|e|e.to_string())?;
-        if known.actor!=actor || known.owner!=*owner || !known.scope.as_ref().is_ok_and(|known|known.provider==scope.provider && known.canonical_home==scope.canonical_home && known.device==scope.device && known.inode==scope.inode) {
+        if known.actor!=actor || known.owner!=*owner || !same_scope(&known.scope,&receipt.scope) {
             return Err("The retirement proof changed its registered helper or physical account".into());
         }
         let existing: Option<String> = tx.query_row("SELECT receipt FROM native_actor_retirements WHERE actor=?1",[actor.to_string()],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
@@ -215,7 +223,13 @@ mod tests {
         assert!(seen.iter().find(|row|row.actor()==unknown).unwrap().scope().is_err());
         assert!(registry.native_actor_ownerships(None,0).is_err());
         assert!(registry.native_actor_ownerships(None,129).is_err());
-        assert!(registry.commit_native_actor_retirement(unknown,&other,&other_source,&scope,None).is_err(),"unknown physical scope cannot certify the requested account");
+        assert!(registry.commit_native_actor_retirement(unknown,&other,&other_source,Ok(&scope),None).is_err(),"unknown physical scope cannot certify the requested account");
+        registry.commit_native_actor_retirement(unknown,&other,&other_source,Err("original captured home unavailable"),None).unwrap();
+        let retired=registry.native_actor_retirement(unknown).unwrap().unwrap();
+        assert!(retired.scope().is_err(),"actor retirement does not invent a physical account");
+        assert!(retired.confirmed_session().is_none(),"actor retirement does not invent a named conversation");
+        assert_eq!(retired.owner(),&other);
+        assert!(registry.commit_native_actor_retirement(unknown,&other,&other_source,Ok(&scope),None).is_err(),"a finally retired unknown owner cannot acquire a later caller's account identity");
     }
 
     #[test]
@@ -224,20 +238,20 @@ mod tests {
         let path=directory.path().join("registry");
         let mut registry=Registry::at(&path).unwrap();
         let (actor,owner,source,scope)=fixture(directory.path());
-        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).is_err(),"unregistered owners are not a complete census");
+        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),None).is_err(),"unregistered owners are not a complete census");
         registry.register_native_actor_ownership(actor,&owner,&source,Ok(&scope)).unwrap();
-        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
-        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
+        registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),None).unwrap();
+        registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),None).unwrap();
         assert!(registry.register_native_actor_ownership(actor,&owner,&source,Ok(&scope)).is_err(),"retired UUID cannot become a new writer");
         drop(registry);
         let mut registry=Registry::at(&path).unwrap();
         let receipt=registry.native_actor_retirement(actor).unwrap().unwrap();
-        assert_eq!(receipt.actor(),actor);assert_eq!(receipt.owner(),&owner);assert_eq!(receipt.source(),&source);assert_eq!(receipt.scope(),&scope);assert!(receipt.confirmed_session().is_none());
-        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&scope,Some("11111111-1111-4111-8111-111111111111")).is_err(),"later callers cannot invent a named history for an already unnamed retirement");
+        assert_eq!(receipt.actor(),actor);assert_eq!(receipt.owner(),&owner);assert_eq!(receipt.source(),&source);assert_eq!(receipt.scope().unwrap(),&scope);assert!(receipt.confirmed_session().is_none());
+        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),Some("11111111-1111-4111-8111-111111111111")).is_err(),"later callers cannot invent a named history for an already unnamed retirement");
         let mut wrong=scope.clone();wrong.inode+=1;
-        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&wrong,None).is_err());
+        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&wrong),None).is_err());
         let mut wrong=owner.clone();wrong.holder.start+=1;
-        assert!(registry.commit_native_actor_retirement(actor,&wrong,&source,&scope,None).is_err());
+        assert!(registry.commit_native_actor_retirement(actor,&wrong,&source,Ok(&scope),None).is_err());
     }
 
     #[test]
@@ -251,14 +265,14 @@ mod tests {
         let _old_home=std::fs::File::open(&home).unwrap();
         std::fs::remove_dir(&home).unwrap();
         assert!(scope.revalidate().is_err());
-        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
+        registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),None).unwrap();
         std::fs::create_dir(&home).unwrap();
         let (_,_,_,replacement)=fixture(&home);
         assert_ne!(replacement.inode,scope.inode);
         assert!(scope.revalidate().is_err());
         let receipt=registry.native_actor_retirement(actor).unwrap().unwrap();
-        assert_eq!(receipt.scope(),&scope);
-        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&replacement,None).is_err());
-        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
+        assert_eq!(receipt.scope().unwrap(),&scope);
+        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&replacement),None).is_err());
+        registry.commit_native_actor_retirement(actor,&owner,&source,Ok(&scope),None).unwrap();
     }
 }
