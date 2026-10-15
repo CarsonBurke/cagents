@@ -87,8 +87,24 @@ impl<T> RecoveryDirectory<T> {
     pub(crate) fn private_metadata(&self) -> &std::fs::Metadata { &self.private_metadata }
     /// Transfer ALL authority into the lower Holding/Undo owner. No uncharged
     /// bare-Root conversion or second reservation is provided.
-    pub(crate) fn into_parts(self) -> (DirectoryPublication, FilesystemRecoveryContext, RecoverySlot, T, std::fs::Metadata) {
-        (self.publication, self.context, self.slot, self.owner, self.private_metadata)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DirectoryPublication,
+        T,
+        std::fs::Metadata,
+        FilesystemRecoveryContext,
+        RecoverySlot,
+    ) {
+        // Normal direct Drop of this transfer tuple must also close T's native
+        // owners before the reservation/creation guard releases its charge.
+        (
+            self.publication,
+            self.owner,
+            self.private_metadata,
+            self.context,
+            self.slot,
+        )
     }
 }
 
@@ -324,12 +340,29 @@ mod tests {
     #[test]
     fn factory_returns_actual_published_holding_and_same_context_reservation() {
         let (_source, context) = context();
-        let holding = prepare_recovery_directory(context.reserve_directory().unwrap(), OsStr::new("holding"), || false).unwrap();
-        assert_eq!(holding.directory().metadata().unwrap().mode() & 0o7777, 0o700);
-        assert!(Arc::ptr_eq(holding.context().placement(), context.placement()));
-        holding.context().validate_payload_root(holding.directory()).unwrap();
-        assert_eq!(names(context.placement().directory()), [OsString::from("holding")]);
-        let (mut publication, retained, slot, (), private) = holding.into_parts();
+        let holding = prepare_recovery_directory(
+            context.reserve_directory().unwrap(),
+            OsStr::new("holding"),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            holding.directory().metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert!(Arc::ptr_eq(
+            holding.context().placement(),
+            context.placement()
+        ));
+        holding
+            .context()
+            .validate_payload_root(holding.directory())
+            .unwrap();
+        assert_eq!(
+            names(context.placement().directory()),
+            [OsString::from("holding")]
+        );
+        let (mut publication, (), private, retained, slot) = holding.into_parts();
         assert_eq!(private.mode() & 0o7777, 0o700);
         assert_eq!(publication.identity(), {
             let held = publication.directory().metadata().unwrap(); (held.dev(), held.ino())
@@ -393,7 +426,11 @@ mod tests {
         recovery.retry().unwrap(); assert!(recovery.is_resolved()); assert!(names(parent).is_empty());
     }
     #[derive(Default)]
-    struct UnknownCreation { sealed: bool, in_flight: usize }
+    struct UnknownCreation {
+        sealed: bool,
+        in_flight: usize,
+        limit: Option<usize>,
+    }
     struct UnknownCreationGuard(Arc<std::sync::Mutex<UnknownCreation>>);
     impl Drop for UnknownCreationGuard {
         fn drop(&mut self) {
@@ -414,8 +451,13 @@ mod tests {
             // This complete isolated test topology grants only counted owned
             // creation admission. Sealing blocks new work, never old cleanup.
             let mut state = self.creation.lock().unwrap();
-            if state.sealed { return Err(io::Error::other("Fixture creation admission sealed")); }
-            state.in_flight = state.in_flight.checked_add(1).expect("bounded fixture admission");
+            if state.sealed || state.limit.is_some_and(|limit| state.in_flight >= limit) {
+                return Err(io::Error::other("Fixture creation admission unavailable"));
+            }
+            state.in_flight = state
+                .in_flight
+                .checked_add(1)
+                .expect("bounded fixture admission");
             Ok(Arc::new(UnknownCreationGuard(self.creation.clone())))
         }
         fn descriptor_budget(&self) -> usize { 1 }
@@ -483,9 +525,15 @@ mod tests {
         let result = prepare_recovery_directory(admission, OsStr::new("holding"), || false);
         unsafe { libc::umask(previous); }
         let holding = result.unwrap();
-        assert_eq!(holding.directory().metadata().unwrap().mode() & 0o7777, 0o700);
-        holding.context().validate_payload_root(holding.directory()).unwrap();
-        let (mut publication, retained, _slot, (), private) = holding.into_parts();
+        assert_eq!(
+            holding.directory().metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
+        holding
+            .context()
+            .validate_payload_root(holding.directory())
+            .unwrap();
+        let (mut publication, (), private, retained, _slot) = holding.into_parts();
         assert_eq!(private.mode() & 0o7777, 0o700);
         assert_eq!(publication.initial_metadata().mode() & 0o7777, 0);
         publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
@@ -519,12 +567,105 @@ mod tests {
         fs::write(source.path().join("original"), b"original bytes").unwrap();
         let owner = Arc::new(fs::File::open(source.path().join("original")).unwrap());
         let weak = Arc::downgrade(&owner);
-        let holding = prepare_recovery_directory_with_owner(context.reserve_directory().unwrap(), OsStr::new("holding"), || false, owner).unwrap();
-        let (mut publication, retained, slot, owner, private) = holding.into_parts();
-        assert!(weak.upgrade().is_some()); assert_eq!(owner.metadata().unwrap().len(), 14);
+        let holding = prepare_recovery_directory_with_owner(
+            context.reserve_directory().unwrap(),
+            OsStr::new("holding"),
+            || false,
+            owner,
+        )
+        .unwrap();
+        let (mut publication, owner, private, retained, slot) = holding.into_parts();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(owner.metadata().unwrap().len(), 14);
         assert_eq!(private.mode() & 0o7777, 0o700);
         publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
         drop((publication, owner, retained, slot)); assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn direct_transfer_drop_keeps_original_native_owner_inside_creation_charge() {
+        struct NativeOwner {
+            _file: Arc<fs::File>,
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for NativeOwner {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+        }
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let source_root = Arc::new(Root::open(source.path()).unwrap());
+        let parent = Arc::new(Root::open(outside.path()).unwrap());
+        let registry = Arc::new(UnknownEnrollment {
+            creation: Arc::new(std::sync::Mutex::new(UnknownCreation {
+                limit: Some(1),
+                ..UnknownCreation::default()
+            })),
+            // This case needs immediate successful enrollment, not the other
+            // fixture's first two deliberately unknown replies.
+            attempts: std::sync::atomic::AtomicUsize::new(2),
+            payload: std::sync::Mutex::new(None),
+            _outside: outside,
+            _runtime: runtime,
+        });
+        let placement = RecoveryPlacement::acquire(
+            parent,
+            source_root.clone(),
+            Arc::from([source_root.clone()]),
+            RecoveryRegistryCheck::from_lease(registry.clone()),
+        )
+        .unwrap();
+        let protection = Arc::new(Some(
+            crate::worktree_cleanup::fixture_protection(
+                registry._runtime.path(),
+                source.path(),
+                false,
+            )
+            .unwrap(),
+        ));
+        let context = FilesystemRecoveryContext::new(&source_root, protection, placement).unwrap();
+        fs::write(source.path().join("original"), b"retained original").unwrap();
+        let file = Arc::new(fs::File::open(source.path().join("original")).unwrap());
+        let weak = Arc::downgrade(&file);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let holding = prepare_recovery_directory_with_owner(
+            context.reserve_directory().unwrap(),
+            OsStr::new("holding"),
+            || false,
+            NativeOwner {
+                _file: file,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        )
+        .unwrap();
+        let worker = std::thread::spawn(move || drop(holding.into_parts()));
+        let entered = entered_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
+        let original_is_live = weak.upgrade().is_some();
+        let charged = registry.creation.lock().unwrap().in_flight;
+        let refused = context.reserve_directory().is_err();
+        // Always release/join before assertions, including the old bad order.
+        let _ = release_tx.send(());
+        let joined = worker.join().is_ok();
+        assert!(entered && joined && original_is_live);
+        assert_eq!(
+            charged, 1,
+            "T's original native owner must stay charged through Drop"
+        );
+        assert!(
+            refused,
+            "the isolated one-owner admission must remain exhausted"
+        );
+        assert!(weak.upgrade().is_none());
+        assert_eq!(registry.creation.lock().unwrap().in_flight, 0);
+        drop(context.reserve_directory().unwrap());
     }
 
     #[test]
