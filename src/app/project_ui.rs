@@ -239,8 +239,8 @@ pub enum Action {
     DeleteOptionsRead { request: u64, result: Result<DeleteOptions, String> },
     DeleteBranchChanged(bool),
     BranchDeleted { request: BranchDeletion, result: Result<(), crate::worktree_branch::BranchDeleteFailure> },
-    ForceDeleteBranch,
-    KeepBranch,
+    ForceDeleteBranch(crate::model::OperationId),
+    KeepBranch(crate::model::OperationId),
     BusyAgentsConfirmed(bool),
     StaleUnlocked { request: u64, result: Result<(), String> },
     SafetyRead {
@@ -290,7 +290,7 @@ pub enum Action {
 impl Action {
     fn user_input(&self) -> bool {
         matches!(self, Self::Command { .. } | Self::ConfirmDelete | Self::DeleteBranchChanged(_)
-            | Self::ForceDeleteBranch | Self::KeepBranch | Self::BusyAgentsConfirmed(_)
+            | Self::ForceDeleteBranch(_) | Self::KeepBranch(_) | Self::BusyAgentsConfirmed(_)
             | Self::OpenCleanupPolicy(_) | Self::CleanupPolicyChanged(_) | Self::SaveCleanupPolicy
             | Self::ConfirmRemove | Self::RetryDelete(_) | Self::Dismiss)
     }
@@ -1525,11 +1525,13 @@ impl Cagents {
                     Err(failure) => self.status = Some(TransientNotice::warning(format!("Worktree deleted; branch {} retained: {}", request.branch, failure.detail))),
                 }
             }
-            Action::KeepBranch => {
+            Action::KeepBranch(id) => {
+                if !self.project_ui.force_branches.front().is_some_and(|(request, _)| request.id == id) { return Task::none(); }
                 self.project_ui.force_branches.pop_front();
                 return self.project_dialog_closed();
             }
-            Action::ForceDeleteBranch => {
+            Action::ForceDeleteBranch(id) => {
+                if !self.project_ui.force_branches.front().is_some_and(|(request, _)| request.id == id) { return Task::none(); }
                 let Some((request, _)) = self.project_ui.force_branches.pop_front() else { return Task::none(); };
                 self.project_ui.branch_requests.insert(request.id);
                 return Task::batch([branch_deletion_task(request, true), self.project_dialog_closed()]);
@@ -2195,8 +2197,8 @@ impl Cagents {
                 super::notice_body("Force deletion can lose commits that are not merged. This confirmation applies only to the commit shown below; a changed or checked-out branch is retained."),
                 super::notice_detail(&request.expected_oid),
                 super::dialog_ui::confirmation_actions(
-                    crate::ui_controls::button::secondary("Keep branch").id(widget::Id::new("dialog.branch.keep")).on_press(Message::ProjectUi(Action::KeepBranch)),
-                    crate::ui_controls::button::destructive("Force delete branch").on_press(Message::ProjectUi(Action::ForceDeleteBranch)),
+                    crate::ui_controls::button::secondary("Keep branch").id(widget::Id::new("dialog.branch.keep")).on_press(Message::ProjectUi(Action::KeepBranch(request.id))),
+                    crate::ui_controls::button::destructive("Force delete branch").on_press(Message::ProjectUi(Action::ForceDeleteBranch(request.id))),
                 ),
             ]).spacing(space::M), 500.0));
         }
@@ -3473,7 +3475,7 @@ mod tests {
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.is_some());
         }
-        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::ForceDeleteBranch)));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::ForceDeleteBranch(crate::model::OperationId::new()))));
         assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::BusyAgentsConfirmed(true))));
     }
 
@@ -3485,11 +3487,25 @@ mod tests {
         drop(app.handle_project_action(Action::BranchDeleted { request: request.clone(), result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Unmerged, detail: "Branch is not merged".into() }) }));
         assert_eq!(app.project_ui.force_branches.len(), 1);
         assert!(app.project_ui.branch_requests.is_empty());
-        drop(app.handle_project_action(Action::KeepBranch));
+        drop(app.handle_project_action(Action::KeepBranch(request.id)));
         assert!(app.project_ui.force_branches.is_empty());
         // Checked-out branches never offer the destructive fallback.
         app.project_ui.branch_requests.insert(request.id);
         drop(app.handle_project_action(Action::BranchDeleted { request, result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere, detail: "Checked out elsewhere".into() }) }));
+        assert!(app.project_ui.force_branches.is_empty());
+    }
+
+    #[test]
+    fn stale_branch_buttons_cannot_confirm_a_later_branch() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let stale = crate::model::OperationId::new();
+        let current = BranchDeletion { id: crate::model::OperationId::new(), repository: "/repo".into(), branch: "current".into(), expected_oid: "b".repeat(40), warnings: Vec::new() };
+        app.project_ui.force_branches.push_back((current.clone(), "Unmerged".into()));
+        drop(app.handle_project_action(Action::ForceDeleteBranch(stale)));
+        drop(app.handle_project_action(Action::KeepBranch(stale)));
+        assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current.id);
+        assert!(app.project_ui.branch_requests.is_empty());
+        drop(app.handle_project_action(Action::KeepBranch(current.id)));
         assert!(app.project_ui.force_branches.is_empty());
     }
 

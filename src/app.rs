@@ -2579,8 +2579,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                     project_ui::Action::Command { .. }
                         | project_ui::Action::ConfirmDelete
                         | project_ui::Action::DeleteBranchChanged(_)
-                        | project_ui::Action::ForceDeleteBranch
-                        | project_ui::Action::KeepBranch
+                        | project_ui::Action::ForceDeleteBranch(_)
+                        | project_ui::Action::KeepBranch(_)
                         | project_ui::Action::BusyAgentsConfirmed(_)
                         | project_ui::Action::OpenCleanupPolicy(_)
                         | project_ui::Action::CleanupPolicyChanged(_)
