@@ -362,7 +362,7 @@ mod tests {
     }
     #[tokio::test]
     async fn actual_selected_message_copy_uses_worker_and_rejects_stale_contexts() {
-        for change in 0..8 {
+        for change in 0..9 {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let mut runtime = runtime();
             let target = runtime.target;
@@ -438,6 +438,15 @@ mod tests {
                 7 => {
                     Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot)
                         .source_incarnation = Some(uuid::Uuid::new_v4());
+                }
+                8 => {
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    let source = runtime.snapshot.clone();
+                    runtime.revoke_source_originals();
+                    assert!(Arc::ptr_eq(&source, &runtime.snapshot));
+                    assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+                    assert!(Arc::ptr_eq(runtime.active_item(&child.id).unwrap(), &child),
+                        "quarantine cancels the copy even before body/token replacement");
                 }
                 _ => {
                     Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot)
