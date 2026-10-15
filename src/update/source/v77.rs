@@ -3,7 +3,7 @@
 use super::{Peer, UpdateError, impact, invalid};
 use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
 use serde::{Deserialize, Serialize};
-use std::{io::{Read, Write}, os::unix::net::UnixStream, path::Path, time::Duration};
+use std::{io::{self, Read, Write}, os::unix::net::UnixStream, path::Path, time::{Duration, Instant}};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Proof { host_session_id: String, boot_id: String, host_incarnation: String }
@@ -70,8 +70,9 @@ impl Client {
         // Connect0 has exactly expected_host and an empty resume cursor vector.
         let bytes = postcard::to_stdvec(&(77u16, 1u64, None::<Proof>, 0u32, None::<Proof>, Vec::<()>::new()))
             .map_err(|_| invalid("Cannot encode the protocol77 source handshake"))?;
-        write(&mut stream, &bytes)?;
-        let bytes = read(&mut stream)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        write(&mut stream, &bytes, deadline)?;
+        let bytes = read(&mut stream, deadline)?;
         let (header, body) = header(&bytes, 1, None)?;
         if header.response != 0 { return Err(invalid("The source did not complete its protocol77 upgrade handshake")); }
         let (proof, rest) = postcard::take_from_bytes::<Proof>(body).map_err(|_| invalid("Malformed protocol77 source proof"))?;
@@ -92,10 +93,10 @@ impl Client {
         self.next = id.checked_add(1).ok_or_else(|| invalid("Source request identity exhausted"))?;
         let bytes = postcard::to_stdvec(&(77u16, id, Some(Proof::from(&self.proof)), tag, fields))
             .map_err(|_| invalid("Cannot encode the protocol77 source upgrade request"))?;
-        self.stream.set_read_timeout(Some(timeout))?;
-        write(&mut self.stream, &bytes)?;
+        let deadline = Instant::now() + timeout;
+        write(&mut self.stream, &bytes, deadline)?;
         // Never repeat a partially written or unacknowledged preparation.
-        let bytes = read(&mut self.stream).map_err(|_| invalid("The source upgrade response was not confirmed. Its checkpoint and ownership require inspection; the request was not retried"))?;
+        let bytes = read(&mut self.stream, deadline).map_err(|_| invalid("The source upgrade response was not confirmed. Its checkpoint and ownership require inspection; the request was not retried"))?;
         let (header, body) = header(&bytes, id, Some(&self.proof))?;
         if header.response != response { return Err(invalid("The protocol77 source returned an unexpected upgrade response")); }
         Ok(body.to_vec())
@@ -131,13 +132,37 @@ fn header<'a>(bytes: &'a [u8], id: u64, proof: Option<&HostSessionProof>) -> Res
     Ok((header, body))
 }
 
-fn write(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), UpdateError> {
+struct DeadlineStream<'a> { stream: &'a mut UnixStream, deadline: Instant }
+impl DeadlineStream<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { Err(io::Error::new(io::ErrorKind::TimedOut, "source operation deadline elapsed")) }
+        else { Ok(remaining) }
+    }
+}
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(bytes)
+    }
+}
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> { self.stream.flush() }
+}
+
+fn write(stream: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Result<(), UpdateError> {
     if bytes.len() > 2 * 1024 * 1024 { return Err(invalid("The protocol77 source request exceeds its bounded frame limit")); }
+    let mut stream = DeadlineStream { stream, deadline };
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(bytes)?;
     Ok(())
 }
-fn read(stream: &mut UnixStream) -> Result<Vec<u8>, UpdateError> {
+fn read(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, UpdateError> {
+    let mut stream = DeadlineStream { stream, deadline };
     let mut prefix = [0;4]; stream.read_exact(&mut prefix)?;
     let length = u32::from_be_bytes(prefix) as usize;
     if length == 0 || length > 8 * 1024 * 1024 { return Err(invalid("The protocol77 source exceeded its bounded frame limit")); }
@@ -194,6 +219,29 @@ mod tests {
                 _ => envelope.message = ServerMessage::HostShuttingDown,
             }
             assert!(header(&postcard::to_stdvec(&envelope).unwrap(), 5, Some(&proof())).is_err());
+        }
+    }
+
+    #[test]
+    fn source77_deadline_covers_trickled_prefix_and_payload_without_resetting() {
+        for prefix_trickle in [true, false] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let frame = if prefix_trickle {
+                    [4u32.to_be_bytes().as_slice(), b"body"].concat()
+                } else {
+                    server.write_all(&4u32.to_be_bytes()).unwrap();
+                    b"body".to_vec()
+                };
+                for byte in frame {
+                    if server.write_all(&[byte]).is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(35));
+                }
+            });
+            let result = read(&mut client, Instant::now() + Duration::from_millis(55));
+            assert!(result.is_err(), "partial frame progress must not reset the absolute deadline");
+            drop(client);
+            worker.join().unwrap();
         }
     }
 }
