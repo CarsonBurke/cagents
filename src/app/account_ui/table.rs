@@ -641,10 +641,19 @@ fn line<'a>(
     height: f32,
 ) -> Element<'a, Message> {
     let mut items: Vec<Element<'a, Message>> = vec![
-        widget::container(account)
-            .width(Length::Fill)
-            .center_y(Length::Fill)
-            .into(),
+        widget::container(
+            widget::row::with_children(vec![
+                account,
+                iced::widget::Space::new()
+                    .width(0)
+                    .height((height - 2.0 * space::XS).max(0.0))
+                    .into(),
+            ])
+            .spacing(0),
+        )
+        .width(Length::Fill)
+        .center_y(Length::Fill)
+        .into(),
     ];
     items.extend(cells.into_iter().map(|(width, cell)| {
         widget::container(cell)
@@ -664,7 +673,6 @@ fn line<'a>(
             .spacing(COLUMN_SPACING)
             .height(Length::Shrink),
     )
-    .min_height(height)
     .padding([space::XS, space::M])
     .into()
 }
@@ -1144,7 +1152,7 @@ fn menu<'a>(
                     "Account name to confirm deletion",
                     &state.table.confirm_delete,
                 )
-                .on_input(|text| action(Action::RemovalDeleteInput(text)))
+                .on_input(|text| Message::AccountUi(Action::RemovalDeleteInput(text)))
                 .into(),
             );
             content.push(
