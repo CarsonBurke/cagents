@@ -19954,7 +19954,7 @@ mod tests {
         for message in emitted { drop(app.update(message)); }
         let draft = &app.settings_draft.agents[&provider];
         assert_eq!(draft.configuration.arguments, ["first-two", "second-one"]);
-        assert_eq!(draft.environment, [("RENAMED_A".into(), "updated-a".into()), ("FIXTURE_B".into(), "updated-b".into())]);
+        assert_eq!(draft.environment, [("RENAMED_A".to_owned(), "updated-a".to_owned()), ("FIXTURE_B".to_owned(), "updated-b".to_owned())]);
         let pending: Vec<_> = app.settings_pending.iter().map(|(field, (generation, _))| (*field, *generation)).collect();
         assert_eq!(pending.len(), 2);
         for (field, generation) in pending { drop(app.update(Message::SettingsAutosave { field, generation })); }
@@ -19980,7 +19980,7 @@ mod tests {
             drop(app.update(Message::AgentListEdited { provider, owner: environment, edit }));
         }
         assert_eq!(app.settings_draft.agents[&provider].configuration.arguments, ["still-second"]);
-        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".into(), "still-b".into())]);
+        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".to_owned(), "still-b".to_owned())]);
         // Two Add callbacks from the same tree both append to the current
         // draft; newly created rows keep independent identities.
         for _ in 0..2 { drop(app.update(Message::AgentListEdited { provider, owner: arguments, edit: AgentListEdit::AddArgument })); }
@@ -19994,7 +19994,7 @@ mod tests {
         for edit in [AgentListEdit::EnvironmentName { row: new_row, value: "FIXTURE_C".into() }, AgentListEdit::EnvironmentValue { row: new_row, value: "c".into() }] {
             drop(app.update(Message::AgentListEdited { provider, owner: environment, edit }));
         }
-        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".into(), "still-b".into()), ("FIXTURE_C".into(), "c".into())]);
+        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".to_owned(), "still-b".to_owned()), ("FIXTURE_C".to_owned(), "c".to_owned())]);
         // External adoption/reset installs new list ownership even when the
         // preference values compare equal. Old Add/remove/type callbacks fail.
         app.settings_draft = SettingsDraft::from_settings(&app.settings);
