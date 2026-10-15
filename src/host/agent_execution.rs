@@ -21,6 +21,8 @@ mod account_info;
 mod directory;
 pub(super) mod mailbox;
 mod ownership;
+mod restart;
+pub(super) use restart::{PairPlan, prepare_restart_pair, restore_restart_pair};
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
@@ -148,6 +150,18 @@ pub(super) fn submit(
         .previous_agent_acceptance(&origin, &request)?
     {
         return Ok(previous);
+    }
+    if let Destination::Existing(id) = &request.destination {
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent(*id)?;
+        if agent.origin != origin || agent.closed {
+            return Err("This caller does not own an open agent with that ID".into());
+        }
+        if let Some(HostedSession::Chat(session)) = &agent.session {
+            super::chat::check_restart_available(host, session)?;
+        }
     }
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
@@ -327,6 +341,13 @@ fn dispatch(
         .agent_request(accepted.run.id)
         .map_err(before)?;
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
+        super::chat::restart_completed_with_execution(
+            host,
+            EXECUTION_CLIENT,
+            session,
+            Some(context.clone()),
+        )
+        .map_err(|error| before(error.message))?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -532,6 +553,55 @@ fn dispatch(
     Ok(())
 }
 
+/// Save provider-confirmed identity even when no window has opened the chat.
+/// Presentation descriptors may be issued before the first init frame arrives.
+pub(super) fn retain_chat_identity(host: &SharedHost, id: TerminalId) {
+    let retained = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&id) else {
+            return;
+        };
+        let Some(identity) = record.handle.confirmed_session_id() else {
+            return;
+        };
+        if record.session.launch.session_id.as_ref() == Some(&identity) {
+            return;
+        }
+        let mut successor = record.session.clone();
+        successor.launch.session_id = Some(identity);
+        (record.session.clone(), successor, record.handle.clone())
+    };
+    let Ok(registry) = registry(host) else {
+        return;
+    };
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(
+            &[HostedSession::Chat(retained.0.clone())],
+            &HostedSession::Chat(retained.1.clone()),
+        );
+    match changed {
+        Ok(changed) => {
+            {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(record) = state.chats.get_mut(&id)
+                    && record.handle.same_actor(&retained.2)
+                    && record.session == retained.0
+                {
+                    record.session = retained.1;
+                }
+            }
+            if changed {
+                announce(host, &registry);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, %id, "cannot retain confirmed agent conversation identity")
+        }
+    }
+}
+
 pub(super) fn observed(
     host: &SharedHost,
     session: TerminalId,
@@ -539,6 +609,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
+    retain_chat_identity(host, session);
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
@@ -1031,6 +1102,17 @@ fn create_console(
     session: &chat::Session,
     handle: &chat::runtime::Handle,
 ) -> Result<(), ConsoleError> {
+    create_console_with_restart(host, registry, agent, session, handle, None).map(|_| ())
+}
+
+fn create_console_with_restart(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+    restart: Option<(&Agent, &chat::Session)>,
+) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     let program = crate::companion::Product::Cli
         .beside_current()
         .map_err(|e| e.to_string())?;
@@ -1129,15 +1211,30 @@ fn create_console(
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
         }
-        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let expected = registry
-            .agent(agent)?
-            .session
-            .ok_or("Provider binding disappeared")?;
-        registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
-        Ok::<_, String>(())
+        let receipt = if let Some((_, source)) = restart {
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let record = state.chats.get(&session.id)
+                    .filter(|record| record.handle.same_actor(handle))
+                    .ok_or("The restarted provider changed before its pair was saved")?;
+                let mut current = record.session.clone();
+                current.launch.session_id = handle.confirmed_session_id();
+                current.native_continuity = handle.native_continuity();
+                current
+            };
+            Some(chat::RestartReceipt::confirm(source.clone(), current)?)
+        } else { None };
+        let mut registry = registry.lock().unwrap_or_else(|p|p.into_inner());
+        if let Some((previous,_)) = restart {
+            registry.rebind_restarted_agent(previous, receipt.as_ref().ok_or("The restart receipt disappeared")?)?;
+        } else {
+            let expected = registry.agent(agent)?.session.ok_or("Provider binding disappeared")?;
+            registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
+        }
+        Ok::<_, String>(receipt)
     })();
-    if let Err(error) = publish {
+    if let Err(error) = &publish {
+        let error = error.clone();
         // The holder must retain its exact pair until terminal teardown is
         // proved. Clearing the pair first loses the cleanup owner if the daemon
         // crashes between that acknowledgment and terminal shutdown.
@@ -1189,8 +1286,9 @@ fn create_console(
         }
         return Err(ConsoleError::Known(error));
     }
+    let receipt = publish.map_err(ConsoleError::Known)?;
     announce(host, registry);
-    Ok(())
+    Ok(receipt)
 }
 
 fn console(

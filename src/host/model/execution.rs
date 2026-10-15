@@ -1049,6 +1049,53 @@ impl Registry {
         Ok(agent)
     }
 
+    /// Publish a replacement console only after the exact stopped owner has
+    /// been retired. Acceptance, runs, policy and caller capability are retained.
+    pub(crate) fn rebind_restarted_agent(
+        &mut self,
+        expected: &Agent,
+        receipt: &crate::chat::RestartReceipt,
+    ) -> Result<Agent, String> {
+        if !receipt.is_valid() {
+            return Err("The restarted conversation has no exact identity receipt".into());
+        }
+        let source = HostedSession::Chat(receipt.source().clone());
+        let replacement = HostedSession::Chat(receipt.replacement().clone());
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut agent = read_agent(&tx, expected.id)?;
+        if &agent != expected || agent.closed
+            || agent.session.as_ref().is_none_or(|session| !session.same_process(&source))
+            || agent.console.as_ref().is_some_and(|console| receipt.source().terminal.as_ref() != Some(console))
+        { return Err("The accepted agent or its console changed before restart was saved".into()); }
+        if let Some(HostedSession::Chat(saved)) = &agent.session {
+            if saved.launch.session_id.as_ref().is_some_and(|id| receipt.source().launch.session_id.as_ref() != Some(id))
+                || saved.owned_codex_listener != receipt.source().owned_codex_listener
+            { return Err("The accepted conversation identity changed before restart was saved".into()); }
+        }
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        if agent.console.is_some() {
+            agent.console = receipt.replacement().terminal.clone();
+        }
+        agent.session = Some(replacement.clone());
+        let authority: Option<String> = tx.query_row(
+            "SELECT source FROM agent_authorities WHERE session_id = ?1", [source.id().to_string()], |row|row.get(0)
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some(authority) = authority {
+            let authority: HostedSession = decode(&authority)?;
+            if !authority.same_process(&source) {
+                return Err("The issuing capability changed during native restart".into());
+            }
+            tx.execute("UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
+                params![source.id().to_string(), encode(&replacement)?]).map_err(|error| error.to_string())?;
+        }
+        tx.execute("UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
+            params![agent.id.to_string(), encode(&agent)?, replacement.id().to_string()]).map_err(|error| error.to_string())?;
+        tx.execute("UPDATE metadata SET sequence = sequence + 1 WHERE key = 0", []).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(agent)
+    }
+
     pub(crate) fn retained_agent_authority_source(
         &self,
         id: crate::model::TerminalId,
@@ -2112,6 +2159,38 @@ mod tests {
                 assert_eq!(actual.state, State::Interrupted, "{changed} is not evidence for this accepted run");
             }
         }
+    }
+
+    #[test]
+    fn console_restart_preserves_acceptance_runs_and_capability_and_fences_stale_pair() {
+        let (mut registry,_directory,request)=fixture();
+        let accepted=registry.submit_agent(&Origin::User,&request,1).unwrap();
+        let HostedSession::Chat(mut original)=source() else {unreachable!()};
+        let issued=HostedSession::Chat(original.clone());
+        registry.bind_agent(accepted.agent.id,None,issued.clone()).unwrap();
+        let capability=registry.fresh_agent_authority(&issued).unwrap();
+        let recipe=crate::model::LaunchRecipe {
+            program:"/matched/cagents".into(),arguments:vec!["agent".into(),"console".into(),accepted.agent.id.to_string()],
+            working_directory:original.launch.recipe.working_directory.clone(),environment:Default::default(),unset_environment:Default::default(),
+        };
+        let mut terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(original.id,recipe,None).session;
+        let proof=original.proof.as_ref().unwrap();
+        terminal.continuity=crate::model::TerminalContinuity::Live {host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
+        registry.bind_agent_console(accepted.agent.id,&issued,terminal.clone()).unwrap();
+        original.terminal=Some(terminal);
+        let before=registry.agent(accepted.agent.id).unwrap();
+        let run=registry.agent_run(accepted.run.id).unwrap();
+        let mut replacement=original.clone();replacement.terminal.as_mut().unwrap().transcript_path=Some("/fixture/new-console.log".into());
+        let receipt=crate::chat::RestartReceipt::confirm(original,replacement.clone()).unwrap();
+        let rebound=registry.rebind_restarted_agent(&before,&receipt).unwrap();
+        assert_eq!(rebound.id,before.id);assert_eq!(rebound.spec,before.spec);assert_eq!(rebound.origin,before.origin);
+        assert_eq!(rebound.console,replacement.terminal);assert_eq!(rebound.session,Some(HostedSession::Chat(replacement.clone())));
+        assert_eq!(registry.agent_run(run.id).unwrap(),run);
+        assert_eq!(registry.register_agent_authority(&HostedSession::Chat(replacement.clone())).unwrap(),capability);
+        let stored:String=registry.db.query_row("SELECT source FROM agent_authorities WHERE session_id=?1",[replacement.id.to_string()],|row|row.get(0)).unwrap();
+        assert_eq!(decode::<HostedSession>(&stored).unwrap(),HostedSession::Chat(replacement));
+        assert!(registry.rebind_restarted_agent(&before,&receipt).is_err());
+        assert_eq!(registry.agent(rebound.id).unwrap(),rebound);
     }
 
     #[test]

@@ -145,7 +145,8 @@ use crate::{
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 /// Version 78 carries terminal provider outcomes and readable exit diagnostics.
 /// Version 79 pages immutable retained provider output by opaque log identity.
-pub const PROTOCOL_VERSION: u16 = 79;
+/// Version 80 carries an exact same-daemon provider and console restart receipt.
+pub const PROTOCOL_VERSION: u16 = 80;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -797,6 +798,10 @@ pub enum ServerResponse {
         bytes: Vec<u8>,
         next_offset: Option<u64>,
         omitted: u64,
+    },
+    ChatRestarted {
+        receipt: crate::chat::RestartReceipt,
+        snapshot: crate::chat::Snapshot,
     },
 }
 

@@ -92,13 +92,14 @@ pub(super) fn restore(
         if state
             .chats
             .get(&source.id)
-            .is_some_and(|record| record.handle.owns_work())
+            .is_some_and(|record| !record.handle.is_completed())
         {
             return Err("The native conversation already has a live actor; attach to it".into());
         }
         if state.chat_handoffs.contains_key(&source.id)
             || state.chats.values().any(|record| {
                 record.handle.owns_work()
+                    && !(record.session.id == source.id && record.handle.is_completed())
                     && same_conversation(&record.session.launch, &source.launch)
             })
             || state
@@ -194,7 +195,12 @@ fn restore_authenticated(
         .clone();
     let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
-    let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
+    let previous = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&source.id)
+        .filter(|record| record.handle.is_completed()).map(|record| record.handle.clone());
+    let store = match previous.as_ref() {
+        Some(previous) => chat::runtime::preflight_retained_restart(&spec, &mut initial, previous)?,
+        None => chat::runtime::preflight_retained(&spec, &mut initial)?,
+    };
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
     let mut session = recovery.source.clone();
     let execution_console = recovery.execution_console.clone();
@@ -205,13 +211,14 @@ fn restore_authenticated(
     let weak = Arc::downgrade(host);
     let id = session.id;
     let execution_instance = uuid::Uuid::new_v4();
-    let handle = Handle::start_adopted(
+    let handle = Handle::start_adopted_with_previous(
         spec,
         adapter,
         initial,
         store,
         recovery,
         holder,
+        previous.as_ref(),
         move |update| {
             if let Update::Execution { run, update } = update {
                 if let Some(host) = weak.upgrade() {
