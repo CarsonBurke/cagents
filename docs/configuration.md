@@ -491,3 +491,11 @@ Native code-buffer language actions are configurable as `editor_complete`
 `show_hover` and `show_diagnostics` (unbound). Clearing or remapping these
 bindings retires their original native chords. `Space` is accepted as a named
 key in configured chords and the shortcut recorder.
+
+File-surface commands are `editor_save` (`Ctrl+S`), `editor_discard_edits`,
+`editor_edit`, `editor_preview` and `editor_diff` (the latter four unbound).
+Their availability follows the file toolbar, including save and read-only
+checks. Clearing or remapping `editor_save` retires the original `Ctrl+S`
+binding. Repository commands keep ordinary fields, chat and terminal input
+separate; the Keyboard table shows **Scoped** for bindings whose pane context
+cannot take a terminal's keys.

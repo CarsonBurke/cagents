@@ -2308,22 +2308,6 @@ fn is_escape_press(event: &keyboard::Event) -> bool {
     )
 }
 
-fn is_save_press(event: &keyboard::Event) -> bool {
-    matches!(
-        event,
-        keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
-            modifiers,
-            repeat: false,
-            ..
-        } if key.eq_ignore_ascii_case("s")
-            && modifiers.control()
-            && !modifiers.alt()
-            && !modifiers.shift()
-            && !modifiers.logo()
-    )
-}
-
 #[cfg(feature = "integrated-browser")]
 fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     use keyboard::{Key, key::Named};
@@ -2954,12 +2938,17 @@ pub enum SettingsField {
     ShortcutFindReferences,
     ShortcutShowHover,
     ShortcutShowDiagnostics,
+    ShortcutEditorSave,
+    ShortcutEditorDiscardEdits,
+    ShortcutEditorEdit,
+    ShortcutEditorPreview,
+    ShortcutEditorDiff,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 143] = [
+    const SHORTCUTS: [Self; 148] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3108,6 +3097,11 @@ impl SettingsField {
         Self::ShortcutFindReferences,
         Self::ShortcutShowHover,
         Self::ShortcutShowDiagnostics,
+        Self::ShortcutEditorSave,
+        Self::ShortcutEditorDiscardEdits,
+        Self::ShortcutEditorEdit,
+        Self::ShortcutEditorPreview,
+        Self::ShortcutEditorDiff,
 
     ];
 
@@ -3261,6 +3255,11 @@ impl SettingsField {
             Self::ShortcutFindReferences => "Find references",
             Self::ShortcutShowHover => "Show hover information",
             Self::ShortcutShowDiagnostics => "Show diagnostics",
+            Self::ShortcutEditorSave => "Save file",
+            Self::ShortcutEditorDiscardEdits => "Discard unsaved edits",
+            Self::ShortcutEditorEdit => "Edit file",
+            Self::ShortcutEditorPreview => "Preview file",
+            Self::ShortcutEditorDiff => "View diff",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3468,6 +3467,11 @@ impl SettingsField {
             | Self::ShortcutFindReferences
             | Self::ShortcutShowHover
             | Self::ShortcutShowDiagnostics
+            | Self::ShortcutEditorSave
+            | Self::ShortcutEditorDiscardEdits
+            | Self::ShortcutEditorEdit
+            | Self::ShortcutEditorPreview
+            | Self::ShortcutEditorDiff
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3638,6 +3642,11 @@ struct ShortcutDraft {
     find_references: String,
     show_hover: String,
     show_diagnostics: String,
+    editor_save: String,
+    editor_discard_edits: String,
+    editor_edit: String,
+    editor_preview: String,
+    editor_diff: String,
 
 
     command_palette: String,
@@ -3796,6 +3805,11 @@ impl ShortcutDraft {
             find_references: settings::format_chords(&shortcuts.find_references),
             show_hover: settings::format_chords(&shortcuts.show_hover),
             show_diagnostics: settings::format_chords(&shortcuts.show_diagnostics),
+            editor_save: settings::format_chords(&shortcuts.editor_save),
+            editor_discard_edits: settings::format_chords(&shortcuts.editor_discard_edits),
+            editor_edit: settings::format_chords(&shortcuts.editor_edit),
+            editor_preview: settings::format_chords(&shortcuts.editor_preview),
+            editor_diff: settings::format_chords(&shortcuts.editor_diff),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4169,6 +4183,11 @@ impl SettingsDraft {
             SettingsField::ShortcutFindReferences => self.keyboard_shortcuts.find_references = value,
             SettingsField::ShortcutShowHover => self.keyboard_shortcuts.show_hover = value,
             SettingsField::ShortcutShowDiagnostics => self.keyboard_shortcuts.show_diagnostics = value,
+            SettingsField::ShortcutEditorSave => self.keyboard_shortcuts.editor_save = value,
+            SettingsField::ShortcutEditorDiscardEdits => self.keyboard_shortcuts.editor_discard_edits = value,
+            SettingsField::ShortcutEditorEdit => self.keyboard_shortcuts.editor_edit = value,
+            SettingsField::ShortcutEditorPreview => self.keyboard_shortcuts.editor_preview = value,
+            SettingsField::ShortcutEditorDiff => self.keyboard_shortcuts.editor_diff = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4535,6 +4554,11 @@ fn settings_update(
         SettingsField::ShortcutFindReferences => { next.keyboard_shortcuts.find_references = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutShowHover => { next.keyboard_shortcuts.show_hover = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutShowDiagnostics => { next.keyboard_shortcuts.show_diagnostics = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorSave => { next.keyboard_shortcuts.editor_save = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorDiscardEdits => { next.keyboard_shortcuts.editor_discard_edits = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorEdit => { next.keyboard_shortcuts.editor_edit = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorPreview => { next.keyboard_shortcuts.editor_preview = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorDiff => { next.keyboard_shortcuts.editor_diff = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -7766,6 +7790,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            Some(CardRuntime::Repository(_)) => workspace_widget::FocusedPane::RepositoryPane,
             _ if self
                 .card_state(card)
                 .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
@@ -18332,25 +18357,6 @@ impl Application for Cagents {
                         editor: true,
                     });
                 }
-                    if is_save_press(&event)
-                        && !matches!(
-                            self.focused_pane(),
-                            workspace_widget::FocusedPane::TextInput
-                                | workspace_widget::FocusedPane::OutsideWorkspace
-                                | workspace_widget::FocusedPane::SidebarRows
-                                | workspace_widget::FocusedPane::SidebarFiles
-                                | workspace_widget::FocusedPane::SidebarChanges
-                        )
-                        && let Some(card) = self.workspace.focused()
-                        && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
-                    {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::Save {
-                                card,
-                                overwrite: false,
-                            },
-                        ));
-                    }
                     match workspace_widget::global_shortcut(
                         &event,
                         &self.settings.keyboard_shortcuts,

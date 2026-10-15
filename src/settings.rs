@@ -390,6 +390,11 @@ pub struct KeyboardShortcuts {
     pub find_references: Vec<String>,
     pub show_hover: Vec<String>,
     pub show_diagnostics: Vec<String>,
+    pub editor_save: Vec<String>,
+    pub editor_discard_edits: Vec<String>,
+    pub editor_edit: Vec<String>,
+    pub editor_preview: Vec<String>,
+    pub editor_diff: Vec<String>,
 
 
     /// Serialized action names whose configured chords pass through to terminals.
@@ -547,6 +552,11 @@ impl Default for KeyboardShortcuts {
             find_references: vec!["Shift+F12".into()],
             show_hover: Vec::new(),
             show_diagnostics: Vec::new(),
+            editor_save: vec!["Ctrl+S".into()],
+            editor_discard_edits: Vec::new(),
+            editor_edit: Vec::new(),
+            editor_preview: Vec::new(),
+            editor_diff: Vec::new(),
 
 
             terminal_passthrough_actions: [
@@ -580,7 +590,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 143] {
+    pub fn actions(&self) -> [&Vec<String>; 148] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -730,6 +740,11 @@ impl KeyboardShortcuts {
             &self.find_references,
             &self.show_hover,
             &self.show_diagnostics,
+            &self.editor_save,
+            &self.editor_discard_edits,
+            &self.editor_edit,
+            &self.editor_preview,
+            &self.editor_diff,
 
 
         ]
@@ -737,7 +752,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 143] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 148] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -882,6 +897,11 @@ impl KeyboardShortcuts {
             &mut self.find_references,
             &mut self.show_hover,
             &mut self.show_diagnostics,
+            &mut self.editor_save,
+            &mut self.editor_discard_edits,
+            &mut self.editor_edit,
+            &mut self.editor_preview,
+            &mut self.editor_diff,
 
         ]
     }
@@ -932,7 +952,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 143] = [
+const SHORTCUT_ACTIONS: [&str; 148] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1081,6 +1101,11 @@ const SHORTCUT_ACTIONS: [&str; 143] = [
     "find_references",
     "show_hover",
     "show_diagnostics",
+    "editor_save",
+    "editor_discard_edits",
+    "editor_edit",
+    "editor_preview",
+    "editor_diff",
 
 
 ];
@@ -1096,6 +1121,8 @@ pub struct ShortcutFault {
 /// A chord handled directly by a native surface rather than the action table.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedShortcut {
+    /// A registered native action may own its conventional reserved chord.
+    pub owner: Option<&'static str>,
     pub label: &'static str,
     pub chords: &'static [&'static str],
     pub scope: &'static str,
@@ -1104,48 +1131,56 @@ pub struct FixedShortcut {
 
 pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut {
+        owner: None,
         label: "Cycle recent panes",
         chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
         scope: "Navigation",
         refusal: "This chord is reserved for Cycle recent panes",
     },
     FixedShortcut {
+        owner: None,
         label: "Increase font size",
         chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
         scope: "Editor",
         refusal: "This chord is reserved for Increase font size",
     },
     FixedShortcut {
+        owner: None,
         label: "Decrease font size",
         chords: &["Ctrl+-"],
         scope: "Editor",
         refusal: "This chord is reserved for Decrease font size",
     },
     FixedShortcut {
+        owner: None,
         label: "Reset font size",
         chords: &["Ctrl+0"],
         scope: "Editor",
         refusal: "This chord is reserved for Reset font size",
     },
     FixedShortcut {
+        owner: Some("editor_save"),
         label: "Save file",
         chords: &["Ctrl+S"],
         scope: "Editor",
         refusal: "This chord is reserved for Save file",
     },
     FixedShortcut {
+        owner: None,
         label: "Stage / unstage selected lines",
         chords: &["Ctrl+Shift+S"],
         scope: "Editor",
         refusal: "This chord is reserved for Stage / unstage selected lines",
     },
     FixedShortcut {
+        owner: None,
         label: "Copy terminal selection",
         chords: &["Ctrl+Shift+C"],
         scope: "Panes",
         refusal: "This chord is reserved for Copy terminal selection",
     },
     FixedShortcut {
+        owner: None,
         label: "Paste into terminal",
         chords: &["Ctrl+Shift+V"],
         scope: "Panes",
@@ -1158,36 +1193,42 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
 /// default such as Reopen pane on the editor's Redo chord.
 pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut {
+        owner: None,
         label: "Undo text edit",
         chords: &["Ctrl+Z"],
         scope: "Editor",
         refusal: "Text inputs keep Undo; this action is available outside text editing",
     },
     FixedShortcut {
+        owner: None,
         label: "Redo text edit",
         chords: &["Ctrl+Shift+Z", "Ctrl+Y"],
         scope: "Editor",
         refusal: "Text inputs keep Redo; this action is available outside text editing",
     },
     FixedShortcut {
+        owner: None,
         label: "Select all text",
         chords: &["Ctrl+A"],
         scope: "Editor",
         refusal: "Text inputs keep Select all; this action is available outside text editing",
     },
     FixedShortcut {
+        owner: None,
         label: "Copy / cut / paste text",
         chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"],
         scope: "Editor",
         refusal: "Text inputs keep clipboard editing; this action is available outside text editing",
     },
     FixedShortcut {
+        owner: None,
         label: "Find in text",
         chords: &["Ctrl+F"],
         scope: "Editor",
         refusal: "Text inputs keep Find; other actions are available outside text editing",
     },
     FixedShortcut {
+        owner: None,
         label: "Navigate / delete words",
         chords: &[
             "Ctrl+Left",
@@ -1243,6 +1284,7 @@ pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBind
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
+    if FIXED_SHORTCUTS.iter().any(|fixed| fixed.owner == Some(action) && fixed.chords.iter().any(|chord| parse_shortcut(chord).ok() == Some(binding))) { return None; }
     if (is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some())
         || (action == "diff_copy" && parse_shortcut("Ctrl+C").ok() == Some(binding))
         || (action == "diff_select_all" && parse_shortcut("Ctrl+A").ok() == Some(binding))
@@ -2268,7 +2310,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 138] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 143] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2412,6 +2454,11 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 138] = [
     "find_references",
     "show_hover",
     "show_diagnostics",
+    "editor_save",
+    "editor_discard_edits",
+    "editor_edit",
+    "editor_preview",
+    "editor_diff",
 
 
 ];

@@ -525,7 +525,7 @@ impl Cagents {
             }
             if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
                 let name = match key {
-                    keyboard::Key::Character(value) if value == " " => Some("Space".to_owned()),
+                    keyboard::Key::Character(value) if value.as_str() == " " => Some("Space".to_owned()),
                     keyboard::Key::Character(value) if value.chars().count() == 1 => {
                         Some(value.to_uppercase())
                     }
@@ -1189,6 +1189,7 @@ impl Cagents {
                 Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
                 Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => workspace_widget::FocusedPane::Review,
                 Some(CardRuntime::Repository(runtime)) if card.is_some_and(|card| runtime.editor_focus_target(card).is_some()) => workspace_widget::FocusedPane::Editor,
+                Some(CardRuntime::Repository(_)) => workspace_widget::FocusedPane::RepositoryPane,
                 _ if state.is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
                 _ => workspace_widget::FocusedPane::Other,
             },
@@ -1200,6 +1201,7 @@ impl Cagents {
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
+            editor_surface_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_surface_command_capabilities(id), Some(CardRuntime::PullRequests(pane)) => pane.runtime.editor_surface_command_capabilities(id), _ => 0 }),
             editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
             pane_index,
             pane_count: self.workspace.order().count(),
@@ -1296,6 +1298,13 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::editor_surface_command_bit(command).is_some() {
+            return self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.registered_surface_command_action(card, command),
+                Some(CardRuntime::PullRequests(pane)) => pane.runtime.registered_surface_command_action(card, command),
+                _ => None,
+            }).map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        }
         if workspace_widget::editor_language_command_bit(command).is_some() {
             return self.workspace.focused().and_then(|card| match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime.editor_language_command_action(card, command),
@@ -1551,6 +1560,11 @@ impl Cagents {
             | Command::FindReferences
             | Command::ShowHover
             | Command::ShowDiagnostics
+            | Command::EditorSave
+            | Command::EditorDiscardEdits
+            | Command::EditorEdit
+            | Command::EditorPreview
+            | Command::EditorDiff
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1828,6 +1842,11 @@ impl SettingsField {
             Self::ShortcutFindReferences => Some(Command::FindReferences),
             Self::ShortcutShowHover => Some(Command::ShowHover),
             Self::ShortcutShowDiagnostics => Some(Command::ShowDiagnostics),
+            Self::ShortcutEditorSave => Some(Command::EditorSave),
+            Self::ShortcutEditorDiscardEdits => Some(Command::EditorDiscardEdits),
+            Self::ShortcutEditorEdit => Some(Command::EditorEdit),
+            Self::ShortcutEditorPreview => Some(Command::EditorPreview),
+            Self::ShortcutEditorDiff => Some(Command::EditorDiff),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -2009,6 +2028,11 @@ impl ShortcutDraft {
             (Command::FindReferences, self.find_references.as_str()),
             (Command::ShowHover, self.show_hover.as_str()),
             (Command::ShowDiagnostics, self.show_diagnostics.as_str()),
+            (Command::EditorSave, self.editor_save.as_str()),
+            (Command::EditorDiscardEdits, self.editor_discard_edits.as_str()),
+            (Command::EditorEdit, self.editor_edit.as_str()),
+            (Command::EditorPreview, self.editor_preview.as_str()),
+            (Command::EditorDiff, self.editor_diff.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
@@ -2725,6 +2749,49 @@ mod tests {
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
         app
+    }
+
+    #[test]
+    fn configured_save_retires_old_chords_and_respects_actual_repository_focus() {
+        use workspace_widget::FocusedPane;
+        let make = || {
+            let mut app = settings_focus_fixture();
+            let card = app.workspace.focused().unwrap();
+            let mut runtime = RepositoryRuntime::dirty_fixture(card);
+            runtime.set_auto_save(false);
+            app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            (app, card)
+        };
+        let press = |app: &mut Cagents, card, pane, key, physical, modifiers| {
+            drop(app.update(Message::RoutedKeyEvent {
+                event: keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modified_key: keyboard::Key::Character("s".into()), physical_key: physical, location: keyboard::Location::Standard, modifiers, text: None, repeat: false },
+                captured: true, region: crate::input_trace::KeyboardRegion { pane, card: Some(card) }, widget: None,
+            }));
+        };
+        for (pane, expected) in [(FocusedPane::RepositoryPane, true), (FocusedPane::Review, true), (FocusedPane::Editor, true), (FocusedPane::TextInput, false), (FocusedPane::SidebarRows, false), (FocusedPane::SidebarFiles, false), (FocusedPane::SidebarChanges, false), (FocusedPane::Terminal, false), (FocusedPane::Chat, false), (FocusedPane::ChatPane, false), (FocusedPane::OutsideWorkspace, false), (FocusedPane::Other, false)] {
+            let (mut app, card) = make();
+            assert!(app.command_available(Command::EditorSave));
+            press(&mut app, card, pane, "s".into(), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL);
+            assert_eq!(app.focused_repository_is_saving(), expected, "{pane:?}");
+        }
+        let (mut app, card) = make();
+        app.settings.keyboard_shortcuts.editor_save.clear();
+        assert!(app.settings.clone().validate().is_ok());
+        press(&mut app, card, FocusedPane::Editor, "s".into(), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL);
+        assert!(!app.focused_repository_is_saving(), "clearing Save retires Ctrl+S");
+        app.settings.keyboard_shortcuts.editor_save = vec!["Ctrl+Alt+F9".into()];
+        assert!(app.settings.clone().validate().is_ok());
+        press(&mut app, card, FocusedPane::Editor, "s".into(), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL);
+        assert!(!app.focused_repository_is_saving(), "rebinding Save leaves the old chord retired");
+        drop(app.update(Message::RoutedKeyEvent {
+            event: keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F9), modified_key: keyboard::Key::Named(keyboard::key::Named::F9), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, text: None, repeat: false },
+            captured: true, region: crate::input_trace::KeyboardRegion { pane: FocusedPane::Editor, card: Some(card) }, widget: None,
+        }));
+        assert!(app.focused_repository_is_saving(), "the configured chord uses the actual save controller once");
+        let (mut app, card) = make();
+        press(&mut app, card, FocusedPane::Editor, "ы".into(), keyboard::key::Physical::Code(keyboard::key::Code::KeyS), keyboard::Modifiers::CTRL);
+        assert!(app.focused_repository_is_saving(), "physical KeyS preserves save on a non-Latin layout");
     }
 
     #[test]

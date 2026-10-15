@@ -4877,6 +4877,27 @@ impl RepositoryRuntime {
         matches!(&self.document, DocumentState::Editable(document) if document.dirty)
     }
 
+    pub fn registered_surface_command_action(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let surface = match command {
+            Command::EditorSave => EditorSurfaceCommand::Save,
+            Command::EditorDiscardEdits => EditorSurfaceCommand::DiscardEdits,
+            Command::EditorEdit => EditorSurfaceCommand::Edit,
+            Command::EditorPreview => EditorSurfaceCommand::Preview,
+            Command::EditorDiff => EditorSurfaceCommand::Diff,
+            _ => return None,
+        };
+        self.editor_surface_command_action(card, surface)
+    }
+
+    pub fn editor_surface_command_capabilities(&self, card: CardId) -> u8 {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        [Command::EditorSave, Command::EditorDiscardEdits, Command::EditorEdit, Command::EditorPreview, Command::EditorDiff].into_iter().filter_map(|command| {
+            self.registered_surface_command_action(card, command)
+                .and_then(|_| crate::workspace_widget::editor_surface_command_bit(command))
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
     /// Returns the exact toolbar action when its current document can accept
     /// it. Palette and remapped shortcuts use this same activation-time guard.
     pub fn editor_surface_command_action(&self, card: CardId, command: EditorSurfaceCommand) -> Option<RepositoryAction> {

@@ -1262,7 +1262,7 @@ fn keyboard_groups<'a>(
         for fixed in settings::FIXED_SHORTCUTS
             .iter()
             .chain(settings::TEXT_EDITING_SHORTCUTS)
-            .filter(|fixed| fixed.scope == group)
+            .filter(|fixed| fixed.scope == group && fixed.owner.is_none())
         {
             let keys = fixed.chords.join(", ");
             let row = widget::row::with_children(vec![
@@ -1379,6 +1379,8 @@ fn shortcut_input<'a>(
         widget::row::with_children(controls).spacing(2).align_y(Alignment::Center).width(Length::FillPortion(4)).into(),
         design::caption(source).width(64).into(),
         {
+            let scope = workspace_widget::shortcut_descriptor(action).scope;
+            if scope.applies_to(workspace_widget::FocusedPane::Terminal) || scope == workspace_widget::ShortcutScope::OutsideTerminal {
             let action_key = KeyboardShortcuts::action_names()[index];
             crate::ui_controls::field::checkbox(
                 draft
@@ -1392,6 +1394,9 @@ fn shortcut_input<'a>(
                 enabled,
             })
             .into()
+            } else {
+                crate::interaction::tooltip(design::caption("Scoped"), "Applies only in its pane context; terminals keep these keys").into()
+            }
         },
     ])
     .spacing(space::S)

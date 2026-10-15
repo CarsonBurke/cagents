@@ -156,6 +156,11 @@ pub enum GlobalShortcut {
     FindReferences,
     ShowHover,
     ShowDiagnostics,
+    EditorSave,
+    EditorDiscardEdits,
+    EditorEdit,
+    EditorPreview,
+    EditorDiff,
 
 
     CommandPalette,
@@ -389,6 +394,11 @@ impl GlobalShortcut {
             Self::FindReferences => "find_references",
             Self::ShowHover => "show_hover",
             Self::ShowDiagnostics => "show_diagnostics",
+            Self::EditorSave => "editor_save",
+            Self::EditorDiscardEdits => "editor_discard_edits",
+            Self::EditorEdit => "editor_edit",
+            Self::EditorPreview => "editor_preview",
+            Self::EditorDiff => "editor_diff",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -458,6 +468,8 @@ pub enum ShortcutScope {
     Chat,
     /// Native editable code buffer only.
     Editor,
+    /// Repository content or its non-text pane controls, including local diff.
+    Repository,
 }
 
 impl ShortcutScope {
@@ -472,6 +484,7 @@ impl ShortcutScope {
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
             Self::Editor => focused == FocusedPane::Editor,
+            Self::Repository => matches!(focused, FocusedPane::Editor | FocusedPane::Review | FocusedPane::RepositoryPane),
         }
     }
 }
@@ -482,6 +495,8 @@ pub enum FocusedPane {
     SidebarRows,
     SidebarFiles,
     SidebarChanges,
+    /// Repository pane chrome or non-editable content; text fields keep TextInput.
+    RepositoryPane,
     /// A terminal, which forwards the keys it is given to its process.
     Terminal,
     /// A pull request review pane.
@@ -546,6 +561,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
     pub diff_commands: u8,
     pub review_commands: u8,
@@ -598,7 +614,7 @@ impl ShortcutDescriptor {
             || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
         {
             "Chat"
-        } else if self.scope == ShortcutScope::Editor {
+        } else if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::Repository) {
             "Editor"
         } else if self.scope == ShortcutScope::Review {
             "Review"
@@ -630,6 +646,7 @@ impl ShortcutDescriptor {
             return context.diff_commands & bit != 0;
         }
         if let Some(bit) = editor_language_command_bit(self.action) { return context.editor_language_commands & bit != 0; }
+        if let Some(bit) = editor_surface_command_bit(self.action) { return context.editor_surface_commands & bit != 0; }
         if let Some(bit) = editor_command_bit(self.action) {
             return context.editor_commands & bit != 0;
         }
@@ -1318,6 +1335,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::FindReferences, label: "Find references", repeatable: false, scope: ShortcutScope::Editor },
     ShortcutDescriptor { action: GlobalShortcut::ShowHover, label: "Show hover information", repeatable: false, scope: ShortcutScope::Editor },
     ShortcutDescriptor { action: GlobalShortcut::ShowDiagnostics, label: "Show diagnostics", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::EditorSave, label: "Save file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::EditorDiscardEdits, label: "Discard unsaved edits", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::EditorEdit, label: "Edit file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::EditorPreview, label: "Preview file", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::EditorDiff, label: "View diff", repeatable: false, scope: ShortcutScope::Repository },
 
 ];
 
@@ -1446,6 +1468,11 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::FindReferences => &shortcuts.find_references,
         GlobalShortcut::ShowHover => &shortcuts.show_hover,
         GlobalShortcut::ShowDiagnostics => &shortcuts.show_diagnostics,
+        GlobalShortcut::EditorSave => &shortcuts.editor_save,
+        GlobalShortcut::EditorDiscardEdits => &shortcuts.editor_discard_edits,
+        GlobalShortcut::EditorEdit => &shortcuts.editor_edit,
+        GlobalShortcut::EditorPreview => &shortcuts.editor_preview,
+        GlobalShortcut::EditorDiff => &shortcuts.editor_diff,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
@@ -1986,6 +2013,17 @@ pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> 
         GlobalShortcut::FindReferences => Some(1 << 2),
         GlobalShortcut::ShowHover => Some(1 << 3),
         GlobalShortcut::ShowDiagnostics => Some(1 << 4),
+        _ => None,
+    }
+}
+
+pub const fn editor_surface_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::EditorSave => Some(1 << 0),
+        GlobalShortcut::EditorDiscardEdits => Some(1 << 1),
+        GlobalShortcut::EditorEdit => Some(1 << 2),
+        GlobalShortcut::EditorPreview => Some(1 << 3),
+        GlobalShortcut::EditorDiff => Some(1 << 4),
         _ => None,
     }
 }
