@@ -571,4 +571,21 @@ mod tests {
         assert!(app.chat_runtime_mut(target).unwrap().expanded.is_empty());
     }
 
+    #[test]
+    fn message_copy_never_uses_a_same_id_foreign_coordination_cache() {
+        use chat::coordination::{Coordination,Kind,Outbound,OutboundKind,Text};
+        let mut runtime=runtime();let selected=Arc::new(chat::Item {id:"same-message-id".into(),role:chat::Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Text {text:"selected child message".into(),thinking:false,phase:chat::Phase::Final}});
+        let foreign=Arc::new(chat::Item {id:selected.id.clone(),role:chat::Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Tool {name:"foreign coordinator".into(),input:"private other call".into(),output:String::new(),status:chat::ToolStatus::Succeeded}});
+        Arc::make_mut(&mut runtime.snapshot).subagents=vec![chat::Subagent {id:"selected-child".into(),kind:String::new(),description:String::new(),status:chat::ToolStatus::Succeeded,
+            model:None,waiting:false,detail:String::new(),background:false,items:vec![selected.clone()]}];runtime.selected_subagent=Some("selected-child".into());
+        let reading=Coordination {kind:Kind::Message(Outbound {kind:OutboundKind::Send,to:"another actor".into(),body:Text::Inline("UNRELATED PRIVATE COORDINATION BODY".into()),summary:String::new(),waits:false}),
+            outcome:Default::default(),subagents:vec![],cli:true};
+        let mut cached=CachedItem::updated(&foreign.content,runtime.syntax_theme,None,true,false,Some(reading));cached.item=Some(foreign);
+        assert!(cached.coordination.as_ref().unwrap().is_card());runtime.cache.insert(selected.id.clone(),cached);
+        assert_eq!(runtime.active_copy_text(&selected.id,CopyPart::Text).as_deref(),Some("selected child message"));
+        assert_eq!(runtime.active_copy_text(&selected.id,CopyPart::PlainText).as_deref(),Some("selected child message"));
+    }
+
 }

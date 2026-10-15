@@ -327,7 +327,9 @@ impl Runtime {
     pub(super) fn active_copy_text(&self,id:&str,part:CopyPart)->Option<String> {
         let item=self.active_item(id)?;
         if matches!(part,CopyPart::PlainText) && item.role==chat::Role::User {return copy_text(CopyPart::Text,&item.content);}
-        let card=self.cache.get(&item.id).and_then(|cached|cached.coordination.as_deref()).filter(|card|card.is_card());
+        let card=self.cache.get(&item.id)
+            .filter(|cached|cached.item.as_ref().is_some_and(|source|Arc::ptr_eq(source,item)))
+            .and_then(|cached|cached.coordination.as_deref()).filter(|card|card.is_card());
         match card {
             Some(card) if matches!(part,CopyPart::Text)=>card.copy_text().or_else(||copy_text(part,&item.content)),
             _=>copy_text(part,&item.content),
