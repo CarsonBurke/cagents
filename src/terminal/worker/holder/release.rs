@@ -5,6 +5,8 @@ use super::super::CompletedRelease;
 use std::sync::OnceLock;
 enum Task {
     Final(Holder),
+    #[cfg(test)]
+    Block { entered: crossbeam_channel::Sender<()>, release: crossbeam_channel::Receiver<()> },
     Completed {
         handle: super::super::TerminalHandle,
         deadline: Instant,
@@ -29,6 +31,11 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
                 while let Ok(task) = receiver.recv() {
                     let _wake = CompletionWake;
                     match task {
+                        #[cfg(test)]
+                        Task::Block { entered, release } => {
+                            let _ = entered.send(());
+                            let _ = release.recv_timeout(Duration::from_secs(10));
+                        }
                         Task::Final(mut holder) => {
                             if let Err(error) = holder.close_until(Instant::now()+Duration::from_secs(5)) {
                                 tracing::warn!(%error,"Terminal family remains owned by its discoverable holder");
@@ -87,6 +94,8 @@ pub(super) fn request(mut holder: Holder) {
             Err(error) => match error.into_inner() {
                 Task::Final(returned) => holder = returned,
                 Task::Completed { .. } => unreachable!("only the submitted final holder can be returned"),
+                #[cfg(test)]
+                Task::Block { .. } => unreachable!("only the submitted final holder can be returned"),
             },
         },
         Err(error) => tracing::warn!(%error,"Terminal cleanup service unavailable"),
@@ -94,6 +103,27 @@ pub(super) fn request(mut holder: Holder) {
     // A registered helper sees daemon loss and retains discovery, directory
     // pin and setup flock for a successor. Absence is never cleanup proof.
     holder.leave_for_successor();
+}
+
+#[cfg(test)]
+impl super::super::TerminalHandle {
+    /// Occupies the real fixed cleanup workers without creating extra process
+    /// owners. Scope exit and a bounded worker timeout both release the latch.
+    pub(crate) fn with_blocked_holder_cleanup_for_test<T>(run: impl FnOnce() -> T) -> T {
+        struct Unblock(Vec<crossbeam_channel::Sender<()>>);
+        impl Drop for Unblock {
+            fn drop(&mut self) { for sender in &self.0 { let _ = sender.try_send(()); } }
+        }
+        let (entered, waiting) = crossbeam_channel::bounded(2);
+        let mut unblock = Unblock(Vec::new());
+        for _ in 0..2 {
+            let (release, receiver) = crossbeam_channel::bounded(1);
+            unblock.0.push(release);
+            assert!(service().unwrap().try_send(Task::Block { entered: entered.clone(), release: receiver }).is_ok());
+        }
+        for _ in 0..2 { waiting.recv_timeout(Duration::from_secs(2)).expect("cleanup worker entered its bounded latch"); }
+        run()
+    }
 }
 
 #[cfg(test)]

@@ -2779,6 +2779,9 @@ pub fn shutdown_outcome_json(outcome: &ShutdownOutcome) -> Value {
         ShutdownOutcome::AlreadyShuttingDown => {
             json!({ "outcome": "already_shutting_down", "termination_requested": false })
         }
+        ShutdownOutcome::OwnershipUncertain => {
+            json!({ "outcome": "ownership_uncertain", "termination_requested": false })
+        }
     }
 }
 
@@ -2815,6 +2818,9 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
         ShutdownOutcome::AlreadyShuttingDown => {
             "Shutdown already requested; termination is not yet confirmed complete".into()
         }
+        ShutdownOutcome::OwnershipUncertain => {
+            "Shutdown refused: original helper cleanup remains unconfirmed (termination_requested=false). Wait for exact cleanup to finish, or resolve retained ownership diagnostics before retrying.".into()
+        }
     }
 }
 
@@ -2849,6 +2855,7 @@ pub fn shutdown_outcome_summary(outcome: &ShutdownOutcome) -> String {
             "Not stopped: the confirmation was not accepted. Try again.".into()
         }
         ShutdownOutcome::AlreadyShuttingDown => "The daemon is already stopping…".into(),
+        ShutdownOutcome::OwnershipUncertain => "Not stopped: original helper cleanup remains unconfirmed. Wait for cleanup or resolve retained ownership before retrying.".into(),
     }
 }
 

@@ -875,6 +875,9 @@ pub enum ShutdownOutcome {
     ConfirmationRequired {
         current_count: u64,
     },
+    /// An original helper is still owned outside the resident inventory.
+    /// Confirmation cannot turn uncertain teardown into an empty daemon.
+    OwnershipUncertain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
