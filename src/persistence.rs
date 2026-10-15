@@ -1754,6 +1754,17 @@ impl StateStore {
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
+        // A stored unread owner cannot keep a worktree in Attention when its
+        // card failed to restore, was closed, or no longer belongs here.
+        if !state.agent_updates.is_empty() {
+            let open: HashSet<_> = state
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .map(|card| card.id)
+                .collect();
+            state.agent_updates.retain(|card, _| open.contains(card));
+        }
         Ok(Some(RestoredWorkspace { state, warnings }))
     }
 
@@ -6264,6 +6275,68 @@ mod tests {
                 .unwrap()
                 .agent_updates
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn unread_agent_updates_cold_restore_drops_unreadable_closed_and_missing_owners() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("partial.db");
+        let boot_id = boot("partial-unread");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let survivor = workspace.cards[0].id;
+        let survivor_owner = (ProjectId::new(), WorktreeId::new());
+        let mut broken = workspace.cards[0].clone();
+        broken.id = CardId::new();
+        let broken_id = broken.id;
+        let broken_terminal = TerminalId::new();
+        let CardKind::Terminal(session) = &mut broken.kind else {
+            unreachable!()
+        };
+        session.id = broken_terminal;
+        session.transcript_path = None;
+        let mut closed = broken.clone();
+        closed.id = CardId::new();
+        let closed_id = closed.id;
+        closed.existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        let CardKind::Terminal(session) = &mut closed.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        workspace.cards.extend([broken, closed]);
+        workspace.agent_updates = BTreeMap::from([
+            (survivor, Some(survivor_owner)),
+            (broken_id, Some((ProjectId::new(), WorktreeId::new()))),
+            (closed_id, Some((ProjectId::new(), WorktreeId::new()))),
+            (CardId::new(), Some((ProjectId::new(), WorktreeId::new()))),
+        ]);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "DELETE FROM terminal_recipes WHERE terminal_id=?1",
+            [broken_terminal.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.warnings.len(), 1);
+        assert!(restored.warnings[0].contains(&broken_id.to_string()));
+        assert!(!restored.state.cards.iter().any(|card| card.id == broken_id));
+        assert_eq!(
+            restored.state.agent_updates,
+            BTreeMap::from([(survivor, Some(survivor_owner))])
         );
     }
 
