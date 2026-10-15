@@ -60,7 +60,6 @@ impl Preview {
         self.text.capacity() + self.tail.capacity() + self.block.retained_span_bytes()
     }
 
-
     pub(super) fn update(
         previous: Option<Self>,
         content: &ItemContent,
@@ -171,9 +170,13 @@ impl Preview {
 
 impl ToolText {
     pub(super) fn retained_bytes(&self) -> usize {
-        self.text.len() + self.syntax.borrow().as_ref().map_or(0, |(_, block)| block.retained_span_bytes())
+        self.text.len()
+            + self
+                .syntax
+                .borrow()
+                .as_ref()
+                .map_or(0, |(_, block)| block.retained_span_bytes())
     }
-
 
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
         let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {

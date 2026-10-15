@@ -2542,9 +2542,11 @@ mod tests {
                     content: cosmic::widget::id_container(
                         crate::ui_memory::gate(widget::Space::new()),
                         widget::Id::new(format!("disposable-presentation-{index}")),
-                    ).into(),
+                    )
+                    .into(),
                 }],
-            }.into()
+            }
+            .into()
         };
         let mut element = make(0);
         let mut tree = Tree::new(&element);
@@ -2557,7 +2559,10 @@ mod tests {
         assert!(released.upgrade().is_some());
         element = make(1);
         tree.diff(&mut element);
-        assert!(released.upgrade().is_none(), "named extraction must not leave a presentation owner behind");
+        assert!(
+            released.upgrade().is_none(),
+            "named extraction must not leave a presentation owner behind"
+        );
         let parked = &tree.state.downcast_ref::<VirtualStripState>().detached[&ids[0]];
         assert!(parked.children[0].children.is_empty());
         // A real remount reconstructs the emptied gate through normal diffing.
