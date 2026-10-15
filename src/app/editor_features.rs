@@ -157,6 +157,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_server_cannot_publish_an_unopened_only_preview_after_doc_version_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for path in ["a.rs", "b.rs"] { std::fs::write(root.path().join(path), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", original);
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let doc = LspDocumentId(44); let path = root.path().join("a.rs");
+        let language = app.lsp.language_for(&path).unwrap();
+        app.lsp.open(doc, &path, root.path(), language, 1, original);
+        let (id, response) = app.lsp.fixture_workspace_edit_preview(doc, Duration::from_secs(120)).unwrap();
+        let plan = plan(&app, root.path(), &["b.rs"]);
+        assert!(plan.documents.iter().all(|document| !document.open));
+        let mut operation = operation(&app, card); operation.server_request = Some(id);
+        app.editor_features.preview = Some(Preview { ticket: 10, diff_ticket: 10, operation, plan, selected: 0, annotation_page: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
+        // Same stored retired flag as the original server; the backend fake
+        // protocol fixture separately exercises manager.restart(doc).
+        app.lsp.fixture_retire_workspace_edit_source(id);
+        app.lsp.change(doc, 2, &[], original);
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        let task = app.update_editor_features(Action::ApplyPreview);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.editor_features.publication.is_none());
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("server retired")));
+        assert_eq!(text(&app, card), original);
+        assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), original);
+        assert!(!response.await.unwrap().applied);
+    }
+
+    #[tokio::test]
     async fn replacing_preview_root_preserves_open_buffers_and_releases_their_freeze() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("worktree");
