@@ -247,7 +247,7 @@ mod tests {
         let action = project_action(model.projects[0].id, Some(model.projects[0].worktrees[0].id), ProjectCommand::OpenEditor("chosen".into()));
         let target = CommandTarget::from_action(&action).unwrap();
         assert!(target.accepts(&model, Command::OpenInExternalEditor, &action));
-        model.external_editors.pop();
+        model.external_editors = model.external_editors.iter().take(1).cloned().collect();
         assert!(!target.accepts(&model, Command::OpenInExternalEditor, &action));
         assert!(!target.accepts(&model, Command::CopyPath, &action));
     }
