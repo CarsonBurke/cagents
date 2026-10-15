@@ -797,7 +797,7 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
         return;
     }
     if role == "controller" {
-        struct Family { settled:bool }
+        struct Family { settled:bool,cleanup_deadline:Option<Instant> }
         impl Family {
             fn identity(pid:i32) -> std::io::Result<(u32,String)> {
                 let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -835,7 +835,7 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
             }
             fn finish(&mut self) -> Result<(),String> {
                 if self.settled { return Ok(()); }
-                let deadline = Instant::now()+Duration::from_secs(5);
+                let deadline = *self.cleanup_deadline.get_or_insert_with(||Instant::now()+Duration::from_secs(5));
                 loop {
                     loop {
                         if Instant::now()>=deadline { return Err("fixture family did not settle before its deadline".into()); }
@@ -878,7 +878,7 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
         // Every orphaned fixture holder/provider remains a descendant of this
         // dedicated controller, even after it leaves the worker's session.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0) },0);
-        let mut family=Family{settled:false};
+        let mut family=Family{settled:false,cleanup_deadline:None};
         let mut worker=Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,"worker").spawn().unwrap();
         let deadline=Instant::now()+Duration::from_secs(90);
         let outcome=loop {
