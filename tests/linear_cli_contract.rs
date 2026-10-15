@@ -488,7 +488,10 @@ fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostic
 
 #[test]
 fn keyring_stderr_writer_cannot_extend_the_original_helper_deadline() {
-    use std::{process::Child, time::{Duration, Instant}};
+    use std::{
+        process::Child,
+        time::{Duration, Instant},
+    };
 
     // The fixture owns this original holder throughout. Transfer just stderr's
     // write descriptor rather than launching an unowned background descendant.
@@ -535,7 +538,10 @@ with socket.socket(socket.AF_UNIX) as server:
     );
     let ready_by = Instant::now() + Duration::from_secs(5);
     while !f.path().join("stderr-ready").exists() {
-        assert!(Instant::now() < ready_by, "private stderr holder did not start");
+        assert!(
+            Instant::now() < ready_by,
+            "private stderr holder did not start"
+        );
         assert!(holder.0.try_wait().unwrap().is_none());
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -557,9 +563,18 @@ raise SystemExit(1)
         .output()
         .unwrap();
     let elapsed = started.elapsed();
-    assert!(f.path().join("stderr-held").exists(), "actual stderr descriptor was not held");
-    assert!(holder.0.try_wait().unwrap().is_none(), "holder must still own the open writer");
-    assert!(elapsed < Duration::from_secs(20), "stderr outlived helper deadline: {elapsed:?}");
+    assert!(
+        f.path().join("stderr-held").exists(),
+        "actual stderr descriptor was not held"
+    );
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "holder must still own the open writer"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "stderr outlived helper deadline: {elapsed:?}"
+    );
     assert!(!output.status.success());
     let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
     assert_eq!(error["kind"], "linear_keyring_unavailable");

@@ -70,7 +70,9 @@ fn helper(
             }
         }
         if let Some(secret) = secret {
-            input.write_all(secret.as_bytes()).map_err(|_| keyring_error())?;
+            input
+                .write_all(secret.as_bytes())
+                .map_err(|_| keyring_error())?;
         }
         drop(input);
         let mut output = Vec::new();
@@ -92,7 +94,11 @@ fn helper(
                         output.extend_from_slice(&buffer[..count]);
                     }
                     Ok(_) => return Err(keyring_error()),
-                    Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
                     Err(_) => return Err(keyring_error()),
                 }
             }
@@ -102,7 +108,11 @@ fn helper(
                 match stderr.read(&mut buffer) {
                     Ok(0) => stderr_done = true,
                     Ok(count) => error_bytes = error_bytes.saturating_add(count as u64),
-                    Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
                     Err(_) => return Err(keyring_error()),
                 }
             }
@@ -117,7 +127,11 @@ fn helper(
             thread::sleep(Duration::from_millis(20));
         };
         // A missing entry exits 1 with neither a value nor error diagnostics.
-        if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() && error_bytes == 0 {
+        if operation == ["lookup"]
+            && status.code() == Some(1)
+            && output.is_empty()
+            && error_bytes == 0
+        {
             return Ok(None);
         }
         if !status.success() {
@@ -125,7 +139,9 @@ fn helper(
         }
         if operation == ["lookup"] {
             // Piped store/lookup preserve exact bytes through EOF.
-            return String::from_utf8(output).map(Some).map_err(|_| keyring_error());
+            return String::from_utf8(output)
+                .map(Some)
+                .map_err(|_| keyring_error());
         }
         Ok(None)
     })();
