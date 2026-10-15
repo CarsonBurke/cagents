@@ -173,6 +173,7 @@ impl Editor {
     }
 
     pub(super) fn finish_navigation_jump(&mut self, card: CardId) -> Task<Message> {
+        let may_focus = !self.modal_open() && !self.exiting;
         let Some(jump) = self.lsp_navigation.jumps.get(&card) else { return Task::none(); };
         if self.selection_epoch != jump.epoch || self.active != Some(card) {
             self.lsp_navigation.jumps.remove(&card); return Task::none();
@@ -185,7 +186,7 @@ impl Editor {
         if !tab.runtime.move_cursor_to_coordinates(jump.at, jump.coordinates) {
             self.notice = Some("The source position is no longer valid.".into()); return Task::none();
         }
-        tab.runtime.focus_editor(card).map(cosmic::Action::App)
+        if may_focus { tab.runtime.focus_editor(card).map(cosmic::Action::App) } else { Task::none() }
     }
 
     pub(super) fn navigation_results_view(&self, card: CardId) -> Option<Element<'_, Message>> {
@@ -287,6 +288,20 @@ mod tests {
         run_tasks(&mut app, task);
         assert_eq!(app.active, Some(target));
         assert_eq!(app.tabs.len(), count);
+    }
+
+    #[test]
+    fn loaded_navigation_applies_position_without_focusing_behind_a_modal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "a😀éX\n").unwrap();
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "main.rs");
+        app.lsp_navigation.jumps.insert(card, PendingJump { path: root.path().join("main.rs"), at: LspPosition::new(0, 4), coordinates: LspCoordinates::Utf16, epoch: app.selection_epoch });
+        app.settings_open = true;
+        let task = app.finish_navigation_jump(card);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(LspPosition::new(0, 3)));
+        assert!(!app.lsp_navigation.jumps.contains_key(&card));
     }
 
     #[test]
