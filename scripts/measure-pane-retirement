@@ -52,7 +52,7 @@ def environment(root):
     if runtime.is_symlink() or runtime.stat().st_uid != os.getuid():
         raise SystemExit('private runtime has unsafe ownership')
     runtime.chmod(0o700)
-    for key in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_ACCOUNT_HOMES', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE', 'AT_SPI_BUS_ADDRESS'):
+    for key in ('CAGENTS_AGENT_AUTHORITY', 'CAGENTS_ACCOUNT_HOMES', 'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE', 'AT_SPI_BUS_ADDRESS'):
         env.pop(key, None)
     env.setdefault('CARGO_HOME', str(original_home / '.cargo'))
     env.setdefault('RUSTUP_HOME', str(original_home / '.rustup'))
