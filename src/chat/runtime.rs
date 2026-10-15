@@ -133,9 +133,10 @@ struct CloseState {
     actor_id: uuid::Uuid,
     revision: u64,
     admitted_work: bool,
+    compacting: bool,
     unobserved_native: bool,
     directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
-    directory: Option<Arc<std::fs::File>>,
+    _directory: Option<Arc<std::fs::File>>,
     working_directory: std::path::PathBuf,
 }
 
@@ -340,7 +341,7 @@ impl Handle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
-        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,unobserved_native:false,directory_identity,directory:close_directory,working_directory:if scope_observed {spec.working_directory.clone()} else {Default::default()}}));
+        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,compacting:false,unobserved_native:false,directory_identity,_directory:close_directory,working_directory:if scope_observed {spec.working_directory.clone()} else {Default::default()}}));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -690,7 +691,7 @@ impl Handle {
         let owns_work=self.owns_work();
         let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
         let close=self.0.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        let activity=if close.unobserved_native {ActivityState::Unknown} else if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
+        let activity=if close.unobserved_native {ActivityState::Unknown} else if (close.admitted_work || close.compacting || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
         CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone(),directory_identity:close.directory_identity}
     }
 
@@ -1721,7 +1722,7 @@ impl Actor {
         if close.working_directory!=directory || close.directory_identity!=identity {
             close.working_directory=directory.into();
             close.directory_identity=identity;
-            close.directory=pinned;
+            close._directory=pinned;
             close.revision=close.revision.saturating_add(1);
         }
     }
@@ -2154,7 +2155,8 @@ impl Actor {
                 None
             };
             let starts_turn = matches!(&command, Command::Prompt { .. });
-            let starts_new_work=matches!(&command,Command::Prompt{..}|Command::Compact|Command::Slash{..}|Command::StartQueued{..}|Command::Branch{..});
+            let compacts = matches!(&command, Command::Compact);
+            let starts_new_work=matches!(&command,Command::Prompt{..}|Command::Slash{..}|Command::StartQueued{..}|Command::Branch{..});
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2191,6 +2193,7 @@ impl Actor {
             };
             match prepared {
                 Ok(step) => {
+                    let compaction_finished=step.events.iter().any(|event|matches!(event,Event::Compaction{active:false}));
                     let observed_boundary=step.events.iter().any(|event|matches!(event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}));
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
@@ -2201,6 +2204,7 @@ impl Actor {
                         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                         close.revision=close.revision.saturating_add(1);
                         close.admitted_work |= starts_new_work && !observed_boundary;
+                        close.compacting |= compacts && !compaction_finished;
                     }
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
@@ -2231,7 +2235,8 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.close_input_is_clear() {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.is_working() || state.waiting || !state.requests.is_empty()
+            || {let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());close.admitted_work || close.compacting} {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -2437,6 +2442,15 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if let Event::Compaction { active } = &event {
+            let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+            if *active && !close.compacting {close.revision=close.revision.saturating_add(1);}
+            close.compacting=*active;
+            return;
+        }
+        if matches!(&event,Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
+            self.close_state.lock().unwrap_or_else(|p|p.into_inner()).compacting=false;
+        }
         // Clear terminal admission markers before attention reducers that may
         // consume terminal events without retaining them in presentation.
         if matches!(&event,Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
@@ -2702,7 +2716,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
         Event::HistoryError(message) => state.error = Some(message),
-        Event::HistoryRecovered => {}
+        Event::HistoryRecovered | Event::Compaction { .. } => {}
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
@@ -3203,7 +3217,7 @@ mod tests {
                     Command::Prompt{..}=>Vec::new(),
                     Command::SetFastMode{..}=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
                     Command::SetModel{..}=>vec![Event::TurnStarted],
-                    Command::Compact=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Succeeded},Event::Status{busy:false,detail:String::new()}],
+                    Command::Compact=>vec![Event::Compaction{active:true},Event::Compaction{active:false},Event::Status{busy:false,detail:String::new()}],
                     Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status{busy:false,detail:String::new()}],
                     _=>return Err("Unexpected consent fixture command".into()),
                 };
@@ -3232,7 +3246,13 @@ mod tests {
         handle.command(Command::SetFastMode{enabled:true}).unwrap();
         assert_eq!(handle.close_observation().close_revision,admitted.close_revision,"ordinary stream updates preserve consent for the same work");
         handle.command(Command::Compact).unwrap();
-        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"a terminal result clears an admitted prompt even without TurnStarted");
+        assert_eq!(handle.close_observation().activity,ActivityState::Working,"maintenance completion and idle status cannot release a previously accepted prompt");
+        handle.command(Command::Interrupt).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"the prompt's own terminal result clears its admission marker without TurnStarted");
+        let idle_generation=handle.close_observation().turn_generation;
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"explicit maintenance completion releases only its own admission");
+        assert_eq!(handle.close_observation().turn_generation,idle_generation,"compaction creates no prompt completion");
         handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
         let autonomous=handle.close_observation();
         assert!(autonomous.close_revision>admitted.close_revision);

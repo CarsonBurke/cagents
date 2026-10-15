@@ -2052,6 +2052,9 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// An explicit maintenance boundary, separate from prompt completion.
+    /// A generic idle status cannot release accepted prompt admission.
+    Compaction { active: bool },
 }
 
 #[cfg(test)]
