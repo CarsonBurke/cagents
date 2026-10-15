@@ -94,7 +94,18 @@ impl RegisteredHeads {
         }
         let primary=records.iter().filter(|record| !record.bare && !linked.contains(&record.path)).collect::<Vec<_>>();
         if primary.len()>1 { return Err("Primary checkout registration is ambiguous".into()); }
-        for record in primary { result.associate(record,0)?; }
+        for record in primary {
+            // Native worktree-list can report the metadata directory itself
+            // for a separate primary Git directory. Resolve only that special
+            // case from common-local core.worktree, then still verify its
+            // physical checkout and exact forward locator to our held common.
+            let mut record=record.clone();
+            if record.path==common_path {
+                let configured=service.configured_primary_worktree(repository,cancel).map_err(io)?;
+                record.path=fs::canonicalize(common_path.join(configured)).map_err(io)?;
+            }
+            result.associate(&record,0)?;
+        }
         let source=service.git_dir(repository,cancel).map_err(io)?;
         result.source_admin=result.heads.iter().copied().find(|index| result.roots[*index].root.path()==source)
             .ok_or("Invocation does not name an actual registered administrative directory")?;

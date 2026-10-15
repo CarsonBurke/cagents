@@ -649,4 +649,31 @@ exec /usr/bin/git "$@"
         }
     }
 
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn registered_head_fences_resolve_configured_separate_primary_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main", "--separate-git-dir", "metadata", "checkout"]);
+        let checkout = root.join("checkout");
+        let metadata = root.join("metadata");
+        git(&checkout, &["config", "core.worktree", "../checkout"]);
+        fs::write(checkout.join("file"), "base").unwrap();
+        git(&checkout, &["add", "file"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let linked = root.join("linked");
+        git(&checkout, &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()]);
+        // Both metadata and a linked invocation must resolve the primary from
+        // the original common config, then prove its locator back to common.
+        for invocation in [&checkout, &metadata, &linked] {
+            git(&checkout, &["branch", "topic"]);
+            let oid = git(&checkout, &["rev-parse", "refs/heads/topic"]);
+            delete_branch_checked_at(invocation, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+            assert!(git(&checkout, &["branch", "--list", "topic"]).is_empty());
+            assert_eq!(git(&checkout, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+            assert_eq!(git(&linked, &["symbolic-ref", "HEAD"]), "refs/heads/linked");
+        }
+    }
+
 }

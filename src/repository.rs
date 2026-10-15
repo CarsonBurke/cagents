@@ -10800,6 +10800,18 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// A separate primary Git directory has no portable checkout backlink.
+    /// Read its explicit common-local worktree setting through this service's
+    /// existing executor; a linked-worktree invocation must not rediscover or
+    /// grant command authority to a foreign checkout just to resolve it.
+    pub(crate) fn configured_primary_worktree(&self, repository: &Path,
+        cancellation: &CancellationToken) -> Result<PathBuf, RepositoryError>
+    {
+        let command=self.git_read(repository,["config","--local","--path","--get","core.worktree"]);
+        let output=self.run_checked(&command,cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout,"primary_worktree"),&output)
+    }
+
     pub(crate) fn uses_files_ref_storage(&self, repository: &Path,
         cancellation: &CancellationToken) -> Result<bool, RepositoryError>
     {
