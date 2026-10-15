@@ -40,6 +40,7 @@ pub struct AdmissionTicket { id: AdmissionId, state: Arc<Mutex<State>> }
 /// Request retirement and keep the window/process alive until is_settled().
 #[derive(Debug, Default)]
 pub struct EditedRootAdmissions {
+    sealed: bool,
     entries: HashMap<AdmissionId, AdmissionTicket>,
     placements: HashMap<AdmissionId, PlacementTicket>,
 }
@@ -87,6 +88,7 @@ impl EditedRootAdmissions {
     /// Pure, zero-FD reservation BEFORE the phase-one worker. The actual client
     /// independently reserves its measured shared native context before RPC.
     pub fn reserve(&mut self) -> Result<AdmissionTicket, &'static str> {
+        if self.sealed { return Err("This window is closing; no new root admission was started."); }
         self.collect_settled();
         if self.len() >= MAX_ADMISSIONS {
             return Err("Root admission custody is full. Retire an earlier root before opening another.");
@@ -102,6 +104,7 @@ impl EditedRootAdmissions {
     /// A placement shares this SAME bounded pool. Its descriptor-free actual
     /// client custody slot is retained BEFORE constructing the intake worker.
     pub fn reserve_placement(&mut self) -> Result<PlacementTicket, &'static str> {
+        if self.sealed { return Err("This window is closing; no new placement intake was started."); }
         self.collect_settled();
         if self.len() >= MAX_ADMISSIONS { return Err("Recovery admission custody is full. Settle an earlier original owner first."); }
         let ticket = PlacementTicket { id: AdmissionId(Uuid::new_v4()), custody: RecoveryPlacementCustody::new(), state: Arc::new(Mutex::new(PlacementState {
@@ -158,6 +161,12 @@ impl EditedRootAdmissions {
             }
         }
     }
+
+    /// Pure irreversible admission seal for an ACTUALLY COMMITTED window exit.
+    /// The owner must freeze/drain publications and request existing retirement
+    /// separately. Per-project close/automatic GC do not seal the whole window.
+    pub fn seal_new_admissions(&mut self) { self.sealed = true; }
+    pub fn is_sealed(&self) -> bool { self.sealed }
 
     pub fn request_all_retirements(&self) {
         for ticket in self.entries.values() { ticket.request_retirement(); }
@@ -741,6 +750,28 @@ mod tests {
         }, source, Arc::new(None), vec![], 1, &original_slot, &CancellationToken::new(), Instant::now() + Duration::from_secs(2)).unwrap_err();
         assert!(error.to_string().contains("sealed"), "lazy worker must refuse before Prepare");
         drop(client); server.join().unwrap();
+    }
+
+
+    #[test]
+    fn committed_window_seal_refuses_new_roots_and_placements_without_erasing_existing_custody() {
+        let mut admissions = EditedRootAdmissions::default();
+        let root = admissions.reserve().unwrap();
+        let placement = admissions.reserve_placement().unwrap();
+        admissions.seal_new_admissions();
+        assert!(admissions.is_sealed());
+        assert!(admissions.reserve().is_err());
+        assert!(admissions.reserve_placement().is_err());
+        assert_eq!(admissions.len(), 2);
+        admissions.request_all_retirements();
+        assert!(root.begin_preparation().is_err());
+        assert!(placement.begin_issue().is_err());
+        assert!(root.begin_retirement().unwrap().is_none());
+        admissions.next_placement_retirement().unwrap().run(Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+        assert!(admissions.is_settled());
+        admissions.collect_settled();
+        assert!(admissions.is_empty());
+        assert!(admissions.reserve().is_err(), "positive cleanup never silently unseals committed exit");
     }
 
 }
