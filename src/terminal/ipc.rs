@@ -687,6 +687,13 @@ pub enum ServerMessage {
     NotificationActivated {
         target: crate::notifications::Target,
     },
+    /// Actual Store authority, including failed Reset invalidation. Delivered
+    /// independently of visibility/body interest; never a semantic Reset ACK.
+    ChatSourceAuthority {
+        chat_id: TerminalId,
+        incarnation: uuid::Uuid,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

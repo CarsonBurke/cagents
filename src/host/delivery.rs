@@ -78,6 +78,7 @@ enum SlotKind {
     Redraw,
     ChatChanged,
     ChatActivity,
+    ChatSourceAuthority,
     Bell,
 }
 
@@ -86,6 +87,7 @@ fn coalescible(message: &ServerMessage) -> Option<(SlotKind, TerminalId)> {
         ServerMessage::Redraw { terminal_id, .. } => Some((SlotKind::Redraw, *terminal_id)),
         ServerMessage::ChatChanged { chat_id } => Some((SlotKind::ChatChanged, *chat_id)),
         ServerMessage::ChatActivity { chat_id, .. } => Some((SlotKind::ChatActivity, *chat_id)),
+        ServerMessage::ChatSourceAuthority {chat_id,..}=>Some((SlotKind::ChatSourceAuthority,*chat_id)),
         ServerMessage::Event {
             terminal_id,
             event: crate::terminal_ipc::WireTerminalEvent::Bell,
@@ -254,6 +256,23 @@ impl DeliveryQueue {
                         return Ok(());
                     }
                 }
+                ServerMessage::ChatSourceAuthority {incarnation,generation,..}=>{
+                    let existing=&state.messages[index];
+                    if existing.proof==message.proof {
+                        if let ServerMessage::ChatSourceAuthority {incarnation:old,generation:old_generation,..}=&existing.message {
+                            if generation>old_generation {
+                                state.messages[index]=message;
+                                return Ok(());
+                            }
+                            if generation<old_generation || incarnation==old {
+                                return Ok(());
+                            }
+                            // Equal clocks with conflicting identities must
+                            // reach the receiver's fail-closed conflict gate;
+                            // never silently replace away the contradiction.
+                        }
+                    }
+                },
                 ServerMessage::ChatActivity { generation, .. } => {
                     let generation = *generation;
                     let existing = &state.messages[index];

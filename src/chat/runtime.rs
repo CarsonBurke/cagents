@@ -83,6 +83,12 @@ pub(crate) enum UpdateReadiness {
     Unready,
 }
 
+/// Actual Store-issued cache authority; this is invalidation, not a semantic ACK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceAuthority {
+    pub(crate) incarnation: uuid::Uuid,
+    pub(crate) generation: u64,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
     Execution {
@@ -113,6 +119,7 @@ pub(crate) enum Update {
     /// attention belonging to the current turn. Managed run lifecycle has
     /// its own exact RunId-bearing Execution update.
     PastAttention(crate::notifications::Evidence),
+    SourceAuthority {incarnation:uuid::Uuid,generation:u64},
 }
 
 #[derive(Clone)]
@@ -129,6 +136,10 @@ impl Drop for OwnedSocket {
 }
 
 impl Handle {
+    /// Exact actor-issued scalar, available without transcript or provider I/O.
+    pub(crate) fn source_authority(&self)->Option<SourceAuthority> {
+        *self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner())
+    }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -139,6 +150,7 @@ struct Inner {
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -311,6 +323,7 @@ impl Handle {
         adapter.bind_item_reader(store::adapter_item_reader(&store));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let source_authority = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -323,6 +336,7 @@ impl Handle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            source_authority: source_authority.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -369,6 +383,7 @@ impl Handle {
                     adapter,
                     state,
                     confirmed_session,
+                    source_authority,
                     store,
                     visible,
                     observe_next,
@@ -1868,6 +1883,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2625,7 +2641,27 @@ impl Actor {
         Ok(())
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
-        self.apply_step(step, None)
+        self.apply_step(step, None)?;
+        if self.source_authority.lock().unwrap_or_else(|p|p.into_inner()).is_none() {
+            self.publish_source_authority()?;
+        }
+        Ok(())
+    }
+    fn publish_source_authority(&mut self)->Result<(),String> {
+        let authority={
+            let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
+            let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+            store.publish_source_authority(&mut state);
+            store.source_authority().ok_or("Source authority could not be ordered")?
+        };
+        let changed={
+            let mut published=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
+            if *published==Some(authority) {false} else {*published=Some(authority);true}
+        };
+        if changed {
+            (self.notify)(Update::SourceAuthority {incarnation:authority.incarnation,generation:authority.generation});
+        }
+        Ok(())
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
@@ -2699,11 +2735,23 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
-            let events = self
-                .store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .apply(event)?;
+            let is_reset=matches!(&event,Event::Reset {..});
+            if is_reset && self.state.lock().unwrap_or_else(|p|p.into_inner()).generation>u64::MAX-2 {
+                return Err("Reset was refused before source mutation because its generation is exhausted".into());
+            }
+            let applied = self.store.lock().unwrap_or_else(|p|p.into_inner()).apply(event);
+            let events=match applied {
+                Ok(events)=>events,
+                Err(error)=>{
+                    // Even failed intent/clear/lease release must revoke a
+                    // hidden peer's cached body BEFORE this original error
+                    // reaches teardown/EOF. This never acknowledges Reset.
+                    if let Err(publication)=self.publish_source_authority() {
+                        tracing::warn!(reason=%super::protocol::preview(publication.as_bytes(),1024),"Source authority could not be published before actor failure");
+                    }
+                    return Err(error);
+                },
+            };
             if events.is_empty() {
                 self.touch();
             } else {
@@ -2711,6 +2759,7 @@ impl Actor {
                     self.apply(event);
                 }
             }
+            if is_reset {self.publish_source_authority()?;}
             if let Some(message) = fatal {
                 return Err(message);
             }

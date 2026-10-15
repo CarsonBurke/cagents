@@ -465,6 +465,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
                 generation: *generation,
                 outcome: outcome.clone(),
             },
+            Update::SourceAuthority {incarnation,generation} => ServerMessage::ChatSourceAuthority {
+                chat_id:id,incarnation:*incarnation,generation:*generation,
+            },
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
             &Update::Observed { generation } if !visible => {
                 let observation = record.observations.entry(client).or_default();
@@ -2292,7 +2295,13 @@ fn process_inner(
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
+            // An actor/helper can seed before its host Record is installed.
+            // Replay its exact cached pair without any source/body read.
+            let authority=record.handle.source_authority();
             drop(state);
+            if let Some(authority)=authority {
+                changed(&Arc::downgrade(host),chat_id,Update::SourceAuthority {incarnation:authority.incarnation,generation:authority.generation});
+            }
             if visible {
                 changed(&Arc::downgrade(host), chat_id, Update::Presentation);
             }

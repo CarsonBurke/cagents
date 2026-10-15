@@ -101,8 +101,20 @@ impl Store {
             self.presented_children.clear();
         }
         state.source_incarnation = Some(self.source_incarnation);
+        if let Err(error)=self.record_source_authority(state) {
+            self.source_reads.poison();
+            self.reset_pending=true;
+            state.items.clear();
+            for child in &mut state.subagents {child.items.clear();}
+            state.source_parts.clear();state.raw_source_parts.clear();
+            state.file_changes=Default::default();
+            state.error=Some(error);
+        }
     }
     pub(super) fn reset_all(&mut self, reason: String) -> Result<Vec<Event>, String> {
+        if !self.source_clock_available() {
+            return Err("Reset was refused before source mutation because its authority clock is exhausted".into());
+        }
         // Revoke local readers BEFORE even attempting the durable reservation.
         // Failed intent persistence is an explicit unacknowledged Reset, never
         // a claim that a future reopen can discover an unwritten intent.
