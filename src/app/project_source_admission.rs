@@ -68,17 +68,23 @@ impl PreparedProjectCreation {
 /// the window's pre-reserved ticket owns it before any message or enrollment.
 pub(super) fn prepare_project_repository(
     path: &Path, project_id: ProjectId, cancellation: CancellationToken,
-    kind: Option<ProjectKind>, retained: Option<worktree_dialog::WorktreeCreationSource>,
+    kind: Option<ProjectKind>, retained: Option<RegisteredProjectSource>,
     endpoint: Result<LocalRecoveryEndpoint, String>, work: PreparationWork, deadline: Instant,
 ) -> Result<PreparedProjectRepository, ProjectPreparationFailure> {
     let ticket = work.ticket().clone();
     let result = (|| -> Result<PreparedProjectRepository, String> {
         if cancellation.is_cancelled() { return Err("Project loading was cancelled before admission.".into()); }
-        if let Some(source) = retained.filter(|_| kind != Some(ProjectKind::Folder)) {
+        if let Some(RegisteredProjectSource { source, editor_root }) = retained.filter(|_| kind != Some(ProjectKind::Folder)) {
             let admission = source.edited_root_admission().map_err(|error| error.to_string())?;
             let (root, _) = source.recovery_roots().map_err(|error| error.to_string())?;
-            let editor_root = crate::editor::FileRootIdentity::admitted(root, admission.clone(), deadline)
-                .map_err(|error| error.to_string())?;
+            let editor_admission = editor_root.retained_admission()
+                .ok_or("The retained editor identity has no original admission.")?;
+            if !std::sync::Arc::ptr_eq(&root, &editor_root.retained_root())
+                || admission.ticket().id() != editor_admission.ticket().id()
+                || !std::sync::Arc::ptr_eq(&admission.lease(), &editor_admission.lease()) {
+                return Err("The retained source and editor identity do not share their original Root/admission.".into());
+            }
+            admission.validate_for_root(&root, deadline).map_err(|error| error.to_string())?;
             if admission.ticket().phase() != AdmissionPhase::Active { return Err("The original source is retiring; no replacement was captured.".into()); }
             // No new lease/context on an ordinary refresh. Preserve actor ID,
             // whole admitted pair and original service/physical authority.
@@ -202,11 +208,12 @@ mod tests {
         admission.validate_for_root(&root, Instant::now() + Duration::from_secs(3)).unwrap();
         assert_eq!(ticket.phase(), AdmissionPhase::Active);
         let refreshed = prepare_project_repository(directory.path(), project,
-            CancellationToken::new(), Some(ProjectKind::Git), Some(source.clone()),
+            CancellationToken::new(), Some(ProjectKind::Git), Some(RegisteredProjectSource { source: source.clone(), editor_root: editor_root.clone() }),
             Err("current endpoint must not replace original source".into()),
             admissions.reserve().unwrap().begin_preparation().unwrap(),
             Instant::now() + Duration::from_secs(3)).unwrap();
         assert!(refreshed.prepared_creation.is_none());
+        assert!(std::sync::Arc::ptr_eq(&editor_root.retained_root(), &refreshed.editor_root.as_ref().unwrap().retained_root()));
         assert_eq!(refreshed.editor_root.as_ref().unwrap().retained_admission().unwrap().ticket().id(), ticket.id());
         assert_eq!(refreshed.loaded.creation_source.as_ref().unwrap().id(), actor);
         ticket.request_retirement();
