@@ -132,7 +132,6 @@ impl Spawn {
 
 #[derive(Serialize, Deserialize)]
 enum Request {
-    Diagnostic,
     Spawn {
         protocol: u32,
         spawn: Spawn,
@@ -155,11 +154,11 @@ enum Request {
         proof: HostSessionProof,
     },
     Release,
+    Diagnostic,
 }
 
 #[derive(Serialize, Deserialize)]
 enum Report {
-    Diagnostic(ExitDiagnostic),
     Started {
         protocol: u32,
         record: Record,
@@ -175,6 +174,7 @@ enum Report {
     },
     Adopted(Recovery),
     Failed(String),
+    Diagnostic(ExitDiagnostic),
 }
 
 /// Raw transport evidence. Presentation strips escape sequences and selects a
@@ -1267,6 +1267,28 @@ extern "C" fn serve_if_requested() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_named_json_inspection_messages_remain_decodable() {
+        let recovery=super::super::tests::recovery();
+        let proof=recovery.source.proof.as_ref().unwrap();
+        // The actual holder codec is length-framed JSON. Its externally tagged
+        // names, rather than Rust enum ordinals, are the compatibility boundary.
+        let inspect=serde_json::json!({"Inspect":{"proof":proof}});
+        let decoded:Request=serde_json::from_value(inspect.clone()).unwrap();
+        assert!(matches!(&decoded,Request::Inspect{proof:decoded} if decoded==proof));
+        assert_eq!(serde_json::to_value(decoded).unwrap(),inspect);
+        let record=serde_json::json!({
+            "version":3,"kind":"Native","application":"legacy-holder",
+            "boot":proof.boot_id,"terminal":recovery.source.id,
+            "holder":{"pid":123,"start":1},"root":{"pid":124,"start":2}
+        });
+        let inspected=serde_json::json!({"Inspected":{"protocol":2,"record":record,"recovery":recovery,"exited":false}});
+        let decoded:Report=serde_json::from_value(inspected).unwrap();
+        let Report::Inspected{protocol,record,recovery:decoded,exited}=decoded else {panic!("legacy inspection changed its JSON tag")};
+        assert_eq!(protocol,2);assert_eq!(record.version,3);assert!(record.build.is_none());assert!(!exited);
+        assert_eq!(decoded.source.proof.as_ref(),Some(proof));
+    }
 
     #[test]
     fn holder_reports_exit_status_and_captured_stderr_over_control() {
