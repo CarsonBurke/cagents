@@ -23,11 +23,10 @@ pub(crate) fn preflight_editor_companions(candidate_protocol: Option<u16>) -> io
         let instance = crate::update::companion_namespace(cli).map_err(io::Error::other)?;
         let protocol = if instance == crate::instance::NAME {
             crate::update::companion_protocol(cli).map_err(io::Error::other)?
-        } else { 0 };
-        Ok(CompanionIdentity {
-            instance,
-            protocol,
-        })
+        } else {
+            0
+        };
+        Ok(CompanionIdentity { instance, protocol })
     })
 }
 

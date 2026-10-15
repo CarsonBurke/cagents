@@ -257,7 +257,14 @@ mod tests {
         live.launch.session_id = None;
         validate_live_chat(&live, false).unwrap();
         assert!(validate_live_chat(&live, true).is_err());
-        qualify_with_mode(&live, std::slice::from_ref(&live), live.proof.as_ref().unwrap(), false, |_| panic!("an exact current actor needs no replacement")).unwrap();
+        qualify_with_mode(
+            &live,
+            std::slice::from_ref(&live),
+            live.proof.as_ref().unwrap(),
+            false,
+            |_| panic!("an exact current actor needs no replacement"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -403,14 +410,26 @@ fn qualify_with_mode(
         .iter()
         .find(|live| handoff::issued_chat_matches(source, live))
         .ok_or("Saved conversation has no exact current source owner")?;
-    if require_resumable { handoff::validate_chat_source(source, &live.launch) } else { Ok(()) }
+    if require_resumable {
+        handoff::validate_chat_source(source, &live.launch)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_live_chat(session: &Session, require_resumable: bool) -> Result<(), String> {
     if !session.has_valid_native_continuity()
         || session.owned_codex_listener.is_some() && !session.owns_codex_listener()
-        || session.terminal.as_ref().is_some_and(|terminal| terminal.id != session.id || terminal.continuity.live_proof().as_ref() != session.proof.as_ref()) {
+        || session.terminal.as_ref().is_some_and(|terminal| {
+            terminal.id != session.id
+                || terminal.continuity.live_proof().as_ref() != session.proof.as_ref()
+        })
+    {
         return Err("Source conversation ownership evidence is inconsistent".into());
     }
-    if require_resumable { handoff::validate_chat_source(session, &session.launch) } else { Ok(()) }
+    if require_resumable {
+        handoff::validate_chat_source(session, &session.launch)
+    } else {
+        Ok(())
+    }
 }

@@ -428,17 +428,22 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
     let daemon_owner = installed_daemon_owner(&layout)?;
     let new_coordinator_for_legacy_source = source_proof.is_some()
-        && source_protocol == 77 && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+        && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
     // An unpatched77 owner CLI cannot run the newly installed pane inspector
     // or source adapter. The new matched set owns this explicit migration.
     installation.version = installation_worker_version(
-        &layout, &served, daemon_owner.as_ref(), new_coordinator_for_legacy_source,
+        &layout,
+        &served,
+        daemon_owner.as_ref(),
+        new_coordinator_for_legacy_source,
     );
-    if !new_coordinator_for_legacy_source && served
-        == installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
+    if !new_coordinator_for_legacy_source
+        && served
+            == installation
+                .prefix
+                .join("versions")
+                .join(&installation.version)
     {
         return Err(invalid("the installed application is already running"));
     }
@@ -460,7 +465,9 @@ fn installation_worker_version(
     daemon: Option<&InstallLayout>,
     new_coordinator_for_legacy_source: bool,
 ) -> String {
-    if new_coordinator_for_legacy_source { return window.version.clone(); }
+    if new_coordinator_for_legacy_source {
+        return window.version.clone();
+    }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -1027,8 +1034,12 @@ fn perform_update(
             )?;
             let latest = observe_impact(
                 &staged.identity,
-                confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-            ).map_err(io::Error::other)?;
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+            )
+            .map_err(io::Error::other)?;
             validate_before_close(&confirmed, &latest).map_err(io::Error::other)
         })?;
     let install_result = (|| {
@@ -1048,8 +1059,8 @@ fn perform_update(
         if let Some(daemon) = current.daemon {
             crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = source::Client::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1116,7 +1127,11 @@ pub(crate) fn inspect_source_panes(
             "The matched source inspector is unavailable; source windows remain usable",
         ));
     }
-    let request = crate::install_guard::SourceInspectionRequest { protocol, proof, require_resumable };
+    let request = crate::install_guard::SourceInspectionRequest {
+        protocol,
+        proof,
+        require_resumable,
+    };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);
     command.args([
@@ -1148,7 +1163,9 @@ pub(crate) fn inspect_source_panes(
     result.map_err(invalid)?;
     let (current_protocol, current_proof) = source::inspect_identity(request.proof.as_ref())?;
     if current_protocol != request.protocol || current_proof != request.proof {
-        return Err(invalid("Source ownership changed during pane inspection; source windows remain usable"));
+        return Err(invalid(
+            "Source ownership changed during pane inspection; source windows remain usable",
+        ));
     }
     Ok(())
 }
@@ -1252,7 +1269,9 @@ fn observe_impact(
         }
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let replaces_daemon = client.as_ref().is_some_and(|client| candidate.protocol != client.protocol());
+    let replaces_daemon = client
+        .as_ref()
+        .is_some_and(|client| candidate.protocol != client.protocol());
     let daemon = if replaces_daemon {
         Some(
             client

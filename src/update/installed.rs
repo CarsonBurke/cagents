@@ -76,7 +76,8 @@ pub(super) fn perform(
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
     // Never move a same-namespace service owned by another installation.
     let _source_owner = installed_daemon_owner(&layout)?;
-    let legacy_source = source_proof.is_some() && source_protocol == 77
+    let legacy_source = source_proof.is_some()
+        && source_protocol == 77
         && crate::terminal_ipc::PROTOCOL_VERSION > 77;
     if served_version_root(&layout)? != root || (root == layout.version_root && !legacy_source) {
         return Err(invalid(
@@ -144,7 +145,13 @@ pub(super) fn perform(
                     .map(|daemon| daemon.capability.proof.clone()),
                 confirmed.replaces_daemon,
             )?;
-            let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy)).map_err(io::Error::other)?;
+            let latest = observe(
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+            )
+            .map_err(io::Error::other)?;
             validate_before_close(&confirmed, &latest).map_err(io::Error::other)
         })?;
     let mut startup_pending = false;
@@ -163,8 +170,8 @@ pub(super) fn perform(
         if let Some(daemon) = current.daemon {
             crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = source::Client::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;

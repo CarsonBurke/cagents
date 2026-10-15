@@ -235,7 +235,13 @@ pub(crate) fn run(
             preflight_editor_companions(None)?;
         }
         guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-            preflight_source_panes(guard, None, arguments.iter().any(|argument| argument == "--restart-daemon"))
+            preflight_source_panes(
+                guard,
+                None,
+                arguments
+                    .iter()
+                    .any(|argument| argument == "--restart-daemon"),
+            )
         })?
     };
     let fd = script.as_raw_fd();
