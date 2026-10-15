@@ -103,6 +103,22 @@ impl<T> HostMutex<T> {
         })
     }
 
+    /// Tests must probe responsiveness without replacing it with a blocking
+    /// acquisition. Preserve the same guard bookkeeping as the production lock.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn try_lock(&self) -> Result<HostGuard<'_, T>, TryLockError<HostGuard<'_, T>>> {
+        let guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(TryLockError::WouldBlock),
+        };
+        self.site.store(std::ptr::from_ref(Location::caller()).cast_mut(), Ordering::Relaxed);
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.owner.store(current_thread(), Ordering::Relaxed);
+        Ok(HostGuard {guard, owner: &self.owner})
+    }
+
     /// The acquisition currently holding the lock, if any.
     fn held(&self) -> Option<u64> {
         // Read the count on both sides of the owner, so a release and a new
