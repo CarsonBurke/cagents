@@ -292,7 +292,7 @@ pub struct Row {
 /// A bunch of parsed Markdown text.
 #[derive(Debug, Clone)]
 pub struct Text {
-    spans: Vec<Span>,
+    spans: Arc<Vec<Span>>,
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
     last_style: Cell<Option<Style>>,
@@ -305,7 +305,7 @@ impl Text {
         starts.push(0);
         for span in &spans { starts.push(starts.last().copied().unwrap() + span.text().len()); }
         Self {
-            spans,
+            spans: spans.into(),
             starts: starts.into(),
             plain: std::cell::OnceCell::new(),
             last_style: Cell::default(),
@@ -318,7 +318,7 @@ impl Text {
             link: None, strong: false, emphasis: false, code: false }] if text == source)
     }
     fn append_plain(&mut self, suffix: &str) {
-        let [Span::Standard { text, .. }] = self.spans.as_mut_slice() else { unreachable!("plain append requires one plain span") };
+        let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else { unreachable!("plain append requires one plain span") };
         text.push_str(suffix);
         let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
         self.starts = Arc::from([0, length]);
