@@ -32,8 +32,10 @@ const _: fn() = || {
     send::<prose::CodeBlock>();
 };
 
+#[derive(Default)]
 struct Canonical {
     parsed: Parsed,
+    blocks: HashMap<u64, prose::CodeBlock>,
 }
 
 #[derive(Default)]
@@ -195,6 +197,8 @@ pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
     blocks: HashMap<u64, prose::CodeBlock>,
+    #[cfg(test)]
+    syntax_work: (usize, usize),
     // Retain the source lease through queued output as well as execution.
     // Evicting State cannot make the global counter forget this input owner.
     _owner: Arc<Shared>,
@@ -258,27 +262,33 @@ async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
 
 fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Result<Prepared,String> {
         let request = shared.latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut canonical = shared.canonical.lock().unwrap_or_else(|e| e.into_inner()).take()
-            .unwrap_or_else(|| Canonical { parsed: Parsed::default() });
+        let mut canonical = shared.canonical.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let body = CachedItem::prose(&request.item.content).ok_or("The source is not Markdown.")?;
         parse_publication(&mut canonical.parsed, body, request.growing, &shared.cancelled)?;
-        if shared.cancelled.load(Ordering::Relaxed) { return Err("Message loading was cancelled.".into()); }
-        let parsed = if request.growing {
-            // The clone is deliberately on the worker. Shared inline spans
-            // are cheap; code/continuation copies remain a measured residual.
-            let parsed = canonical.parsed.clone();
-            if shared.cancelled.load(Ordering::Relaxed) { return Err("Message loading was cancelled.".into()); }
-            *shared.canonical.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
-            parsed
-        } else { canonical.parsed };
-        let mut blocks=HashMap::new();
-        for_each_fence(parsed.markdown.items(),&mut |language,code| {
+        let mut previous=std::mem::take(&mut canonical.blocks);
+        #[cfg(test)]
+        let mut syntax_work=(0,0);
+        for_each_fence(canonical.parsed.markdown.items(),&mut |language,code| {
             if shared.cancelled.load(Ordering::Relaxed) || code.len()>CachedItem::HIGHLIGHT_LIMIT {return;}
             let key=fence_key(language.unwrap_or_default(),code);
-            blocks.entry(key).or_insert_with(||prose::CodeBlock::new(language.and_then(prose::fence_language),code,request.theme));
+            canonical.blocks.entry(key).or_insert_with(||previous.remove(&key).unwrap_or_else(|| {
+                #[cfg(test)]
+                {syntax_work.0+=1;syntax_work.1+=code.len();}
+                prose::CodeBlock::new(language.and_then(prose::fence_language),code,request.theme)
+            }));
         });
         if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
-        Ok(Prepared { request, parsed, blocks, _owner: shared, _permit: permit })
+        let (parsed,blocks) = if request.growing {
+            // Cloning happens deliberately on the worker. Unchanged syntax
+            // palettes and inline spans share immutable Arc backing. Code and
+            // parser continuation copies remain an explicit O(source) residual.
+            let parsed=canonical.parsed.clone();
+            let blocks=canonical.blocks.iter().map(|(key,block)|(*key,block.settled_clone())).collect();
+            if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
+            *shared.canonical.lock().unwrap_or_else(|e| e.into_inner())=Some(canonical);
+            (parsed,blocks)
+        } else {(canonical.parsed,canonical.blocks)};
+        Ok(Prepared { request, parsed, blocks, #[cfg(test)] syntax_work, _owner: shared, _permit: permit })
 }
 
 /// Rendering fixtures explicitly complete the production engine before
@@ -359,6 +369,27 @@ mod tests {
         assert!(Arc::ptr_eq(&dark,cached.blocks[&key].spans(true)),"installation moves the worker's spans without re-highlighting");
         assert!(Arc::ptr_eq(&light,cached.blocks[&key].spans(false)));
         assert!(!cached.placeholder);
+    }
+    #[test]
+    fn streaming_tail_reuses_finished_fence_highlights_without_new_syntax_work() {
+        let mut body=(0..200).map(|index|format!("```rust\nlet value_{index} = {index};\n```\n\n")).collect::<String>();
+        body.push_str("A growing tail");
+        let first=item(&body);let target=target();let mut state=configured(target,&first);
+        let theme=crate::settings::EditorSyntaxTheme::Mocha;
+        state.stage(&first,true,theme,|_,_|false);
+        let (run,shared)=job(&state);let output=execute(shared,permit()).unwrap();
+        assert_eq!(output.syntax_work.0,200);
+        let key=fence_key("rust","let value_123 = 123;\n");
+        let spans=output.blocks[&key].spans(true).clone();
+        drop(state.accept(target,"message",run,ready(Ok(output))).unwrap());
+        for _ in 0..5 {
+            body.push_str(" more words");let next=item(&body);
+            state.stage(&next,true,theme,|_,_|true);
+            let (run,shared)=job(&state);let output=execute(shared,permit()).unwrap();
+            assert_eq!(output.syntax_work,(0,0),"a tiny tail append does not highlight completed history again");
+            assert!(Arc::ptr_eq(&spans,output.blocks[&key].spans(true)));
+            drop(state.accept(target,"message",run,ready(Ok(output))).unwrap());
+        }
     }
     #[test]
     fn syntax_theme_change_rejects_old_worker_palette_without_losing_input() {

@@ -74,6 +74,13 @@ impl CodeBlock {
             }
     }
 
+
+    /// Share immutable prepared palettes across worker snapshots. Streaming
+    /// highlighter continuations are never cloned or transferred this way.
+    pub(super) fn settled_clone(&self) -> Self {
+        Self { spans: self.spans.clone(), tail: None }
+    }
+
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
