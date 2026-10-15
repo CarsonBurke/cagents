@@ -420,8 +420,9 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
 #[path = "fs_safety/directory_creation.rs"]
 mod directory_creation;
 pub use directory_creation::{
-    DirectoryStage, stage_directory_in_namespace, DirectoryCreateError, DirectoryPreparation, DirectoryCreation, DirectoryNamespace, DirectoryPublication, DirectoryRecovery, create_directory_beneath,
-    create_directory_in_namespace,
+    DirectoryCreateError, DirectoryCreation, DirectoryNamespace, DirectoryPreparation,
+    DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
+    create_directory_in_namespace, stage_directory_in_namespace,
 };
 
 #[cfg(test)]
