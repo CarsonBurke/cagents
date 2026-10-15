@@ -17,6 +17,7 @@ pub(crate) fn metadata_key(session: &Session) -> Option<String> {
     let root = if let Some(selected) = recorded(variable) {
         recipe.working_directory.join(selected)
     } else {
+        if !recipe.unset_environment.contains(variable) { return None; }
         recipe.working_directory.join(recorded("HOME")?).join(match session.launch.provider {
             crate::agent::Provider::Claude => ".claude",
             crate::agent::Provider::Codex => ".codex",
@@ -26,7 +27,7 @@ pub(crate) fn metadata_key(session: &Session) -> Option<String> {
     // These explicit selectors can override the account stored in that home.
     // Never hash credentials or pretend a recipe proves the effective login.
     if crate::account::credential_overrides(session.launch.provider).iter()
-        .any(|name| recorded(name).is_some()) { return None; }
+        .any(|name| !recipe.unset_environment.contains(*name)) { return None; }
     let mut digest = Sha256::new();
     for part in [session.launch.provider.label().as_bytes(), id.as_bytes(),
         root.as_os_str().as_bytes(), recipe.working_directory.as_os_str().as_bytes()] {
@@ -44,7 +45,8 @@ mod tests {
             owned_codex_listener: None, native_continuity: Default::default(),
             launch: super::super::Launch { provider, session_id: Some("copied-provider-uuid".into()),
                 recipe: crate::model::LaunchRecipe { program: provider.executable().into(), arguments: Vec::new(),
-                    working_directory: "/project".into(), environment: Default::default(), unset_environment: Default::default() } } }
+                    working_directory: "/project".into(), environment: Default::default(),
+                    unset_environment: crate::account::credential_overrides(provider).iter().map(|name| (*name).to_owned()).collect() } } }
     }
     #[test]
     fn copied_provider_ids_partition_by_recorded_home_and_project_without_reading_ambient_state() {
@@ -53,6 +55,9 @@ mod tests {
             let variable = crate::account::home_variable(provider).unwrap();
             a.launch.recipe.environment.insert(variable.into(), "/accounts/A".into());
             let a_key = metadata_key(&a).unwrap();
+            let mut inherited_credentials = a.clone();
+            inherited_credentials.launch.recipe.unset_environment.remove(crate::account::credential_overrides(provider)[0]);
+            assert!(metadata_key(&inherited_credentials).is_none(), "omitted credential values can still be inherited");
             let mut b = a.clone(); b.launch.recipe.environment.insert(variable.into(), "/accounts/B".into());
             assert_ne!(metadata_key(&b).unwrap(), a_key);
             b = a.clone(); b.launch.recipe.working_directory = "/another-project".into();
@@ -64,6 +69,12 @@ mod tests {
             b.launch.recipe.environment.insert(variable.into(), "/project/../accounts/A".into());
             assert_eq!(metadata_key(&b).unwrap(), relative_key);
             a.launch.recipe.environment.clear(); assert!(metadata_key(&a).is_none());
+            a.launch.recipe.environment.insert("HOME".into(), "/recorded/home".into());
+            assert!(metadata_key(&a).is_none(), "HOME does not rule out an inherited provider selector");
+            a.launch.recipe.unset_environment.insert(variable.into());
+            assert!(metadata_key(&a).is_some(), "explicit selector removal permits recorded HOME default");
+            a.launch.recipe.unset_environment.remove(variable);
+            a.launch.recipe.environment.remove("HOME");
             a.launch.recipe.environment.insert(variable.into(), "/accounts/A".into());
             a.launch.recipe.unset_environment.insert(variable.into()); assert!(metadata_key(&a).is_none());
         }
