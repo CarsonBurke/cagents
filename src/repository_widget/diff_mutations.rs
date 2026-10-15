@@ -554,8 +554,14 @@ mod tests {
         for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
-            let initialized = std::process::Command::new("git").args(["init", "-b", "main"])
+            let initialized = std::process::Command::new("git")
+                .args(["-c", "core.fsmonitor=false", "init", "--template=", "-b", "main"])
                 .arg(&root).env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_PARAMETERS").env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_OBJECT_DIRECTORY").env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
                 .output().unwrap();
             assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stderr));
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
