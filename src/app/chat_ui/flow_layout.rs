@@ -462,9 +462,15 @@ impl Prepared {
     pub(super) fn hit(&self, position: iced::Point, length: usize) -> usize {
         if position.y < 0.0 {return 0;}
         if position.y >= self.bounds.height {return length;}
-        // A small glyph envelope preserves exact engine caret affinity while
-        // avoiding a full million-glyph horizontal row projection per move.
-        let margin=self.snapshot.line_height(self.snapshot.visible_lines(position.y,position.y+0.1).start).unwrap_or(20.0)*4.0;
+        let visual=self.snapshot.visible_lines(position.y,position.y+0.1).start;
+        let advance_hit=self.snapshot.glyphs_in_x(visual,position.x,position.x)
+            .is_some_and(|mut glyphs|glyphs.any(|(_,glyph)|position.x>=glyph.x && position.x<=glyph.x+glyph.w));
+        if !advance_hit {
+            return self.snapshot.caret_outside_x(visual,position.x).unwrap_or(0).min(length);
+        }
+        // A small glyph envelope preserves the engine's cluster caret affinity
+        // without projecting a full million-glyph horizontal row per move.
+        let margin=self.snapshot.line_height(visual).unwrap_or(20.0)*4.0;
         let projected=self.projection_rect(position.y,position.y+0.1,position.x-margin,position.x+margin);
         let map_hit=|projection:Projection| {
             let cursor=projection.buffer.hit(position.x,position.y-projection.top)?;
@@ -778,4 +784,19 @@ fn horizontal_flow_projects_sparse_glyphs_and_keeps_source_hit_and_find_coordina
     }
     let wrapped=Prepared::new(&[Span::new("short last row".to_owned())],iced::Pixels(16.0),iced::Font::DEFAULT,720.0,iced::widget::text::Wrapping::WordOrGlyph);
     assert_eq!(wrapped.hit(iced::Point::new(700.0,2.0),14),14);
+}
+
+#[test]
+fn flow_caret_external_edges_match_full_engine_in_rtl_and_mixed_rows() {
+    for source in ["שלום עברית ".repeat(400),"العربية نص عربي ".repeat(400),
+        "abc العربية עברית mixed ".repeat(400)] {
+        let spans=vec![Span::new(source.clone())];
+        let size=iced::Pixels(16.0);
+        let full=reference(&spans,size,iced::Font::DEFAULT,720.0,iced::widget::text::Wrapping::None);
+        let prepared=Prepared::new(&spans,size,iced::Font::DEFAULT,720.0,iced::widget::text::Wrapping::None);
+        for x in [-10_000.0,-1.0,0.0,prepared.bounds.width+1.0,prepared.bounds.width+10_000.0] {
+            let expected=full.buffer().hit(x,2.0).unwrap().index;
+            assert_eq!(prepared.hit(iced::Point::new(x,2.0),source.len()),expected,"external caret x{x}");
+        }
+    }
 }
