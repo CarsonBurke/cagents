@@ -209,6 +209,80 @@ impl<'a> ManagedDisplayIndex<'a> {
     }
 }
 
+/// Directory evidence for attention branch labels. A verified directory is still
+/// only presentation metadata: callers must match an actually loaded worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionDirectory<'a> {
+    /// Older snapshots have no location record; retain their launch-directory
+    /// presentation without inventing a relocated path.
+    Launch,
+    Verified(&'a std::path::Path),
+    /// Refused, ambiguous, replaced or incomplete evidence has no branch label.
+    Unavailable,
+}
+
+/// Build once per sidebar refresh. Location metadata can override an immutable
+/// launch recipe only for the exact current canonical saved pane and actor.
+/// It never changes shared filing, process ownership or execution policy.
+pub struct AttentionDirectoryIndex<'a> {
+    displays: ManagedDisplayIndex<'a>,
+    agents: std::collections::HashMap<CardId, Option<&'a crate::agent_execution::Agent>>,
+    locations: std::collections::HashMap<CardId, Option<&'a super::AgentLocation>>,
+}
+
+impl<'a> AttentionDirectoryIndex<'a> {
+    pub fn new(model: &'a super::WorkspaceModel) -> Self {
+        let mut agents = std::collections::HashMap::new();
+        for agent in &model.agents {
+            agents.entry(CardId::from_uuid(agent.id.as_uuid()))
+                .and_modify(|entry| *entry = None).or_insert(Some(agent));
+        }
+        let mut locations = std::collections::HashMap::new();
+        for location in &model.agent_locations {
+            locations.entry(CardId::from_uuid(location.agent.as_uuid()))
+                .and_modify(|entry| *entry = None).or_insert(Some(location));
+        }
+        Self { displays: ManagedDisplayIndex::new(model), agents, locations }
+    }
+
+    pub fn directory(&self, card: &CardState) -> AttentionDirectory<'a> {
+        let Some(location) = self.locations.get(&card.id) else {
+            return AttentionDirectory::Launch;
+        };
+        let Some(location) = *location else {
+            return AttentionDirectory::Unavailable;
+        };
+        let Some(Some(agent)) = self.agents.get(&card.id) else {
+            return AttentionDirectory::Unavailable;
+        };
+        if !card.existence.is_open() || agent.closed
+            || location.blocked_directory.is_some() || !location.directory.is_absolute()
+            || self.displays.scope(agent).is_none()
+        {
+            return AttentionDirectory::Unavailable;
+        }
+        // No fallback placement: location metadata needs current saved canonical
+        // membership, even for actors which could otherwise be freshly adopted.
+        let Some(Some((_, pane))) = self.displays.owners.get(&card.id) else {
+            return AttentionDirectory::Unavailable;
+        };
+        let matches = match (&card.kind, &pane.kind) {
+            (CardKind::Chat(current), CardKind::Chat(saved)) => current.proof.as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+                && crate::agent_execution::same_chat_process(current, saved),
+            (CardKind::Terminal(current), CardKind::Terminal(saved)) => current.continuity
+                .live_proof().is_some_and(|proof| proof.is_complete())
+                && crate::agent_execution::same_terminal_process(current, saved),
+            _ => false,
+        };
+        if matches {
+            AttentionDirectory::Verified(&location.directory)
+        } else {
+            AttentionDirectory::Unavailable
+        }
+    }
+}
+
 fn pane_resource(kind: &CardKind) -> Option<(u8, crate::model::TerminalId)> {
     match kind {
         CardKind::Chat(session) => Some((0, session.id)),
@@ -767,6 +841,108 @@ mod managed_display_tests {
             ..pane.clone()
         };
         (agent, pane, terminal)
+    }
+
+    fn location_model(agent: &Agent, pane: &Pane) -> super::super::WorkspaceModel {
+        super::super::WorkspaceModel {
+            agents: vec![agent.clone()],
+            agent_locations: vec![super::super::AgentLocation {
+                agent: agent.id,
+                repository: "/relocated/repository/.git".into(),
+                directory: "/relocated/worktree".into(),
+                blocked_directory: None,
+            }],
+            views: vec![View {
+                scope: Scope::Channel(ChannelId::new()),
+                revision: 1,
+                panes: vec![pane.clone()],
+                retired: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn location_card(pane: &Pane) -> CardState {
+        CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: pane.kind.clone(),
+        }
+    }
+
+    #[test]
+    fn attention_directory_uses_verified_location_for_exact_saved_surface_without_mutation() {
+        let (agent, native, terminal) = fixture();
+        for pane in [native, terminal] {
+            let model = location_model(&agent, &pane);
+            let card = location_card(&pane);
+            let before = (model.clone(), card.clone());
+            assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
+                AttentionDirectory::Verified(std::path::Path::new("/relocated/worktree")));
+            assert_eq!((model, card), before, "display metadata cannot rewrite launch or filing");
+        }
+    }
+
+    #[test]
+    fn attention_directory_refuses_candidates_duplicates_and_missing_membership() {
+        let (agent, pane, _) = fixture();
+        let base = location_model(&agent, &pane);
+        let card = location_card(&pane);
+        for case in 0..8 {
+            let mut model = base.clone();
+            match case {
+                0 => model.agent_locations[0].blocked_directory = Some("/candidate/worktree".into()),
+                1 => model.agent_locations.push(model.agent_locations[0].clone()),
+                2 => model.agents.push(agent.clone()),
+                3 => model.agents.clear(),
+                4 => model.views[0].panes.clear(),
+                5 => model.views.push(model.views[0].clone()),
+                6 => model.agents[0].closed = true,
+                7 => model.agent_locations[0].directory = "relative".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
+                AttentionDirectory::Unavailable, "refusal case {case}");
+        }
+        let mut old = base;
+        old.agent_locations.clear();
+        assert_eq!(AttentionDirectoryIndex::new(&old).directory(&card), AttentionDirectory::Launch);
+        assert_eq!(AttentionDirectoryIndex::new(&Default::default()).directory(&card), AttentionDirectory::Launch);
+    }
+
+    #[test]
+    fn attention_directory_requires_complete_current_card_proof_and_open_canonical_identity() {
+        let (agent, native, terminal) = fixture();
+        for pane in [native, terminal] {
+            let model = location_model(&agent, &pane);
+            for case in 0..4 {
+                let mut card = location_card(&pane);
+                match case {
+                    0 => card.existence = Existence::Closing { operation_id: OperationId::new() },
+                    1 => match &mut card.kind {
+                        CardKind::Chat(session) => session.proof = None,
+                        CardKind::Terminal(session) => session.continuity = TerminalContinuity::RelaunchAvailable {
+                            recipe: session.launch.clone(), last_exit: None,
+                        },
+                        _ => unreachable!(),
+                    },
+                    2 => match &mut card.kind {
+                        CardKind::Chat(session) => session.launch.recipe.arguments.push("different".into()),
+                        CardKind::Terminal(session) => session.launch.arguments.push("different".into()),
+                        _ => unreachable!(),
+                    },
+                    3 => card.kind = CardKind::Settings,
+                    _ => unreachable!(),
+                }
+                assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
+                    AttentionDirectory::Unavailable, "card refusal {case}");
+            }
+        }
     }
 
     #[test]
