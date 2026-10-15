@@ -5610,10 +5610,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A plain branch name is local intent. Cached remote-tracking refs
             // can identify an existing remote branch; unknown names create a
             // local branch without a speculative network lookup.
-            let mut candidates: Vec<_> = refs.remote.iter()
-                .filter(|reference| reference.branch == branch.as_str())
-                .map(|reference| (reference.remote.clone(), reference.branch.clone()))
-                .collect();
+            let mut candidates: Vec<_> = refs.remote.iter().filter_map(|reference| {
+                remotes.iter().filter_map(|remote| {
+                    reference.name.as_str().strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                        .map(|name| (remote, name))
+                }).max_by_key(|(remote, _)| remote.name.len())
+                    .filter(|(_, name)| *name == branch.as_str())
+                    .map(|(remote, name)| (remote.name.clone(), name.to_owned()))
+            }).collect();
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
@@ -5786,7 +5790,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
             }
             for branch in ["main", "master"] {
-                if let Some(reference) = refs.remote.iter().find(|reference| reference.remote == remote.name && reference.branch == branch) {
+                if let Some(reference) = refs.remote.iter().find(|reference| reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)) {
                     return Ok(BaseRevision::remote_ref(reference.name.as_str())?);
                 }
             }
@@ -12175,6 +12179,17 @@ mod worktree_journal_tests {
         assert!(report.detail.contains("using cached refs/remotes/origin/topic"), "{report:?}");
         assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
         assert!(matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty()));
+    }
+
+    #[test]
+    fn cached_remote_resolution_preserves_configured_remote_names_containing_slashes() {
+        let mut fixture = Fixture::new(); let remote = Fixture::new();
+        remote.git(&["branch", "topic"]); fixture.add_remote("team/nested", &remote);
+        fixture.git(&["fetch", "team/nested"]);
+        fixture.resolve(fixture.input("topic"));
+        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic"));
+        assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
+        assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "team/nested");
     }
 
     #[test]
