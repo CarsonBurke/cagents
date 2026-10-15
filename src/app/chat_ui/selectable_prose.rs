@@ -95,10 +95,20 @@ impl State {
     }
 
     pub(super) fn link(&self, position: Point) -> Option<String> {
-        self.paragraph()
-            .hit_span(position)
-            .and_then(|index| self.spans.as_ref()?.get(index))
-            .and_then(|span| span.link.clone())
+        // Link activation uses the glyph under the pointer, rather than a
+        // caret offset: iced's hit_span rejects line.len() even with Before
+        // affinity, losing the right half of the last linked glyph.
+        let index = self.paragraph().buffer().layout_runs().find_map(|run| {
+            (position.y >= run.line_top && position.y < run.line_top + run.line_height)
+                .then(|| {
+                    run.glyphs
+                        .iter()
+                        .find(|glyph| position.x >= glyph.x && position.x < glyph.x + glyph.w)
+                        .map(|glyph| glyph.metadata)
+                })
+                .flatten()
+        })?;
+        self.spans.as_ref()?.get(index)?.link.clone()
     }
 
     fn validate_selection(&mut self, plain: &str) {
@@ -473,12 +483,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let state = tree.state.downcast_ref::<State>();
-            if state
-                .paragraph()
-                .hit_span(position)
-                .and_then(|index| self.spans.get(index))
-                .is_some_and(|span| span.link.is_some())
-            {
+            if state.link(position).is_some() {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::Text
@@ -614,12 +619,62 @@ mod tests {
             state.hit(position) > source.len() - 32,
             "the tail remains hit-testable"
         );
-        assert_eq!(state.link(position).as_deref(), Some("https://example.com"));
+        for fraction in [0.25, 0.75] {
+            let point = Point::new(last_glyph.x + last_glyph.w * fraction, position.y);
+            assert_eq!(state.link(point).as_deref(), Some("https://example.com"));
+        }
+        assert_eq!(
+            state.link(Point::new(last_glyph.x + last_glyph.w + 2.0, position.y)),
+            None
+        );
         assert!(
             (node.size().height - state.paragraph().min_bounds().height).abs() < 0.1,
             "draw and hit-test paragraphs must have the same wrapped height"
         );
         assert_eq!(state.plain.as_ref(), source);
+    }
+
+    #[test]
+    fn link_hit_uses_glyph_metadata_across_wrapping_and_bidi_boundaries() {
+        let spans: Arc<[Span<'static, String>]> = vec![
+            Span::new("linked ".repeat(12)).link("first".to_owned()),
+            Span::new(" plain "),
+            Span::new("שלום".to_owned()).link("rtl".to_owned()),
+        ]
+        .into();
+        let state = State {
+            plain: spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>()
+                .into(),
+            spans: Some(spans.clone()),
+            shape: Some(Shape {
+                bounds: Size::new(110.0, f32::INFINITY),
+                size: design::TEXT_PROSE.into(),
+                font: iced::Font::default(),
+            }),
+            ..Default::default()
+        };
+        let mut checked = [false; 3];
+        let mut bottom = 0.0_f32;
+        for run in state.paragraph().buffer().layout_runs() {
+            bottom = bottom.max(run.line_top + run.line_height);
+            for glyph in run.glyphs {
+                checked[glyph.metadata] = true;
+                for fraction in [0.25, 0.75] {
+                    let point = Point::new(
+                        glyph.x + glyph.w * fraction,
+                        run.line_top + run.line_height * 0.5,
+                    );
+                    assert_eq!(state.link(point), spans[glyph.metadata].link);
+                }
+            }
+            assert_eq!(state.link(Point::new(-2.0, run.line_top + 2.0)), None);
+            assert_eq!(state.link(Point::new(112.0, run.line_top + 2.0)), None);
+        }
+        assert_eq!(checked, [true; 3]);
+        assert_eq!(state.link(Point::new(10.0, bottom + 2.0)), None);
     }
 
     #[test]
