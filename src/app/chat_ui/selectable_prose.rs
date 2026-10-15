@@ -90,6 +90,12 @@ impl State {
             })
     }
 
+    #[cfg(test)]
+    pub(super) fn typography_for_test(&self) -> (iced::Font, iced::Pixels) {
+        let paragraph = self.paragraph();
+        (paragraph.font(), paragraph.size())
+    }
+
     pub(super) fn hit(&self, position: Point) -> usize {
         hit(self.paragraph(), &self.plain, position)
     }

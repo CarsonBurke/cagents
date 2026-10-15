@@ -143,13 +143,18 @@ pub fn menu_button<'a, Message>(
 where
     Message: std::clone::Clone + 'a,
 {
+    let line_height = iced_core::text::LineHeight::default()
+        .to_absolute(iced_core::Pixels(widget::text::default_size()))
+        .0;
     widget::button::custom(
         widget::Row::from_vec(children)
             .align_y(Alignment::Center)
             .height(Length::Fill)
             .width(Length::Fill),
     )
-    .height(Length::Fixed(36.0))
+    // Preserve the ordinary row height while allowing the default text's
+    // relative line box and vertical padding at larger interface sizes.
+    .height(Length::Fixed(36.0_f32.max((line_height + 8.0).ceil())))
     .padding([4, 16])
     .width(Length::Fill)
     .class(theme::Button::MenuItem)

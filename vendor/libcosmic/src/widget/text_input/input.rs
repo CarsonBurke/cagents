@@ -234,6 +234,8 @@ where
         let spacing = THEME.lock().unwrap().cosmic().space_xxs();
 
         let v: Cow<'a, str> = value.into();
+        // Capture the interface defaults for this newly built widget; the
+        // renderer defaults remain those selected when the window started.
         TextInput {
             id: Id::unique(),
             placeholder: placeholder.into(),
@@ -243,10 +245,10 @@ where
             is_read_only: false,
             select_on_focus: false,
             double_click_select_delimiter: None,
-            font: None,
+            font: Some(crate::font::default()),
             width: Length::Fill,
             padding: spacing.into(),
-            size: None,
+            size: Some(crate::widget::text::default_size()),
             helper_size: 10.0,
             helper_line_height: text::LineHeight::Absolute(14.0.into()),
             on_focus: None,
@@ -819,7 +821,19 @@ where
             let size = self.size.unwrap_or_else(|| renderer.default_size().0);
             let line_height = self.line_height;
             let state = tree.state.downcast_mut::<State>();
-            if state.dirty {
+            // Text may be unchanged while a retained input adopts a new theme
+            // or explicit typography. Drawing uses these current attributes;
+            // its caret, selection and hit tests must use the same paragraph.
+            if state.dirty
+                || state.value.raw().font() != font
+                || state.value.raw().size() != iced::Pixels(size)
+                || state
+                    .value
+                    .raw()
+                    .line_height()
+                    .to_absolute(iced::Pixels(size))
+                    != line_height.to_absolute(iced::Pixels(size))
+            {
                 state.dirty = false;
                 let value = if self.is_secure {
                     &self.value.secure()
