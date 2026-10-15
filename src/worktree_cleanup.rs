@@ -279,7 +279,9 @@ impl Protection {
         use std::os::unix::fs::MetadataExt;
         let mut files = Vec::new();
         for lock in &self._locks {
-            let file = std::fs::OpenOptions::new().read(true).write(true)
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
                 .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
             let old = lock.metadata()?;
             let new = file.metadata()?;
@@ -1118,10 +1120,16 @@ mod tests {
         }
         let mut command = spec.to_command();
         drop(spec);
-        let mut child = command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         drop(command);
         let mut ready = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
         assert_eq!(ready, "ready\n");
         drop(parent); // OwnedLock's explicit unlock must not retire child locks.
         assert!(acquire(runtime.path(), &directory, true).is_err());
@@ -1141,7 +1149,10 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let exclusive = acquire(runtime.path(), directory.path(), true).unwrap();
-        assert_eq!(exclusive.retained_child_files().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            exclusive.retained_child_files().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert!(acquire(runtime.path(), directory.path(), false).is_err());
         drop(exclusive);
         assert!(acquire(runtime.path(), directory.path(), false).is_ok());

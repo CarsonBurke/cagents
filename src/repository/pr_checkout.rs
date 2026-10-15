@@ -4,7 +4,10 @@
 //! execution must repeat its identity and configuration checks before effects.
 use super::*;
 use crate::github::{GitHubRepoKey, remote_repository_key};
-use std::{io::Write, os::unix::fs::{MetadataExt, PermissionsExt}};
+use std::{
+    io::Write,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+};
 mod effect;
 #[cfg(test)]
 mod tests;
@@ -80,7 +83,11 @@ impl DirectoryIdentity {
         let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
         let root = fs_safety::Root::open(&path).map_err(|error| error.to_string())?;
         let metadata = root.metadata().map_err(|error| error.to_string())?;
-        Ok(Self { path, device: metadata.dev(), inode: metadata.ino() })
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 }
 
@@ -112,7 +119,8 @@ impl fmt::Debug for ExistingPrCheckoutPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // This plan passes through Debug application messages. Configuration
         // may contain authorization headers and remote URLs may carry tokens.
-        formatter.debug_struct("ExistingPrCheckoutPlan")
+        formatter
+            .debug_struct("ExistingPrCheckoutPlan")
             .field("request", &self.request)
             .field("worktree", &self.worktree)
             .field("git_dir", &self.git_dir)
@@ -125,10 +133,18 @@ impl fmt::Debug for ExistingPrCheckoutPlan {
 }
 
 impl ExistingPrCheckoutPlan {
-    pub fn request(&self) -> &ExistingPrCheckoutRequest { &self.request }
-    pub fn path(&self) -> &Path { &self.worktree.path }
-    pub fn disposition(&self) -> PrCheckoutDisposition { self.disposition }
-    pub fn notice(&self) -> &str { &self.notice }
+    pub fn request(&self) -> &ExistingPrCheckoutRequest {
+        &self.request
+    }
+    pub fn path(&self) -> &Path {
+        &self.worktree.path
+    }
+    pub fn disposition(&self) -> PrCheckoutDisposition {
+        self.disposition
+    }
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,10 +156,18 @@ pub struct VerifiedPrCheckout {
 }
 
 impl VerifiedPrCheckout {
-    pub fn path(&self) -> &Path { &self.path }
-    pub fn branch(&self) -> &ValidatedBranchName { &self.branch }
-    pub fn head(&self) -> &Oid { &self.head }
-    pub fn upstream(&self) -> Option<&str> { self.upstream.as_deref() }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn branch(&self) -> &ValidatedBranchName {
+        &self.branch
+    }
+    pub fn head(&self) -> &Oid {
+        &self.head
+    }
+    pub fn upstream(&self) -> Option<&str> {
+        self.upstream.as_deref()
+    }
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
@@ -164,11 +188,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, String> {
         let command = self.git_read(worktree, ["config", "--null", "--get-all", key]);
-        let output = self.run(&command, cancellation).map_err(|error| error.reported_detail())?;
-        if output.exit_code == Some(1) { return Ok(Vec::new()); }
-        if !output.success { return Err(git_failure(&command, output).to_string()); }
-        if !output.stdout.ends_with(&[0]) { return Err("Unterminated Git configuration value".into()); }
-        output.stdout[..output.stdout.len() - 1].split(|byte| *byte == 0)
+        let output = self
+            .run(&command, cancellation)
+            .map_err(|error| error.reported_detail())?;
+        if output.exit_code == Some(1) {
+            return Ok(Vec::new());
+        }
+        if !output.success {
+            return Err(git_failure(&command, output).to_string());
+        }
+        if !output.stdout.ends_with(&[0]) {
+            return Err("Unterminated Git configuration value".into());
+        }
+        output.stdout[..output.stdout.len() - 1]
+            .split(|byte| *byte == 0)
             .map(|value| String::from_utf8(value.to_vec()).map_err(|error| error.to_string()))
             .collect()
     }
@@ -182,35 +215,74 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<ExistingPrCheckoutPlan, PrCheckoutFailure> {
         let refuse = |detail: String| PrCheckoutFailure::refused(&request.worktree, detail);
         let prepare = || -> Result<ExistingPrCheckoutPlan, String> {
-            ValidatedBranchName::parse(request.branch.as_str()).map_err(|error| error.to_string())?;
-            ValidatedBranchName::parse(request.head_branch.as_str()).map_err(|error| error.to_string())?;
+            ValidatedBranchName::parse(request.branch.as_str())
+                .map_err(|error| error.to_string())?;
+            ValidatedBranchName::parse(request.head_branch.as_str())
+                .map_err(|error| error.to_string())?;
             Oid::parse_object(request.expected_head.as_str()).map_err(|error| error.to_string())?;
             let worktree = DirectoryIdentity::read(&request.worktree)?;
-            let discovered = self.discover(&worktree.path, cancellation).map_err(|error| error.to_string())?;
-            if discovered.is_bare || discovered.worktree_root.as_deref() != Some(worktree.path.as_path()) {
+            let discovered = self
+                .discover(&worktree.path, cancellation)
+                .map_err(|error| error.to_string())?;
+            if discovered.is_bare
+                || discovered.worktree_root.as_deref() != Some(worktree.path.as_path())
+            {
                 return Err("Select the exact registered worktree root and try again".into());
             }
             let common_dir = DirectoryIdentity::read(&discovered.common_dir)?;
             let git_dir = DirectoryIdentity::read(&discovered.git_dir)?;
-            let repository = self.discover(&request.repository, cancellation).map_err(|error| error.to_string())?;
+            let repository = self
+                .discover(&request.repository, cancellation)
+                .map_err(|error| error.to_string())?;
             if DirectoryIdentity::read(&repository.common_dir)? != common_dir {
                 return Err("The selected worktree belongs to a different repository".into());
             }
-            let registered = self.list_worktrees(&worktree.path, cancellation).map_err(|error| error.to_string())?;
-            if !registered.iter().any(|entry| entry.path == worktree.path && entry.branch.as_deref() == Some(request.branch.full_ref().as_str()) && !entry.bare && !entry.lock.locked && entry.prunable_reason.is_none()) {
-                return Err("The worktree registration or checked-out branch changed; refresh the PR".into());
+            let registered = self
+                .list_worktrees(&worktree.path, cancellation)
+                .map_err(|error| error.to_string())?;
+            if !registered.iter().any(|entry| {
+                entry.path == worktree.path
+                    && entry.branch.as_deref() == Some(request.branch.full_ref().as_str())
+                    && !entry.bare
+                    && !entry.lock.locked
+                    && entry.prunable_reason.is_none()
+            }) {
+                return Err(
+                    "The worktree registration or checked-out branch changed; refresh the PR"
+                        .into(),
+                );
             }
-            for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer", "MERGE_AUTOSTASH"] {
+            for marker in [
+                "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "rebase-merge",
+                "rebase-apply",
+                "sequencer",
+                "MERGE_AUTOSTASH",
+            ] {
                 match fs::symlink_metadata(git_dir.path.join(marker)) {
-                    Ok(_) => return Err(format!("An existing Git operation ({marker}) must be completed before reconciling this checkout")),
+                    Ok(_) => {
+                        return Err(format!(
+                            "An existing Git operation ({marker}) must be completed before reconciling this checkout"
+                        ));
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            let status = self.status_for_removal(&worktree.path, cancellation).map_err(|error| error.to_string())?;
+            let status = self
+                .status_for_removal(&worktree.path, cancellation)
+                .map_err(|error| error.to_string())?;
             let current_head = match &status.head {
-                HeadState::Branch { name, oid } if name == request.branch.as_str() => Oid::parse_object(oid).map_err(|error| error.to_string())?,
-                _ => return Err("The worktree is no longer on the selected PR branch; refresh it".into()),
+                HeadState::Branch { name, oid } if name == request.branch.as_str() => {
+                    Oid::parse_object(oid).map_err(|error| error.to_string())?
+                }
+                _ => {
+                    return Err(
+                        "The worktree is no longer on the selected PR branch; refresh it".into(),
+                    );
+                }
             };
             let read = |key: &str| self.pr_values(&worktree.path, key, cancellation);
             let tracking = TrackingSnapshot {
@@ -219,22 +291,33 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 push_remote: read(&format!("branch.{}.pushremote", request.branch.as_str()))?,
                 push_default: read("remote.pushdefault")?,
             };
-            self.checked_remote(&worktree.path, &request.remote, cancellation).map_err(|error| error.to_string())?;
-            let remote = self.remotes(&worktree.path, cancellation).map_err(|error| error.to_string())?
-                .into_iter().find(|remote| remote.name == request.remote)
+            self.checked_remote(&worktree.path, &request.remote, cancellation)
+                .map_err(|error| error.to_string())?;
+            let remote = self
+                .remotes(&worktree.path, cancellation)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|remote| remote.name == request.remote)
                 .ok_or("The selected PR remote is no longer configured")?;
             let urls = read(&format!("remote.{}.url", request.remote))?;
             let push_urls = read(&format!("remote.{}.pushurl", request.remote))?;
             if urls.len() != 1 || push_urls.len() > 1 {
                 return Err("The PR remote has ambiguous fetch or push URLs; resolve its configuration first".into());
             }
-            let matches = |url: &str| remote_repository_key(url).is_some_and(|repo| repo.same_repository(&request.head_repository));
-            if !matches(&urls[0]) || (request.tracking == PrCheckoutTracking::RemoteBranch && push_urls.first().is_some_and(|url| !matches(url))) {
+            let matches = |url: &str| {
+                remote_repository_key(url)
+                    .is_some_and(|repo| repo.same_repository(&request.head_repository))
+            };
+            if !matches(&urls[0])
+                || (request.tracking == PrCheckoutTracking::RemoteBranch
+                    && push_urls.first().is_some_and(|url| !matches(url)))
+            {
                 return Err("The PR remote no longer names its reviewed head repository".into());
             }
             let absent = tracking.remote.is_empty() && tracking.merge.is_empty();
             let expected_merge = request.head_branch.full_ref();
-            let correct = tracking.remote == [request.remote.clone()] && tracking.merge == [expected_merge];
+            let correct =
+                tracking.remote == [request.remote.clone()] && tracking.merge == [expected_merge];
             let repair = match request.tracking {
                 PrCheckoutTracking::ReadOnly if absent => false,
                 PrCheckoutTracking::ReadOnly => return Err("This read-only review branch has tracking configured; reconcile it explicitly before opening".into()),
@@ -243,14 +326,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 PrCheckoutTracking::RemoteBranch => return Err("The branch has partial or different upstream configuration; preserve it and reconcile manually".into()),
             };
             if request.tracking == PrCheckoutTracking::RemoteBranch {
-                if tracking.push_remote.len() > 1 || tracking.push_default.len() > 1 || tracking.push_remote.first().or(tracking.push_default.first()).is_some_and(|name| name != &request.remote) {
+                if tracking.push_remote.len() > 1
+                    || tracking.push_default.len() > 1
+                    || tracking
+                        .push_remote
+                        .first()
+                        .or(tracking.push_default.first())
+                        .is_some_and(|name| name != &request.remote)
+                {
                     return Err("The branch's push destination differs from the PR remote; reconcile it explicitly".into());
                 }
                 if !read(&format!("remote.{}.push", request.remote))?.is_empty() {
                     return Err("The PR remote has explicit push refspecs; reconcile its push behavior before opening a writable checkout".into());
                 }
                 let push_mode = read("push.default")?;
-                if push_mode.len() > 1 || push_mode.first().is_some_and(|mode| !matches!(mode.as_str(), "simple" | "upstream" | "current")) || (request.branch != request.head_branch && push_mode.first().map(String::as_str) != Some("upstream")) {
+                if push_mode.len() > 1
+                    || push_mode.first().is_some_and(|mode| {
+                        !matches!(mode.as_str(), "simple" | "upstream" | "current")
+                    })
+                    || (request.branch != request.head_branch
+                        && push_mode.first().map(String::as_str) != Some("upstream"))
+                {
                     return Err("The configured push mode cannot safely publish this local branch to the PR head; reconcile it explicitly".into());
                 }
             }
@@ -259,41 +355,102 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if storage.len() > 1 || storage.first().is_some_and(|value| value != "files") {
                     return Err("Automatic tracking repair requires Git's files ref storage; configure the upstream explicitly and refresh".into());
                 }
-                if !read("extensions.worktreeconfig")?.is_empty() || git_dir.path.join("config.worktree").exists() || common_dir.path.join("config.worktree").exists() {
-                    return Err("Worktree-specific configuration requires explicit upstream reconciliation".into());
+                if !read("extensions.worktreeconfig")?.is_empty()
+                    || git_dir.path.join("config.worktree").exists()
+                    || common_dir.path.join("config.worktree").exists()
+                {
+                    return Err(
+                        "Worktree-specific configuration requires explicit upstream reconciliation"
+                            .into(),
+                    );
                 }
-                let command = self.git_read(&worktree.path, ["config", "--name-only", "--get-regexp", r"^(include|includeif)\."]);
-                let output = self.run(&command, cancellation).map_err(|error| error.reported_detail())?;
+                let command = self.git_read(
+                    &worktree.path,
+                    [
+                        "config",
+                        "--name-only",
+                        "--get-regexp",
+                        r"^(include|includeif)\.",
+                    ],
+                );
+                let output = self
+                    .run(&command, cancellation)
+                    .map_err(|error| error.reported_detail())?;
                 if output.exit_code != Some(1) {
                     return Err("Included configuration cannot be repaired atomically here; configure the upstream explicitly and refresh".into());
                 }
                 let fetch = read(&format!("remote.{}.fetch", request.remote))?;
                 let wildcard = format!("refs/heads/*:refs/remotes/{}/*", request.remote);
-                let exact = format!("{}:refs/remotes/{}/{}", request.head_branch.full_ref(), request.remote, request.head_branch.as_str());
-                if fetch.len() != 1 || ![wildcard.as_str(), exact.as_str()].contains(&fetch[0].trim_start_matches('+')) {
+                let exact = format!(
+                    "{}:refs/remotes/{}/{}",
+                    request.head_branch.full_ref(),
+                    request.remote,
+                    request.head_branch.as_str()
+                );
+                if fetch.len() != 1
+                    || ![wildcard.as_str(), exact.as_str()]
+                        .contains(&fetch[0].trim_start_matches('+'))
+                {
                     return Err("The remote's custom fetch mapping requires explicit upstream reconciliation".into());
                 }
             }
-            let remote_ref = format!("refs/remotes/{}/{}", request.remote, request.head_branch.as_str());
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                request.remote,
+                request.head_branch.as_str()
+            );
             ValidatedRefName::parse(&remote_ref).map_err(|error| error.to_string())?;
             let symbolic = self.git_read(&worktree.path, ["symbolic-ref", "--quiet", &remote_ref]);
-            let symbolic = self.run(&symbolic, cancellation).map_err(|error| error.reported_detail())?;
+            let symbolic = self
+                .run(&symbolic, cancellation)
+                .map_err(|error| error.reported_detail())?;
             if symbolic.exit_code != Some(1) {
-                return Err("The PR tracking ref is symbolic or unreadable; reconcile it explicitly".into());
+                return Err(
+                    "The PR tracking ref is symbolic or unreadable; reconcile it explicitly".into(),
+                );
             }
-            let remote_tracking = self.resolve_optional_revision(&worktree.path, &remote_ref, cancellation).map_err(|error| error.to_string())?;
-            let command = self.git_read(&worktree.path, ["config", "--null", "--list", "--show-scope"]);
-            let config = self.run_checked(&command, cancellation).map_err(|error| error.reported_detail())?.stdout;
-            if config.len() as u64 > CONFIG_LIMIT { return Err("Configuration is too large to reconcile safely".into()); }
+            let remote_tracking = self
+                .resolve_optional_revision(&worktree.path, &remote_ref, cancellation)
+                .map_err(|error| error.to_string())?;
+            let command = self.git_read(
+                &worktree.path,
+                ["config", "--null", "--list", "--show-scope"],
+            );
+            let config = self
+                .run_checked(&command, cancellation)
+                .map_err(|error| error.reported_detail())?
+                .stdout;
+            if config.len() as u64 > CONFIG_LIMIT {
+                return Err("Configuration is too large to reconcile safely".into());
+            }
             let advance = current_head != request.expected_head;
             if advance && status.dirty.is_dirty() {
                 return Err("The existing worktree has local changes. Commit or stash them before updating the PR checkout; nothing was overwritten".into());
             }
             // A newly reviewed commit may not be local yet. Fetch and ancestry
             // admission belong to execution, before any checkout effects.
-            if advance && self.resolve_optional_revision(&worktree.path, request.expected_head.as_str(), cancellation).map_err(|error| error.to_string())?.is_some() {
-                let command = self.git_read(&worktree.path, ["merge-base", "--is-ancestor", current_head.as_str(), request.expected_head.as_str()]);
-                let output = self.run(&command, cancellation).map_err(|error| error.reported_detail())?;
+            if advance
+                && self
+                    .resolve_optional_revision(
+                        &worktree.path,
+                        request.expected_head.as_str(),
+                        cancellation,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+            {
+                let command = self.git_read(
+                    &worktree.path,
+                    [
+                        "merge-base",
+                        "--is-ancestor",
+                        current_head.as_str(),
+                        request.expected_head.as_str(),
+                    ],
+                );
+                let output = self
+                    .run(&command, cancellation)
+                    .map_err(|error| error.reported_detail())?;
                 if !output.success {
                     return Err("The local PR branch is ahead or has diverged. Its commits were preserved; reconcile it manually".into());
                 }
@@ -310,7 +467,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 PrCheckoutDisposition::RepairTracking => "Configure the missing PR upstream and open the existing worktree.",
                 PrCheckoutDisposition::FastForwardAndRepair => "Configure the missing upstream, verify the fetched PR head, then fast-forward and open the existing clean worktree.",
             }.to_owned();
-            Ok(ExistingPrCheckoutPlan { request: request.clone(), worktree, git_dir, common_dir, current_head, tracking, remote, remote_tracking, config, dirty: status.dirty, disposition, notice })
+            Ok(ExistingPrCheckoutPlan {
+                request: request.clone(),
+                worktree,
+                git_dir,
+                common_dir,
+                current_head,
+                tracking,
+                remote,
+                remote_tracking,
+                config,
+                dirty: status.dirty,
+                disposition,
+                notice,
+            })
         };
         prepare().map_err(refuse)
     }
