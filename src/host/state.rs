@@ -57,6 +57,7 @@ pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
+    authority_rebind_pending: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
@@ -731,6 +732,10 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        if self.terminals.get(&terminal_id).is_some_and(|record| record.authority_rebind_pending) {
+            return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+                "Terminal ownership survived but its durable association is pending; use authenticated Retry", true));
+        }
         let record = self
             .terminals
             .get(&terminal_id)
@@ -930,7 +935,12 @@ impl HostState {
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
         let mut session = record.session.clone();
-        session.continuity = if !record.handle.is_completed() && attached {
+        session.continuity = if record.authority_rebind_pending {
+            TerminalContinuity::Failed { typed_error: crate::model::RuntimeError {
+                code: "terminal_authority_rebind_pending".into(),
+                message: "The original terminal survived, but its durable session association is unavailable. Retry to finish authenticated reconciliation.".into(),
+            }, retryable: true }
+        } else if !record.handle.is_completed() && attached {
             TerminalContinuity::Live {
                 host_session_id: self.proof.host_session_id.clone(),
                 boot_id: self.proof.boot_id.clone(),
@@ -1156,6 +1166,7 @@ impl HostState {
             terminal_id,
             TerminalRecord {
                 screen_lost_after_crash: false,
+                authority_rebind_pending: false,
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
@@ -1194,9 +1205,12 @@ impl HostState {
                 false,
             ));
         }
-        self.terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))
+        let record = self.terminals.get(&terminal_id).ok_or_else(|| not_found(terminal_id))?;
+        if record.authority_rebind_pending {
+            return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+                "Terminal ownership survived but its durable association is pending; use authenticated Retry", true));
+        }
+        Ok(record)
     }
 
     pub(crate) fn handle(
@@ -2518,42 +2532,38 @@ fn restore_terminal_execution_authority(
     previous: &[TerminalSession],
 ) -> Result<(), String> {
     use crate::agent_execution::HostedSession;
+    let (successor, expected, proof) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.terminals.get(&source.id).ok_or("The restored terminal disappeared before authority binding")?;
+        let proof = state.proof().clone();
+        let mut successor = record.session.clone();
+        successor.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        (successor, record.handle.clone(), proof)
+    };
     let registry = super::agent_execution::registry(host)?;
-    let authority = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_authority_source(source.id)?;
-    if !matches!(authority, Some(HostedSession::Terminal(_))) {
-        return Ok(());
-    }
-    let successor = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .descriptor(0, source.id)
-        .map_err(|error| error.message)?
-        .session;
-    let mut retained = Vec::new();
-    for source in previous.iter().chain(std::iter::once(source)) {
-        retained.push(HostedSession::Terminal(source.clone()));
-        if let Some(proof) = source.continuity.live_proof() {
-            // Holder discovery records detached ownership. Capability issuance
-            // used the same process proof while it was attached to the daemon.
-            let mut attached = source.clone();
-            attached.continuity = TerminalContinuity::Live {
-                host_session_id: proof.host_session_id,
-                boot_id: proof.boot_id,
-                host_incarnation: proof.host_incarnation,
-            };
-            retained.push(HostedSession::Terminal(attached.clone()));
-            attached.resume_hint =
-                crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
-            retained.push(HostedSession::Terminal(attached));
+    let authority = registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_authority_source(source.id)?;
+    if matches!(authority, Some(HostedSession::Terminal(_))) {
+        let mut retained = Vec::new();
+        for source in previous.iter().chain(std::iter::once(source)) {
+            retained.push(HostedSession::Terminal(source.clone()));
+            if let Some(proof) = source.continuity.live_proof() {
+                let mut attached = source.clone();
+                attached.continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id, boot_id: proof.boot_id, host_incarnation: proof.host_incarnation,
+                };
+                retained.push(HostedSession::Terminal(attached.clone()));
+                attached.resume_hint = crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
+                retained.push(HostedSession::Terminal(attached));
+            }
         }
+        registry.lock().unwrap_or_else(|p| p.into_inner())
+            .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
     }
-    registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.proof() != &proof { return Err("Daemon ownership changed during terminal authority binding".into()); }
+    let record = state.terminals.get_mut(&source.id).filter(|record| record.handle.same_worker(&expected))
+        .ok_or("The terminal worker changed during authority binding")?;
+    record.authority_rebind_pending = false;
     Ok(())
 }
 
@@ -3578,6 +3588,7 @@ fn start_terminal_view_owned(
         Default::default()
     };
     let weak = Arc::downgrade(shared);
+    let adopting = adoption.is_some();
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -3643,6 +3654,7 @@ fn start_terminal_view_owned(
             finish_pending_terminal(&mut state, terminal_id);
         }
         if descriptor.is_ok() {
+            state.terminals.get_mut(&terminal_id).expect("finished spawn").authority_rebind_pending = adopting;
             state
                 .terminals
                 .get_mut(&terminal_id)

@@ -91,6 +91,23 @@ fn reconcile_at(
     let original = terminals.iter().find(|terminal| {
         terminal.session.id == session.id && terminal.session.launch == session.launch
     });
+    if explicit_retry {
+        match client.reconcile_terminal(session.clone()) {
+            Ok(terminal) => {
+                crate::daemon::replacement_owner(socket, &proof)
+                    .map_err(|error| format!("cannot establish reconciled daemon ownership: {error}"))?;
+                return Ok(RecoveredTerminal {
+                    attach_completed: !terminal.session.continuity.can_resume_live(&proof),
+                    session: terminal.session, expected_host: Some(proof), recovery_lease,
+                });
+            }
+            // A genuinely absent holder leaves the existing positive process
+            // census and explicit replay policy in charge. Unsafe, foreign or
+            // unrecognized holder evidence never falls through to a spawn.
+            Err(crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound, .. }) => {}
+            Err(error) => return Err(format!("Cannot authenticate the original terminal holder: {error}. Its processes were preserved; no replacement was started")),
+        }
+    }
     if proof == expected {
         if let Some(terminal) = original
             && terminal.session.continuity.can_resume_live(&expected)
@@ -126,23 +143,6 @@ fn reconcile_at(
             expected_host: Some(proof),
             recovery_lease,
         });
-    }
-    if explicit_retry && original.is_none() {
-        match client.reconcile_terminal(session.clone()) {
-            Ok(terminal) => {
-                crate::daemon::replacement_owner(socket, &proof)
-                    .map_err(|error| format!("cannot establish reconciled daemon ownership: {error}"))?;
-                return Ok(RecoveredTerminal {
-                    attach_completed: !terminal.session.continuity.can_resume_live(&proof),
-                    session: terminal.session, expected_host: Some(proof), recovery_lease,
-                });
-            }
-            // A genuinely absent holder leaves the existing positive process
-            // census and explicit replay policy in charge. Unsafe, foreign or
-            // unrecognized holder evidence never falls through to a spawn.
-            Err(crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound, .. }) => {}
-            Err(error) => return Err(format!("Cannot authenticate the original terminal holder: {error}. Its processes were preserved; no replacement was started")),
-        }
     }
     if proof != expected
         && terminals

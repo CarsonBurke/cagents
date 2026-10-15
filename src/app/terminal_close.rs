@@ -1003,11 +1003,16 @@ mod tests {
 }
 
 fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
+    match crate::terminal::ipc::daemon_socket_path() {
+        Ok(path) => revalidate_and_close_at(intent, allow_active, &path),
+        Err(error) => CloseOutcome::Unreachable(error.to_string()),
+    }
+}
+
+fn revalidate_and_close_at(intent: &CloseIntent, allow_active: bool, path: &Path) -> CloseOutcome {
     if let Some(source) = &intent.completed_source {
         let run = || -> Result<CloseOutcome, String> {
-            let path =
-                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
             if client.proof() != &intent.proof || !intent.proof.is_complete() {
                 return Ok(CloseOutcome::Stale);
             }
@@ -1023,9 +1028,12 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
     if let Some(source) = &intent.live_source {
+        // Preserve the established exact current-daemon close route, including
+        // native returned terminals and accepted execution consoles.
+        let current = close_hosted_terminal_at(path, intent.terminal, &intent.proof, allow_active);
+        if !matches!(current, CloseOutcome::Stale) { return current; }
         let run = || -> Result<CloseOutcome, String> {
-            let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
             client.reconcile_terminal_close(source.clone(), allow_active).map_err(|error| error.to_string()).map(|outcome| match outcome {
                 TerminalCloseResult::Closed => CloseOutcome::Closed,
                 TerminalCloseResult::Active => CloseOutcome::Active,
@@ -1034,7 +1042,7 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
-    close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+    close_hosted_terminal_at(path, intent.terminal, &intent.proof, allow_active)
 }
 
 /// Asks the daemon to close `terminal`, provided the daemon is still the one
@@ -1046,9 +1054,15 @@ pub(super) fn close_hosted_terminal(
     proof: &HostSessionProof,
     allow_active: bool,
 ) -> CloseOutcome {
+    match crate::terminal::ipc::daemon_socket_path() {
+        Ok(path) => close_hosted_terminal_at(&path, terminal, proof, allow_active),
+        Err(error) => CloseOutcome::Unreachable(error.to_string()),
+    }
+}
+
+fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
-        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+        let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
         if client.proof() != proof || !proof.is_complete() {
             return Ok(CloseOutcome::Stale);
         }
@@ -1088,4 +1102,52 @@ pub(super) fn close_hosted_terminal(
         )
     };
     run().unwrap_or_else(CloseOutcome::Unreachable)
+}
+
+#[cfg(test)]
+mod paired_close_regression {
+    use super::*;
+    use crate::terminal_ipc::{ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, read_frame, write_frame};
+    #[test]
+    fn current_native_and_execution_console_close_keep_the_established_checked_route() {
+        for native_listener in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let proof = HostSessionProof { host_session_id: crate::model::HostSessionId::new("paired-close"), boot_id: crate::model::BootId::new("paired-boot"), host_incarnation: crate::model::HostIncarnation::new("paired-incarnation") };
+            let id = TerminalId::new();
+            let recipe = LaunchRecipe { program: if native_listener { "codex".into() } else { "/usr/bin/cagents".into() }, arguments: if native_listener { vec!["--remote".into(), "unix:///private/native.sock".into()] } else { vec!["agent".into(), "console".into(), id.to_string()] }, working_directory: directory.path().to_owned(), environment: Default::default(), unset_environment: Default::default() };
+            let mut descriptor = TerminalDescriptor::relaunchable(id, recipe, None);
+            descriptor.session.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+            if native_listener {
+                descriptor.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener { socket: "/private/native.sock".into(), allocator: proof.clone() });
+            }
+            let intent = CloseIntent { card: CardId::new(), terminal: id, proof: proof.clone(), completed_source: None, live_source: Some(descriptor.session.clone()), generation: 1, restore_card: None, pending: true, active: false, dont_ask_again: false, detail: None, focus: 0, restore_keyboard_nav: false };
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+                let send = |stream: &mut std::os::unix::net::UnixStream, request_id: u64, response| {
+                    write_frame(stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request_id), proof: proof.clone(), message: ServerMessage::Response { response } }).unwrap();
+                };
+                let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                send(&mut stream, connect.request_id, ServerResponse::Connected { proof: proof.clone(), resumed: vec![] });
+                let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(list.request, ClientRequest::List, "a known current console must not enter ordinary orphan adoption");
+                send(&mut stream, list.request_id, ServerResponse::Listed { terminals: vec![descriptor.clone()] });
+                let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == id));
+                send(&mut stream, attach.request_id, ServerResponse::Attached { terminal: descriptor });
+                write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Synchronized { terminal_id: id, generation: 0, event_sequence: 0 } }).unwrap();
+                let close: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(close.request, ClientRequest::CloseTerminalChecked { terminal_id, allow_active: false } if terminal_id == id));
+                send(&mut stream, close.request_id, ServerResponse::TerminalCloseChecked { terminal_id: id, outcome: TerminalCloseResult::Active });
+                let detach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
+                send(&mut stream, detach.request_id, ServerResponse::Detached);
+            });
+            assert!(matches!(revalidate_and_close_at(&intent, false, &socket), CloseOutcome::Active));
+            server.join().unwrap();
+        }
+    }
 }
