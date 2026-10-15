@@ -191,11 +191,14 @@ impl Drop for OwnedSocket {
 }
 
 impl LocalHandle {
+    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {self.0.native_holder_record.as_ref()}
+
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 struct Inner {
+    native_holder_record: Option<crate::daemon::holder_registry::Record>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
@@ -530,6 +533,7 @@ impl LocalHandle {
                 .and_then(|context| context.directory_descriptor()),
         ));
         let inner = Arc::new(Inner {
+            native_holder_record:native_holder.as_ref().map(|holder|holder.record().clone()),
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
             commands,
