@@ -2449,7 +2449,7 @@ impl Actor {
     fn apply(&mut self, event: Event) {
         if let Event::Compaction { active } = &event {
             let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-            if *active {close.revision=close.revision.saturating_add(1);}
+            if *active || close.compacting!=*active {close.revision=close.revision.saturating_add(1);}
             close.compacting=*active;
             return;
         }
