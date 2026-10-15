@@ -80,6 +80,7 @@ impl AccountSwitchOptions {
 enum ActorCommand {
     AccountNotice(String),
     AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
+    CheckAccountSwitch {generation:u64,admitted:crossbeam_channel::Sender<Option<AccountSwitchOptions>>},
     RetainedProvider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -1184,7 +1185,9 @@ impl LocalHandle {
     /// An observed idle generation never authorizes stopping autonomous work.
     pub(crate) fn close_for_account_switch(&self,generation:u64)->Result<Option<AccountSwitchOptions>,String> {
         if !self.is_completed() {
-            return Err("This live provider cannot prove safe exact account handoff. Continue on the selected account as a new conversation (cache lost); the original session stays open.".into());
+            let (admitted,response)=crossbeam_channel::bounded(1);
+            self.ownership_command(ActorCommand::CheckAccountSwitch{generation,admitted})?;
+            return response.try_recv().map_err(|error|format!("Account-switch admission was not acknowledged: {error}"));
         }
         let options={
             let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
@@ -1218,32 +1221,23 @@ impl LocalHandle {
             if let Some(failure) = self.failure() {
                 return Err(failure);
             }
-            let snapshot = self
-                .snapshot(None)
-                .ok_or("The account switch options are unavailable")?;
-            if snapshot.ready {
-                let model_matches = options.model.is_none()
-                    || (snapshot.selected_model == options.model
-                        && snapshot.reasoning == options.reasoning);
-                let permission_matches = options.permission_mode.is_none()
-                    || snapshot.permission_mode == options.permission_mode;
-                let fast_matches = options.fast_mode.is_none()
-                    || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)
-                        == options.fast_mode;
-                // Account-owned inherited rules are never rewritten as session
-                // rules. If known permissions differ, refuse the seamless handoff
-                // rather than silently losing a restriction or granting access.
-                let permissions_match =
-                    options.permissions.is_none() || snapshot.permissions == options.permissions;
+            let (ready,model_matches,permission_matches,fast_matches,permissions_match,fast_enabled,model_available)={
+                let snapshot=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
+                (snapshot.ready,
+                    options.model.is_none() || (snapshot.selected_model==options.model && snapshot.reasoning==options.reasoning),
+                    options.permission_mode.is_none() || snapshot.permission_mode==options.permission_mode,
+                    options.fast_mode.is_none() || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)==options.fast_mode,
+                    options.permissions.is_none() || snapshot.permissions==options.permissions,
+                    snapshot.fast_mode.as_ref().is_some_and(super::FastMode::enabled),
+                    snapshot.models.iter().any(|model|Some(&model.id)==options.model.as_ref()))
+            };
+            // Inspect only current controls. Restoring settings must never page
+            // or clone a transcript merely because the source pane is hidden.
+            if ready {
                 if model_matches && permission_matches && fast_matches && permissions_match {
                     return Ok(());
                 }
-                if options.fast_mode == Some(false)
-                    && snapshot
-                        .fast_mode
-                        .as_ref()
-                        .is_some_and(super::FastMode::enabled)
-                {
+                if options.fast_mode == Some(false) && fast_enabled {
                     // A successor may restart with the issued recipe's fast tier.
                     // Disable it and await confirmation before a non-fast model
                     // can be selected. Enabling follows model restoration below.
@@ -1253,10 +1247,7 @@ impl LocalHandle {
                     }
                 } else if !model_matches
                     && !model_sent
-                    && snapshot
-                        .models
-                        .iter()
-                        .any(|model| Some(&model.id) == options.model.as_ref())
+                    && model_available
                 {
                     self.command(Command::SetModel {
                         model: options.model.clone().expect("a differing known model"),
@@ -3047,6 +3038,17 @@ impl Actor {
                 self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
+                ActorCommand::CheckAccountSwitch{generation,admitted} => {
+                    let state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+                    let idle=state.generation==generation && self.update_readiness(&state)==UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready() && state.queued_messages.is_empty();
+                    // Busy/stale is a proved refusal before effects, so the UI
+                    // can retain its queued choice. Idle is not backend consent
+                    // or a provider barrier; preserve autonomous work as f45 does.
+                    let _=admitted.send(None);
+                    let _=reply.send(if idle {Err("This live provider cannot prove safe exact account handoff. Continue on the selected account as a new conversation (cache lost); the original session stays open.".into())} else {Ok(())});
+                    continue;
+                }
                 ActorCommand::AccountSwitchGeneration(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let generation = (self.update_readiness(&state) == UpdateReadiness::Idle

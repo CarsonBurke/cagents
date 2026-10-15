@@ -1392,7 +1392,32 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    pub fn account_switch_generation(&self)->Result<Option<u64>,String> {
+        if self.state().completed {
+            if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {return Ok(Some(snapshot.generation));}
+        }
+        self.call("account_switch_generation",Value::Null)
+    }
+    pub fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
+        // A finally retired helper cannot answer RPC. Its exact final attached
+        // publication remains immutable in this proxy, without hydrating disk.
+        if self.state().completed {
+            if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {
+                return Ok(Some(super::AccountSwitchOptions::capture(snapshot)));
+            }
+        }
+        self.call("completed_account_options",Value::Null)
+    }
     pub fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
+        let cached=if self.state().completed {
+            self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|snapshot|(snapshot.generation,super::AccountSwitchOptions::capture(snapshot)))
+        } else {None};
+        if let Some((current,options))=cached {
+            if current!=generation {return Ok(None);}
+            // Options metadata alone never proves ownership release.
+            self.finish_close()?;
+            return Ok(Some(options));
+        }
         let result:AccountSwitchClose=self.call("close_for_account_switch",json!([generation]))?;
         match (result.options,result.publication) {
             (None,None)=>Ok(None),
@@ -3682,6 +3707,20 @@ done"#;
         assert!(actor.owns_work(),"a partial reply is not cleanup proof");
         assert!(!actor.state().completed);
         peer.join().unwrap();
+    }
+
+
+    #[test]
+    fn completed_account_metadata_survives_helper_retirement_without_a_new_rpc_or_read_authority() {
+        let actor=RemoteActor::fixture(); // Its endpoint deliberately does not exist.
+        actor.publish_closed(Snapshot{generation:77,selected_model:Some("final-confirmed-model".into()),reasoning:Some("high".into()),exited:true,..Snapshot::default()});
+        assert_eq!(actor.account_switch_generation().unwrap(),Some(77));
+        let options=actor.completed_account_options().unwrap().unwrap();
+        assert_eq!(options.model.as_deref(),Some("final-confirmed-model"));
+        assert_eq!(options.reasoning.as_deref(),Some("high"));
+        assert!(actor.close_for_account_switch(76).unwrap().is_none(),"a stale generation grants no handoff");
+        // Metadata alone does not call publish_retirement or reconstruct scope.
+        assert!(actor.launch_account_scope().is_err());
     }
 
 }
