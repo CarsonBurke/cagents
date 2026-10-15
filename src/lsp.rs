@@ -369,6 +369,15 @@ pub struct LspProgress {
 /// Everything the runtime pushes to the application.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspEvent {
+    PrepareRename {request:LspRequestId,doc:LspDocumentId,range:Option<LspRange>,placeholder:Option<String>},
+    WorkspaceEdit {request:LspRequestId,doc:LspDocumentId,kind:LspEditKind,edit:LspWorkspaceEdit},
+    CodeActions {request:LspRequestId,doc:LspDocumentId,items:Vec<LspCodeAction>},
+    CodeActionResolved {request:LspRequestId,doc:LspDocumentId,item:LspCodeAction},
+    SignatureHelp {request:LspRequestId,doc:LspDocumentId,help:Option<LspSignatureHelp>},
+    ServerMessage {doc:LspDocumentId,level:LspMessageLevel,message:String},
+    CommandExecuted {request:LspRequestId,doc:LspDocumentId},
+    ApplyWorkspaceEdit {doc:LspDocumentId,id:LspServerEditId,label:Option<String>,edit:LspWorkspaceEdit},
+
     /// Discovery completed off the UI thread. The application acknowledges it
     /// with `LspManager::finish_discovery`; closed/replaced documents are ignored.
     RootDiscovered {
@@ -430,6 +439,10 @@ pub enum LspEvent {
 /// Why a conversion or request was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LspError {
+    #[error("request timed out after {milliseconds} ms")]
+    TimedOut { milliseconds:u64 },
+    #[error("unsupported language-server operation: {0}")]
+    Unsupported(String),
     #[error("document {0} is not open at the LSP boundary")]
     UnknownDocument(u64),
     #[error("no language server is running for this document")]
@@ -936,6 +949,7 @@ enum StagedClass {
     Status(LspDocumentId),
     Progress(LspDocumentId),
     Resources(LspDocumentId),
+    ServerMessage(LspDocumentId),
 }
 
 #[derive(Debug, Default)]
@@ -967,6 +981,7 @@ impl PendingInner {
             LspEvent::Status { doc, .. } => StagedClass::Status(*doc),
             LspEvent::Progress { doc, .. } => StagedClass::Progress(*doc),
             LspEvent::Resources { doc } => StagedClass::Resources(*doc),
+            LspEvent::ServerMessage { doc,.. } => StagedClass::ServerMessage(*doc),
             _ => {
                 // Terminal: dropping one would leave the application waiting
                 // for an answer that never comes, so the oldest is only
@@ -1007,6 +1022,7 @@ impl PendingInner {
             StagedClass::Status(doc),
             StagedClass::Progress(doc),
             StagedClass::Resources(doc),
+            StagedClass::ServerMessage(doc),
         ] {
             self.replaceable.remove(&class);
         }
@@ -1014,7 +1030,8 @@ impl PendingInner {
             StagedClass::Diagnostics(at)
             | StagedClass::Status(at)
             | StagedClass::Progress(at)
-            | StagedClass::Resources(at) => *at != doc,
+            | StagedClass::Resources(at)
+            | StagedClass::ServerMessage(at) => *at != doc,
         });
         self.diagnostic_versions.remove(&doc);
         self.terminal.retain(|event| event_doc(event) != Some(doc));
@@ -1033,6 +1050,14 @@ fn event_doc(event: &LspEvent) -> Option<LspDocumentId> {
         | LspEvent::Status { doc, .. }
         | LspEvent::Progress { doc, .. }
         | LspEvent::RequestFailed { doc, .. }
+        | LspEvent::PrepareRename { doc, .. }
+        | LspEvent::WorkspaceEdit { doc, .. }
+        | LspEvent::CodeActions { doc, .. }
+        | LspEvent::CodeActionResolved { doc, .. }
+        | LspEvent::SignatureHelp { doc, .. }
+        | LspEvent::ServerMessage { doc, .. }
+        | LspEvent::CommandExecuted { doc, .. }
+        | LspEvent::ApplyWorkspaceEdit { doc, .. }
         | LspEvent::DocumentDesynced { doc, .. } => Some(*doc),
     }
 }
@@ -1794,6 +1819,14 @@ enum RequestKind {
     Hover,
     Definition,
     References,
+    PrepareRename,
+    Rename,
+    Formatting,
+    RangeFormatting,
+    CodeActions,
+    ResolveCodeAction,
+    ExecuteCommand,
+    SignatureHelp,
 }
 
 /// One client request, already converted to protocol coordinates.
@@ -1808,6 +1841,9 @@ struct PendingRequest {
     /// Snapshot version the position was converted against; a result that
     /// arrives after the document moved on is refused.
     version: i32,
+    args: RequestArgs,
+    timeout: Duration,
+    observed_versions: HashMap<Url, i32>,
 }
 
 enum SessionCommand {
@@ -1860,6 +1896,7 @@ struct InFlight {
 
 /// Raw server answers, unified so one code path converts all four.
 enum RawResult {
+    Feature(features::RawFeatureResult),
     Completion(Option<lsp_types::CompletionResponse>),
     Hover(Option<lsp_types::Hover>),
     Definition(Option<lsp_types::GotoDefinitionResponse>),
@@ -1872,6 +1909,7 @@ async fn perform(
     server: ServerSocket,
     kind: RequestKind,
     position: lsp_types::TextDocumentPositionParams,
+    args: RequestArgs,
 ) -> Result<RawResult, async_lsp::Error> {
     match kind {
         RequestKind::Completion => server
@@ -1909,10 +1947,14 @@ async fn perform(
             })
             .await
             .map(RawResult::References),
+        kind => features::perform_feature(server, kind, position, args).await.map(RawResult::Feature),
     }
 }
 
 struct SessionContext {
+    server_edits:Arc<features::ServerEdits>,
+    capabilities: Arc<Mutex<LspCapabilities>>,
+    server_settings: LanguageServerSettings,
     key: SessionKey,
     launch: LaunchSpec,
     transport: TransportFactory,
@@ -1955,6 +1997,8 @@ impl SessionContext {
 
 /// Shared state for the client-side router handling server-initiated traffic.
 struct RouterState {
+    server_edits:Arc<features::ServerEdits>,
+    configuration:serde_json::Value,
     key: SessionKey,
     snapshots: Arc<SnapshotStore>,
     events: EventSink,
@@ -1963,6 +2007,8 @@ struct RouterState {
 
 fn build_router(context: &SessionContext) -> Router<RouterState> {
     let mut router = Router::new(RouterState {
+        server_edits:Arc::clone(&context.server_edits),
+        configuration:context.server_settings.configuration.clone(),
         key: context.key.clone(),
         snapshots: Arc::clone(&context.snapshots),
         events: context.events.clone(),
@@ -1976,8 +2022,8 @@ fn build_router(context: &SessionContext) -> Router<RouterState> {
         publish_progress(state, &params);
         ControlFlow::Continue(())
     });
-    router.notification::<notification::ShowMessage>(|_, _| ControlFlow::Continue(()));
-    router.notification::<notification::LogMessage>(|_, _| ControlFlow::Continue(()));
+    router.notification::<notification::ShowMessage>(|state, params| {features::publish_message(state,params.typ,params.message,true);ControlFlow::Continue(())});
+    router.notification::<notification::LogMessage>(|state, params| {features::publish_message(state,params.typ,params.message,false);ControlFlow::Continue(())});
     router.notification::<notification::TelemetryEvent>(|_, _| ControlFlow::Continue(()));
     router.notification::<notification::LogTrace>(|_, _| ControlFlow::Continue(()));
     // Dynamic registration is accepted and ignored: every capability this
@@ -1988,9 +2034,10 @@ fn build_router(context: &SessionContext) -> Router<RouterState> {
     // No per-server configuration is exposed, so every requested section is
     // answered with null rather than an error, which servers read as "use
     // your defaults".
-    router.request::<request::WorkspaceConfiguration, _>(|_, params| {
-        std::future::ready(Ok(vec![serde_json::Value::Null; params.items.len()]))
+    router.request::<request::WorkspaceConfiguration, _>(|state, params| {
+        std::future::ready(Ok(params.items.into_iter().map(|item|features::configuration(&state.configuration,item.section.as_deref())).collect()))
     });
+    router.request::<request::ApplyWorkspaceEdit,_>(features::apply_workspace_edit);
     // Unknown notifications must never break the main loop: an unsupported
     // notification is not a reason to lose a working language server.
     router.unhandled_notification(|_, _| ControlFlow::Continue(()));
@@ -2105,7 +2152,7 @@ fn publish_progress(state: &mut RouterState, params: &lsp_types::ProgressParams)
 }
 
 fn client_capabilities() -> lsp_types::ClientCapabilities {
-    lsp_types::ClientCapabilities {
+    let mut caps = lsp_types::ClientCapabilities {
         text_document: Some(lsp_types::TextDocumentClientCapabilities {
             synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
                 dynamic_registration: Some(false),
@@ -2154,10 +2201,13 @@ fn client_capabilities() -> lsp_types::ClientCapabilities {
             work_done_progress: Some(true),
             ..Default::default()
         }),
+        workspace:Some(lsp_types::WorkspaceClientCapabilities {apply_edit:Some(true),configuration:Some(true),workspace_edit:Some(lsp_types::WorkspaceEditClientCapabilities {document_changes:Some(true),change_annotation_support:Some(lsp_types::ChangeAnnotationWorkspaceEditClientCapabilities {groups_on_label:Some(true)}),..Default::default()}),..Default::default()}),
         // No alternative position encoding is advertised, so the server must
         // use UTF-16, which is what the conversion layer above implements.
         ..Default::default()
-    }
+    };
+    features::add_client_capabilities(&mut caps);
+    caps
 }
 
 #[allow(deprecated)]
@@ -2237,7 +2287,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
     // `a_superseded_request_is_cancelled_on_the_wire` locks the coupling.
     let mut next_wire_id: i32 = 0;
 
-    let params = match initialize_params(&context.launch.root) {
+    let mut params = match initialize_params(&context.launch.root) {
         Ok(params) => params,
         Err(reason) => {
             teardown(protocol, child, stderr_drain, &context.process_group).await;
@@ -2245,7 +2295,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             return;
         }
     };
-    let initialize = server.request::<request::Initialize>(params);
+    let initialize = server.request::<request::Initialize>({ params.initialization_options = context.server_settings.initialization_options.clone(); params });
     next_wire_id += 1;
     let initialized = tokio::select! {
         biased;
@@ -2296,6 +2346,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             return;
         }
     };
+    *context.capabilities.lock().unwrap_or_else(|p| p.into_inner()) = features::negotiate(&negotiated.capabilities);
     let sync = SyncSupport::negotiate(negotiated.capabilities.text_document_sync.as_ref());
     *context
         .completion_triggers
@@ -2306,6 +2357,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
         .map(|provider| provider.trigger_characters.unwrap_or_default());
     // `initialized` is legal only after the response has been received.
     let _ = server.notify::<notification::Initialized>(lsp_types::InitializedParams {});
+    if !context.server_settings.configuration.is_null() {let _=server.notify::<notification::DidChangeConfiguration>(lsp_types::DidChangeConfigurationParams {settings:context.server_settings.configuration.clone()});}
     context.set_status(LspStatus::Ready).await;
 
     let mut state = SessionState {
@@ -2685,7 +2737,7 @@ impl SessionState {
         // meaningful.
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let mut call = Box::pin(perform(server, request.kind, position));
+            let mut call = Box::pin(perform(server.clone(), request.kind, position, request.args.clone()));
             let mut settled: Option<Result<RawResult, async_lsp::Error>> = None;
             std::future::poll_fn(|context| {
                 if let Poll::Ready(value) = call.as_mut().poll(context) {
@@ -2697,7 +2749,15 @@ impl SessionState {
             let _ = started_tx.send(());
             let outcome = match settled {
                 Some(value) => value,
-                None => call.await,
+                None => match tokio::time::timeout(request.timeout, call).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let _ = server.notify::<notification::Cancel>(lsp_types::CancelParams { id:lsp_types::NumberOrString::Number(wire_id) });
+                        events.emit(LspEvent::RequestFailed { request:request.id,doc:request.doc,error:LspError::TimedOut { milliseconds: request.timeout.as_millis() as u64 } }).await;
+                        let _ = done.send(request.id);
+                        return;
+                    }
+                },
             };
             let event = match outcome {
                 Ok(raw) => convert_result(&snapshots, &request, raw),
@@ -2749,6 +2809,14 @@ impl SessionState {
             RequestKind::Hover,
             RequestKind::Definition,
             RequestKind::References,
+            RequestKind::PrepareRename,
+            RequestKind::Rename,
+            RequestKind::Formatting,
+            RequestKind::RangeFormatting,
+            RequestKind::CodeActions,
+            RequestKind::ResolveCodeAction,
+            RequestKind::ExecuteCommand,
+            RequestKind::SignatureHelp,
         ] {
             if let Some(entry) = self.in_flight.remove(&(doc, kind)) {
                 self.by_request.remove(&entry.id);
@@ -2876,6 +2944,7 @@ fn convert_result(snapshots: &SnapshotStore, request: &PendingRequest, raw: RawR
     };
 
     match raw {
+        RawResult::Feature(raw) => features::convert_feature(snapshots, request, &snapshot, raw),
         RawResult::Completion(response) => {
             let raw_items = match response {
                 None => Vec::new(),
@@ -3477,6 +3546,8 @@ impl SessionActivity {
 
 #[derive(Clone)]
 struct SessionHandle {
+    capabilities: Arc<Mutex<LspCapabilities>>,
+    server_settings: LanguageServerSettings,
     worktree: Arc<Path>,
     activity: Arc<Mutex<SessionActivity>>,
     resident_bytes: Arc<AtomicU64>,
@@ -3605,6 +3676,7 @@ static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// The application's single LSP client.
 pub struct LspManager {
+    server_edits:Arc<features::ServerEdits>,
     servers: Vec<LanguageServerSettings>,
     /// Lowercase extension to the first server and language that claims it.
     extensions: HashMap<String, LspLanguage>,
@@ -3680,6 +3752,7 @@ impl LspManager {
             transport: Arc::new(spawn_process_transport),
             retiring: Vec::new(),
             flusher: None,
+            server_edits:Arc::new(features::ServerEdits::default()),
             next_request: 1,
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
             stopping: false,
@@ -4007,6 +4080,7 @@ impl LspManager {
     /// Unregisters the document and arms a bounded warm-cache period after
     /// its final tab closes.
     pub fn close(&mut self, doc: LspDocumentId) {
+        self.server_edits.close_doc(doc);
         self.pending_opens.remove(&doc);
         let Some(reference) = self.documents.remove(&doc) else {
             return;
@@ -4227,6 +4301,7 @@ impl LspManager {
     /// server, because the reap that answers for these ones has already been
     /// arranged. See [`LspManager::stopping`].
     pub fn shutdown(&mut self) {
+        self.server_edits.clear();
         self.stopping = true;
         for session in self.sessions.values() {
             if let Some(retiring) = session.retire() {
@@ -4320,6 +4395,10 @@ impl LspManager {
     }
 
     fn request(&mut self, doc: LspDocumentId, at: LspPosition, kind: RequestKind) -> LspRequestId {
+        self.request_with_args(doc, at, kind, RequestArgs::None, Duration::from_secs(15))
+    }
+
+    fn request_with_args(&mut self, doc: LspDocumentId, at: LspPosition, kind: RequestKind, args:RequestArgs, timeout:Duration) -> LspRequestId {
         let id = LspRequestId(self.next_request);
         self.next_request += 1;
         let fail = |events: &EventSink, error: LspError| {
@@ -4353,6 +4432,7 @@ impl LspManager {
                 kind,
                 position,
                 version: snapshot.version,
+                args, timeout, observed_versions: if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {self.snapshots.lock().uris.iter().map(|(uri,state)| ((**uri).clone(),state.latest().version)).collect()} else {HashMap::new()},
             }))
         {
             return fail(&self.events, LspError::Protocol(reason.to_owned()));
@@ -4486,6 +4566,8 @@ impl LspManager {
         }
         let (tx, rx) = commands::channel();
         let handle = SessionHandle {
+            capabilities: Arc::new(Mutex::new(LspCapabilities::default())),
+            server_settings: server.clone(),
             worktree: Arc::from(worktree.to_path_buf()),
             activity: Arc::new(Mutex::new(SessionActivity::default())),
             resident_bytes: Arc::new(AtomicU64::new(0)),
@@ -4498,6 +4580,9 @@ impl LspManager {
             task: Arc::new(Mutex::new(None)),
         };
         let context = SessionContext {
+            server_edits:Arc::clone(&self.server_edits),
+            capabilities: Arc::clone(&handle.capabilities),
+            server_settings: server.clone(),
             key: key.clone(),
             launch: LaunchSpec {
                 command: server.command.clone(),
@@ -8622,6 +8707,7 @@ mod tests {
             kind: RequestKind::Definition,
             position: lsp_types::Position::new(0, 0),
             version: 1,
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
         }
     }
 
@@ -8789,6 +8875,7 @@ mod tests {
             kind: RequestKind::Completion,
             position: lsp_types::Position::new(0, 3),
             version: 1,
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
         };
         let event = convert_result(
             &store,
@@ -8807,5 +8894,74 @@ mod tests {
             vec!["fine"],
             "the refused item is omitted and the rest are still offered"
         );
+    }
+    #[test]
+    fn editor_feature_requests_round_trip_with_exact_configuration_and_coordinates() {
+        block_on(async {
+            let (_guard,worktree,file)=workspace();let other=file.with_file_name("other.rs");
+            let uri=Url::from_file_path(&file).unwrap();let other_uri=Url::from_file_path(&other).unwrap();
+            let mut manager=rust_manager();manager.servers[0].initialization_options=Some(json!({"check":{"command":"clippy"}}));
+            manager.servers[0].configuration=json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+            let edit=json!({"documentChanges":[{"textDocument":{"uri":uri,"version":1},"edits":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"bar"}]},{"textDocument":{"uri":other_uri,"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}]}]});
+            let response_edit=edit.clone();
+            let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":{"prepareProvider":true},"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"codeActionProvider":{"resolveProvider":true},"executeCommandProvider":{"commands":["fixture.fix"]},"signatureHelpProvider":{"triggerCharacters":["(",","],"retriggerCharacters":[","]}}),move |request|{
+                let result=match request.method.as_str(){
+                    "textDocument/prepareRename"=>json!({"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"placeholder":"foo"}),
+                    "textDocument/rename"=>response_edit.clone(),
+                    "textDocument/formatting"|"textDocument/rangeFormatting"=>json!([{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"foo "}]),
+                    "textDocument/codeAction"=>json!([{"title":"Import fixture","kind":"quickfix","data":{"opaque":7}}]),
+                    "codeAction/resolve"=>json!({"title":"Import fixture","edit":response_edit,"command":{"title":"Apply","command":"fixture.fix","arguments":[{"opaque":7}]}}),
+                    "workspace/executeCommand"=>Value::Null,
+                    "textDocument/signatureHelp"=>json!({"signatures":[{"label":"f(𝄞, value)","parameters":[{"label":[2,4]},{"label":[6,11]}]}],"activeSignature":0,"activeParameter":1}),
+                    _=>return vec![],
+                };vec![json!({"jsonrpc":"2.0","id":request.id,"result":result})]
+            });
+            let doc=LspDocumentId(1);let events=manager.events();manager.open_for_test(doc,&file,&worktree,rust_language(),1,"a𝄞foo\n");
+            let handle=handle_of(&slot).await;await_ready(&events,doc).await;
+            assert_eq!(handle.wait_for("initialize").await.params["initializationOptions"],json!({"check":{"command":"clippy"}}));
+            assert_eq!(handle.wait_for("workspace/didChangeConfiguration").await.params["settings"]["rust-analyzer"]["check"]["command"],json!("clippy"));
+            assert!(manager.capabilities(doc).rename);assert!(manager.signature_trigger(doc,'('));
+            let request=manager.request_prepare_rename(doc,LspPosition::new(0,2));
+            let range=next_matching(&events,|e|match e{LspEvent::PrepareRename{request:r,range,..}if *r==request=>Some(*range),_=>None}).await.unwrap();assert_eq!(range.start.character,2);
+            let request=manager.request_rename(doc,LspPosition::new(0,2),"bar".into());
+            let edit=next_matching(&events,|e|match e{LspEvent::WorkspaceEdit{request:r,edit,..}if *r==request=>Some(edit.clone()),_=>None}).await;
+            assert_eq!(edit.documents.len(),2);assert_eq!(edit.documents[0].edits[0].range.start.character,2);assert_eq!(edit.documents[0].observed_version,Some(1));assert_eq!(edit.documents[1].coordinates,LspCoordinates::Utf16);
+            assert_eq!(handle.wait_for("textDocument/rename").await.params["position"]["character"],json!(3));
+            for selection in [false,true] {
+                let request=if selection{manager.request_range_formatting(doc,range,LspFormattingOptions::default(),Duration::from_millis(1000))}else{manager.request_formatting(doc,LspFormattingOptions::default(),Duration::from_millis(1000))};
+                next_matching(&events,|e|match e{LspEvent::WorkspaceEdit{request:r,..}if *r==request=>Some(()),_=>None}).await;
+            }
+            let request=manager.request_code_actions(doc,range,&[]);
+            let item=next_matching(&events,|e|match e{LspEvent::CodeActions{request:r,items,..}if *r==request=>items.first().cloned(),_=>None}).await;assert!(item.needs_resolve);
+            let request=manager.request_resolve_code_action(doc,item);
+            let item=next_matching(&events,|e|match e{LspEvent::CodeActionResolved{request:r,item,..}if *r==request=>Some(item.clone()),_=>None}).await;assert_eq!(item.edit.as_ref().unwrap().documents.len(),2);
+            assert_eq!(handle.wait_for("codeAction/resolve").await.params["data"]["opaque"],json!(7));
+            let request=manager.execute_command(doc,item.command.unwrap());next_matching(&events,|e|match e{LspEvent::CommandExecuted{request:r,..}if *r==request=>Some(()),_=>None}).await;
+            let request=manager.request_signature_help(doc,LspPosition::new(0,2),Some("(".into()));let help=next_matching(&events,|e|match e{LspEvent::SignatureHelp{request:r,help,..}if *r==request=>Some(help.clone()),_=>None}).await.unwrap();
+            assert_eq!(help.active_parameter,Some(1));assert_eq!(help.signatures[0].parameters[0].range,Some(2..6));assert_eq!(help.signatures[0].parameters[1].label,"value");
+            handle.notify("window/showMessage",json!({"type":1,"message":"workspace failed to load"}));
+            let message=next_matching(&events,|e|match e{LspEvent::ServerMessage{level:LspMessageLevel::Error,message,..}=>Some(message.clone()),_=>None}).await;assert_eq!(message,"workspace failed to load");
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn editor_feature_timeout_cancels_wire_and_reports_terminal_failure(){block_on(async{
+        let (_guard,worktree,file)=workspace();let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"documentFormattingProvider":true}), |_|vec![]);let events=manager.events();let doc=LspDocumentId(1);
+        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo\n");let handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        let request=manager.request_formatting(doc,LspFormattingOptions::default(),Duration::from_millis(25));
+        next_matching(&events,|e|match e{LspEvent::RequestFailed{request:r,error:LspError::TimedOut{milliseconds:25},..}if *r==request=>Some(()),_=>None}).await;
+        let wire=handle.wait_for("textDocument/formatting").await.id.unwrap();assert_eq!(handle.wait_for("$/cancelRequest").await.params["id"],json!(wire));manager.begin_shutdown().await;
+    });}
+
+    #[test]
+    fn workspace_edit_conversion_refuses_stale_targets_and_preserves_document_changes_precedence(){
+        let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,2,Arc::from("a𝄞foo"));
+        let edit: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"changes":{"file:///ignored.rs":[]},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":2},"edits":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"bar"}]}]})).unwrap();
+        let converted=features::convert_workspace_edit(&store,edit.clone(),Some(&HashMap::from([((*uri).clone(),2)]))).unwrap();assert_eq!(converted.documents.len(),1);assert_eq!(converted.documents[0].edits[0].range.start.character,2);
+        assert!(matches!(features::convert_workspace_edit(&store,edit,Some(&HashMap::from([((*uri).clone(),1)]))),Err(LspError::StaleVersion{..})));
+        let resource: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]})).unwrap();assert!(matches!(features::convert_workspace_edit(&store,resource,None),Err(LspError::Unsupported(_))));
+        assert_eq!(features::configuration(&json!({"rust-analyzer":{"check":{"command":"clippy"}}}),Some("rust-analyzer.check.command")),json!("clippy"));
     }
 }

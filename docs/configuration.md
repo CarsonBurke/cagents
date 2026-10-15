@@ -416,3 +416,26 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+### Language-server editor options
+
+Each `[[language_servers]]` entry accepts `format_on_save` (default `false`),
+`formatting_timeout_ms` (default `1000`, range `50..=10000`),
+`initialization_options`, and `configuration`. Initialization options are sent
+unchanged in `initialize`; configuration is sent after initialization and used
+for `workspace/configuration` section requests. Dotted sections such as
+`rust-analyzer.check` select nested configuration objects. Each JSON value is
+limited to 1 MiB. For example, these fields belong to the rust-analyzer server:
+
+```toml
+format_on_save = true
+formatting_timeout_ms = 1000
+initialization_options = { check = { command = "clippy" } }
+configuration = { rust-analyzer = { check = { command = "clippy" } } }
+```
+
+Formatting timeouts report a terminal request failure and cancel the server
+request, allowing the application to continue saving. Workspace-edit file
+creation, file deletion, and file renaming are rejected before applying any
+text edits; ordinary multi-file text edits retain server versions and preview
+annotations for the application to validate and confirm.
