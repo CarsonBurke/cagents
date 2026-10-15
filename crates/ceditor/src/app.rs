@@ -44,6 +44,14 @@ use std::{
 const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
+/// Display limits never authorize a mutation; full-group workers use status().
+fn display_snapshot_options(status_limit: usize) -> cagents::repository::SnapshotOptions {
+    cagents::repository::SnapshotOptions {
+        status_limit: Some(status_limit),
+        ..Default::default()
+    }
+}
+
 mod checkout;
 mod notification_ui;
 
@@ -1230,6 +1238,10 @@ impl Editor {
     }
 
     fn resolve_open(path: PathBuf) -> Result<Opened, String> {
+        Self::resolve_open_with_limit(path, AppSettings::default().git_status_limit)
+    }
+
+    fn resolve_open_with_limit(path: PathBuf, status_limit: usize) -> Result<Opened, String> {
         let path = path
             .canonicalize()
             .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -1253,7 +1265,7 @@ impl Editor {
             .as_ref()
             .map(|root| {
                 service
-                    .snapshot(root, &token)
+                    .snapshot_with_options(root, display_snapshot_options(status_limit), &token)
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
@@ -1269,9 +1281,9 @@ impl Editor {
         })
     }
 
-    fn open(path: PathBuf, selection_epoch: u64) -> Task<Message> {
+    fn open(path: PathBuf, selection_epoch: u64, status_limit: usize) -> Task<Message> {
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || Self::resolve_open(path))
+            let result = tokio::task::spawn_blocking(move || Self::resolve_open_with_limit(path, status_limit))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -1279,14 +1291,14 @@ impl Editor {
         })
     }
 
-    fn restore_session(paths: Vec<(PathBuf, bool)>) -> Task<Message> {
+    fn restore_session(paths: Vec<(PathBuf, bool)>, status_limit: usize) -> Task<Message> {
         cosmic::task::future(async move {
             // Resolve in durable order, not background-task completion order.
             // An unavailable entry never prevents the remaining files opening.
             let opened = tokio::task::spawn_blocking(move || {
                 paths
                     .into_iter()
-                    .map(|(path, focus)| (focus, Self::resolve_open(path)))
+                    .map(|(path, focus)| (focus, Self::resolve_open_with_limit(path, status_limit)))
                     .collect()
             })
             .await
@@ -1721,7 +1733,7 @@ impl Editor {
             return self.continue_exit();
         }
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
-        Self::open(path, self.selection_epoch)
+        Self::open(path, self.selection_epoch, self.settings.git_status_limit)
     }
 
     fn remove_tab(&mut self, id: CardId) {
@@ -2294,6 +2306,7 @@ impl Editor {
     }
 
     fn refresh_snapshot(&mut self, id: CardId, force: bool) -> Task<Message> {
+        let status_limit = self.settings.git_status_limit;
         let Some(tab) = self.tab_mut(id).filter(|tab| tab.git) else {
             return Task::none();
         };
@@ -2309,7 +2322,7 @@ impl Editor {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let mut snapshot = RepositoryService::system("git")
-                    .snapshot(&root, &CancellationToken::default())
+                    .snapshot_with_options(&root, display_snapshot_options(status_limit), &CancellationToken::default())
                     .map_err(|error| error.to_string())?;
                 let target = worker_path
                     .as_ref()
@@ -3027,7 +3040,7 @@ impl Application for Editor {
             tasks.push(app.set_window_title("ceditor".to_owned(), window));
         }
         if !startup_paths.is_empty() {
-            tasks.push(Self::restore_session(startup_paths));
+            tasks.push(Self::restore_session(startup_paths, app.settings.git_status_limit));
         }
         (app, Task::batch(tasks))
     }
@@ -3228,7 +3241,7 @@ impl Application for Editor {
                         Message::Chosen(selection_epoch, chosen_path(response))
                     })
                 }
-                Message::Chosen(epoch, Ok(Some(path))) => Self::open(path, epoch),
+                Message::Chosen(epoch, Ok(Some(path))) => Self::open(path, epoch, self.settings.git_status_limit),
                 Message::DocumentOpened(epoch, fragment, result) => {
                     let opened = match result {
                         Ok(opened) if !self.exiting => opened,
@@ -3498,9 +3511,10 @@ impl Application for Editor {
                                 // Markdown-to-Markdown navigation stays in the preview, including
                                 // fragmentless links. New tabs preserve the source's unsaved edits.
                                 let fragment = Some(fragment.unwrap_or_default());
+                                let status_limit = self.settings.git_status_limit;
                                 return cosmic::task::future(async move {
                                     let result = tokio::task::spawn_blocking(move || {
-                                        let mut opened = Self::resolve_open(path.clone())?;
+                                        let mut opened = Self::resolve_open_with_limit(path.clone(), status_limit)?;
                                         if path.is_dir() {
                                             let directory = path
                                                 .canonicalize()
@@ -7614,6 +7628,28 @@ mod tests {
             file_operation_destination(source, " renamed λ.txt ").unwrap(),
             Path::new("src/ renamed λ.txt "),
         );
+    }
+
+    #[test]
+    fn standalone_display_snapshots_keep_the_configured_cap_on_open_and_refresh() {
+        let directory = git_fixture();
+        for number in 0..6 {
+            std::fs::write(directory.path().join(format!("new-{number}.txt")), "new\n").unwrap();
+        }
+        let mut app = editor();
+        app.settings.git_status_limit = 2;
+        let epoch = app.selection_epoch;
+        let task = app.update(Message::Chosen(epoch, Ok(Some(directory.path().to_path_buf()))));
+        run_tasks(&mut app, task);
+        let id = app.active.unwrap();
+        let shown = |app: &Editor| app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap()
+            .groups().iter().map(|group| group.rows().len()).sum::<usize>();
+        assert_eq!(shown(&app), 2);
+        let task = app.update(Message::RefreshVisible);
+        run_tasks(&mut app, task);
+        assert_eq!(shown(&app), 2);
+        assert_eq!(RepositoryService::system("git").status(directory.path(), &CancellationToken::default())
+            .unwrap().entries.len(), 6, "display limits never affect authoritative status");
     }
 
     #[test]
