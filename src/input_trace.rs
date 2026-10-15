@@ -1007,7 +1007,9 @@ mod tests {
             {
                 shell.publish(FocusConflictMessage::RawInput);
             }
-            if self.focused.get() && matches!(event, Event::Keyboard(keyboard::Event::KeyReleased { .. })) {
+            if self.focused.get()
+                && matches!(event, Event::Keyboard(keyboard::Event::KeyReleased { .. }))
+            {
                 shell.publish(FocusConflictMessage::RawRelease);
             }
         }
@@ -1271,45 +1273,88 @@ mod tests {
             let raw_id = cosmic::iced::widget::Id::unique();
             let control = cosmic::iced::widget::Id::unique();
             let raw_focused = Rc::new(Cell::new(true));
-            let raw = Element::new(RetainedRaw { id: raw_id.clone(), focused: raw_focused.clone() });
+            let raw = Element::new(RetainedRaw {
+                id: raw_id.clone(),
+                focused: raw_focused.clone(),
+            });
             let popup: Element<'_, FocusConflictMessage> = match kind {
                 "read-only" => cosmic::widget::text_input("Overlay", "retained")
-                    .id(control.clone()).editing(false).on_input(FocusConflictMessage::Edited).into(),
+                    .id(control.clone())
+                    .editing(false)
+                    .on_input(FocusConflictMessage::Edited)
+                    .into(),
                 "no-handler" => cosmic::widget::text_input("Overlay", "retained")
-                    .id(control.clone()).into(),
+                    .id(control.clone())
+                    .into(),
                 "editable" => cosmic::widget::text_input("Overlay", "retained")
-                    .id(control.clone()).on_input(FocusConflictMessage::Edited).into(),
+                    .id(control.clone())
+                    .on_input(FocusConflictMessage::Edited)
+                    .into(),
                 _ => cosmic::widget::button::text("Overlay action")
-                    .id(control.clone()).on_press(FocusConflictMessage::Click).into(),
+                    .id(control.clone())
+                    .on_press(FocusConflictMessage::Click)
+                    .into(),
             };
             let regions = vec![
-                (raw_id, KeyboardRegion { pane: FocusedPane::Terminal, card: Some(CardId::new()) }),
+                (
+                    raw_id,
+                    KeyboardRegion {
+                        pane: FocusedPane::Terminal,
+                        card: Some(CardId::new()),
+                    },
+                ),
                 (control.clone(), FocusedPane::OutsideWorkspace.into()),
             ];
             let element = observe_keyboard_events(
-                cosmic::widget::popover(raw).popup(popup), &trace, regions.clone(),
+                cosmic::widget::popover(raw).popup(popup),
+                &trace,
+                regions.clone(),
                 |_, _, region, widget| FocusConflictMessage::Key(region, widget),
             );
-            let mut ui = UserInterface::build(element, Size::new(400.0, 180.0), Cache::new(), &mut renderer);
+            let mut ui = UserInterface::build(
+                element,
+                Size::new(400.0, 180.0),
+                Cache::new(),
+                &mut renderer,
+            );
             if kind != "unfocused" {
                 ui.operate(&renderer, &mut focusable::focus::<()>(control.clone()));
                 // Reproduce a retained raw native flag without replacing the
                 // actual focusable overlay widget or bypassing its operation.
                 raw_focused.set(true);
-                let mut query = KeyboardFocus { known_regions: regions.iter().cloned().collect(), ..KeyboardFocus::default() };
+                let mut query = KeyboardFocus {
+                    known_regions: regions.iter().cloned().collect(),
+                    ..KeyboardFocus::default()
+                };
                 ui.operate(&renderer, &mut query);
                 assert_eq!(query.widget_id(&regions), Some(control));
             }
             let mut messages = Vec::new();
             let _ = ui.update(
-                &[Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("ime".into()))],
-                mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages,
+                &[Event::InputMethod(
+                    cosmic::iced::advanced::input_method::Event::Commit("ime".into()),
+                )],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
             );
-            assert_eq!(messages.contains(&FocusConflictMessage::RawInput), kind == "unfocused", "{kind}: {messages:?}");
-            assert!(raw_focused.get(), "the negative must be proved by overlay ownership, not by clearing the raw fixture");
-            let edited: Vec<_> = messages.iter().filter_map(|message| match message {
-                FocusConflictMessage::Edited(value) => Some(value), _ => None,
-            }).collect();
+            assert_eq!(
+                messages.contains(&FocusConflictMessage::RawInput),
+                kind == "unfocused",
+                "{kind}: {messages:?}"
+            );
+            assert!(
+                raw_focused.get(),
+                "the negative must be proved by overlay ownership, not by clearing the raw fixture"
+            );
+            let edited: Vec<_> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    FocusConflictMessage::Edited(value) => Some(value),
+                    _ => None,
+                })
+                .collect();
             if kind == "editable" {
                 assert_eq!(edited.len(), 1, "{messages:?}");
                 assert_eq!(edited[0].matches("ime").count(), 1);
@@ -1322,41 +1367,96 @@ mod tests {
 
     #[test]
     fn focused_overlay_leaves_an_ignored_release_for_the_original_raw_child() {
-        use cosmic::iced::{keyboard::key::{Code, Physical}, advanced::{clipboard, widget::operation::focusable}};
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{
+            advanced::{clipboard, widget::operation::focusable},
+            keyboard::key::{Code, Physical},
+        };
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let raw = cosmic::iced::widget::Id::unique();
         let control = cosmic::iced::widget::Id::unique();
         let retained = Rc::new(Cell::new(true));
         let trace = InputTrace::default();
         let element = observe_keyboard_events(
-            cosmic::widget::popover(Element::new(RetainedRaw { id: raw.clone(), focused: retained.clone() }))
-                .popup(cosmic::widget::button::text("Overlay action").id(control.clone()).on_press(FocusConflictMessage::Click)),
+            cosmic::widget::popover(Element::new(RetainedRaw {
+                id: raw.clone(),
+                focused: retained.clone(),
+            }))
+            .popup(
+                cosmic::widget::button::text("Overlay action")
+                    .id(control.clone())
+                    .on_press(FocusConflictMessage::Click),
+            ),
             &trace,
-            vec![(raw, KeyboardRegion { pane: FocusedPane::Terminal, card: Some(CardId::new()) }), (control.clone(), FocusedPane::OutsideWorkspace.into())],
+            vec![
+                (
+                    raw,
+                    KeyboardRegion {
+                        pane: FocusedPane::Terminal,
+                        card: Some(CardId::new()),
+                    },
+                ),
+                (control.clone(), FocusedPane::OutsideWorkspace.into()),
+            ],
             |_, _, region, widget| FocusConflictMessage::Key(region, widget),
         );
-        let mut ui = UserInterface::build(element, Size::new(400.0, 180.0), Cache::new(), &mut renderer);
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(400.0, 180.0),
+            Cache::new(),
+            &mut renderer,
+        );
         let down = Event::Keyboard(keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
-            physical_key: Physical::Code(Code::KeyR), location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(), text: Some("r".into()), repeat: false,
+            key: keyboard::Key::Character("r".into()),
+            modified_key: keyboard::Key::Character("r".into()),
+            physical_key: Physical::Code(Code::KeyR),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("r".into()),
+            repeat: false,
         });
         let up = Event::Keyboard(keyboard::Event::KeyReleased {
-            key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
-            physical_key: Physical::Code(Code::KeyR), location: keyboard::Location::Standard,
+            key: keyboard::Key::Character("r".into()),
+            modified_key: keyboard::Key::Character("r".into()),
+            physical_key: Physical::Code(Code::KeyR),
+            location: keyboard::Location::Standard,
             modifiers: keyboard::Modifiers::CTRL,
         });
         let mut messages = Vec::new();
-        let _ = ui.update(&[down], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
-        assert_eq!(messages.iter().filter(|message| **message == FocusConflictMessage::RawInput).count(), 1);
+        let _ = ui.update(
+            &[down],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| **message == FocusConflictMessage::RawInput)
+                .count(),
+            1
+        );
         ui.operate(&renderer, &mut focusable::focus::<()>(control));
         // Keep the original raw consumer's ownership across overlay focus;
         // this test qualifies transport, not PTY receipt/pairing semantics.
         retained.set(true);
         messages.clear();
-        let _ = ui.update(&[up], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
-        assert_eq!(messages.iter().filter(|message| **message == FocusConflictMessage::RawRelease).count(), 1, "{messages:?}");
+        let _ = ui.update(
+            &[up],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| **message == FocusConflictMessage::RawRelease)
+                .count(),
+            1,
+            "{messages:?}"
+        );
     }
 
     fn moved(x: f32) -> Event {

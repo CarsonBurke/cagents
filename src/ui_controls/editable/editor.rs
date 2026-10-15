@@ -1,10 +1,13 @@
 //! Form editors use the same native editor for ordinary interaction. Absolute
 //! assistive selections go through an explicit app callback, never synthesized
 //! key or pointer events.
+use super::history::{EditHistory, HistoryIntent};
 use super::*;
 use cosmic::iced::{advanced::text::highlighter::PlainText, widget::text_editor};
-use std::{cell::RefCell, sync::{Arc, Mutex}};
-use super::history::{EditHistory, HistoryIntent};
+use std::{
+    cell::RefCell,
+    sync::{Arc, Mutex},
+};
 
 struct EditorFocus(bool);
 impl Operation for EditorFocus {
@@ -77,16 +80,25 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
         self
     }
     fn initial_history(&self) -> Option<(EditorHistoryOwner, Arc<Mutex<EditHistory>>)> {
-        self.history_owner.as_ref().map(|owner| (
-            owner.clone(),
-            Arc::new(Mutex::new(EditHistory::new(self.content.text(), self.content.cursor()))),
-        ))
+        self.history_owner.as_ref().map(|owner| {
+            (
+                owner.clone(),
+                Arc::new(Mutex::new(EditHistory::new(
+                    self.content.text(),
+                    self.content.cursor(),
+                ))),
+            )
+        })
     }
     fn publish_history(&self, tree: &Tree, intent: HistoryIntent, shell: &mut Shell<'_, Message>) {
         if let Some(callback) = &self.on_history
             && let Some((owner, history)) = &tree.state.downcast_ref::<EditorState>().history
         {
-            shell.publish(callback(EditorHistoryCommand::new(owner, history.clone(), intent)));
+            shell.publish(callback(EditorHistoryCommand::new(
+                owner,
+                history.clone(),
+                intent,
+            )));
         }
     }
     pub fn on_cursor(mut self, callback: impl Fn(text_editor::Cursor) -> Message + 'a) -> Self {
@@ -519,7 +531,11 @@ mod tests {
         })
     }
 
-    fn native_batch(content: &text_editor::Content<Renderer>, owner: &EditorHistoryOwner, events: &[Event]) -> Vec<Message> {
+    fn native_batch(
+        content: &text_editor::Content<Renderer>,
+        owner: &EditorHistoryOwner,
+        events: &[Event],
+    ) -> Vec<Message> {
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let id = Id::new("test.batch-composer");
@@ -623,7 +639,8 @@ mod tests {
                         )));
                         // Like a single-line commit subject, normalization is
                         // accepted in this same draft, not a new draft owner.
-                        content = text_editor::Content::with_text(&content.text().to_ascii_uppercase());
+                        content =
+                            text_editor::Content::with_text(&content.text().to_ascii_uppercase());
                     }
                     Message::Edit(_) => {}
                     Message::History(command) => {
@@ -673,14 +690,22 @@ mod tests {
         let mut content = text_editor::Content::new();
         let owner = EditorHistoryOwner::default();
         let mut redo = batch_key('z', true);
-        if let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { modifiers, .. }) = &mut redo {
+        if let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { modifiers, .. }) =
+            &mut redo
+        {
             *modifiers |= cosmic::iced::keyboard::Modifiers::SHIFT;
         }
-        for message in native_batch(&content, &owner, &[batch_key('a', false), batch_key('z', true), redo]) {
+        for message in native_batch(
+            &content,
+            &owner,
+            &[batch_key('a', false), batch_key('z', true), redo],
+        ) {
             match message {
                 Message::Edit(action) => content.perform(action),
                 Message::Cursor(cursor) => content.move_to(cursor),
-                Message::History(command) => { command.apply(&mut content, &owner); }
+                Message::History(command) => {
+                    command.apply(&mut content, &owner);
+                }
             }
         }
         assert_eq!(content.text(), "a");

@@ -50,7 +50,11 @@ impl EditorHistoryCommand {
         history: Arc<Mutex<EditHistory>>,
         intent: HistoryIntent,
     ) -> Self {
-        Self { owner: owner.0.clone(), history, intent }
+        Self {
+            owner: owner.0.clone(),
+            history,
+            intent,
+        }
     }
     pub fn changes_text(&self) -> bool {
         !matches!(self.intent, HistoryIntent::Observe)
@@ -158,5 +162,4 @@ mod tests {
         assert!(history.bytes <= 1024 * 1024);
         assert!(history.entries.len() <= 128);
     }
-
 }
