@@ -3835,6 +3835,11 @@ impl RepositoryRuntime {
     }
 
     /// The live buffer, or nothing while no editable document is open.
+    /// The standalone LSP concern retains the editor's existing four-space
+    /// default. The indentation concern supplies per-file detected/configured
+    /// values through this same small interface during integration.
+    pub fn editor_formatting_options(&self) -> (u32, bool) { (4, true) }
+
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
             DocumentState::Editable(document) => Some(document.content.text()),

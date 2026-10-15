@@ -442,7 +442,10 @@ impl Cagents {
                     return Task::none();
                 }
                 let timeout = self.lsp.formatting_settings(operation.doc).map_or(Duration::from_millis(1000), |(_, timeout)| timeout);
-                let options = LspFormattingOptions::default();
+                let options = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => { let (tab_size, insert_spaces) = runtime.editor_formatting_options(); LspFormattingOptions { tab_size, insert_spaces } },
+                    _ => LspFormattingOptions::default(),
+                };
                 let request = if selection {
                     let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                     let Some(range) = runtime.editor_selection_range() else {
