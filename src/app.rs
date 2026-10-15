@@ -222,6 +222,8 @@ const NOTICE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const BROWSER_TOOLBAR_HEIGHT: f32 = design::ROW_HEIGHT;
 #[cfg(feature = "integrated-browser")]
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
+#[cfg(feature = "integrated-browser")]
+static BROWSER_PROGRESS_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const DIALOG_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 /// How long an exit waits once its window is gone: a frame, which lets winit
@@ -4519,7 +4521,6 @@ struct BrowserRuntime {
     address: BrowserAddress,
     address_focused: bool,
     address_error: bool,
-    progress_phase: f32,
     load_state: Option<String>,
 }
 
@@ -9143,7 +9144,7 @@ impl Cagents {
                 );
             }
             {
-                let phase = browser_runtime.map_or(0.0, |browser| browser.progress_phase);
+                let phase = (BROWSER_PROGRESS_EPOCH.elapsed().as_secs_f64() * 0.7).fract() as f32;
                 rows.push(
                     widget::container(crate::ui_controls::responsive(move |size| {
                         let width = size.width * 0.25;
@@ -15548,14 +15549,7 @@ impl Application for Cagents {
                 Task::none()
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserProgressTick => {
-                for runtime in self.cards.values_mut() {
-                    if let CardRuntime::Browser(browser) = runtime {
-                        browser.progress_phase = (browser.progress_phase + 0.035) % 1.0;
-                    }
-                }
-                Task::none()
-            }
+            Message::BrowserProgressTick => Task::none(),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserNavigate(card) => {
                 let url = match self.cards.get_mut(&card) {
@@ -17672,7 +17666,6 @@ fn spawn_browser(
     };
     BrowserHandle::spawn(restore, visible, fallback)
         .map(|handle| BrowserRuntime {
-            progress_phase: 0.0,
             address_focused: false,
             address_error: false,
             handle,
