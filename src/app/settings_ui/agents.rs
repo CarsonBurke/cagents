@@ -288,7 +288,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(cosmic::Renderer::new(
-                Font::MONOSPACE,
+                cosmic::iced::Font::MONOSPACE,
                 iced::Pixels(14.0),
                 Some("tiny-skia"),
             ))
