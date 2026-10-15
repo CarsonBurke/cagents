@@ -403,7 +403,8 @@ fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uu
         retained_actor::wake(&host, id);
         return;
     }
-    if matches!(&update, Update::Ready) {
+    if matches!(&update, Update::Ready | Update::Identity) {
+        if instance.is_some_and(|instance| !host.lock().unwrap_or_else(|p|p.into_inner()).chats.get(&id).is_some_and(|record|record.execution_instance==instance)) {return;}
         super::agent_execution::retain_chat_identity(&host, id);
     }
     if matches!(&update, Update::Attention(_)) {

@@ -731,6 +731,7 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
+                        let identity_changed=state.confirmed_session != old.confirmed_session;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -758,6 +759,7 @@ impl RemoteActor {
                                 outcome,
                             });
                         }
+                        if identity_changed { (actor.0.notify)(Update::Identity); }
                         if ready {
                             (actor.0.notify)(Update::Ready);
                         }

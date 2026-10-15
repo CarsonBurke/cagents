@@ -145,6 +145,10 @@ pub(crate) enum Update {
     },
     /// Older-turn evidence must never sample or replace current attention.
     PastAttention(crate::notifications::Evidence),
+    /// A provider-confirmed identity changed after initial readiness. Scalar
+    /// metadata only; the host reads its exact current actor under its fence.
+    Identity,
+
 }
 
 #[derive(Clone)]
@@ -3250,12 +3254,12 @@ impl Actor {
         }
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
-        if let Some(confirmed) = confirmed {
-            *self
-                .confirmed_session
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = confirmed;
-        }
+        let identity_changed = if let Some(confirmed) = confirmed {
+            let mut retained=self.confirmed_session.lock().unwrap_or_else(|p| p.into_inner());
+            let changed=*retained!=confirmed;
+            *retained=confirmed;
+            changed
+        } else {false};
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
         // its final outcome (which may arrive in a much later frame).
@@ -3283,6 +3287,7 @@ impl Actor {
                 let _ = reply.send(result);
             }
         }
+        if identity_changed { (self.notify)(Update::Identity); }
         self.publish_activity();
         match frame_error { Some(error) => Err(error), None => Ok(()) }
     }
