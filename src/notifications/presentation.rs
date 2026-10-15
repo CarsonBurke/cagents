@@ -30,10 +30,44 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         Kind::ReviewRequested => "Review requested",
         Kind::MessageReceived => "Messages waiting",
         Kind::AutomationPaused => "Automation paused",
-        Kind::AutomationBlocked => "Automation blocked",
-        Kind::AutomationSkipped => "Automation occurrence skipped",
+        Kind::AutomationBlocked => "Automation needs attention",
+        Kind::AutomationSkipped => "Occurrence skipped",
         Kind::AutomationProposed => "Scheduled work needs approval",
     };
+    // Scheduler reasons are safe semantic metadata at their producer. Keep
+    // the complete recovery instruction independently of opt-in chat excerpts;
+    // capping the combined context as a title would hide its useful tail.
+    let automation = match &event.target {
+        Target::Automation { name, reason, .. } => Some((
+            name.as_str(),
+            bounded_words(&without_controls(reason), 512),
+            "Open automation history",
+        )),
+        Target::AutomationProposal { name, project, requester, .. } => Some((
+            name.as_str(),
+            format!("Project: {}\nRequested by: {}",
+                bounded_words(&without_controls(project), 256),
+                if requester.is_empty() { "Hosted conversation".into() }
+                else { bounded_words(&without_controls(requester), 256) }),
+            "Review proposal",
+        )),
+        _ => None,
+    };
+    if let Some((name, metadata, action)) = automation {
+        let full_name = bounded_words(&without_controls(name), 160);
+        let title = if full_name.is_empty() { outcome.into() } else { title(&full_name) };
+        let mut body = outcome.to_owned();
+        if !full_name.is_empty() { body.push('\n'); body.push_str(&full_name); }
+        if !metadata.is_empty() { body.push('\n'); body.push_str(&metadata); }
+        if let Some(excerpt) = content.map(|content| plain_preview(&content.preview)).filter(|text| !text.is_empty()) {
+            body.push('\n'); body.push_str(&excerpt);
+        }
+        return Message {
+            title, body, action,
+            needs_input: matches!(event.evidence.kind,
+                Kind::AutomationPaused | Kind::AutomationBlocked | Kind::AutomationProposed),
+        };
+    }
     let inbox = matches!(event.target, Target::SessionInbox(_));
     let context = if inbox {
         String::new()
@@ -72,14 +106,11 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         action: match event.target {
             Target::PullRequest(_) => "Open review",
             Target::SessionInbox(_) => "Open terminal",
-            Target::Automation { .. } => "Open automation",
-            Target::AutomationProposal { .. } => "Review proposal",
             _ => "Open conversation",
         },
         needs_input: matches!(
             event.evidence.kind,
             Kind::Waiting | Kind::ReviewRequested | Kind::MessageReceived
-                | Kind::AutomationPaused | Kind::AutomationBlocked | Kind::AutomationProposed
         ),
     }
 }
@@ -271,8 +302,8 @@ mod tests {
         use crate::notifications::{Event, Evidence, Kind, Target};
         for (kind, label, needs_input) in [
             (Kind::AutomationPaused, "Automation paused", true),
-            (Kind::AutomationBlocked, "Automation blocked", true),
-            (Kind::AutomationSkipped, "Automation occurrence skipped", false),
+            (Kind::AutomationBlocked, "Automation needs attention", true),
+            (Kind::AutomationSkipped, "Occurrence skipped", false),
             (Kind::AutomationProposed, "Scheduled work needs approval", true),
         ] {
             let mut event = Event::session(crate::model::TerminalId::new(), crate::agent::Provider::Claude,
@@ -289,7 +320,7 @@ mod tests {
             let shown = message(&event, false);
             assert!(shown.body.starts_with(label));
             assert!(shown.title.contains("Original"));
-            assert_eq!(shown.action, if kind == Kind::AutomationProposed { "Review proposal" } else { "Open automation" });
+            assert_eq!(shown.action, if kind == Kind::AutomationProposed { "Review proposal" } else { "Open automation history" });
             assert_eq!(shown.needs_input, needs_input);
         }
     }
@@ -330,5 +361,54 @@ mod tests {
         assert!(result.ends_with('…'));
         assert!(!result.contains('\n'));
         assert!(title(&"🦀".repeat(1000)).chars().count() <= TITLE_LIMIT);
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+    use crate::notifications::{Content, Event, Evidence, Kind, Target};
+
+    #[test]
+    fn automation_default_retains_complete_safe_recovery_reason_and_exact_action() {
+        let name = "Nightly review ".repeat(9);
+        let reason = format!("{} Reopen the project and enable the automation.", "a".repeat(430));
+        for kind in [Kind::AutomationPaused, Kind::AutomationBlocked, Kind::AutomationSkipped] {
+            let event = Event {
+                target: Target::Automation { id: uuid::Uuid::new_v4(), name: name.clone(), reason: reason.clone() },
+                source_session: None, provider: None, directory: None, destination: None,
+                evidence: Evidence { key: format!("automation-{kind:?}"), kind },
+                content: Some(Content { conversation: "Private conversation".into(), preview: "Private provider diagnostic".into(), request: None }),
+            };
+            event.validate().unwrap();
+            let private = message(&event, false);
+            assert!(private.title.chars().count() <= TITLE_LIMIT);
+            assert!(private.body.contains(name.trim()), "full semantic name is not limited to the title");
+            assert!(private.body.ends_with(&reason), "the recovery instruction must not be reduced to an 80-character context title");
+            assert!(!private.body.contains("Private"));
+            assert_eq!(private.action, "Open automation history");
+            assert_eq!(private.needs_input, kind != Kind::AutomationSkipped);
+            let rich = message(&event, true);
+            assert!(rich.body.contains(&reason));
+            assert!(rich.body.ends_with("Private provider diagnostic"));
+            assert_eq!(rich.title, private.title, "automation identity remains the title");
+        }
+    }
+
+    #[test]
+    fn proposal_default_names_the_actual_project_requester_and_review_action() {
+        let event = Event {
+            target: Target::AutomationProposal { id: uuid::Uuid::new_v4(), name: "Daily focused review".into(), project: "actual-project".into(), requester: "actual-requester".into() },
+            source_session: None, provider: None, directory: None, destination: None,
+            evidence: Evidence { key: "proposal".into(), kind: Kind::AutomationProposed },
+            content: None,
+        };
+        event.validate().unwrap();
+        let rendered = message(&event, false);
+        assert_eq!(rendered.title, "Daily focused review");
+        assert!(rendered.body.contains("Project: actual-project"));
+        assert!(rendered.body.contains("Requested by: actual-requester"));
+        assert_eq!(rendered.action, "Review proposal");
+        assert!(rendered.needs_input);
     }
 }
