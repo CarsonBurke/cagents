@@ -736,6 +736,22 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut { label: "Paste into terminal", chords: &["Ctrl+Shift+V"], scope: "Panes", refusal: "This chord is reserved for Paste into terminal" },
 ];
 
+/// These chords remain valid workspace bindings outside text editing. They
+/// are shown as scoped conflicts, rather than rejecting a useful workspace
+/// default such as Reopen pane on the editor's Redo chord.
+pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut { label: "Undo text edit", chords: &["Ctrl+Z"], scope: "Editor", refusal: "Text inputs keep Undo; this action is available outside text editing" },
+    FixedShortcut { label: "Redo text edit", chords: &["Ctrl+Shift+Z", "Ctrl+Y"], scope: "Editor", refusal: "Text inputs keep Redo; this action is available outside text editing" },
+    FixedShortcut { label: "Select all text", chords: &["Ctrl+A"], scope: "Editor", refusal: "Text inputs keep Select all; this action is available outside text editing" },
+    FixedShortcut { label: "Copy / cut / paste text", chords: &["Ctrl+C", "Ctrl+X", "Ctrl+V"], scope: "Editor", refusal: "Text inputs keep clipboard editing; this action is available outside text editing" },
+    FixedShortcut { label: "Find in text", chords: &["Ctrl+F"], scope: "Editor", refusal: "Text inputs keep Find; other actions are available outside text editing" },
+    FixedShortcut { label: "Navigate / delete words", chords: &["Ctrl+Left", "Ctrl+Right", "Ctrl+Shift+Left", "Ctrl+Shift+Right", "Ctrl+Backspace", "Ctrl+Delete", "Alt+Left", "Alt+Right", "Alt+Shift+Left", "Alt+Shift+Right", "Alt+Backspace", "Alt+Delete"], scope: "Editor", refusal: "Text inputs keep word editing; this action is available outside text editing" },
+];
+
+pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'static str> {
+    TEXT_EDITING_SHORTCUTS.iter().find(|fixed| fixed.chords.iter().any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))).map(|fixed| fixed.refusal)
+}
+
 /// The same refusal is used by the recorder, typed edits and file validation.
 pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> {
     if let Some(reason) = withheld_from_the_card(binding) {
