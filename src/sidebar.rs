@@ -5740,6 +5740,9 @@ fn compact_project_identity(
                 worktree.behind
             )
         );
+        if let Some(operation) = worktree.operation {
+            let _ = write!(description, ", {} in progress", operation.label());
+        }
         if let Some(attention) = state.worktree_attention(project.id, worktree.id) {
             let _ = write!(description, ", {}", attention_description(attention));
         }
