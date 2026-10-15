@@ -846,28 +846,19 @@ impl Cagents {
         } else {
             iced::widget::Space::new().width(Length::Fill).into()
         };
-        rows.push(
-            widget::row::with_children(vec![
-                status,
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("dialog.worktree.cancel"))
-                    .on_press(Message::CancelDialog)
-                    .into(),
-                crate::ui_controls::button::primary(if dialog.resolving.is_some() {
-                    "Creating…"
-                } else {
-                    "Create worktree"
-                })
+        let actions = dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("dialog.worktree.cancel"))
+                .on_press(Message::CancelDialog),
+            crate::ui_controls::button::primary(if dialog.resolving.is_some() { "Creating…" } else { "Create worktree" })
                 .id(widget::Id::new("dialog.worktree.create"))
-                .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree))
-                .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
+                .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree)),
         );
+        let form = widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(Length::Shrink))
+            .max_height((self.window_height - 220.0).max(120.0));
+        let content = widget::column::with_children(vec![form.into(), widget::container(status).height(24.0).width(Length::Fill).into(), actions]).spacing(space::M);
         Some((
-            dialog_ui::surface(widget::column::with_children(rows).spacing(space::M), 520.0),
+            dialog_ui::surface(content, 520.0),
             editable.then_some(Message::CancelDialog),
         ))
     }
