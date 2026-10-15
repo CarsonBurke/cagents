@@ -6372,6 +6372,128 @@ mod tests {
     }
 
     #[test]
+    fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        for source in ["bounded αβ words ".repeat(300), format!("```\n{}```", "αβ item line\n".repeat(100))] {
+        let cached = CachedItem::new(&ItemContent::Text { text: source, thinking: false,
+            phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let mut builder = selection::Catalog::builder();
+        builder.markdown(&format!("unbound-{}", cached.revision), &[0], cached.markdown.items());
+        let catalog = builder.finish();
+        let expected = catalog.search_blocks().into_iter().map(|(_, text)| text.to_string()).collect::<String>();
+        let content = scroll::transcript(prose::view(&cached, settings, runtime.target, None),
+            runtime.target, None, vec![], true, vec![]);
+        let mut element = selection::transcript_virtualized(
+            content, runtime.target, None, catalog, Default::default(),
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 3000.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
+        let mut text = ReadText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut text,
+        );
+        assert!(text.0.len() >= 2, "fixture crosses a real visual chunk seam");
+        assert_eq!(text.0.iter().map(|(text, _)| text.as_str()).collect::<String>(), expected);
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                self.0 = contents;
+            }
+        }
+        let first = text.0.first().unwrap().1;
+        let last = text.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+        let mut clipboard = ClipboardText::default();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 3000.0));
+        for (event, pointer) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                start,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                end,
+            ),
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("c".into()),
+                    modified_key: keyboard::Key::Character("c".into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+        }
+        assert_eq!(clipboard.0, expected, "visual chunk seams are absent from copied logical source");
+        }
+    }
+
+    #[test]
     fn waiting_queue_is_bounded_and_independent_of_transcript_scroll() {
         let mut runtime = Runtime::draft(
             Target {
