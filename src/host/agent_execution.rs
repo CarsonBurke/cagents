@@ -1312,6 +1312,7 @@ fn create_console_from_recipe(
             let record = state.chats.get_mut(&session.id).expect("checked actor");
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
+            super::chat::source_binding::pair_changed(&mut state, session.id);
         }
         let mut retained = retained_before.clone();
         retained.terminal = Some(descriptor.session.clone());
@@ -1336,6 +1337,7 @@ fn create_console_from_recipe(
                 .ok_or("The provider closed while publishing its console")?;
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
+            super::chat::source_binding::pair_changed(&mut state, session.id);
         }
         let receipt = if let Some((_, source)) = restart {
             let current = {
@@ -1409,6 +1411,7 @@ fn create_console_from_recipe(
                 record.session.terminal = None;
                 record.console_recipe = None;
                 record.paired_terminal = None;
+                super::chat::source_binding::pair_changed(&mut state, session.id);
             }
             if state.terminals.get(&session.id).is_some_and(|record| {
                 super::chat::matches_paired_terminal(

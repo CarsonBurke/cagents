@@ -270,6 +270,7 @@ pub(in crate::host) fn restore_restart_pair(
             record.session.terminal = None;
             record.paired_terminal = None;
             record.console_recipe = None;
+            super::super::chat::source_binding::pair_changed(&mut state, session.id);
         }
         session.terminal = None;
         match &plan.kind {
@@ -354,6 +355,7 @@ fn publish_pair(
     record.session.terminal = Some(terminal.clone());
     record.paired_terminal = Some(worker.clone());
     record.console_recipe = Some(terminal.launch.clone());
+    super::super::chat::source_binding::pair_changed(&mut state, session.id);
     Ok(())
 }
 

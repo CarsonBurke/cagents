@@ -17,6 +17,9 @@ pub(crate) struct BackendIdentity {
 }
 impl BackendIdentity {
     pub(crate) fn conversation(&self) -> Option<String> { self.conversation.clone() }
+    pub(crate) fn same_backend(&self, other: &Self) -> bool {
+        self.helper == other.helper && self.actor == other.actor && self.process == other.process
+    }
     pub(crate) fn valid(&self) -> bool { !self.actor.is_nil() && self.process.pid > 0 && self.process.start > 0 }
 }
 

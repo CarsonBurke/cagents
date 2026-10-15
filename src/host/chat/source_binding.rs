@@ -13,7 +13,8 @@ pub(in crate::host) struct History {
 struct Entry {
     instance: uuid::Uuid,
     unresolved: bool,
-    known: Option<(chat::runtime::BackendIdentity, ChatSourceBinding)>,
+    learned_from: Option<ChatSourceBinding>,
+    known: Option<(chat::runtime::BackendIdentity, ChatSourceBinding, Option<uuid::Uuid>)>,
 }
 impl History {
     /// Called BEFORE publication of every new native Record, even if its
@@ -25,20 +26,27 @@ impl History {
             }
             self.order.push_back(id);
         }
-        self.entries.insert(id, Entry { instance, unresolved: false, known: None });
+        self.entries.insert(id, Entry { instance, unresolved: false, learned_from: None, known: None });
     }
     /// Fence even a start which creates a backend but loses its reply before
     /// Record installation. The previous positive publication stays invalid.
     pub(in crate::host) fn mutating(&mut self, id: TerminalId) {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.known = None;
+            entry.learned_from = None;
             entry.unresolved = true;
         }
     }
     pub(super) fn observed(&mut self, id: TerminalId, instance: uuid::Uuid, thread: Option<String>) -> bool {
         let Some(entry) = self.entries.get_mut(&id).filter(|e| e.instance == instance) else { return false; };
-        if entry.known.as_ref().is_some_and(|(_, binding)| binding.source.launch.session_id != thread) {
-            entry.known = None;
+        if entry.known.as_ref().is_some_and(|(_, binding, _)| binding.source.launch.session_id != thread) {
+            // Preserve only the private unknown-thread witness for its first
+            // positive learning. A known conversation changed immediately
+            // invalidates receipt authority, even before another UI read.
+            if entry.known.as_ref().is_some_and(|(_, binding, _)| binding.source.launch.session_id.is_some()) {
+                entry.known = None;
+                entry.learned_from = None;
+            }
             return true;
         }
         false
@@ -47,31 +55,51 @@ impl History {
         let entry = self.entries.get_mut(&id).filter(|e| e.instance == instance)
             .ok_or_else(|| unavailable("Native backend publication history is unavailable; no owner was changed"))?;
         entry.known = None;
+        entry.learned_from = None;
         entry.unresolved = true;
         Ok(())
     }
     fn publish(&mut self, source: Session, instance: uuid::Uuid,
-        witness: chat::runtime::BackendIdentity, resolve: bool) -> Result<ChatSourceBinding, ProtocolError> {
+        witness: chat::runtime::BackendIdentity, paired: Option<uuid::Uuid>, resolve: bool) -> Result<ChatSourceBinding, ProtocolError> {
         let entry = self.entries.get_mut(&source.id).filter(|e| e.instance == instance)
             .ok_or_else(|| unavailable("Native backend publication history was replaced or evicted"))?;
         if entry.unresolved && !resolve {
             return Err(unavailable("The exact backend restart remains unresolved; retry its original operation before returning to a terminal"));
         }
-        if let Some((previous, binding)) = &entry.known {
-            if *previous == witness { return Ok(binding.clone()); }
+        if let Some((previous, binding, previous_pair)) = &entry.known {
+            if *previous == witness && binding.source == source && *previous_pair == paired {
+                return Ok(binding.clone());
+            }
         }
+        entry.learned_from = entry.known.as_ref().and_then(|(previous, binding, previous_pair)| {
+            (previous.same_backend(&witness) && *previous_pair == paired
+                && first_thread_learning(&binding.source, &source)).then(|| binding.clone())
+        });
         // Even a failed restart resolved back to A mints fresh authority. An
         // earlier A intent never learns that no intervening backend existed.
         let binding = ChatSourceBinding { source, execution_instance: instance, backend: uuid::Uuid::new_v4() };
-        entry.known = Some((witness, binding.clone()));
+        entry.known = Some((witness, binding.clone(), paired));
         entry.unresolved = false;
         Ok(binding)
+    }
+    fn authorizes_intent(&self, binding: &ChatSourceBinding) -> bool {
+        self.validates(binding) || self.entries.get(&binding.source.id).is_some_and(|entry|
+            !entry.unresolved && entry.instance == binding.execution_instance
+                && entry.known.is_some() && entry.learned_from.as_ref() == Some(binding))
     }
     pub(in crate::host) fn validates(&self, binding: &ChatSourceBinding) -> bool {
         self.entries.get(&binding.source.id).is_some_and(|entry| !entry.unresolved
             && entry.instance == binding.execution_instance
-            && entry.known.as_ref().is_some_and(|(_, issued)| issued == binding))
+            && entry.known.as_ref().is_some_and(|(_, issued, _)| issued == binding))
     }
+}
+
+fn first_thread_learning(before: &Session, after: &Session) -> bool {
+    if before.launch.session_id.is_some() || after.launch.session_id.is_none() { return false; }
+    let mut promoted = before.clone();
+    promoted.launch.session_id = after.launch.session_id.clone();
+    promoted.native_continuity = after.native_continuity.clone();
+    promoted == *after
 }
 
 /// Must run while the caller holds the exact per-chat transition. No private
@@ -90,7 +118,8 @@ pub(super) fn refresh(host: &SharedHost, id: TerminalId, resolve: bool) -> Resul
     let mut source = session_descriptor(record);
     source.launch.session_id = witness.conversation();
     validate_proof(source.proof.as_ref(), state.proof())?;
-    let binding = state.native_sources.publish(source, instance, witness, resolve)?;
+    let paired = record.paired_terminal.as_ref().map(|worker| worker.execution_instance());
+    let binding = state.native_sources.publish(source, instance, witness, paired, resolve)?;
     state.chats.get_mut(&id).expect("same lock").source_binding = Some(binding.clone());
     Ok(binding)
 }
@@ -109,10 +138,56 @@ pub(super) fn restarting(host: &SharedHost, id: TerminalId, handle: &Handle) -> 
     Ok(())
 }
 
-/// Admission proof is compared with fresh actual backend evidence while the
-/// same transition guard fences restart. Never upgrades stale user intent.
-pub(super) fn require(host: &SharedHost, client: ClientId, expected: &ChatSourceBinding) -> Result<(), ProtocolError> {
-    {
+/// Invalidate the old publication at every actual pair mutation, including
+/// pair B which publishes and retires before the next UI observation. Repeating
+/// the same publication is harmless; a cleared/replaced pair never revives A.
+pub(in crate::host) fn pair_changed(state: &mut HostState, id: TerminalId) {
+    let Some(record) = state.chats.get(&id) else { return; };
+    let paired = record.paired_terminal.as_ref().map(|worker| worker.execution_instance());
+    let terminal = record.session.terminal.clone();
+    let instance = record.execution_instance;
+    let Some(entry) = state.native_sources.entries.get_mut(&id).filter(|entry| entry.instance == instance) else { return; };
+    if entry.known.as_ref().is_some_and(|(_, binding, old_pair)|
+        *old_pair != paired || binding.source.terminal != terminal) {
+        entry.known = None;
+        entry.learned_from = None;
+        state.chats.get_mut(&id).expect("same lock").source_binding = None;
+    }
+}
+
+/// Private continuation proof captured under the lifecycle claim BEFORE the
+/// handoff's own pair mutation. It is never supplied by a client.
+pub(super) struct Continuation {
+    instance: uuid::Uuid,
+    witness: chat::runtime::BackendIdentity,
+}
+pub(super) fn continuation(host: &SharedHost, binding: &ChatSourceBinding) -> Result<Continuation, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.native_sources.validates(binding) {
+        return Err(unavailable("The source changed before its own pair transition"));
+    }
+    let witness = state.native_sources.entries[&binding.source.id].known.as_ref().expect("validated publication").0.clone();
+    Ok(Continuation { instance: binding.execution_instance, witness })
+}
+
+/// The operation's own paired source may change, but its actual backend and
+/// confirmed conversation must remain exactly the one authenticated beforehand.
+pub(super) fn complete_pair(host: &SharedHost, id: TerminalId, previous: &Continuation) -> Result<ChatSourceBinding, ProtocolError> {
+    let binding = refresh(host, id, false)?;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let known = state.native_sources.entries.get(&id).and_then(|entry| entry.known.as_ref());
+    if binding.execution_instance != previous.instance
+        || known.is_none_or(|(witness, _, _)| witness != &previous.witness) {
+        return Err(unavailable("The actual provider backend changed during its terminal pairing; ownership was retained"));
+    }
+    Ok(binding)
+}
+
+/// Admission compares fresh actual evidence under the same transition claim.
+/// An unknown thread may learn its first authenticated identity on that exact
+/// backend/pair; a known identity, changed pair or intervening restart never may.
+pub(super) fn require(host: &SharedHost, client: ClientId, expected: &ChatSourceBinding) -> Result<ChatSourceBinding, ProtocolError> {
+    let previous = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(expected.source.proof.as_ref(), state.proof())?;
         let record = attached(&state, client, expected.source.id)?;
@@ -122,15 +197,24 @@ pub(super) fn require(host: &SharedHost, client: ClientId, expected: &ChatSource
             || expected.source.launch.session_id.as_ref().is_some_and(|thread| current.launch.session_id.as_ref() != Some(thread)) {
             return Err(unavailable("The captured provider conversation changed; no owner was stopped"));
         }
-        if record.execution_instance != expected.execution_instance || !state.native_sources.validates(expected) {
+        if record.execution_instance != expected.execution_instance || !state.native_sources.authorizes_intent(expected) {
             return Err(unavailable("The captured native backend changed; no provider or console was stopped"));
         }
-    }
+        state.native_sources.entries[&expected.source.id].known.as_ref().expect("validated publication").clone()
+    };
     let current = refresh(host, expected.source.id, false)?;
-    if current != *expected {
-        return Err(unavailable("The captured native backend changed; no provider or console was stopped"));
+    if current == *expected { return Ok(current); }
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let learned = state.native_sources.entries.get(&expected.source.id).and_then(|entry| entry.known.as_ref())
+        .is_some_and(|(witness, _, pair)| previous.0.same_backend(witness) && previous.2 == *pair);
+    let mut promoted = expected.source.clone();
+    promoted.launch.session_id = current.source.launch.session_id.clone();
+    promoted.native_continuity = current.source.native_continuity.clone();
+    if expected.source.launch.session_id.is_none() && current.source.launch.session_id.is_some()
+        && learned && promoted == current.source {
+        return Ok(current);
     }
-    Ok(())
+    Err(unavailable("The captured native backend changed; no provider or console was stopped"))
 }
 
 /// Adds only authenticated metadata to the response produced for this request.
@@ -160,7 +244,7 @@ pub(super) fn decorate(host: &SharedHost, response: &mut ServerResponse) {
 
 pub(in crate::host) fn validate_receipt(state: &HostState, receipt: &TerminalHandoffReceipt) -> Result<(), ProtocolError> {
     if receipt.source_execution_instance != receipt.source_binding.execution_instance
-        || !state.native_sources.validates(&receipt.source_binding) {
+        || !state.native_sources.validates(receipt.retained_binding.as_ref().unwrap_or(&receipt.source_binding)) {
         return Err(unavailable("The handoff's original native backend was superseded or its history is unavailable"));
     }
     Ok(())
@@ -244,11 +328,12 @@ mod tests {
     }
     struct Owner(Handle);
     impl Drop for Owner { fn drop(&mut self) { let _ = self.0.close(); } }
-    fn actor(source: &Session) -> Owner {
+    fn actor(source: &Session) -> Owner { actor_with(source, Box::new(Idle)) }
+    fn actor_with(source: &Session, adapter: Box<dyn Adapter>) -> Owner {
         let spec = ProcessSpec::from(&source.launch.recipe);
         let mut initial = Step::default();
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while handle.provider_process().is_none() { assert!(Instant::now() < deadline); thread::yield_now(); }
         Owner(handle)
@@ -305,4 +390,67 @@ mod tests {
         assert!(!state.native_sources.validates(&resolved));
         assert!(state.native_sources.entries.len() <= CAPACITY);
     }
+    #[test]
+    fn publication_binds_full_source_and_exact_paired_worker_even_on_the_same_backend() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor(&source);
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        let before = fixture.capture().unwrap();
+        let mut state = fixture.host.lock().unwrap();
+        let witness = state.native_sources.entries[&source.id].known.as_ref().unwrap().0.clone();
+        let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(source.id, source.launch.recipe.clone(), None).session;
+        let mut paired_source = source.clone();
+        paired_source.terminal = Some(terminal);
+        let first_worker = uuid::Uuid::new_v4();
+        let paired = state.native_sources.publish(paired_source.clone(), before.execution_instance, witness.clone(), Some(first_worker), false).unwrap();
+        assert_ne!(paired.backend, before.backend, "pair publication cannot reuse no-pair consent");
+        assert!(!state.native_sources.validates(&before));
+        let successor = state.native_sources.publish(paired_source.clone(), before.execution_instance, witness.clone(), Some(uuid::Uuid::new_v4()), false).unwrap();
+        assert_ne!(successor.backend, paired.backend, "same descriptor cannot alias another concrete terminal worker");
+        assert!(!state.native_sources.validates(&paired));
+        let restored = state.native_sources.publish(source.clone(), before.execution_instance, witness, None, false).unwrap();
+        assert_ne!(restored.backend, before.backend, "retired pair never revives earlier source consent");
+        assert!(!state.native_sources.authorizes_intent(&before));
+    }
+
+    #[test]
+    fn first_confirmed_thread_learning_keeps_only_the_original_unknown_intent() {
+        struct Learns;
+        impl Adapter for Learns {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
+                Ok(Step { writes: vec![], events: vec![chat::Event::Session { id: value["thread"].as_str().unwrap().into(), title: None }] })
+            }
+            fn command(&mut self, command: chat::Command) -> Result<Step, String> {
+                let chat::Command::SetModel { model, .. } = command else { return Ok(Step::default()); };
+                Ok(Step { writes: vec![format!("{{\"thread\":{}}}\n", serde_json::to_string(&model).unwrap())], events: vec![] })
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor_with(&source, Box::new(Learns));
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        let unknown = fixture.capture().unwrap();
+        let learn = |thread: &str| {
+            owner.0.command(chat::Command::SetModel { model: thread.into(), reasoning: None }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while owner.0.confirmed_session_id().as_deref() != Some(thread) {
+                assert!(Instant::now() < deadline, "actual provider pipe must confirm {thread}");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        learn("first");
+        let first = fixture.capture().unwrap(); // UI may read before Return.
+        assert_eq!(first.source.launch.session_id.as_deref(), Some("first"));
+        assert_eq!(require(&fixture.host, 1, &unknown).unwrap(), first);
+        assert!(!fixture.validates(&unknown), "old unknown is not general receipt authority");
+        learn("second");
+        let second = fixture.capture().unwrap();
+        assert_eq!(second.source.launch.session_id.as_deref(), Some("second"));
+        assert!(require(&fixture.host, 1, &unknown).is_err());
+        assert!(require(&fixture.host, 1, &first).is_err());
+        assert!(!owner.0.is_completed(), "known-thread or old unknown refusal has no teardown effects");
+    }
+
 }
