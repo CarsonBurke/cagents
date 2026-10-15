@@ -454,7 +454,7 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct StoredLockMetadata {
     pid: u32,
     #[serde(default)]
@@ -601,10 +601,17 @@ pub(crate) fn cleanup_stale_development_daemon() -> Result<bool, PlatformError> 
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    let Some(pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else { return Ok(false); };
+    let Some(_previous_owner) = daemon_pidfd_from_lock(&mut lock, &paths)? else { return Ok(false); };
     lock.seek(SeekFrom::Start(0))?;
     let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
     if stored.idle_exit_signal != Some(libc::SIGUSR2) { return Ok(false); }
+    // A predecessor can release the lease between the first validation and
+    // reading capability metadata. Bind the advertised capability to this
+    // metadata's own kernel-validated process, never the earlier pidfd.
+    let pidfd = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
+    lock.seek(SeekFrom::Start(0))?;
+    let current: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    if current != stored { return Ok(false); }
     let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
     if !stale_executable(&executable) { return Ok(false); }
     signal_process(&pidfd, libc::SIGUSR2)?;
