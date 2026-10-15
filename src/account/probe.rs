@@ -808,7 +808,7 @@ async fn run_json(command: Command) -> Result<Value, String> {
 /// system account's login is the reader's own.
 /// Acquire unique account probe locks in a stable order, all or nothing.
 /// Lifecycle mutations keep these guards through all copying and sign-out.
-pub(super) fn lock_accounts(
+pub(crate) fn lock_accounts(
     cache: &Cache,
     accounts: &[&Account],
 ) -> Result<Vec<crate::instance::OwnedLock>, String> {
