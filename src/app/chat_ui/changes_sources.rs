@@ -83,7 +83,7 @@ where F:FnMut(PatchQuery)->Fut,
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn epoch(revision:u64)->u64 {revision}
+    fn epoch(revision:u64)->chat::cache::SourceEpoch {chat::cache::SourceEpoch {incarnation:uuid::Uuid::from_u128(1),revision}}
     fn fixture(text:&str)->Arc<Manifest> {
         Arc::new(Manifest {source:chat::cache::SourceKey {agent_id:None,source_id:"opaque:native-part:looks-like-a-suffix".into()},
             epoch:epoch(7),metadata:chat::cache::changes::Metadata {role:chat::Role::Assistant,status:ToolStatus::Succeeded,

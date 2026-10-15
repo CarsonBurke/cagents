@@ -257,6 +257,53 @@ fn transmit(
         )
         .map_err(|e| e.to_string())
 }
+// Keep admission and socket backpressure asynchronous. Callers include this
+// future in the same deadline as the reply; dropping it never leaves a sender
+// task waiting to transmit a stale request later.
+async fn transmit_async(
+    wire: &Mutex<Wire>,
+    alive: &AtomicBool,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<(), String> {
+    let mut frame = Vec::new();
+    FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES).write(&mut frame, &ClientEnvelope {
+        version: PROTOCOL_VERSION, request_id: id, proof: Some(proof.clone()), request,
+    }).map_err(|error| error.to_string())?;
+    loop {
+        if try_transmit_frame(wire, alive, &frame)? { return Ok(()); }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn try_transmit_frame(wire: &Mutex<Wire>, alive: &AtomicBool, frame: &[u8]) -> Result<bool, String> {
+    use std::{os::fd::AsRawFd, sync::TryLockError};
+    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    let wire = match wire.try_lock() {
+        Ok(wire) => wire,
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    // MSG_DONTWAIT affects only this call. Setting O_NONBLOCK would also alter
+    // the cloned descriptor used by the blocking response reader.
+    // SAFETY: the wire guard owns a live socket; frame remains valid for send.
+    let sent = unsafe { libc::send(wire.stream.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if sent == frame.len() as isize { return Ok(true); }
+    if sent < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) { return Ok(false); }
+        alive.store(false, Ordering::Release);
+        let _ = wire.stream.shutdown(Shutdown::Both);
+        return Err(error.to_string());
+    }
+    // A cancelled partial frame must never be followed by another writer's
+    // frame. Close this connection; the daemon's actor remains independent.
+    alive.store(false, Ordering::Release);
+    let _ = wire.stream.shutdown(Shutdown::Both);
+    Err("The daemon connection closed after an incomplete request write".into())
+}
 fn receive(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
