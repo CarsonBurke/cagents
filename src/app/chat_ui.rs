@@ -1608,6 +1608,10 @@ pub(super) struct Runtime {
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
+    /// Conservative local eligibility fence, not proof of non-acceptance.
+    /// A string error cannot establish that a previously dispatched draft is
+    /// safe to forward automatically into another conversation.
+    attempted_draft_revision: Option<u64>,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
@@ -2201,6 +2205,7 @@ impl Runtime {
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
             revision: 0,
+            attempted_draft_revision: None,
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
@@ -4393,6 +4398,25 @@ impl Cagents {
         self.change_chat_account(card, id, None, None, true)
     }
 
+    /// Do not turn an unchanged failed/ambiguous send into a cross-account
+    /// retry. This is a negative local fence; only the host's actual admission
+    /// contract can authorize forwarding a new unaccepted request.
+    fn refuse_attempted_automatic_draft(&mut self, target: Target, mode: PromptMode) -> bool {
+        if mode != PromptMode::Send { return false; }
+        let refused = self.cards.get(&target.card).and_then(|card| match card {
+            CardRuntime::Chat(runtime) if runtime.target == target
+                && runtime.attempted_draft_revision == Some(runtime.revision)
+                && runtime.session.launch.recipe.environment.get(account::routing::AUTOMATIC_MARKER).map(String::as_str) == Some("1") => {
+                    self.chat_account(runtime.session.launch.provider,&runtime.session.launch.recipe)
+                },
+            _ => None,
+        }).is_some_and(|account| self.account_ui.needs_alternate(&account));
+        if refused && let Some(runtime)=self.chat_runtime_mut(target) {
+            runtime.error=Some("Automatic did not forward this unchanged draft because its previous send may have reached the provider. The draft is preserved; check the original conversation before retrying or explicitly starting a separate conversation.".into());
+        }
+        refused
+    }
+
     fn automatic_chat_account(
         &self,
         target: Target,
@@ -4407,6 +4431,7 @@ impl Cagents {
         if runtime.target != target
             || runtime.is_draft() && !runtime.choosing()
             || runtime.pastes_pending > 0
+            || runtime.attempted_draft_revision == Some(runtime.revision)
             || runtime.composer.text().trim().is_empty() && runtime.attachments.is_empty()
             || runtime
                 .session
@@ -6394,6 +6419,11 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
+        if clear_draft && matches!(&command, Command::Prompt { .. }) {
+            // Before the first possible transport effect. A timeout/error must
+            // not clear this fence while retaining that exact composer draft.
+            runtime.attempted_draft_revision=Some(runtime.revision);
+        }
         runtime.pending = Some(PendingCommand {
             followup: false,
             take_back: None,
@@ -7830,6 +7860,7 @@ impl Cagents {
                     }
                 };
                 self.adopt_routing_accounts(snapshot);
+                if self.refuse_attempted_automatic_draft(target, PromptMode::Send) { return Task::none(); }
                 if self
                     .automatic_chat_account(target, PromptMode::Send)
                     .is_some()
@@ -7842,6 +7873,7 @@ impl Cagents {
                 return Task::none();
             }
             Action::Submit(target, mode) => {
+                if self.refuse_attempted_automatic_draft(target, mode) { return Task::none(); }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
                 {
@@ -12207,6 +12239,90 @@ mod tests {
                 Some(nested.as_path())
             );
         }
+    }
+
+    #[test]
+    fn automatic_routing_never_forwards_an_unchanged_draft_after_actual_prompt_eof() {
+        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use cosmic::iced::futures::StreamExt;
+        use std::{os::unix::net::UnixStream,thread,time::Duration};
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let alternate=app.account_ui.add_managed_fixture(Provider::Codex,452);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let target=chat_runtime(&app,card).target;
+        let source=chat_runtime(&app,card).session.clone();
+        let proof=source.proof.clone().unwrap();
+        let attached=chat_runtime(&app,card).snapshot.as_ref().clone();
+        let (client,mut server)=UnixStream::pair().unwrap();
+        let peer=thread::spawn(move|| {
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut codec=FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+            let connect:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(connect.request,ClientRequest::Connect {..}));
+            codec.write(&mut server,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(connect.request_id),proof:proof.clone(),
+                message:ServerMessage::Response {response:ServerResponse::Connected {proof:proof.clone(),resumed:Vec::new()}}}).unwrap();
+            let start:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart {mut session,..}=start.request else {panic!("attach fixture")};
+            session.proof=Some(proof.clone());
+            codec.write(&mut server,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(start.request_id),proof,
+                message:ServerMessage::Response {response:ServerResponse::ChatAttached {session,snapshot:attached,account_home:None}}}).unwrap();
+            let prompt:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatCommand {command:Command::Prompt {text,..},..}=prompt.request else {panic!("ordinary prompt reached peer")};
+            assert_eq!(text,"A request whose acknowledgement is lost");
+            // The actual bytes reached the peer. EOF without an ACK cannot
+            // establish that an ordinary provider did not accept that request.
+            server.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let handle=Arc::new(ClientHandle::fixture_stream(client,source.clone(),|_|{}).unwrap());
+        {
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            runtime.connection=Connection::Live(handle.clone());
+            runtime.replace_draft(text_editor::Content::with_text("A request whose acknowledgement is lost"));
+            runtime.session.launch.recipe.environment.insert(account::routing::AUTOMATIC_MARKER.into(),"1".into());
+        }
+        let task=app.chat_send(target,Command::Prompt {text:"A request whose acknowledgement is lost".into(),attachments:Vec::new(),mode:PromptMode::Send},true);
+        let attempted=chat_runtime(&app,card).revision;
+        let command=chat_runtime(&app,card).pending.as_ref().unwrap().id;
+        assert_eq!(chat_runtime(&app,card).attempted_draft_revision,Some(attempted));
+        let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let completion=executor.block_on(async {
+            let mut stream=cosmic::iced::runtime::task::into_stream(task).unwrap();
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while let Some(action)=stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message @ Message::ChatUi(Action::CommandFinished(..))))=action {return message;}
+                }
+                panic!("ordinary prompt completion")
+            }).await.unwrap()
+        });
+        assert!(matches!(&completion,Message::ChatUi(Action::CommandFinished(_,id,Err(_))) if *id==command));
+        peer.join().unwrap();
+        drop(app.update(completion));
+        assert!(chat_runtime(&app,card).pending.is_none());
+        assert_eq!(chat_runtime(&app,card).revision,attempted);
+        // Deliberately leave the independent EOF Wake unhandled: an ordinary
+        // command result can arrive first while the presentation is still ready.
+        assert!(!chat_runtime(&app,card).disconnected);
+        let now=crate::chat::now_ms().unwrap();
+        for (id,status) in [(Account::system(Provider::Codex).id(),account::UsageStatus::Limited),(alternate.clone(),account::UsageStatus::Ok)] {
+            drop(app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {owner:app.account_ui.probe_owner(&id).unwrap(),id,
+                outcome:account::probe::Outcome::Answered {identity:None,catalog:None,snapshot:account::UsageSnapshot::state(status,"",now)}})));
+        }
+        assert!(app.automatic_chat_account(target,PromptMode::Send).is_none());
+        let cards=app.durable.cards.len();
+        drop(app.handle_chat_ui(Action::Submit(target,PromptMode::Send)));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.error.as_deref().unwrap().contains("previous send may have reached"));
+        assert_eq!(runtime.composer.text().trim(),"A request whose acknowledgement is lost");
+        assert_eq!(runtime.next_command,command); assert!(runtime.pending.is_none());
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(),&handle));
+        assert_eq!(app.durable.cards.len(),cards); assert!(app.chat_ui.retiring.is_empty());
+        app.chat_runtime_mut(target).unwrap().replace_draft(text_editor::Content::with_text("An independently edited new request"));
+        // Eligibility is only a hint; actual host source/FD/current-controls and
+        // unaccepted-request admission remain mandatory before future forwarding.
+        assert_eq!(app.automatic_chat_account(target,PromptMode::Send).unwrap().0.id(),alternate);
+        drop(app.handle_chat_ui(Action::CommandFinished(target,command,Err("late old failure".into()))));
+        assert!(app.automatic_chat_account(target,PromptMode::Send).is_some());
     }
 
     #[test]
