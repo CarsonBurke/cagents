@@ -71,7 +71,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
                 children.push(highlighted(
                     format!("Matches: {}", terms.join(" · ")),
                     query,
-                    cosmic::font::default(),
+                    design::interface_font(),
                 ));
             }
         }
@@ -88,7 +88,7 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
             children.push(highlighted(
                 self.detail.into_owned(),
                 query,
-                cosmic::font::default(),
+                design::interface_font(),
             ));
         }
         widget::column::with_children(children)
@@ -104,6 +104,7 @@ fn highlighted<'a, Message: 'a>(
     query: &str,
     font: iced::Font,
 ) -> Element<'a, Message> {
+    let size = design::interface_size();
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let max_chars = words
         .iter()
@@ -115,10 +116,9 @@ fn highlighted<'a, Message: 'a>(
     if words.is_empty() {
         let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text).font(font);
         return iced::widget::rich_text([span])
-            .size(design::TEXT_BODY)
-            .line_height(iced::widget::text::LineHeight::Absolute(
-                design::LINE_BODY.into(),
-            ))
+            .size(size)
+            .font(font)
+            .line_height(iced::widget::text::LineHeight::Absolute((size + 5.0).into()))
             .width(Length::Fill)
             .into();
     }
@@ -157,10 +157,9 @@ fn highlighted<'a, Message: 'a>(
         run_start = end;
     }
     iced::widget::rich_text(spans)
-        .size(design::TEXT_BODY)
-        .line_height(iced::widget::text::LineHeight::Absolute(
-            design::LINE_BODY.into(),
-        ))
+        .size(size)
+        .font(font)
+        .line_height(iced::widget::text::LineHeight::Absolute((size + 5.0).into()))
         .width(Length::Fill)
         .into()
 }
@@ -338,6 +337,29 @@ pub fn search_id() -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn labels_and_search_highlights_follow_interface_type_size() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let height = |query| {
+            let mut label: Element<'_, ()> = highlighted("Interface font".into(), query, design::heading_font());
+            let mut tree = Tree::new(label.as_widget());
+            label.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 100.0)),
+            ).size().height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = [height(""), height("font")];
+        design::configure_typography("", 24.0, "", 14.0);
+        for (small, large) in small.into_iter().zip([height(""), height("font")]) {
+            assert!(large > small);
+            assert_eq!(large, 29.0);
+        }
+        design::configure_typography("", 13.0, "", 14.0);
+    }
+
     #[test]
     fn search_indexes_keys_values_captions_and_current_shortcuts() {
         let cases = [
