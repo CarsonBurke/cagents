@@ -1,6 +1,8 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
+mod presentation_repair;
+
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;

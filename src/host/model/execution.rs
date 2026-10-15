@@ -1364,7 +1364,7 @@ fn check_parent_depth(db: &Connection, origin: &Origin) -> Result<(), String> {
     Ok(())
 }
 
-fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
+pub(super) fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
     let record: String = db
         .query_row(
             "SELECT record FROM agents WHERE id = ?1",
@@ -1441,6 +1441,8 @@ mod tests {
         model::ProjectKind,
         workspace_model::ModelEdit,
     };
+
+    include!("execution_presentation_tests.rs");
 
     fn source() -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
