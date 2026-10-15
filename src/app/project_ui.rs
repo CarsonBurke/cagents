@@ -35,6 +35,7 @@ pub struct State {
     deletion_authorizations: HashMap<WorktreeId, WorktreeSafetySnapshot>,
     branch_deletions: HashMap<WorktreeId, BranchDeletion>,
     released_delete_protections: HashSet<WorktreeId>,
+    deletion_warnings: HashMap<WorktreeId, Vec<String>>,
     branch_requests: HashSet<crate::model::OperationId>,
     force_branches: VecDeque<(BranchDeletion, String)>,
     remove_dialog: Option<ProjectRemoval>,
@@ -188,7 +189,7 @@ struct Dialog {
 }
 
 #[derive(Debug, Clone)]
-pub struct BranchDeletion { id: crate::model::OperationId, repository: PathBuf, branch: String, expected_oid: String }
+pub struct BranchDeletion { id: crate::model::OperationId, repository: PathBuf, branch: String, expected_oid: String, warnings: Vec<String> }
 
 #[derive(Debug, Clone)]
 pub struct DeleteOptions { branch_elsewhere: bool, stale_lock: bool, lock_error: Option<String> }
@@ -261,6 +262,7 @@ pub enum Action {
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
     DeletionSessionsClosed { target: Target, started_at: Instant, result: Result<(), String> },
+    RemovalCompleted { target: Target, result: Result<Vec<String>, String> },
     AutomaticallyDeleted {
         target: Target,
         result: Result<RemovedWorktree, String>,
@@ -1474,7 +1476,9 @@ impl Cagents {
             Action::BranchDeleted { request, result } => {
                 if !self.project_ui.branch_requests.remove(&request.id) { return Task::none(); }
                 match result {
-                    Ok(()) => self.status = Some(TransientNotice::success(format!("Worktree and branch {} deleted.", request.branch))),
+                    Ok(()) => self.status = Some(if request.warnings.is_empty() {
+                        TransientNotice::success(format!("Worktree and branch {} deleted.", request.branch))
+                    } else { TransientNotice::warning(format!("Worktree and branch {} deleted; {}", request.branch, request.warnings.join("; "))) }),
                     Err(failure) if failure.kind == crate::worktree_branch::BranchDeleteFailureKind::Unmerged => {
                         self.project_ui.force_branches.push_back((request, failure.detail));
                         return iced::widget::operation::focus(widget::Id::new("dialog.branch.keep")).map(cosmic::Action::App);
@@ -1545,7 +1549,7 @@ impl Cagents {
                     let request = dialog.request;
                     let store = self.session.as_ref().unwrap().operation_store();
                     return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").unlock_stale_worktree(&store, &target.repository, &target.path, &CancellationToken::new()))
+                        let result = tokio::task::spawn_blocking(move || unlock_stale_worktree_for_window(&store, &target.repository, &target.path))
                             .await.map_err(|error| error.to_string()).and_then(|result| result);
                         Message::ProjectUi(Action::StaleUnlocked { request, result })
                     });
@@ -1594,7 +1598,7 @@ impl Cagents {
                             }
                             if let Some(id) = target.worktree {
                                 if let Some((branch, expected_oid)) = branch {
-                                    self.project_ui.branch_deletions.insert(id, BranchDeletion { id: crate::model::OperationId::new(), repository: target.repository.clone(), branch, expected_oid });
+                                    self.project_ui.branch_deletions.insert(id, BranchDeletion { id: crate::model::OperationId::new(), repository: target.repository.clone(), branch, expected_oid, warnings: Vec::new() });
                                 } else { self.project_ui.branch_deletions.remove(&id); }
                                 self.project_ui.deletion_authorizations.insert(id, snapshot);
                             }
@@ -1636,6 +1640,10 @@ impl Cagents {
                     return Task::none();
                 }
                 return self.open_worktree_delete_dialog(target);
+            }
+            Action::RemovalCompleted { target, result } => {
+                let result = result.map(|warnings| { if let Some(id) = target.worktree { self.project_ui.deletion_warnings.insert(id, warnings); } });
+                return self.handle_project_action(Action::Deleted { target, result });
             }
             Action::DeletionSessionsClosed { target, started_at, result } => {
                 let Some(id) = target.worktree else { return Task::none(); };
@@ -1796,8 +1804,11 @@ impl Cagents {
                         Some(snapshot) if snapshot.branch.is_none() => "Detached worktree deleted.",
                         _ => "Worktree deleted; branch retained.",
                     };
-                    self.status = Some(TransientNotice::success(detail));
-                    let branch_delete = target.worktree.and_then(|id| self.project_ui.branch_deletions.remove(&id)).map(|request| {
+                    let warnings = target.worktree.and_then(|id| self.project_ui.deletion_warnings.remove(&id)).unwrap_or_default();
+                    self.status = Some(if warnings.is_empty() { TransientNotice::success(detail) }
+                        else { TransientNotice::warning(format!("{detail} {}", warnings.join("; "))) });
+                    let branch_delete = target.worktree.and_then(|id| self.project_ui.branch_deletions.remove(&id)).map(|mut request| {
+                        request.warnings = warnings.clone();
                         self.project_ui.branch_requests.insert(request.id);
                         branch_deletion_task(request, false)
                     }).unwrap_or_else(Task::none);
@@ -1872,11 +1883,12 @@ impl Cagents {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let confirmed = authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
-                let service = RepositoryService::system("git"); let token = CancellationToken::new();
-                let records = service.list_worktrees(&request.repository, &token).map_err(|error| error.to_string())?;
-                let record = records.iter().find(|record| Some(record.id) == request.worktree && record.path == request.path).ok_or("Worktree changed before closing sessions")?;
-                if record.lock.locked || records.first().is_some_and(|primary| primary.id == record.id) || record.bare { return Err("Worktree is locked or is the primary checkout".into()); }
-                verify_worktree_safety(&service, &request.path, &confirmed, &token)?;
+                let crate::worktree_control::Reply::Listed { worktrees } = worktree_control_request(crate::worktree_control::Operation::List { repository: request.repository.clone() })? else { return Err("Unexpected worktree listing response".into()); };
+                let record = worktrees.iter().find(|record| record.path == request.path).ok_or("Worktree changed before closing sessions")?;
+                if record.locked || record.primary { return Err("Worktree is locked or is the primary checkout".into()); }
+                let crate::worktree_control::Reply::Inspected { snapshot, .. } = worktree_control_request(crate::worktree_control::Operation::Inspect { repository: request.repository.clone(), path: request.path.clone() })? else { return Err("Unexpected worktree safety response".into()); };
+                let current: WorktreeSafetySnapshot = serde_json::from_str(&snapshot).map_err(|error| error.to_string())?;
+                if current != confirmed { return Err("The worktree changed after confirmation; review its current files and commits".into()); }
                 close_worktree_sessions(&request)
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::ProjectUi(Action::DeletionSessionsClosed { target, started_at, result })
@@ -1891,7 +1903,12 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || {
                 let authorization =
                     authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
-                let removed = delete_worktree_inner(&request, &authorization, false)?;
+                let service = RepositoryService::system("git"); let token = CancellationToken::new();
+                let removed = service.common_dir(&request.repository, &token).ok().zip(service.git_dir(&request.path, &token).ok())
+                    .map(|(common_dir, admin_dir)| RemovedWorktree { common_dir, admin_dir, path: request.path.clone(), branch: authorization.branch.as_ref().map(|branch| format!("refs/heads/{branch}")) });
+                let crate::worktree_control::Reply::Removed { path, mut warnings, branch_error, .. } = worktree_control_request(confirmed_removal_operation(&request, &authorization)?)? else { return Err("Unexpected worktree removal response".into()); };
+                if path != request.path { return Err("The daemon removed a different worktree identity; refresh the repository".into()); }
+                if let Some(error) = branch_error { warnings.push(error); }
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -1900,19 +1917,16 @@ impl Cagents {
                     // The worktree is gone either way; what stays held is
                     // only the chance to create the same one again.
                     for error in errors {
-                        tracing::warn!(
-                            worktree = %request.path.display(),
-                            %error,
-                            "could not release the deleted worktree's creation"
-                        );
+                        tracing::warn!(worktree = %request.path.display(), %error, "could not release the deleted worktree's creation");
+                        warnings.push(format!("Creation receipt could not be retired: {error}"));
                     }
                 }
-                Ok(())
+                Ok(warnings)
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::ProjectUi(Action::Deleted { target, result })
+            Message::ProjectUi(Action::RemovalCompleted { target, result })
         })
     }
 
@@ -2768,6 +2782,7 @@ fn delete_worktree(target: &Target, confirmed: &WorktreeSafetySnapshot) -> Resul
     delete_worktree_inner(target, confirmed, true)
 }
 
+#[cfg(test)]
 fn delete_worktree_inner(
     target: &Target,
     confirmed: &WorktreeSafetySnapshot,
@@ -2837,6 +2852,7 @@ fn delete_worktree_inner(
     Ok(removed)
 }
 
+#[cfg(test)]
 fn worktree_removal_command(target: &Target, confirmed: &WorktreeSafetySnapshot) -> CommandSpec {
     let command = RepositoryService::system("git")
         .git_base(&target.repository, true)
@@ -2853,6 +2869,7 @@ fn worktree_removal_command(target: &Target, confirmed: &WorktreeSafetySnapshot)
         .output_limits(64 * 1024, 64 * 1024)
 }
 
+#[cfg(test)]
 fn verify_worktree_safety(
     service: &RepositoryService,
     path: &Path,
@@ -2868,12 +2885,45 @@ fn verify_worktree_safety(
     Ok(())
 }
 
+fn confirmed_removal_operation(target: &Target, confirmed: &WorktreeSafetySnapshot) -> Result<crate::worktree_control::Operation, String> {
+    // The control protocol currently represents removal targets as UTF-8.
+    // A lossy path could name a different checkout and must never be sent.
+    let path = target.path.to_str().ok_or("This worktree path cannot be represented by the daemon protocol; remove it explicitly in Git")?;
+    Ok(crate::worktree_control::Operation::Remove {
+        repository: target.repository.clone(), target: path.to_owned(),
+        force: confirmed.files_to_discard() > 0, delete_branch: false,
+        expected_fingerprint: Some(confirmed.fingerprint.clone()),
+    })
+}
+
+fn worktree_control_request(operation: crate::worktree_control::Operation) -> Result<crate::worktree_control::Reply, String> {
+    match crate::device_service::request(crate::device_service::Operation::Worktree { operation })? {
+        crate::device_service::Reply::Worktree(reply) => Ok(reply),
+        _ => Err("Unexpected worktree control response".into()),
+    }
+}
+
+fn unlock_stale_worktree_for_window(store: &crate::persistence::StateStore, repository: &Path, path: &Path) -> Result<(), String> {
+    RepositoryService::system("git").unlock_stale_worktree(store, repository, path, &CancellationToken::new()).or_else(|local_error| {
+        match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: repository.to_path_buf(), path: path.to_path_buf(), unlock: true }) {
+            Ok(crate::worktree_control::Reply::StaleLock { unlocked: true }) => Ok(()),
+            Ok(_) => Err("Unexpected stale-lock unlock response".into()),
+            Err(error) => Err(format!("{local_error}; {error}")),
+        }
+    })
+}
+
 fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let worker = request.clone();
-        let result = tokio::task::spawn_blocking(move || crate::worktree_branch::delete_branch_checked_at(
-            &worker.repository, &worker.branch, force, Some(&worker.expected_oid), &CancellationToken::new()))
-            .await.unwrap_or_else(|error| Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail: error.to_string() }));
+        let result = tokio::task::spawn_blocking(move || {
+            let other = |detail| crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail };
+            match worktree_control_request(crate::worktree_control::Operation::DeleteBranch { repository: worker.repository, branch: worker.branch, force, expected_oid: Some(worker.expected_oid) }).map_err(other)? {
+                crate::worktree_control::Reply::BranchDeleted { .. } => Ok(()),
+                crate::worktree_control::Reply::BranchDeleteRefused { failure } => Err(failure),
+                _ => Err(other("Unexpected branch deletion response".into())),
+            }
+        }).await.unwrap_or_else(|error| Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail: error.to_string() }));
         Message::ProjectUi(Action::BranchDeleted { request, result })
     })
 }
@@ -2881,11 +2931,18 @@ fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
 fn delete_options_task(target: Target, request: u64, store: crate::persistence::StateStore) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let service = RepositoryService::system("git"); let token = CancellationToken::new();
-            let records = service.list_worktrees(&target.repository, &token).map_err(|error| error.to_string())?;
+            let crate::worktree_control::Reply::Listed { worktrees: records } = worktree_control_request(crate::worktree_control::Operation::List { repository: target.repository.clone() })? else { return Err("Unexpected worktree listing response".into()); };
             let record = records.iter().find(|record| record.path == target.path).ok_or("Worktree no longer registered")?;
             let branch_elsewhere = record.branch.as_ref().is_some_and(|branch| records.iter().any(|other| other.path != record.path && other.branch.as_ref() == Some(branch)));
-            let lock = record.lock.locked.then(|| service.stale_worktree_lock(&store, &target.repository, &target.path, &token));
+            let lock = record.locked.then(|| {
+                RepositoryService::system("git").stale_worktree_lock(&store, &target.repository, &target.path, &CancellationToken::new()).or_else(|local_error| {
+                    match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: target.repository.clone(), path: target.path.clone(), unlock: false }) {
+                        Ok(crate::worktree_control::Reply::StaleLock { unlocked: false }) => Ok(()),
+                        Ok(_) => Err("Unexpected stale-lock inspection response".into()),
+                        Err(error) => Err(format!("{local_error}; {error}")),
+                    }
+                })
+            });
             Ok(DeleteOptions { branch_elsewhere, stale_lock: matches!(&lock, Some(Ok(()))), lock_error: lock.and_then(Result::err) })
         }).await.map_err(|error| error.to_string()).and_then(|result| result);
         Message::ProjectUi(Action::DeleteOptionsRead { request, result })
@@ -3128,7 +3185,7 @@ mod tests {
     #[test]
     fn unmerged_branch_refusal_requires_a_separate_force_confirmation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let request = BranchDeletion { id: crate::model::OperationId::new(), repository: "/repo".into(), branch: "feature".into(), expected_oid: "a".repeat(40) };
+        let request = BranchDeletion { id: crate::model::OperationId::new(), repository: "/repo".into(), branch: "feature".into(), expected_oid: "a".repeat(40), warnings: Vec::new() };
         app.project_ui.branch_requests.insert(request.id);
         drop(app.handle_project_action(Action::BranchDeleted { request: request.clone(), result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Unmerged, detail: "Branch is not merged".into() }) }));
         assert_eq!(app.project_ui.force_branches.len(), 1);
@@ -3139,6 +3196,21 @@ mod tests {
         app.project_ui.branch_requests.insert(request.id);
         drop(app.handle_project_action(Action::BranchDeleted { request, result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere, detail: "Checked out elsewhere".into() }) }));
         assert!(app.project_ui.force_branches.is_empty());
+    }
+
+    #[test]
+    fn confirmed_rpc_keeps_branch_and_file_discard_consent_separate() {
+        let target = Target { project: ProjectId::new(), worktree: Some(WorktreeId::new()), repository: "/repo".into(), path: "/repo/linked".into(), label: "feature".into() };
+        let mut snapshot = clean_snapshot(); snapshot.unpushed_commits = 3;
+        let crate::worktree_control::Operation::Remove { force, delete_branch, expected_fingerprint, .. } = confirmed_removal_operation(&target, &snapshot).unwrap() else { panic!("wrong operation") };
+        assert!(!force, "unpushed commits do not authorize force-removing files");
+        assert!(!delete_branch, "branch deletion gets its own typed result and second confirmation");
+        assert_eq!(expected_fingerprint.as_deref(), Some("fixture"));
+        snapshot.untracked = 1;
+        assert!(matches!(confirmed_removal_operation(&target, &snapshot).unwrap(), crate::worktree_control::Operation::Remove { force: true, .. }));
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = Target { path: PathBuf::from(std::ffi::OsString::from_vec(b"/repo/non-utf8-\xff".to_vec())), ..target };
+        assert!(confirmed_removal_operation(&invalid, &snapshot).is_err());
     }
 
     #[test]
