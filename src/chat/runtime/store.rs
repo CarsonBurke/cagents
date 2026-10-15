@@ -855,60 +855,6 @@ impl Store {
         }
         Ok(out)
     }
-    /// Finalize only the indexed live tools, leaving transcript bodies and
-    /// completed history untouched. Batch metadata bounds transient memory.
-    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
-        let _ = self.flush_text()?;
-        let _ = self.flush_input()?;
-        loop {
-            let rows = {
-                let mut query = self
-                    .db
-                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
-                    .map_err(|error| error.to_string())?;
-                let rows = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                rows
-            };
-            if rows.is_empty() {
-                break;
-            }
-            for (id, metadata) in rows {
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                match &mut item.content {
-                    ItemContent::Tool {
-                        status: current, ..
-                    }
-                    | ItemContent::Command {
-                        status: current, ..
-                    }
-                    | ItemContent::Changes {
-                        status: current, ..
-                    } if *current == crate::chat::ToolStatus::Running => *current = status,
-                    _ => {}
-                }
-                if matches!(item.content, ItemContent::Changes { .. }) {
-                    self.finish_file_status("", &id, status)?;
-                }
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                self.db
-                    .execute(
-                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
-                        params![id, metadata],
-                    )
-                    .map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
-            }
-        }
-        Ok(())
-    }
     fn flush_input(&mut self) -> Result<Option<String>, String> {
         match self.pending_input.take() {
             Some((id, offset, delta)) => match self.append_body(&id, offset, &delta, true) {

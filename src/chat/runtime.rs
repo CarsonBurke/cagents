@@ -538,7 +538,6 @@ impl Handle {
                     actor.apply(Event::ProviderExit(diagnostic));
                 }
                 let code = status.and_then(|status| status.code());
-                let owned_native_cleanup = actor.native_holder.is_some();
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -570,15 +569,10 @@ impl Handle {
                         });
                     }
                     if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
-                    let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
-                    if let Some(status)=terminal.filter(|_|owned_native_cleanup && direct_closed && native_closed) {
-                        // A disconnected external socket or exited direct
-                        // provider is not proof that independent processes
-                        // ended. This path requires exact holder cleanup.
-                        finish_snapshot_work(&mut state,status,true);
-                        drop(state);
-                        if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
-                    }
+                    // Provider/holder cleanup has process-family scope, while
+                    // Tool/Command/Changes and delegated rows can describe work
+                    // on external MCP servers. Preserve their last native item
+                    // status until an exact per-item terminal proof arrives.
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -3547,37 +3541,6 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
 }
 
-fn finish_snapshot_work(state: &mut Snapshot, status: ToolStatus, include_background: bool) {
-    fn finish_items(items: &mut [Arc<Item>], status: ToolStatus) {
-        for item in items {
-            if item.content.status() != Some(ToolStatus::Running) {
-                continue;
-            }
-            match &mut Arc::make_mut(item).content {
-                ItemContent::Tool {
-                    status: current, ..
-                }
-                | ItemContent::Command {
-                    status: current, ..
-                }
-                | ItemContent::Changes {
-                    status: current, ..
-                } => *current = status,
-                _ => {}
-            }
-        }
-    }
-    finish_items(&mut state.items, status);
-    for child in &mut state.subagents {
-        if child.status == ToolStatus::Running && (!child.background || include_background) {
-            child.status = status;
-            child.waiting = false;
-            child.detail.clear();
-            finish_items(&mut child.items, status);
-        }
-    }
-}
-
 /// Running task identities authorize interruption and idle waits. Retiring
 /// presentation history must never retire that ownership evidence. Keep only
 /// the newest 32 rich child transcripts, with older active entries remaining
@@ -4377,12 +4340,10 @@ mod tests {
         assert!(state.outcome.is_none());
         assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
         assert_eq!(state.subagents[0].status, ToolStatus::Running);
-        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Failed,
-            "confirmed provider teardown settles all owned children"
-        );
+        apply_event(&mut state, &mut indices, Event::Exited { code: Some(3) });
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[1].status, ToolStatus::Running,
+            "provider exit alone has no per-item remote/delegated completion authority");
     }
 
     #[test]
@@ -6695,6 +6656,81 @@ mod tests {
             .unwrap();
         assert!(handle.is_completed());
         assert!(handle.0.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn owned_holder_cleanup_does_not_claim_remote_mcp_item_completion() {
+        const ROLE: &str = "CAGENTS_REMOTE_ITEM_AUTHORITY_TEST";
+        const TEST: &str = "chat::runtime::tests::owned_holder_cleanup_does_not_claim_remote_mcp_item_completion";
+        match std::env::var(ROLE).as_deref() {
+            Ok("server") => {
+                let listener = std::os::unix::net::UnixListener::bind(
+                    std::env::var_os("CAGENTS_REMOTE_ITEM_SOCKET").unwrap(),
+                ).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut socket = tungstenite::accept(stream).unwrap();
+                while let Ok(message) = socket.read() {
+                    if matches!(message, tungstenite::Message::Close(_)) { break; }
+                }
+                return;
+            }
+            Ok("controller") => {}
+            _ => {
+                let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+                let output = Process::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "controller")
+                    .env("XDG_RUNTIME_DIR", directory.path())
+                    .env("XDG_DATA_HOME", directory.path().join("data"))
+                    .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                    .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                    .env("CAGENTS_LOCAL_DEBUG", "0")
+                    .output().unwrap();
+                assert!(output.status.success(), "stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                return;
+            }
+        }
+        let mut source = super::super::native_holder::fixture_source();
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let spec = ProcessSpec {
+            execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket { socket: socket.clone() },
+            program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            arguments: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([(ROLE.into(), "server".into()),
+                ("CAGENTS_REMOTE_ITEM_SOCKET".into(), socket.to_string_lossy().into_owned())]),
+        };
+        let remote = Item { id: "mcp-job-outside-local-family".into(), role: Role::Assistant,
+            started_at: None, at: None, content: ItemContent::Tool {
+                name: "mcp__external__long_job".into(), input: "{}".into(), output: String::new(),
+                status: ToolStatus::Running,
+            }};
+        let mut initial = Echo.initialize().unwrap();
+        initial.events.extend([Event::TurnStarted, Event::Status { busy: true, detail: "Remote job reported".into() }, Event::Item(remote.clone())]);
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start_owned(spec, Box::new(Echo), initial, store, source.clone(), BTreeMap::new(), |_| {}).unwrap();
+        until(&handle, |state| state.busy && state.items.iter().any(|item| item.id == remote.id));
+        let root = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        let record = crate::daemon::holder_registry::evidence(
+            &crate::daemon::holder_registry::socket(&root, source.id),
+            crate::daemon::holder_registry::Kind::Native,
+        ).unwrap().unwrap();
+        assert!(record.root.is_current());
+        handle.close_until(Instant::now() + Duration::from_secs(10)).unwrap();
+        assert!(!record.root.is_current(), "the actual owned provider family must have closed");
+        assert_eq!(handle.snapshot(None).unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
+            "local family cleanup cannot manufacture a terminal result for an unbound external tool");
+        assert_eq!(handle.0.store.lock().unwrap().window().unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
+            "canonical source and resident projection must preserve the same last native item status");
     }
 
     #[test]
