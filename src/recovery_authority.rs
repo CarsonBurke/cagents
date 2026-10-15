@@ -67,6 +67,22 @@ impl RecoveryContext {
     }
 }
 
+/// Isolated test ledger using the production context admission and Drop path.
+/// Tests of opaque owners must not race the process-wide descriptor budget.
+#[cfg(test)]
+pub(crate) struct RecoveryContextTestBudget(Arc<Mutex<ContextUsage>>);
+#[cfg(test)]
+impl RecoveryContextTestBudget {
+    pub(crate) fn new() -> Self { Self(Arc::new(Mutex::new(ContextUsage::default()))) }
+    pub(crate) fn with_guard(&self, guard: impl Send + Sync + 'static, descriptors: usize) -> Result<RecoveryContext, String> {
+        RecoveryContext::from_budget(guard, descriptors, Arc::clone(&self.0))
+    }
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        let usage = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (usage.contexts, usage.descriptors)
+    }
+}
+
 /// Reserve one bounded recovery payload before touching the filesystem.
 /// Producers must retain no more than MAX_RECOVERY_DESCRIPTORS descriptors.
 pub(crate) struct RecoverySlot {
