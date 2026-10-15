@@ -192,6 +192,9 @@ impl Registry {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
             navigation_orders,
+            headless_automation_agents: self.headless_automation_agents()?,
+            archived_automation_agents: self.archived_automation_agents()?,
+            pending_automation_proposals: self.all_pending_automation_proposals()?,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
@@ -623,6 +626,17 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 12 {
         mailbox::migrate_attention(db)?;
     }
+    // Additive outbox migration also applies to existing automation stores.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS automation_notifications (key TEXT PRIMARY KEY, event TEXT NOT NULL) STRICT;
+        CREATE TABLE IF NOT EXISTS automation_retired_manual_requests (
+            automation TEXT NOT NULL, request TEXT NOT NULL, revision INTEGER NOT NULL,
+            PRIMARY KEY(automation,request)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS automation_snapshots (
+            firing TEXT PRIMARY KEY REFERENCES automation_firings(id) ON DELETE CASCADE,
+            agent TEXT NOT NULL UNIQUE, snapshot TEXT NOT NULL
+        ) STRICT;")
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 

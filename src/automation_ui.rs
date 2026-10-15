@@ -94,6 +94,9 @@ pub enum Action {
     Schedule(usize),
     Weekday(usize),
     Reuse(bool),
+    Headless(bool),
+    CatchUp(usize),
+    CatchUpMinutes(String),
     Precheck(bool),
     ToggleAdvanced,
     Prompt(text_editor::Action),
@@ -113,6 +116,7 @@ pub enum Action {
     InspectRun(crate::model::RunId),
     CancelRun,
     OpenSession,
+    Unblock,
     Received {
         sequence: u64,
         result: std::sync::Arc<Result<Response, String>>,
@@ -187,6 +191,9 @@ struct DraftValues {
     schedule: usize,
     weekday: usize,
     reuse: bool,
+    headless: bool,
+    catch_up: usize,
+    catch_up_minutes: String,
     precheck: bool,
     prompt: String,
     shell: String,
@@ -201,6 +208,8 @@ pub struct Draft {
     custom_model: bool,
     effort: Option<String>,
     permission: String,
+    // Visibility edits preserve CLI-selected presentation surface.
+    surface: Surface,
     timezone: String,
     /// The saved automation's timezone exactly as stored. The daemon treats
     /// any change in its spelling as a material edit, so the same zone typed
@@ -222,6 +231,9 @@ pub struct Draft {
     schedule: usize,
     weekday: usize,
     reuse: bool,
+    headless: bool,
+    catch_up: usize,
+    catch_up_minutes: String,
     precheck: bool,
     advanced: bool,
     prompt: text_editor::Content<cosmic::Renderer>,
@@ -245,6 +257,7 @@ impl Draft {
             custom_model: false,
             effort: None,
             permission: String::new(),
+            surface: Surface::Chat,
             timezone: crate::automations::schedule::system_timezone()
                 .unwrap_or_else(|| "UTC".into()),
             loaded_timezone: None,
@@ -260,6 +273,9 @@ impl Draft {
             schedule: 1,
             weekday: 0,
             reuse: false,
+            headless: false,
+            catch_up: 1,
+            catch_up_minutes: "15".into(),
             precheck: false,
             advanced: false,
             prompt: text_editor::Content::new(),
@@ -274,6 +290,7 @@ impl Draft {
             value.model = definition.agent.model.clone().unwrap_or_default();
             value.effort = definition.agent.reasoning_effort.clone();
             value.permission = definition.agent.permission_mode.clone().unwrap_or_default();
+            value.surface = definition.agent.surface;
             value.advanced = !value.permission.is_empty() || definition.precheck.is_some();
             value.timezone = definition.schedule.timezone.clone();
             value.loaded_timezone = Some(definition.schedule.timezone.clone());
@@ -302,6 +319,15 @@ impl Draft {
                 });
             }
             value.reuse = definition.session_mode == SessionMode::Reuse;
+            value.headless = definition.visibility == crate::automations::Visibility::Headless;
+            value.catch_up = match definition.catch_up {
+                crate::automations::CatchUp::Skip => 0,
+                crate::automations::CatchUp::WithinMinutes(minutes) => {
+                    value.catch_up_minutes = minutes.to_string();
+                    1
+                }
+                crate::automations::CatchUp::OnceOnWake => 2,
+            };
             value.prompt = text_editor::Content::with_text(&definition.prompt);
             if let Some(precheck) = &definition.precheck {
                 value.precheck = true;
@@ -362,6 +388,9 @@ impl Draft {
             schedule: self.schedule,
             weekday: self.weekday,
             reuse: self.reuse,
+            headless: self.headless,
+            catch_up: self.catch_up,
+            catch_up_minutes: self.catch_up_minutes.clone(),
             precheck: self.precheck,
             prompt: self.prompt.text(),
             shell: self.shell.text(),
@@ -535,7 +564,7 @@ impl Draft {
                 provider: provider(self.provider),
                 account: Some(account.id.clone()),
                 target: target.target.clone(),
-                surface: Surface::Chat,
+                surface: self.surface,
                 model: optional(&self.model),
                 permission_mode: optional(&self.permission),
                 reasoning_effort: self.effort.clone(),
@@ -545,6 +574,20 @@ impl Draft {
                 SessionMode::Reuse
             } else {
                 SessionMode::Fresh
+            },
+            visibility: if self.headless {
+                crate::automations::Visibility::Headless
+            } else {
+                crate::automations::Visibility::Headfull
+            },
+            catch_up: match self.catch_up {
+                0 => crate::automations::CatchUp::Skip,
+                2 => crate::automations::CatchUp::OnceOnWake,
+                _ => crate::automations::CatchUp::WithinMinutes(
+                    self.catch_up_minutes
+                        .parse()
+                        .map_err(|_| "Enter a catch-up window in minutes")?,
+                ),
             },
             precheck: if self.precheck {
                 Some(crate::automations::Precheck {
@@ -646,7 +689,7 @@ impl State {
             widget::column::with_children(vec![
                 crate::design::title("Discard automation changes?").into(),
                 crate::design::body("Your unsaved changes will be lost.").into(),
-                widget::row::with_children(vec![
+                crate::app::dialog_ui::confirmation_controls(vec![
                     crate::ui_controls::button::secondary("Keep editing")
                         .id(draft_dialog_focus_id())
                         .on_press(Action::KeepDraft(*generation))
@@ -654,9 +697,7 @@ impl State {
                     crate::ui_controls::button::destructive("Discard changes")
                         .on_press(Action::DiscardDraft(*generation))
                         .into(),
-                ])
-                .spacing(space::S)
-                .into(),
+                ]),
             ])
             .spacing(space::M),
             560.0,
@@ -751,6 +792,9 @@ impl State {
                 | Action::Schedule(..)
                 | Action::Weekday(..)
                 | Action::Reuse(..)
+                | Action::Headless(..)
+                | Action::CatchUp(..)
+                | Action::CatchUpMinutes(..)
                 | Action::Precheck(..)
                 | Action::Prompt(..)
                 | Action::PromptCursor(..)
@@ -932,7 +976,11 @@ impl State {
                         "Cancellation requested. Refresh the run for its confirmed outcome.".into(),
                     )
                 }
-                Ok(Response::Proposal(_) | Response::Proposals(_)) => {
+                Ok(
+                    Response::Proposal(_)
+                    | Response::Proposals(_)
+                    | Response::ArchivedConversation(_),
+                ) => {
                     self.error = Some("Unexpected automation approval response".into());
                 }
             }
@@ -1190,6 +1238,21 @@ impl State {
                     draft.weekday = index;
                 }
             }
+            Action::Headless(value) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.headless = value;
+                }
+            }
+            Action::CatchUp(value) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.catch_up = value;
+                }
+            }
+            Action::CatchUpMinutes(value) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.catch_up_minutes = value;
+                }
+            }
             Action::Reuse(value) => {
                 if let Some(draft) = &mut self.draft {
                     draft.reuse = value;
@@ -1321,6 +1384,20 @@ impl State {
                     );
                 }
             }
+            Action::Unblock => {
+                if let Some(selected) = &self.selected
+                    && let Some(firing) = selected.active_firing
+                {
+                    return self.request(
+                        Pending::Mutate,
+                        Request::Unblock {
+                            id: selected.id,
+                            firing,
+                            revision: selected.revision,
+                        },
+                    );
+                }
+            }
             Action::OpenSession => {
                 if let Some(run) = &self.run {
                     return self
@@ -1341,7 +1418,7 @@ impl State {
             .pending
             .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
-        let mut content = widget::column::with_children(vec![
+        let mut header = widget::column::with_children(vec![
             widget::row::with_children(vec![
                 crate::design::title("Automations")
                     .width(Length::Fill)
@@ -1368,8 +1445,12 @@ impl State {
                 .into(),
         ])
         .spacing(space::M)
-        .padding(space::L)
+        .padding([space::L, space::L, space::S, space::L])
         .width(Length::Fill);
+        let mut content = widget::column::with_children(Vec::<Element<'_, Action>>::new())
+            .spacing(space::M)
+            .padding([0, space::L, space::L, space::L])
+            .width(Length::Fill);
         if let Some(error) = &self.error
             && self.draft.is_none()
         {
@@ -1417,16 +1498,32 @@ impl State {
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
-            content = content.push(
+            header = header.push(
                 widget::row::with_children(vec![
-                    button("New automation", Action::New, !busy),
-                    button(
-                        "Automations",
-                        Action::Browse,
-                        !busy && (self.run.is_some() || self.all_history),
+                    widget::button::custom(crate::design::body("Automations"))
+                        .class(crate::ui_controls::control_style(
+                            !self.all_history && self.run.is_none(),
+                            None,
+                        ))
+                        .selected(!self.all_history && self.run.is_none())
+                        .on_press_maybe((!busy).then_some(Action::Browse))
+                        .into(),
+                    widget::button::custom(crate::design::body("Run history"))
+                        .class(crate::ui_controls::control_style(
+                            self.all_history || self.run.is_some(),
+                            None,
+                        ))
+                        .selected(self.all_history || self.run.is_some())
+                        .on_press_maybe((!busy).then_some(Action::AllHistory))
+                        .into(),
+                    crate::ui_controls::button::primary("New automation")
+                        .on_press_maybe((!busy).then_some(Action::New))
+                        .into(),
+                    crate::interaction::tooltip(
+                        crate::ui_controls::button::secondary("↻")
+                            .on_press_maybe((!busy).then_some(Action::Refresh)),
+                        "Refresh automations",
                     ),
-                    button("Refresh", Action::Refresh, !busy),
-                    button("All run history", Action::AllHistory, !busy),
                 ])
                 .spacing(space::S)
                 .wrap(),
@@ -1438,6 +1535,7 @@ impl State {
                             "Search loaded automations",
                             &self.search,
                         )
+                        .id(widget::Id::new("automation.search"))
                         .on_input(Action::Search)
                         .into(),
                     );
@@ -1526,42 +1624,62 @@ impl State {
                         if let Some(blocked) = &selected.blocked {
                             content = content.push(crate::design::body(blocked));
                         }
-                        content = content.push(
-                            widget::row::with_children(vec![
-                                button("Edit", Action::Edit, !busy),
-                                if selected.enabled {
-                                    button("Pause", Action::Pause, !busy)
-                                } else {
-                                    button(
-                                        "Enable…",
-                                        Action::Enable,
-                                        !busy && selected.blocked.is_none(),
+                        if let Some(firing) = selected
+                            .active_firing
+                            .filter(|_| selected.blocked.is_some())
+                        {
+                            content = content.push(
+                                widget::row::with_children(vec![
+                                    button("Open blocking run", Action::Run(firing), !busy),
+                                    crate::ui_controls::button::destructive(
+                                        "Close run and unblock",
                                     )
-                                },
-                                button(
-                                    if self.manual_requests.get(&selected.id).is_some_and(
-                                        |(revision, _)| *revision == selected.execution_revision,
-                                    ) {
-                                        "Retry run…"
+                                    .on_press_maybe((!busy).then_some(Action::Unblock))
+                                    .into(),
+                                ])
+                                .spacing(space::S)
+                                .wrap(),
+                            );
+                        } else {
+                            content = content.push(
+                                widget::row::with_children(vec![
+                                    button("Edit", Action::Edit, !busy),
+                                    if selected.enabled {
+                                        button("Pause", Action::Pause, !busy)
                                     } else {
-                                        "Run now…"
+                                        button(
+                                            "Enable…",
+                                            Action::Enable,
+                                            !busy && selected.blocked.is_none(),
+                                        )
                                     },
-                                    Action::RunNow,
-                                    !busy
-                                        && selected.active_firing.is_none()
-                                        && selected.blocked.is_none(),
-                                ),
-                                button(
-                                    "Remove…",
-                                    Action::Remove,
-                                    !busy
-                                        && selected.active_firing.is_none()
-                                        && selected.blocked.is_none(),
-                                ),
-                            ])
-                            .spacing(space::S)
-                            .wrap(),
-                        );
+                                    button(
+                                        if self.manual_requests.get(&selected.id).is_some_and(
+                                            |(revision, _)| {
+                                                *revision == selected.execution_revision
+                                            },
+                                        ) {
+                                            "Retry run…"
+                                        } else {
+                                            "Run now…"
+                                        },
+                                        Action::RunNow,
+                                        !busy
+                                            && selected.active_firing.is_none()
+                                            && selected.blocked.is_none(),
+                                    ),
+                                    button(
+                                        "Remove…",
+                                        Action::Remove,
+                                        !busy
+                                            && selected.active_firing.is_none()
+                                            && selected.blocked.is_none(),
+                                    ),
+                                ])
+                                .spacing(space::S)
+                                .wrap(),
+                            );
+                        }
                     }
                 }
                 if self.selected.is_some() || self.all_history {
@@ -1601,7 +1719,7 @@ impl State {
                                 firing.name,
                                 timestamp(firing.created_ms),
                                 origin,
-                                state_label(firing.state)
+                                history_state(firing)
                             ),
                             Action::Run(firing.id),
                             !busy,
@@ -1613,6 +1731,14 @@ impl State {
                 }
             }
             if let Some(run) = &self.run {
+                content = content.push(
+                    widget::row::with_children(vec![
+                        button("Automations", Action::Browse, !busy),
+                        crate::design::body(format!("› {} › Run", run.definition.name)).into(),
+                    ])
+                    .spacing(space::S)
+                    .align_y(Alignment::Center),
+                );
                 content = content
                     .push(crate::design::title(format!(
                         "{} · {}",
@@ -1653,13 +1779,18 @@ impl State {
                             !busy && run.firing.state.is_active(),
                         ),
                         button(
-                            "Open agent",
+                            if run.agent.as_ref().is_some_and(|agent| agent.closed) {
+                                "Open saved conversation"
+                            } else {
+                                "Open agent"
+                            },
                             Action::OpenSession,
                             !busy
-                                && run
-                                    .agent
-                                    .as_ref()
-                                    .is_some_and(|agent| !agent.closed && agent.session.is_some()),
+                                && run.agent.as_ref().is_some_and(|agent| {
+                                    agent.session.is_some()
+                                        && (!agent.closed
+                                            || run.definition.session_mode == SessionMode::Fresh)
+                                }),
                         ),
                     ])
                     .spacing(space::S)
@@ -1667,35 +1798,40 @@ impl State {
                 );
             }
         }
-        let content: Element<'_, Action> = widget::scrollable(content)
+        let detail: Element<'_, Action> = widget::scrollable(content)
             .height(Length::Fill)
             .width(Length::Fill)
             .into();
-        if listing.is_empty() {
-            return content;
-        }
-        let list = widget::scrollable(
-            widget::column::with_children(listing)
-                .spacing(space::XS)
-                .padding(space::S),
-        );
-        if width >= 700.0 {
-            widget::row::with_children(vec![
-                list.width(240).height(Length::Fill).into(),
-                crate::design::vertical_rule(),
-                content,
-            ])
-            .height(Length::Fill)
-            .into()
+        let body = if listing.is_empty() {
+            detail
         } else {
-            widget::column::with_children(vec![
-                list.width(Length::Fill).height(200).into(),
-                crate::design::horizontal_rule(),
-                content,
-            ])
+            let list = widget::scrollable(
+                widget::column::with_children(listing)
+                    .spacing(space::XS)
+                    .padding([0, space::L, space::L, space::L]),
+            );
+            if width >= 700.0 {
+                widget::row::with_children(vec![
+                    list.width(260).height(Length::Fill).into(),
+                    crate::design::vertical_rule(),
+                    detail,
+                ])
+                .height(Length::Fill)
+                .into()
+            } else {
+                widget::column::with_children(vec![
+                    list.width(Length::Fill).height(200).into(),
+                    crate::design::horizontal_rule(),
+                    detail,
+                ])
+                .height(Length::Fill)
+                .into()
+            }
+        };
+        widget::column::with_children(vec![header.into(), body])
             .height(Length::Fill)
+            .width(Length::Fill)
             .into()
-        }
     }
 }
 
@@ -1795,6 +1931,22 @@ impl Draft {
             .push(crate::design::caption(
                 "Otherwise, each run starts a fresh session. Taking over the agent pauses reuse.",
             ));
+        schedule = schedule.push(
+            crate::ui_controls::field::checkbox(self.headless)
+                .label("Headless (keep the conversation in the background)")
+                .on_toggle(Action::Headless),
+        ).push(crate::design::caption("Headfull is the default: the original agent appears in its destination without moving focus."))
+        .push(crate::design::caption("After a missed schedule"))
+        .push(crate::ui_controls::field::select(
+            vec!["Skip".to_owned(), "Run if within N minutes".to_owned(), "Run once on wake".to_owned()],
+            Some(self.catch_up), Action::CatchUp,
+        ));
+        if self.catch_up == 1 {
+            schedule = schedule.push(
+                crate::ui_controls::field::text("Catch-up minutes", &self.catch_up_minutes)
+                    .on_input(Action::CatchUpMinutes),
+            );
+        }
         let work = form_section("Work", "What the agent should do", work.into());
         let schedule = form_section("Schedule", "When it should run", schedule.into());
         let layout: Element<'a, Action> = if width >= 820.0 {
@@ -2258,6 +2410,8 @@ mod tests {
                     timezone: "UTC".into(),
                 },
                 session_mode: SessionMode::Fresh,
+                visibility: crate::automations::Visibility::default(),
+                catch_up: crate::automations::CatchUp::default(),
                 precheck: None,
             },
             target_identity: crate::automations::DirectoryIdentity {
@@ -2273,6 +2427,102 @@ mod tests {
             channel: None,
             blocked: None,
         }
+    }
+
+    fn rendered_labels(state: &State, width: f32) -> (Vec<(String, f32)>, Option<f32>) {
+        use cosmic::iced::{
+            Rectangle, Size,
+            advanced::{
+                Layout, layout,
+                renderer::Headless,
+                widget::{Operation, Tree, operation::TextInput},
+            },
+        };
+        #[derive(Default)]
+        struct Labels {
+            texts: Vec<(String, f32)>,
+            search: Option<f32>,
+        }
+        impl Operation for Labels {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                self.texts.push((text.to_owned(), bounds.y));
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn TextInput,
+            ) {
+                if id == Some(&widget::Id::new("automation.search")) {
+                    self.search = Some(bounds.y);
+                }
+            }
+        }
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element = state.view_layout(width);
+        let mut tree = Tree::new(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 1000.0)),
+        );
+        let mut labels = Labels::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut labels);
+        (labels.texts, labels.search)
+    }
+
+    #[test]
+    fn automation_header_precedes_search_at_wide_and_narrow_widths() {
+        for width in [1600.0, 900.0, 580.0] {
+            let state = State::default();
+            let (labels, search) = rendered_labels(&state, width);
+            let title = labels
+                .iter()
+                .find(|(text, _)| text == "Automations")
+                .unwrap();
+            assert!(title.1 < search.expect("the real search widget is rendered"));
+            assert!(labels.iter().any(|(text, _)| text == "Run history"));
+        }
+    }
+
+    #[test]
+    fn blocked_automation_renders_actions_for_its_exact_owner() {
+        let mut selected = automation();
+        let firing = Uuid::new_v4();
+        selected.blocked = Some("The provider needs a proved close".into());
+        selected.active_firing = Some(firing);
+        let id = selected.id;
+        let revision = selected.revision;
+        let mut state = State {
+            selected: Some(selected),
+            ..Default::default()
+        };
+        let (labels, _) = rendered_labels(&state, 900.0);
+        assert!(labels.iter().any(|(text, _)| text == "Open blocking run"));
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Close run and unblock")
+        );
+        let effect = state.update(Action::Unblock).unwrap();
+        assert!(
+            matches!(effect, Effect::Request { request: Request::Unblock { id: actual, firing: owner, revision: seen }, .. }
+            if actual == id && owner == firing && seen == revision)
+        );
     }
 
     #[test]
@@ -2479,6 +2729,8 @@ mod tests {
             agent: None,
             run: None,
             skip: None,
+            skipped_occurrences: None,
+            missed_interval: None,
             diagnostic: None,
         }
     }
@@ -3376,6 +3628,26 @@ mod tests {
         assert!(state.draft.as_ref().unwrap().accounts.is_empty());
     }
 }
+fn history_state(firing: &Firing) -> String {
+    if let Some(interval) = &firing.missed_interval {
+        format!(
+            "Missed interval · {} until {} (exclusive); occurrence count unknown",
+            timestamp(interval.first_due_ms),
+            timestamp(interval.until_exclusive_ms)
+        )
+    } else if let Some(summary) = &firing.skipped_occurrences {
+        format!(
+            "{} ×{} · {} – {}",
+            state_label(firing.state),
+            summary.count,
+            timestamp(summary.first_occurrence_ms),
+            timestamp(summary.last_occurrence_ms)
+        )
+    } else {
+        state_label(firing.state).to_owned()
+    }
+}
+
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
     use crate::automations::FiringState::*;
     match state {
@@ -3388,5 +3660,28 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
         Skipped => "Skipped",
         Cancelled => "Cancelled",
         Interrupted => "Outcome uncertain",
+    }
+    #[test]
+    fn editing_visibility_preserves_a_saved_terminal_surface() {
+        let mut existing = automation();
+        existing.definition.agent.surface = Surface::Terminal;
+        let account = AccountChoice {
+            label: "Fixture account".into(),
+            id: existing.definition.agent.account.clone().unwrap(),
+            provider: existing.definition.agent.provider,
+        };
+        let target = TargetChoice {
+            label: "Fixture target".into(),
+            target: existing.definition.agent.target.clone(),
+            defaults: BTreeMap::new(),
+        };
+        let mut draft = Draft::new(&[target], &[account], Some(&existing));
+        draft.headless = true;
+        let definition = draft.definition(&Models::new()).unwrap();
+        assert_eq!(definition.agent.surface, Surface::Terminal);
+        assert_eq!(
+            definition.visibility,
+            crate::automations::Visibility::Headless
+        );
     }
 }

@@ -10,6 +10,8 @@ use crate::{
 };
 
 #[cfg(any(feature = "host", feature = "ui"))]
+pub mod archive;
+#[cfg(any(feature = "host", feature = "ui"))]
 pub mod schedule;
 
 pub const MAX_NAME_BYTES: usize = 160;
@@ -91,6 +93,18 @@ pub enum Request {
         revision: u64,
         approved: bool,
     },
+    Unblock {
+        id: Uuid,
+        firing: Uuid,
+        revision: u64,
+    },
+    AllPendingProposals {
+        after: Option<Uuid>,
+        limit: usize,
+    },
+    ArchivedConversation {
+        agent: AgentId,
+    },
 }
 
 impl Request {
@@ -119,6 +133,15 @@ pub enum Response {
     CancellationRequested,
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
+    ArchivedConversation(Box<ArchivedConversation>),
+}
+
+/// Bounded final presentation of an exact retired provider conversation.
+/// This payload is fetched only when its pane is visible; never in model watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedConversation {
+    pub agent: agent_execution::Agent,
+    pub snapshot: crate::chat::Snapshot,
 }
 
 /// A saved execution configuration, separate from active scheduler records.
@@ -261,6 +284,29 @@ pub struct Precheck {
     pub timeout_seconds: u32,
 }
 
+/// Whether a scheduled session is automatically attached to its destination.
+/// Definitions saved before this setting existed use the normal visible mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    #[default]
+    Headfull,
+    Headless,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUp {
+    Skip,
+    WithinMinutes(u32),
+    OnceOnWake,
+}
+impl Default for CatchUp {
+    fn default() -> Self {
+        Self::WithinMinutes(15)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub name: String,
@@ -268,6 +314,10 @@ pub struct Definition {
     pub agent: agent_execution::Spec,
     pub schedule: Schedule,
     pub session_mode: SessionMode,
+    #[serde(default)]
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub catch_up: CatchUp,
     pub precheck: Option<Precheck>,
 }
 
@@ -297,6 +347,10 @@ impl Definition {
             || self.schedule.timezone.chars().any(char::is_control)
         {
             return Err("Choose an explicit IANA timezone, such as America/Vancouver".into());
+        }
+        if matches!(self.catch_up, CatchUp::WithinMinutes(minutes) if minutes == 0 || minutes > 10_080)
+        {
+            return Err("Catch-up must be between 1 and 10080 minutes".into());
         }
         if let Some(precheck) = &self.precheck {
             if precheck.command.trim().is_empty()
@@ -399,6 +453,22 @@ pub enum SkipReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedOccurrences {
+    pub count: u64,
+    pub first_occurrence_ms: u64,
+    pub last_occurrence_ms: u64,
+}
+
+/// A bounded missed-time interval; no occurrence count is inferred across downtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissedInterval {
+    pub first_due_ms: u64,
+    /// The next eligible occurrence is excluded from this missed interval.
+    pub until_exclusive_ms: u64,
+    pub intervals: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Firing {
     pub id: Uuid,
     pub automation: Uuid,
@@ -420,6 +490,10 @@ pub struct Firing {
     pub agent: Option<AgentId>,
     pub run: Option<RunId>,
     pub skip: Option<SkipReason>,
+    #[serde(default)]
+    pub skipped_occurrences: Option<SkippedOccurrences>,
+    #[serde(default)]
+    pub missed_interval: Option<MissedInterval>,
     /// Bounded process/validation diagnostic, never a duplicate transcript.
     pub diagnostic: Option<String>,
 }

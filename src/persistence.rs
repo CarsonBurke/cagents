@@ -260,6 +260,7 @@ pub struct WorkspaceManifest {
     pub channels: Vec<ProjectChannel>,
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
+    pub automation_archives: HashMap<CardId, crate::model::AgentId>,
     pub chat_drafts: HashMap<CardId, String>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -1742,6 +1743,7 @@ impl StateStore {
             channels: manifest.channels,
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
+            automation_archives: manifest.automation_archives,
             chat_drafts: manifest.chat_drafts,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -3285,6 +3287,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:automation_archives"),
+        &to_json(&state.automation_archives)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
         &to_json(&state.workspace_history)?,
     )?;
@@ -3420,7 +3427,7 @@ fn save_card(
             });
         }
         if stored.kind != kind {
-            validate_card_conversion(transaction, card, stored.kind)?;
+            validate_card_conversion(transaction, workspace_id, card, stored.kind)?;
         }
     } else if expected != 0 {
         return Err(StoreError::StaleGeneration {
@@ -3591,6 +3598,7 @@ fn tombstone_card(
 /// same workspace/card CAS transaction as the following payload write.
 fn validate_card_conversion(
     transaction: &Transaction<'_>,
+    workspace_id: &str,
     card: &CardState,
     previous: PersistedCardKind,
 ) -> Result<()> {
@@ -3612,7 +3620,9 @@ fn validate_card_conversion(
                 || id != source.id.to_string()
                 || from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe)?
                     != source.launch
-                || !(source_chat_launch_matches(source, session) || codex_cli_view(session, source))
+                || !(source_chat_launch_matches(source, session)
+                    || codex_cli_view(session, source)
+                    || archived_execution_console(transaction, workspace_id, card.id, source)?)
                 || exact_chat_resume(session).is_none()
             {
                 return Err(invalid());
@@ -3676,6 +3686,32 @@ fn validate_card_conversion(
         _ => return Err(invalid()),
     }
     Ok(())
+}
+
+/// An execution console is a view of a hosted provider, not its resume recipe.
+/// Its conversion is allowed only under a persisted canonical archive binding;
+/// every UI launch path treats that binding as read-only and fetches the exact
+/// saved provider descriptor instead of starting the console or provider.
+fn archived_execution_console(
+    transaction: &Transaction<'_>,
+    workspace: &str,
+    card: CardId,
+    source: &TerminalSession,
+) -> Result<bool> {
+    let Some(value) = metadata(
+        transaction,
+        &format!("workspace:{workspace}:navigation:automation_archives"),
+    )?
+    else {
+        return Ok(false);
+    };
+    let bindings: HashMap<CardId, crate::model::AgentId> =
+        from_json("automation archive bindings", &value)?;
+    let Some(agent) = bindings.get(&card) else {
+        return Ok(false);
+    };
+    Ok(agent.as_uuid() == card.as_uuid()
+        && source.launch.arguments == ["agent".to_owned(), "console".to_owned(), agent.to_string()])
 }
 
 fn source_chat_launch_matches(source: &TerminalSession, session: &crate::chat::Session) -> bool {
@@ -4622,6 +4658,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace card scopes", &value))
         .transpose()?
         .unwrap_or_default(),
+        automation_archives: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:automation_archives"),
+        )?
+        .map(|value| from_json("workspace automation archives", &value))
+        .transpose()?
+        .unwrap_or_default(),
         workspace_history: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_history"),
@@ -5263,6 +5306,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            automation_archives: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -9197,5 +9241,56 @@ mod tests {
         assert_eq!(report.retained, 1);
         assert!(directory.join(format!("{live}.log")).is_file());
         assert!(!directory.join(format!("{orphan}.log")).exists());
+    }
+    #[test]
+    fn completed_execution_console_conversion_requires_exact_canonical_archive_binding() {
+        for invalid in 0..4 {
+            let directory = tempdir().unwrap();
+            let store =
+                StateStore::open(directory.path().join("archive.sqlite3"), boot("chat-boot"))
+                    .unwrap();
+            let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Claude);
+            let card = workspace.cards[0].id;
+            let agent = crate::model::AgentId::from_uuid(card.as_uuid());
+            let mut console = chat.terminal.clone().unwrap();
+            console.launch.program = "/private/matched/cagents".into();
+            console.launch.arguments = vec!["agent".into(), "console".into(), agent.to_string()];
+            console.resume_hint = None;
+            workspace.cards[0].kind = CardKind::Terminal(console.clone());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            chat.terminal = Some(console);
+            if invalid != 1 {
+                workspace.automation_archives.insert(
+                    card,
+                    if invalid == 2 {
+                        crate::model::AgentId::new()
+                    } else {
+                        agent
+                    },
+                );
+            }
+            if invalid == 3 {
+                chat.terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("unexpected".into());
+            }
+            workspace.cards[0].kind = CardKind::Chat(chat.clone());
+            let result = lane.save(&store, &workspace);
+            if invalid == 0 {
+                result.unwrap();
+                let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+                assert_eq!(restored.cards[0].kind, CardKind::Chat(chat));
+                assert_eq!(restored.automation_archives.get(&card), Some(&agent));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "unqualified archived console case {invalid} must fail"
+                );
+            }
+        }
     }
 }

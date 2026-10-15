@@ -28,6 +28,31 @@ pub enum AutomationCommand {
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         wait_seconds: u64,
     },
+    /// List pending requests from every project (user authority required).
+    Proposals {
+        /// Continue after this proposal UUID from the previous page.
+        #[arg(long)]
+        after: Option<Uuid>,
+        /// Maximum number of pending requests to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Approve the immutable saved proposal (user authority required).
+    Approve {
+        /// Exact pending proposal UUID shown by automation proposals.
+        id: Uuid,
+        /// Immutable proposal revision being decided.
+        #[arg(long, default_value_t = 1)]
+        revision: u64,
+    },
+    /// Explicitly decline the immutable saved proposal.
+    Decline {
+        /// Exact pending proposal UUID shown by automation proposals.
+        id: Uuid,
+        /// Immutable proposal revision being decided.
+        #[arg(long, default_value_t = 1)]
+        revision: u64,
+    },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
         #[arg(long)]
@@ -187,6 +212,10 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
                 .map_err(protocol_error)?;
         }
     }
+    Ok(response_output(name, reply))
+}
+
+fn response_output(name: &'static str, reply: Response) -> CommandOutput {
     let (data, human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
@@ -207,10 +236,26 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             };
             (json!({"proposal":proposal}), human)
         }
-        Response::Proposals(proposals) => (
-            json!({"proposals":proposals}),
-            "Automation approval requests".into(),
-        ),
+        Response::Proposals(proposals) => {
+            let human = if proposals.is_empty() {
+                "No pending automation approval requests".into()
+            } else {
+                proposals
+                    .iter()
+                    .map(|proposal| {
+                        format!(
+                            "{}\t{}\t{}\trevision {}",
+                            proposal.id,
+                            proposal.name,
+                            proposal.repository.display(),
+                            proposal.revision
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            (json!({"proposals":proposals}), human)
+        }
         Response::Listed(entries) => {
             let human = entries
                 .iter()
@@ -248,7 +293,25 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             let human = history
                 .firings
                 .iter()
-                .map(|run| format!("{}\t{:?}", run.id, run.state))
+                .map(|run| {
+                    if let Some(interval) = &run.missed_interval {
+                        format!(
+                            "{}\t{:?}\tmissed interval [{}..{}); occurrence count unknown",
+                            run.id, run.state, interval.first_due_ms, interval.until_exclusive_ms
+                        )
+                    } else if let Some(summary) = &run.skipped_occurrences {
+                        format!(
+                            "{}\t{:?}\t{} occurrences\t{}..{}",
+                            run.id,
+                            run.state,
+                            summary.count,
+                            summary.first_occurrence_ms,
+                            summary.last_occurrence_ms
+                        )
+                    } else {
+                        format!("{}\t{:?}", run.id, run.state)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             (json!({"history": history}), human)
@@ -267,6 +330,10 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             );
             (json!({"run": detail}), human)
         }
+        Response::ArchivedConversation(archive) => (
+            json!({"archive":archive}),
+            "Saved scheduled conversation".into(),
+        ),
         Response::Removed => (
             json!({"removed": true}),
             "Automation removed. Past runs remain in history.".into(),
@@ -276,11 +343,11 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Cancellation requested; inspect the run for its confirmed outcome.".into(),
         ),
     };
-    Ok(CommandOutput {
+    CommandOutput {
         command: name,
         data,
         human,
-    })
+    }
 }
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
@@ -297,6 +364,26 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
             },
         ),
         AutomationCommand::Proposal { id, .. } => ("automation.proposal", Request::Proposal { id }),
+        AutomationCommand::Proposals { after, limit } => (
+            "automation.proposals",
+            Request::AllPendingProposals { after, limit },
+        ),
+        AutomationCommand::Approve { id, revision } => (
+            "automation.approve",
+            Request::ResolveProposal {
+                id,
+                revision,
+                approved: true,
+            },
+        ),
+        AutomationCommand::Decline { id, revision } => (
+            "automation.decline",
+            Request::ResolveProposal {
+                id,
+                revision,
+                approved: false,
+            },
+        ),
         AutomationCommand::Create { definition } => (
             "automation.create",
             Request::Create {
@@ -414,6 +501,32 @@ mod tests {
             TopCommand::Automation { command } => Ok(command),
             _ => panic!("expected automation command"),
         }
+    }
+
+    #[test]
+    fn proposal_management_is_explicit_and_never_granted_to_agent_tokens() {
+        let id = Uuid::new_v4();
+        let id_text = id.to_string();
+        for (args, expected) in [
+            (vec!["cagents", "automation", "approve", &id_text], true),
+            (vec!["cagents", "automation", "decline", &id_text], false),
+        ] {
+            let (_, request) = request(parse(&args).unwrap()).unwrap();
+            assert!(
+                matches!(request, Request::ResolveProposal { id: actual, revision: 1, approved } if actual == id && approved == expected)
+            );
+            assert!(!request.allowed_from_hosted_conversation());
+        }
+        let (_, request) =
+            request(parse(&["cagents", "automation", "proposals"]).unwrap()).unwrap();
+        assert!(matches!(
+            request,
+            Request::AllPendingProposals {
+                after: None,
+                limit: 50
+            }
+        ));
+        assert!(!request.allowed_from_hosted_conversation());
     }
 
     #[test]
@@ -570,6 +683,63 @@ mod tests {
                 approved: true
             }
             .allowed_from_hosted_conversation()
+        );
+    }
+    #[test]
+    fn proposal_management_json_preserves_pending_list_and_immutable_decision_receipts() {
+        use crate::automations::{Proposal, ProposalState, ProposalSummary};
+        let definition: Definition = serde_json::from_value(json!({
+            "name":"Requested fixture", "prompt":"Inspect project",
+            "agent":{"provider":"Claude","account":null,
+                "target":{"repository":"/project","directory":"/project","channel":null},
+                "surface":"Chat","model":null,"permission_mode":null},
+            "schedule":{"pattern":{"daily":{"hour":3,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        }))
+        .unwrap();
+        let mut proposal = Proposal {
+            id: Uuid::new_v4(),
+            revision: 1,
+            owner: crate::agent_execution::Origin::Child {
+                parent: crate::agent_execution::Lineage(crate::model::TerminalId::new()),
+            },
+            requested: definition.clone(),
+            definition,
+            target_identity: crate::automations::DirectoryIdentity {
+                device: 1,
+                inode: 1,
+            },
+            channel_title: None,
+            created_ms: 100,
+            state: ProposalState::Pending,
+        };
+        let list = response_output(
+            "automation.proposals",
+            Response::Proposals(vec![ProposalSummary::from(&proposal)]),
+        );
+        assert_eq!(list.command, "automation.proposals");
+        assert_eq!(list.data["proposals"][0]["id"], proposal.id.to_string());
+        assert_eq!(list.data["proposals"][0]["repository"], "/project");
+        proposal.state = ProposalState::Declined;
+        let declined = response_output(
+            "automation.decline",
+            Response::Proposal(Box::new(proposal.clone())),
+        );
+        assert_eq!(declined.data["proposal"]["state"], "Declined");
+        let automation = Uuid::new_v4();
+        proposal.state = ProposalState::Approved {
+            automation,
+            execution_revision: 7,
+        };
+        let approved =
+            response_output("automation.approve", Response::Proposal(Box::new(proposal)));
+        assert_eq!(
+            approved.data["proposal"]["state"]["Approved"]["automation"],
+            automation.to_string()
+        );
+        assert_eq!(
+            approved.data["proposal"]["state"]["Approved"]["execution_revision"],
+            7
         );
     }
 }

@@ -32,3 +32,27 @@ pub(super) fn wake(host: &super::state::SharedHost) {
 }
 mod broker;
 pub(super) use broker::{Broker, Handle};
+
+/// Transfer committed scheduler events to the daemon's existing attention
+/// broker. With no broker available, leave the durable outbox untouched.
+pub(super) fn flush_notifications(host: &super::state::SharedHost) -> Result<(), String> {
+    let notifications = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .notifications
+        .clone();
+    let Some(notifications) = notifications else {
+        return Ok(());
+    };
+    let registry = super::agent_execution::registry(host)?;
+    let receipts = notifications.take_automation_receipts();
+    let events = {
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        registry.acknowledge_automation_notifications(&receipts)?;
+        registry.automation_notifications()?
+    };
+    for event in events {
+        notifications.record(event);
+    }
+    Ok(())
+}

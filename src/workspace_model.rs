@@ -185,6 +185,13 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    #[serde(default)]
+    pub headless_automation_agents: Vec<crate::model::AgentId>,
+    #[serde(default)]
+    pub archived_automation_agents: Vec<crate::agent_execution::Agent>,
+    /// Pending consent requests from every project, delivered over model watch.
+    #[serde(default)]
+    pub pending_automation_proposals: Vec<crate::automations::ProposalSummary>,
 }
 
 impl WorkspaceModel {

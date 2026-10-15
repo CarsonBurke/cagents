@@ -18,17 +18,20 @@ pub(crate) fn surface<'a, M: 'a>(
 
 /// The closing row every confirmation shares: right-aligned, the dismissal
 /// before the committing action, a sibling-control gap apart.
-pub(super) fn confirmation_actions<'a>(
-    dismiss: impl Into<Element<'a, Message>>,
-    confirm: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    widget::row::with_children(vec![
-        iced::widget::Space::new().width(Length::Fill).into(),
-        dismiss.into(),
-        confirm.into(),
-    ])
-    .spacing(space::S)
-    .into()
+pub(super) fn confirmation_actions<'a, M: 'a>(
+    dismiss: impl Into<Element<'a, M>>,
+    confirm: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    confirmation_controls(vec![dismiss.into(), confirm.into()])
+}
+
+pub(crate) fn confirmation_controls<'a, M: 'a>(
+    mut controls: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    controls.insert(0, iced::widget::Space::new().width(Length::Fill).into());
+    widget::row::with_children(controls)
+        .spacing(space::S)
+        .into()
 }
 
 pub(super) fn overlay<'a>(

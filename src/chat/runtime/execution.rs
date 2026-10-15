@@ -170,7 +170,14 @@ impl Tracker {
             Kind::Succeeded => State::Succeeded,
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
-            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested | Kind::MessageReceived => {
+            Kind::Waiting
+            | Kind::Interrupted
+            | Kind::ReviewRequested
+            | Kind::MessageReceived
+            | Kind::AutomationPaused
+            | Kind::AutomationBlocked
+            | Kind::AutomationSkipped
+            | Kind::AutomationProposed => {
                 return Err("Attention is not a confirmed provider outcome".into());
             }
         };

@@ -142,7 +142,13 @@ impl Cagents {
                 let Some(agent) = detail.agent else {
                     return Task::none();
                 };
-                if agent.closed
+                let archived = agent.closed
+                    && detail.definition.session_mode == crate::automations::SessionMode::Fresh
+                    && matches!(
+                        &agent.session,
+                        Some(crate::agent_execution::HostedSession::Chat(_))
+                    );
+                if (agent.closed && !archived)
                     || !matches!(agent.origin, crate::agent_execution::Origin::Automation { id } if id == detail.firing.automation)
                 {
                     self.status = Some(TransientNotice::error(
@@ -189,9 +195,17 @@ impl Cagents {
                         self.select_worktree(path.clone(), false)
                     }
                 };
+                if archived {
+                    let card = CardId::from_uuid(agent.id.as_uuid());
+                    Arc::make_mut(&mut self.durable)
+                        .automation_archives
+                        .insert(card, agent.id);
+                    self.prepare_automation_archive(card, &agent);
+                }
                 let adopted = self
                     .adopt_execution_agent(&agent)
                     .unwrap_or_else(Task::none);
+                self.persist();
                 Task::batch([
                     adopted,
                     selected,

@@ -473,7 +473,12 @@ cagents automation run FIRING_ID
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History
 returns `next` with the paired `--before-ms` and `--before-id` cursor for the next
-page. `--json` returns the same typed results for scripts. A definition file has
+page. Repeated consecutive scheduled skips with the same reason share one
+history row with a count and first/last occurrence times. History retains up to
+500 firings or 30 days per automation, preserving active or blocked owners;
+removed automation history expires after 30 days. Minimal manual request
+identities prevent an expired receipt from authorizing a repeat charge: retrying
+one is refused, and new work requires a new request UUID. `--json` returns the same typed results for scripts. A definition file has
 this shape (the repository must already be open):
 
 ```json
@@ -498,6 +503,8 @@ this shape (the repository must already be open):
     "timezone": "America/Vancouver"
   },
   "session_mode": "fresh",
+  "visibility": "headfull",
+  "catch_up": { "within_minutes": 15 },
   "precheck": null
 }
 ```
@@ -517,11 +524,31 @@ request:
 cagents automation propose --request-id UUID --definition automation.json --wait
 ```
 
-The definition is saved separately from schedules. In a focused cagents window
-showing that project's workspace, **Review request** opens **Approve scheduled work?** with the saved prompt,
+Definitions without `visibility` use `"headfull"`: their original hosted agent
+appears in its channel or worktree without switching focus, including when the UI
+opens after a run. Choose `"headless"` to keep runs in the background and open
+agents explicitly from history. Fresh runs retain a bounded read-only view of the exact completed conversation
+after their provider is closed; each next firing creates a fresh agent. Headfull
+saved views appear automatically, while headless saved views open from history.
+Transcript bodies are retained only while visible. During an update, hidden saved
+views are also read to verify their exact archive, then their bodies are released.
+Saved views never start a replacement or resend a prompt. Reused runs share an
+agent. Explicit pane closes remain closed across reconnect and restart.
+
+`catch_up` accepts `"skip"`, `{ "within_minutes": N }` (1–10080 minutes), or
+`"once_on_wake"`. Omission preserves the 15 minute catch-up window. At most one
+missed occurrence runs after a wake. Pauses, blocked runs and skipped occurrences
+produce notifications that open the automation's history.
+
+The definition is saved separately from schedules. Every cagents window shows
+pending requests from all projects. **Review request** opens **Approve scheduled work?** with the saved prompt,
 schedule and timezone, directory, channel, account, model, permissions, and any
 shell precheck. **Approve and enable** atomically creates the schedule and its
-approval receipt; **Decline** creates no schedule. The waiting conversation
+approval receipt; **Decline** creates no schedule. Escape, backdrop dismissal,
+and the default **Not now** button leave the request pending. User CLI commands
+`cagents automation proposals`, `cagents automation approve UUID`, and
+`cagents automation decline UUID` provide the same explicit decision; inherited
+agent capabilities cannot use these commands. The waiting conversation
 receives that decision without asking you to copy a terminal command.
 Defaults are resolved when preparing the request, and approval verifies the
 saved account, directory identity, and channel membership again. Reusing the

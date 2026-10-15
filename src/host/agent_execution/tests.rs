@@ -541,6 +541,8 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
                 timezone: "UTC".into(),
             },
             session_mode: crate::automations::SessionMode::Reuse,
+            visibility: crate::automations::Visibility::default(),
+            catch_up: crate::automations::CatchUp::default(),
             precheck: None,
         },
     )
@@ -761,6 +763,8 @@ fn automation_fixture(host: &SharedHost, request: &Submit) -> crate::automations
                 timezone: "UTC".into(),
             },
             session_mode: crate::automations::SessionMode::Reuse,
+            visibility: crate::automations::Visibility::default(),
+            catch_up: crate::automations::CatchUp::default(),
             precheck: None,
         },
     )
@@ -2774,4 +2778,103 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn automation_proposals_and_decisions_are_delivered_over_the_existing_model_watch() {
+    use crate::automations::{Request, Response};
+    const NAME: &str =
+        "automation_proposals_and_decisions_are_delivered_over_the_existing_model_watch";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let definition = automation_fixture(&host, &request).definition;
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let source = store
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap();
+    let token = store
+        .lock()
+        .unwrap()
+        .retained_agent_authority(source.id())
+        .unwrap();
+    let watcher = model_watcher(&host);
+    let before = store.lock().unwrap().execution_sequence().unwrap();
+    let Response::Proposal(proposal) = crate::host::automations::service::process_under_control(
+        &host,
+        token.clone(),
+        Request::Propose {
+            request: uuid::Uuid::new_v4(),
+            definition,
+        },
+    )
+    .unwrap() else {
+        panic!("proposal response")
+    };
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .model()
+            .unwrap()
+            .pending_automation_proposals
+            .len(),
+        1
+    );
+    assert!(
+        crate::host::automations::service::process_under_control(
+            &host,
+            token.clone(),
+            Request::ResolveProposal {
+                id: proposal.id,
+                revision: proposal.revision,
+                approved: true
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        crate::host::automations::service::process_under_control(
+            &host,
+            token,
+            Request::AllPendingProposals {
+                after: None,
+                limit: 50
+            }
+        )
+        .is_err()
+    );
+    crate::host::automations::service::process_under_control(
+        &host,
+        Authority::default(),
+        Request::ResolveProposal {
+            id: proposal.id,
+            revision: proposal.revision,
+            approved: false,
+        },
+    )
+    .unwrap();
+    let after = store.lock().unwrap().execution_sequence().unwrap();
+    assert_eq!(after, before + 2);
+    let edges = edges_through(&watcher, after);
+    watcher.close_after_drain();
+    assert!(edges.contains(&(before + 1, ModelEdit::AgentsChanged)));
+    assert!(edges.contains(&(before + 2, ModelEdit::AgentsChanged)));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .model()
+            .unwrap()
+            .pending_automation_proposals
+            .is_empty()
+    );
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }

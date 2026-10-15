@@ -117,6 +117,8 @@ struct Shared {
     pending: Mutex<Pending>,
     presence: Mutex<BTreeMap<ClientId, Presence>>,
     snapshot: Mutex<Snapshot>,
+    /// Scheduler outbox receipts are emitted only after the journal commits.
+    automation_receipts: Mutex<BTreeSet<String>>,
     wake: mpsc::Sender<()>,
 }
 
@@ -132,6 +134,16 @@ impl Handle {
         change(&mut pending);
         drop(pending);
         let _ = self.0.wake.try_send(());
+    }
+
+    pub(super) fn take_automation_receipts(&self) -> BTreeSet<String> {
+        std::mem::take(
+            &mut *self
+                .0
+                .automation_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
     }
 
     pub fn record(&self, event: Event) {
@@ -243,6 +255,7 @@ impl Broker {
             pending: Mutex::default(),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
+            automation_receipts: Mutex::default(),
             wake,
         }));
         let shared = Arc::downgrade(&handle.0);
@@ -828,6 +841,7 @@ mod tests {
             pending: Mutex::default(),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
+            automation_receipts: Mutex::default(),
             wake,
         }));
         let host = crate::host::service::test_host();
@@ -896,6 +910,7 @@ mod tests {
             pending: Mutex::default(),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
+            automation_receipts: Mutex::default(),
             wake,
         }));
         let session = TerminalId::new();
@@ -929,6 +944,7 @@ mod tests {
             pending: Mutex::default(),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
+            automation_receipts: Mutex::default(),
             wake,
         }));
         let first = handle.test();
@@ -976,6 +992,7 @@ mod tests {
             pending: Mutex::default(),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
+            automation_receipts: Mutex::default(),
             wake,
         });
         (shared, receiver)
@@ -1176,6 +1193,43 @@ mod tests {
         queue_withdrawal(&mut queue, existing);
         assert_eq!(queue.len(), MAX_PENDING);
     }
+    #[test]
+    fn stopped_and_full_notification_queues_never_fabricate_scheduler_journal_receipts() {
+        let event = Event {
+            target: Target::Automation {
+                id: Uuid::new_v4(),
+                name: "Scheduled fixture".into(),
+                reason: "Project closed".into(),
+            },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: "automation-fixture".into(),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+        };
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        shared.pending.lock().unwrap().stopped = true;
+        handle.record(event.clone());
+        assert!(shared.pending.lock().unwrap().events.is_empty());
+        assert!(handle.take_automation_receipts().is_empty());
+        shared.pending.lock().unwrap().stopped = false;
+        for _ in 0..MAX_PENDING {
+            let mut other = event.clone();
+            other.target = Target::Session(TerminalId::new());
+            other.evidence.kind = crate::notifications::Kind::Succeeded;
+            handle.record(other);
+        }
+        handle.record(event.clone());
+        let pending = shared.pending.lock().unwrap();
+        assert_eq!(pending.events.len(), MAX_PENDING);
+        assert!(!pending.events.contains_key(&event.target));
+        drop(pending);
+        assert!(handle.take_automation_receipts().is_empty());
+    }
 }
 
 async fn run(
@@ -1357,7 +1411,29 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            match journal.record(event, suppressed) {
+            let automation_receipt = matches!(
+                &event.target,
+                Target::Automation { .. } | Target::AutomationProposal { .. }
+            )
+            .then(|| event.evidence.key.clone());
+            let recorded = journal.record(event, suppressed);
+            if recorded.is_ok()
+                && let Some(key) = automation_receipt
+            {
+                if let Some(core) = shared.upgrade() {
+                    let mut receipts = core
+                        .automation_receipts
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if receipts.len() < MAX_PENDING {
+                        receipts.insert(key);
+                    }
+                }
+                if let Some(host) = host.upgrade() {
+                    super::automations::wake(&host);
+                }
+            }
+            match recorded {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot

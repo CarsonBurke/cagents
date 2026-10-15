@@ -8316,7 +8316,7 @@ impl Cagents {
         // Actions are only emitted for real transitions, so an empty sweep left
         // the durable state untouched and needs no snapshot.
         let durable_changed = !actions.is_empty();
-        let mut tasks = Vec::new();
+        let mut tasks = vec![self.hydrate_visible_automation_archives(visible)];
         let mut schedule_sweep = false;
         for action in actions {
             match action {
@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -19318,6 +19321,9 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
             };
             match frame {
                 // One adopted row.

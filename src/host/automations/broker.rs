@@ -64,6 +64,7 @@ struct Inner {
     // The journal is bounded. Polling must not resurrect a blocked run after
     // newer unrelated events evict its durable replay identity.
     attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
+    history_pruned_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -87,6 +88,7 @@ impl Broker {
             workers: Mutex::new(BTreeMap::new()),
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -334,6 +336,21 @@ impl Handle {
             return Ok(Duration::from_millis(250));
         }
         let now = service::now()?;
+        let last_pruned = self
+            .0
+            .history_pruned_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_pruned == 0 || now.saturating_sub(last_pruned) >= 60 * 60 * 1000 {
+            self.0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .prune_automation_history(now)?;
+            self.0
+                .history_pruned_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        super::flush_notifications(host)?;
         let active = self
             .0
             .registry
@@ -437,7 +454,11 @@ impl Handle {
             let Some(previous) = &automation.next else {
                 continue;
             };
-            let plan = Compiled::new(&automation.definition.schedule)?.due(previous, now)?;
+            let plan = Compiled::new(&automation.definition.schedule)?.due_with_policy(
+                previous,
+                now,
+                &automation.definition.catch_up,
+            )?;
             if let Some(occurrence) = plan.fire {
                 let expected = if plan.missed && occurrence.due_ms > previous.due_ms {
                     self.0
@@ -489,6 +510,7 @@ impl Handle {
                     )?;
             }
         }
+        super::flush_notifications(host)?;
         let next = self
             .0
             .registry
@@ -520,6 +542,42 @@ impl Handle {
         let agent = detail
             .agent
             .ok_or("The automation lost its agent identity")?;
+        let archive_handle = if detail.definition.session_mode == SessionMode::Fresh
+            && !agent.closed
+        {
+            match &agent.session {
+                Some(crate::agent_execution::HostedSession::Chat(session)) => host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chats
+                    .get(&session.id)
+                    .filter(|record| {
+                        crate::agent_execution::HostedSession::Chat(session.clone()).same_process(
+                            &crate::agent_execution::HostedSession::Chat(record.session.clone()),
+                        )
+                    })
+                    .map(|record| record.handle.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(handle) = &archive_handle
+            && let Some(snapshot) = handle.snapshot(None)
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+        {
+            if !self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .preserve_automation_conversation(firing.id, &agent, snapshot, now)?
+            {
+                return Ok(false);
+            }
+        }
         // Explicit user close is valid cleanup evidence even when the earlier
         // provider outcome was interrupted. It must never authorize a resend.
         let disposition = if agent.closed {
@@ -750,6 +808,7 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -833,6 +892,7 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();

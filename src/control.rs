@@ -4027,6 +4027,9 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4281,6 +4284,9 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4344,6 +4350,9 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -4468,6 +4477,9 @@ mod tests {
                         closed_projects: Vec::new(),
                         views: Vec::new(),
                         agents: Vec::new(),
+                        headless_automation_agents: Vec::new(),
+                        archived_automation_agents: Vec::new(),
+                        pending_automation_proposals: Vec::new(),
                     },
                 ),
             )
@@ -4529,6 +4541,9 @@ mod tests {
             closed_projects: Vec::new(),
             views: Vec::new(),
             agents: Vec::new(),
+            headless_automation_agents: Vec::new(),
+            archived_automation_agents: Vec::new(),
+            pending_automation_proposals: Vec::new(),
         }
     }
 

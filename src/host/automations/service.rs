@@ -57,6 +57,17 @@ pub(in crate::host) fn process_under_control(
                 .unwrap_or_else(|p| p.into_inner())
                 .pending_automation_proposals(&repository, after, limit)?,
         ),
+        Request::AllPendingProposals { after, limit } => Response::Proposals(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .all_pending_automation_proposals()?
+                .iter()
+                .filter(|proposal| after.is_none_or(|id| proposal.id > id))
+                .take(limit.clamp(1, crate::automations::MAX_HISTORY_PAGE))
+                .cloned()
+                .collect(),
+        ),
         Request::ResolveProposal {
             id,
             revision,
@@ -104,6 +115,13 @@ pub(in crate::host) fn process_under_control(
                 .unwrap_or_else(|p| p.into_inner())
                 .automations(after, limit)
                 .map(Response::Listed);
+        }
+        Request::ArchivedConversation { agent } => {
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .archived_automation_conversation(agent)
+                .map(|archive| Response::ArchivedConversation(Box::new(archive)));
         }
         Request::Show { id } => {
             return registry
@@ -160,11 +178,55 @@ pub(in crate::host) fn process_under_control(
             request,
             confirmed,
         } => Response::Firing(handle()?.run_now(id, execution_revision, request, confirmed)?),
+        Request::Unblock {
+            id,
+            firing,
+            revision,
+        } => {
+            let (automation, detail) = {
+                let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+                (store.automation(id)?, store.automation_run_detail(firing)?)
+            };
+            if automation.revision != revision
+                || automation.active_firing != Some(firing)
+                || detail.firing.automation != id
+                || automation.blocked.is_none()
+            {
+                return Err("The blocking run changed; inspect the current automation".into());
+            }
+            if let Some(agent) = detail.agent {
+                agent_execution::close_owned_agent_under_control(
+                    host,
+                    crate::agent_execution::Origin::Automation { id },
+                    agent.id,
+                )?;
+                let current = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .agent(agent.id)?;
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .finish_automation_release(firing, &current, now()?)?;
+            } else {
+                handle()?.cancel(id, firing)?;
+            }
+            Response::Automation(
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .automation(id)?,
+            )
+        }
         Request::Cancel { id, firing } => {
             handle()?.cancel(id, firing)?;
             Response::CancellationRequested
         }
     };
+    if matches!(&response, Response::Proposal(_) | Response::Automation(_)) {
+        agent_execution::announce(host, &registry);
+    }
+    super::flush_notifications(host)?;
     super::wake(host);
     Ok(response)
 }
@@ -254,6 +316,8 @@ fn process_hosted(
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
                 .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+            agent_execution::announce(host, &registry);
+            super::flush_notifications(host)?;
             Ok(Response::Proposal(Box::new(proposal)))
         }
         Request::List { after, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
@@ -308,6 +372,7 @@ pub(super) fn edit(
         .automation(id)?;
     let mut without_name = definition.clone();
     without_name.name = previous.definition.name.clone();
+    without_name.visibility = previous.definition.visibility;
     let material = without_name != previous.definition
         || (definition == previous.definition && identity != previous.target_identity);
     let new_agent = definition.agent != previous.definition.agent

@@ -175,6 +175,9 @@ fn scope_descriptor(
         // A global-only strip still needs an active pane, without making that
         // browser an ownership source or displacing a worktree's own panes.
         .or_else(|| cards.first().map(|card| card.id));
+    let automation_archives=state.automation_archives.iter()
+        .filter(|(id,_)|cards.iter().any(|card|card.id==**id))
+        .map(|(card,agent)|(*card,*agent)).collect();
     WorkspaceState {
         schema_version: state.schema_version,
         id: state.id,
@@ -189,6 +192,7 @@ fn scope_descriptor(
         active_channel: None,
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
+        automation_archives,
         chat_drafts: HashMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),

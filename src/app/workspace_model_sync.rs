@@ -696,13 +696,24 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id);
         }
+        for agent in &model.archived_automation_agents {
+            let card = CardId::from_uuid(agent.id.as_uuid());
+            if self.durable.automation_archives.get(&card) != Some(&agent.id) {
+                Arc::make_mut(&mut self.durable)
+                    .automation_archives
+                    .insert(card, agent.id);
+                changed = true;
+            }
+            changed |= self.prepare_automation_archive(card, agent);
+            if let Some(task) = self.adopt_execution_agent(agent) {
+                changed = true;
+                tasks.push(task);
+            }
+        }
         for agent in &model.agents {
-            // Scheduled agents stay headless until an explicit history or
-            // notification action opens their exact live run.
-            if matches!(
-                agent.origin,
-                crate::agent_execution::Origin::Automation { .. }
-            ) {
+            // Headfull runs attach their exact hosted descriptor, including
+            // after a UI restart. Durable pane tombstones below preserve closes.
+            if model.headless_automation_agents.contains(&agent.id) {
                 continue;
             }
             if let Some(task) = self.adopt_execution_agent(agent) {
@@ -710,6 +721,11 @@ impl Cagents {
                 tasks.push(task);
             }
         }
+        tasks.push(
+            self.update_automation_approval(super::automation_approval::Action::Updated(
+                model.pending_automation_proposals.clone(),
+            )),
+        );
         self.workspace_model = model;
         if changed {
             self.sort_durable_channels();
@@ -727,7 +743,11 @@ impl Cagents {
         &mut self,
         agent: &crate::agent_execution::Agent,
     ) -> Option<Task<Message>> {
-        if agent.closed
+        if (agent.closed
+            && !self
+                .durable
+                .automation_archives
+                .contains_key(&CardId::from_uuid(agent.id.as_uuid())))
             || agent.channel().is_some_and(|channel| {
                 self.channel_ui.is_deleting(channel) || self.channel_ui.was_deleted(channel)
             })
@@ -735,7 +755,12 @@ impl Cagents {
             return None;
         }
         let selected;
-        let session = if agent.spec.surface == crate::agent_execution::Surface::Terminal {
+        let session = if agent.spec.surface == crate::agent_execution::Surface::Terminal
+            && !self
+                .durable
+                .automation_archives
+                .contains_key(&CardId::from_uuid(agent.id.as_uuid()))
+        {
             selected = crate::agent_execution::HostedSession::Terminal(agent.console.clone()?);
             &selected
         } else {
@@ -1415,6 +1440,9 @@ mod tests {
             shared(active, &agent.spec.target.repository, "Active", 0),
             shared(target, &agent.spec.target.repository, "Execution", 1),
         ]);
+        app.workspace_model
+            .headless_automation_agents
+            .push(scheduled.id);
         app.workspace_model.agents.push(scheduled);
         drop(app.reconcile_workspace_model());
         assert!(
@@ -1424,7 +1452,12 @@ mod tests {
                 .any(|candidate| candidate.id == card),
             "model refresh must not mount scheduled history or its live actor"
         );
-        assert!(app.adopt_execution_agent(&agent).is_some());
+        app.workspace_model.headless_automation_agents.clear();
+        drop(app.reconcile_workspace_model());
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "headfull adoption is deduplicated"
+        );
         assert!(
             app.chat_start_pending(card),
             "even an unnamed accepted conversation in a hidden channel attaches to its proven actor"
@@ -1533,6 +1566,9 @@ mod tests {
             closed_projects: Vec::new(),
             views: Vec::new(),
             agents: Vec::new(),
+            headless_automation_agents: Vec::new(),
+            archived_automation_agents: Vec::new(),
+            pending_automation_proposals: Vec::new(),
         }
     }
 
