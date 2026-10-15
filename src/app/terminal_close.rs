@@ -225,18 +225,22 @@ impl Cagents {
         self.terminal_close_bindings.removals.remove(&card);
     }
 
+    fn surface_close_binding_current(&self, card:CardId, captured:Option<&CapturedTerminal>)->bool {
+        let Some(CardRuntime::Terminal(surface))=self.cards.get(&card) else {return true};
+        let actual=surface.worker_binding();
+        match (captured,actual) {
+            (None,None)=>true,
+            (Some(expected),Some(actual))=>actual.execution_instance==expected.execution_instance
+                && actual.source.id==expected.source.id && actual.source.launch==expected.source.launch
+                && actual.source.continuity.live_proof().is_none_or(|proof|proof==expected.proof)
+                && surface.host_proof().is_none_or(|proof|proof==expected.proof),
+            _=>false,
+        }
+    }
+
     fn terminal_close_binding_current(&self, intent: &CloseIntent) -> bool {
-        intent.captured.as_ref().is_none_or(|captured| {
-            self.terminal_close_bindings
-                .bound
-                .get(&intent.card)
-                .is_some_and(|current| {
-                    current.execution_instance == captured.execution_instance
-                        && current.proof == captured.proof
-                        && current.source.id == captured.source.id
-                        && current.source.launch == captured.source.launch
-                })
-        })
+        same_captured(intent.captured.as_ref(),self.terminal_close_bindings.bound.get(&intent.card))
+            && self.surface_close_binding_current(intent.card,intent.captured.as_ref())
     }
 
     fn queued_card_close(&mut self, card: CardId, unasked: bool) -> QueuedCardClose {
@@ -296,7 +300,7 @@ impl Cagents {
         let binding_matches = same_captured(
             queued.captured.as_ref(),
             self.terminal_close_bindings.bound.get(&queued.card),
-        );
+        ) && self.surface_close_binding_current(queued.card,queued.captured.as_ref());
         if !kind_matches
             || !binding_matches
             || self.terminal_start_in_flight(queued.card)
@@ -648,7 +652,8 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         if let Some(expected) = self.terminal_close_bindings.removals.get(&id) {
             let matches=same_captured(Some(expected),self.terminal_close_bindings.bound.get(&id))
-                && self.card_state(id).is_some_and(|state| matches!(&state.kind,CardKind::Terminal(source) if source.id==expected.source.id && source.launch==expected.source.launch))
+                && self.surface_close_binding_current(id,Some(expected))
+                && self.card_state(id).is_some_and(|state| matches!(&state.kind,CardKind::Terminal(source) if source.id==expected.source.id && source.launch==expected.source.launch && source.continuity.live_proof().is_none_or(|proof|proof==expected.proof)))
                 && !self.terminal_start_in_flight(id) && !self.chat_start_pending(id);
             if !matches {
                 let _ = self.workspace.cancel_close(id);
@@ -1402,6 +1407,20 @@ mod tests {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.workspace.card(card).is_some());
         assert!(!app.closed_terminal_cards.contains(&card));
+        assert!(app.workspace.pending_close().is_none());
+    }
+
+    #[test]
+    fn acknowledged_old_worker_cannot_commit_after_shared_proof_changes_before_binding() {
+        let (mut app,card,captured)=bound_fixture();
+        app.terminal_close_bindings.removals.insert(card,captured);
+        app.closed_terminal_cards.insert(card);
+        let _=app.request_card_removal(card);
+        let CardKind::Terminal(source)=&mut app.card_state_mut(card).unwrap().kind else {panic!()};
+        source.continuity=TerminalContinuity::Live {host_session_id:HostSessionId::new("new-daemon"),boot_id:BootId::new("boot"),host_incarnation:HostIncarnation::new("new-incarnation")};
+        assert!(app.commit_card_removal(card,None).is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_some());
         assert!(app.workspace.pending_close().is_none());
     }
 
