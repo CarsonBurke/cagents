@@ -87,7 +87,7 @@ fn highlighted<'a, Message: 'a>(text: String, query: &str, font: iced::Font) -> 
         }
     }
     for range in boundaries.windows(2) {
-        let span = iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
+        let span: iced::widget::text::Span<'_, ()> = iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
         spans.push(if highlighted[range[0]] {
             span.font(iced::Font { weight: iced::font::Weight::Bold, ..font })
         } else { span.font(font) });
