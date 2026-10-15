@@ -599,23 +599,49 @@ impl HostState {
             scope,
             expected_revision,
             operation,
-            ..
+            change,
         } = &edit
         {
             let registry = self.registry()?;
-            if !registry
+            let seen = registry
                 .view_operation_seen(*operation)
-                .map_err(model_unavailable)?
-                && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ViewConflict,
-                    "The workspace view changed; rebase this pane mutation on the current revision",
-                    true,
-                ));
+                .map_err(model_unavailable)?;
+            if !seen {
+                if let Some(reason) = registry
+                    .view_change_refusal(scope, change)
+                    .map_err(model_unavailable)?
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        reason,
+                        false,
+                    ));
+                }
+                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "The workspace view changed; rebase this pane mutation on the current revision",
+                        true,
+                    ));
+                }
             }
         }
-        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        let registry = self.registry()?;
+        let applied = registry.apply(&edit).map_err(|error| {
+            // An execution writer can close a view after the preflight read.
+            // apply has rolled back; inspect authoritative membership again
+            // rather than making the client retry a permanently invalid edit.
+            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
+                match registry.view_change_refusal(scope, change) {
+                    Ok(Some(reason)) => {
+                        return ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false);
+                    }
+                    Err(storage) => return model_unavailable(storage),
+                    Ok(None) => {}
+                }
+            }
+            model_unavailable(error)
+        })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }

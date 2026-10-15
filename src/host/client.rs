@@ -2409,6 +2409,147 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    #[test]
+    fn transfer_requests_refuse_invalid_membership_without_acknowledging_or_mutating_it() {
+        use crate::{
+            model::{
+                BootId, BrowserId, BrowserSession, CardId, CardKind, ChannelId, HostIncarnation,
+                HostSessionId,
+            },
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        let other = directory.path().join("other");
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("transfer-session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            }),
+        ));
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+        }
+        let edit = |edit| process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit });
+        for path in [&repository, &other] {
+            std::fs::create_dir(path).unwrap();
+            edit(ModelEdit::OpenProject {
+                repository: path.clone(),
+                name: "project".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        }
+        let source = ChannelId::new();
+        let destination = ChannelId::new();
+        let foreign = ChannelId::new();
+        for (id, repository) in [
+            (source, repository.clone()),
+            (destination, repository),
+            (foreign, other),
+        ] {
+            edit(ModelEdit::CreateChannel {
+                id,
+                repository,
+                title: "channel".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        }
+        let pane = Pane {
+            id: CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        edit(ModelEdit::SeedView {
+            scope: Scope::Channel(source),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        let before = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read_model()
+            .unwrap();
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .revision;
+        for (scope, id, to) in [
+            (Scope::Channel(ChannelId::new()), pane.id, destination),
+            (Scope::Channel(source), pane.id, ChannelId::new()),
+            (Scope::Channel(source), CardId::new(), destination),
+            (Scope::Channel(source), pane.id, foreign),
+            (Scope::Channel(source), CardId::new(), source),
+        ] {
+            let error = edit(ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id,
+                    destination: Scope::Channel(to),
+                    before: None,
+                },
+            })
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert_eq!(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .read_model()
+                    .unwrap(),
+                before
+            );
+        }
+        let valid = ModelEdit::ChangeView {
+            scope: Scope::Channel(source),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
+                id: pane.id,
+                destination: Scope::Channel(destination),
+                before: None,
+            },
+        };
+        let moved = edit(valid.clone()).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: moved } = moved else {
+            panic!("transfer must return its committed model")
+        };
+        let replayed = edit(valid).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: replayed } = replayed else {
+            panic!("replay must return its committed model")
+        };
+        assert_eq!(
+            moved, replayed,
+            "successful replay must bypass the now-empty source pane check"
+        );
+    }
+
     /// A shared-model edit reaches every window watching the model and never
     /// its originator, which already has the model the edit returned. A client
     /// that only reads - every CLI invocation - receives nothing at all.
