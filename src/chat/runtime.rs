@@ -5047,9 +5047,13 @@ mod tests {
                     ],
                 };
                 if self.fatal {
-                    step.events.insert(3, Event::Error {
-                        message: "Actual provider failure".into(), fatal: true,
-                    });
+                    step.events.insert(
+                        3,
+                        Event::Error {
+                            message: "Actual provider failure".into(),
+                            fatal: true,
+                        },
+                    );
                 }
                 Ok(step)
             }

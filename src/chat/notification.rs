@@ -427,13 +427,24 @@ mod tests {
     #[test]
     fn immutable_frame_context_preserves_final_excerpt_across_fatal_error_ordering() {
         let final_item = Event::Item(super::super::Item {
-            id: "answer".into(), role: Role::Assistant, at: None, started_at: None,
+            id: "answer".into(),
+            role: Role::Assistant,
+            at: None,
+            started_at: None,
             content: ItemContent::Text {
-                text: "Exact final response".into(), thinking: false, phase: Phase::Final,
+                text: "Exact final response".into(),
+                thinking: false,
+                phase: Phase::Final,
             },
         });
-        let finished = Event::TurnFinished { key: Some("turn".into()), outcome: Kind::Succeeded };
-        let fatal = Event::Error { message: "Actual provider failure".into(), fatal: true };
+        let finished = Event::TurnFinished {
+            key: Some("turn".into()),
+            outcome: Kind::Succeeded,
+        };
+        let fatal = Event::Error {
+            message: "Actual provider failure".into(),
+            fatal: true,
+        };
         for events in [
             vec![fatal.clone(), final_item.clone(), finished.clone()],
             vec![finished, fatal, final_item],
