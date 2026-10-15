@@ -769,7 +769,10 @@ impl Cagents {
         }
         let requested: Vec<_> = agent.session.iter().filter(|owner| owner.id() == session).cloned()
             .chain(agent.console.iter().filter(|owner| owner.id == session).cloned().map(HostedSession::Terminal))
-            .filter(HostedSession::has_complete_proof).collect();
+            .collect();
+        // A shared UUID names both typed descriptors. Do not hide an
+        // incomplete counterpart by retaining only its proved sibling.
+        if requested.iter().any(|owner| !owner.has_complete_proof()) { return None; }
         let requested_owner = requested.first()?.clone();
         let display = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
             .resolve_activation(agent, &requested_owner)?;
@@ -1608,19 +1611,17 @@ mod tests {
             assert_ne!(app.workspace.focused(), Some(card.id));
             let focused = app.workspace.focused();
             let saved_cards = app.durable.cards.clone();
-            if !shared_uuid {
-                let current = &mut app.workspace_model.agents[0];
-                if saved_chat {
-                    let console = current.console.as_mut().unwrap();
-                    console.continuity = TerminalContinuity::RelaunchAvailable { recipe: console.launch.clone(), last_exit: None };
-                } else if let Some(HostedSession::Chat(native)) = &mut current.session { native.proof = None; }
-                app.workspace_model.sequence += 1;
-                drop(app.update_notifications(Action::Activated(Target::Session(session))));
-                assert_eq!(app.workspace.focused(), focused,
-                    "the requested counterpart needs its own complete current proof even when the saved surface is proved");
-                assert_eq!(app.durable.cards, saved_cards);
-                app.workspace_model.agents[0] = original.clone();
-            }
+            let current = &mut app.workspace_model.agents[0];
+            if saved_chat {
+                let console = current.console.as_mut().unwrap();
+                console.continuity = TerminalContinuity::RelaunchAvailable { recipe: console.launch.clone(), last_exit: None };
+            } else if let Some(HostedSession::Chat(native)) = &mut current.session { native.proof = None; }
+            app.workspace_model.sequence += 1;
+            drop(app.update_notifications(Action::Activated(Target::Session(session))));
+            assert_eq!(app.workspace.focused(), focused,
+                "the requested counterpart needs its own complete current proof even when the saved surface is proved, including shared UUIDs");
+            assert_eq!(app.durable.cards, saved_cards);
+            app.workspace_model.agents[0] = original.clone();
             app.workspace_model.sequence += 1;
             app.workspace_model.views[1].panes[0].kind = super::super::tests::terminal_card_state().kind;
             drop(app.update_notifications(Action::Activated(Target::Session(session))));
