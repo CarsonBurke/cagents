@@ -8243,6 +8243,78 @@ mod tests {
     }
 
     #[test]
+    fn standalone_new_capability_refusal_survives_active_completion_and_retires_queued_groups() {
+        use cagents::repository::ChangeArea;
+        use sidebar::ChangeGroupCommand as Group;
+        for failed in [false, true] {
+            for queued in [false, true] {
+                let directory = git_fixture();
+                let root = directory.path();
+                std::fs::write(root.join("new.txt"), "preserved work\n").unwrap();
+                let mut app = editor();
+                let id = open_real_git(&mut app, root, None);
+                let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+                let read = app.update(Message::Sidebar(SidebarAction::ChangeGroup { key: key.clone(), area: ChangeArea::Untracked, command: Group::Stage }));
+                let completed = task_messages(read).into_iter().find(|message| matches!(message, Message::ChangeGroupResolved { result: Ok(_), .. })).unwrap();
+                if queued {
+                    drop(app.update(Message::Sidebar(SidebarAction::ChangeGroup { key: key.clone(), area: ChangeArea::Untracked, command: Group::Stage })));
+                    assert_eq!(app.git_groups.get(root).unwrap().pending_len(), 1);
+                }
+                let reason: Arc<str> = Arc::from("Git writes disabled after this read started.");
+                {
+                    let tab = app.tab_mut(id).unwrap();
+                    tab.sidebar.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+                    tab.runtime.set_git_mutation_unavailable_reason(Some(reason.clone()));
+                }
+                let completed = if failed {
+                    let Message::ChangeGroupResolved { request, .. } = completed else { unreachable!() };
+                    Message::ChangeGroupResolved { request, result: Err("fixture status failure".into()) }
+                } else { completed };
+                let followup = app.update(completed);
+                run_tasks(&mut app, followup);
+                assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+                assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "preserved work\n");
+                assert!(app.git_groups.is_empty(), "not-yet-started groups retire on the new refusal");
+                let source = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap();
+                assert_eq!(source.mutation_unavailable_reason(), Some(reason.as_ref()));
+                assert!(!source.busy());
+                assert!(app.tab(id).unwrap().mutation.is_none());
+                sidebar_action(&mut app, SidebarAction::Stage { key, selection: vec![PathSelection::new(RepoPath::parse("new.txt").unwrap())] });
+                assert_eq!(app.notice.as_deref(), Some(reason.as_ref()));
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_read_only_git_keeps_buffer_hunk_revert_and_one_native_undo() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "working text\n").unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, None);
+        open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+        {
+            let tab = app.tab_mut(id).unwrap();
+            tab.worktree_authority = None;
+            let reason: Arc<str> = Arc::from("Git writes unavailable; native buffer edits remain enabled.");
+            tab.runtime.set_git_mutation_unavailable_reason(Some(reason.clone()));
+            tab.sidebar.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason));
+        }
+        assert!(app.tab(id).unwrap().runtime.diff_hunk_mutation_action(id, Kind::Stage).is_none());
+        apply_real_hunk(&mut app, id, Kind::Revert);
+        assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "working text\n");
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        let undo = app.update(Message::Repository(RepositoryAction::Undo { card: id }));
+        run_tasks(&mut app, undo);
+        assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "working text\n");
+        assert!(!app.tab(id).unwrap().runtime.can_step_editor_history(false));
+        assert!(app.git_groups.is_empty());
+    }
+
+    #[test]
     fn standalone_cancel_preparation_releases_reservation_and_late_completion_cannot_mutate() {
         let directory = git_fixture();
         let root = directory.path();
