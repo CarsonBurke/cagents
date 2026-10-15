@@ -384,7 +384,13 @@ fn attached_mut(
     }
     Ok(record)
 }
+pub(super) fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+    changed_from(host, id, Some(instance), update);
+}
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    changed_from(host, id, None, update);
+}
+fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uuid>, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -416,6 +422,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if instance.is_some_and(|instance| !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance)) {
+        return;
+    }
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
@@ -2048,12 +2057,12 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     requested: &chat::Session,
 ) -> Result<ServerResponse, ProtocolError> {
     let handle = reserved_automation_actor(host, client, agent, false)?;
-    let mut issued = {
+    let (mut issued, instance) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state.chats.get(&requested.id)
             .filter(|record| record.handle.same_actor(&handle))
             .ok_or_else(|| unavailable("The pending archive actor changed before attachment"))?;
-        record.session.clone()
+        (record.session.clone(), record.execution_instance)
     };
     issued.launch.session_id = handle.confirmed_session_id();
     issued.native_continuity = handle.native_continuity();
@@ -2067,7 +2076,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(requested.proof.as_ref(), state.proof())?;
     let record = state.chats.get_mut(&requested.id)
-        .filter(|record| record.handle.same_actor(&handle) && !record.handle.is_completed())
+        .filter(|record| record.execution_instance == instance && record.handle.same_actor(&handle) && !record.handle.is_completed())
         .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
@@ -2076,7 +2085,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     if let Some(generation) = advanced {
         // The client retains ChatObserved edges received before ChatAttached.
         // Use the ordinary coalescer, including its successful-delivery receipt.
-        changed(&Arc::downgrade(host), requested.id, Update::Observed { generation });
+        changed_owned(&Arc::downgrade(host), requested.id, instance, Update::Observed { generation });
     }
     Ok(ServerResponse::ChatAttached { session: issued, snapshot })
 }
@@ -3200,6 +3209,7 @@ mod tests {
         };
         let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
         let chat_id = TerminalId::new();
+        let instance = uuid::Uuid::new_v4();
         let recipe = LaunchRecipe {
             program: "/bin/cat".into(),
             arguments: Vec::new(),
@@ -3231,7 +3241,7 @@ mod tests {
             let mut state = host.lock().unwrap();
             let queue = state.register_client(17);
             let mut record = Record {
-                execution_instance: uuid::Uuid::nil(),
+                execution_instance: instance,
                 console_recipe: None,
                 paired_terminal: None,
                 session: Session {
@@ -3255,8 +3265,10 @@ mod tests {
             (queue,advanced)
         };
         assert!(advanced.is_some_and(|current| current >= generation));
+        changed_owned(&Arc::downgrade(&host),chat_id,uuid::Uuid::new_v4(),Update::Observed { generation: advanced.unwrap() });
+        assert!(!host.lock().unwrap().chats[&chat_id].observations[&17].notified, "an older actor instance must not notify the replacement reader");
         for _ in 0..2 {
-            changed(&Arc::downgrade(&host),chat_id,Update::Observed { generation: advanced.unwrap() });
+            changed_owned(&Arc::downgrade(&host),chat_id,instance,Update::Observed { generation: advanced.unwrap() });
         }
         queue.close_after_drain();
         let mut observations = Vec::new();
