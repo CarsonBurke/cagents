@@ -641,7 +641,10 @@ mod tests {
             assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
             assert!(status >= 0 && status & libc::O_NONBLOCK != 0);
         }
-        assert!(!pipe.deferred().unwrap(), "an empty live pipe must not block");
+        assert!(
+            !pipe.deferred().unwrap(),
+            "an empty live pipe must not block"
+        );
         pipe.writer.write_all(DEFERRED_RECEIPT).unwrap();
         assert!(pipe.deferred().unwrap());
         assert!(!pipe.deferred().unwrap());
@@ -650,7 +653,9 @@ mod tests {
     #[test]
     fn result_pipe_refuses_unrecognized_routing_receipts() {
         let mut pipe = ResultPipe::new().unwrap();
-        pipe.writer.write_all(b"{\"version\":2,\"preserve_previous_ui\":true}\n").unwrap();
+        pipe.writer
+            .write_all(b"{\"version\":2,\"preserve_previous_ui\":true}\n")
+            .unwrap();
         assert!(pipe.deferred().is_err());
     }
 

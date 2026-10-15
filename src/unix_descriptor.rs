@@ -8,7 +8,10 @@
 use std::{
     fs::File,
     io,
-    os::{fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd}, unix::net::UnixStream},
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
+        unix::net::UnixStream,
+    },
 };
 
 fn configure(descriptor: BorrowedFd<'_>) -> io::Result<()> {

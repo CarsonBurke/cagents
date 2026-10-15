@@ -464,13 +464,22 @@ pub struct ControlClient {
 
 fn new_control_socket() -> io::Result<UnixStream> {
     #[cfg(target_os = "macos")]
-    { crate::unix_descriptor::nonblocking_socket() }
+    {
+        crate::unix_descriptor::nonblocking_socket()
+    }
     #[cfg(not(target_os = "macos"))]
     {
         // SAFETY: transfer the new atomically configured descriptor to the stream.
-        let fd = unsafe { libc::socket(libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 { return Err(io::Error::last_os_error()); }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(unsafe { UnixStream::from_raw_fd(fd) })
     }
 }
@@ -492,11 +501,16 @@ fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStre
         *target = *byte as _;
     }
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "daemon connection timeout is too large")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon connection timeout is too large",
+        )
     })?;
     let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
     #[cfg(target_os = "macos")]
-    { address.sun_len = address_length as _; }
+    {
+        address.sun_len = address_length as _;
+    }
     let mut delay = Duration::from_millis(1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -545,8 +559,10 @@ fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStre
 fn ensure_connect_deadline(deadline: Instant) -> io::Result<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(io::Error::new(io::ErrorKind::TimedOut,
-            "daemon socket connection deadline elapsed"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon socket connection deadline elapsed",
+        ));
     }
     Ok(remaining)
 }
@@ -557,25 +573,34 @@ fn ensure_connect_deadline(deadline: Instant) -> io::Result<Duration> {
 fn wait_control_connection(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
     loop {
         let remaining = ensure_connect_deadline(deadline)?;
-        let milliseconds = remaining.as_millis()
+        let milliseconds = remaining
+            .as_millis()
             .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
             .min(i32::MAX as u128) as i32;
         let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(), events: libc::POLLOUT, revents: 0,
+            fd: stream.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
         };
         // SAFETY: the stream owns this live descriptor for the entire wait.
         let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
         if ready == -1 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted { continue; }
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(error);
         }
         ensure_connect_deadline(deadline)?;
-        if ready == 0 { continue; }
+        if ready == 0 {
+            continue;
+        }
         if descriptor.revents & libc::POLLNVAL != 0 {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        if let Some(error) = stream.take_error()? { return Err(error); }
+        if let Some(error) = stream.take_error()? {
+            return Err(error);
+        }
         stream.peer_addr()?;
         return Ok(());
     }
@@ -3876,22 +3901,38 @@ mod tests {
         let (stream, _peer) = UnixStream::pair().unwrap();
         stream.set_nonblocking(true).unwrap();
         wait_control_connection(&stream, Instant::now() + Duration::from_secs(1)).unwrap();
-        assert_eq!(wait_control_connection(&stream, Instant::now()).unwrap_err().kind(),
-            io::ErrorKind::TimedOut);
+        assert_eq!(
+            wait_control_connection(&stream, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
         let unconnected = new_control_socket().unwrap();
-        assert_eq!(wait_control_connection(&unconnected, Instant::now() + Duration::from_secs(1))
-            .unwrap_err().kind(), io::ErrorKind::NotConnected,
-            "write readiness and SO_ERROR zero must not certify an unconnected socket");
+        assert_eq!(
+            wait_control_connection(&unconnected, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected,
+            "write readiness and SO_ERROR zero must not certify an unconnected socket"
+        );
     }
 
     #[test]
     fn control_socket_rejects_zero_or_overflowing_connection_deadlines() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
-        assert_eq!(connect_control_socket(&path, Duration::ZERO).unwrap_err().kind(),
-            io::ErrorKind::TimedOut);
-        assert_eq!(connect_control_socket(&path, Duration::MAX).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput);
+        assert_eq!(
+            connect_control_socket(&path, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            connect_control_socket(&path, Duration::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
