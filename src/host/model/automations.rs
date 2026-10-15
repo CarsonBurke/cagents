@@ -4814,7 +4814,7 @@ mod tests {
             },
         };
         let mut old_model = model.clone();
-        old_model.archived_automation_agents = retained_agents;
+        old_model.archived_automation_agents = retained_agents.into_iter().rev().take(1024).collect();
         assert!(crate::terminal_ipc::write_frame(&mut Vec::new(), &envelope(old_model)).is_err(), "the old row-only push exceeds the real frame limit with legal provider metadata");
         let expected = envelope(model.clone());
         let mut framed = Vec::new();
