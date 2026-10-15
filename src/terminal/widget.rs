@@ -6409,12 +6409,10 @@ mod tests {
             epoch: 3,
             dropped: 100,
         };
-        let mut state = WidgetState {
-            history_total: 1000,
-            history_position: captured,
-            selection: Some(Selection::new(at(9, 0), SelectionMode::Character)),
-            ..WidgetState::default()
-        };
+        let mut state = WidgetState::default();
+        state.history_total = 1000;
+        state.history_position = captured;
+        state.selection = Some(Selection::new(at(9, 0), SelectionMode::Character));
         let current = super::super::HistoryPosition {
             epoch: 3,
             dropped: 102,

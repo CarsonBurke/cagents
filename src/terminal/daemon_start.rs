@@ -318,7 +318,6 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
 
         let paths = crate::daemon::RuntimePaths {
-            #[cfg(feature = "host")]
             directory: socket.parent().unwrap().to_owned(),
             socket: socket.to_owned(),
             lock: socket.with_file_name("cagentsd.lock"),
