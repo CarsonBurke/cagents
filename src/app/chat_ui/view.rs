@@ -3070,8 +3070,6 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
-        (self.snapshot.busy,self.snapshot.ready,self.snapshot.exited,self.pending.is_some(),
-            &self.recovery.retried,self.recovery.commands.len(),self.snapshot.branch_points.len()).hash(&mut hasher);
         if turn.running {self.snapshot.detail.starts_with("Retrying").then_some(&self.snapshot.detail).hash(&mut hasher);}
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
@@ -3110,6 +3108,18 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            // Keep only the controls whose visible state changes. Draft text,
+            // attachment work and qualified replay metadata are not item
+            // revisions, but still change their enabled state or presence.
+            if matches!(item.content,ItemContent::Text {thinking:false,..}) {
+                let editable=self.edit_supported(item);
+                editable.hash(&mut hasher);
+                if editable {
+                    (self.can_edit_prompt(item),self.recovery_composer_empty(),self.session.launch.provider)
+                        .hash(&mut hasher);
+                }
+                self.retry_for_assistant(item).hash(&mut hasher);
+            }
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -6335,6 +6345,53 @@ mod tests {
     }
 
     #[test]
+    fn retained_prompt_edit_controls_follow_draft_and_attachment_work() {
+        use iced::advanced::{Layout,layout,widget::Tree};
+        let item=chat::Item {id:"turn/user".into(),role:chat::Role::User,started_at:None,at:None,
+            content:ItemContent::Text {text:"Original prompt".into(),thinking:false,phase:chat::Phase::Final}};
+        let (mut runtime,_handle)=frame_cost::live_runtime(&[item]);
+        let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree=Tree::empty();
+        for stage in 0..=10 {
+            match stage {
+                1=>runtime.replace_draft(text_editor::Content::with_text("Unsent draft")),
+                2=>runtime.replace_draft(text_editor::Content::new()),
+                3=>runtime.attachments=vec![Attachment {path:"draft.png".into()}],
+                4=>runtime.attachments.clear(),
+                5=>runtime.pastes_pending=1,
+                6=>runtime.pastes_pending=0,
+                7=>runtime.image_pastes_saving=1,
+                8=>runtime.image_pastes_saving=0,
+                9=>runtime.attachment_chooser_pending=true,
+                10=>runtime.attachment_chooser_pending=false,
+                _=>{},
+            }
+            let mut element=runtime.find_turn_view_for_test();
+            tree.diff(element.as_widget_mut());
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,
+                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
+            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
+            let edit=accessible.root().iter().chain(accessible.children()).find(|node|
+                node.node().label().is_some_and(|label|label.starts_with("Edit and resend")
+                    || label.starts_with("Send or clear your draft"))).expect("mounted edit control");
+            assert_eq!(edit.node().is_disabled(),stage%2==1,"retained control at stage {stage}");
+        }
+        // Equal branch counts are not equal capabilities for this exact item.
+        runtime.session.launch.provider=Provider::Codex;
+        let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.capabilities.branch=true;
+        snapshot.branch_points=vec![chat::BranchPoint {id:"turn".into(),label:"Original prompt".into()}];
+        for (point,expected) in [("turn",true),("other",false),("turn",true)] {
+            Arc::make_mut(&mut runtime.snapshot).branch_points[0].id=point.into();
+            let mut element=runtime.find_turn_view_for_test();tree.diff(element.as_widget_mut());
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,
+                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
+            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
+            assert_eq!(accessible.root().iter().chain(accessible.children()).any(|node|
+                node.node().label()==Some("Edit and resend in a new branch")),expected);
+        }
+    }
+
+    #[test]
     fn busy_changes_invalidate_only_turns_containing_reasoning() {
         let mut items = frame_cost::transcript(2);
         items.retain(|item| !matches!(item.content, ItemContent::Text { thinking: true, .. }));
@@ -6355,6 +6412,9 @@ mod tests {
             });
         }
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        // This contract isolates reasoning. A provider with no branch point
+        // has no Edit control whose availability also depends on busy state.
+        runtime.session.launch.provider=Provider::Codex;
         let reasoning = runtime
             .turns
             .iter()
@@ -6396,6 +6456,7 @@ mod tests {
         // Even reasoning already followed by an answer keeps its busy
         // dependency; this change does not localize cross-item completion.
         let (mut history, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        history.session.launch.provider=Provider::Codex;
         let idle = fingerprints(&history, true);
         Arc::make_mut(&mut history.snapshot).busy = true;
         for (turn, (idle, busy)) in history
