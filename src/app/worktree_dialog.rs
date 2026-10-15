@@ -174,6 +174,41 @@ fn sentence(message: &str) -> String {
         .unwrap_or_default()
 }
 
+/// One original physical source, shared by resolution, creation and retry.
+/// Constructing this handle does no filesystem work on the UI thread. The
+/// blocking workers validate the original authority and reuse the same scoped
+/// service; a later pathname lookup never supplies replacement authority.
+#[derive(Clone)]
+pub(super) struct WorktreeCreationSource {
+    authority: crate::repository::WorktreeAuthority,
+    service: Arc<std::sync::Mutex<Option<Arc<ScopedCreationService>>>>,
+}
+
+type ScopedCreationService = RepositoryService<crate::repository::WorktreeExecutor<crate::repository::SystemProcessExecutor>>;
+
+impl std::fmt::Debug for WorktreeCreationSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("WorktreeCreationSource").field("authority", &self.authority).finish_non_exhaustive()
+    }
+}
+
+impl WorktreeCreationSource {
+    fn new(authority: crate::repository::WorktreeAuthority) -> Self {
+        Self { authority, service: Arc::new(std::sync::Mutex::new(None)) }
+    }
+
+    pub(super) fn repository(&self) -> &Path { self.authority.path() }
+
+    pub(super) fn service(&self) -> Result<Arc<ScopedCreationService>, RepositoryError> {
+        self.authority.validate()?;
+        let mut cached = self.service.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(service) = &*cached { return Ok(service.clone()); }
+        let service = Arc::new(RepositoryService::system("git").with_worktree_authority(self.authority.clone())?);
+        *cached = Some(service.clone());
+        Ok(service)
+    }
+}
+
 /// A resolution in flight: the dialog is read-only until it answers, and
 /// cancelling the dialog stops it.
 #[derive(Debug, Clone)]
@@ -189,6 +224,7 @@ pub struct WorktreeDialog {
     request: OperationId,
     project_id: ProjectId,
     repository: PathBuf,
+    source: Option<WorktreeCreationSource>,
     draft: WorktreeDraft,
     advanced: bool,
     resolving: Option<Resolution>,
@@ -208,6 +244,7 @@ impl WorktreeDialog {
             request: OperationId::new(),
             project_id,
             repository,
+            source: None,
             advanced: draft.uses_options(),
             draft,
             resolving: None,
@@ -297,12 +334,38 @@ impl Cagents {
         draft: WorktreeDraft,
         error: Option<WorktreeInputError>,
     ) -> Task<Message> {
+        self.open_worktree_dialog_with_source(project_id, repository, draft, error, None, None)
+    }
+
+    /// Opens History creation against the authority the displayed source already
+    /// owns. The caller must never recapture a pathname to create this authority.
+    pub(super) fn open_worktree_dialog_bound(
+        &mut self,
+        project_id: ProjectId,
+        authority: crate::repository::WorktreeAuthority,
+        draft: WorktreeDraft,
+        replaces: Option<OperationId>,
+    ) -> Task<Message> {
+        let source = WorktreeCreationSource::new(authority);
+        self.open_worktree_dialog_with_source(project_id, source.repository().to_owned(), draft, None, Some(source), replaces)
+    }
+
+    fn open_worktree_dialog_with_source(
+        &mut self,
+        project_id: ProjectId,
+        repository: PathBuf,
+        draft: WorktreeDraft,
+        error: Option<WorktreeInputError>,
+        source: Option<WorktreeCreationSource>,
+        replaces: Option<OperationId>,
+    ) -> Task<Message> {
         if let Some(replaced) = self.worktree_dialog.take() {
             replaced.cancel();
         }
-        let dialog = self
-            .worktree_dialog
-            .insert(WorktreeDialog::new(project_id, repository, draft));
+        let mut opened = WorktreeDialog::new(project_id, repository, draft);
+        opened.source = source;
+        opened.replaces = replaces;
+        let dialog = self.worktree_dialog.insert(opened);
         match error {
             Some(error) => dialog.show_error(error),
             None => WorktreeField::Branch.focus(),
@@ -337,6 +400,7 @@ impl Cagents {
             token: token.clone(),
         });
         let project_id = dialog.project_id;
+        let source = dialog.source.clone();
         let draft = dialog.draft.clone();
         let input = WorktreeInput {
             repository: dialog.repository.clone(),
@@ -348,9 +412,15 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &token)
-                    .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
+                match source {
+                    Some(source) => source.service()
+                        .map_err(|error| WorktreeInputError::general(error.to_string()))?
+                        .resolve_worktree_request(&input, &token)
+                        .map_err(|error| WorktreeInputError::from_resolution(&error, &draft)),
+                    None => RepositoryService::system("git")
+                        .resolve_worktree_request(&input, &token)
+                        .map_err(|error| WorktreeInputError::from_resolution(&error, &draft)),
+                }
             })
             .await
             .map_err(|error| WorktreeInputError::general(error.to_string()))
@@ -384,13 +454,17 @@ impl Cagents {
         dialog.resolving = None;
         match result {
             Ok(request) => {
+                if dialog.source.as_ref().is_some_and(|source| source.repository() != request.repository) {
+                    return dialog.show_error(WorktreeInputError::general("The resolved source differs from the original displayed worktree. No creation was started."));
+                }
+                let source = dialog.source.clone();
                 let draft = dialog.draft.clone();
                 let replaces = dialog.replaces;
                 self.worktree_dialog = None;
                 if let Some(replaced) = replaces {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
-                let start = self.start_worktree_operation(project_id, request, Some(draft));
+                let start = self.start_worktree_operation_with_source(project_id, request, Some(draft), source);
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
                     None => self.focus_context_overlay_if_exposed(),
@@ -412,7 +486,7 @@ impl Cagents {
         if self.worktree_dialog.is_some() {
             return Task::none();
         }
-        let Some((project_id, repository, draft, failure)) =
+        let Some((project_id, repository, draft, failure, source)) =
             self.worktree_operations.get(&id).and_then(|operation| {
                 operation.reopenable_draft().map(|draft| {
                     (
@@ -420,6 +494,7 @@ impl Cagents {
                         operation.repository().map(Path::to_path_buf),
                         draft.clone(),
                         operation.failure().map(WorktreeInputError::recorded),
+                        operation.source(),
                     )
                 })
             })
@@ -436,7 +511,7 @@ impl Cagents {
             return Task::none();
         };
         let error = failure.filter(|_| !submit);
-        let focus = self.open_worktree_dialog(project_id, repository, draft, error);
+        let focus = self.open_worktree_dialog_with_source(project_id, repository, draft, error, source, Some(id));
         if let Some(dialog) = &mut self.worktree_dialog {
             dialog.replaces = Some(id);
         }
@@ -1148,4 +1223,152 @@ mod tests {
         dialog.edit(WorktreeField::Branch, "feature/one".into());
         assert_eq!(dialog.branch_preview(), None);
     }
+
+    #[cfg(target_os = "linux")]
+    fn real_history_source() -> (Fixture, tempfile::TempDir, PathBuf, crate::repository::Oid) {
+        let mut fixture = fixture();
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().join("repository");
+        std::fs::create_dir(&root).unwrap();
+        isolated_git(&root, &["init", "--template=", "-b", "main"]);
+        isolated_git(&root, &["config", "user.name", "Fixture"]);
+        isolated_git(&root, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(root.join("tracked"), b"original source\n").unwrap();
+        isolated_git(&root, &["add", "tracked"]);
+        isolated_git(&root, &["commit", "-m", "Original"]);
+        let oid = crate::repository::Oid::parse_object(isolated_git(&root, &["rev-parse", "HEAD"])).unwrap();
+        fixture.app.settings.managed_worktree_directory = ".worktrees".into();
+        fixture.app.sidebar_model.projects[0].repository = root.clone();
+        let authority = crate::repository::WorktreeAuthority::capture(&root).unwrap();
+        drop(fixture.app.open_worktree_dialog_bound(fixture.project, authority,
+            WorktreeDraft { branch: "history-topic".into(), base: oid.as_str().into(), destination: String::new() }, None));
+        (fixture, files, root, oid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolated_git(root: &Path, arguments: &[&str]) -> String {
+        let command = crate::repository::CommandSpec::new("git").cwd(root)
+            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+            .args(arguments.iter().copied());
+        let output = crate::git_watch::tests::run_fixture_command(
+            crate::git_watch::tests::isolated_fixture_command(command));
+        String::from_utf8(output.stdout).unwrap().trim_end_matches('\n').to_owned()
+    }
+
+    /// Drive only the creation pipeline's actual returned tasks. Repository
+    /// refreshes after settlement are outside this fixture and are not run.
+    #[cfg(target_os = "linux")]
+    async fn finish_creation_tasks(app: &mut Cagents, task: Task<Message>) -> Vec<crate::repository::WorktreeOperationReport> {
+        use cosmic::iced::futures::StreamExt;
+        let mut pending = vec![task];
+        let mut reports = Vec::new();
+        while let Some(task) = pending.pop() {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    match action {
+                        iced::runtime::Action::Output(cosmic::Action::App(Message::WorktreeInputResolved { project_id, operation_id, result })) => {
+                            pending.push(app.finish_worktree_input(project_id, operation_id, result));
+                        }
+                        iced::runtime::Action::Output(cosmic::Action::App(Message::WorktreeOperationFinished { operation, generation, result })) => {
+                            if let Ok(report) = &result { reports.push(report.clone()); }
+                            drop(app.finish_worktree_operation(operation, generation, result));
+                        }
+                        _ => {},
+                    }
+                }
+            }
+        }
+        reports
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn resolve_history_input(task: Task<Message>) -> (ProjectId, OperationId, CreateWorktreeRequest) {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("resolution worker exists");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(Message::WorktreeInputResolved { project_id, operation_id, result })) = action {
+                return (project_id, operation_id, result.expect("original source resolves"));
+            }
+        }
+        panic!("resolution worker must deliver its request");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_history_source(root: &Path) -> PathBuf {
+        let parked = root.with_extension("original");
+        std::fs::rename(root, &parked).unwrap();
+        std::fs::create_dir(root).unwrap();
+        isolated_git(root, &["init", "--template=", "-b", "replacement"]);
+        std::fs::write(root.join("replacement-only"), b"preserve replacement\n").unwrap();
+        parked
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn history_creation_current_source_reuses_one_scoped_service_through_journal() {
+        if !crate::git_watch::tests::fixture_isolated("app::worktree_dialog::tests::history_creation_current_source_reuses_one_scoped_service_through_journal") { return; }
+        let (mut fixture, _files, root, oid) = real_history_source();
+        let source = dialog(&fixture.app).source.clone().unwrap();
+        assert!(source.service.lock().unwrap().is_none(), "opening the dialog does not initialize a filesystem service on the UI thread");
+        let task = fixture.app.submit_worktree_dialog();
+        let reports = finish_creation_tasks(&mut fixture.app, task).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, WorktreeOperationState::Created, "{:?}", reports[0]);
+        let request = reports[0].request.as_ref().unwrap();
+        assert_eq!(request.repository, root);
+        assert_eq!(isolated_git(&request.destination, &["rev-parse", "HEAD"]), oid.as_str());
+        assert_eq!(isolated_git(&root, &["rev-parse", "HEAD"]), oid.as_str());
+        assert_eq!(std::fs::read(root.join("tracked")).unwrap(), b"original source\n");
+        let retained = fixture.app.worktree_operations[&reports[0].operation_id].source().unwrap();
+        assert!(Arc::ptr_eq(&source.service, &retained.service));
+        assert!(Arc::ptr_eq(&source.service().unwrap(), &retained.service().unwrap()), "resolution and creation share exactly one scoped service");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn history_creation_refuses_a_replaced_displayed_source_before_submit() {
+        if !crate::git_watch::tests::fixture_isolated("app::worktree_dialog::tests::history_creation_refuses_a_replaced_displayed_source_before_submit") { return; }
+        let (mut fixture, _files, root, _) = real_history_source();
+        let parked = replace_history_source(&root);
+        let task = fixture.app.submit_worktree_dialog();
+        let reports = finish_creation_tasks(&mut fixture.app, task).await;
+        assert!(reports.is_empty());
+        assert!(dialog(&fixture.app).error.as_ref().unwrap().message.contains("replaced"));
+        assert!(fixture.app.worktree_operations.is_empty());
+        assert_eq!(std::fs::read(root.join("replacement-only")).unwrap(), b"preserve replacement\n");
+        assert!(!root.join(".worktrees").exists());
+        assert!(!parked.join(".worktrees").exists());
+        assert!(isolated_git(&root, &["for-each-ref", "--format=%(refname)"]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn history_creation_refuses_replacement_after_resolution_and_retry_keeps_original_authority() {
+        if !crate::git_watch::tests::fixture_isolated("app::worktree_dialog::tests::history_creation_refuses_replacement_after_resolution_and_retry_keeps_original_authority") { return; }
+        let (mut fixture, _files, root, _) = real_history_source();
+        let source = dialog(&fixture.app).source.clone().unwrap();
+        let task = fixture.app.submit_worktree_dialog();
+        let (project, operation, request) = resolve_history_input(task).await;
+        assert!(source.service.lock().unwrap().is_some(), "resolution initialized the original scoped service");
+        let parked = replace_history_source(&root);
+        let task = fixture.app.finish_worktree_input(project, operation, Ok(request));
+        let reports = finish_creation_tasks(&mut fixture.app, task).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, WorktreeOperationState::NotCreated);
+        assert!(reports[0].detail.contains("replaced"));
+        let retained = fixture.app.worktree_operations[&operation].source().unwrap();
+        assert!(Arc::ptr_eq(&source.service, &retained.service));
+        drop(fixture.app.reopen_worktree_operation(operation, false));
+        assert!(Arc::ptr_eq(&source.service, &dialog(&fixture.app).source.as_ref().unwrap().service));
+        let task = fixture.app.submit_worktree_dialog();
+        assert!(finish_creation_tasks(&mut fixture.app, task).await.is_empty());
+        assert!(dialog(&fixture.app).error.as_ref().unwrap().message.contains("replaced"));
+        assert_eq!(fixture.app.worktree_operations.len(), 1, "retry cannot mint replacement authority");
+        assert_eq!(std::fs::read(root.join("replacement-only")).unwrap(), b"preserve replacement\n");
+        assert!(!root.join(".worktrees").exists());
+        assert!(!parked.join(".worktrees").exists());
+        assert!(isolated_git(&root, &["for-each-ref", "--format=%(refname)"]).is_empty());
+        assert_eq!(isolated_git(&parked, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main");
+    }
+
 }

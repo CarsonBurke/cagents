@@ -1,4 +1,5 @@
 use super::*;
+use super::worktree_dialog::WorktreeCreationSource;
 use crate::{
     model::OperationId,
     repository::{
@@ -12,6 +13,7 @@ pub(super) struct ActiveWorktreeOperation {
     project: ProjectId,
     generation: u64,
     request: Option<CreateWorktreeRequest>,
+    source: Option<WorktreeCreationSource>,
     token: Option<CancellationToken>,
     receiver: Option<async_channel::Receiver<WorktreeProgressEvent>>,
     stage: Option<WorktreeProgressStage>,
@@ -32,6 +34,8 @@ pub(super) struct ActiveWorktreeOperation {
 }
 
 impl ActiveWorktreeOperation {
+    pub(super) fn source(&self) -> Option<WorktreeCreationSource> { self.source.clone() }
+
     pub(super) fn project(&self) -> ProjectId {
         self.project
     }
@@ -170,6 +174,16 @@ impl Cagents {
         request: CreateWorktreeRequest,
         draft: Option<WorktreeDraft>,
     ) -> Task<Message> {
+        self.start_worktree_operation_with_source(project, request, draft, None)
+    }
+
+    pub(super) fn start_worktree_operation_with_source(
+        &mut self,
+        project: ProjectId,
+        request: CreateWorktreeRequest,
+        draft: Option<WorktreeDraft>,
+        source: Option<WorktreeCreationSource>,
+    ) -> Task<Message> {
         let Some(session) = self.session.as_ref() else {
             self.status = Some(TransientNotice::error(
                 "Worktree creation requires an available durable journal. No Git mutation was started.",
@@ -188,6 +202,7 @@ impl Cagents {
                 generation,
                 label: worktree_operation_label(Some(&request)),
                 request: Some(request.clone()),
+                source: source.clone(),
                 token: Some(token.clone()),
                 receiver: Some(receiver),
                 stage: None,
@@ -205,8 +220,28 @@ impl Cagents {
         self.sync_worktree_operation_rows();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .create_worktree_journaled(&store, &request, generation, &token, &sender)
+                let refused = |detail: String| WorktreeOperationReport {
+                    operation_id: request.operation_id,
+                    generation,
+                    request: Some(request.clone()),
+                    state: WorktreeOperationState::NotCreated,
+                    outcome: None,
+                    detail: format!("The original creation source is unavailable; no creation was started: {detail}"),
+                    created_at_unix_ms: unix_millis(),
+                };
+                match source {
+                    Some(source) => {
+                        if source.repository() != request.repository {
+                            return refused("the request names another repository".to_owned());
+                        }
+                        match source.service() {
+                            Ok(service) => service.create_worktree_journaled(&store, &request, generation, &token, &sender),
+                            Err(error) => refused(error.to_string()),
+                        }
+                    }
+                    None => RepositoryService::system("git")
+                        .create_worktree_journaled(&store, &request, generation, &token, &sender),
+                }
             })
             .await
             .map_err(|error| {
@@ -391,6 +426,7 @@ impl Cagents {
                             generation: report.generation,
                             label: worktree_operation_label(report.request.as_ref()),
                             request: report.request,
+                            source: None,
                             token: None,
                             receiver: None,
                             stage: None,
@@ -493,6 +529,7 @@ mod tests {
                     created_worktree: None,
                     generation: 2,
                     request: None,
+                    source: None,
                     token: Some(token.clone()),
                     receiver: None,
                     stage,
@@ -562,6 +599,7 @@ mod tests {
             created_worktree: Some((PathBuf::from(path), 1)),
             generation: 1,
             request: None,
+            source: None,
             token: None,
             receiver: None,
             stage: Some(WorktreeProgressStage::Finished),
