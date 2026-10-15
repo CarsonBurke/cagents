@@ -295,7 +295,7 @@ fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeAc
     if !valid || serde_json::to_vec(&raw).map_or(true,|data|data.len()>16*1024*1024){return Err(LspError::Unsupported("code-action title, disabled reason, command, or payload exceeds its bounded metadata budget".into()));}
     let (title,kind,is_preferred,disabled,edit,cmd,needs_resolve)=match &raw {
         lsp_types::CodeActionOrCommand::Command(c)=>(c.title.clone(),None,false,None,None,Some(command(c.clone())),false),
-        lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),c.edit.is_none()&&c.command.is_none()&&c.data.is_some()),
+        lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),(c.edit.is_none()||c.command.is_none())&&c.data.is_some()),
     };
     Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version})
 }
@@ -431,6 +431,15 @@ mod tests {
         let diagnostic=lsp_types::Diagnostic {message:"short".into(),data:Some(json!({"opaque":"x".repeat(1024*1024)})),..Default::default()};
         let args=RequestArgs::CodeActions {range:Default::default(),diagnostics:vec![diagnostic]};
         assert!(args.queued_bytes()>=1024*1024,"opaque diagnostic data is retained by each queued request");
+    }
+
+    #[test]
+    fn code_actions_can_resolve_an_edit_even_when_a_command_is_already_present() {
+        let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,1,Arc::from("foo")).unwrap();
+        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::CodeActions,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:HashMap::from([(Url::parse("file:///repo/a.rs").unwrap(),1)])};
+        let raw:lsp_types::CodeActionOrCommand=serde_json::from_value(json!({"title":"Fix and run","command":{"title":"Run","command":"server.run"},"data":{"resolve_edit":true}})).unwrap();
+        let item=convert_action(&store,&request,raw).unwrap();assert!(item.needs_resolve);assert!(item.command.is_some());assert!(item.edit.is_none());
     }
 
     #[test]
