@@ -221,6 +221,24 @@ editable code buffer. Other text fields and terminal programs retain their own
 editing keys. Rebinding or clearing an editor action also replaces its original
 code-buffer chord; menu hints follow the current binding.
 
+`next_diagnostic` (`F8`) and `previous_diagnostic` (`Shift+F8`) navigate the
+editable buffer's diagnostics. They are available when the buffer has
+diagnostics, and their bindings can be changed or cleared in Keyboard settings.
+
+Diff selections use `diff_copy` (`Ctrl+C`) and `diff_select_all` (`Ctrl+A`).
+`diff_copy_old`, `diff_copy_new`, `diff_copy_patch`,
+`diff_copy_line_reference` and `diff_open_in_editor` start unbound. These
+commands act in a focused diff; typing in its Find field retains normal text
+editing. A row menu retains its original source and row even if focus moves.
+
+Sidebar commands such as `copy_branch`, `new_worktree_from_branch`,
+`rename_channel`, `mark_channel_read`, `mark_worktree_read`, `delete_channel`,
+`delete_worktree`, `remove_project` and `delete_selected_rows` start unbound.
+Open the palette while the target sidebar row or file has focus to invoke a
+command for that target. A stale selection does not retarget the command to a
+pane. The `open_in_external_editor` command uses the first configured editor;
+a menu entry for another configured editor keeps that editor as its target.
+
 
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.

@@ -91,6 +91,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Close focused pane | `Ctrl+Shift+W` |
 | Find in editor/chat / otherwise search projects | `Ctrl+F` |
 | Search projects / find in terminal | `Ctrl+Shift+F` |
+| Search file contents in the active project | `Ctrl+Alt+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
@@ -637,7 +638,8 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   expand captures such as `$1`; plain replacements can **Preserve case** for
   upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
-  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  the affected text. **F8** and **Shift+F8** move to the next and previous
+  diagnostic; these bindings can be changed or cleared in Keyboard settings. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
