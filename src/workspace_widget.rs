@@ -695,6 +695,7 @@ pub struct ShortcutDescriptor {
 /// deterministic and can be tested without launching native panes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CommandContext {
+    pub remote_device: bool,
     /// Some mask records an originating sidebar target, including a stale target with no actions.
     pub sidebar_commands: Option<u64>,
     pub git_commands: u32,
@@ -822,7 +823,22 @@ impl ShortcutDescriptor {
         default_shortcut_keys(self.action).to_vec()
     }
 
+    /// These actions consume desktop repository services or local-only forms.
+    /// Remote row navigation remains supported through its captured mask; it
+    /// must not silently substitute Device files for a different user action.
+    pub fn available_on_device(self, remote: bool) -> bool {
+        if !remote { return true; }
+        if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository | ShortcutScope::Review) { return false; }
+        !matches!(self.action,
+            GlobalShortcut::ResumeConversation | GlobalShortcut::NewWorktree
+            | GlobalShortcut::NewChannel | GlobalShortcut::CloneRepository
+            | GlobalShortcut::ChatAttach | GlobalShortcut::SearchInProject
+            | GlobalShortcut::MarkAllRead | GlobalShortcut::OpenInExternalEditor
+            | GlobalShortcut::ReviewConversationChanges | GlobalShortcut::RestartDaemon)
+    }
+
     pub fn available(self, context: &CommandContext) -> bool {
+        if !self.available_on_device(context.remote_device) { return false; }
         if context.save_in_flight && self.action.blocked_during_save() {
             return false;
         }

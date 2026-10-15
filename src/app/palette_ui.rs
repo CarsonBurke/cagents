@@ -1827,12 +1827,17 @@ impl Cagents {
     /// Availability is shared by palette listing and execution. A stale menu
     /// or shortcut cannot turn an unavailable command into a silent no-op.
     fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
+        self.command_context_for_device(card, crate::device::is_remote())
+    }
+
+    fn command_context_for_device(&self, card: Option<CardId>, remote_device: bool) -> workspace_widget::CommandContext {
         let pane_index =
             card.and_then(|id| self.workspace.order().position(|candidate| candidate == id));
         let state = card.and_then(|id| self.card_state(id));
         let save_in_flight = self.focused_repository_is_saving()
             || card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()));
         workspace_widget::CommandContext {
+            remote_device,
             save_in_flight,
             sidebar_commands: self.sidebar_command_target().as_ref().map(|target| self.sidebar_command_mask(target)),
             git_commands: self.git_command_mask(),
@@ -1905,7 +1910,7 @@ impl Cagents {
                 }
                 _ => false,
             }),
-            daemon_can_restart: !crate::device::is_remote(),
+            daemon_can_restart: !remote_device,
             can_search_project: self.sidebar_state.active_worktree().is_some(),
             has_attention: !self.sidebar_state.attention_cards().is_empty(),
             can_cycle_workspace: sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state).len() > 1,
@@ -3620,6 +3625,34 @@ mod tests {
         assert!(app.command_available(Command::MarkAllRead));
         drop(app.update(Message::RunCommand(Command::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn remote_device_context_hides_local_services_but_keeps_supported_navigation() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let runtime = RepositoryRuntime::dirty_fixture(card);
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let local = app.command_context_for_device(Some(card), false);
+        let remote = app.command_context_for_device(Some(card), true);
+        for command in [Command::ResumeConversation, Command::NewWorktree, Command::CloneRepository, Command::EditorSave, Command::EditorDiscardEdits, Command::SearchInProject] {
+            let descriptor = workspace_widget::shortcut_descriptor(command);
+            assert!(descriptor.available(&local), "local {command:?}");
+            assert!(!descriptor.available(&remote), "remote {command:?}");
+        }
+        for command in [Command::OpenFolder, Command::OpenSettings, Command::FocusProjectSearch, Command::CopyPath] {
+            let descriptor = workspace_widget::shortcut_descriptor(command);
+            assert!(descriptor.available(&remote), "supported remote {command:?}");
+        }
+        let attach = workspace_widget::shortcut_descriptor(Command::ChatAttach);
+        let mut chat = workspace_widget::CommandContext { focused: workspace_widget::FocusedPane::Chat, chat_user_commands: u16::MAX, ..Default::default() };
+        assert!(attach.available(&chat));
+        chat.remote_device = true;
+        assert!(!attach.available(&chat));
+        assert!(workspace_widget::shortcut_descriptor(Command::ChatSend).available(&chat));
     }
 
     #[test]

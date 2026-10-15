@@ -182,6 +182,7 @@ impl Cagents {
         card: CardId,
         command: RegisteredAction,
     ) -> Option<RegisteredChatCommand> {
+        if !workspace_widget::shortcut_descriptor(command).available_on_device(crate::device::is_remote()) { return None; }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
         };
