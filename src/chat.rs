@@ -947,6 +947,9 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Original prose mutation boundary, independent of status/presentation updates.
+    #[serde(default)]
+    pub source_revision: u64,
 }
 
 /// When a provider takes a message it is holding.

@@ -84,6 +84,7 @@ pub(crate) struct Store {
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
     pending_child_source: Option<(String, String, String)>,
+    pub(super) source_revision: u64,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
@@ -188,6 +189,7 @@ impl Store {
                 presented_children: Default::default(),
                 pending_text: None,
                 pending_child_source: None,
+                source_revision: 0,
             })
         })();
         if result.is_err() {
@@ -217,6 +219,7 @@ impl Store {
         older: bool,
         assigned: Option<i64>,
     ) -> Result<Option<String>, String> {
+        let is_text = matches!(&item.content, ItemContent::Text { .. });
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -388,6 +391,7 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if is_text || previous.as_ref().is_some_and(|(_,metadata,_)|postcard::from_bytes::<Item>(metadata).is_ok_and(|old|matches!(old.content,ItemContent::Text{..}))) {self.source_changed()?;}
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -780,6 +784,7 @@ impl Store {
                 thinking,
                 delta,
             } => {
+                if !delta.is_empty() {self.source_changed()?;}
                 if self.pending_text.as_ref().is_some_and(|pending| {
                     pending.0 != id
                         || pending.1 != role
@@ -802,6 +807,7 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
+                if self.removes_text_sources(&ids)? {self.source_changed()?;}
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
@@ -815,6 +821,7 @@ impl Store {
             }
             Event::Reset { reason } => {
                 self.appended.clear();
+                self.source_changed()?;
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
