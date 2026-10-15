@@ -3346,6 +3346,8 @@ impl SidebarState {
             }
             SidebarAction::ToggleSection { section, .. } => {
                 toggle_membership(&mut self.toggled_sections, *section);
+                self.change_first_rows.clear();
+                self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
             }
             SidebarAction::ToggleSourceControlPanel { .. } => self.panel_open = !self.panel_open,
             SidebarAction::FilesPage { page, .. } => self.files_page = *page,
@@ -3366,7 +3368,13 @@ impl SidebarState {
                 self.change_first_rows.clear();
                 self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
             }
-            SidebarAction::SetChangesTab { tab, .. } => self.changes_tab = *tab,
+            SidebarAction::SetChangesTab { tab, .. } => {
+                if self.changes_tab != *tab {
+                    self.changes_tab = *tab;
+                    self.change_first_rows.clear();
+                    self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
+                }
+            }
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
@@ -7459,6 +7467,9 @@ fn panel_section<'a>(
     } else {
         header.into()
     };
+    let header = RowInteraction::change_target(header, SidebarAction::ToggleSection {
+        key: key.clone(), section,
+    }, None);
     let mut column = widget::column::with_capacity(2).push(header);
     if expanded {
         column = column.push(widget::container(body()).padding([0.0, 0.0, space::S, 0.0]));
@@ -16355,6 +16366,164 @@ pub(crate) mod tests {
             Some(0.0),
             "native offset and mounted row coordinates must reset together"
         );
+    }
+
+    #[test]
+    fn change_group_headers_do_not_transfer_held_stage_all_presses_to_another_area() {
+        use cosmic::iced::{Event, Rectangle, mouse,
+            advanced::{Shell, clipboard, widget::{Operation, operation}}};
+        struct Bounds { target: Id, button: Option<Rectangle> }
+        impl Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+            fn focusable(&mut self, id: Option<&Id>, bounds: Rectangle, _: &mut dyn operation::Focusable) {
+                if id == Some(&self.target) { self.button = Some(bounds); }
+            }
+        }
+        let mut source = source_control();
+        let group = |area, name: &str| ChangeGroup::new(source.key.worktree_id, area,
+            vec![ChangeRow::new(source.key.worktree_id,
+                &changed(repo_path(name), area, if area == ChangeArea::Untracked { ChangeKind::Untracked } else { ChangeKind::Modified }, None))]);
+        let original = group(ChangeArea::Unstaged, "original.rs");
+        let replacement = group(ChangeArea::Untracked, "replacement.rs");
+        source.groups = vec![original];
+        let state = panel_state(&panel_model());
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(380.0, 600.0));
+        let mut element = changes_section(&state, &source, false);
+        let mut tree = Tree::new(&element);
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()));
+        let mut bounds = Bounds { target: source.groups[0].chrome.stage_all_id.clone(), button: None };
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let pointer = bounds.button.expect("original Stage all header is mounted").center();
+        let send = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree, node: &layout::Node, event: Event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(tree, &event, Layout::new(node), mouse::Cursor::Available(pointer),
+                &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            messages
+        };
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        send(&mut element, &mut tree, &node, Event::Mouse(mouse::Event::CursorMoved { position: pointer }));
+        assert!(send(&mut element, &mut tree, &node, press.clone()).is_empty());
+        assert_eq!(send(&mut element, &mut tree, &node, release.clone()),
+            vec![SidebarAction::ChangeGroup { key: source.key.clone(), area: ChangeArea::Unstaged,
+                command: ChangeGroupCommand::Stage }]);
+        assert!(send(&mut element, &mut tree, &node, press.clone()).is_empty());
+        drop(element);
+        // A disappears and B takes the same header position, just as empty
+        // groups omitted by changes_section shift later groups upwards.
+        source.groups = vec![replacement];
+        element = changes_section(&state, &source, false);
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()));
+        let mut bounds = Bounds { target: source.groups[0].chrome.stage_all_id.clone(), button: None };
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        assert_eq!(bounds.button.expect("replacement header is mounted").center(), pointer);
+        assert!(send(&mut element, &mut tree, &node, release.clone()).is_empty(),
+            "held Stage all must not transfer to the different area");
+        send(&mut element, &mut tree, &node, Event::Mouse(mouse::Event::CursorMoved { position: pointer }));
+        assert!(send(&mut element, &mut tree, &node, press).is_empty());
+        let fresh = send(&mut element, &mut tree, &node, release);
+        assert_eq!(fresh, vec![SidebarAction::ChangeGroup { key: source.key.clone(), area: ChangeArea::Untracked,
+            command: ChangeGroupCommand::Stage }]);
+        let SidebarAction::Stage { selection, .. } = resolve_group_command(&source, &fresh[0]).unwrap() else {
+            panic!("expected current whole-group Stage");
+        };
+        assert_eq!(selection, vec![PathSelection::new(repo_path("replacement.rs"))]);
+    }
+
+    #[test]
+    fn collapsing_groups_and_switching_tabs_remount_at_matching_native_and_model_coordinates() {
+        use cosmic::iced::{Event, Rectangle, Vector, mouse, window,
+            advanced::{Shell, clipboard, widget::{Operation, operation}}};
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+            fn scrollable(&mut self, _: Option<&Id>, _: Rectangle, _: Rectangle,
+                translation: Vector, _: &mut dyn operation::Scrollable) { self.0 = Some(translation.y); }
+        }
+        fn body<'a>(state: &'a SidebarState, source: &'a SourceControlModel) -> Element<'a, SidebarAction> {
+            match state.changes_tab {
+                ChangesTab::Changes => changes_section(state, source, false),
+                ChangesTab::Branch => branch_changes_section(state, source, false),
+                ChangesTab::History => history_section(state, source, false),
+            }
+        }
+        let renderer = headless_renderer();
+        for switch_tab in [false, true] {
+            let mut source = source_control();
+            source.groups = vec![ChangeGroup::new(source.key.worktree_id, ChangeArea::Unstaged,
+                (0..200).map(|index| ChangeRow::new(source.key.worktree_id,
+                    &changed(repo_path(&format!("file-{index:04}.rs")), ChangeArea::Unstaged,
+                        ChangeKind::Modified, None))).collect())];
+            let mut state = panel_state(&panel_model());
+            state.apply(&SidebarAction::SetChangeListMode { key: source.key.clone(), mode: FileListMode::Flat });
+            let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+            state.apply(&SidebarAction::ChangeViewport { key: source.key.clone(), scope,
+                epoch: state.change_scroll_epoch, first_row: 20 });
+            let old_epoch = state.change_scroll_epoch;
+            let limits = layout::Limits::new(Size::ZERO, Size::new(380.0, 600.0));
+            let mut element = body(&state, &source);
+            let mut tree = Tree::new(&element);
+            let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let id = stable_id(format!("changes.scroll.{}.{scope:?}.{old_epoch}", source.key.worktree_id));
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                &mut operation::scrollable::scroll_to::<()>(id,
+                    operation::scrollable::AbsoluteOffset { x: None, y: Some(20.0 * PANEL_ROW_HEIGHT) }));
+            drop(element);
+            // Selecting the current tab and redrawing the same group is a no-op.
+            state.apply(&SidebarAction::SetChangesTab { key: source.key.clone(), tab: ChangesTab::Changes });
+            assert_eq!(state.change_scroll_epoch, old_epoch);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut before = Offset::default();
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+            assert_eq!(before.0, Some(20.0 * PANEL_ROW_HEIGHT));
+            assert!(control_ids(&element).contains(&source.groups[0].rows[23].chrome.stage_id.to_string()));
+            drop(element);
+            let away = if switch_tab {
+                SidebarAction::SetChangesTab { key: source.key.clone(), tab: ChangesTab::Branch }
+            } else {
+                SidebarAction::ToggleSection { key: source.key.clone(), section: PanelSection::Unstaged }
+            };
+            state.apply(&away);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut absent = Offset::default();
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut absent);
+            assert_eq!(absent.0, None, "the real section/tab switch unmounted its virtual scrollable");
+            drop(element);
+            let back = if switch_tab {
+                SidebarAction::SetChangesTab { key: source.key.clone(), tab: ChangesTab::Changes }
+            } else { away };
+            state.apply(&back);
+            element = body(&state, &source);
+            tree.diff(&mut element);
+            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut first_layout = Offset::default();
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut first_layout);
+            assert_eq!(first_layout.0, Some(0.0), "first native layout must match the mounted top rows");
+            assert!(control_ids(&element).contains(&source.groups[0].rows[0].chrome.stage_id.to_string()));
+            let mut callbacks = Vec::new();
+            element.as_widget_mut().update(&mut tree,
+                &Event::Window(window::Event::RedrawRequested(std::time::Instant::now())),
+                Layout::new(&node), mouse::Cursor::Unavailable, &renderer,
+                &mut clipboard::Null, &mut Shell::new(&mut callbacks),
+                &Rectangle::with_size(Size::new(380.0, 600.0)));
+            drop(element);
+            for callback in callbacks {
+                if matches!(callback, SidebarAction::ChangeViewport { .. }) { state.apply(&callback); }
+            }
+            state.apply(&SidebarAction::ChangeViewport { key: source.key.clone(), scope,
+                epoch: old_epoch, first_row: 20 });
+            assert_eq!(state.change_first_rows.get(&scope).copied().unwrap_or(0), 0,
+                "redraw notifications and delayed old-layout callbacks must keep the top model coordinates");
+        }
     }
 
     #[test]
