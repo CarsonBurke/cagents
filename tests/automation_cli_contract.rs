@@ -838,6 +838,7 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
                 let deadline = Instant::now()+Duration::from_secs(5);
                 loop {
                     loop {
+                        if Instant::now()>=deadline { return Err("fixture family did not settle before its deadline".into()); }
                         let mut status = 0;
                         let reaped = unsafe { libc::waitpid(-1,&mut status,libc::WNOHANG) };
                         if reaped > 0 { eprintln!("archive fixture reaped child {reaped}: wait status {status}");continue; }
