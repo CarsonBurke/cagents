@@ -103,6 +103,8 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
             .width(Length::Fill)
             .into();
     }
+    let accent = design::accent_color(&cosmic::theme::active());
+    let font = cosmic::font::default();
     let searchable = search_label(label);
     let offset = label.len() - searchable.len();
     let folded: Vec<_> = searchable
@@ -150,10 +152,10 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
             if start < index {
                 let span = Span::new(label[start..index].to_owned());
                 spans.push(if highlighted {
-                    span.color(design::accent_color(&cosmic::theme::active()))
+                    span.color(accent)
                         .font(iced::Font {
                             weight: iced::font::Weight::Bold,
-                            ..cosmic::font::default()
+                            ..font
                         })
                 } else {
                     span
@@ -165,10 +167,10 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
     }
     let span = Span::new(label[start..].to_owned());
     spans.push(if highlighted {
-        span.color(design::accent_color(&cosmic::theme::active()))
+        span.color(accent)
             .font(iced::Font {
                 weight: iced::font::Weight::Bold,
-                ..cosmic::font::default()
+                ..font
             })
     } else {
         span
@@ -176,7 +178,7 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
     widget::container(
         iced::widget::rich_text(spans)
             .size(design::TEXT_BODY)
-            .font(cosmic::font::default())
+            .font(font)
             .wrapping(iced::widget::text::Wrapping::None)
             .ellipsize(iced::widget::text::Ellipsize::End(
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
