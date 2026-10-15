@@ -1057,9 +1057,9 @@ impl CachedItem {
                     .is_some_and(|item| std::ptr::eq(&item.content, content))
             })
             .and_then(|cached| cached.find_paint.clone());
-        // Source replacement retires every old shaped leaf, including leaves
-        // that vanished or became small enough to use ordinary prose.
-        let flow_cache = flow_layout::Cache::default();
+        // Weak descriptors survive append publication; only mounted row owners
+        // retain glyphs. Each leaf independently proves styled-prefix lineage.
+        let flow_cache = previous.as_ref().map(|cached| cached.flow_cache.clone()).unwrap_or_default();
         let reader_memory = previous.as_ref().map(|cached| cached.reader_memory.clone()).unwrap_or_default();
         let reader_context = previous.as_ref().and_then(|cached| cached.reader_context.clone());
         let (
