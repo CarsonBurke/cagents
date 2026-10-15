@@ -8,7 +8,17 @@ pub(super) struct State { depth: Cell<usize>, poisoned: Cell<bool> }
 impl State {
     pub(super) fn guard_connection(&self,db:&Connection)->Result<(),String> {
         if self.poisoned.get() { return Err(POISONED.into()); }
-        if (self.depth.get()==0)!=db.is_autocommit() {
+        let transaction=db.transaction_state::<&str>(None).map_err(|error| {
+            self.poisoned.set(true);
+            format!("Source cache transaction state could not be verified: {error}")
+        })?;
+        let tracked=self.depth.get()>0;
+        let valid=if tracked {
+            !db.is_autocommit() && matches!(transaction,rusqlite::TransactionState::None|rusqlite::TransactionState::Read)
+        } else {
+            db.is_autocommit() && transaction==rusqlite::TransactionState::None
+        };
+        if !valid {
             self.poisoned.set(true);
             return Err("Source cache transaction ownership is unknown; this connection is unavailable".into());
         }
@@ -56,12 +66,16 @@ impl<'a> Lease<'a> {
         self.active=false;
         let depth=self.state.depth.get();
         let owned=self.transaction.is_some();
+        let ownership=self.state.guard_connection(self.db);
         let release=match self.transaction.take() {
             Some(transaction)=>transaction.rollback().map_err(|error|error.to_string()),
             None=>if self.db.is_autocommit(){Err("Nested source read lost its owner transaction".into())}else{Ok(())},
         };
         self.state.depth.set(depth.saturating_sub(1));
-        if release.is_err() || depth==0 || (owned && (depth!=1 || !self.db.is_autocommit())) {
+        let no_snapshot=if owned {
+            self.db.is_autocommit() && matches!(self.db.transaction_state::<&str>(None),Ok(rusqlite::TransactionState::None))
+        } else {true};
+        if ownership.is_err() || release.is_err() || depth==0 || (owned && (depth!=1 || !no_snapshot)) {
             self.state.poisoned.set(true);
             return Err(format!("{POISONED}: {}",release.err().unwrap_or_else(||"source read ownership changed".into())));
         }
@@ -237,6 +251,36 @@ mod tests {
         handle.command(denial).unwrap();
         assert_eq!(received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),"deny");
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn implicit_untracked_snapshot_is_refused_even_while_autocommit_is_true() {
+        let mut store=populated();
+        let mut statement=store.db.prepare("SELECT id FROM items ORDER BY ordinal").unwrap();
+        let mut rows=statement.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        assert!(store.db.is_autocommit());
+        assert_eq!(store.db.transaction_state::<&str>(None).unwrap(),rusqlite::TransactionState::Read);
+        assert!(store.with_source_read(|e|e,|_|Ok::<_,String>("untracked bytes")).is_err());
+        drop(rows);drop(statement);
+        assert_eq!(store.db.transaction_state::<&str>(None).unwrap(),rusqlite::TransactionState::None);
+        assert_all_reads_and_retry_refuse(&mut store);
+    }
+    #[test]
+    fn rollback_success_cannot_publish_if_an_unfinished_statement_retains_the_snapshot() {
+        let mut store=populated();
+        let mut statement=store.db.prepare("SELECT id FROM items ORDER BY ordinal").unwrap();
+        let mut retained=None;
+        let result=store.with_source_read(|e|e,|_| {
+            retained=Some(statement.query([]).unwrap());
+            assert!(retained.as_mut().unwrap().next().unwrap().is_some());
+            Ok("a successful rollback alone is not release proof")
+        });
+        assert!(result.is_err());
+        assert!(store.db.is_autocommit(),"explicit rollback itself succeeded");
+        assert_eq!(store.db.transaction_state::<&str>(None).unwrap(),rusqlite::TransactionState::Read);
+        drop(retained);drop(statement);
+        assert_all_reads_and_retry_refuse(&mut store);
     }
 
 }
