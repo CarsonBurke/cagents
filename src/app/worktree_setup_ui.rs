@@ -1384,7 +1384,8 @@ pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
         }
         if !review.trusted && !review.loading {
             rows.push(
-                widget::checkbox("Trust these exact project commands", review.approved)
+                widget::checkbox(review.approved)
+                    .label("Trust these exact project commands")
                     .on_toggle(move |value| {
                         Message::ProjectUi(project_ui::Action::SetupReviewTrust {
                             request,
