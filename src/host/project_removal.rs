@@ -72,8 +72,8 @@ pub(super) fn inventory(
     for (mut session, instance, actor, returning_terminal) in chats {
         // Refresh, ownership and source projections all remain off HostState.
         // Final teardown still checks exact actor/provider under lifecycle claim.
-        actor.refresh_retained_state().map_err(error)?;
         if !actor.owns_work()&&!returning_terminal {continue;}
+        actor.refresh_retained_state().map_err(error)?;
         session.launch.session_id=actor.session_id();
         session.native_continuity=actor.native_continuity();
         sessions.push(SessionClose {
