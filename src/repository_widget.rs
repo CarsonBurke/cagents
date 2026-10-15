@@ -10188,11 +10188,12 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         ("Branch", "Compare branch with base", BasisChoice::Committed(CommittedChoice::Branch), DiffPresentationCommand::Branch),
         ("History", "Compare last commit with its parent", BasisChoice::Committed(CommittedChoice::LastCommit), DiffPresentationCommand::History),
     ] {
+        let action = runtime.diff_presentation_action(card, command);
         controls.push(labelled_diff_control(
             label,
             tip,
-            runtime.diff_presentation_available(command) && selected == Some(choice),
-            runtime.diff_presentation_action(card, command),
+            action.is_some() && selected == Some(choice),
+            action,
         ));
     }
     crate::ui_controls::segmented_controls(controls)
