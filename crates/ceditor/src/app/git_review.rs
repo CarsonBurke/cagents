@@ -417,6 +417,75 @@ mod tests {
     }
 
     #[test]
+    fn standalone_history_search_finds_author_body_and_sha_beyond_first_page() {
+        let directory = git_fixture(); let root = directory.path();
+        git(root, &["config", "user.name", "Beyond Page Author"]);
+        git(root, &["commit", "--amend", "--reset-author", "-m", "Old subject\n\nHidden body marker"]);
+        let oldest = git(root, &["rev-parse", "HEAD"]);
+        let tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+        git(root, &["config", "user.name", "Recent Author"]);
+        let mut head = oldest.clone();
+        for index in 0..201 { head = git(root, &["commit-tree", &tree, "-p", &head, "-m", &format!("Recent {index}")]); }
+        git(root, &["update-ref", "HEAD", &head]);
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        assert_eq!(source.history.len(), 200);
+        assert!(!source.history.iter().any(|row| row.oid.as_str() == oldest));
+        for query in ["BEYOND PAGE AUTHOR".to_owned(), "hidden body marker".to_owned(), oldest[..12].to_owned()] {
+            sidebar_action(&mut app, SidebarAction::SearchHistory { key: origin.key.clone(), query });
+            let rows = &app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history;
+            assert_eq!(rows.len(), 1); assert_eq!(rows[0].oid.as_str(), oldest);
+        }
+    }
+
+    #[test]
+    fn standalone_history_copy_actions_emit_exact_clipboard_payloads() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = git_fixture(); let mut app = editor();
+        let card = open_real_git(&mut app, directory.path(), None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        for (command, expected) in [(sidebar::HistoryCommand::CopySha, row.oid.to_string()), (sidebar::HistoryCommand::CopyMessage, row.message.to_string())] {
+            let task = app.update(Message::Sidebar(SidebarAction::HistoryCommand { key: origin.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: row.message.clone(), command }));
+            let writes = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let mut writes = Vec::new(); let mut stream = iced::runtime::task::into_stream(task).expect("clipboard task");
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, .. }) = action { writes.push(contents); }
+                }
+                writes
+            });
+            assert_eq!(writes, [expected]);
+        }
+    }
+
+    #[test]
+    fn standalone_history_revert_and_cross_worktree_cherry_pick_use_actual_mutation_path() {
+        let directory = git_fixture(); let root = directory.path(); let side = tempfile::tempdir().unwrap();
+        git(root, &["branch", "history-target"]);
+        std::fs::write(root.join("tracked.txt"), "picked contents\n").unwrap();
+        git(root, &["add", "tracked.txt"]); git(root, &["commit", "-m", "Change to replay"]);
+        let picked = git(root, &["rev-parse", "HEAD"]);
+        let destination = side.path().join("worktree");
+        git(root, &["worktree", "add", destination.to_str().unwrap(), "history-target"]);
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        sidebar_action(&mut app, SidebarAction::HistoryCommand { key: origin.key, oid: row.oid, mainline: row.mainline, message: row.message, command: sidebar::HistoryCommand::Revert });
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original\n");
+        assert!(git(root, &["log", "-1", "--format=%s"]).starts_with("Revert"));
+        let other = open_real_git(&mut app, &destination, None); let target = bound(&app, other);
+        sidebar_action(&mut app, SidebarAction::SearchHistory { key: target.key.clone(), query: picked.clone() });
+        let row = app.tab(other).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        assert_eq!(row.oid.as_str(), picked);
+        sidebar_action(&mut app, SidebarAction::HistoryCommand { key: target.key, oid: row.oid, mainline: row.mainline, message: row.message, command: sidebar::HistoryCommand::CherryPick });
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(std::fs::read_to_string(destination.join("tracked.txt")).unwrap(), "picked contents\n");
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original\n");
+        assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Change to replay");
+    }
+
+    #[test]
     fn standalone_history_menu_refuses_forged_rows_and_branch_form_retargets() {
         use sidebar::HistoryCommand;
         let directory = git_fixture(); let root = directory.path();
