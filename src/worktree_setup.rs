@@ -295,6 +295,16 @@ fn matches(
             // Symlinks and unreadable entries cannot be copied or traversed.
             Err(_) => continue,
         };
+        // A primary checkout may physically contain managed worktrees.
+        // Never recurse into another Git checkout, including the destination
+        // itself, when a broad glob such as **/.env is configured.
+        if metadata.is_dir() {
+            match fs_safety::metadata_beneath(root, &child.join(".git")) {
+                Ok(_) => continue,
+                Err(err) if err.is_not_found() => {}
+                Err(err) => return Err(error(err)),
+            }
+        }
         if parts[0] == "**" {
             if metadata.is_dir() {
                 matches(root, parts, &child, scanned, found, cancel)?;
@@ -519,9 +529,16 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_nested_destination(false)
+        }
+        fn with_nested_destination(nested: bool) -> Self {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let primary = directory.path().join("primary");
-            let destination = directory.path().join("new");
+            let destination = if nested {
+                primary.join(".worktrees/new")
+            } else {
+                directory.path().join("new")
+            };
             fs::create_dir(&primary).unwrap();
             let fixture = Self {
                 _directory: directory,
@@ -674,6 +691,28 @@ mod tests {
             b"cert"
         );
         assert!(!fixture.destination.join("config/link").exists());
+    }
+
+    #[test]
+    fn broad_globs_do_not_copy_other_managed_worktrees_or_the_destination() {
+        let fixture = Fixture::with_nested_destination(true);
+        let other = fixture.primary.join(".worktrees/other");
+        fixture.git(&["worktree", "add", "--detach", other.to_str().unwrap()]);
+        fs::write(fixture.primary.join(".env"), "primary secret").unwrap();
+        fs::write(other.join(".env"), "other agent secret").unwrap();
+        let plan = fixture.config("copy = ['**/.env']");
+        let result = fixture.prepare(&plan).unwrap();
+        assert_eq!(result.copied, [PathBuf::from(".env")]);
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"primary secret"
+        );
+        assert!(!fixture.destination.join(".worktrees").exists());
+        assert_eq!(fs::read(other.join(".env")).unwrap(), b"other agent secret");
+        // A second preparation must not feed the destination's new .env back
+        // into a nested copy of itself.
+        assert!(fixture.prepare(&plan).unwrap().copied.is_empty());
+        assert!(!fixture.destination.join(".worktrees").exists());
     }
 
     #[test]

@@ -21,7 +21,8 @@ Copies come from the primary checkout, preserve ordinary permission bits, and
 never overwrite tracked files (even deleted tracked files), existing untracked
 files, or symbolic links. Sources missing from a pattern are reported and do not
 fail creation. Patterns must stay within the checkout and cannot select `.git`.
-Directory traversal and copies refuse symbolic links. Glob patterns support
+Directory traversal and copies refuse symbolic links and do not cross into nested
+Git checkouts, including other managed worktrees or the destination itself. Glob patterns support
 `*`, `?`, character classes and recursive `**` directory components.
 
 Choose **Skip setup** for one creation, or use `cagents worktree create --no-setup`.
