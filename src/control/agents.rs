@@ -303,6 +303,29 @@ fn checkout(project: &Path) -> PathBuf {
     }
 }
 
+fn list_human(summaries: &[Summary]) -> String {
+    super::format::table(
+        ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
+        summaries.iter().map(|summary| [
+            short(summary.agent.id),
+            summary.agent.spec.provider.executable().into(),
+            match summary.state {
+                crate::agent_execution::State::Accepted => "Queued",
+                crate::agent_execution::State::Running => "Running",
+                crate::agent_execution::State::Waiting => "Waiting for input",
+                crate::agent_execution::State::Succeeded => "Succeeded",
+                crate::agent_execution::State::Failed => "Failed",
+                crate::agent_execution::State::Cancelled => "Cancelled",
+                crate::agent_execution::State::Interrupted => "Outcome uncertain",
+            }.into(),
+            short(summary.run),
+            summary.agent.spec.target.directory.display().to_string(),
+            summary.agent.name.clone().unwrap_or_default(),
+        ]).collect(),
+        "No open agents",
+    )
+}
+
 /// The part of an ID people type and read: unique among one caller's agents
 /// in practice, and accepted back as a handle.
 fn short(id: impl std::fmt::Display) -> String {
@@ -997,30 +1020,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         }
         AgentCommand::List => {
             let summaries = session.summaries()?.to_vec();
-            let human = if summaries.is_empty() {
-                "No open agents".to_owned()
-            } else {
-                summaries
-                    .iter()
-                    .map(|summary| {
-                        format!(
-                            "{}  {:<6} {:<11} run {}  {}{}",
-                            short(summary.agent.id),
-                            summary.agent.spec.provider.executable(),
-                            format!("{:?}", summary.state),
-                            short(summary.run),
-                            summary.agent.spec.target.directory.display(),
-                            summary
-                                .agent
-                                .name
-                                .as_ref()
-                                .map(|name| format!("  {name}"))
-                                .unwrap_or_default()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let human = list_human(&summaries);
             Ok(CommandOutput {
                 command: "agent.list",
                 data: json!({"agents": summaries}),
@@ -2281,6 +2281,23 @@ mod tests {
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
         }
+    }
+
+    #[test]
+    fn readable_agent_list_labels_waiting_and_uncertain_results_with_an_empty_state() {
+        assert_eq!(list_human(&[]), "No open agents");
+        let mut entry = summary("abcdef00-0000-4000-8000-000000000001", "12345678-0000-4000-8000-000000000001");
+        entry.agent.name = Some("reviewer\nnext".into());
+        entry.state = crate::agent_execution::State::Waiting;
+        let human = list_human(&[entry.clone()]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(human.lines().next().unwrap().split_whitespace().collect::<Vec<_>>(),
+            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]);
+        assert!(human.contains("abcdef00"));
+        assert!(human.contains("Waiting for input"));
+        assert!(human.ends_with("reviewer next"));
+        entry.state = crate::agent_execution::State::Interrupted;
+        assert!(list_human(&[entry]).contains("Outcome uncertain"));
     }
 
     #[test]
