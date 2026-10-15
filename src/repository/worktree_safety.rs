@@ -6,11 +6,14 @@ const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
 
 fn require_complete_inventory(output: &ProcessOutput) -> Result<(), RepositoryError> {
     if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let line = stderr.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("Git inventory warning");
+        let detail: String = line.chars().take(FAILURE_DETAIL_LIMIT).collect();
         return Err(RepositoryError::InvalidOutput {
             field: "worktree_safety",
             reason: format!(
                 "Git could not inspect every file; worktree was kept: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                detail
             ),
         });
     }
