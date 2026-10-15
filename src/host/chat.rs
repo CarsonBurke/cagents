@@ -3115,17 +3115,19 @@ fn process_inner(
         }
         ClientRequest::ChatClose { chat_id } => {
             restart::require_not_busy(host, chat_id)?;
-            let handle = {
+            let (handle, source) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                let handle = attached(&state, client, chat_id)?.handle.clone();
+                let record = attached(&state, client, chat_id)?;
+                let result = (record.handle.clone(), record.session.clone());
                 state.issued_chat_ids.insert(chat_id);
-                handle
+                result
             };
+            super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             let (retained, pending_cleanup) = {
@@ -3579,6 +3581,29 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
     session.owns_codex_listener()
 }
 
+/// Check a paired managed presentation before the terminal worker itself can
+/// stop. This is read-only; the actor path repeats its checks after teardown.
+pub(super) fn preflight_for_terminal_close(host: &SharedHost, terminal_id: TerminalId,
+    expected: &crate::terminal::TerminalHandle) -> Result<(), ProtocolError> {
+    let source = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.chats.get(&terminal_id).filter(|record| {
+            (record.session.launch.provider == Provider::Codex || record.owns_execution_console())
+                && record.session.terminal.as_ref().is_some_and(|source| source.id == terminal_id)
+        }).map(|record| {
+            if !record.paired_terminal.as_ref().is_some_and(|handle| handle.same_worker(expected))
+                || !state.terminals.get(&terminal_id).is_some_and(|current| current.handle.same_worker(expected)) {
+                return Err(unavailable("The terminal worker no longer belongs to this provider pairing"));
+            }
+            Ok(record.session.clone())
+        }).transpose()?
+    };
+    if let Some(source) = source {
+        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    }
+    Ok(())
+}
+
 /// A terminal card restored after a GUI restart has no parked UI runtime, but
 /// the daemon still owns its exact native actor. Explicit card close retires both.
 pub(super) fn close_for_terminal(
@@ -3646,6 +3671,9 @@ pub(super) fn close_terminal_actor(
             .filter(|record| record.handle.same_actor(handle))
             .map(|record| record.session.clone())
     };
+    if let Some(source) = &source {
+        super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
+    }
     handle.close().map_err(unavailable)?;
     if let Some(source) = &source {
         retained_actor::finish_close(host, handle, source).map_err(unavailable)?;

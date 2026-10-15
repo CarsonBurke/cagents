@@ -865,6 +865,171 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
 }
 
 #[test]
+fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable() {
+    if isolated("legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable").is_some() { return; }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let (agent, pane, scope) = {
+        let mut store = store.lock().unwrap();
+        let agent = store.agent(accepted.agent.id).unwrap();
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {unreachable!()};
+        // Persist the old UI's ended-console projection directly, as an old
+        // store would contain it after console /quit or EOF (neither closes
+        // the provider). The provider below is an actual running fixture.
+        let mut console_recipe = source.launch.recipe.clone();
+        console_recipe.program = "/bin/cat".into();
+        console_recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {id: source.id, owned_codex_listener: None,
+            recovery_origin: None, predecessor: None, launch: console_recipe,
+            transcript_path: None, resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+                code: Some(0), signal: None, occurred_at_unix_ms: 1}}};
+        let agent = store.bind_agent_console(agent.id, agent.session.as_ref().unwrap(), terminal.clone()).unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy ended console".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(terminal), scope: None};
+        store.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        (agent, pane, scope)
+    };
+    let source = agent.session.as_ref().unwrap().id();
+    let handle = host.lock().unwrap().chats[&source].handle.clone();
+    // Exercise the public checked-close dispatcher with a real live PTY,
+    // rather than only calling the actor helper after terminal teardown.
+    let console = agent.console.as_ref().unwrap().clone();
+    let terminal = crate::terminal::TerminalHandle::spawn(console.clone(), Default::default(), |_| {}).unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(29);
+        state.reserve_spawn(source).unwrap();
+        state.finish_spawn(29, console.clone(), terminal.clone(), true).unwrap();
+        let record = state.chats.get_mut(&source).unwrap();
+        record.console_recipe = Some(console.launch.clone());
+        record.session.terminal = Some(console);
+        record.paired_terminal = Some(terminal.clone());
+    }
+    assert!(!terminal.is_completed());
+    let before = store.lock().unwrap().model().unwrap();
+    let prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
+    assert!(close(&host, &Authority::default(), agent.id).unwrap_err().contains("historical generation proof"));
+    assert!(crate::host::chat::process(&host, EXECUTION_CLIENT, ClientRequest::ChatClose {chat_id: source})
+        .unwrap_err().message.contains("historical generation proof"));
+    assert!(crate::host::chat::close_terminal_actor(&host, source, &handle)
+        .unwrap_err().message.contains("historical generation proof"));
+    let HostedSession::Chat(retained) = agent.session.as_ref().unwrap() else {unreachable!()};
+    assert!(crate::host::chat::close_retained_native(&host, retained)
+        .unwrap_err().contains("historical generation proof"));
+    let checked = crate::host::client::process_request(&host, 29,
+        ClientRequest::CloseTerminalChecked {terminal_id: source, allow_active: true});
+    assert!(checked.unwrap_err().message.contains("historical generation proof"));
+    assert!(!terminal.is_completed(), "checked-close refusal must precede PTY teardown");
+    assert!(host.lock().unwrap().terminals[&source].handle.same_worker(&terminal));
+    assert!(!handle.is_completed(), "refusal must precede provider freeze/stop");
+    assert!(host.lock().unwrap().chats[&source].handle.same_actor(&handle));
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(run.id).unwrap(), run);
+    assert_eq!(std::fs::read(path.parent().unwrap().join("prompts")).unwrap(), prompts);
+    let followup = submit(&host, &Authority::default(), Submit {name: None, destination: Destination::Existing(agent.id),
+        prompt: "Still usable after refused close".into(), idempotency_key: "after-refusal".into()}).unwrap();
+    assert_eq!(settled(&host, followup.run.id).result.text, "SERVICE_RESULT_2");
+    assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(), "spawn\n");
+    // Test-owned cleanup after proving refusal had no teardown side effect.
+    {let mut store = store.lock().unwrap(); let revision = store.view_revision(&scope).unwrap();
+        store.apply(&ModelEdit::ChangeView {scope, expected_revision: revision, operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Remove {id: pane.id}}).unwrap();}
+    terminal.shutdown().unwrap();
+    close(&host, &Authority::default(), agent.id).unwrap();
+}
+
+#[test]
+fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
+    if isolated("retained_old_alias_preflights_current_agent_before_real_holder_release").is_some() { return; }
+    use crate::daemon::holder_registry::{self as holders, Kind};
+    use chat::protocol::{ExecutionContext, ProcessSpec, TransportSpec};
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else { unreachable!() };
+    spec.provider = Provider::Codex;
+    let store = registry(&host).unwrap();
+    let accepted = store.lock().unwrap().submit_agent(&Origin::User, &request, now()).unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let mut original_proof = current_proof.clone();
+    original_proof.host_incarnation = HostIncarnation::new("before-holder-adoption");
+    let directory = path.parent().unwrap();
+    let id = TerminalId::new();
+    let mut original = chat::fresh_session(Provider::Codex, id, directory.to_owned(),
+        &Account::system(Provider::Codex)).unwrap();
+    original.proof = Some(original_proof.clone());
+    original.claim_owned_codex_listener(Path::new("/var/tmp"), &original_proof);
+    let socket = original.owned_codex_listener.as_ref().unwrap().socket.clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &original_proof).unwrap();
+    let context = Arc::new(ExecutionContext::new(Some(Arc::new(std::fs::File::open(directory).unwrap()))));
+    let process = ProcessSpec {execution: Some(context.clone()), messages: None,
+        transport: TransportSpec::OwnedUnixWebSocket {socket}, program: "/bin/sleep".into(),
+        arguments: vec!["60".into()], working_directory: directory.to_owned(),
+        environment: Default::default(), unset_environment: Default::default()};
+    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    context.installed();
+    let owner = holders::evidence(&holders::socket(&holders::directory(Kind::Native).unwrap(), id),
+        Kind::Native).unwrap().unwrap();
+    holder.confirm(uuid::Uuid::new_v4().to_string(), chat::protocol::ServerIdentity {
+        user_agent: "cagents/0.157.1 (Linux)".into(), canonical_home: directory.to_owned(),
+        reported_home: directory.display().to_string()}, owner.root.clone()).unwrap();
+    holder.preserve();
+    store.lock().unwrap().bind_agent(accepted.agent.id, None, HostedSession::Chat(original.clone())).unwrap();
+    drop(lease);
+    let _lease = crate::daemon::HostLease::acquire(&paths, &current_proof).unwrap();
+    let (adopted, recovery) = chat::native_holder::adopt(&owner, &original, &current_proof).unwrap();
+    let detached = adopted.preserve();
+    assert_ne!(recovery.source.proof, original.proof);
+    assert!(recovery.previous_sources.contains(&original));
+    let current = HostedSession::Chat(recovery.source.clone());
+    store.lock().unwrap().adopt_authenticated_agent_session(
+        &recovery.previous_sources.iter().cloned().map(HostedSession::Chat).collect::<Vec<_>>(), &current).unwrap();
+    let (agent, scope, pane) = {
+        let mut store = store.lock().unwrap();
+        let mut recipe = recovery.source.launch.recipe.clone();
+        recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+        let terminal = crate::model::TerminalSession {id, launch: recipe,
+            owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            transcript_path: None, resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+                code: Some(0), signal: None, occurred_at_unix_ms: 1}}};
+        let agent = store.bind_agent_console(accepted.agent.id, &current, terminal.clone()).unwrap();
+        let scope = agent.placement.clone();
+        let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Legacy adopted console".into(), user_title: None, pending_terminal_start: false,
+            width_fraction: 1.0, kind: crate::model::CardKind::Terminal(terminal), scope: None};
+        store.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![pane.clone()], closed: vec![]}).unwrap();
+        (agent, scope, pane)
+    };
+    let before = store.lock().unwrap().model().unwrap();
+    let run = store.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    // This old alias genuinely passes the original preflight predicate. The
+    // cleanup service must additionally check the actual current owner set.
+    preflight_retirement(&host, &original).unwrap();
+    let error = crate::host::chat::close_retained_native(&host, &original).unwrap_err();
+    assert!(error.contains("historical generation proof"), "{error}");
+    assert!(owner.root.is_current(), "preflight refusal must not Release the real retained server");
+    let (still_owned, exited) = chat::native_holder::inspect(&owner, &current_proof).unwrap();
+    assert!(!exited); assert_eq!(still_owned.source, recovery.source);
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(run.id).unwrap(), run);
+    assert!(!host.lock().unwrap().native_closing.contains_key(&id));
+    // Test-owned cleanup, only after all no-side-effect assertions.
+    {let mut store = store.lock().unwrap(); let revision = store.view_revision(&scope).unwrap();
+        store.apply(&ModelEdit::ChangeView {scope, expected_revision: revision, operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Remove {id: pane.id}}).unwrap();}
+    detached.close().unwrap();
+    assert!(!owner.root.is_current());
+}
+
+#[test]
 fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority() {
     if isolated("committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authority")
         .is_some()
@@ -937,8 +1102,37 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     assert!(close(&host, &Authority::default(), child.agent.id).is_err());
     assert!(close(&host, &authority, child.agent.id).unwrap().closed);
 
-    // An ordinary UI ChatClose uses the same retirement transaction as the
-    // execution CLI. Afterwards its capability cannot create another child.
+    // An ordinary UI ChatClose must publish the pane tombstone in its first
+    // retirement transaction, without requiring a later execution Close call.
+    let scope = crate::workspace_model::views::Scope::Channel(parent.channel().unwrap());
+    let pane_id = crate::model::CardId::from_uuid(parent.id.as_uuid());
+    let HostedSession::Chat(parent_chat) = parent.session.as_ref().unwrap() else {
+        unreachable!()
+    };
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Review".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(parent_chat.clone()),
+                scope: None,
+            }],
+            closed: vec![],
+        })
+        .unwrap();
+    let retained_run = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(accepted.run.id)
+        .unwrap();
     let parent_session = parent.session.as_ref().unwrap().id();
     super::super::chat::process(
         &host,
@@ -957,6 +1151,14 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
             .unwrap()
             .closed
     );
+    // Read a separate database connection, before any service-level Close, to
+    // verify the committed state that subscribed windows receive.
+    let stored = Registry::at(&path).unwrap();
+    let model = stored.model().unwrap();
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert!(view.panes.iter().all(|pane| pane.id != pane_id));
+    assert!(view.retired.contains(&pane_id));
+    assert_eq!(stored.agent_run(accepted.run.id).unwrap(), retained_run);
     assert!(origin(&host, &authority).is_err());
     let Reply::Listed(agents) = process(&host, Authority::default(), Operation::List).unwrap()
     else {

@@ -119,7 +119,12 @@ pub enum AgentCommand {
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        agent: String,
+        /// Remove only the currently observed ended pane of an already-closed agent when its historical generation cannot be verified. Preserves saved results; never stops or contacts a provider.
+        #[arg(long)]
+        repair_stale_presentation: bool,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -673,6 +678,36 @@ impl Session {
             .map_err(protocol_error)
     }
 
+    /// The explicit flag grants consent for the exact current presentation.
+    /// The inspected target is an opaque CAS token, never a historical-owner
+    /// claim and never output containing the Agent's prompt/environment.
+    fn repair_stale_presentation(&mut self, agent: AgentId) -> Result<CommandOutput, AppError> {
+        let Reply::PresentationRepair(observed) = self.call(Operation::InspectPresentationRepair(agent))? else {
+            return Err(AppError::new("agent.presentation_repair", "Unexpected presentation inspection response"));
+        };
+        let removed = if let Some(observed) = observed {
+            if observed.agent.id != agent || !observed.agent.closed {
+                return Err(AppError::new("agent.presentation_repair", "Inspection did not identify the requested already-closed agent"));
+            }
+            let Reply::PresentationRemoved { agent: confirmed, removed } = self.call(Operation::ConfirmPresentationRepair { observed })? else {
+                return Err(AppError::new("agent.presentation_repair", "Unexpected presentation repair response"));
+            };
+            if confirmed != agent {
+                return Err(AppError::new("agent.presentation_repair", "Presentation repair response identifies another agent"));
+            }
+            removed
+        } else { false };
+        Ok(CommandOutput {
+            command: "agent.close",
+            data: json!({ "agent": agent, "presentation_repair": true, "removed": removed, "historical_generation_verified": false }),
+            human: if removed {
+                format!("Removed the observed ended pane for already-closed agent {} (historical generation unverified); saved results preserved", short(agent))
+            } else {
+                format!("No stale ended pane to repair for already-closed agent {} (historical generation unverified); saved results preserved", short(agent))
+            },
+        })
+    }
+
     /// Waits for `runs`; an agent's wait also ends when a message arrives
     /// for it. The user's shell has `cagents inbox` and is never busy.
     fn wait(&mut self, runs: &[RunId], any: bool, timeout: f64) -> Result<Waited, AppError> {
@@ -1113,8 +1148,11 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 ),
             })
         }
-        AgentCommand::Close { agent } => {
+        AgentCommand::Close { agent, repair_stale_presentation } => {
             let agent = session.agent(&agent)?;
+            if repair_stale_presentation {
+                return session.repair_stale_presentation(agent);
+            }
             let Reply::Closed(agent) = session.call(Operation::Close(agent))? else {
                 return Err(AppError::new("agent.close", "Unexpected close response"));
             };
@@ -1429,6 +1467,91 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_repair_requires_explicit_single_agent_consent() {
+        assert!(matches!(parse(&["close", "1234", "--repair-stale-presentation"]), AgentCommand::Close { repair_stale_presentation: true, .. }));
+        assert!(matches!(parse(&["close", "1234"]), AgentCommand::Close { repair_stale_presentation: false, .. }));
+        for words in [
+            vec!["cagents", "agent", "close", "--repair-stale-presentation"],
+            vec!["cagents", "agent", "close", "1234", "5678", "--repair-stale-presentation"],
+        ] { assert!(Cli::try_parse_from(words).is_err()); }
+        let help = Cli::try_parse_from(["cagents", "agent", "close", "--help"]).unwrap_err().to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in ["--repair-stale-presentation", "already-closed", "historical generation", "Preserves saved results", "never stops or contacts a provider"] {
+            assert!(help.contains(text), "missing {text}: {help}");
+        }
+    }
+
+    fn presentation_target() -> crate::agent_execution::PresentationRepairTarget {
+        use crate::model::{CardId, CardKind, TerminalId, TerminalSession, TerminalContinuity, TerminalExit, LaunchRecipe};
+        let (_, Reply::Status { mut agent, .. }) = running() else { unreachable!() };
+        agent.closed = true; agent.name = Some("PRIVATE_AGENT_NAME".into()); agent.spec.surface = Surface::Terminal;
+        let terminal = TerminalSession { id: TerminalId::new(), owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            launch: LaunchRecipe { program: "private-provider".into(), arguments: vec!["PRIVATE_ARGUMENT".into()], working_directory: "/repo".into(), environment: std::collections::BTreeMap::from([("SECRET_ENV".into(), "PRIVATE_ENV_VALUE".into())]), unset_environment: Default::default() }, transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::Exited { last_exit: TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 } } };
+        agent.console = Some(terminal.clone());
+        crate::agent_execution::PresentationRepairTarget { registry: uuid::Uuid::new_v4(), scope: agent.placement.clone(),
+            view_revision: 19, pane: crate::workspace_model::views::Pane { id: CardId::from_uuid(agent.id.as_uuid()), title: "PRIVATE_PANE_TITLE".into(), user_title: None, pending_terminal_start: false, width_fraction: 1.0, scope: None,
+                kind: CardKind::Terminal(terminal) }, agent }
+    }
+    #[test]
+    fn presentation_repair_confirms_only_exact_observation_and_outputs_compact_receipt() {
+        for (present, removed) in [(false, false), (true, true), (true, false)] {
+            let target = presentation_target(); let agent = target.agent.id;
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::InspectPresentationRepair(id), .. } if *id == agent), ServerResponse::Agent(Reply::PresentationRepair(present.then(|| target.clone()))));
+                if present {
+                    answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if *observed == target), ServerResponse::Agent(Reply::PresentationRemoved { agent, removed }));
+                }
+            });
+            let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
+            let output = session.repair_stale_presentation(agent).unwrap(); server.join().unwrap();
+            assert_eq!(output.data, json!({"agent":agent,"presentation_repair":true,"removed":removed,"historical_generation_verified":false}));
+            let rendered = format!("{} {}", output.human, output.data);
+            assert!(!rendered.contains("PRIVATE_") && !rendered.contains("SECRET_ENV"));
+            assert!(output.human.contains("historical generation unverified"));
+        }
+    }
+    #[test]
+    fn presentation_repair_refuses_wrong_agent_before_mutation_and_never_replays_lost_confirm() {
+        for wrong_agent in [false, true] {
+            let target = presentation_target(); let requested = if wrong_agent { AgentId::new() } else { target.agent.id };
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                answer(&mut server_stream, |_| true, ServerResponse::Agent(Reply::PresentationRepair(Some(target.clone()))));
+                if wrong_agent {
+                    assert!(read_frame::<ClientEnvelope>(&mut server_stream).unwrap().is_none(), "wrong-agent receipt must never be confirmed");
+                } else {
+                    let frame: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert!(matches!(frame.request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if observed == target));
+                    // Lost reply: no success or mutation retry can be inferred.
+                }
+            });
+            let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
+            assert!(session.repair_stale_presentation(requested).is_err()); drop(session); server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_presentation_consent_is_not_reinspected_or_retried_after_refusal() {
+        let target = presentation_target(); let agent = target.agent.id;
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(&mut server_stream, |request| matches!(request, ClientRequest::Agent { operation: Operation::InspectPresentationRepair(id), .. } if *id == agent), ServerResponse::Agent(Reply::PresentationRepair(Some(target.clone()))));
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Agent { operation: Operation::ConfirmPresentationRepair { observed }, .. } if observed == target));
+            write_frame(&mut server_stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof(), message: ServerMessage::Error(terminal::ipc::ProtocolError::new(terminal::ipc::ProtocolErrorCode::ViewConflict, "The observed presentation changed", true)) }).unwrap();
+            assert!(read_frame::<ClientEnvelope>(&mut server_stream).unwrap().is_none(), "stale consent must not inspect a replacement or replay any operation");
+        });
+        let mut session = Session { authority: Authority::default(), connection: Some((ControlClient::from_stream(client_stream).unwrap(), "/fixture".into())), summaries: None };
+        let error = session.repair_stale_presentation(agent).err().unwrap();
+        assert!(error.message.contains("The observed presentation changed"));
+        drop(session); server.join().unwrap();
+    }
 
     #[test]
     fn wait_contract_has_one_shape_and_outcome_exit_codes() {
