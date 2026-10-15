@@ -2878,7 +2878,10 @@ fn require_current_descriptor_write(transaction: &Transaction<'_>) -> Result<()>
     }
     let found: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found > CURRENT_SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchema { found, supported: CURRENT_SCHEMA_VERSION });
+        return Err(StoreError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
     }
     if found != CURRENT_SCHEMA_VERSION {
         return Err(StoreError::InvalidState(format!(
@@ -7125,14 +7128,25 @@ mod tests {
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
     }
 
-    fn descriptor_admission_fixture(path: &Path) -> (StateStore, CardId, crate::chat::Session, crate::chat::Session) {
+    fn descriptor_admission_fixture(
+        path: &Path,
+    ) -> (
+        StateStore,
+        CardId,
+        crate::chat::Session,
+        crate::chat::Session,
+    ) {
         let store = StateStore::open(path, boot("chat-boot")).unwrap();
         let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
         let card = workspace.cards[0].id;
         workspace.cards[0].kind = CardKind::Chat(source.clone());
         SaveLane::default().save(&store, &workspace).unwrap();
         let mut replacement = source.clone();
-        replacement.launch.recipe.environment.insert("DESCRIPTOR_TEST".into(), "replacement".into());
+        replacement
+            .launch
+            .recipe
+            .environment
+            .insert("DESCRIPTOR_TEST".into(), "replacement".into());
         (store, card, source, replacement)
     }
 
@@ -7142,14 +7156,36 @@ mod tests {
         let path = directory.path().join("state.sqlite3");
         let (store, card, source, replacement) = descriptor_admission_fixture(&path);
         let mut stale = source.clone();
-        stale.launch.recipe.environment.insert("DESCRIPTOR_TEST".into(), "stale".into());
-        assert!(store.rebind_chat_descriptor(card, &stale, &replacement).is_err());
-        assert_eq!(store.load_card(card, None).unwrap().unwrap().kind, CardKind::Chat(source.clone()));
-        store.rebind_chat_descriptor(card, &source, &replacement).unwrap();
+        stale
+            .launch
+            .recipe
+            .environment
+            .insert("DESCRIPTOR_TEST".into(), "stale".into());
+        assert!(
+            store
+                .rebind_chat_descriptor(card, &stale, &replacement)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        store
+            .rebind_chat_descriptor(card, &source, &replacement)
+            .unwrap();
         let changes = store.lock_inner().unwrap().connection.total_changes();
-        store.rebind_chat_descriptor(card, &source, &replacement).unwrap();
-        assert_eq!(store.lock_inner().unwrap().connection.total_changes(), changes, "idempotence still writes nothing");
-        assert_eq!(store.load_card(card, None).unwrap().unwrap().kind, CardKind::Chat(replacement));
+        store
+            .rebind_chat_descriptor(card, &source, &replacement)
+            .unwrap();
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            changes,
+            "idempotence still writes nothing"
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
     }
 
     #[test]
@@ -7161,25 +7197,86 @@ mod tests {
             let changes = {
                 let inner = store.lock_inner().unwrap();
                 match refusal {
-                    "old-schema" => inner.connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1).unwrap(),
-                    "foreign-keys" => inner.connection.pragma_update(None, "foreign_keys", false).unwrap(),
-                    "synchronous" => inner.connection.pragma_update(None, "synchronous", 0).unwrap(),
-                    "journal" => inner.connection.pragma_update(None, "journal_mode", "DELETE").unwrap(),
+                    "old-schema" => inner
+                        .connection
+                        .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
+                        .unwrap(),
+                    "foreign-keys" => inner
+                        .connection
+                        .pragma_update(None, "foreign_keys", false)
+                        .unwrap(),
+                    "synchronous" => inner
+                        .connection
+                        .pragma_update(None, "synchronous", 0)
+                        .unwrap(),
+                    "journal" => inner
+                        .connection
+                        .pragma_update(None, "journal_mode", "DELETE")
+                        .unwrap(),
                     _ => unreachable!(),
                 }
                 inner.connection.total_changes()
             };
-            assert!(matches!(store.rebind_chat_descriptor(card, &source, &replacement), Err(StoreError::InvalidState(_))), "{refusal}");
-            assert!(store.rebind_chat_descriptor(card, &source, &source).is_err(), "even idempotent return requires admission: {refusal}");
+            assert!(
+                matches!(
+                    store.rebind_chat_descriptor(card, &source, &replacement),
+                    Err(StoreError::InvalidState(_))
+                ),
+                "{refusal}"
+            );
+            assert!(
+                store
+                    .rebind_chat_descriptor(card, &source, &source)
+                    .is_err(),
+                "even idempotent return requires admission: {refusal}"
+            );
             let inner = store.lock_inner().unwrap();
-            assert_eq!(inner.connection.total_changes(), changes, "refusal must not mutate card/hash: {refusal}");
-            let stored: String = inner.connection.query_row("SELECT content_json FROM cards WHERE card_id=?1", [card.to_string()], |row| row.get(0)).unwrap();
-            assert_eq!(from_json::<crate::chat::Session>("chat card", &stored).unwrap(), source);
+            assert_eq!(
+                inner.connection.total_changes(),
+                changes,
+                "refusal must not mutate card/hash: {refusal}"
+            );
+            let stored: String = inner
+                .connection
+                .query_row(
+                    "SELECT content_json FROM cards WHERE card_id=?1",
+                    [card.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                from_json::<crate::chat::Session>("chat card", &stored).unwrap(),
+                source
+            );
             match refusal {
-                "old-schema" => assert_eq!(inner.connection.pragma_query_value::<u32, _>(None, "user_version", |row|row.get(0)).unwrap(), CURRENT_SCHEMA_VERSION - 1),
-                "foreign-keys" => assert_eq!(inner.connection.pragma_query_value::<i64, _>(None, "foreign_keys", |row|row.get(0)).unwrap(), 0),
-                "synchronous" => assert_eq!(inner.connection.pragma_query_value::<i64, _>(None, "synchronous", |row|row.get(0)).unwrap(), 0),
-                "journal" => assert_eq!(inner.connection.pragma_query_value::<String, _>(None, "journal_mode", |row|row.get(0)).unwrap(), "delete"),
+                "old-schema" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                        .unwrap(),
+                    CURRENT_SCHEMA_VERSION - 1
+                ),
+                "foreign-keys" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<i64, _>(None, "foreign_keys", |row| row.get(0))
+                        .unwrap(),
+                    0
+                ),
+                "synchronous" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<i64, _>(None, "synchronous", |row| row.get(0))
+                        .unwrap(),
+                    0
+                ),
+                "journal" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                        .unwrap(),
+                    "delete"
+                ),
                 _ => unreachable!(),
             }
         }
@@ -7191,8 +7288,11 @@ mod tests {
         static DESCRIPTOR_BUSY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     }
     fn descriptor_busy_gate(attempt: i32) -> bool {
-        if let Some((entered, proceed)) = DESCRIPTOR_BUSY_GATE.with(|gate| gate.borrow_mut().take()) {
-            if entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err() { return false; }
+        if let Some((entered, proceed)) = DESCRIPTOR_BUSY_GATE.with(|gate| gate.borrow_mut().take())
+        {
+            if entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err() {
+                return false;
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
         attempt < 5000
@@ -7208,14 +7308,23 @@ mod tests {
         let changes = store.lock_inner().unwrap().connection.total_changes();
         let mut winner = Connection::open(&path).unwrap();
         configure_connection(&winner, DEFAULT_BUSY_TIMEOUT).unwrap();
-        let transaction = winner.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let transaction = winner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         transaction.execute_batch("CREATE TABLE future_descriptor_owner (evidence TEXT NOT NULL) STRICT; INSERT INTO future_descriptor_owner VALUES ('keep future bytes');").unwrap();
-        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1).unwrap();
+        transaction
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
         let delayed = std::thread::spawn(move || {
             DESCRIPTOR_BUSY_GATE.with(|gate| *gate.borrow_mut() = Some((entered_tx, proceed_rx)));
-            store.lock_inner().unwrap().connection.busy_handler(Some(descriptor_busy_gate)).unwrap();
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .busy_handler(Some(descriptor_busy_gate))
+                .unwrap();
             let result = store.rebind_chat_descriptor(card, &source, &replacement);
             (store, card, source, result)
         });
@@ -7224,21 +7333,66 @@ mod tests {
         let database_before = std::fs::read(&path).unwrap();
         let wal_path = path.with_file_name("state.sqlite3-wal");
         let wal_before = std::fs::read(&wal_path).unwrap();
-        let schema_before: Vec<(String, Option<String>)> = winner.prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name").unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let schema_before: Vec<(String, Option<String>)> = winner
+            .prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         proceed_tx.send(()).unwrap();
         let (store, card, source, result) = delayed.join().unwrap();
-        assert!(matches!(result, Err(StoreError::UnsupportedSchema {found, supported}) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION));
-        assert!(matches!(store.rebind_chat_descriptor(card, &source, &source), Err(StoreError::UnsupportedSchema {..})), "future schema refuses idempotent return too");
-        assert_eq!(store.lock_inner().unwrap().connection.total_changes(), changes);
-        assert_eq!(std::fs::read(&path).unwrap(), database_before, "refusal must not write database bytes");
-        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before, "refusal must not append WAL frames");
-        let schema_after: Vec<(String, Option<String>)> = winner.prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name").unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(
+            matches!(result, Err(StoreError::UnsupportedSchema {found, supported}) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
+        assert!(
+            matches!(
+                store.rebind_chat_descriptor(card, &source, &source),
+                Err(StoreError::UnsupportedSchema { .. })
+            ),
+            "future schema refuses idempotent return too"
+        );
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            changes
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            database_before,
+            "refusal must not write database bytes"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            wal_before,
+            "refusal must not append WAL frames"
+        );
+        let schema_after: Vec<(String, Option<String>)> = winner
+            .prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(schema_before, schema_after);
-        assert_eq!(winner.query_row("SELECT evidence FROM future_descriptor_owner", [], |row| row.get::<_, String>(0)).unwrap(), "keep future bytes");
-        let stored: String = winner.query_row("SELECT content_json FROM cards WHERE card_id=?1", [card.to_string()], |row| row.get(0)).unwrap();
-        assert_eq!(from_json::<crate::chat::Session>("chat card", &stored).unwrap(), source);
+        assert_eq!(
+            winner
+                .query_row("SELECT evidence FROM future_descriptor_owner", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep future bytes"
+        );
+        let stored: String = winner
+            .query_row(
+                "SELECT content_json FROM cards WHERE card_id=?1",
+                [card.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            from_json::<crate::chat::Session>("chat card", &stored).unwrap(),
+            source
+        );
     }
 
     #[test]

@@ -58,9 +58,15 @@ type Reader = v77::Client;
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
     if request.protocol != 77 {
-        return Err("Source protocol has no qualified migration inspector; source windows remain usable".into());
+        return Err(
+            "Source protocol has no qualified migration inspector; source windows remain usable"
+                .into(),
+        );
     }
-    let proof = request.proof.as_ref().filter(|proof| proof.is_complete())
+    let proof = request
+        .proof
+        .as_ref()
+        .filter(|proof| proof.is_complete())
         .ok_or("Saved conversations have no authenticated source service")?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| "Source service namespace is unavailable")?;
@@ -91,7 +97,10 @@ fn inspect(request: Request) -> Result<(), String> {
             return Err("Saved pane inventory exceeds the migration inspection limit".into());
         }
     }
-    let saved = saved.into_iter().map(|(_, card, kind)| (card, kind)).collect::<Vec<_>>();
+    let saved = saved
+        .into_iter()
+        .map(|(_, card, kind)| (card, kind))
+        .collect::<Vec<_>>();
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => session.is_unstarted(),
         CardKind::Terminal(session) => terminal_ended(session),

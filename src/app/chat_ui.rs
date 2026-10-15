@@ -10293,13 +10293,31 @@ mod tests {
         for program in ["omp", "my-agent-wrapper", "bash"] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
             let card = app.durable.cards[0].id;
-            let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else { unreachable!() };
+            let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind
+            else {
+                unreachable!()
+            };
             session.launch.program = program.into();
-            assert_eq!(app.startup_pane_check(), Ok(false), "{program} is still loading");
-            app.cards.insert(card, CardRuntime::Failed("Fixture terminal failed to attach".into()));
-            assert!(app.startup_pane_check().unwrap_err().contains(&card.to_string()));
+            assert_eq!(
+                app.startup_pane_check(),
+                Ok(false),
+                "{program} is still loading"
+            );
+            app.cards.insert(
+                card,
+                CardRuntime::Failed("Fixture terminal failed to attach".into()),
+            );
+            assert!(
+                app.startup_pane_check()
+                    .unwrap_err()
+                    .contains(&card.to_string())
+            );
             app.cards.remove(&card);
-            assert_eq!(app.startup_pane_check(), Ok(false), "missing runtime is not ready");
+            assert_eq!(
+                app.startup_pane_check(),
+                Ok(false),
+                "missing runtime is not ready"
+            );
         }
     }
 

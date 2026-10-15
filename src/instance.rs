@@ -952,8 +952,10 @@ impl UiUpdateGuard {
         }
         preflight(self)?;
         if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut,
-                "Source inspection exceeded the window preparation allowance; source windows remain usable"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Source inspection exceeded the window preparation allowance; source windows remain usable",
+            ));
         }
         for slot in &slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
@@ -2374,14 +2376,21 @@ mod tests {
                         match listener.accept() {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                assert!(std::time::Instant::now() < deadline, "window request was not received");
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "window request was not received"
+                                );
                                 std::thread::sleep(Duration::from_millis(5));
                             }
                             Err(error) => panic!("window accept: {error}"),
                         }
                     };
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
                     actions.push(read_capped_line(&stream).unwrap());
                     writeln!(&stream, "ok").unwrap();
                 }
@@ -2408,7 +2417,10 @@ mod tests {
         assert!(guard.closed.is_empty());
         drop(guard);
         for (worker, completion) in workers {
-            assert_eq!(completion.recv_timeout(Duration::from_secs(6)).unwrap(), ["update-prepare", "update-cancel"]);
+            assert_eq!(
+                completion.recv_timeout(Duration::from_secs(6)).unwrap(),
+                ["update-prepare", "update-cancel"]
+            );
             worker.join().unwrap();
         }
     }

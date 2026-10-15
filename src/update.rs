@@ -885,9 +885,10 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
         ));
     }
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        crate::install_guard::preflight_source_panes(guard, None, false)
-    })?;
+    let windows = guard
+        .prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            crate::install_guard::preflight_source_panes(guard, None, false)
+        })?;
     // Saving and closing takes as long as the windows need, and another install
     // can land inside it. Reopen whatever is served now, so this relaunch does
     // not hand the reader a window that is already stale again.
@@ -1118,7 +1119,6 @@ pub(crate) fn inspect_source_panes(
     }
     Ok(())
 }
-
 
 /// Probe only a fixed, owned companion beside an authenticated editor process.
 /// No daemon startup command or inherited installer authority is passed.

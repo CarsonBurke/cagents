@@ -550,11 +550,17 @@ impl ControlClient {
         Self::from_stream_inner(stream, None)
     }
 
-    pub(crate) fn from_stream_with_deadline(stream: UnixStream, deadline: Instant) -> Result<Self, ControlError> {
+    pub(crate) fn from_stream_with_deadline(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
         Self::from_stream_inner(stream, Some(deadline))
     }
 
-    fn from_stream_inner(stream: UnixStream, deadline: Option<Instant>) -> Result<Self, ControlError> {
+    fn from_stream_inner(
+        stream: UnixStream,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -1675,18 +1681,34 @@ impl HandshakeClient {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let request = ClientEnvelope {
-            version: PROTOCOL_VERSION, request_id, proof: None,
-            request: ClientRequest::Connect { expected_host: None, resume: Vec::new() },
+            version: PROTOCOL_VERSION,
+            request_id,
+            proof: None,
+            request: ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
+            },
         };
         match deadline {
-            Some(deadline) => write_frame(&mut DeadlineWriter { stream: &mut self.stream, deadline }, &request)?,
+            Some(deadline) => write_frame(
+                &mut DeadlineWriter {
+                    stream: &mut self.stream,
+                    deadline,
+                },
+                &request,
+            )?,
             None => write_frame(&mut self.stream, &request)?,
         }
         let timeout = self.stream.read_timeout().ok().flatten();
         let envelope: ServerEnvelope = match deadline {
-            Some(deadline) => read_frame(&mut DeadlineReader { stream: &mut self.stream, deadline }),
+            Some(deadline) => read_frame(&mut DeadlineReader {
+                stream: &mut self.stream,
+                deadline,
+            }),
             None => read_frame(&mut self.stream),
-        }.map_err(|error| reply_error(error, timeout))?.ok_or(ControlError::ConnectionClosed)?;
+        }
+        .map_err(|error| reply_error(error, timeout))?
+        .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,

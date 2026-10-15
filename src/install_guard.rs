@@ -225,11 +225,20 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        if arguments.iter().any(|argument| argument == "--restart-daemon") {
+        if arguments
+            .iter()
+            .any(|argument| argument == "--restart-daemon")
+        {
             preflight_editor_companions(None)?;
         }
         guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-            preflight_source_panes(guard, None, arguments.iter().any(|argument| argument == "--restart-daemon"))
+            preflight_source_panes(
+                guard,
+                None,
+                arguments
+                    .iter()
+                    .any(|argument| argument == "--restart-daemon"),
+            )
         })?
     };
     let fd = script.as_raw_fd();

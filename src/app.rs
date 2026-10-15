@@ -22509,20 +22509,41 @@ mod tests {
         let mut app = context_inspector_test_app(false);
         let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
             .map(|program| restored_live_terminal(program, Exposure::Offscreen));
-        app.durable = Arc::new(WorkspaceState { cards: terminals.to_vec(), ..WorkspaceState::default() });
+        app.durable = Arc::new(WorkspaceState {
+            cards: terminals.to_vec(),
+            ..WorkspaceState::default()
+        });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.initialize_runtimes());
-        assert_eq!(app.terminal_starts_in_flight(), 0, "ordinary offscreen lifecycle stays deferred");
+        assert_eq!(
+            app.terminal_starts_in_flight(),
+            0,
+            "ordinary offscreen lifecycle stays deferred"
+        );
         assert!(app.restored_agent_attaches.is_empty());
         drop(app.qualify_startup_terminals());
         assert_eq!(app.terminal_starts_in_flight(), 1);
         assert_eq!(app.restored_agent_attaches.len(), 2);
         assert_eq!(app.startup_pane_check(), Ok(false));
-        let CardKind::Terminal(first) = &terminals[0].kind else { unreachable!() };
-        drop(app.update(Message::RestoredAgentAttached { card: terminals[0].id, terminal: first.id, result: Ok(None) }));
-        assert_eq!(app.terminal_starts_in_flight(), 1, "one next attach uses the existing bounded queue");
+        let CardKind::Terminal(first) = &terminals[0].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[0].id,
+            terminal: first.id,
+            result: Ok(None),
+        }));
+        assert_eq!(
+            app.terminal_starts_in_flight(),
+            1,
+            "one next attach uses the existing bounded queue"
+        );
         assert_eq!(app.restored_agent_attaches.len(), 1);
-        assert_ne!(app.startup_pane_check(), Ok(true), "unattached owners never qualify");
+        assert_ne!(
+            app.startup_pane_check(),
+            Ok(true),
+            "unattached owners never qualify"
+        );
     }
 
     #[test]

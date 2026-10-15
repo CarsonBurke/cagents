@@ -3985,26 +3985,49 @@ for line in sys.stdin:
         restore_upgrade(&host, &saved).unwrap();
         let replacement = resolve_upgrade(&host, &saved.source).unwrap();
         let evidence = Arc::new(crate::upgrade::handoff::Store::open(directory.path()).unwrap());
-        evidence.record_recovered(&[crate::upgrade::handoff::RecoveredChat {
-            evidence: saved.clone(), replacement: replacement.clone(), aliases: Vec::new(),
-        }]).unwrap();
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
         let handle = {
             let mut state = host.lock().unwrap();
             state.upgrade_evidence = Some(evidence.clone());
             state.chats[&saved.source.id].handle.clone()
         };
-        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_some());
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_some()
+        );
         close_terminal_actor(&host, saved.source.id, &handle).unwrap();
         assert!(!host.lock().unwrap().chats.contains_key(&saved.source.id));
-        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_none());
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_none()
+        );
         // An old close receipt must not clear evidence for another live actor.
         restore_upgrade(&host, &saved).unwrap();
         let replacement = resolve_upgrade(&host, &saved.source).unwrap();
-        evidence.record_recovered(&[crate::upgrade::handoff::RecoveredChat {
-            evidence: saved.clone(), replacement: replacement.clone(), aliases: Vec::new(),
-        }]).unwrap();
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
         close_terminal_actor(&host, saved.source.id, &handle).unwrap();
-        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_some());
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_some()
+        );
         let current = host.lock().unwrap().chats[&saved.source.id].handle.clone();
         close_terminal_actor(&host, saved.source.id, &current).unwrap();
     }
@@ -4052,7 +4075,9 @@ for line in sys.stdin:
                         .environment
                         .insert("HOME".into(), "/another-account".into());
                 }
-                2 => changed.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into()),
+                2 => {
+                    changed.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into())
+                }
                 _ => changed
                     .launch
                     .recipe
@@ -4068,19 +4093,31 @@ for line in sys.stdin:
     #[test]
     fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread() {
         const CHILD: &str = "CAGENTS_LEGACY_CODEX_UPGRADE_CONTRACT";
-        let exact = thread::current().name().expect("named owning contract").to_owned();
+        let exact = thread::current()
+            .name()
+            .expect("named owning contract")
+            .to_owned();
         if std::env::var(CHILD).as_deref() != Ok(exact.as_str()) {
-            use crate::repository::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+            use crate::repository::{
+                CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+            };
             // Keep private evidence on success AND failure; a child result does
             // not establish that every descendant has positively retired.
-            let root = tempfile::Builder::new().prefix("cagents-legacy-upgrade-")
-                .tempdir_in("/var/tmp").unwrap().keep();
+            let root = tempfile::Builder::new()
+                .prefix("cagents-legacy-upgrade-")
+                .tempdir_in("/var/tmp")
+                .unwrap()
+                .keep();
             for name in ["home", "run", "data", "config", "cache"] {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::create_dir(root.join(name)).unwrap();
-                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
             }
-            eprintln!("legacy upgrade owning evidence retained at {}", root.display());
+            eprintln!(
+                "legacy upgrade owning evidence retained at {}",
+                root.display()
+            );
             let command = CommandSpec::new(std::env::current_exe().unwrap())
                 .args(["--exact", exact.as_str(), "--nocapture", "--test-threads=1"])
                 .env(CHILD, &exact)
@@ -4089,16 +4126,26 @@ for line in sys.stdin:
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .env("XDG_CACHE_HOME", root.join("cache"))
-                .timeout(Duration::from_secs(35)).output_limits(128 * 1024, 128 * 1024);
-            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+                .timeout(Duration::from_secs(35))
+                .output_limits(128 * 1024, 128 * 1024);
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
             std::fs::write(root.join("stdout.log"), &output.stdout).unwrap();
             std::fs::write(root.join("stderr.log"), &output.stderr).unwrap();
             let output = output.require_success(&command.program).unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(stdout.lines().any(|line| line == "running 1 test")
-                && stdout.lines().any(|line| line == format!("test {exact} ... ok"))
-                && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-                "exact owning contract did not execute; retained evidence {}", root.display());
+            assert!(
+                stdout.lines().any(|line| line == "running 1 test")
+                    && stdout
+                        .lines()
+                        .any(|line| line == format!("test {exact} ... ok"))
+                    && stdout
+                        .lines()
+                        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "exact owning contract did not execute; retained evidence {}",
+                root.display()
+            );
             return;
         }
         use std::os::unix::net::UnixListener;
@@ -4118,21 +4165,34 @@ for line in sys.stdin:
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "exact Codex peer never connected");
+                        assert!(
+                            Instant::now() < deadline,
+                            "exact Codex peer never connected"
+                        );
                         thread::sleep(Duration::from_millis(2));
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut socket = tungstenite::accept(stream).unwrap();
             loop {
                 assert!(Instant::now() < deadline, "exact Codex peer did not close");
                 let message = match socket.read() {
                     Ok(message) => message,
-                    Err(tungstenite::Error::Io(error)) if matches!(error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
                     Err(_) => break,
                 };
                 let tungstenite::Message::Text(text) = message else {
@@ -4210,7 +4270,9 @@ for line in sys.stdin:
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
             chat::ItemContent::Text { text, .. } if text == "existing exact-thread answer")));
         handle.close().unwrap();
-        completion.recv_timeout(Duration::from_secs(3)).expect("bounded Codex fixture completion");
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("bounded Codex fixture completion");
         server.join().unwrap();
     }
 

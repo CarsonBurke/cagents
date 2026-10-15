@@ -54,8 +54,9 @@ impl Cagents {
                 match self.cards.get(&card.id) {
                     Some(CardRuntime::Terminal(surface))
                         if surface.terminal_id() == session.id
-                            && session.continuity.live_proof().is_some_and(|proof| proof.is_complete()
-                                && surface.host_proof().as_ref() == Some(&proof))
+                            && session.continuity.live_proof().is_some_and(|proof| {
+                                proof.is_complete() && surface.host_proof().as_ref() == Some(&proof)
+                            })
                             && !surface.snapshot().detached => {}
                     Some(CardRuntime::Loading) | None => pending = true,
                     _ => failures.push(card.id),

@@ -1,7 +1,16 @@
 //! Read-only ownership sampling for current-protocol source pane inspection.
 use super::{UpdateError, invalid};
-use crate::{control::{ControlClient, ControlError}, model::HostSessionProof};
-use std::{io, os::fd::AsRawFd, os::unix::net::UnixStream, path::{Path,PathBuf}, time::{Duration,Instant}};
+use crate::{
+    control::{ControlClient, ControlError},
+    model::HostSessionProof,
+};
+use std::{
+    io,
+    os::fd::AsRawFd,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 pub(crate) struct Peer {
     pid: u32,
@@ -60,13 +69,20 @@ pub(crate) fn inspect_identity(
     let deadline = Instant::now() + Duration::from_secs(5);
     let connected = (|| {
         if crate::device::is_remote() {
-            return Err(ControlError::Configure(io::Error::other("Source pane inspection requires the local daemon")));
+            return Err(ControlError::Configure(io::Error::other(
+                "Source pane inspection requires the local daemon",
+            )));
         }
-        let stream = crate::control::connect_control_socket(&socket, deadline.saturating_duration_since(Instant::now()))
-            .map_err(ControlError::Connect)?;
-        let peer = Peer::observe(&stream, &socket).map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
+        let stream = crate::control::connect_control_socket(
+            &socket,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .map_err(ControlError::Connect)?;
+        let peer = Peer::observe(&stream, &socket)
+            .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
         let client = ControlClient::from_stream_with_deadline(stream, deadline)?;
-        peer.verify(client.proof()).map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
+        peer.verify(client.proof())
+            .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
         Ok(client)
     })();
     match connected {
@@ -74,7 +90,10 @@ pub(crate) fn inspect_identity(
             if expected.is_some_and(|proof| proof != client.proof()) {
                 return Err(invalid("The source daemon changed before pane inspection"));
             }
-            Ok((crate::terminal_ipc::PROTOCOL_VERSION, Some(client.proof().clone())))
+            Ok((
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                Some(client.proof().clone()),
+            ))
         }
         Err(ControlError::Connect(error))
             if matches!(
