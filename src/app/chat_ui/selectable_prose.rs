@@ -233,9 +233,9 @@ struct Selectable {
 impl Selectable {
     /// Search backgrounds are paint-only: the same shaped prose spans remain
     /// authoritative for drawing, links, selection, and exact match geometry.
-    fn search_spans(&self,mut visit:impl FnMut(&std::ops::Range<usize>,bool)) {
-        for range in &self.matches {visit(range,false);}
-        if let Some(current)=&self.current {visit(current,true);}
+    fn search_spans(&self,mut visit:impl FnMut(&[std::ops::Range<usize>],bool)) {
+        visit(&self.matches,false);
+        if let Some(current)=&self.current {visit(std::slice::from_ref(current),true);}
     }
 
     #[cfg(test)]
@@ -497,8 +497,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
             }
         }
-        self.search_spans(|range,current| {
-            paint_ranges(renderer,paragraph,std::slice::from_ref(range),translation,
+        self.search_spans(|ranges,current| {
+            paint_ranges(renderer,paragraph,ranges,translation,
                 if current {design::accent_color(theme)} else {design::accent_wash(theme)});
         });
         let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
@@ -633,7 +633,7 @@ mod tests {
             size:design::TEXT_PROSE.into(),font:iced::Font::default(),
             target:Target {card:CardId::new(),generation:0} };
         let mut painted=Vec::new();
-        selectable.search_spans(|range,current|painted.push((range.clone(),current)));
+        selectable.search_spans(|ranges,current|painted.extend(ranges.iter().cloned().map(|range|(range,current))));
         assert_eq!(painted,vec![(0..3,false),(4..7,false),(4..7,true)],
             "the actual renderer paints all matched spans and a distinct current overlay");
         let spans = selectable.selected_spans(&State::default());
