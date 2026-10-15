@@ -74,7 +74,8 @@ impl PresenceHolding {
         let slot = context.reserve().map_err(FileIoError::Io)?;
         let parent = parent.try_clone().map_err(io_error)?;
         // Published only covers this exact protected parent. Shared or unknown
-        // parents refuse before creating or acquiring any presence artifacts.
+        // parents can return an unverified mkdir receipt; retain it without
+        // chmod or guessed cleanup rather than claiming no artifact exists.
         let namespace = fs_safety::DirectoryNamespace::acquire(&parent).map_err(io_error)?;
         let leaf = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
         let creation = match create(&namespace, &parent, Path::new(&leaf)) {
@@ -97,7 +98,18 @@ impl PresenceHolding {
         let publication = match creation {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor staging name already exists and was preserved.".into())),
-            fs_safety::DirectoryCreation::Unverified { reason, .. } => return Err(FileIoError::Io(format!("Editor staging ownership could not be verified; the entry was preserved: {reason}"))),
+            fs_safety::DirectoryCreation::Unverified { directory, reason } => {
+                let message = format!("Editor staging ownership could not be verified; the entry was preserved: {reason}");
+                let authority = slot.retain(message.clone(), move || {
+                    // Ownership was never established. Never chmod/delete or
+                    // adopt a replacement from a diagnostic public spelling.
+                    if directory.metadata().map_err(|error| error.to_string())?.nlink() != 0 {
+                        return Err("Creation ownership remains unverified. Inspect and remove the retained entry manually before retrying; no entry was changed.".into());
+                    }
+                    fs_safety::sync_directory(&parent).map_err(|error| error.to_string())
+                });
+                return Err(FileIoError::Recovery { message, authority });
+            },
         };
         let holding = Self { publication, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
         let prepared = (|| {
@@ -203,6 +215,30 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn unverified_actual_mkdir_keeps_typed_receipt_without_chmod_or_guessed_cleanup() {
+        let directory = tempfile::tempdir().unwrap(); let other = tempfile::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap(); let other = Root::open(other.path()).unwrap();
+        let namespace = fs_safety::DirectoryNamespace::acquire(&other).unwrap();
+        let context = RecoveryContext::with_guard((), 0).unwrap(); let mut created = None;
+        let result = PresenceHolding::create_in_context_with(&root, std::ffi::OsStr::new("file"), &context, |_, parent, leaf| {
+            created = Some(leaf.to_path_buf());
+            fs_safety::create_directory_in_namespace(&namespace, parent, leaf, 0o700)
+        });
+        let error = match result { Err(error) => error, Ok(_) => panic!("different namespace cannot prove creation") };
+        let authority = error.recovery_authority().expect("unverified native mkdir keeps a live carrier");
+        let leaf = created.unwrap(); let metadata = fs_safety::metadata_beneath(&root, &leaf).unwrap();
+        assert!(authority.retry().is_err());
+        let after = fs_safety::metadata_beneath(&root, &leaf).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino(), metadata.mode()), (after.dev(), after.ino(), after.mode()));
+        fs_safety::remove_directory_within(&root, leaf.as_os_str()).unwrap();
+        // A replacement at the same spelling must remain untouched. Only the
+        // retained original's unlink state permits authority resolution.
+        fs::create_dir(directory.path().join(&leaf)).unwrap(); fs::write(directory.path().join(&leaf).join("foreign"), "keep").unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert_eq!(fs::read(directory.path().join(leaf).join("foreign")).unwrap(), b"keep");
+    }
+
     #[test]
     fn actual_prepublication_error_retains_preparation_and_cleanup_lease() {
         let directory = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
