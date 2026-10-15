@@ -48,6 +48,7 @@ struct PendingRemoval {
     batch: Option<uuid::Uuid>,
     kind: CardKind,
     observed_chat: Option<crate::chat::Session>,
+    waiting_for_editor_write: bool,
 }
 
 pub(super) fn same_chat_removal_source(
@@ -609,6 +610,19 @@ impl Cagents {
         }
     }
 
+    /// A local scope move must not overtake this pane's already captured
+    /// Close/End/Hide decision or asynchronous retirement. This is not a
+    /// daemon-wide lock and grants no execution or membership authority.
+    pub(super) fn pane_close_owned(&self,card:CardId)->bool {
+        self.pending_card_removal_target(card).is_some()
+            || self.workspace.pending_close().is_some_and(|pending|pending.unmounting==card)
+            || self.terminal_close_pending(card)
+            || self.pane_close_batch_for(card).is_some()
+            || self.conversation_close_owns_pane(card)
+            || self.terminal_confirmation_owns_pane(card)
+            || self.dirty_repository_close.as_ref().is_some_and(|close|close.card==card || close.remaining.contains(&card))
+    }
+
     pub(super) fn terminal_close_pending(&self, card: CardId) -> bool {
         self.terminal_close
             .as_ref()
@@ -764,6 +778,10 @@ impl Cagents {
     /// card ran must already have ended or been closed through the daemon,
     /// as a worktree's deletion retires the cards it held.
     pub(super) fn retire_offstrip_card(&mut self, card: CardId) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.status=Some(TransientNotice::warning("The editor was kept until its file recovery finishes."));
+            return Task::none();
+        }
         if self.workspace.order().any(|id| id == card)
             || self
                 .card_state(card)
@@ -814,6 +832,11 @@ impl Cagents {
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
             ));
             self.stop_pane_close_batch(batch);
+            return Task::none();
+        }
+        if self.card_has_editor_recovery(card) {
+            self.stop_pane_close_batch(batch);
+            self.status=Some(TransientNotice::warning("Resolve file recovery before closing this editor."));
             return Task::none();
         }
         if self.terminal_start_in_flight(card)
@@ -1179,6 +1202,27 @@ impl Cagents {
                 _ => true,
             }
     }
+    /// Resume only the previously admitted removal after its editor write
+    /// settles. The queued message keeps the original nonce/source/origin.
+    /// Workspace publication calls this after releasing its actual buffers.
+    pub(super) fn resume_waiting_editor_closes(&mut self) -> Task<Message> {
+        let ready = self.terminal_close_bindings.pending_removals.values()
+            .filter(|pending| pending.waiting_for_editor_write)
+            .filter(|pending| matches!(self.cards.get(&pending.target.card),
+                Some(CardRuntime::Repository(runtime)) if !runtime.is_saving()))
+            .map(|pending| pending.target).collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for target in ready {
+            let Some(pending) = self.terminal_close_bindings.pending_removals.get_mut(&target.card)
+                .filter(|pending| pending.target == target) else { continue; };
+            // An emitted retry is still source/nonce checked on receipt. Do
+            // not enqueue duplicates while another completion is delivered.
+            pending.waiting_for_editor_write = false;
+            tasks.push(cosmic::task::message(Message::CommitCloseTarget(target)));
+        }
+        Task::batch(tasks)
+    }
+
     /// Retire only this exact operation, including stale lifecycle outcomes.
     /// Nested Option distinguishes a direct origin from a missing operation.
     pub(super) fn retire_card_removal(
@@ -1260,6 +1304,7 @@ impl Cagents {
                         batch,
                         kind,
                         observed_chat,
+                        waiting_for_editor_write: false,
                     });
                 Some(handoff)
             }
@@ -1328,6 +1373,32 @@ impl Cagents {
             self.stop_pane_close_batch(origin);
             self.status = Some(TransientNotice::warning(
                 "The pending pane removal no longer matches its captured source. Its current pane and history were kept.",
+            ));
+            return None;
+        }
+        if self.card_has_editor_recovery(id) {
+            self.retire_card_removal(target);
+            let _=self.workspace.cancel_close(id);
+            self.stop_pane_close_batch(origin);
+            self.status=Some(TransientNotice::warning("The editor was kept because file recovery is pending. Resolve recovery before choosing Close again."));
+            return None;
+        }
+        if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()) {
+            self.terminal_close_bindings.pending_removals.get_mut(&id)?
+                .waiting_for_editor_write = true;
+            self.status = Some(TransientNotice::warning(
+                "This pane is saving or applying edits. Close is waiting for that write to finish; its buffer and pending request were kept.",
+            ));
+            return None;
+        }
+        if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) {
+            // A publication or edit may have changed this buffer after the
+            // original consent. Completing a write grants no discard consent.
+            self.retire_card_removal(target);
+            let _ = self.workspace.cancel_close(id);
+            self.stop_pane_close_batch(origin);
+            self.status = Some(TransientNotice::warning(
+                "This editor changed while Close was pending. Its buffer was kept; save or discard those changes before choosing Close again.",
             ));
             return None;
         }
@@ -2006,6 +2077,112 @@ mod tests {
             .bound
             .insert(card, captured.clone());
         (app, card, captured)
+    }
+
+    #[test]
+    fn move_busy_ownership_covers_held_removal_and_initial_batch_selection_only() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let card=app.workspace.focused().unwrap();let other=CardId::new();
+        let _held=app.request_card_removal(card);
+        let target=app.pending_card_removal_target(card).unwrap();
+        assert!(app.pane_close_owned(card));assert!(!app.pane_close_owned(other));
+        app.retire_card_removal(target);let _=app.workspace.cancel_close(card);
+        assert!(!app.pane_close_owned(card));
+        let _held=app.close_cards_in_order(vec![card]);
+        assert!(app.pane_close_owned(card));assert!(!app.pane_close_owned(other));
+        let batch=app.pane_close_batch_for(card);app.stop_pane_close_batch(batch);
+        assert!(!app.pane_close_owned(card));
+    }
+
+    #[test]
+    fn actual_reserved_close_cannot_drop_new_editor_recovery_without_an_active_save() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let card=app.workspace.focused().unwrap();
+        let (runtime,_)=RepositoryRuntime::open_fixture(card,"source.rs","clean");
+        app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+        let _held=app.request_card_removal(card);
+        let target=app.pending_card_removal_target(card).expect("real typed removal reserved before recovery arrives");
+        let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("original held files".into(),||Ok(()));
+        let Some(CardRuntime::Repository(runtime))=app.cards.get_mut(&card) else {panic!()};
+        runtime.retain_editor_recovery(authority.clone(),"needs actual recovery".into());
+        assert!(!runtime.is_dirty());assert!(!runtime.is_saving());
+        drop(app.update(Message::CommitCloseTarget(target)));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id|id==card));
+        assert!(app.card_has_editor_recovery(card));assert!(!authority.is_resolved());
+        assert!(app.pending_card_removal_target(card).is_none());assert!(app.workspace.pending_close().is_none());
+        assert!(app.status.as_ref().is_some_and(|notice|notice.message.contains("recovery")));
+    }
+
+    #[tokio::test]
+    async fn pending_editor_write_retains_removal_nonce_then_preserves_later_edits() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut app, card, _) = bound_fixture();
+        app.workspace_model = Default::default();
+        app.shared_views = Default::default();
+        let (runtime, completion) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let descriptor = runtime.descriptor.clone();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.request_card_removal(card));
+        let target = app.pending_card_removal_target(card).unwrap();
+        drop(app.update(Message::CommitCloseTarget(target)));
+        assert_eq!(app.pending_card_removal_target(card), Some(target));
+        assert!(app.card_removal_current(target));
+        assert!(app.terminal_close_bindings.pending_removals[&card].waiting_for_editor_write);
+        assert!(app.workspace.card(card).is_some());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.recently_closed.is_empty());
+        let task = app.update(Message::Repository(completion));
+        let mut retry = None;
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::CommitCloseTarget(current))) = action {
+                    assert!(retry.replace(current).is_none(), "only one original retry may be emitted");
+                }
+            }
+        }
+        assert_eq!(retry, Some(target));
+        assert!(!app.terminal_close_bindings.pending_removals[&card].waiting_for_editor_write);
+        drop(app.update(Message::CommitCloseTarget(retry.unwrap())));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("buffer retained"); };
+        assert!(!runtime.is_saving());
+        assert!(runtime.blocks_navigation(), "later edits and durability recovery need fresh consent");
+        assert_eq!(runtime.editor_text().as_deref(), Some("A\n"));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_some());
+        assert!(app.pending_card_removal_target(card).is_none());
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.recently_closed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn emitted_editor_write_retry_cannot_consume_a_new_same_card_removal() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut app, card, _) = bound_fixture();
+        app.workspace_model = Default::default(); app.shared_views = Default::default();
+        let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let descriptor = runtime.descriptor.clone();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.request_card_removal(card)); let old = app.pending_card_removal_target(card).unwrap();
+        drop(app.update(Message::CommitCloseTarget(old)));
+        // The real publication completion releases its runtime before calling
+        // the retry helper. Model that boundary with an otherwise clean viewer.
+        app.cards.insert(card, CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(descriptor, &[]))));
+        let retry = app.resume_waiting_editor_closes();
+        let mut stream = iced::runtime::task::into_stream(retry).unwrap();
+        let Some(iced::runtime::Action::Output(cosmic::Action::App(Message::CommitCloseTarget(held)))) = stream.next().await else { panic!("captured retry"); };
+        assert_eq!(held, old);
+        app.retire_card_removal(old); app.workspace.cancel_close(card).unwrap();
+        drop(app.request_card_removal(card)); let current = app.pending_card_removal_target(card).unwrap();
+        assert_ne!(old, current);
+        drop(app.update(Message::CommitCloseTarget(held)));
+        assert_eq!(app.pending_card_removal_target(card), Some(current));
+        assert!(app.card_removal_current(current));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.recently_closed.is_empty());
     }
 
     fn descriptor_for(captured: &CapturedTerminal) -> crate::terminal::ipc::TerminalDescriptor {

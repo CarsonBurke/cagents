@@ -19295,6 +19295,7 @@ impl Application for Cagents {
                         tasks.push(self.save_settings_task(false));
                     }
                 }
+                tasks.push(self.resume_waiting_editor_closes());
                 tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
