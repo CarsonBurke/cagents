@@ -2646,6 +2646,7 @@ pub struct RepositoryRuntime {
     /// name and an object id.
     diffs: Vec<(DiffBasis, DiffState)>,
     git_read_source: Option<crate::repository::GitReadSource>,
+    diff_surface_owner: crate::model::OperationId,
     #[cfg(test)]
     git_read_fixture: Option<Arc<tempfile::TempDir>>,
     working_diff: WorkingDiffRefresh,
@@ -2812,6 +2813,7 @@ impl RepositoryRuntime {
         Self {
             command_incarnation: Arc::new(()),
             git_read_source,
+            diff_surface_owner: crate::model::OperationId::new(),
             #[cfg(test)]
             git_read_fixture: None,
             directory_only: descriptor.selected_file.is_some(),
@@ -3246,7 +3248,7 @@ impl RepositoryRuntime {
         {
             layout.set_folding(model, enabled);
         }
-        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.advance_diff_layout_revision();
         self.apply_diff_viewport(anchor);
         self.capture_diff_viewport();
         self.restore_visible_scroll()
@@ -7196,7 +7198,7 @@ impl RepositoryRuntime {
         if let Some(DiffState::Ready(_, layout)) = &mut self.disk_comparison {
             layout.set_row_heights(typography.line_height, typography.fold_height());
         }
-        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.advance_diff_layout_revision();
         self.apply_diff_viewport(anchor);
     }
 
@@ -7711,7 +7713,7 @@ impl RepositoryRuntime {
                     && self.disk_comparison.is_some()
                     && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash))
                 {
-                    self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+                    self.advance_diff_layout_revision();
                     let mut state = DiffState::ready(match model {
                         Some(model) => RenderedDiff::Text {
                             model: Arc::new(model),
@@ -9516,6 +9518,14 @@ impl RepositoryRuntime {
             .map(|(_, state)| state)
     }
 
+    fn advance_diff_layout_revision(&mut self) {
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        // A native gesture belongs to this actual layout installation. A new
+        // owner also prevents counter wrap or a replacement Runtime from
+        // reviving an earlier pointer press in a named widget cache.
+        self.diff_surface_owner = crate::model::OperationId::new();
+    }
+
     fn set_diff_state(&mut self, basis: DiffBasis, mut state: DiffState) {
         if basis == self.diff_basis {
             self.clear_diff_selection();
@@ -9525,7 +9535,7 @@ impl RepositoryRuntime {
             let typography = self.diff_typography();
             layout.set_row_heights(typography.line_height, typography.fold_height());
         }
-        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.advance_diff_layout_revision();
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         // The rows on screen before a rebuild, which a rebuild must not move:
         // display rows and pixel offsets both change meaning with the model.
@@ -10636,7 +10646,7 @@ impl RepositoryRuntime {
         }
         // Display rows moved: annotation measurements taken against the old
         // rows no longer name the rows they measured.
-        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.advance_diff_layout_revision();
         self.apply_diff_viewport(anchor);
         self.capture_diff_viewport();
         self.restore_visible_scroll()
@@ -25423,7 +25433,7 @@ mod tests {
     /// hand back the pixels it drew.
     ///
     /// One per render: the renderer accumulates the layers it is drawn into.
-    fn headless_renderer() -> cosmic::Renderer {
+    pub(super) fn headless_renderer() -> cosmic::Renderer {
         use cosmic::iced::Pixels;
         use cosmic::iced::advanced::renderer::Headless;
 
