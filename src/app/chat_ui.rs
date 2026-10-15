@@ -4070,6 +4070,12 @@ impl Cagents {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
 
+    /// A context-menu destination is authoritative even if a focused shell
+    /// has changed its current directory outside that worktree.
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
+    }
+
     fn preferred_chat_provider(&self) -> Provider {
         self.workspace
             .focused()

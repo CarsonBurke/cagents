@@ -188,7 +188,8 @@ impl Cagents {
                 Task::batch([insert,settled])
             }
             Intent::NewTerminal(path) => self.add_terminal(path),
-            Intent::NewNativeThread => self.new_native_thread(),
+            Intent::NewNativeThread => self.active_workspace.clone().map_or_else(Task::none,
+                |directory|self.new_native_thread_at(directory)),
             Intent::Chat {session,beside,ephemeral} => self.insert_chat_card_with_lifetime(session,beside,ephemeral,None),
             Intent::Resume {entry,replace} => self.commit_resumed_conversation(entry,replace),
             Intent::Focus {card,activate} => {
@@ -306,6 +307,28 @@ mod tests {
         let (selected,_,_) = prepare_target(path.clone(),vec![(path.clone(),Some(path.clone()),true)],Some(path.clone()),&monitor,
             |_|panic!("unchanged root was canonicalized again"), |_|Ok(None)).unwrap();
         assert_eq!(selected,path);
+    }
+
+    #[test]
+    fn committed_native_thread_uses_worktree_scope_instead_of_focused_terminal_cwd() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let primary = PathBuf::from("/project");
+        let linked = PathBuf::from("/project/worktrees/linked");
+        app.sidebar_model.projects = vec![SidebarProject::new(ProjectId::new(),RepositoryId::new(),"project".into(),primary.clone(),
+            [&primary,&linked].into_iter().map(|path|SidebarWorktree::new(crate::model::WorktreeId::new(),path.clone(),None,false,false,None,None,None)).collect(),Vec::new())];
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = &mut card.kind else {unreachable!()};
+        session.launch.working_directory = linked.clone();
+        let terminal = card.id;
+        Arc::make_mut(&mut app.durable).cards.push(card);
+        drop(app.select_worktree(linked.clone(),false));
+        drop(app.workspace.focus(terminal));
+        app.terminal_working_directories.insert(terminal,primary.clone());
+        assert_eq!(app.terminal_directory(),Some(primary));
+        drop(app.finish_worktree_selection(Intent::NewNativeThread));
+        let chat = app.durable.cards.iter().find_map(|card|match &card.kind {CardKind::Chat(session)=>Some(session),_=>None}).unwrap();
+        assert_eq!(chat.launch.recipe.working_directory,linked);
+        assert_eq!(app.active_workspace.as_ref(),Some(&linked));
     }
 
     #[test]
