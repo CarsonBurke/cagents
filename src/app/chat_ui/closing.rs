@@ -1037,13 +1037,17 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original chat"); };
         let target = runtime.target;
         app.chat_ui.phases.insert(card, Phase::Returning { target, local: None, close_requested: false });
-        drop(app.begin_chat_close(card));
+        let _original_delivery = queued(app.close_cards_in_order(vec![card]));
+        let batch = app.pane_close_batch_for(card);
+        assert!(batch.is_some());
+        drop(app.begin_chat_close_for(card, batch));
         assert!(app.chat_ui.end_requests.contains_key(&target));
         app.workspace_model.views[0].scope = crate::workspace_model::views::Scope::Worktree {
             repository: directory.path().into(), path: directory.path().join("new-owner"),
         };
         drop(app.update(Message::ChatUi(super::super::Action::HandoffFinished(target, Err("original return failed".into())))));
         assert!(app.chat_ui.end_requests.is_empty());
+        assert!(!app.pane_close_batch_current(batch), "failed old intent must not leave a dormant selection");
         assert!(app.chat_ui.phases.is_empty());
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.workspace.order().any(|id| id == card));

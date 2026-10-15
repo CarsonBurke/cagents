@@ -8291,6 +8291,7 @@ impl Cagents {
                 let terminal = match result {
                     Ok(terminal) => terminal,
                     Err(error) => {
+                        if !close { self.stop_pane_close_batch(batch); }
                         self.status = Some(TransientNotice::error(error));
                         self.reread_chat_activity(target);
                         return if close {
