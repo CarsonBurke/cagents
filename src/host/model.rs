@@ -28,7 +28,7 @@ mod automation_archive_clock;
 mod automation_membership;
 mod agent_locations;
 mod session_locations;
-pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
+pub(crate) use agent_locations::{AcceptedDirectory, AgentMove, Location as AgentLocation};
 pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
 mod automation_extensions_schema;
 mod automation_proposals;

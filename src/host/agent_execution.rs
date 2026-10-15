@@ -208,15 +208,9 @@ pub(super) fn submit(
                 .ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
         })
         .transpose()?;
-    let directory_identity = pinned_directory
-        .as_ref()
-        .map(|directory| {
-            directory
-                .metadata()
-                .map(|metadata| crate::agent_execution::DirectoryIdentity::from_metadata(&metadata))
-                .map_err(|error| error.to_string())
-        })
-        .transpose()?;
+    let directory_observation=pinned_directory.as_ref().zip(selected.as_ref()).map(|(directory,spec)| {
+        super::model::AcceptedDirectory::observe(&spec.target.directory,directory.clone())
+    }).transpose()?;
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -224,7 +218,7 @@ pub(super) fn submit(
             &origin,
             &request,
             selected.as_ref(),
-            directory_identity,
+            directory_observation,
             now(),
         )?;
     announce(host, &registry);

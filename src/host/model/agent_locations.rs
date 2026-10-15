@@ -82,16 +82,45 @@ fn insert(db: &Connection, agent: &Agent) -> Result<(), String> {
     Ok(())
 }
 
-/// Pin a real selected directory at first acceptance. Legacy records keep
-/// their existing policy; opening a replacement old path cannot reapprove it.
-pub(super) fn insert_new(db: &Connection, agent: &Agent) -> Result<(), String> {
-    insert(db, agent)?;
-    if let Ok(directory) = open_directory(&agent.spec.target.directory) {
-        let identity = DirectoryIdentity::from_metadata(
-            &directory.metadata().map_err(|error| error.to_string())?,
-        );
-        db.execute("INSERT INTO agent_policies(agent,directory) VALUES (?1,?2) ON CONFLICT(agent) DO UPDATE SET directory=excluded.directory WHERE agent_policies.directory IS NULL", params![agent.id.to_string(), encode(&identity)?]).map_err(|error| error.to_string())?;
+/// Nonserialized observation of the caller's actual retained descriptor.
+/// Construct on the owning worker BEFORE taking Registry/the writer TX. The
+/// private fields prevent a recipe/path or bare inode tuple granting approval.
+#[derive(Debug)]
+pub(crate) struct AcceptedDirectory {
+    path:PathBuf,
+    identity:DirectoryIdentity,
+    _directory:std::sync::Arc<File>,
+}
+impl AcceptedDirectory {
+    pub(crate) fn observe(path:&Path,directory:std::sync::Arc<File>)->Result<Self,String> {
+        Self::observe_with(path,directory,|path|std::fs::symlink_metadata(path))
     }
+    fn observe_with(path:&Path,directory:std::sync::Arc<File>,read_named:impl FnOnce(&Path)->std::io::Result<std::fs::Metadata>)->Result<Self,String> {
+        if !path.is_absolute()||path.components().any(|component|matches!(component,std::path::Component::ParentDir)) {
+            return Err("The selected agent directory must have its original absolute path".into());
+        }
+        let metadata=directory.metadata().map_err(|error|error.to_string())?;
+        let named=read_named(path).map_err(|error|error.to_string())?;
+        let identity=DirectoryIdentity::from_metadata(&metadata);
+        if !metadata.is_dir()||!named.is_dir()||identity!=DirectoryIdentity::from_metadata(&named) {
+            return Err("The selected agent directory changed before acceptance".into());
+        }
+        Ok(Self{path:path.to_owned(),identity,_directory:directory})
+    }
+    fn require_target(&self,path:&Path)->Result<DirectoryIdentity,String> {
+        if self.path!=path {return Err("The captured agent directory belongs to another selected target".into());}
+        Ok(self.identity)
+    }
+}
+
+/// Metadata-only acceptance insert. The original observation was made outside
+/// Registry/the writer; None remains explicitly unqualified. Never reopen the
+/// current path here or in the scheduler's caller-owned firing transaction.
+pub(super) fn insert_new(db:&Connection,agent:&Agent,directory:Option<&AcceptedDirectory>)->Result<(),String> {
+    let identity=directory.map(|observation|observation.require_target(&agent.spec.target.directory)).transpose()?;
+    insert(db,agent)?;
+    let encoded=identity.as_ref().map(encode).transpose()?;
+    db.execute("INSERT INTO agent_policies(agent,directory) VALUES (?1,?2) ON CONFLICT(agent) DO UPDATE SET directory=excluded.directory WHERE agent_policies.directory IS NULL",params![agent.id.to_string(),encoded]).map_err(|error|error.to_string())?;
     Ok(())
 }
 
@@ -330,8 +359,9 @@ mod tests {
                 closed: Vec::new(),
             })
             .unwrap();
+        let observed=AcceptedDirectory::observe(repository,std::sync::Arc::new(open_directory(repository).unwrap())).unwrap();
         registry
-            .submit_agent(
+            .submit_agent_with_directory(
                 &Origin::User,
                 &Submit {
                     name: None,
@@ -351,6 +381,8 @@ mod tests {
                     prompt: "fixture only, no provider starts".into(),
                     idempotency_key: key.into(),
                 },
+                None,
+                Some(observed),
                 1,
             )
             .unwrap()
@@ -503,26 +535,89 @@ mod tests {
 
     #[test]
     fn acceptance_pins_the_callers_descriptor_and_rolls_back_on_a_racing_replacement() {
-        let fixture = tempfile::tempdir().unwrap();
-        let old = fixture.path().join("old");
-        std::fs::create_dir(&old).unwrap();
-        let mut registry = Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();
-        let first = accepted(&mut registry, &old, "original");
-        let pinned = registry.agent_directory(first.agent.id).unwrap().unwrap();
-        let request = registry.agent_request(first.run.id).unwrap();
-        let moved = fixture.path().join("moved");
-        std::fs::rename(&old, &moved).unwrap();
-        std::fs::create_dir(&old).unwrap();
-        let mut racing = request;
-        racing.idempotency_key = "racing-replacement".into();
-        let before = registry.agents(None).unwrap().len();
-        assert!(
-            registry
-                .submit_agent_with_directory(&Origin::User, &racing, None, Some(pinned), 2)
-                .unwrap_err()
-                .contains("changed during acceptance")
-        );
-        assert_eq!(registry.agents(None).unwrap().len(), before);
+        let fixture=tempfile::tempdir().unwrap();let old=fixture.path().join("old");std::fs::create_dir(&old).unwrap();
+        let mut registry=Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();
+        let first=accepted(&mut registry,&old,"original");
+        let original=std::sync::Arc::new(open_directory(&old).unwrap());
+        let moved=fixture.path().join("moved");std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
+        let before=registry.model().unwrap();
+        assert!(AcceptedDirectory::observe(&old,original).unwrap_err().contains("changed before acceptance"));
+        assert_eq!(registry.model().unwrap(),before);
+        assert!(registry.agent_execution_directory(first.agent.id).is_err(),"the original approved directory cannot become the replacement");
+    }
+
+    #[test]
+    fn uncaptured_acceptance_and_scheduler_transaction_do_not_approve_an_existing_directory() {
+        let fixture=tempfile::tempdir().unwrap();let path=fixture.path().join("project");std::fs::create_dir(&path).unwrap();
+        let mut registry=Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();
+        let first=accepted(&mut registry,&path,"qualified");let mut request=registry.agent_request(first.run.id).unwrap();
+        request.idempotency_key="unobserved-acceptance".into();
+        let unqualified=registry.submit_agent_with_directory(&Origin::User,&request,None,None,2).unwrap();
+        assert_eq!(registry.agent_directory(unqualified.agent.id).unwrap(),None,"a real existing path cannot silently upgrade an absent observation");
+        assert_eq!(registry.agent_location(unqualified.agent.id).unwrap().directory,path);
+        request.idempotency_key="caller-owned-scheduler-transaction".into();
+        let before=registry.model().unwrap();
+        let tx=registry.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let scheduled=Registry::submit_agent_in(&tx,&Origin::User,&request,3).unwrap();
+        let approved:Option<String>=tx.query_row("SELECT directory FROM agent_policies WHERE agent=?1",[scheduled.agent.id.to_string()],|row|row.get(0)).unwrap();
+        assert!(approved.is_none(),"no-I/O scheduler acceptance carries no newly observed directory approval");
+        assert_eq!(read(&tx,&scheduled.agent).unwrap().directory,path);
+        tx.rollback().unwrap();assert_eq!(registry.model().unwrap(),before);
+        assert!(registry.agent(scheduled.agent.id).is_err(),"scheduler remains inside its caller's real atomic rollback");
+    }
+
+    #[test]
+    fn observed_original_policy_is_not_replaced_by_the_current_path_and_failed_acceptance_rolls_back_every_row() {
+        let fixture=tempfile::tempdir().unwrap();let old=fixture.path().join("old");std::fs::create_dir(&old).unwrap();
+        let mut registry=Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();let first=accepted(&mut registry,&old,"first");
+        let mut request=registry.agent_request(first.run.id).unwrap();request.idempotency_key="observed-before-replacement".into();
+        let directory=std::sync::Arc::new(open_directory(&old).unwrap());
+        let observation=AcceptedDirectory::observe(&old,directory.clone()).unwrap();let original=observation.identity;
+        let moved=fixture.path().join("moved");std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
+        let observed=registry.submit_agent_with_directory(&Origin::User,&request,None,Some(observation),2).unwrap();
+        assert_eq!(registry.agent_directory(observed.agent.id).unwrap(),Some(original),"the TX consumes original evidence instead of reopening the replacement");
+        assert!(registry.agent_execution_directory(observed.agent.id).unwrap_err().contains("replaced"),"a later named-path replacement remains visibly refused before dispatch");
+        // An already-replaced name is rejected by the owning observation
+        // boundary, before any writer or acceptance is entered.
+        assert!(AcceptedDirectory::observe(&old,directory).is_err());
+        let replacement=std::sync::Arc::new(open_directory(&old).unwrap());
+        let observation=AcceptedDirectory::observe(&old,replacement.clone()).unwrap();
+        let before=registry.model().unwrap();
+        let counts=|registry:&Registry|["agents","agent_runs","agent_locations","agent_policies"].map(|table|registry.db.query_row(&format!("SELECT count(*) FROM {table}"),[],|row|row.get::<_,u64>(0)).unwrap());
+        let original_counts=counts(&registry);request.idempotency_key="rollback-after-policy".into();
+        registry.db.execute_batch("CREATE TEMP TRIGGER fail_accepted_run BEFORE INSERT ON agent_runs BEGIN SELECT RAISE(ABORT,'fixture reached run insert after location and policy'); END;").unwrap();
+        let error=registry.submit_agent_with_directory(&Origin::User,&request,None,Some(observation),3).unwrap_err();
+        assert!(error.contains("fixture reached run insert after location and policy"),"{error}");
+        assert_eq!(counts(&registry),original_counts);assert_eq!(registry.model().unwrap(),before);
+        registry.db.execute_batch("DROP TRIGGER fail_accepted_run").unwrap();
+        let mut wrong=request.clone();let Destination::New(spec)=&mut wrong.destination else{unreachable!()};spec.target.directory=moved;
+        let observation=AcceptedDirectory::observe(&old,replacement).unwrap();
+        assert!(registry.submit_agent_with_directory(&Origin::User,&wrong,None,Some(observation),4).unwrap_err().contains("another selected target"));
+        assert_eq!(counts(&registry),original_counts);
+    }
+
+    #[test]
+    fn held_actual_directory_observation_does_not_hold_the_registry_writer() {
+        let fixture=tempfile::tempdir().unwrap();let path=fixture.path().join("project");std::fs::create_dir(&path).unwrap();
+        let database=fixture.path().join("registry.sqlite3");let mut registry=Registry::at(&database).unwrap();
+        let first=accepted(&mut registry,&path,"initial");let mut request=registry.agent_request(first.run.id).unwrap();request.idempotency_key="observed-on-worker".into();
+        let other=Registry::at(&database).unwrap();
+        let pin=std::sync::Arc::new(open_directory(&path).unwrap());let directory=path.clone();
+        let (entered,ready)=crossbeam_channel::bounded(1);let (release,released)=crossbeam_channel::bounded(1);
+        let worker=std::thread::spawn(move||AcceptedDirectory::observe_with(&directory,pin,|path| {
+            entered.send(()).unwrap();released.recv_timeout(std::time::Duration::from_secs(5)).unwrap();std::fs::symlink_metadata(path)
+        }));
+        ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let started=std::time::Instant::now();
+        // Actual second SQLite connection/writer commits while the worker is
+        // held at its real metadata read boundary. This is a deterministic
+        // admission fixture, not a measured network-filesystem stall.
+        let tx=other.db.unchecked_transaction().unwrap();
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0",[]).unwrap();tx.commit().unwrap();
+        assert!(started.elapsed()<std::time::Duration::from_secs(2));
+        release.send(()).unwrap();let observation=worker.join().unwrap().unwrap();
+        let accepted=registry.submit_agent_with_directory(&Origin::User,&request,None,Some(observation),2).unwrap();
+        assert!(registry.agent_directory(accepted.agent.id).unwrap().is_some());
     }
 
     #[test]
