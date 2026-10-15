@@ -252,6 +252,8 @@ pub struct KeyboardShortcuts {
     pub cycle_pane_width: Vec<String>,
     pub previous_workspace: Vec<String>,
     pub next_workspace: Vec<String>,
+    pub next_attention: Vec<String>,
+    pub previous_attention: Vec<String>,
     /// Flips the viewed mark on the file a review pane shows.
     pub review_toggle_viewed: Vec<String>,
     pub review_next_file: Vec<String>,
@@ -329,6 +331,8 @@ impl Default for KeyboardShortcuts {
             cycle_pane_width: vec!["Alt+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned(), "Ctrl+Alt+PageUp".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned(), "Ctrl+Alt+PageDown".to_owned()],
+            next_attention: vec!["Alt+A".to_owned()],
+            previous_attention: vec!["Alt+Shift+A".to_owned()],
             review_toggle_viewed: vec!["Alt+V".to_owned()],
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
@@ -398,7 +402,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 71] {
+    pub fn actions(&self) -> [&Vec<String>; 73] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -411,6 +415,8 @@ impl KeyboardShortcuts {
             &self.cycle_pane_width,
             &self.previous_workspace,
             &self.next_workspace,
+            &self.next_attention,
+            &self.previous_attention,
             &self.review_toggle_viewed,
             &self.review_next_file,
             &self.review_previous_file,
@@ -598,7 +604,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 71] = [
+const SHORTCUT_ACTIONS: [&str; 73] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -610,6 +616,8 @@ const SHORTCUT_ACTIONS: [&str; 71] = [
     "cycle_pane_width",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
@@ -1620,7 +1628,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 66] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 68] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1648,6 +1656,8 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 66] = [
     "clone_pane",
     "previous_workspace",
     "next_workspace",
+    "next_attention",
+    "previous_attention",
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
