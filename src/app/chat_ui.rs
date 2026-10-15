@@ -2605,7 +2605,7 @@ impl Runtime {
         {
             return None;
         }
-        let text = self.composer.text().trim_end_matches('\n').to_owned();
+        let text = self.composer.text();
         (!text.trim().is_empty()).then(|| Command::Answer {
             request_id: request_id.to_owned(),
             action: "deny".into(),
@@ -8746,6 +8746,7 @@ mod tests {
 
     #[test]
     fn denying_with_composer_instructions_clears_only_the_acknowledged_draft() {
+        let instructions="  use git push --force-with-lease instead\n\nKeep existing changes.  \n\n";
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("approval"));
         let target = {
@@ -8753,9 +8754,7 @@ mod tests {
                 unreachable!()
             };
             runtime.session.launch.provider = Provider::Claude;
-            runtime.replace_draft(text_editor::Content::with_text(
-                "use git push --force-with-lease instead",
-            ));
+            runtime.replace_draft(text_editor::Content::with_text(instructions));
             runtime.attachments.push(Attachment {
                 path: "retained.png".into(),
             });
@@ -8781,7 +8780,7 @@ mod tests {
                 request_id: "approval".into(),
                 action: "deny".into(),
                 answers: vec![chat::Answer::denial_instructions(
-                    "use git push --force-with-lease instead".into()
+                    instructions.into()
                 )],
             })
         );
@@ -8795,8 +8794,8 @@ mod tests {
         let command_id = pending.id;
         let next = runtime.next_command;
         assert_eq!(
-            runtime.composer.text().trim_end(),
-            "use git push --force-with-lease instead"
+            runtime.composer.text(),
+            instructions
         );
         drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
         assert_eq!(
