@@ -12596,7 +12596,7 @@ impl Cagents {
                         self.settings.editor_find_options,
                         self.settings.editor_replace_preserve_case,
                     ),
-                    _ => Task::none(),
+                    _ => iced::Task::none(),
                 };
                 tasks.push(repository_task(task));
             }
@@ -14109,7 +14109,7 @@ impl Application for Cagents {
                                 CardRuntime::PullRequests(pane) => pane
                                     .runtime
                                     .update_find_preferences(*target, options, preserve),
-                                _ => Task::none(),
+                                _ => iced::Task::none(),
                             };
                             tasks.push(repository_task(task));
                         }
