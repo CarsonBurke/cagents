@@ -194,6 +194,18 @@ pub(super) struct Logical {
     pub paint: Option<Arc<find::Paint>>,
 }
 
+impl Logical {
+    fn flow_search(&self) -> flow_layout::Search<'_> {
+        let ranges = self.paint.as_ref()
+            .and_then(|paint| paint.blocks.get(&self.identity))
+            .map_or(&[][..], |ranges| ranges.as_ref());
+        let current = self.paint.as_ref().and_then(|paint| paint.current.as_ref())
+            .filter(|found| found.identity == self.identity)
+            .map(|found| found.range.clone());
+        flow_layout::Search { ranges, current, offset: self.start }
+    }
+}
+
 pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
     font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
     build_text(spans, size, font, target, find, Some(logical), None)
@@ -215,8 +227,11 @@ pub(super) fn flow_source_optional(size: iced::Pixels, font: iced::Font, target:
     let ready = flow.borrow().prepared();
     let spans = ready.as_ref().map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
     let plain: Arc<str> = ready.as_ref().map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
-    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    Element::new(Selectable { logical, flow: Some(flow), flow_ready: ready, matches: highlights.ranges, spans, plain, size, font, target })
+    // Indexed logical blocks share the worker's ranges. A full-context flow
+    // can contain millions of occurrences; do not copy or rescan them here.
+    let matches = if logical.is_some() { Vec::new() }
+        else { super::find::highlights(&plain, find.unwrap_or_default()).ranges };
+    Element::new(Selectable { logical, flow: Some(flow), flow_ready: ready, matches, current: None, spans, plain, size, font, target })
 }
 
 #[cfg(test)]
@@ -232,7 +247,9 @@ fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
         .map(|span| span.text.as_ref())
         .collect::<String>()
         .into();
-    let (matches, current, truncated) = if let Some(logical) = &logical {
+    let (matches, current, truncated) = if flow.is_some() && logical.is_some() {
+        (Vec::new(), None, false)
+    } else if let Some(logical) = &logical {
         let (matches, current) = logical
             .paint
             .as_ref()
@@ -616,7 +633,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 let left=viewport.x-layout.bounds().x-overscan;
                 let right=viewport.x+viewport.width-layout.bounds().x+overscan;
                 if let Some(projection)=ready.projection_rect(top,top+viewport.height+self.size.0*1.3,left,right) {
-                    flow_layout::paint(renderer, &projection, &ready.spans, &self.matches,
+                    let search = self.logical.as_ref().map_or_else(
+                        || flow_layout::Search { ranges: &self.matches, current: self.current.clone(), offset: 0 },
+                        Logical::flow_search);
+                    flow_layout::paint(renderer, &projection, &ready.spans, search,
                         state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
                         layout.position(), theme, defaults, viewport);
                     *state.flow_projection.borrow_mut() = Some(projection);
@@ -1288,7 +1308,7 @@ mod flow_tests {
         let flow = cache.entry(99, spans.clone());
         let target = Target { card: CardId::new(), generation: 0 };
         let mut element = flow_text(spans, iced::Pixels(16.0), iced::Font::DEFAULT, target, None,
-            Logical { identity: 99, start: 0 }, flow);
+            Logical { identity: 99, start: 0, paint: None }, flow);
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(&mut tree, &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)));

@@ -508,9 +508,47 @@ impl Prepared {
     }
 }
 
+/// Borrowed worker ranges in whole logical-block coordinates.
+pub(super) struct Search<'a> {
+    pub ranges: &'a [std::ops::Range<usize>],
+    pub current: Option<std::ops::Range<usize>>,
+    pub offset: usize,
+}
+
+/// Visit backgrounds against the exact projected glyph/source mapping. Sparse
+/// BiDi projections do not have an additive source-start mapping.
+pub(super) fn range_bounds(projection: &Projection, ranges: &[std::ops::Range<usize>],
+    offset: usize, mut paint: impl FnMut(iced::Rectangle)) {
+    if ranges.is_empty() { return; }
+    for run in projection.buffer.layout_runs() {
+        let Some(source_map) = projection.source_maps.get(run.line_i) else { continue; };
+        let mut active: Option<(f32, f32)> = None;
+        let mut flush = |active: &mut Option<(f32, f32)>| {
+            if let Some((left, right)) = active.take() {
+                paint(iced::Rectangle::new(iced::Point::new(left, run.line_top + projection.top),
+                    iced::Size::new(right - left, run.line_height)));
+            }
+        };
+        for glyph in run.glyphs {
+            let mapped = source_map.source_byte(glyph.start).zip(source_map.source_byte(glyph.end))
+                .and_then(|(begin, end)| begin.checked_add(offset).zip(end.checked_add(offset)));
+            let selected = mapped.is_some_and(|(begin, end)| {
+                let index = ranges.partition_point(|range| range.end <= begin);
+                ranges.get(index).is_some_and(|range| range.start < end && !range.is_empty())
+            });
+            if selected {
+                let left = glyph.x.min(glyph.x + glyph.w);
+                let right = glyph.x.max(glyph.x + glyph.w);
+                active = Some(active.map_or((left, right), |(lo, hi)| (lo.min(left), hi.max(right))));
+            } else { flush(&mut active); }
+        }
+        flush(&mut active);
+    }
+}
+
 pub(super) fn paint(
     renderer: &mut cosmic::Renderer, projection: &Projection,
-    spans: &[Span<'static, String>], matches: &[std::ops::Range<usize>], selection: std::ops::Range<usize>,
+    spans: &[Span<'static, String>], search: Search<'_>, selection: std::ops::Range<usize>,
     size: iced::Pixels, position: iced::Point, theme: &cosmic::Theme,
     defaults: &iced::advanced::renderer::Style, viewport: &iced::Rectangle,
 ) {
@@ -518,7 +556,6 @@ pub(super) fn paint(
     use iced::advanced::text::Renderer as _;
     let translation = iced::Vector::new(position.x, position.y + projection.top);
     for run in projection.buffer.layout_runs() {
-        let Some(source_map)=projection.source_maps.get(run.line_i) else {continue;};
         let mut start = 0;
         while let Some(first) = run.glyphs.get(start) {
             let end = start + run.glyphs[start..].iter().position(|glyph| glyph.metadata != first.metadata).unwrap_or(run.glyphs.len() - start);
@@ -549,30 +586,58 @@ pub(super) fn paint(
             }
             start = end;
         }
-        for (ranges, color) in [(matches, design::accent_wash(theme)), (std::slice::from_ref(&selection), design::accent_color(theme))] {
-            let mut active: Option<(f32, f32)> = None;
-            let flush = |active: &mut Option<(f32, f32)>, renderer: &mut cosmic::Renderer| {
-                if let Some((left, right)) = active.take() {
-                    renderer.fill_quad(iced::advanced::renderer::Quad {
-                        bounds: iced::Rectangle::new(iced::Point::new(left, run.line_top) + translation,
-                            iced::Size::new(right - left, run.line_height)), ..Default::default()
-                    }, color);
-                }
-            };
-            for glyph in run.glyphs {
-                let (Some(begin),Some(finish))=(source_map.source_byte(glyph.start),source_map.source_byte(glyph.end)) else {continue;};
-                let index = ranges.partition_point(|range| range.end <= begin);
-                if ranges.get(index).is_some_and(|range| range.start < finish && !range.is_empty()) {
-                    let left = glyph.x.min(glyph.x + glyph.w);
-                    let right = glyph.x.max(glyph.x + glyph.w);
-                    active = Some(active.map_or((left, right), |(lo, hi)| (lo.min(left), hi.max(right))));
-                } else { flush(&mut active, renderer); }
-            }
-            flush(&mut active, renderer);
-        }
+    }
+    let current = search.current.as_ref().map_or(&[][..], std::slice::from_ref);
+    for (ranges, offset, color) in [
+        (search.ranges, search.offset, design::accent_wash(theme)),
+        (current, search.offset, design::accent_color(theme)),
+        (std::slice::from_ref(&selection), 0, design::accent_color(theme)),
+    ] {
+        range_bounds(projection, ranges, offset, |bounds| {
+            renderer.fill_quad(iced::advanced::renderer::Quad {
+                bounds: iced::Rectangle::new(bounds.position() + iced::Vector::new(position.x, position.y), bounds.size()),
+                ..Default::default()
+            }, color);
+        });
     }
     renderer.fill_raw(graphics_text::Raw { buffer: Arc::downgrade(&projection.buffer), position: position + iced::Vector::new(0.0, projection.top),
         color: defaults.text_color, clip_bounds: *viewport });
+}
+
+#[test]
+fn indexed_find_paint_uses_full_context_glyphs_across_2048_and_syntax_seams() {
+    let _renderer = crate::app::tests::headless_renderer();
+    for prefix in ["a".repeat(2046), "نص عربي English עברית שלום ".repeat(120)] {
+        let byte = prefix.len();
+        let source = format!("{prefix}needle{}", "z".repeat(4000));
+        let split = byte + 2;
+        let spans: Arc<[Span<'static, String>]> = vec![
+            Span::new(source[..split].to_owned()),
+            Span::new(source[split..].to_owned()).color(iced::Color::from_rgb(0.2, 0.7, 0.4)),
+        ].into();
+        let prepared = Prepared::new(&spans, iced::Pixels(16.0), iced::Font::MONOSPACE, 720.0,
+            iced::widget::text::Wrapping::None);
+        let first = prepared.byte_bounds(byte, source.len()).expect("first matched glyph");
+        let last = prepared.byte_bounds(byte + 5, source.len()).expect("last matched glyph");
+        let projection = prepared.projection_rect(0.0, 100.0, first.x.min(last.x) - 100.0,
+            (first.x + first.width).max(last.x + last.width) + 100.0).unwrap();
+        let logical_start = 41;
+        let ranges = [logical_start + byte..logical_start + byte + 6];
+        let mut painted = Vec::new();
+        range_bounds(&projection, &ranges, logical_start, |bounds| painted.push(bounds));
+        assert!(!painted.is_empty(), "the actual sparse glyph projection must retain the indexed match");
+        for glyph in [first, last] {
+            assert!(painted.iter().any(|bounds| bounds.intersection(&glyph).is_some()),
+                "both halves across the syntax/seam boundary use original source coordinates");
+        }
+        let left = painted.iter().map(|bounds| bounds.x).fold(f32::INFINITY, f32::min);
+        let right = painted.iter().map(|bounds| bounds.x + bounds.width).fold(f32::NEG_INFINITY, f32::max);
+        assert!((left - first.x.min(last.x)).abs() < 0.1);
+        assert!((right - (first.x + first.width).max(last.x + last.width)).abs() < 0.1);
+        let mut stale = Vec::new();
+        range_bounds(&projection, &[source.len() + 100..source.len() + 110], logical_start, |bounds| stale.push(bounds));
+        assert!(stale.is_empty(), "offscreen/nonexistent matches must not paint a projected source gap");
+    }
 }
 
 #[test]
@@ -635,7 +700,7 @@ fn virtual_row_eviction_releases_flow_glyphs_without_hiding_the_chat() {
             assert!(flow.borrow_mut().complete(&request, Some(ready)));
             selectable_prose::flow_text(spans.clone(), iced::Pixels(16.0), iced::Font::DEFAULT,
                 Target { card: CardId::new(), generation: 0 }, None,
-                selectable_prose::Logical { identity, start: 0 }, flow)
+                selectable_prose::Logical { identity, start: 0, paint: None }, flow)
         })
     }).collect();
     let mut element = virtualized::column(rows, window.clone());

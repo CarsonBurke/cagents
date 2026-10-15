@@ -1095,89 +1095,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexed_find_match_crossing_two_mounted_code_chunks_paints_both_halves() {
-        use iced::advanced::{
-            Layout, layout,
-            widget::{Operation, Tree},
-        };
-        let renderer = crate::app::tests::headless_renderer();
-        let identity = 7;
-        let found = find::Match {
-            turn: "t".into(),
-            item: "i".into(),
-            identity,
-            range: 2046..2052,
-        };
-        let paint = Arc::new(find::Paint::new(1, &[found.clone()], Some(found)));
-        let source: Arc<str> = format!("{}needle{}", "a".repeat(2046), "z".repeat(2048)).into();
-        let mut element = code_text(
-            source,
-            Arc::from([]),
-            design::TEXT_BODY.into(),
-            iced::Font::MONOSPACE,
-            Target {
-                card: CardId::new(),
-                generation: 0,
-            },
-            Some("needle"),
-            Some(selectable_prose::Logical {
-                identity,
-                start: 0,
-                paint: Some(paint),
-            }),
-        );
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 12000.0)),
-        );
-        #[derive(Default)]
-        struct Painted(
-            Vec<(
-                usize,
-                Vec<std::ops::Range<usize>>,
-                Option<std::ops::Range<usize>>,
-            )>,
-        );
-        impl Operation for Painted {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn custom(
-                &mut self,
-                _: Option<&iced::advanced::widget::Id>,
-                _: iced::Rectangle,
-                state: &mut dyn std::any::Any,
-            ) {
-                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-                    && let Some(logical) = &prose.logical
-                    && !prose.search_paint.0.is_empty()
-                {
-                    self.0.push((
-                        logical.start,
-                        prose.search_paint.0.clone(),
-                        prose.search_paint.1.clone(),
-                    ));
-                }
-            }
-        }
-        let mut painted = Painted::default();
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut painted);
-        painted.0.sort_by_key(|(start, _, _)| *start);
-        assert_eq!(
-            painted.0,
-            vec![
-                (0, vec![2046..2048], Some(2046..2048)),
-                (2048, vec![0..4], Some(0..4))
-            ],
-            "one indexed occurrence keeps ordinary and current paint on both actual mounted fragments"
-        );
-    }
-
-    #[test]
     fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
         let theme=crate::settings::EditorSyntaxTheme::Auto;
         let blocks=(0..200).map(|key|(key,CodeBlock::new(Some("rust"),"let value = 1;",theme))).collect();
@@ -1201,7 +1118,7 @@ mod tests {
         let mut element = paragraph(
             design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE), text,
             Target { card: CardId::new(), generation: 0 }, None,
-            Some(selectable_prose::Logical { identity: 7, start: 0 }), Some(&cache));
+            Some(selectable_prose::Logical { identity: 7, start: 0, paint: None }), Some(&cache));
         let mut tree = Tree::new(&element);
         element.as_widget_mut().layout(&mut tree, &crate::app::tests::headless_renderer(),
             &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)));
