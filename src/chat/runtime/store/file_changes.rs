@@ -349,6 +349,20 @@ impl Store {
         }
         Ok(())
     }
+    pub(super) fn finish_file_status(&mut self,source:&str,id:&str,status:ToolStatus)->Result<(),String> {
+        let old=postcard::to_stdvec(&ToolStatus::Running).map_err(|error|error.to_string())?;
+        let rows={let mut query=self.db.prepare("SELECT path,imported,additions,deletions FROM file_edits WHERE source=?1 AND item_id=?2 AND status=?3").map_err(|error|error.to_string())?;
+            query.query_map(params![source,id,old],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,Option<u64>>(2)?,row.get::<_,Option<u64>>(3)?))).map_err(|error|error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?};
+        for (path,imported,added,deleted) in &rows {
+            self.adjust_file_total(source,path,ToolStatus::Running,*imported,added.zip(*deleted),-1)?;
+            self.adjust_file_total(source,path,status,*imported,added.zip(*deleted),1)?;
+        }
+        if !rows.is_empty() {
+            self.db.execute("UPDATE file_edits SET status=?4 WHERE source=?1 AND item_id=?2 AND status=?3",params![source,id,old,postcard::to_stdvec(&status).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;
+            self.file_revision=self.file_revision.saturating_add(1);
+        }
+        Ok(())
+    }
     pub(super) fn index_child_event(&mut self, event: &Event) -> Result<(), String> {
         match event {
             Event::SubagentItem { id, item } => {
