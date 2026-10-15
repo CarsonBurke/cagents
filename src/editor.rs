@@ -1554,13 +1554,28 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn editor_root_relocation_requires_the_original_physical_directory() {
+        use crate::edited_root_admission::{EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        use std::{sync::Arc, time::{Duration, Instant}};
         let directory = tempfile::tempdir().unwrap();
         let original = directory.path().join("original");
         let moved = directory.path().join("moved");
         std::fs::create_dir(&original).unwrap();
-        let retained =
-            FileRootIdentity::of(std::sync::Arc::new(worktree_root(&original).unwrap())).unwrap();
+        let root = Arc::new(worktree_root(&original).unwrap());
+        // Actual client framing/descriptor transfer with a scripted private
+        // peer, not a claim of daemon Registry19 admission acceptance.
+        let peer = ScriptedEditedRootPeer::start(&root);
+        let mut ledger = EditedRootAdmissions::default();
+        let ticket = ledger.reserve().unwrap();
+        let work = ticket.begin_preparation().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = crate::recovery_domain::RecoveryPlacementClient::connect_local_until(peer.endpoint(), deadline).unwrap();
+        let owner = client.prepare_edited_root_owner(root.clone()).unwrap();
+        let prepared = work.prepared(owner);
+        let admission = prepared.begin_enrollment().unwrap().run(&crate::process::CancellationToken::new(), deadline).unwrap();
+        let retained = FileRootIdentity::admitted(root, admission, deadline).unwrap();
+        drop(client);
         std::fs::rename(&original, &moved).unwrap();
         let rebound = retained.rebind_same_directory(&moved).unwrap();
         assert!(rebound.validate_named(&moved).is_ok());
@@ -1573,6 +1588,26 @@ mod tests {
             retained.rebind_same_directory(&original).is_err(),
             "a replacement clone cannot acquire the old Undo root"
         );
+        drop(rebound);
+        drop(retained);
+        ledger.request_unowned_retirements();
+        ledger.next_retirement().unwrap().expect("actual relocated owners drained").run(Instant::now() + Duration::from_secs(2)).unwrap();
+        drop(ticket);
+        drop(ledger);
+        assert!(peer.finish().contains(&Event::Released));
+    }
+
+    #[test]
+    fn a_raw_root_and_its_relocation_never_authorize_a_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let raw = FileRootIdentity::of(std::sync::Arc::new(worktree_root(&original).unwrap())).unwrap();
+        assert!(raw.validate_named(&original).is_err());
+        std::fs::rename(&original, &moved).unwrap();
+        let rebound = raw.rebind_same_directory(&moved).unwrap();
+        assert!(rebound.validate_named(&moved).is_err(), "a path/identity rebind does not mint negative-root enrollment");
     }
 
     #[test]
