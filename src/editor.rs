@@ -1311,19 +1311,34 @@ mod tests {
         binary.write_all(&vec![b'a'; 5000]).unwrap();
         binary.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
         let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
-            content(root.path(), "late-binary.bin") else { panic!("bounded binary preview"); };
+            content(root.path(), "late-binary.bin")
+        else {
+            panic!("bounded binary preview");
+        };
         assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
         assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
         assert!(preview.data[..5000].iter().all(|byte| *byte == b'a'));
         assert_eq!(preview.data[5000], 0);
         assert!(preview.error.as_deref().unwrap().contains("editing limit"));
-        let next = load_binary_page(root.path(), Path::new("late-binary.bin"), BINARY_PREVIEW_BYTES).unwrap();
+        let next = load_binary_page(
+            root.path(),
+            Path::new("late-binary.bin"),
+            BINARY_PREVIEW_BYTES,
+        )
+        .unwrap();
         assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
         assert!(next.error.as_deref().unwrap().contains("editing limit"));
 
-        fs::write(root.path().join("large-text.txt"), vec![b'x'; MAX_EDITABLE_FILE_BYTES as usize + 1]).unwrap();
+        fs::write(
+            root.path().join("large-text.txt"),
+            vec![b'x'; MAX_EDITABLE_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
         let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(text)) =
-            content(root.path(), "large-text.txt") else { panic!("oversized text remains read-only"); };
+            content(root.path(), "large-text.txt")
+        else {
+            panic!("oversized text remains read-only");
+        };
         assert_eq!(text.data.len(), BINARY_PREVIEW_BYTES as usize);
         assert!(text.data.iter().all(|byte| *byte == b'x'));
         assert!(text.error.as_deref().unwrap().contains("editing limit"));
@@ -1451,7 +1466,10 @@ mod tests {
         )
         .unwrap();
         let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
-            content(root.path(), "big.txt") else { panic!("oversized text is not editable"); };
+            content(root.path(), "big.txt")
+        else {
+            panic!("oversized text is not editable");
+        };
         assert_eq!(preview.bytes, MAX_EDITABLE_FILE_BYTES + 1);
         assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
     }
