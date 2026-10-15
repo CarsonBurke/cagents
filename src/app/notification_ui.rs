@@ -444,7 +444,8 @@ impl Cagents {
                     .find(|channel| channel.cards.contains(&card.id))
                     .map(|channel| channel.id);
                 let scope = if let Some(channel) = channel {
-                    self.select_channel(channel)
+                    return self.select_channel_then(channel,
+                        worktree_ui::selection::Intent::Focus {card:card.id,activate:true});
                 } else {
                     let directory = self.durable.card_scopes.get(&card.id).cloned().or_else(|| {
                         match &card.kind {
@@ -457,9 +458,11 @@ impl Cagents {
                             _ => None,
                         }
                     });
-                    directory.map_or_else(Task::none, |directory| {
-                        self.select_worktree(directory, false)
-                    })
+                    if let Some(directory) = directory {
+                        return self.select_worktree_then(directory, false,
+                            worktree_ui::selection::Intent::Focus {card: card.id, activate: true});
+                    }
+                    Task::none()
                 };
                 let focus = self.workspace.focus(card.id).map_or_else(
                     |_| Task::none(),

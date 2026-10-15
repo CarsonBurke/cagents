@@ -159,7 +159,7 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let selected = match &agent.placement {
+                match &agent.placement {
                     crate::agent_execution::Placement::Channel(id) => {
                         let Some(channel) = self
                             .durable
@@ -175,7 +175,7 @@ impl Cagents {
                         if self.sidebar_model.project(channel.project_id).is_none() {
                             return Task::none();
                         }
-                        self.select_channel(*id)
+                        return self.select_channel_then(*id,worktree_ui::selection::Intent::Agent(agent));
                     }
                     crate::agent_execution::Placement::Worktree { path, .. } => {
                         if self.project_ui.deleting_directory(path)
@@ -186,19 +186,10 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        self.select_worktree(path.clone(), false)
+                        return self.select_worktree_then(path.clone(), false,
+                            worktree_ui::selection::Intent::Agent(agent));
                     }
-                };
-                let adopted = self
-                    .adopt_execution_agent(&agent)
-                    .unwrap_or_else(Task::none);
-                Task::batch([
-                    adopted,
-                    selected,
-                    cosmic::task::message(Message::FocusCard(CardId::from_uuid(
-                        agent.id.as_uuid(),
-                    ))),
-                ])
+                }
             }
         }
     }

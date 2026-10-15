@@ -1317,6 +1317,10 @@ async fn run_instance<P>(
                     || window.raw.pre_present_notify(),
                 ) {
                     Ok(()) => {
+                        if !window.first_frame_submitted {
+                            window.first_frame_submitted = true;
+                            log::debug!(target: "cagents::startup", "stage=first_frame_submitted window={id:?}");
+                        }
                         present_span.finish();
                     }
                     Err(error) => match error {
@@ -1718,6 +1722,9 @@ async fn run_instance<P>(
             }
             #[cfg(feature = "a11y")]
             Event::AccessibilityEnabled(id, enabled) => {
+                events.push((Some(id), core::Event::Window(
+                    core::window::Event::AccessibilityEnabled(enabled),
+                )));
                 if enabled {
                     a11y_enabled.insert(id);
                     if let Some(window) = window_manager.get_mut(id) {

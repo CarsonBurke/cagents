@@ -26,6 +26,7 @@ mod layout;
 mod markdown_source;
 mod monospace;
 mod permissions;
+mod permission_preview;
 mod prose;
 mod retained;
 mod scroll;
@@ -147,6 +148,16 @@ pub enum Action {
     RecoverAccount(CardId, AccountId),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
+    DraftPermissionRead(permission_preview::Reply),
+    RefreshDraftPermissionPreview,
+    FreshPolicyPrepared {
+        target: Target,
+        original: chat::Launch,
+        session: chat::Session,
+        intent: chat::Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+    },
     /// Opens or closes the account choice.
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
@@ -336,6 +347,9 @@ impl Action {
                 | Self::DisarmInterrupt(..)
                 | Self::Files(..)
                 | Self::Tick
+                | Self::DraftPermissionRead(_)
+                | Self::RefreshDraftPermissionPreview
+                | Self::FreshPolicyPrepared { .. }
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
                 | Self::ImageNext(_)
@@ -451,6 +465,7 @@ impl Phase {
 pub(super) struct State {
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
+    permission_preview: Option<permission_preview::Monitor>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
@@ -492,6 +507,7 @@ impl Default for State {
         Self {
             image_viewer: None,
             files: HashMap::new(),
+            permission_preview: None,
             sender,
             receiver,
             generation: 0,
@@ -2054,8 +2070,7 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let permission_mode = None;
         let mut runtime = Self {
             target,
             session,
@@ -2296,10 +2311,7 @@ impl Runtime {
                 .any(|message| &message.id == id)
         });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
-                });
+            Arc::make_mut(&mut snapshot).permission_mode = self.snapshot.permission_mode.clone();
         }
         if !self.scroll.at_bottom()
             && !snapshot.has_later
@@ -2985,7 +2997,7 @@ fn fresh_chat_session(
     account: &Account,
     automatic: bool,
 ) -> Result<chat::Session, String> {
-    let mut session = chat::fresh_session(provider, id, working_directory, account)?;
+    let mut session = chat::fresh_session_deferred_policy(provider, id, working_directory, account)?;
     if automatic {
         session
             .launch
@@ -3624,12 +3636,7 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
-        let recipe = moved
-            .as_ref()
-            .map_or(&runtime.session.launch.recipe, |session| {
-                &session.launch.recipe
-            });
-        snapshot.permission_mode = draft_permission_mode(recipe, provider);
+        snapshot.permission_mode = (moved.is_none()).then(|| runtime.snapshot.permission_mode.clone()).flatten();
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -3740,8 +3747,7 @@ impl Cagents {
         }
         runtime.session = session.clone();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, account.provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -4110,8 +4116,72 @@ impl Cagents {
         Task::batch([open, focus, iced::widget::operation::focus(card_control_id(card, "chat-composer")).map(cosmic::Action::App)])
     }
 
+    /// Stage prepared forge context after the owning scope and physical lease
+    /// have committed. This helper never selects a scope or sends a message.
+    pub(super) fn finish_pr_agent_context(
+        &mut self, worktree: PathBuf, card: Option<CardId>, prompt: String, provider: Provider,
+    ) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let card = if let Some(card) = card {
+            let valid = self.workspace.card(card).is_some() && self.card_state(card).is_some_and(|state| {
+                state.existence.is_open() && matches!(&state.kind,CardKind::Chat(session)
+                    if self.card_worktree(state)==Some(worktree.as_path()) || session.launch.recipe.working_directory==worktree)
+            });
+            if !valid {
+                self.status=Some(TransientNotice::warning("The selected conversation changed before review context was ready."));
+                return Task::none();
+            }
+            card
+        } else {
+            // A new draft is filed in the already committed explicit worktree,
+            // never in a focused shell's cwd or through a second navigation.
+            if self.durable.active_channel.is_some() || self.active_workspace.as_deref()!=Some(worktree.as_path())
+                || self.refuse_in_deleting_worktree(&worktree)
+            { return Task::none(); }
+            let account = self.default_account_for_directory(provider,&worktree);
+            let automatic = self.automatic_accounts_for_directory(provider,&worktree);
+            let session = match fresh_chat_session(provider,TerminalId::new(),worktree,&account,automatic) {
+                Ok(session)=>session,
+                Err(error)=>{self.status=Some(TransientNotice::error(error));return Task::none();}
+            };
+            let session_id=session.id;
+            tasks.push(self.insert_chat_card(session,None,None));
+            let Some(card)=self.durable.cards.iter().find_map(|state|matches!(&state.kind,CardKind::Chat(session) if session.id==session_id).then_some(state.id)) else {
+                return Task::batch(tasks);
+            };
+            card
+        };
+        self.chat_ui.default_chats.remove(&card);
+        let runtime = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime))=>Some(runtime.as_mut()),
+            _=>self.chat_ui.parked.get_mut(&card).map(Box::as_mut),
+        };
+        if let Some(runtime)=runtime {
+            let mut draft=runtime.unsent_text();
+            if !draft.trim().is_empty(){draft.push_str("\n\n");}
+            draft.push_str(&prompt);
+            runtime.history_cursor=None;
+            runtime.history_stash=None;
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+        } else {
+            let draft=self.chat_ui.drafts.entry(card).or_default();
+            if !draft.trim().is_empty(){draft.push_str("\n\n");}
+            draft.push_str(&prompt);
+        }
+        self.persist();
+        tasks.push(self.focus_workspace_card(card));
+        tasks.push(iced::widget::operation::focus(card_control_id(card,"chat-composer")).map(cosmic::Action::App));
+        Task::batch(tasks)
+    }
+
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
         self.new_native_chat(self.preferred_chat_provider(), None)
+    }
+
+    /// A context-menu destination is authoritative even if a focused shell
+    /// has changed its current directory outside that worktree.
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
     }
 
     fn preferred_chat_provider(&self) -> Provider {
@@ -4408,17 +4478,13 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let scope = if self.durable.active_channel.is_none()
+        if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
-            self.select_worktree(working_directory, false)
-        } else {
-            Task::none()
-        };
-        Task::batch([
-            scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
-        ])
+            return self.select_worktree_then(working_directory, false,
+                worktree_ui::selection::Intent::Chat { session, beside: None, ephemeral });
+        }
+        self.insert_chat_card_with_lifetime(session, None, ephemeral, None)
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first
@@ -4434,7 +4500,7 @@ impl Cagents {
         self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
     }
 
-    fn insert_chat_card_with_lifetime(
+    pub(super) fn insert_chat_card_with_lifetime(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
@@ -4560,8 +4626,7 @@ impl Cagents {
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        snapshot.permission_mode = None;
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -4589,10 +4654,25 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    pub(super) fn refresh_draft_permission_previews(&mut self) {
+        let requests = self.cards.values().filter_map(|card| match card {
+            CardRuntime::Chat(runtime) if runtime.is_draft() => {
+                Some((runtime.target, &runtime.session.launch))
+            }
+            _ => None,
+        }).collect::<Vec<_>>();
+        if requests.is_empty() && self.chat_ui.permission_preview.is_none() { return; }
+        let monitor = self.chat_ui.permission_preview.get_or_insert_with(permission_preview::Monitor::new);
+        monitor.sync(requests.into_iter());
+    }
+
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
         let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
         let mut subscriptions = vec![wakes];
+        if let Some(preview) = &self.chat_ui.permission_preview {
+            subscriptions.push(preview.subscription(self.refresh_ui.focused));
+        }
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
@@ -5199,7 +5279,6 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
-        let selection = None;
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -5210,6 +5289,47 @@ impl Cagents {
                 upgrade_committed: false,
             }),
         );
+        if intent == chat::Intent::Start && session.is_unstarted()
+            && session.launch.provider == Provider::Claude {
+            return cosmic::task::future(async move {
+                let original = session.launch.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let mut session = session;
+                    // Authored argv/environment retain their precedence. This
+                    // is the same configured default formerly read in the UI
+                    // constructor, pinned before any provider process exists.
+                    let explicit = session.launch.recipe.arguments.iter().any(|argument| {
+                        argument == "--dangerously-skip-permissions"
+                            || argument == "--permission-mode"
+                            || argument.starts_with("--permission-mode=")
+                    });
+                    if !explicit && let Some(mode) = chat::claude_configured_default_mode(&session.launch.recipe) {
+                        session.launch.recipe.arguments.extend(["--permission-mode".into(), mode]);
+                    }
+                    session
+                }).await;
+                match prepared {
+                    Ok(session) => Message::ChatUi(Action::FreshPolicyPrepared {
+                        target, original, session, intent, source, terminate_source,
+                    }),
+                    Err(error) => Message::ChatUi(Action::Ready(target, Ready(Arc::new(Mutex::new(Some(
+                        Err(chat::StartFailure::retry(format!("Could not read launch policy: {error}")))
+                    )))))),
+                }
+            });
+        }
+        self.connect_chat_task(target, session, intent, source, terminate_source)
+    }
+
+    fn connect_chat_task(
+        &self,
+        target: Target,
+        session: chat::Session,
+        intent: chat::Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+    ) -> Task<Message> {
+        let selection = None;
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -5576,7 +5696,7 @@ impl Cagents {
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
-        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
+        snapshot.permission_mode = None;
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft => None,
@@ -5860,6 +5980,34 @@ impl Cagents {
                 return self.choose_chat_account(target, id);
             }
             Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
+            Action::FreshPolicyPrepared { target, original, session, intent, source, terminate_source } => {
+                // No provider was started by the preparation task. A card
+                // closed while it read config must remain closed.
+                if self.chat_ui.abandoned.remove(&target).is_some() { return Task::none(); }
+                let Some(Phase::Starting(attempt)) = self.chat_ui.phases.get_mut(&target.card) else {
+                    return Task::none();
+                };
+                if attempt.target != target || attempt.session.launch != original
+                    || attempt.session.id != session.id { return Task::none(); }
+                attempt.session = session.clone();
+                if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                    runtime.session = session.clone();
+                    if let Some(queued) = &mut runtime.queued { queued.draft = session.clone(); }
+                }
+                self.replace_chat_conversation(target.card, session.clone());
+                return self.connect_chat_task(target, session, intent, source, terminate_source);
+            }
+            Action::RefreshDraftPermissionPreview => {
+                if let Some(preview) = &self.chat_ui.permission_preview { preview.invalidate(); }
+            }
+            Action::DraftPermissionRead(reply) => {
+                if let Some(runtime) = self.chat_card_runtime_mut(reply.target)
+                    && runtime.is_draft() && runtime.session.launch == reply.launch
+                    && runtime.snapshot.permission_mode != reply.mode
+                {
+                    Arc::make_mut(&mut runtime.snapshot).permission_mode = reply.mode;
+                }
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -6451,7 +6599,7 @@ impl Cagents {
                             Task::none()
                         };
                         return Task::batch([
-                            self.drain_terminal(target.card, 0),
+                            self.drain_terminal(target.card, 0).0,
                             cleanup,
                             if terminal_switch {
                                 cosmic::task::message(Message::ChromeUi(
@@ -6655,23 +6803,15 @@ impl Cagents {
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
-                                let scope = if let Some(channel) = self
-                                    .durable
-                                    .channels
-                                    .iter()
-                                    .find(|channel| channel.cards.contains(&target.card))
-                                    .map(|channel| channel.id)
+                                if let Some(channel) = self.durable.channels.iter()
+                                    .find(|channel| channel.cards.contains(&target.card)).map(|channel| channel.id)
                                 {
-                                    self.select_channel(channel)
+                                    self.select_channel_then(channel,
+                                        worktree_ui::selection::Intent::Chat {session,beside:Some(target.card),ephemeral:false})
                                 } else {
-                                    self.select_worktree(
-                                        session.launch.recipe.working_directory.clone(),
-                                        false,
-                                    )
-                                };
-                                let insert =
-                                    self.insert_chat_card(session, Some(target.card), None);
-                                Task::batch([scope, insert])
+                                    self.select_worktree_then(session.launch.recipe.working_directory.clone(), false,
+                                        worktree_ui::selection::Intent::Chat { session, beside: Some(target.card), ephemeral: false })
+                                }
                             }),
                         ]);
                     }
@@ -8526,6 +8666,25 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_closed_cards_late_policy_preparation_starts_no_provider() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let session = runtime.session.clone();
+        let original = session.launch.clone();
+        app.chat_ui.abandoned.insert(target, session.clone());
+        let task = app.handle_chat_action(Action::FreshPolicyPrepared {
+            target, original, session, intent: chat::Intent::Start,
+            source: None, terminate_source: false,
+        });
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(!app.chat_start_pending(card));
+        assert!(!app.chat_ui.abandoned.contains_key(&target));
+        assert!(chat_runtime(&app, card).handle().is_none());
+    }
+
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
@@ -12172,6 +12331,41 @@ mod tests {
     }
 
     #[test]
+    fn prepared_pr_context_preserves_the_existing_unsent_draft_and_does_not_send() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=draft_chat(&mut app);
+        write(&mut app,card,"Existing request");
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),Some(card),"Selected review context".into(),Provider::Claude));
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Existing request\n\nSelected review context");
+        assert_eq!(chat_runtime(&app,card).session.launch.provider,Provider::Codex);
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn prepared_pr_context_creates_an_explicit_directory_draft_without_reselecting() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        drop(app.select_worktree(FIXTURE_DIRECTORY.into(),false));
+        let generation=app.worktree_selection.generation_for_test();
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Review without sending".into(),Provider::Codex));
+        let card=app.workspace.focused().unwrap();
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Review without sending");
+        assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,PathBuf::from(FIXTURE_DIRECTORY));
+        assert_eq!(app.worktree_selection.generation_for_test(),generation);
+        assert!(chat_runtime(&app,card).is_draft());
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn prepared_pr_context_cannot_create_a_draft_in_a_newer_selected_scope() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        drop(app.select_worktree("/newer".into(),false));
+        let before=app.durable.cards.len();
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Stale context".into(),Provider::Codex));
+        assert_eq!(app.durable.cards.len(),before);
+        assert_eq!(app.active_workspace.as_deref(),Some(Path::new("/newer")));
+    }
+
+    #[test]
     fn multiline_prompt_history_restores_the_exact_unsent_draft_and_attachments() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("history"));
@@ -13408,7 +13602,7 @@ mod tests {
             &account,
         )
         .unwrap();
-        let runtime = Runtime::new(
+        let mut runtime = Runtime::new(
             Target {
                 card: CardId::new(),
                 generation: 0,
@@ -13418,6 +13612,12 @@ mod tests {
             true,
             Default::default(),
         );
+        assert_eq!(runtime.snapshot.permission_mode, None);
+        let monitor = permission_preview::Monitor::new();
+        monitor.sync(std::iter::once((runtime.target, &runtime.session.launch)));
+        let reply = monitor.next_for_test();
+        assert_eq!(reply.launch, runtime.session.launch);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = reply.mode;
         assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("auto"));
 
         let mut recipe = runtime.session.launch.recipe.clone();

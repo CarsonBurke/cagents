@@ -4,6 +4,7 @@
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Terminal update tail](#terminal-update-tail)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -212,3 +213,38 @@ Both fit the 50/100 ms input budgets. This is an upper bound to
 compositor-visible pixels, not presentation timestamps or physical scanout. The
 settled idle native terminal produced no additional terminal draws and no
 measurable UI CPU ticks in a three-second observation.
+
+
+## Terminal update tail
+
+Use the same saved fixture and matched CLI, daemon, and UI binaries for both
+revisions. The fixture has twenty terminal cards distributed among project
+channels, plus one visible input pane. Run it through
+`scripts/run-development --browserless --debug --log-file PATH` in private
+campaign HOME/XDG directories; record revision, feature lane, profile,
+renderer, focused state, card/channel counts, and the owned process IDs and
+start times. Finish compilation before sampling. A shared development daemon
+must not be restarted for this fixture.
+
+In each of the twenty producer terminals, run this finite workload:
+
+```sh
+python3 -u -c 'import sys,time; chunk=("busy terminal output\n"*4096).encode(); [(sys.stdout.buffer.write(chunk),sys.stdout.buffer.flush(),time.sleep(.05)) for _ in range(400)]'
+```
+
+Capture twenty seconds of UI `/proc/PID/stat` user and system CPU ticks, with
+monotonic start/end times and `SC_CLK_TCK`. Report CPU as the percentage of one
+core, separately from host CPU. Record baseline and changed runs, preferably
+alternating repeated runs; a host under concurrent compilation is unsuitable
+for comparison. Also capture the settled idle baseline separately. While the
+producers run, type a known string into the input pane and confirm its visible
+contents; change an OSC title and confirm its tab label updates. Record the
+input-to-observed-content interval and screenshots or compositor observations.
+Do not describe CPU counters or a successful build as proof of responsiveness.
+
+The narrow regressions cover no-op terminal wakes, each projection's input
+generation, channel/worktree lookup behavior, and a burst of transient titles
+that enters durable state only after a three-second quiet interval. An OSC
+spinner glyph alone does not change the persisted title. This workload is a
+measurement recipe; no before/after result is implied without retained raw
+samples from both revisions.

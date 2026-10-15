@@ -750,9 +750,9 @@ impl Cagents {
                 // one tab. The job keeps waiting; only its dialog steps aside.
                 self.update_ui.set_aside = self.update_ui.job.as_ref().map(|job| job.id.clone());
                 self.update_ui.confirmation = None;
-                let selected =
-                    channel.map_or_else(Task::none, |channel| self.select_channel(channel));
-                Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
+                if let Some(channel) = channel {
+                    self.select_channel_then(channel,worktree_ui::selection::Intent::Focus {card,activate:false})
+                } else { cosmic::task::message(Message::FocusCard(card)) }
             }
             Action::CopyDetails => self
                 .update_ui
