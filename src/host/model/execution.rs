@@ -3290,7 +3290,8 @@ mod tests {
         let old = directory.path().join("issued-project");
         if locate {
             std::fs::create_dir(&old).unwrap();
-            registry.apply(&ModelEdit::OpenProject {repository:old.clone(),name:"Issued".into(),kind:ProjectKind::Folder}).unwrap();
+            registry.apply(&ModelEdit::OpenProject {
+            checkout: None, primary_checkout: None,repository:old.clone(),name:"Issued".into(),kind:ProjectKind::Folder}).unwrap();
             let Destination::New(spec) = &mut request.destination else {unreachable!()};
             spec.target.repository = old.clone(); spec.target.directory = old.clone();
         }

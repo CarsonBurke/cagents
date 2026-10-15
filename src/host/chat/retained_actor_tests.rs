@@ -70,6 +70,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     let mut registry = super::super::model::Registry::at(&path).unwrap();
     registry
         .apply(&ModelEdit::OpenProject {
+            checkout: None, primary_checkout: None,
             repository: root.join("project"),
             name: "Retained actor fixture".into(),
             kind: ProjectKind::Folder,
@@ -580,6 +581,7 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     let accepted = if role == "source" {
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: root.join("project"),
                 name: "Killed host fixture".into(),
                 kind: ProjectKind::Folder,

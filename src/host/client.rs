@@ -3882,6 +3882,7 @@ mod tests {
         for path in [&repository, &other] {
             std::fs::create_dir(path).unwrap();
             edit(ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: path.clone(),
                 name: "project".into(),
                 kind: Default::default(),

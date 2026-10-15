@@ -255,6 +255,7 @@ mod tests {
         let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: directory.path().into(),
                 name: "Retained loss fixture".into(),
                 kind: ProjectKind::Folder,
@@ -431,6 +432,7 @@ mod tests {
         let mut registry = Registry::at(&path).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: directory.path().into(),
                 name: "Remote actor fixture".into(),
                 kind: ProjectKind::Folder,

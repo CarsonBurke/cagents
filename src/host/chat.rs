@@ -6373,6 +6373,7 @@ for line in sys.stdin:
             super::super::model::Registry::at(&directory.path().join("binding.sqlite3")).unwrap();
         registry
             .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: directory.path().to_owned(),
                 name: "Binding fixture".into(),
                 kind: crate::model::ProjectKind::Folder,

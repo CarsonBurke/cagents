@@ -23,6 +23,7 @@ mod tests {
         let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: root.path().into(),
                 name: "Clock limit".into(),
                 kind: ProjectKind::Folder,

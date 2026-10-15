@@ -802,6 +802,7 @@ mod tests {
         );
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None, primary_checkout: None,
                 repository: definition.agent.target.repository,
                 name: "Unrelated sidebar edit".into(),
                 kind: ProjectKind::Folder,

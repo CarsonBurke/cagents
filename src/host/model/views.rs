@@ -1270,6 +1270,7 @@ mod tests {
         seed(&mut r, a, vec![p.clone()]);
         let foreign = ChannelId::new();
         r.apply(&ModelEdit::OpenProject {
+            checkout: None, primary_checkout: None,
             repository: "/other".into(),
             name: "other".into(),
             kind: Default::default(),

@@ -10,6 +10,7 @@ fn located_console_fixture() -> (
     std::fs::create_dir(&old).unwrap();
     let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
     registry.apply(&ModelEdit::OpenProject {
+        checkout: None, primary_checkout: None,
         repository: old.clone(), name: "Located fixture".into(), kind: ProjectKind::Folder,
     }).unwrap();
     let request = Submit {
