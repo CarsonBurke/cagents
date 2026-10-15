@@ -7,6 +7,7 @@ pub(super) struct Authority {
     session:Option<String>,
     latest_proven:Option<String>,
     unconfirmed_commands:Vec<String>,
+    revision:u64,
     store:Option<annotations::storage::Store>,
     notice:Option<String>,
     retry_at:Option<std::time::Instant>,
@@ -14,7 +15,7 @@ pub(super) struct Authority {
     root:Option<std::path::PathBuf>,
 }
 impl Authority {
-    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,unconfirmed_commands:Vec::new(),store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
+    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,unconfirmed_commands:Vec::new(),revision:0,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
     fn pending_store(&self)->Result<annotations::storage::Store,String>{
         let scope=self.scope.as_ref().map_err(Clone::clone)?;
         #[cfg(test)]
@@ -66,7 +67,7 @@ impl Authority {
                 annotations::OriginalUpdate::Rejected{command_id}=>self.abandon(&command_id),
                 annotations::OriginalUpdate::Accepted{command_id,session_id,user_id,turn_id,aliases}=>{
                     if self.session.as_deref()!=Some(session_id.as_str()){Err("Original acceptance does not match the confirmed provider conversation".into())}
-                    else if let Some(store)=&mut self.store{store.accept_prepared(&command_id,&user_id,&turn_id,&aliases).map_err(|error|format!("{error:?}"))}
+                    else if let Some(store)=&mut self.store{let result=store.accept_prepared(&command_id,&user_id,&turn_id,&aliases).map_err(|error|format!("{error:?}"));if result.is_ok(){self.revision=self.revision.wrapping_add(1);}result}
                     else{Err("Qualified original command storage is unavailable".into())}
                 },
                 annotations::OriginalUpdate::Latest{session_id,user_id}=>{
@@ -78,6 +79,7 @@ impl Authority {
         warning
     }
     pub(super) fn session(&self)->Option<&str>{self.session.as_deref()}
+    pub(super) fn revision(&self)->u64{self.revision}
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         let store=self.store.as_ref().ok_or_else(||OriginalError::Unavailable(self.notice.clone().or_else(||self.scope.as_ref().err().cloned()).unwrap_or_else(||"No qualified provider-confirmed original command is available".into())))?;
         let user=user.or(self.latest_proven.as_deref()).ok_or_else(||OriginalError::Unavailable("The provider's current latest user message has not been confirmed".into()))?;
@@ -88,6 +90,7 @@ impl Authority {
     pub(super) fn latest_user(&mut self,user:&str)->Result<(),String>{
         // Invalidate the old latest proof even when the new command cannot
         // be annotated or the metadata database is temporarily unavailable.
+        if self.latest_proven.as_deref()!=Some(user){self.revision=self.revision.wrapping_add(1);}
         self.latest_proven=None;
         if user.is_empty() || user.len()>4096{return Err("Invalid latest user identity".into());}
         self.latest_proven=Some(user.to_owned());
@@ -96,6 +99,7 @@ impl Authority {
     }
     pub(super) fn apply(&mut self,confirmed:Option<&Option<String>>,updates:Vec<ApprovalUpdate>,events:&mut Vec<Event>)->Option<String>{
         if let Some(identity)=confirmed && self.session.as_ref()!=identity.as_ref(){
+            self.revision=self.revision.wrapping_add(1);
             self.session=identity.clone();self.latest_proven=None;self.store=None;self.notice=None;self.retry_at=None;
         }
         if self.store.is_none() && self.retry_at.is_none_or(|at|std::time::Instant::now()>=at){
@@ -105,7 +109,7 @@ impl Authority {
                 #[cfg(not(test))]
                 let opened=annotations::storage::Store::installation(scope,session);
                 match opened {
-                    Ok(store)=>{self.store=Some(store);self.retry_at=None;self.notice=None;},
+                    Ok(store)=>{self.store=Some(store);self.retry_at=None;self.notice=None;self.revision=self.revision.wrapping_add(1);},
                     Err(error)=>{self.retry_at=Some(std::time::Instant::now()+std::time::Duration::from_secs(1));return self.warning(error);},
                 }
             }
@@ -330,6 +334,7 @@ mod tests {
         for frame in [json!({"type":"system","subtype":"init","session_id":session,"model":"reported-model","effort":"low","permissionMode":"default","fast_mode_state":"off"}),json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}),json!({"type":"user","uuid":id,"session_id":session,"parent_tool_use_id":null,"message":{"id":"actual-root","role":"user","content":[{"type":"text","text":"rewritten provider echo"}]}})]{
             let mut step=adapter.receive(frame).unwrap();let confirmed=step.events.iter().find_map(|event|if let Event::Session{id,..}=event{Some(Some(id.clone()))}else{None});assert!(authority.apply(confirmed.as_ref(),adapter.take_approval_updates(),&mut step.events).is_none());assert!(authority.originals(adapter.take_original_updates()).is_none());
         }
+        assert!(authority.revision()>=4,"Session, availability, latest and acceptance each publish eligibility");
         let original=authority.original(None,0,1024).unwrap();assert_eq!(original.text,"original /slash-command");assert_eq!(original.session_id,session);assert_eq!(original.original.user_id,id);assert_eq!(authority.original(Some("actual-root:0"),0,1024).ok().map(|page|page.text),Some("original /slash-command".into()));
     }
 

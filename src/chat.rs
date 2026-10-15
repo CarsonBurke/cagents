@@ -966,6 +966,10 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Actor-local eligibility revision for exact originals. It changes when
+    /// authority/acceptance/latest changes, independently of presentation noise.
+    #[serde(default)]
+    pub original_revision:u64,
 }
 
 /// When a provider takes a message it is holding.

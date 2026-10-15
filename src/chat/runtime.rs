@@ -2268,6 +2268,10 @@ impl Actor {
         }
         let originals=self.adapter.take_original_updates();
         if let Some(message)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).originals(originals){tracing::warn!(%message,"original command metadata unavailable");}
+        let original_revision=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).revision();
+        let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+        if state.original_revision!=original_revision{state.original_revision=original_revision;self.dirty=true;}
+        drop(state);
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
