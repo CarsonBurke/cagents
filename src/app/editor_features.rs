@@ -180,6 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn a_full_persistent_error_log_may_refuse_transient_info_without_panicking() {
+        let mut app = app();
+        let card = CardId::new();
+        let doc = LspDocumentId(1);
+        app.lsp_documents.insert(doc, card);
+        for index in 0..NOTICE_LOG_CAPACITY {
+            drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Error, message: format!("Persistent error {index}") })));
+        }
+        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "Background indexing done".into() })));
+        assert_eq!(app.notices.len(), NOTICE_LOG_CAPACITY);
+        assert!(app.notices.recent().all(|entry| entry.notice.severity == NoticeSeverity::Error));
+        assert!(app.editor_features.notice_expiry.is_empty());
+    }
+
+    #[test]
     fn code_action_command_failures_reach_the_notice_and_success_retires_the_request() {
         let mut app = app();
         let card = CardId::new();
@@ -465,7 +480,9 @@ impl Cagents {
                     LspMessageLevel::Info => {
                         let notice = TransientNotice::success(message.clone());
                         self.notices.record(notice.clone());
-                        let id = self.notices.recent().find(|entry| entry.notice == notice).map(|entry| entry.id).unwrap();
+                        // A log filled with persistent failures may choose to
+                        // discard this lower-severity transient immediately.
+                        let Some(id) = self.notices.recent().find(|entry| entry.notice == notice).map(|entry| entry.id) else { return Some(Task::none()); };
                         self.editor_features.notice_expiry.retain(|id, _| self.notices.entries.iter().any(|entry| entry.id == *id));
                         let ticket = self.editor_features.next();
                         self.editor_features.notice_expiry.insert(id, ticket);
