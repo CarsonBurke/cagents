@@ -1327,15 +1327,20 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
+                        let native_name=required(block,"name")?;
+                        let projected=tool_content(native_name,&block["input"],&self.cwd);
+                        if child.is_none() {
+                            step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{
+                                source:crate::chat::cache::SourceKey{agent_id:None,source_id:tool_id.clone()},
+                                name:native_name.into(),input:block["input"].to_string(),
+                                command:crate::chat::cache::raw::RawCommandCall::from_content(&projected),
+                            }));
+                        }
                         self.remember_tool_input(child,&tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
-                            content: tool_content(
-                                required(block, "name")?,
-                                &block["input"],
-                                &self.cwd,
-                            ),
+                            content: projected,
                             started_at: None,
                             at: None,
                         };
@@ -1431,7 +1436,13 @@ impl Claude {
                             });
                         let failed=block["is_error"].as_bool()==Some(true);
                         let original_input=if failed {correlated_call.map(|call|call["input"].to_string())} else {None};
-                        let edit=self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or_else(||correlated_call.and_then(|call|call["name"].as_str()));
+                        let original=if failed && child.is_none() && matches!(&item.content,ItemContent::Changes {..}) && original_input.is_none() {
+                            match self.item_reader.as_ref().map(|reader|reader.original_call(&CanonicalItemKey::new(child,&tool_id))).transpose() {
+                                Ok(value)=>value.flatten(),
+                                Err(message)=>{step.events.push(Event::Error{message,fatal:false});None}
+                            }
+                        } else {None};
+                        let edit=self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or_else(||correlated_call.and_then(|call|call["name"].as_str())).or_else(||original.as_ref().map(|call|call.0.as_str()));
                         if failed && edit.is_none() && matches!(&item.content,ItemContent::Changes {..}) {
                             step.events.push(Event::Error {message:format!("Tool failed: {}. Its original tool identity is unavailable; the failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
                         }
@@ -1440,7 +1451,7 @@ impl Claude {
                             content_text(&block["content"]),
                             failed,
                             edit,
-                            self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref()),
+                            self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref()).or_else(||original.as_ref().map(|call|call.1.as_str())),
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
                             if content.len() == 1 {
@@ -2034,7 +2045,7 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } => {
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadRawSource { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
@@ -3919,6 +3930,11 @@ impl Claude {
                 if bytes>MAX_RAW_BLOCK_BYTES {return Err("Claude simultaneous streaming bodies exceed the 64 MiB retained limit".into());}
                 self.raw_block_bytes=bytes;
                 self.closed_blocks.remove(&key);
+                if parent.is_empty() && let ItemContent::Tool{name,..}=&item.content {
+                    step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Start{
+                        source:crate::chat::cache::SourceKey{agent_id:None,source_id:item.id.clone()},name:name.clone(),
+                    }));
+                }
                 step.events.push(Event::Item(item.clone()));
                 self.blocks.insert(key, item);
             }
@@ -4008,6 +4024,17 @@ impl Claude {
                         // accumulate as a plain tool call and the richer
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
+                        if parent.is_empty() {
+                            use sha2::{Digest,Sha256};
+                            use crate::chat::cache::{SourceKey,raw::{RawCommandCall,RawToolCapture}};
+                            let source=SourceKey{agent_id:None,source_id:item.id.clone()};
+                            let command=RawCommandCall::from_content(&content);
+                            let canonical=parsed.to_string();
+                            let capture=if input.is_empty(){RawToolCapture::Full{source,name:name.clone(),input:canonical,command}}else{
+                                RawToolCapture::Seal{source,input_len:input.len(),canonical_hash:Sha256::digest(canonical.as_bytes()).into(),command}
+                            };
+                            step.events.push(Event::RawToolCapture(capture));
+                        }
                         self.remember_tool_input(Some(&parent),&item.id, &parsed)?;
                         if matches!(content, ItemContent::Changes { .. }) {
                             self.edit_tools.insert(CanonicalItemKey::new(Some(&parent),&item.id), name.clone());

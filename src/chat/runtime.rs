@@ -683,7 +683,7 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. }
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadRawSource { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -896,6 +896,9 @@ impl Handle {
     pub(crate) fn source_query(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
         self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)
     }
+    pub(crate) fn raw_source_query(&self,query:super::cache::raw::RawSourceQuery)->Result<super::cache::raw::RawSourcePage,super::cache::SourceError>{
+        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).raw_source_page(query)
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -921,6 +924,7 @@ impl Handle {
                 Ok(window) => {
                     state.source_parts.retain(|part|part.source.agent_id.is_some());
                     state.source_parts.extend(window.source_parts);
+                    state.raw_source_parts=window.raw_source_parts;
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -3134,7 +3138,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } => {}
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } | Event::RawToolCapture(_) => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));

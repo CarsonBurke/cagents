@@ -146,7 +146,7 @@ use crate::{
 /// Version 78 carries terminal provider outcomes and readable exit diagnostics.
 /// Version 79 pages immutable retained provider output by opaque log identity.
 /// Version 80 adds requester-specific original source pages (union provisional).
-pub const PROTOCOL_VERSION: u16 = 80;
+pub const PROTOCOL_VERSION: u16 = 81;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -802,6 +802,10 @@ pub enum ServerResponse {
     ChatSource {
         chat_id: TerminalId,
         result: Result<crate::chat::cache::SourcePage, crate::chat::cache::SourceError>,
+    },
+    ChatRawSource {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::raw::RawSourcePage, crate::chat::cache::SourceError>,
     },
 }
 

@@ -20,6 +20,8 @@ impl ItemKey {
 /// presentation window is sufficient authority for reconstructing old tools.
 pub trait ItemReader:Send+Sync {
     fn read(&self,key:&ItemKey)->Result<Option<Item>,String>;
+    /// Exact native original arguments, independently of a derived Changes item.
+    fn original_call(&self,_key:&ItemKey)->Result<Option<(String,String)>,String>{Ok(None)}
 }
 pub(crate) type Reader=Arc<dyn ItemReader>;
 

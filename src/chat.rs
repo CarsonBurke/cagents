@@ -959,6 +959,9 @@ pub struct Snapshot {
     pub source_revision: u64,
     #[serde(default)]
     pub source_parts: Vec<cache::SourcePart>,
+    /// Store-authored original raw call aliases; bodies remain on disk.
+    #[serde(default)]
+    pub raw_source_parts: Vec<cache::raw::RawSourcePart>,
 }
 
 /// Readable provider failure with a separately expandable bounded stderr tail.
@@ -1257,6 +1260,7 @@ pub enum Command {
     },
     /// Read original prose without hydrating or changing the presentation window.
     LoadSource { query: cache::SourceQuery },
+    LoadRawSource { query: cache::raw::RawSourceQuery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

@@ -1710,7 +1710,7 @@ impl Adapter for Codex {
                 // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } =>
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadRawSource { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
             Command::LoadEarlier => {

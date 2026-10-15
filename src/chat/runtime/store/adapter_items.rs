@@ -12,6 +12,12 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation!=self.generation {return Err("Original tool source was revoked by a conversation reset".into());}
         store.adapter_item(key)
     }
+    fn original_call(&self,key:&CanonicalItemKey)->Result<Option<(String,String)>,String>{
+        let store=self.store.upgrade().ok_or("Original tool Store is no longer available")?;
+        let mut store=store.lock().unwrap_or_else(|p|p.into_inner());
+        if store.canonical_generation!=self.generation{return Err("Original tool source was revoked by reset".into());}
+        store.raw_original(&crate::chat::cache::SourceKey{agent_id:key.agent_id.clone(),source_id:key.item_id.clone()})
+    }
 }
 pub(in crate::chat::runtime) fn reader(store:&Arc<Mutex<Store>>)->Arc<dyn CanonicalItemReader> {
     let generation=store.lock().unwrap_or_else(|p|p.into_inner()).canonical_generation;
@@ -35,20 +41,26 @@ impl Store {
         if result.len()!=expected {return Err("Original tool source is incomplete; its stored call was preserved".into());}
         Ok(result)
     }
-    fn adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
+    pub(super) fn adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         self.flush_input()?;self.flush_text()?;
+        self.raw_guard()?;
+        if key.agent_id.is_none()&&self.raw_revoked(&crate::chat::cache::SourceKey{agent_id:None,source_id:key.item_id.clone()})?{return Err("Original tool identity was explicitly removed; replay is refused until reset".into());}
         if key.agent_id.is_some() {
             return self.child_adapter_item(key);
         }
         let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END,source_shortened FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,bool>(5)?))).optional().map_err(|error|error.to_string())?;
         let Some((metadata,len0,len1,len2,spans,shortened))=record else {return Ok(None);};
-        if shortened {return Err("Original tool identity was shortened for presentation; refusing to promote it as complete source".into());}
         let metadata=metadata.ok_or("Original tool metadata exceeds its canonical limit")?;
         let spans=spans.ok_or("Original tool patch metadata exceeds its canonical limit")?;
         let lengths=[len0,len1,len2].map(usize::try_from);
         let [Ok(len0),Ok(len1),Ok(len2)]=lengths else {return Err("Original tool source has invalid body lengths".into());};
         if len0.checked_add(len1).and_then(|bytes|bytes.checked_add(len2)).is_none_or(|bytes|bytes>MAX_REHYDRATION) {return Err("Original tool source exceeds the bounded adapter read limit".into());}
         let mut item:Item=postcard::from_bytes(&metadata).map_err(|error|error.to_string())?;
+        if shortened {
+            let original=self.raw_command(&crate::chat::cache::SourceKey{agent_id:None,source_id:key.item_id.clone()})?.ok_or("Original tool identity was shortened and its raw call was not captured")?;
+            let ItemContent::Command{label,command,working_directory,action,..}=&mut item.content else{return Err("Shortened source is not an exactly captured command".into());};
+            *label=original.label;*command=original.command;*working_directory=original.working_directory;*action=original.action;
+        }
         if item.id!=key.item_id || len2!=0 {return Err("Original tool source identity or layout changed".into());}
         let body0=String::from_utf8(self.strict_adapter_field(&key.item_id,0,len0)?).map_err(|error|error.to_string())?;
         let body1=String::from_utf8(self.strict_adapter_field(&key.item_id,1,len1)?).map_err(|error|error.to_string())?;
@@ -82,6 +94,7 @@ mod tests {
             self.reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
             self.inner.read(key)
         }
+        fn original_call(&self,key:&CanonicalItemKey)->Result<Option<(String,String)>,String>{self.inner.original_call(key)}
     }
     fn commit(store:&Arc<Mutex<Store>>,adapter:&mut dyn crate::chat::protocol::Adapter,step:crate::chat::protocol::Step) {
         let mut reset=false;
@@ -193,11 +206,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_old_write_preserves_attempted_patch_without_guessing_an_expired_tool_name() {
+    fn uncaptured_legacy_failed_write_preserves_patch_without_guessing_an_expired_tool_name() {
         use serde_json::json;
         let store=Arc::new(Mutex::new(Store::new().unwrap()));
         let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
-        let step=adapter.receive(json!({"type":"assistant","uuid":"old-call","message":{"content":[{"type":"tool_use","id":"old-write","name":"Write","input":{"file_path":"attempted.txt","content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+        let mut step=adapter.receive(json!({"type":"assistant","uuid":"old-call","message":{"content":[{"type":"tool_use","id":"old-write","name":"Write","input":{"file_path":"attempted.txt","content":"x".repeat(3*1024*1024)}}]}})).unwrap();
+        // A retained legacy actor may have presentation history predating raw
+        // capture. Missing original proof must remain explicit in that case.
+        step.events.retain(|event|!matches!(event,Event::RawToolCapture(_)));
         commit(&store,adapter.as_mut(),step);
         for index in 0..513 {
             let step=adapter.receive(json!({"type":"assistant","uuid":format!("later-{index}"),"message":{"content":[{"type":"tool_use","id":format!("later-{index}"),"name":"Opaque","input":{}}]}})).unwrap();

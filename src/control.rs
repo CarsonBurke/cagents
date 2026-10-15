@@ -1826,6 +1826,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::ChatProviderExitOutput { .. } => "chat_provider_exit_output",
         ServerResponse::ChatSource { .. } => "chat_source",
+        ServerResponse::ChatRawSource { .. } => "chat_raw_source",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }

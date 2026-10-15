@@ -91,6 +91,9 @@ struct SourceRequest<'a> { pending: &'a SourcePending, id: u64 }
 impl Drop for SourceRequest<'_> {
     fn drop(&mut self) { self.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id); }
 }
+type RawSourcePending = Arc<Mutex<BTreeMap<u64,tokio::sync::oneshot::Sender<Result<super::cache::raw::RawSourcePage,super::cache::SourceError>>>>>;
+struct RawSourceRequest<'a>{pending:&'a RawSourcePending,id:u64}
+impl Drop for RawSourceRequest<'_>{fn drop(&mut self){self.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id);}}
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
@@ -151,6 +154,7 @@ struct Inner {
     pending: Pending,
     file_pending: FilePending,
     source_pending: SourcePending,
+    raw_source_pending: RawSourcePending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -557,6 +561,7 @@ impl ClientHandle {
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
                 file_pending: Arc::new(Mutex::new(BTreeMap::new())),
                 source_pending: Arc::default(),
+                raw_source_pending: Arc::default(),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             }),
@@ -1005,6 +1010,7 @@ impl ClientHandle {
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let source_pending: SourcePending = Arc::default();
+        let raw_source_pending: RawSourcePending=Arc::default();
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -1026,6 +1032,7 @@ impl ClientHandle {
             pending: pending.clone(),
             file_pending: file_pending.clone(),
             source_pending: source_pending.clone(),
+            raw_source_pending:raw_source_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1113,8 +1120,17 @@ impl ClientHandle {
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     for (_,reply) in std::mem::take(&mut *source_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.send(Err(super::cache::SourceError::Transport("Chat was explicitly closed".into())));}
+                    for (_,reply) in std::mem::take(&mut *raw_source_pending.lock().unwrap_or_else(|p|p.into_inner())){let _=reply.send(Err(super::cache::SourceError::Transport("Chat was explicitly closed".into())));}
                     wake(Wake::Changed);
                     return;
+                }
+                if let Some(reply)=envelope.request_id.and_then(|request|raw_source_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
+                    let result=match envelope.message {
+                        ServerMessage::Response{response:ServerResponse::ChatRawSource{chat_id,result}} if chat_id==id=>result,
+                        ServerMessage::Error(error)=>Err(super::cache::SourceError::Transport(error.message)),
+                        _=>Err(super::cache::SourceError::Transport("Unexpected original tool reply".into())),
+                    };
+                    let _=reply.send(result);continue;
                 }
                 if let Some(reply)=envelope.request_id.and_then(|request|source_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
@@ -1223,6 +1239,7 @@ impl ClientHandle {
                 let _=reply.try_send(Err(failure.clone()));
             }
             for (_,reply) in std::mem::take(&mut *source_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.send(Err(super::cache::SourceError::Transport(failure.clone())));}
+            for (_,reply) in std::mem::take(&mut *raw_source_pending.lock().unwrap_or_else(|p|p.into_inner())){let _=reply.send(Err(super::cache::SourceError::Transport(failure.clone())));}
             wake(Wake::Disconnected(failure));
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
@@ -1449,6 +1466,35 @@ impl ClientHandle {
             transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadSource{query}}).await.map_err(SourceError::Transport)?;
             response.await.map_err(|_|SourceError::Transport("Source request disconnected".into()))?
         }).await.map_err(|_|SourceError::Transport("Source request timed out".into()))?
+    }
+    /// Request one original-call page through this authenticated connection's
+    /// existing reply reader. Cancellation removes its bounded pending credit.
+    pub async fn raw_source_page(&self,query:super::cache::raw::RawSourceQuery)->Result<super::cache::raw::RawSourcePage,super::cache::SourceError>{
+        use super::cache::{SourceError,raw::RAW_SOURCE_BYTES,PAGE_BYTES};
+        if !(4..=PAGE_BYTES).contains(&query.limit)||query.source.source_id.len()>4096||query.source.source_id.is_empty()||query.source.agent_id.as_ref().is_some_and(|id|id.len()>4096||id.is_empty())
+            ||(query.offset>0&&(query.until.is_none()||query.expected_epoch.is_none()))||(query.until.is_some()&&query.expected_epoch.is_none()){return Err(SourceError::InvalidRange);}
+        if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
+        let id=self.inner.next.fetch_add(1,Ordering::Relaxed);let (reply,response)=tokio::sync::oneshot::channel();
+        {
+            let mut pending=self.inner.raw_source_pending.lock().unwrap_or_else(|p|p.into_inner());
+            if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
+            if pending.len()>=64{return Err(SourceError::Transport("Original source request capacity reached".into()));}
+            pending.insert(id,reply);
+        }
+        let _request=RawSourceRequest{pending:&self.inner.raw_source_pending,id};
+        let requested=query.clone();
+        let page=tokio::time::timeout(Duration::from_secs(40),async{
+            transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadRawSource{query}}).await.map_err(SourceError::Transport)?;
+            response.await.map_err(|_|SourceError::Transport("Original source request disconnected".into()))?
+        }).await.map_err(|_|SourceError::Transport("Original source request timed out".into()))??;
+        if page.source!=requested.source||page.field!=requested.field||page.offset!=requested.offset||page.text.len()>requested.limit||page.source_len>RAW_SOURCE_BYTES
+            ||page.next_offset!=page.offset.saturating_add(page.text.len())||page.next_offset>page.source_len||page.complete!=(page.next_offset==page.source_len)
+            ||page.metadata.tool_name.is_empty()||page.metadata.tool_name.len()>4096
+            ||(page.field==super::cache::raw::RawSourceField::CommandCall)!=(page.metadata.representation==super::cache::raw::RawRepresentation::CommandMetadataJson)
+            ||(page.text.is_empty()&&!page.complete)||requested.expected_epoch.is_some_and(|epoch|epoch!=page.epoch)||requested.until.is_some_and(|until|until!=page.source_len){
+            return Err(SourceError::Transport("Original source reply did not match its exact request".into()));
+        }
+        Ok(page)
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {
@@ -3343,6 +3389,52 @@ mod tests {
             server.join().unwrap();
         }
     }
+    #[test]
+    fn raw_source_replies_remain_requester_specific_without_snapshot_hydration() {
+        use super::super::cache::{SourceKey,raw::{RawSourceQuery,RawSourcePage,RawSourceMetadata,RawRepresentation,RawSourceField}};
+        let (client,mut server)=UnixStream::pair().unwrap();
+        let (done,finished)=std::sync::mpsc::channel();
+        let worker=thread::spawn(move || {
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let proof=host_proof("raw-source-query");
+            let mut codec=FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond=|codec:&mut FrameCodec,server:&mut UnixStream,request_id,response| {
+                codec.write(server,&ServerEnvelope{version:PROTOCOL_VERSION,request_id,proof:proof.clone(),message:ServerMessage::Response{response}}).unwrap();
+            };
+            let connect:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            respond(&mut codec,&mut server,Some(connect.request_id),ServerResponse::Connected{proof:proof.clone(),resumed:vec![]});
+            let start:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart{session,..}=start.request else {panic!("start expected")};
+            let chat_id=session.id;
+            respond(&mut codec,&mut server,Some(start.request_id),ServerResponse::ChatAttached{session,snapshot:Snapshot{generation:7,..Default::default()}});
+            let first:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let second:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            for request in [second,first] {
+                let ClientRequest::ChatCommand{command:Command::LoadRawSource{query},..}=request.request else {panic!("source expected")};
+                let text=query.source.source_id.clone();
+                respond(&mut codec,&mut server,Some(request.request_id),ServerResponse::ChatRawSource{chat_id,result:Ok(RawSourcePage{source:query.source,field:query.field,epoch:super::super::cache::SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:1},source_len:text.len(),offset:0,next_offset:text.len(),text,complete:true,metadata:RawSourceMetadata{tool_name:"Write".into(),representation:RawRepresentation::CanonicalJson,complete_call:true}})});
+            }
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle=ClientHandle::connect_on(client,omp_card(None,None),Intent::Start,None,false,None,None,|_|{}).unwrap();
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            let mut tasks=Vec::new();
+            for id in ["one","two"] {
+                let handle=handle.clone();
+                tasks.push(tokio::spawn(async move {
+                    let page=handle.raw_source_page(RawSourceQuery{field:RawSourceField::ToolInput,source:SourceKey{agent_id:None,source_id:id.into()},offset:0,limit:256,expected_epoch:None,until:None}).await.unwrap();
+                    assert_eq!(page.text,id);assert_eq!(page.source.source_id,id);
+                }));
+            }
+            for task in tasks {task.await.unwrap();}
+        });
+        assert_eq!(handle.snapshot().generation,7);
+        assert!(handle.snapshot().items.is_empty());
+        assert!(handle.inner.raw_source_pending.lock().unwrap().is_empty());
+        done.send(()).unwrap();worker.join().unwrap();
+    }
+
     #[test]
     fn source_replies_are_async_correlated_and_do_not_hydrate_snapshot() {
         use super::super::cache::{SourceKey,SourceQuery,SourcePage};

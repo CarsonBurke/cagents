@@ -89,3 +89,20 @@ impl RawToolCapture {
         match self { Self::Start {source,..}|Self::Full {source,..}|Self::Seal {source,..}=>source }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn raw_source_wire_preserves_representation_and_exact_store_epoch(){
+        let source=SourceKey{agent_id:None,source_id:"opaque:native-part:1".into()};let epoch=SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:19};
+        let query=RawSourceQuery{source:source.clone(),field:RawSourceField::ToolInput,offset:4,limit:256,expected_epoch:Some(epoch),until:Some(8)};
+        let chat_id=crate::model::TerminalId::new();let request=crate::terminal_ipc::ClientRequest::ChatCommand{chat_id,command:crate::chat::Command::LoadRawSource{query}};
+        assert_eq!(postcard::from_bytes::<crate::terminal_ipc::ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),request);
+        for representation in [RawRepresentation::StreamJson,RawRepresentation::CanonicalJson,RawRepresentation::CommandMetadataJson]{
+            let response=crate::terminal_ipc::ServerResponse::ChatRawSource{chat_id,result:Ok(RawSourcePage{source:source.clone(),field:RawSourceField::ToolInput,epoch,source_len:8,offset:4,next_offset:8,text:"null".into(),complete:true,metadata:RawSourceMetadata{tool_name:"Write".into(),representation,complete_call:false}})};
+            assert_eq!(postcard::from_bytes::<crate::terminal_ipc::ServerResponse>(&postcard::to_stdvec(&response).unwrap()).unwrap(),response);
+            assert_eq!(serde_json::from_str::<crate::terminal_ipc::ServerResponse>(&serde_json::to_string(&response).unwrap()).unwrap(),response);
+        }
+    }
+}

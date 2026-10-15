@@ -5,6 +5,7 @@ mod adapter_items;
 mod child_tools;
 pub(super) use adapter_items::reader as adapter_item_reader;
 mod source;
+mod raw;
 
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -51,6 +52,7 @@ pub(super) struct Window {
     pub items: Vec<std::sync::Arc<Item>>,
     pub changes: Vec<crate::chat::presentation::ItemChange>,
     pub source_parts: Vec<crate::chat::cache::SourcePart>,
+    pub raw_source_parts: Vec<crate::chat::cache::raw::RawSourcePart>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
@@ -58,6 +60,7 @@ pub(crate) struct Store {
     db: Connection,
     /// A reset revokes every previously issued canonical source reader.
     canonical_generation: uuid::Uuid,
+    raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -153,7 +156,7 @@ impl Store {
                 .mode(0o600)
                 .open(&path)
                 .map_err(|e| e.to_string())?;
-            let db = Connection::open(&path).map_err(|e| e.to_string())?;
+            let mut db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,running INTEGER NOT NULL DEFAULT 0,source_shortened INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX running_tools ON items(id) WHERE running=1;
@@ -162,7 +165,9 @@ impl Store {
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             db.execute_batch(child_tools::SCHEMA).map_err(|e| e.to_string())?;
+            let raw_sources=raw::initialize(&mut db)?;
             Ok(Self {
+                raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
                 file_revision: 0,
                 child_file_ordinal: 0,
@@ -381,6 +386,8 @@ impl Store {
             body0.len() as i64
         };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        raw::guard(&transaction,self.raw_sources.nonce)?;
+        if raw::revoked(&transaction,&crate::chat::cache::SourceKey{agent_id:None,source_id:item.id.clone()})?{return Err("Removed original tool identity cannot be rewritten".into());}
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,running,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,running=excluded.running,source_shortened=MAX(items.source_shortened,excluded.source_shortened)", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,item.content.status()==Some(crate::chat::ToolStatus::Running),shortened]).map_err(|e| e.to_string())?;
@@ -684,10 +691,21 @@ impl Store {
                 _ => {}
             }
         }
+        if self.raw_event_revoked(&event)? {
+            return Ok(vec![nonfatal("Original tool source was removed; its late update was discarded".into())]);
+        }
+        let raw_warning=self.cache_raw_call(&event)?;
+        if matches!(&event,Event::Item(_)|Event::History{..}|Event::LatestHistory{..})&&self.raw_event_revoked(&event)?{
+            return Ok(vec![nonfatal("An original tool identity changed kind; its private source was revoked and the ambiguous update discarded".into())]);
+        }
+        if matches!(&event,Event::RawToolCapture(_)) {
+            return Ok(raw_warning.into_iter().map(nonfatal).collect());
+        }
         if self.revoked_child_tool_event(&event)? {
             return Ok(vec![nonfatal("Delegated tool source was removed; a late update was discarded without recreating its private body".into())]);
         }
         let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
+        out.extend(raw_warning.into_iter().map(nonfatal));
         self.index_child_event(&event)?;
         self.cache_child_source(&event)?;
 
@@ -1008,6 +1026,8 @@ impl Store {
         item.at = at;
         let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        raw::guard(&transaction,self.raw_sources.nonce)?;
+        if raw::revoked(&transaction,&crate::chat::cache::SourceKey{agent_id:None,source_id:id.into()})?{return Err("Removed original tool input cannot be appended".into());}
         insert_body(&transaction, &id, field, offset as i64, &delta)?;
         let update = if field == 0 {
             "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
@@ -1241,12 +1261,15 @@ impl Store {
         };
         let mut items = Vec::new();
         let mut source_parts = Vec::new();
+        let mut raw_source_parts = Vec::new();
+        let mut raw_part_bytes=0usize;
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
         'records: for (id, ordinal, metadata, len0, len1, len2, spans, source_epoch) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
+            let original_parts=self.raw_parts(&id)?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
             let cut = |target: usize| {
                 if patch {
@@ -1313,6 +1336,11 @@ impl Store {
                 }
                 if kind=="text" {
                     source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:crate::chat::cache::SourceEpoch{incarnation:self.source_incarnation,revision:source_epoch},metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
+                }
+                for original in &original_parts {
+                    let cost=original.source.source_id.len()+item_id.len()+original.metadata.tool_name.len()+128;
+                    if raw_source_parts.len()>=crate::chat::cache::raw::RAW_PARTS||raw_part_bytes.saturating_add(cost)>crate::chat::cache::raw::RAW_PART_BYTES {break;}
+                    let mut original=original.clone();original.item_id=item_id.to_string();raw_source_parts.push(original);raw_part_bytes+=cost;
                 }
                 if self
                     .changed
@@ -1525,6 +1553,7 @@ impl Store {
             items,
             changes,
             source_parts,
+            raw_source_parts,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
