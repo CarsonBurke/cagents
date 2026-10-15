@@ -275,6 +275,16 @@ impl Cagents {
                 let Ok(path) = RepoPath::parse(&matched.path) else {
                     return Task::none();
                 };
+                if let Some(card) = self.repository_card_for(&root.canonical_path)
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    && runtime.selected_path() != Some(matched.path.as_path())
+                    && runtime.blocks_navigation()
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "Save the current editor or resolve its pending changes before opening another search result.",
+                    ));
+                    return self.focus_workspace_card(card);
+                }
                 let task = self.route_panel_open(&root, &path);
                 self.pending_panel_open = None;
                 // Location belongs to this concrete path, not the next file
@@ -527,6 +537,47 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_another_search_file_preserves_a_blocked_editor_and_explains_the_guard() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let root = app.sidebar_state.active_worktree().unwrap().clone();
+        let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::dirty_fixture(card);
+        runtime.descriptor.project = root.project_id;
+        runtime.descriptor.repository = root.canonical_path.clone();
+        runtime.descriptor.worktree = root.canonical_path.clone();
+        runtime.descriptor.selected_file = None;
+        let selected = runtime.selected_path().unwrap().to_path_buf();
+        let navigation = runtime.navigation();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.search_ui.root = Some(root);
+        app.search_ui.matches.push(project_search::Match {
+            path: "another-search-result.rs".into(),
+            line: 0,
+            column: 0,
+            length: 3,
+            snippet: "hit".into(),
+            highlight: 0..3,
+        });
+        drop(app.update_project_search(Action::OpenResult(0)));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.severity == NoticeSeverity::Warning)
+        );
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            panic!("editor")
+        };
+        assert_eq!(runtime.selected_path(), Some(selected.as_path()));
+        assert_eq!(runtime.navigation(), navigation);
+        assert!(runtime.is_dirty());
+        assert!(app.pending_panel_open.is_none());
+    }
+
     #[test]
     fn new_queries_cancel_old_search_and_reject_stale_batches() {
         let mut app = super::super::tests::context_inspector_test_app(false);
