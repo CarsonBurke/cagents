@@ -263,6 +263,34 @@ pub(in crate::host) fn restart_completed(
     Ok(Some(response))
 }
 
+/// The pair publisher may cross original None to confirmed Some only through
+/// THIS same retained restart's positive receipt and canonical prepared UUID.
+/// This query performs no provider I/O, creates no identity and changes no
+/// source/recipe; an ordinary fresh session has no such cached authority.
+pub(in crate::host) fn confirms_restart_projection(
+    host: &SharedHost, source: &Session, current: &Session, handle: &Handle,
+) -> Result<bool, String> {
+    if source.launch.session_id.is_some() || current.launch.session_id.is_none() {
+        return Ok(false);
+    }
+    let request = super::super::restart::request_id(host, source.id)
+        .map_err(|error| error.message)?;
+    let Some(identity) = handle.actor_identity() else { return Ok(false); };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if source.proof.as_ref() != Some(state.proof())
+        || state.chats.get(&source.id).is_none_or(|record| {
+            !record.handle.same_actor(handle) || record.execution_instance != identity.instance
+        })
+    {
+        return Ok(false);
+    }
+    Ok(state.native_actor_restarts.get(&source.id).is_some_and(|pending| {
+        pending.request == request && pending.identity == identity
+            && pending.source == *source && pending.settled && !pending.failed_proved
+            && pending.is_confirmed_projection(current, handle)
+    }))
+}
+
 /// A new user retry may prepare another request only after the helper's
 /// explicit positive teardown receipt for this exact failed request.
 pub(in crate::host) fn restart_failure_proved(

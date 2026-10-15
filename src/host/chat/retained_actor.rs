@@ -4,7 +4,7 @@
 use super::*;
 mod restart;
 mod semantic_drain;
-pub(in crate::host) use self::restart::PreparedRestart;
+pub(in crate::host) use self::restart::{PreparedRestart, confirms_restart_projection};
 pub(super) use self::restart::{restart_completed, restart_failure_proved};
 use crate::host::model::NativeActorEvent;
 use std::{

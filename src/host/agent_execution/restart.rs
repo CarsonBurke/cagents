@@ -184,10 +184,14 @@ pub(in crate::host) fn restore_restart_pair(
     plan: &PairPlan,
 ) -> Result<chat::RestartReceipt, String> {
     let (mut session, handle) = current(host, plan.source.id)?;
+    let exact_confirmed_restart = session.launch.session_id != plan.source.launch.session_id
+        && super::super::chat::retained_actor::confirms_restart_projection(
+            host, &plan.source, &session, &handle,
+        )?;
     if session.proof != plan.source.proof
         || session.launch.provider != plan.source.launch.provider
         || session.launch.recipe != plan.source.launch.recipe
-        || session.launch.session_id != plan.source.launch.session_id
+        || (session.launch.session_id != plan.source.launch.session_id && !exact_confirmed_restart)
         || session.owned_codex_listener != plan.source.owned_codex_listener
     {
         return Err(
