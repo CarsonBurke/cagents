@@ -2104,7 +2104,10 @@ done
         let request = "        printf '{\"type\":\"control_request\",\"request_id\":\"background-first\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"tool_use_id\":\"first\",\"input\":{\"command\":\"true\"}}}\\n'\n";
         let result = "        printf '{\"type\":\"result\",\"uuid\":\"first-result\",\"is_error\":false}\\n'\n";
         let original = format!("{request}{result}");
-        assert!(script.contains(&original), "fixture must reverse the actual decoder frames");
+        assert!(
+            script.contains(&original),
+            "fixture must reverse the actual decoder frames"
+        );
         script.replacen(&original, &format!("{result}{request}"), 1)
     } else {
         script.to_owned()

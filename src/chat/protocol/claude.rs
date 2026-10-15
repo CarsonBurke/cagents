@@ -489,9 +489,7 @@ impl Claude {
         // so the adapter may already be idle when it is answered. Once no
         // request or active turn remains, forget between-turn interruption:
         // this idle generation also identifies the next prompt.
-        if self.pending.is_empty()
-            && self.started_generation != Some(self.attention_generation)
-        {
+        if self.pending.is_empty() && self.started_generation != Some(self.attention_generation) {
             self.interruption = None;
             // This idle generation will also identify the next prompt. Forget
             // its between-turn interrupts before a late reply can be mistaken
@@ -5793,15 +5791,22 @@ mod tests {
                     .send_prompt("first".into(), vec![], PromptMode::Send)
                     .unwrap();
                 if !request_after_result {
-                    adapter.receive(approval("background", "Bash", json!({"command":"true"}))).unwrap();
+                    adapter
+                        .receive(approval("background", "Bash", json!({"command":"true"})))
+                        .unwrap();
                 }
                 adapter
                     .receive(json!({"type":"result","is_error":false}))
                     .unwrap();
                 if request_after_result {
                     assert!(!adapter.busy, "main result precedes the late decision");
-                    adapter.receive(approval("background", "Bash", json!({"command":"true"}))).unwrap();
-                    assert!(!adapter.busy, "late permission does not create a new main turn");
+                    adapter
+                        .receive(approval("background", "Bash", json!({"command":"true"})))
+                        .unwrap();
+                    assert!(
+                        !adapter.busy,
+                        "late permission does not create a new main turn"
+                    );
                 }
                 let old = adapter.command(Command::Interrupt).unwrap();
                 let old_id = old.writes[0]["request_id"].as_str().unwrap();
