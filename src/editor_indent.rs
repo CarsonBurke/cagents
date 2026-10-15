@@ -72,11 +72,12 @@ pub fn read(worktree: &Path, path: &Path) -> Overrides {
 
 fn parse(text: &str, path: &str, result: &mut Overrides) {
     let mut active = false;
+    let mut glob_budget = 4_000_000usize;
     for line in text.lines().map(str::trim).filter(|line| !line.starts_with(['#', ';'])) {
         if line.starts_with('[') && line.ends_with(']') {
             let pattern = &line[1..line.len()-1];
             let target = if pattern.contains('/') { path } else { path.rsplit('/').next().unwrap_or(path) };
-            active = glob(pattern.trim_start_matches('/'), target);
+            active = glob_with_budget(pattern.trim_start_matches('/'), target, &mut glob_budget);
         } else if active && let Some((key, value)) = line.split_once('=') {
             let value = value.trim().to_ascii_lowercase();
             let width = || value.parse::<u16>().ok().filter(|width| (1..=16).contains(width));
@@ -90,15 +91,29 @@ fn parse(text: &str, path: &str, result: &mut Overrides) {
     }
 }
 
-fn glob(pattern: &str, text: &str) -> bool {
-    if pattern.len() > 512 || pattern.bytes().filter(|byte| *byte == b'{').count() > 4 { return false; }
+#[cfg(test)]
+fn glob(pattern: &str, text: &str) -> bool { glob_with_budget(pattern, text, &mut 4_000_000) }
+
+fn charge_glob(budget: &mut usize, steps: usize) -> bool {
+    match budget.checked_sub(steps) {
+        Some(remaining) => { *budget = remaining; true },
+        None => { *budget = 0; false },
+    }
+}
+
+fn glob_with_budget(pattern: &str, text: &str, budget: &mut usize) -> bool {
+    if pattern.len() > 512 || pattern.bytes().filter(|byte| *byte == b'{').count() > 4 || !charge_glob(budget, pattern.len().max(1)) { return false; }
     // EditorConfig brace alternatives are bounded for repository input.
     // Wildcards and ** paths are matched below without regex.
     if let Some(start) = pattern.find('{') && let Some(end) = pattern[start..].find('}').map(|end| start + end) {
         return pattern[start+1..end].split(',').take(64).any(|part| {
-            glob(&format!("{}{}{}", &pattern[..start], part, &pattern[end+1..]), text)
+            glob_with_budget(&format!("{}{}{}", &pattern[..start], part, &pattern[end+1..]), text, budget)
         });
     }
+    // Charge the complete dynamic-programming grid before allocating it.
+    // Recursion and later sections share this budget, so individually small
+    // brace groups cannot multiply into unbounded worker CPU time.
+    if !charge_glob(budget, pattern.len().saturating_mul(text.len().saturating_add(1))) { return false; }
     let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
     let mut current = vec![false; text.len()+1]; current[0] = true;
     let mut index = 0;
@@ -162,6 +177,18 @@ mod tests {
         for path in ["src/a.rs", "src/deep/b.rs"] { assert!(glob("src/**/[ab].{rs,py}", path)); }
         assert!(!glob("src/**/[!ab].rs", "src/a.rs"));
         assert!(glob("src/**/[!ab].rs", "src/c.rs"));
+    }
+
+    #[test]
+    fn brace_expansion_and_later_sections_share_one_work_budget() {
+        let alternatives = (0..32).map(|index| format!("{index:02}")).collect::<Vec<_>>().join(",");
+        let pattern = format!("{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}{{{alternatives}}}");
+        assert!(pattern.len() < 512);
+        let mut budget = 4096;
+        assert!(!glob_with_budget(&pattern, "never-matches", &mut budget));
+        assert_eq!(budget, 0);
+        assert!(!glob_with_budget("*", "later.rs", &mut budget));
+        assert!(glob("*.{rs,py}", "normal.rs"));
     }
 
     #[test]
