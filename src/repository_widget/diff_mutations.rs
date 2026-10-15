@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn diff_hunk_native_press_cannot_cross_runtime_or_model_replacement() {
         use cosmic::iced::{
-            Event, Point, Size,
+            Event, Point, Size, mouse,
             advanced::clipboard,
             runtime::{UserInterface, user_interface::Cache},
         };
