@@ -194,11 +194,13 @@ mod tests {
         assert!(reader.finish().unwrap().text.is_empty());
         assert_eq!(validate_query(None, None, 1, 1), Err(OriginalError::InvalidRange));
         assert_eq!(validate_query(Some("u"), Some("s"), 1, 0), Err(OriginalError::InvalidRange));
-        assert_eq!(validate_page(None, None, 0, 1, &page(0, "", 1)), Err(OriginalError::Changed));
-        assert_eq!(validate_page(None, None, 0, 1, &page(0, "x", ORIGINAL_TEXT_BYTES + 1)), Err(OriginalError::TooLarge));
+        assert_eq!(validate_page(None, None, 0, 4, &page(0, "", 1)), Err(OriginalError::Changed));
+        assert_eq!(validate_page(None, None, 0, 4, &page(0, "x", ORIGINAL_TEXT_BYTES + 1)), Err(OriginalError::TooLarge));
         let mut unknown = page(0, "x", 1);
         unknown.original.settings.model = Setting::Unknown;
-        assert!(matches!(validate_page(None, None, 0, 1, &unknown), Err(OriginalError::Unavailable(_))));
+        assert_eq!(validate_page(None, None, 0, 1, &unknown),Err(OriginalError::InvalidRange));
+        assert_eq!(validate_page(None, None, 0, 4, &unknown),Ok(()));
+        assert!(!unknown.original.settings.is_exact(),"accepted Unknown input remains Edit-only");
     }
 
     #[test]
