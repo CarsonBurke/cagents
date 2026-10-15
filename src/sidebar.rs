@@ -17045,20 +17045,28 @@ pub(crate) mod tests {
                 .filter_map(|command| command.action)
                 .collect::<Vec<_>>();
             for actions in [&group_actions, &row_actions] {
-                assert!(actions.iter().any(|action| match area {
-                    ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
-                    _ => matches!(action, SidebarAction::Stage { .. }),
-                }), "stage and unstage intentions must reach the serialized queue");
-                assert!(!actions.iter().any(|action| matches!(
-                    action, SidebarAction::RequestDiscard { .. }
-                )), "discard remains unavailable while a mutation runs");
+                assert!(
+                    actions.iter().any(|action| match area {
+                        ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
+                        _ => matches!(action, SidebarAction::Stage { .. }),
+                    }),
+                    "stage and unstage intentions must reach the serialized queue"
+                );
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, SidebarAction::RequestDiscard { .. })),
+                    "discard remains unavailable while a mutation runs"
+                );
             }
             for commands in [
                 group_commands(&source, group, true),
                 row_commands(&source, area, &group.rows()[0], true),
             ] {
-                assert!(commands.iter().all(|command| command.action.is_none()),
-                    "an open dialog still withholds every command");
+                assert!(
+                    commands.iter().all(|command| command.action.is_none()),
+                    "an open dialog still withholds every command"
+                );
             }
         }
     }
