@@ -378,6 +378,16 @@ pub(super) struct ServerEdits {
     pending: Mutex<HashMap<LspServerEditId, ServerEdit>>,
 }
 impl ServerEdits {
+    fn preview(&self, doc:LspDocumentId, deadline:std::time::Instant)
+        -> Result<(LspServerEditId, tokio::sync::oneshot::Receiver<lsp_types::ApplyWorkspaceEditResponse>),String> {
+        let mut pending = self.pending.lock().unwrap_or_else(|p|p.into_inner());
+        if pending.len() >= 64 { return Err("too many pending workspace-edit previews".into()); }
+        let id = LspServerEditId(NEXT_SERVER_EDIT_ID.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+            |next|next.checked_add(1)).map_err(|_|"workspace-edit request identity space exhausted".to_owned())?);
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        pending.insert(id, ServerEdit { doc, deadline, reply:Some(reply) });
+        Ok((id, receiver))
+    }
     pub(super) fn close_doc(&self, doc: LspDocumentId) {
         self.pending.lock().unwrap_or_else(|p| p.into_inner())
             .retain(|_, entry| entry.doc != doc || entry.reply.is_none());
@@ -426,6 +436,16 @@ impl Drop for LspServerEditLease {
     }
 }
 impl LspManager {
+    /// Unit controller fixtures own the real bounded preview/reply state; a
+    /// synthetic event ID cannot accidentally grant publication authority.
+    #[cfg(test)]
+    pub(crate) fn fixture_workspace_edit_preview(&self, doc:LspDocumentId, timeout:Duration)
+        -> Result<(LspServerEditId, tokio::sync::oneshot::Receiver<lsp_types::ApplyWorkspaceEditResponse>),String> {
+        if self.document_version(doc).is_none() { return Err("The fixture document is not registered".into()); }
+        let deadline = std::time::Instant::now().checked_add(timeout)
+            .ok_or("The fixture preview deadline is outside the clock range")?;
+        self.server_edits.preview(doc, deadline)
+    }
     /// Atomically claims an unexpired preview. Closing a document or timing
     /// out before this point makes claiming fail without publication authority.
     /// Once claimed, the lease owns the response across preview expiry and
@@ -474,9 +494,7 @@ fn apply_workspace_edit_with_timeout(state:&mut RouterState, params:lsp_types::A
         let doc=state.snapshots.docs_for_session(&state.key).into_iter().next().ok_or("no open document owns this language server")?;
         let versions=state.snapshots.lock().uris.iter().filter(|(_,uri)|uri.session==state.key).map(|(uri,entry)|((**uri).clone(),entry.latest().version)).collect();
         let edit=convert_workspace_edit(&state.snapshots,params.edit,Some(&versions)).map_err(|e|e.to_string())?;
-        let id=LspServerEditId(NEXT_SERVER_EDIT_ID.fetch_add(1,Ordering::Relaxed));
-        let (tx,rx)=tokio::sync::oneshot::channel();
-        {let mut pending=state.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner());if pending.len()>=64{return Err("too many pending workspace-edit previews".to_owned());}pending.insert(id,ServerEdit { doc, deadline, reply:Some(tx) });}
+        let (id,rx)=state.server_edits.preview(doc,deadline)?;
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
     })();
     let guard=result.as_ref().ok().map(|(id,_)|ServerEditGuard{id:*id,edits:Arc::clone(&state.server_edits)});
