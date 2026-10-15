@@ -144,9 +144,9 @@ fn lock_registry() -> std::sync::MutexGuard<'static, Option<(u64, Sender<Registr
 /// Servo's blur operation has no WebViewId and clears every webview. Track
 /// the exact session whose focus this engine requested before emitting it.
 #[derive(Debug)]
-struct FocusOwner<T>(Cell<Option<T>>);
+struct FocusOwner<T: Copy>(Cell<Option<T>>);
 
-impl<T> Default for FocusOwner<T> {
+impl<T: Copy> Default for FocusOwner<T> {
     fn default() -> Self {
         Self(Cell::new(None))
     }
