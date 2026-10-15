@@ -1640,12 +1640,13 @@ mod tests {
         use crate::model::{CardId, CardKind, TerminalId, TerminalSession, TerminalContinuity, TerminalExit, LaunchRecipe};
         let (_, Reply::Status { mut agent, .. }) = running() else { unreachable!() };
         agent.closed = true; agent.name = Some("PRIVATE_AGENT_NAME".into()); agent.spec.surface = Surface::Terminal;
-        let terminal = TerminalId::new(); agent.console = Some(terminal);
+        let terminal = TerminalSession { id: TerminalId::new(), owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            launch: LaunchRecipe { program: "private-provider".into(), arguments: vec!["PRIVATE_ARGUMENT".into()], working_directory: "/repo".into(), environment: std::collections::BTreeMap::from([("SECRET_ENV".into(), "PRIVATE_ENV_VALUE".into())]), unset_environment: Default::default() }, transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::Exited { last_exit: TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 } } };
+        agent.console = Some(terminal.clone());
         crate::agent_execution::PresentationRepairTarget { registry: uuid::Uuid::new_v4(), scope: agent.placement.clone(),
             view_revision: 19, pane: crate::workspace_model::views::Pane { id: CardId::from_uuid(agent.id.as_uuid()), title: "PRIVATE_PANE_TITLE".into(), user_title: None, pending_terminal_start: false, width_fraction: 1.0, scope: None,
-                kind: CardKind::Terminal(TerminalSession { id: terminal, owned_codex_listener: None, recovery_origin: None, predecessor: None,
-                    launch: LaunchRecipe { program: "private-provider".into(), arguments: vec!["PRIVATE_ARGUMENT".into()], working_directory: "/repo".into(), environment: std::collections::BTreeMap::from([("SECRET_ENV".into(), "PRIVATE_ENV_VALUE".into())]), unset_environment: Default::default() }, transcript_path: None, resume_hint: None,
-                    continuity: TerminalContinuity::Exited { last_exit: TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 } } }) }, agent }
+                kind: CardKind::Terminal(terminal) }, agent }
     }
     #[test]
     fn presentation_repair_confirms_only_exact_observation_and_outputs_compact_receipt() {
