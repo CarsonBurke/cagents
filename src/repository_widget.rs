@@ -3172,6 +3172,7 @@ impl RepositoryRuntime {
                 if units > at.character { return false; }
                 scalars += 1;
             }
+            if units != at.character { return false; }
             at.character = scalars;
         }
         self.move_cursor_to(at)
@@ -10882,6 +10883,9 @@ mod tests {
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 3)));
         let before = runtime.cursor_position();
         assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(1, 2), crate::lsp::LspCoordinates::Utf16));
+        assert_eq!(runtime.cursor_position(), before);
+        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(1, 99), crate::lsp::LspCoordinates::Utf16));
+        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(2, 1), crate::lsp::LspCoordinates::Utf16));
         assert_eq!(runtime.cursor_position(), before);
         assert!(runtime.move_cursor_to_coordinates(LspPosition::new(1, 3), crate::lsp::LspCoordinates::Scalar));
         assert_eq!(runtime.cursor_position(), before);
