@@ -11,6 +11,9 @@ pub(in crate::app) struct State {
     pub(super) inflight: HashSet<u64>,
 }
 impl State {
+    #[cfg(test)]
+    pub(in crate::app) fn generation_for_test(&self) -> u64 {self.generation}
+
     pub(in crate::app) fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
@@ -23,6 +26,7 @@ pub(in crate::app) enum Intent {
     Navigate,
     Channel { id: ChannelId, path: PathBuf, after: Box<Intent> },
     EnsureDefaultPane,
+    PrAgentContext {worktree:PathBuf,card:Option<CardId>,prompt:String,provider:crate::agent::Provider},
     Terminal(TerminalSession),
     TerminalWithLifecycle { session: TerminalSession, committed: Box<Message>, rejected: Box<Message> },
     NewTerminal(PathBuf),
@@ -218,6 +222,7 @@ impl Cagents {
             Intent::Navigate => Task::none(),
             Intent::Channel {after,..} => self.finish_worktree_selection(*after),
             Intent::EnsureDefaultPane => self.ensure_default_pane(),
+            Intent::PrAgentContext {worktree,card,prompt,provider} => self.finish_pr_agent_context(worktree,card,prompt,provider),
             Intent::Terminal(session) => self.insert_terminal_card(session,None),
             Intent::TerminalWithLifecycle {session,committed,rejected} => {
                 if self.refuse_in_deleting_worktree(&session.launch.working_directory) {

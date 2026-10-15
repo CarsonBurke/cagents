@@ -4066,6 +4066,64 @@ impl Cagents {
         Some(task.map(cosmic::Action::App))
     }
 
+    /// Stage prepared forge context after the owning scope and physical lease
+    /// have committed. This helper never selects a scope or sends a message.
+    pub(super) fn finish_pr_agent_context(
+        &mut self, worktree: PathBuf, card: Option<CardId>, prompt: String, provider: Provider,
+    ) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let card = if let Some(card) = card {
+            let valid = self.workspace.card(card).is_some() && self.card_state(card).is_some_and(|state| {
+                state.existence.is_open() && matches!(&state.kind,CardKind::Chat(session)
+                    if self.card_worktree(state)==Some(worktree.as_path()) || session.launch.recipe.working_directory==worktree)
+            });
+            if !valid {
+                self.status=Some(TransientNotice::warning("The selected conversation changed before review context was ready."));
+                return Task::none();
+            }
+            card
+        } else {
+            // A new draft is filed in the already committed explicit worktree,
+            // never in a focused shell's cwd or through a second navigation.
+            if self.durable.active_channel.is_some() || self.active_workspace.as_deref()!=Some(worktree.as_path())
+                || self.refuse_in_deleting_worktree(&worktree)
+            { return Task::none(); }
+            let account = self.default_account_for_directory(provider,&worktree);
+            let automatic = self.automatic_accounts_for_directory(provider,&worktree);
+            let session = match fresh_chat_session(provider,TerminalId::new(),worktree,&account,automatic) {
+                Ok(session)=>session,
+                Err(error)=>{self.status=Some(TransientNotice::error(error));return Task::none();}
+            };
+            let session_id=session.id;
+            tasks.push(self.insert_chat_card(session,None,None));
+            let Some(card)=self.durable.cards.iter().find_map(|state|matches!(&state.kind,CardKind::Chat(session) if session.id==session_id).then_some(state.id)) else {
+                return Task::batch(tasks);
+            };
+            card
+        };
+        self.chat_ui.default_chats.remove(&card);
+        let runtime = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime))=>Some(runtime.as_mut()),
+            _=>self.chat_ui.parked.get_mut(&card).map(Box::as_mut),
+        };
+        if let Some(runtime)=runtime {
+            let mut draft=runtime.unsent_text();
+            if !draft.trim().is_empty(){draft.push_str("\n\n");}
+            draft.push_str(&prompt);
+            runtime.history_cursor=None;
+            runtime.history_stash=None;
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+        } else {
+            let draft=self.chat_ui.drafts.entry(card).or_default();
+            if !draft.trim().is_empty(){draft.push_str("\n\n");}
+            draft.push_str(&prompt);
+        }
+        self.persist();
+        tasks.push(self.focus_workspace_card(card));
+        tasks.push(iced::widget::operation::focus(card_control_id(card,"chat-composer")).map(cosmic::Action::App));
+        Task::batch(tasks)
+    }
+
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
@@ -12220,6 +12278,41 @@ mod tests {
             target,
             text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.to_owned()))),
         )));
+    }
+
+    #[test]
+    fn prepared_pr_context_preserves_the_existing_unsent_draft_and_does_not_send() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=draft_chat(&mut app);
+        write(&mut app,card,"Existing request");
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),Some(card),"Selected review context".into(),Provider::Claude));
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Existing request\n\nSelected review context");
+        assert_eq!(chat_runtime(&app,card).session.launch.provider,Provider::Codex);
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn prepared_pr_context_creates_an_explicit_directory_draft_without_reselecting() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        drop(app.select_worktree(FIXTURE_DIRECTORY.into(),false));
+        let generation=app.worktree_selection.generation_for_test();
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Review without sending".into(),Provider::Codex));
+        let card=app.workspace.focused().unwrap();
+        assert_eq!(chat_runtime(&app,card).composer.text(),"Review without sending");
+        assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,PathBuf::from(FIXTURE_DIRECTORY));
+        assert_eq!(app.worktree_selection.generation_for_test(),generation);
+        assert!(chat_runtime(&app,card).is_draft());
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn prepared_pr_context_cannot_create_a_draft_in_a_newer_selected_scope() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        drop(app.select_worktree("/newer".into(),false));
+        let before=app.durable.cards.len();
+        drop(app.finish_pr_agent_context(FIXTURE_DIRECTORY.into(),None,"Stale context".into(),Provider::Codex));
+        assert_eq!(app.durable.cards.len(),before);
+        assert_eq!(app.active_workspace.as_deref(),Some(Path::new("/newer")));
     }
 
     #[test]
