@@ -585,7 +585,14 @@ impl Cagents {
                         .worktrees
                         .iter()
                         .map(|worktree| worktree.path.as_path())
-                })),
+                }))
+                .chain(
+                    self.sidebar_model
+                        .projects
+                        .iter()
+                        .filter(|project| project.kind == ProjectKind::Folder)
+                        .map(|project| project.repository.as_path()),
+                ),
         )
     }
 

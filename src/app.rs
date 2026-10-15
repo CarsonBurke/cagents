@@ -25786,6 +25786,11 @@ mod tests {
         );
         assert!(app.reconcile_agent_attention_owners());
         assert_eq!(
+            app.agent_worktree(card)
+                .map(|owner| (owner.project_id, owner.worktree_id)),
+            Some((key.project_id, key.worktree_id))
+        );
+        assert_eq!(
             app.sidebar_state
                 .agent_activity(key.project_id, key.worktree_id),
             Some(crate::agent::ActivityState::Working)
@@ -25794,6 +25799,7 @@ mod tests {
             .card_scopes
             .insert(card, "/elsewhere".into());
         assert!(app.reconcile_agent_attention_owners());
+        assert!(app.agent_worktree(card).is_none());
         assert_eq!(
             app.sidebar_state
                 .agent_activity(key.project_id, key.worktree_id),
