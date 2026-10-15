@@ -1421,6 +1421,12 @@ pub const TEXT_EDITING_SHORTCUTS: &[FixedShortcut] = &[
         refusal: "Text inputs keep Find; other actions are available outside text editing",
     },
     FixedShortcut {
+        label: "Navigate / select to document end",
+        chords: &["Ctrl+End", "Ctrl+Shift+End"],
+        scope: "Editor",
+        refusal: "Text inputs keep document navigation; this action is available outside text editing",
+    },
+    FixedShortcut {
         label: "Navigate / delete words",
         chords: &[
             "Ctrl+Left",
