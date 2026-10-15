@@ -15,7 +15,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if relative.as_os_str().is_empty() {
             return Err(ValidationError::Io("The repository root cannot be its managed worktree directory".into()).into());
         }
-        let check = self.git_read(&primary, [OsString::from("check-ignore"), "--quiet".into(), "--no-index".into(), "--".into(), relative.join(".cagents-ignore-check").into_os_string()]);
+        let mut ignored_directory = relative.as_os_str().to_owned();
+        ignored_directory.push("/");
+        let check = self.git_read(&primary, [OsString::from("check-ignore"), "--quiet".into(), "--no-index".into(), "--".into(), ignored_directory]);
         let output = self.run(&check, cancellation)?;
         if output.success { return Ok(()); }
         if output.exit_code != Some(1) { return Err(git_failure(&check, output).into()); }
@@ -99,5 +101,11 @@ mod tests {
         service.ignore_legacy_managed_worktrees(&root, &cancel).unwrap();
         assert!(legacy.exists());
         assert!(!String::from_utf8(git(&root, &["status", "--porcelain", "-uall"])).unwrap().contains("worktrees/"));
+        // A generic rule ignoring a sentinel filename must not be mistaken
+        // for a rule ignoring the containing managed directory itself.
+        fs::write(root.join(".gitignore"), "already/\n.cagents-ignore-check\n").unwrap();
+        service.ensure_managed_directory_ignored(&root, &root.join("other-managed"), &cancel).unwrap();
+        let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert!(contents.lines().any(|line| line == "/other-managed/"));
     }
 }
