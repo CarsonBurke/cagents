@@ -563,6 +563,7 @@ struct Codex {
 struct EarlyNotification {
     completed: Option<Value>,
     preview: crate::chat::notification::Preview,
+    preview_transferred: bool,
 }
 
 struct Execution {
@@ -2267,7 +2268,9 @@ impl Adapter for Codex {
                         }
                     }
                     if let Some(early) = early_completion {
-                        step.notification_preview = Some(early.preview);
+                        if !early.preview_transferred {
+                            step.notification_preview = Some(early.preview);
+                        }
                         if let Some(completed) = early.completed {
                         // Preserve the original final frame's context, rather
                         // than sampling whatever the actor currently shows.
@@ -2611,16 +2614,14 @@ impl Adapter for Codex {
                 if method == "turn/started" {
                     // The observed start now proves the early stream's exact
                     // owner. Transfer it once, before later live deltas, and
-                    // remove the saved copy so the RPC ACK cannot rewind it.
-                    if let Some(Pending::Turn { early, early_bytes, .. }) = self.pending.values_mut().find(|pending|
+                    // consume the saved preview so the RPC ACK cannot rewind
+                    // it. Retain any known terminal proof for that exact ACK.
+                    if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                         matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
                     {
-                        if let Some(context) = early.remove(turn_id) {
-                            if let Some(completed) = &context.completed {
-                                let bytes = serde_json::to_vec(completed).map_err(|error| error.to_string())?.len();
-                                *early_bytes = early_bytes.saturating_sub(bytes);
-                            }
-                            step.notification_preview = Some(context.preview.at_observed_start());
+                        if let Some(context) = early.get_mut(turn_id) {
+                            step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
+                            context.preview_transferred = true;
                         }
                     }
                     self.notification_revision = self.notification_revision.wrapping_add(1);
@@ -4168,6 +4169,27 @@ mod tests {
         assert_eq!(callbacks[0].1.conversation, "Review B migration");
         assert_eq!(callbacks[0].1.preview, "First part. Second part.");
         assert_eq!(state.notification_content(crate::notifications::Kind::Succeeded).preview, "First part. Second part.");
+    }
+
+    #[test]
+    fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
+        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        // A conservative decoder-order control, not a claim that a supported
+        // provider emits start after completion on one ordered connection.
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(Box::new(adapter), vec![
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[
+                {"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]},
+                {"id":"b-answer","type":"agentMessage","text":"Already completed B response."}]}}}),
+            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+            json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+        ], false);
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "Already completed B response.");
+        assert!(!state.is_working());
     }
 
     #[test]
