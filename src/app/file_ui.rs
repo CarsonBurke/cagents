@@ -242,7 +242,7 @@ impl Cagents {
                     ))
                 })
                 .unwrap_or_else(|| self.terminal_insertion_indices());
-            let width = self.settings.default_native_pane_fraction;
+            let width = self.new_pane_fraction(self.settings.default_native_pane_fraction);
             let state = CardState {
                 id: card,
                 generation: self.durable.generation,

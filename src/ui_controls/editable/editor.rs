@@ -5,6 +5,81 @@ use super::*;
 use cosmic::iced::{advanced::text::highlighter::PlainText, widget::text_editor};
 use std::cell::RefCell;
 
+/// Bounded per-control history supplies the undo/redo operations absent from
+/// iced's form editor. Record text only on focused keyboard input, never on
+/// redraw, so an idle retained form does no cloning or history work.
+struct EditSnapshot {
+    text: String,
+    cursor: text_editor::Cursor,
+}
+struct EditHistory {
+    entries: Vec<EditSnapshot>,
+    current: usize,
+    restoring: Option<usize>,
+    bytes: usize,
+}
+impl EditHistory {
+    fn new(text: String, cursor: text_editor::Cursor) -> Self {
+        let bytes = text.len();
+        Self {
+            entries: vec![EditSnapshot { text, cursor }],
+            current: 0,
+            restoring: None,
+            bytes,
+        }
+    }
+    fn observe(&mut self, text: String, cursor: text_editor::Cursor) {
+        if let Some(target) = self.restoring {
+            if text != self.entries[target].text {
+                return;
+            }
+            self.current = target;
+            self.restoring = None;
+        }
+        if text == self.entries[self.current].text {
+            self.entries[self.current].cursor = cursor;
+            return;
+        }
+        for entry in self.entries.drain(self.current + 1..) {
+            self.bytes -= entry.text.len();
+        }
+        self.bytes += text.len();
+        self.entries.push(EditSnapshot { text, cursor });
+        while self.entries.len() > 128 || self.bytes > 1024 * 1024 && self.entries.len() > 1 {
+            self.bytes -= self.entries.remove(0).text.len();
+        }
+        self.current = self.entries.len() - 1;
+    }
+    fn restore(&mut self, redo: bool) -> Option<&EditSnapshot> {
+        if self.restoring.is_some() {
+            return None;
+        }
+        let target = if redo {
+            self.current
+                .checked_add(1)
+                .filter(|target| *target < self.entries.len())?
+        } else {
+            self.current.checked_sub(1)?
+        };
+        self.restoring = Some(target);
+        self.entries.get(target)
+    }
+}
+struct EditorFocus(bool);
+impl Operation for EditorFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        self.0 |= state.is_focused();
+    }
+}
+
 pub struct TextEditor<'a, Message> {
     inner: cosmic::iced::widget::TextEditor<'a, PlainText, Message, Theme, Renderer>,
     content: &'a text_editor::Content<Renderer>,
@@ -16,6 +91,7 @@ pub struct TextEditor<'a, Message> {
 struct EditorState {
     identity: State,
     lines: RefCell<Vec<Id>>,
+    history: EditHistory,
 }
 impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
     pub fn new(name: impl Into<Cow<'a, str>>, content: &'a text_editor::Content<Renderer>) -> Self {
@@ -112,6 +188,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         tree::State::new(EditorState {
             identity: State::new(self.id.clone(), &self.name),
             lines: RefCell::default(),
+            history: EditHistory::new(self.content.text(), self.content.cursor()),
         })
     }
     fn children(&self) -> Vec<Tree> {
@@ -125,6 +202,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         state.identity.bind(self.id.clone(), &self.name);
         if old != state.identity.id {
             state.lines.get_mut().clear();
+            state.history = EditHistory::new(self.content.text(), self.content.cursor());
         }
         self.inner.set_id(state.identity.id.clone());
         tree.children[0].diff(&mut self.inner as &mut dyn Widget<Message, Theme, Renderer>);
@@ -203,6 +281,12 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
     ) {
         self.inner
             .operate(&mut tree.children[0], layout, renderer, operation);
+        let own = tree.state.downcast_ref::<EditorState>();
+        operation.custom(
+            Some(&own.identity.id),
+            layout.bounds(),
+            &mut crate::input_trace::TextEditing,
+        );
     }
     fn overlay<'b>(
         &'b mut self,
@@ -281,6 +365,49 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        }) = event
+            && let Some(action) = &self.on_action
+        {
+            let mut focused = EditorFocus(false);
+            self.inner
+                .operate(&mut tree.children[0], layout, renderer, &mut focused);
+            if focused.0 {
+                let history = &mut tree.state.downcast_mut::<EditorState>().history;
+                history.observe(self.content.text(), self.content.cursor());
+                let command = if modifiers.command() && !modifiers.alt() {
+                    match key
+                        .to_latin(*physical_key)
+                        .map(|key| key.to_ascii_lowercase())
+                    {
+                        Some('z') => Some(modifiers.shift()),
+                        Some('y') if !modifiers.shift() => Some(true),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(redo) = command {
+                    if let Some(snapshot) = history.restore(redo) {
+                        shell.publish(action(text_editor::Action::SelectAll));
+                        shell.publish(action(text_editor::Action::Edit(text_editor::Edit::Paste(
+                            std::sync::Arc::new(snapshot.text.clone()),
+                        ))));
+                        if let Some(cursor) = &self.on_cursor {
+                            shell.publish(cursor(snapshot.cursor));
+                        }
+                        shell.invalidate_layout();
+                        shell.request_redraw();
+                    }
+                    shell.capture_event();
+                    return;
+                }
+            }
+        }
         if let Event::A11y(id, request) = event {
             let state = tree.state.downcast_ref::<EditorState>();
             let ids = state.lines.borrow();
@@ -377,7 +504,147 @@ mod tests {
     enum Message {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
+        Keyboard(
+            cosmic::iced::keyboard::Event,
+            bool,
+            crate::input_trace::KeyboardRegion,
+        ),
     }
+    #[test]
+    fn native_composer_keys_undo_and_redo_without_a_workspace_action() {
+        use crate::{
+            input_trace,
+            workspace_widget::{self, FocusedPane},
+        };
+        use cosmic::iced::keyboard::{
+            self,
+            key::{Code, Physical},
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut content = text_editor::Content::new();
+        let id = Id::new("test.chat-composer");
+        let trace = input_trace::InputTrace::default();
+        let owning_card = crate::model::CardId::new();
+        let mut tree = Tree::empty();
+        for (key, code, modifiers, text, expected) in [
+            (
+                "a",
+                Code::KeyA,
+                keyboard::Modifiers::empty(),
+                Some("a"),
+                "a",
+            ),
+            ("z", Code::KeyZ, keyboard::Modifiers::CTRL, None, ""),
+            (
+                "Z",
+                Code::KeyZ,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                None,
+                "a",
+            ),
+        ] {
+            let event = keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(key.into()),
+                modified_key: keyboard::Key::Character(key.into()),
+                physical_key: Physical::Code(code),
+                modifiers,
+                text: text.map(Into::into),
+                repeat: false,
+                location: keyboard::Location::Standard,
+            };
+            let mut messages = Vec::new();
+            {
+                let editor = TextEditor::new("Message", &content)
+                    .id(id.clone())
+                    .on_action(Message::Edit)
+                    .on_cursor(Message::Cursor);
+                let mut element = input_trace::observe_keyboard_events(
+                    editor,
+                    &trace,
+                    vec![(
+                        id.clone(),
+                        input_trace::KeyboardRegion {
+                            pane: FocusedPane::Chat,
+                            card: Some(owning_card),
+                        },
+                    )],
+                    Message::Keyboard,
+                );
+                tree.diff(element.as_widget_mut());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(400., 180.)),
+                );
+                let layout = Layout::new(&node);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    layout,
+                    &renderer,
+                    &mut cosmic::iced::advanced::widget::operation::focusable::focus::<()>(
+                        id.clone(),
+                    ),
+                );
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(event.clone()),
+                    layout,
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &layout.bounds(),
+                );
+            }
+            for message in messages {
+                match message {
+                    Message::Edit(action) => content.perform(action),
+                    Message::Cursor(cursor) => content.move_to(cursor),
+                    Message::Keyboard(delivered, captured, region) => {
+                        assert_eq!(delivered, event);
+                        assert!(captured, "the text widget handles each tested edit chord");
+                        if modifiers.control() {
+                            assert_eq!(region.card, Some(owning_card));
+                            assert_eq!(region.pane, FocusedPane::Chat);
+                        }
+                    }
+                }
+            }
+            assert_eq!(content.text(), expected);
+            if modifiers.control() {
+                assert_eq!(trace.keyboard_focus(), Some(FocusedPane::Chat));
+                assert_eq!(trace.keyboard_card(), Some(owning_card));
+                assert_eq!(
+                    workspace_widget::global_shortcut(
+                        &event,
+                        &crate::settings::KeyboardShortcuts::default(),
+                        trace.keyboard_focus().unwrap()
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editor_history_discards_redo_after_new_text_and_bounds_retention() {
+        let cursor = text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 0 },
+            selection: None,
+        };
+        let mut history = EditHistory::new(String::new(), cursor);
+        history.observe("a".into(), cursor);
+        assert_eq!(history.restore(false).unwrap().text, "");
+        history.observe("".into(), cursor);
+        history.observe("b".into(), cursor);
+        assert!(history.restore(true).is_none());
+        for value in 0..200 {
+            history.observe(format!("{value}{}", "x".repeat(20_000)), cursor);
+        }
+        assert!(history.bytes <= 1024 * 1024);
+        assert!(history.entries.len() <= 128);
+    }
+
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();

@@ -178,27 +178,56 @@ impl State {
         account.present || account.account.registry_key().is_some()
     }
 
+    pub(super) fn provider_ready(&self, provider: Provider) -> bool {
+        self.installed.get(&provider) == Some(&true)
+            && self.of(provider).any(|account| {
+                account.present
+                    && account.identity.is_some()
+                    && self.login_conflict(account).is_none()
+                    && !account
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.status == UsageStatus::NeedsLogin)
+            })
+    }
+
     pub(super) fn provider_status(&self, provider: Provider) -> &'static str {
         match self.installed.get(&provider) {
             None => "Checking provider…",
             Some(false) => "CLI not found on PATH",
-            Some(true)
-                if self.of(provider).any(|account| {
-                    account.identity.is_some()
-                        && !account
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| snapshot.status == UsageStatus::NeedsLogin)
-                }) =>
-            {
-                "Account available"
-            }
+            Some(true) if self.provider_ready(provider) => "Account available",
             Some(true) if self.of(provider).any(|account| account.identity.is_some()) => {
                 "Sign in again"
             }
             Some(true) => "Installed · sign in to get started",
         }
     }
+    /// The same installation and identity evidence used by the Accounts pane.
+    pub(super) fn onboarding_action(&self, provider: Provider) -> Option<(&'static str, Action)> {
+        match self.installed.get(&provider) {
+            None => None,
+            Some(false) => Some(("Install", Action::Install(provider))),
+            Some(true) if self.provider_ready(provider) => {
+                Some(("Manage accounts", Action::OpenPane))
+            }
+            Some(true) if provider == Provider::Omp => {
+                // OMP owns its authentication; Cagents must not create a
+                // Claude/Codex-style account or issue an unsupported login.
+                Some(("Set up OMP", Action::Install(provider)))
+            }
+            Some(true) => Some((
+                "Sign in",
+                self.of(provider).next().map_or(
+                    Action::Add {
+                        provider,
+                        device: false,
+                    },
+                    |account| Action::SignIn(account.id.clone()),
+                ),
+            )),
+        }
+    }
+
     /// The state of a real window, sharing figures with every other window
     /// of this installation through the cache in its state directory, and
     /// accounts through the registry in its configuration directory.
@@ -5207,6 +5236,77 @@ mod tests {
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn onboarding_provider_actions_follow_detection_and_authentication() {
+        let mut state = State::new(None, None, None);
+        for provider in Provider::ALL {
+            assert!(state.onboarding_action(provider).is_none());
+            state.installed.insert(provider, false);
+            assert!(matches!(state.onboarding_action(provider),
+                Some(("Install", Action::Install(selected))) if selected == provider));
+            state.installed.insert(provider, true);
+            if provider == Provider::Omp {
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Set up OMP", Action::Install(Provider::Omp)))
+                ));
+            } else {
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Sign in", Action::SignIn(_)))
+                ));
+                let id = Account::system(provider).id();
+                let account = state.account_mut(&id).unwrap();
+                account.present = true;
+                account.identity = Some(Identity::default());
+                account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+                assert!(matches!(
+                    state.onboarding_action(provider),
+                    Some(("Manage accounts", Action::OpenPane))
+                ));
+                state.account_mut(&id).unwrap().snapshot =
+                    Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW));
+                assert!(matches!(state.onboarding_action(provider),
+                    Some(("Sign in", Action::SignIn(selected))) if selected == id));
+            }
+        }
+    }
+
+    #[test]
+    fn onboarding_readiness_requires_a_present_home_and_unconflicted_login() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut state = State::new(None, None, None);
+            state.installed.insert(provider, true);
+            let system = Account::system(provider).id();
+            let account = state.account_mut(&system).unwrap();
+            account.present = false;
+            account.identity = Some(Identity::default());
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+            assert!(!state.provider_ready(provider));
+            assert!(matches!(
+                state.onboarding_action(provider),
+                Some(("Sign in", Action::SignIn(_)))
+            ));
+            state.account_mut(&system).unwrap().present = true;
+            assert!(state.provider_ready(provider));
+            state.account_mut(&system).unwrap().present = false;
+            let managed = state.add_managed_fixture(provider, 991);
+            let account = state.account_mut(&managed).unwrap();
+            account.identity = Some(Identity {
+                email: Some("changed-login@example.com".into()),
+                ..Identity::default()
+            });
+            account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+            assert!(
+                state
+                    .login_conflict(state.account(&managed).unwrap())
+                    .is_some()
+            );
+            assert!(!state.provider_ready(provider));
+            assert_eq!(state.provider_status(provider), "Sign in again");
+        }
+    }
 
     #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {

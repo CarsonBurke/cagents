@@ -95,7 +95,7 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 6
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -105,8 +105,9 @@ chat_model = ["Ctrl+Shift+M"]
 chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
-close_focused_column = ["Ctrl+W"]
-search_projects = ["Ctrl+F"]
+close_focused_column = ["Ctrl+Shift+W"]
+search_projects = ["Ctrl+Shift+F"]
+find_in_pane = ["Ctrl+F"]
 previous_column = ["Ctrl+PageUp"]
 next_column = ["Ctrl+PageDown"]
 cycle_pane_width = ["Alt+R"]
@@ -174,7 +175,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `palette_recents` | array of strings | `[]` | Recent command and navigation IDs, most recent first. Written by the palette and bounded to 24 entries |
+| `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -184,6 +186,26 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `notifications.review_requests` | boolean | `true` | Alerts for incoming GitHub review requests |
 
 ## Keyboard shortcuts
+
+The command palette, Keyboard settings, and pane context menus share the same
+command definitions. Additional commands are unbound by default: `new_browser`,
+`open_folder`, `new_worktree`, `close_other_panes`, `close_panes_to_right`,
+`copy_path`, `reveal_in_projects`, `fork_conversation`, `focus_sidebar_tree`,
+`restart_daemon`, `toggle_theme`, `resume_conversation`, `switch_pane`, and
+`review_conversation_changes`. Set their chord lists under `[keyboard_shortcuts]`,
+or bind them in **Settings → Keyboard**. For example:
+
+```toml
+copy_path = ["Ctrl+Alt+Shift+K"]
+close_other_panes = []
+```
+
+`focus_project_1` through `focus_project_9` select projects in sidebar order.
+The `settings_general`, `settings_appearance`, `settings_terminal`,
+`settings_links`, `settings_keyboard`, `settings_native_chat`, `settings_editor`,
+`settings_accounts`, `settings_notifications`, and `settings_about` commands
+open the corresponding Settings section. These commands also start unbound.
+
 
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
@@ -195,18 +217,23 @@ modifiers, joined by `+`. Names are case-insensitive.
   `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
   keys, for example `Ctrl+Comma`.
 - No chord can appear twice, even under different actions.
-- A chord you bind here is not passed to the program running in a pane.
-  For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
-  cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
-  be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
-  with a letter or arrow, can be bound but then no longer reach a terminal.
-  The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
-  pane width, and **Ctrl+T** to create a native thread tab.
-- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
-  which opens terminal scrollback find. The same key finds in the focused
-  editor or chat transcript, and otherwise searches projects.
-  File and hunk navigation also works in local diff panes. Viewed-file commands
-  act only in a pull request pane. The chords reach terminals outside that scope.
+- Terminal interception follows the action's **Send to terminal** policy in
+  Keyboard settings. `terminal_passthrough_actions` stores serialized action
+  names whose chords reach the focused terminal. Its defaults include
+  `rename_pane`, `new_native_thread`, `find_in_pane`, `cycle_pane_width` and
+  `focus_pane_1` through `focus_pane_9`; removing a name explicitly enables
+  that action in terminals. Bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and
+  `Ctrl+Q` remain reserved to preserve interruption, EOF and flow control.
+- **Ctrl+F** finds in the focused editor or chat, and falls back to project
+  search for panes without find. It stays in sidebar and inspector text fields
+  when those have keyboard focus. **Ctrl+Shift+F** searches projects outside
+  terminals and searches terminal scrollback inside them. Sending
+  `search_projects` to the terminal releases this chord too.
+- Native text controls retain undo, redo, selection and word navigation even
+  when a global action is bound to those editing chords. Reopen pane's
+  **Ctrl+Shift+Z** default applies outside text controls.
+- File and hunk navigation work in review panes; viewed-file commands apply
+  to pull request panes. Their chords reach terminals outside that scope.
 - `chat_account`, `chat_model`, and `chat_permissions` apply only to the
   focused native chat. Account selection is available before the conversation
   starts. Up/Down or Tab/Shift+Tab choose an account or permission mode, and
@@ -338,7 +365,7 @@ them back as version 3 the next time it saves.
   | `new_terminal` | `Ctrl+T` | `Ctrl+Shift+T` |
   | `new_channel` | `Alt+G` | `Ctrl+Shift+G` |
   | `clone_pane` | `Alt+E` | `Ctrl+Shift+D` |
-  | `close_focused_column` | `Ctrl+Shift+W` (revisions 2–3) | `Ctrl+W` |
+  | `close_focused_column` | `Ctrl+W` (revisions 1, 4–5) | `Ctrl+Shift+W` |
   | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
@@ -350,7 +377,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 6`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
@@ -403,3 +430,9 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+The command registry also exposes `keyboard_shortcuts.mark_all_read` and
+`keyboard_shortcuts.clone_repository` (both unbound by default), and
+`keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
+uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
+attention navigation bindings. All of these appear in Keyboard settings.

@@ -9,6 +9,7 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
@@ -75,6 +76,7 @@ pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
+pub mod layout_metrics;
 pub mod model;
 pub mod notifications;
 pub mod performance;
@@ -83,6 +85,8 @@ pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod process;
 pub mod project_location;
+#[cfg(feature = "ui")]
+pub mod project_search;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
@@ -97,7 +101,6 @@ mod selected_file_path;
 mod separator;
 #[cfg(feature = "ui")]
 pub mod session;
-#[cfg(feature = "ui")]
 pub mod settings;
 #[cfg(feature = "ui")]
 pub mod settings_widgets;

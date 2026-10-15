@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
+pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -643,6 +644,7 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// A terminal some other client created, delivered only to a connection
     /// that subscribed with [`ClientRequest::WatchTerminals`].
@@ -1850,6 +1852,22 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn activity_ipc_preserves_failed_outcome_and_reason() {
+        let message = ServerMessage::ChatActivity {
+            chat_id: TerminalId::new(),
+            state: crate::agent::ActivityState::Idle,
+            generation: 42,
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "Provider exited with status 3".into() }),
+        };
+        let binary = postcard::to_stdvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        let json = serde_json::to_value(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+    }
 
     #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {

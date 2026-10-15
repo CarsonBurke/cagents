@@ -42,7 +42,9 @@ pub const NOTICE_POPOVER_WIDTH: f32 = 408.0;
 pub const PANE_NAVIGATOR_MIN_WIDTH: f32 = 42.0;
 pub const PANE_NAVIGATOR_RESERVED_WIDTH: f32 = 110.0;
 pub const TAB_MIN_WIDTH: f32 = 160.0;
-pub const TAB_MAX_WIDTH: f32 = 280.0;
+pub const TAB_MAX_WIDTH: f32 = 420.0;
+/// New panes fill a tiled workspace without changing existing pane widths.
+pub const NARROW_WORKSPACE_WIDTH: f32 = 1_100.0;
 pub const PULL_REQUEST_BROWSER_ROW_HEIGHT: f32 = 48.0;
 /// Icons that stand alone as the illustration of a whole pane state.
 pub const STATUS_ICON_SIZE: u16 = 20;
@@ -119,13 +121,11 @@ pub fn surface(
     })
 }
 
-pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
-pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;
-pub const NAVIGATION_MAX_WIDTH: f32 = 420.0;
+pub use crate::layout_metrics::{
+    INSPECTOR_DEFAULT_WIDTH, INSPECTOR_MAX_WIDTH, INSPECTOR_MIN_WIDTH,
+    NAVIGATION_DEFAULT_WIDTH, NAVIGATION_MAX_WIDTH, NAVIGATION_MIN_WIDTH,
+};
 pub const NAVIGATION_RAIL_WIDTH: f32 = 52.0;
-pub const INSPECTOR_MIN_WIDTH: f32 = 320.0;
-pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
-pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
 ///
