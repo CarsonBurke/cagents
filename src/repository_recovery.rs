@@ -752,7 +752,8 @@ fn recovery_parent(
             fs_safety::DirectoryCreation::Published(publication) => {
                 let publication_error = publication.publication_error().map(str::to_owned);
                 if let Some(error) = publication_error {
-                    created.warnings.insert(key.clone(), MutationFailure::Path { path: key.clone(), reason: format!("The created directory was published, but staging cleanup is unconfirmed: {error}; opened recovery spelling: {:?}", publication.pending_staging_path()) });
+                    let staging = publication.pending_staging_path().map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".into());
+                    created.warnings.insert(key.clone(), MutationFailure::Path { path: key.clone(), reason: format!("The created directory was published, but staging cleanup is unconfirmed: {error}; originally opened recovery spelling: {staging}") });
                 }
                 // Retain BEFORE fallible chmod/clone so even partial setup keeps
                 // the exact created inode for final mode restoration.
