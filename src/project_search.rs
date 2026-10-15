@@ -15,6 +15,7 @@ pub const RESULT_LIMIT: usize = 2_000;
 const BATCH_SIZE: usize = 64;
 const BATCH_DELAY: Duration = Duration::from_millis(25);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+const SEARCH_BLOCK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
@@ -128,11 +129,15 @@ pub fn search(
         .ignore(!options.include_ignored)
         .require_git(false)
         .follow_links(false)
+        // Stable file order makes initial delivery independent of filesystem
+        // insertion order (which can defer source files behind large trees).
+        .sort_by_file_name(|left, right| left.cmp(right))
         .filter_entry(|entry| entry.file_name() != ".git");
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut total = 0;
     let mut skipped = 0;
     let mut last_batch = Instant::now();
+    let mut bytes = Vec::with_capacity(SEARCH_BLOCK_BYTES);
     for entry in walker.build() {
         if cancellation.is_cancelled() {
             return;
@@ -167,64 +172,97 @@ pub fn search(
         }
         let path = path.to_path_buf();
         let mut reader = BufReader::new(file);
-        let mut bytes = Vec::new();
         let mut line = 0;
-        loop {
-            if cancellation.is_cancelled() {
-                return;
-            }
+        let mut finished = false;
+        while !finished {
             bytes.clear();
-            // `take` bounds even a single multi-megabyte line. The remainder
-            // is not useful text search; report the file as skipped instead.
-            let read = std::io::Read::take(&mut reader, (MAX_LINE_BYTES + 1) as u64)
-                .read_until(b'\n', &mut bytes);
-            match read {
-                Ok(0) => break,
-                Err(_) => {
-                    skipped += 1;
-                    break;
-                }
-                _ => {}
-            }
-            if bytes.len() > MAX_LINE_BYTES || bytes.contains(&0) {
-                skipped += 1;
-                break;
-            }
-            let Ok(text) = std::str::from_utf8(&bytes) else {
-                skipped += 1;
-                break;
-            };
-            let text = text.trim_end_matches(['\r', '\n']);
-            for matched in regex.find_iter(text) {
+            let mut block_lines = 0;
+            // Read complete lines into bounded blocks. Literal queries can
+            // reject a whole block with one regex search instead of creating
+            // a separate regex iterator/cache for every nonmatching line.
+            // Regex mode keeps its exact per-line anchor semantics.
+            while bytes.len() < SEARCH_BLOCK_BYTES {
                 if cancellation.is_cancelled() {
                     return;
                 }
-                if total == RESULT_LIMIT {
-                    if !batch.is_empty() && !publish(Progress::Batch(std::mem::take(&mut batch))) {
-                        return;
+                let start = bytes.len();
+                let read = std::io::Read::take(&mut reader, (MAX_LINE_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut bytes);
+                match read {
+                    Ok(0) => {
+                        finished = true;
+                        break;
                     }
-                    publish(Progress::Finished {
-                        capped: true,
-                        skipped,
-                    });
-                    return;
-                }
-                let (snippet, highlight) = snippet(text, matched.range());
-                batch.push(Match {
-                    path: path.clone(),
-                    line,
-                    column: matched.start(),
-                    length: matched.len(),
-                    snippet,
-                    highlight,
-                });
-                total += 1;
-                if batch.len() >= BATCH_SIZE || last_batch.elapsed() >= BATCH_DELAY {
-                    if !publish(Progress::Batch(std::mem::take(&mut batch))) {
-                        return;
+                    Err(_) => {
+                        bytes.truncate(start);
+                        skipped += 1;
+                        finished = true;
+                        break;
                     }
-                    last_batch = Instant::now();
+                    _ => {}
                 }
+                let next = &bytes[start..];
+                if next.len() > MAX_LINE_BYTES
+                    || next.contains(&0)
+                    || std::str::from_utf8(next).is_err()
+                {
+                    // Earlier complete text lines remain searchable, while
+                    // the invalid/oversized line and rest of this file skip.
+                    bytes.truncate(start);
+                    skipped += 1;
+                    finished = true;
+                    break;
+                }
+                block_lines += 1;
+            }
+            let text =
+                std::str::from_utf8(&bytes).expect("only validated complete lines enter the block");
+            if options.regex || regex.is_match(text) {
+                for text in text.split_inclusive('\n') {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    for matched in regex.find_iter(text) {
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        if total == RESULT_LIMIT {
+                            if !batch.is_empty()
+                                && !publish(Progress::Batch(std::mem::take(&mut batch)))
+                            {
+                                return;
+                            }
+                            publish(Progress::Finished {
+                                capped: true,
+                                skipped,
+                            });
+                            return;
+                        }
+                        let (snippet, highlight) = snippet(text, matched.range());
+                        batch.push(Match {
+                            path: path.clone(),
+                            line,
+                            column: matched.start(),
+                            length: matched.len(),
+                            snippet,
+                            highlight,
+                        });
+                        total += 1;
+                        if batch.len() >= BATCH_SIZE || last_batch.elapsed() >= BATCH_DELAY {
+                            if !publish(Progress::Batch(std::mem::take(&mut batch))) {
+                                return;
+                            }
+                            last_batch = Instant::now();
+                        }
+                    }
+                    if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
+                        if !publish(Progress::Batch(std::mem::take(&mut batch))) {
+                            return;
+                        }
+                        last_batch = Instant::now();
+                    }
+                    line += 1;
+                }
+            } else {
+                line += block_lines;
             }
             if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
                 if !publish(Progress::Batch(std::mem::take(&mut batch))) {
@@ -232,13 +270,6 @@ pub fn search(
                 }
                 last_batch = Instant::now();
             }
-            line += 1;
-        }
-        if !batch.is_empty() && last_batch.elapsed() >= BATCH_DELAY {
-            if !publish(Progress::Batch(std::mem::take(&mut batch))) {
-                return;
-            }
-            last_batch = Instant::now();
         }
     }
     if cancellation.is_cancelled() {
@@ -427,6 +458,38 @@ mod tests {
             started.elapsed().as_millis()
         );
         assert!(count > 0);
+        assert!(
+            first.unwrap() < Duration::from_millis(125),
+            "the worker must leave room for the 75ms UI debounce within the 200ms first-result budget: {first:?}"
+        );
+    }
+
+    #[test]
+    fn literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = "not a match\n".repeat(10_000);
+        let mut text = prefix.into_bytes();
+        text.extend_from_slice(b"NEEDLE\r\n");
+        text.extend_from_slice("more text\n".repeat(10_000).as_bytes());
+        text.extend_from_slice(b"needle\ninvalid\0needle\nneedle\n");
+        std::fs::write(fixture.path().join("large.txt"), text).unwrap();
+        let mut opts = options("needle");
+        opts.whole_word = true;
+        let events = run(fixture.path(), opts);
+        let found = matches(events.clone());
+        assert_eq!(
+            found.iter().map(|found| found.line).collect::<Vec<_>>(),
+            vec![10_000, 20_001]
+        );
+        assert!(
+            found
+                .iter()
+                .all(|found| found.column == 0 && found.length == 6)
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Progress::Finished { skipped: 1, .. })
+        ));
     }
 
     #[test]
