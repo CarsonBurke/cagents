@@ -94,53 +94,97 @@ pub(super) fn edit(
     Ok(applied.model)
 }
 
-/// Completing an automatic terminal reservation is a layout write too. It
-/// follows the same writer/publication order as requests from window clients.
-pub(super) fn complete_terminal(
+/// Obtain the existing writer admission without keeping HostState borrowed.
+pub(super) fn writer(
     host: &SharedHost,
+) -> Result<std::sync::Arc<std::sync::Mutex<super::model::Registry>>, ProtocolError> {
+    host.lock().unwrap_or_else(|p| p.into_inner()).workspace_registry.clone()
+        .ok_or_else(|| unavailable("The workspace model writer is unavailable"))
+}
+
+/// A model reservation read under the writer admission. Keep that admission
+/// through worker publication and completion; this is not process authority.
+pub(super) struct PendingTerminal {
+    pub(super) session: crate::model::TerminalSession,
+    pub(super) pane: crate::workspace_model::views::Pane,
+    scope: crate::workspace_model::views::Scope,
+    revision: u64,
+}
+
+pub(super) fn pending_terminal(
+    registry: &super::model::Registry,
+    pane: crate::model::CardId,
     terminal_id: crate::model::TerminalId,
-) -> Result<(), String> {
-    let (session, writer) = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let session = state
-            .terminals
-            .get(&terminal_id)
-            .ok_or("terminal is no longer hosted")?
-            .session
-            .clone();
-        (
-            session,
-            state
-                .workspace_registry
-                .clone()
-                .ok_or("workspace writer is unavailable")?,
-        )
-    };
-    let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-    for view in registry.model()?.views {
-        for before in view.panes {
-            if before.pending_terminal_start
-                && matches!(&before.kind, crate::model::CardKind::Terminal(terminal) if terminal.id == terminal_id)
-            {
-                let mut pane = before.clone();
-                pane.pending_terminal_start = false;
-                pane.kind = crate::model::CardKind::Terminal(session.clone());
-                let edit = ModelEdit::ChangeView {
-                    scope: view.scope.clone(),
-                    expected_revision: registry.view_revision(&view.scope)?,
-                    operation: uuid::Uuid::new_v4(),
-                    change: crate::workspace_model::views::Change::Update { before, pane },
-                };
-                let applied = registry.apply(&edit)?;
-                if applied.changed {
-                    host.lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .announce_model_edit(0, applied.sequence, &edit);
+) -> Result<PendingTerminal, ProtocolError> {
+    for view in registry.model().map_err(unavailable)?.views {
+        for candidate in view.panes {
+            if candidate.id == pane {
+                if let crate::model::CardKind::Terminal(session) = &candidate.kind {
+                    if session.id == terminal_id {
+                        return Ok(PendingTerminal {
+                            session: session.clone(), pane:candidate,
+                            scope:view.scope, revision:view.revision,
+                        });
+                    }
                 }
             }
         }
     }
+    Err(ProtocolError::new(ProtocolErrorCode::TerminalNotFound,
+        "The automatic terminal reservation changed", false))
+}
+
+/// Ignore only provider-observed hint metadata. Every launch and saved source
+/// field still belongs to the exact accepted reservation.
+pub(super) fn matches_pending(
+    accepted: &crate::model::TerminalSession,
+    current: &crate::model::TerminalSession,
+) -> bool {
+    let mut current = current.clone();
+    current.resume_hint = accepted.resume_hint.clone();
+    accepted == &current
+}
+
+/// Caller retains the same writer guard used for the authoritative reservation
+/// read and brief worker publication. No SQLite operation borrows HostState.
+pub(super) fn complete_terminal(
+    host: &SharedHost,
+    registry: &mut super::model::Registry,
+    reservation: PendingTerminal,
+    session: crate::model::TerminalSession,
+) -> Result<(), String> {
+    if !reservation.pane.pending_terminal_start {
+        return Ok(());
+    }
+    if !matches_pending(&reservation.session, &session) {
+        return Err("The automatic terminal source changed before completion".into());
+    }
+    let mut pane = reservation.pane.clone();
+    pane.pending_terminal_start = false;
+    pane.kind = crate::model::CardKind::Terminal(session);
+    let edit = ModelEdit::ChangeView {
+        scope:reservation.scope, expected_revision:reservation.revision,
+        operation:uuid::Uuid::new_v4(),
+        change:crate::workspace_model::views::Change::Update {
+            before:reservation.pane, pane,
+        },
+    };
+    let applied = registry.apply(&edit)?;
+    if applied.changed {
+        host.lock().unwrap_or_else(|p| p.into_inner())
+            .announce_model_edit(0, applied.sequence, &edit);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PENDING_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn pending_publication_test_hook() {
+    let hook = BEFORE_PENDING_PUBLICATION.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook { hook(); }
 }
 
 #[cfg(test)]
@@ -219,3 +263,6 @@ mod tests {
         assert_eq!(host.lock().unwrap().read_model().unwrap().projects.len(), 1);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod pending_tests;

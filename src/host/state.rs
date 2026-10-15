@@ -3205,40 +3205,16 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
-fn finish_pending_terminal(shared: &SharedHost, terminal_id: TerminalId) {
-    if let Err(error) = super::workspace::complete_terminal(shared, terminal_id) {
+fn finish_pending_terminal(
+    shared: &SharedHost,
+    registry: &mut super::model::Registry,
+    reservation: super::workspace::PendingTerminal,
+    session: TerminalSession,
+) {
+    let terminal_id = session.id;
+    if let Err(error) = super::workspace::complete_terminal(shared, registry, reservation, session) {
         tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation");
     }
-}
-
-/// Reads only the daemon's accepted reservation, never a client's launch recipe.
-fn pending_terminal_session(
-    state: &HostState,
-    pane: crate::model::CardId,
-    terminal_id: TerminalId,
-    require_pending: bool,
-) -> Result<TerminalSession, ProtocolError> {
-    let model = state
-        .model
-        .as_ref()
-        .ok_or_else(|| model_unavailable("registry is unavailable".into()))?
-        .model()
-        .map_err(model_unavailable)?;
-    model
-        .views
-        .into_iter()
-        .flat_map(|view| view.panes)
-        .find_map(|candidate| {
-            if candidate.id == pane && (!require_pending || candidate.pending_terminal_start) {
-                if let crate::model::CardKind::Terminal(session) = candidate.kind {
-                    if session.id == terminal_id {
-                        return Some(session);
-                    }
-                }
-            }
-            None
-        })
-        .ok_or_else(|| not_found(terminal_id))
 }
 
 pub(super) fn spawn_pending_terminal(
@@ -3249,8 +3225,9 @@ pub(super) fn spawn_pending_terminal(
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
-        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        pending_terminal_session(&state, pane, terminal_id, false)?
+        let writer = super::workspace::writer(shared)?;
+        let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+        super::workspace::pending_terminal(&registry, pane, terminal_id)?.session
     };
     start_terminal_view_owned(
         shared,
@@ -3373,21 +3350,41 @@ fn start_terminal_view_owned(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
+    let pending_writer = pending_pane.map(|_| super::workspace::writer(shared)).transpose()?;
     let holder_recovery = {
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pane) = pending_pane {
-            // Completion is idempotent across clients, but an actor alone is
-            // insufficient: its authoritative pane must still name it.
-            if state.terminals.contains_key(&terminal_id) {
-                pending_terminal_session(&state, pane, terminal_id, false)?;
+        let mut registry = pending_writer.as_ref()
+            .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+        let reservation = match (registry.as_ref(), pending_pane) {
+            (Some(registry), Some(pane)) => Some(super::workspace::pending_terminal(registry, pane, terminal_id)?),
+            _ => None,
+        };
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(reservation) = reservation {
+            if let Some(current) = state.terminals.get(&terminal_id) {
+                // A model can hold the original source or this actual
+                // worker's current Live/Detached publication. Compare those
+                // exact descriptors; never infer identity from its ID alone.
+                let published = state.descriptor_as(
+                    matches!(reservation.session.continuity, TerminalContinuity::Live { .. }),
+                    terminal_id,
+                )?;
+                if !super::workspace::matches_pending(&reservation.session, &current.session)
+                    && !super::workspace::matches_pending(&reservation.session, &published.session)
+                {
+                    return Err(not_found(terminal_id));
+                }
+                let current_session = if super::workspace::matches_pending(&reservation.session, &current.session) {
+                    current.session.clone()
+                } else { published.session };
+                let handle = current.handle.clone();
                 let descriptor = state.attach(client_id, terminal_id)?;
-                let handle = state.terminals[&terminal_id].handle.clone();
+                drop(state);
+                finish_pending_terminal(shared, registry.as_mut().unwrap(), reservation, current_session);
                 return Ok((descriptor, handle));
             }
-            let accepted = pending_terminal_session(&state, pane, terminal_id, true)?;
-            if accepted.launch != session.launch {
+            if !reservation.pane.pending_terminal_start
+                || !super::workspace::matches_pending(&reservation.session, &session)
+            {
                 return Err(not_found(terminal_id));
             }
         }
@@ -3541,30 +3538,37 @@ fn start_terminal_view_owned(
 
     let event_rx = handle.events();
     let redraw_handle = handle.clone();
-    let descriptor = {
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pane) = pending_pane {
-            let validation =
-                pending_terminal_session(&state, pane, terminal_id, true).and_then(|accepted| {
-                    if accepted.launch == session.launch {
-                        Ok(())
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
+    // Keep the existing writer admission through the final model read,
+    // worker publication and exact reservation completion. Concurrent layout
+    // edits cannot install a newer source between these steps. SQLite reads
+    // and commits stay outside HostState, so input delivery remains independent.
+    let mut pending_registry = pending_writer.as_ref()
+        .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+    let reservation = match (pending_registry.as_ref(), pending_pane) {
+        (Some(registry), Some(pane)) => {
+            let accepted = super::workspace::pending_terminal(registry, pane, terminal_id)
+                .and_then(|reservation| {
+                    if reservation.pane.pending_terminal_start
+                        && super::workspace::matches_pending(&reservation.session, &session)
+                    { Ok(reservation) } else { Err(not_found(terminal_id)) }
                 });
-            if let Err(error) = validation {
-                state.cancel_spawn(terminal_id);
-                drop(state);
-                // The reservation was withdrawn while the worker was starting.
-                // Shut down only this unpublished worker, never an actor
-                // already attached by another client.
-                let _ = handle.shutdown();
-                drop(handle);
-                return Err(error);
+            match accepted {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    shared.lock().unwrap_or_else(|p| p.into_inner()).cancel_spawn(terminal_id);
+                    drop(pending_registry);
+                    // No model/Host guard may outlive this unpublished cleanup.
+                    let _ = handle.shutdown();
+                    return Err(error);
+                }
             }
         }
+        _ => None,
+    };
+    #[cfg(test)]
+    if reservation.is_some() { super::workspace::pending_publication_test_hook(); }
+    let (descriptor, current_session) = {
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
         if descriptor.is_ok() {
             state
@@ -3583,11 +3587,14 @@ fn start_terminal_view_owned(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        descriptor
+        let current_session = (descriptor.is_ok() && pending_pane.is_some())
+            .then(|| state.terminals[&terminal_id].session.clone());
+        (descriptor, current_session)
     };
-    if descriptor.is_ok() && pending_pane.is_some() {
-        finish_pending_terminal(shared, terminal_id);
+    if let (Some(reservation), Some(session)) = (reservation, current_session) {
+        finish_pending_terminal(shared, pending_registry.as_mut().unwrap(), reservation, session);
     }
+    drop(pending_registry);
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
