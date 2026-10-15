@@ -1203,6 +1203,7 @@ where
             horizontal: internal.horizontal,
         };
         let mut editor = NativeEditor::with_text("");
+        editor.set_tab_width(internal.indentation.tab_width);
         let lines = &internal.editor.buffer().lines;
         for line in &lines[..start.line] {
             append_fragment(&mut editor, line.text(), line.ending().as_str());
@@ -5276,6 +5277,8 @@ mod tests {
         content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 8, tab_width: 8 });
         assert_eq!(content.0.borrow().editor.buffer().tab_width(), 8);
         assert_eq!(content.text(), "a\tb");
+        content.perform_edit(Edit::Paste(Arc::new("row\n".repeat(256)))).unwrap();
+        assert_eq!(content.0.borrow().editor.buffer().tab_width(), 8);
     }
 
     #[test]
