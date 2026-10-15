@@ -3718,6 +3718,7 @@ mod tests {
             modifiers: Default::default(),
             text: Some("a".into()),
             unshifted_codepoint: Some('a'),
+            scroll_to_bottom_on_input: true,
         }
     }
     fn receipt_response(
