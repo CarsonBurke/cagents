@@ -670,11 +670,14 @@ impl Cagents {
             if !create_if_empty {
                 return (true, Task::none());
             }
-            return (true, if !has_terminal {
-                self.add_default_pane(path, self.settings.default_worktree_pane)
-            } else {
-                Task::none()
-            });
+            return (
+                true,
+                if !has_terminal {
+                    self.add_default_pane(path, self.settings.default_worktree_pane)
+                } else {
+                    Task::none()
+                },
+            );
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {

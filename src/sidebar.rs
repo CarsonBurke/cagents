@@ -6156,7 +6156,11 @@ impl widget::menu::Action for ContextCommand<'_> {
 }
 
 fn project_channel_command_label(worktree: Option<WorktreeId>) -> &'static str {
-    if worktree.is_some() { "New thread" } else { "New channel" }
+    if worktree.is_some() {
+        "New thread"
+    } else {
+        "New channel"
+    }
 }
 
 fn context_controls<'a>(
@@ -6179,7 +6183,11 @@ fn context_controls<'a>(
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            (project_channel_command_label(worktree_id).to_owned(), None, ProjectCommand::NewChannel),
+            (
+                project_channel_command_label(worktree_id).to_owned(),
+                None,
+                ProjectCommand::NewChannel,
+            ),
         ];
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
@@ -11095,7 +11103,10 @@ pub(crate) mod tests {
     #[test]
     fn project_and_worktree_menu_creation_labels_match_their_scope() {
         assert_eq!(super::project_channel_command_label(None), "New channel");
-        assert_eq!(super::project_channel_command_label(Some(crate::model::WorktreeId::new())), "New thread");
+        assert_eq!(
+            super::project_channel_command_label(Some(crate::model::WorktreeId::new())),
+            "New thread"
+        );
     }
 
     #[test]

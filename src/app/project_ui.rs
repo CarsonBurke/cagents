@@ -1136,13 +1136,15 @@ impl Cagents {
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
                         if target.worktree.is_some() {
-                            let (selected, scope) = self.select_worktree_checked(target.path, false);
+                            let (selected, scope) =
+                                self.select_worktree_checked(target.path, false);
                             if !selected {
                                 return scope;
                             }
                             // Selection commits synchronously, including aliases;
                             // do not reconstruct the target from a later callback.
-                            let directory = self.active_workspace.clone().expect("selected worktree");
+                            let directory =
+                                self.active_workspace.clone().expect("selected worktree");
                             let thread = self.new_native_thread_at(directory);
                             return Task::batch([scope, thread]);
                         }
@@ -2357,38 +2359,94 @@ mod tests {
             let repository = tempfile::tempdir().unwrap();
             let linked_directory = tempfile::tempdir().unwrap();
             let runtime = tempfile::tempdir().unwrap();
-            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.path().into(), Some("main".into()));
-            let linked = SidebarWorktree::from_durable(WorktreeId::new(), linked_directory.path().into(), Some("feature/login".into()));
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.path().into(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                linked_directory.path().into(),
+                Some("feature/login".into()),
+            );
             let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
-            app.worktree_protections.use_fixture_runtime(runtime.path().into());
+            app.worktree_protections
+                .use_fixture_runtime(runtime.path().into());
             drop(app.select_worktree(repository.path().into(), false));
             let old_scope = app.active_workspace.clone();
             let old_order = app.workspace.order().collect::<Vec<_>>();
             let old_cards = app.durable.cards.clone();
             let old_scopes = app.durable.card_scopes.clone();
-            let _exclusive = blocked.then(|| crate::worktree_cleanup::fixture_protection(runtime.path(), linked_directory.path(), true).unwrap());
-            let action = || Action::Command {project_id:project, worktree_id:Some(linked.id), command:ProjectCommand::NewChannel};
+            let _exclusive = blocked.then(|| {
+                crate::worktree_cleanup::fixture_protection(
+                    runtime.path(),
+                    linked_directory.path(),
+                    true,
+                )
+                .unwrap()
+            });
+            let action = || Action::Command {
+                project_id: project,
+                worktree_id: Some(linked.id),
+                command: ProjectCommand::NewChannel,
+            };
             drop(app.handle_project_action(action()));
             if blocked {
                 assert_eq!(app.active_workspace, old_scope);
                 assert_eq!(app.workspace.order().collect::<Vec<_>>(), old_order);
-                assert_eq!(app.durable.cards, old_cards, "refused physical protection cannot expose a draft");
+                assert_eq!(
+                    app.durable.cards, old_cards,
+                    "refused physical protection cannot expose a draft"
+                );
                 assert_eq!(app.durable.card_scopes, old_scopes);
-                assert!(app.status.as_ref().unwrap().message.contains("Cannot open this worktree"));
+                assert!(
+                    app.status
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("Cannot open this worktree")
+                );
             } else {
-                assert_eq!(app.active_workspace.as_deref(), Some(linked_directory.path()));
+                assert_eq!(
+                    app.active_workspace.as_deref(),
+                    Some(linked_directory.path())
+                );
                 assert!(app.durable.active_channel.is_none());
-                assert!(app.durable.channels.is_empty(), "worktree row opens a thread, not a project channel");
-                let added = app.durable.cards.iter().filter(|card| !old_cards.iter().any(|old| old.id == card.id)).collect::<Vec<_>>();
+                assert!(
+                    app.durable.channels.is_empty(),
+                    "worktree row opens a thread, not a project channel"
+                );
+                let added = app
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| !old_cards.iter().any(|old| old.id == card.id))
+                    .collect::<Vec<_>>();
                 assert_eq!(added.len(), 1);
-                assert!(matches!(&added[0].kind, CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path()));
-                assert_eq!(crate::worktree_cleanup::fixture_protection(runtime.path(), linked_directory.path(), true).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+                assert!(
+                    matches!(&added[0].kind, CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())
+                );
+                assert_eq!(
+                    crate::worktree_cleanup::fixture_protection(
+                        runtime.path(),
+                        linked_directory.path(),
+                        true
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
                 // A successful same-scope no-op still authorizes another thread.
                 let count = app.durable.cards.len();
                 drop(app.handle_project_action(action()));
                 assert_eq!(app.durable.cards.len(), count + 1);
-                let CardKind::Chat(session) = &app.durable.cards.last().unwrap().kind else {panic!("native thread")};
-                assert_eq!(session.launch.recipe.working_directory, linked_directory.path());
+                let CardKind::Chat(session) = &app.durable.cards.last().unwrap().kind else {
+                    panic!("native thread")
+                };
+                assert_eq!(
+                    session.launch.recipe.working_directory,
+                    linked_directory.path()
+                );
             }
         }
     }
@@ -2397,20 +2455,43 @@ mod tests {
     fn project_row_channel_uses_primary_scope_and_branch_label_without_saving_a_fake_name() {
         let repository = tempfile::tempdir().unwrap();
         let linked_directory = tempfile::tempdir().unwrap();
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.path().into(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), linked_directory.path().into(), Some("feature/login".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.path().into(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            linked_directory.path().into(),
+            Some("feature/login".into()),
+        );
         let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
         app.settings.default_channel_pane = settings::DefaultPane::NativeChat;
         drop(app.select_worktree(linked_directory.path().into(), false));
-        let task = app.handle_project_action(Action::Command {project_id:project, worktree_id:None, command:ProjectCommand::NewChannel});
+        let task = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: None,
+            command: ProjectCommand::NewChannel,
+        });
         let message = super::super::tests::task_app_message(task);
-        assert!(matches!(&message, Message::Sidebar(SidebarAction::NewChannel {project_id}) if *project_id == project));
+        assert!(
+            matches!(&message, Message::Sidebar(SidebarAction::NewChannel {project_id}) if *project_id == project)
+        );
         drop(app.update(message));
         assert_eq!(app.active_workspace.as_deref(), Some(repository.path()));
         let channel = app.durable.channels.last().unwrap();
-        assert!(channel.title.is_empty(), "the first actual conversation remains free to name it");
-        assert_eq!(channel_ui::channel_display_title(channel, app.sidebar_model.project(project)), "New channel · main");
-        assert_eq!(app.sidebar_model.project(project).unwrap().channels[0].title, "New channel · main");
+        assert!(
+            channel.title.is_empty(),
+            "the first actual conversation remains free to name it"
+        );
+        assert_eq!(
+            channel_ui::channel_display_title(channel, app.sidebar_model.project(project)),
+            "New channel · main"
+        );
+        assert_eq!(
+            app.sidebar_model.project(project).unwrap().channels[0].title,
+            "New channel · main"
+        );
         assert!(channel.cards.iter().any(|id| matches!(&app.card_state(*id).unwrap().kind, CardKind::Chat(session) if session.launch.recipe.working_directory == repository.path())));
     }
 

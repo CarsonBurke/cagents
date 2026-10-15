@@ -425,7 +425,11 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_protection(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
+pub(crate) fn fixture_protection(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+) -> io::Result<Protection> {
     acquire(runtime, directory, exclusive)
 }
 

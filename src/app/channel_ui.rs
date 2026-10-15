@@ -330,7 +330,12 @@ impl Cagents {
                         .channels
                         .iter()
                         .find(|channel| channel.id == id)
-                        .map(|channel| channel_display_title(channel, self.sidebar_model.project(channel.project_id)))
+                        .map(|channel| {
+                            channel_display_title(
+                                channel,
+                                self.sidebar_model.project(channel.project_id),
+                            )
+                        })
                         .unwrap_or(Cow::Borrowed("the channel"));
                     self.status = Some(TransientNotice::error(format!(
                         "Could not delete {title}: {error}"
@@ -374,7 +379,9 @@ impl Cagents {
                     return Task::none();
                 };
                 if let Err(error) = self.worktree_protections.protect_next(&directory) {
-                    self.status = Some(TransientNotice::warning(format!("Cannot open this worktree yet: {error}")));
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Cannot open this worktree yet: {error}"
+                    )));
                     return Task::none();
                 }
                 let id = ChannelId::new();
@@ -518,7 +525,8 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id)).into_owned();
+        let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
+            .into_owned();
         let chats = self.channel_conversation_count(channel);
         if chats == 0 && !always_confirm {
             return self.delete_channel(id);
@@ -794,9 +802,16 @@ impl Cagents {
                 .iter()
                 .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
                 .map_or_else(
-                    || project.repository.parent()
-                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                        .unwrap_or(&project.repository).to_path_buf(),
+                    || {
+                        project
+                            .repository
+                            .parent()
+                            .filter(|parent| {
+                                sidebar::is_primary_worktree(&project.repository, parent)
+                            })
+                            .unwrap_or(&project.repository)
+                            .to_path_buf()
+                    },
                     |worktree| worktree.path.clone(),
                 ),
         )
@@ -1001,7 +1016,10 @@ fn channel_title_from_prompt(prompt: &str) -> Option<String> {
 /// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
-pub(super) fn channel_display_title<'a>(channel: &'a ProjectChannel, project: Option<&SidebarProject>) -> Cow<'a, str> {
+pub(super) fn channel_display_title<'a>(
+    channel: &'a ProjectChannel,
+    project: Option<&SidebarProject>,
+) -> Cow<'a, str> {
     if !channel.title.is_empty() {
         return Cow::Borrowed(&channel.title);
     }
@@ -1009,11 +1027,18 @@ pub(super) fn channel_display_title<'a>(channel: &'a ProjectChannel, project: Op
 }
 
 fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> {
-    let branch = project.and_then(|project| project.worktrees.iter()
-        .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-        .and_then(|worktree| worktree.branch.as_deref()));
+    let branch = project.and_then(|project| {
+        project
+            .worktrees
+            .iter()
+            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+            .and_then(|worktree| worktree.branch.as_deref())
+    });
     match branch {
-        Some(branch) => Cow::Owned(format!("New channel · {}", branch.strip_prefix("refs/heads/").unwrap_or(branch))),
+        Some(branch) => Cow::Owned(format!(
+            "New channel · {}",
+            branch.strip_prefix("refs/heads/").unwrap_or(branch)
+        )),
         None => Cow::Borrowed("New channel"),
     }
 }
@@ -1027,11 +1052,27 @@ mod tests {
     fn primary_channel_guard_and_selection_share_git_directory_fallback() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(),
-            "repo".into(), "/repo/.git".into(), vec![], vec![]));
-        let channel = ProjectChannel {id:ChannelId::new(), project_id:project, title:String::new(),
-            title_source:Default::default(), ordinal:0, shared:false, cards:vec![], focused:None};
-        Arc::make_mut(&mut app.durable).channels.push(channel.clone());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo/.git".into(),
+            vec![],
+            vec![],
+        ));
+        let channel = ProjectChannel {
+            id: ChannelId::new(),
+            project_id: project,
+            title: String::new(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![],
+            focused: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(channel.clone());
         let protected = app.project_primary_worktree(project).unwrap();
         drop(app.select_channel(channel.id));
         assert_eq!(protected, Path::new("/repo"));
