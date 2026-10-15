@@ -96,12 +96,25 @@ mod tests {
         let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
         assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
         assert!(names.next().unwrap().is_ok());
+        use std::os::unix::fs::MetadataExt;
+        let original = root.metadata().unwrap();
         drop(names);
-        // No descriptor-creating call intervenes: the original owned stream
-        // must have closed its descriptor, rather than leaking on early exit.
-        let status = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        let error = io::Error::last_os_error();
-        assert_eq!(status, -1);
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        // Another test thread may reuse this numerical slot. Compare object
+        // identity rather than assuming no other thread opens a descriptor.
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes only into this owned output. A closed slot
+        // returns EBADF; a reused slot describes its current object.
+        let status = unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) };
+        if status == -1 {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        } else {
+            // SAFETY: successful fstat initialized the metadata.
+            let metadata = unsafe { metadata.assume_init() };
+            assert_ne!(
+                (metadata.st_dev as u64, metadata.st_ino as u64),
+                (original.dev(), original.ino()),
+                "the stream must not retain its unique fixture directory"
+            );
+        }
     }
 }
