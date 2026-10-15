@@ -2003,7 +2003,7 @@ mod tests {
         let _guard = diagnostic_test_guard();
         wait_capacity(0);
         let (client, mut server) = UnixStream::pair().unwrap();
-        let raw = format!("{}€\x1b[31mred\x1b[0m\rkept\n", "x".repeat(256 * 1024 - 1)).into_bytes();
+        let raw = format!("{}€\x1b[31mred\x1b[0m\nold\rkept\n", "x".repeat(256 * 1024 - 1)).into_bytes();
         let expected = provider_exit::readable(raw.clone());
         let log = super::super::super::ProviderExitLog {
             id: "typed-pages".into(),
@@ -2126,6 +2126,8 @@ mod tests {
         let completion = runtime().block_on(handle.read_provider_exit_job(request.clone()));
         let output = completion.take_result().unwrap().unwrap();
         assert_eq!(output.as_str(), expected);
+        assert!(output.as_str().contains("€red\n"));
+        assert!(output.as_str().ends_with("kept\n"));
         assert_eq!(output.omitted(), 17);
         assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
         assert_eq!(diagnostic_resource_usage().response_owners, 0);
