@@ -145,7 +145,7 @@ pub(super) mod tests {
     use super::*;
     use cosmic::iced::futures::StreamExt;
 
-    fn git(root: &Path, arguments: &[&str]) -> std::process::Output {
+    pub(crate) fn git(root: &Path, arguments: &[&str]) -> std::process::Output {
         let mut command = std::process::Command::new("git");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") { command.env_remove(key); }

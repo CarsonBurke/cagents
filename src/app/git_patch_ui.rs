@@ -190,4 +190,54 @@ mod tests {
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else { panic!() };
         assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
+    async fn worker_message(task: Task<Message>, accepts: impl Fn(&Message) -> bool) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("actual worker task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                if accepts(&message) { return message; }
+            }
+        }
+        panic!("expected worker receipt");
+    }
+
+    #[tokio::test]
+    async fn actual_preparation_worker_and_owned_turn_stage_only_the_current_captured_patch() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        for earlier_turn in [false, true] {
+            let (temporary, mut app, card, key) = fixture();
+            let root = temporary.path();
+            let git = |arguments: &[&str]| {
+                let output = super::super::git_binding::tests::git(root, arguments);
+                assert!(output.status.success(), "{arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+                output.stdout
+            };
+            std::fs::write(root.join("file.txt"), "original\nkeep\n").unwrap();
+            git(&["add", "file.txt"]); git(&["commit", "-m", "base"]);
+            std::fs::write(root.join("file.txt"), "changed\nkeep\n").unwrap();
+            let first = if earlier_turn {
+                std::fs::write(root.join("other.txt"), "earlier turn\n").unwrap();
+                Some(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![crate::repository::PathSelection::new(RepoPath::parse("other.txt").unwrap())])))
+            } else { None };
+            let prepare = app.start_diff_patch(card, git_patch::Kind::Stage, None);
+            let receipt = worker_message(prepare, |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+            let effect = app.update(receipt);
+            if let Some(first) = first {
+                drop(effect); // Preparation filled its pending slot only.
+                let completed = worker_message(first, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+                assert!(matches!(&completed, Message::SourceControlMutated { report: None, .. }));
+                drop(app.update(completed));
+                assert!(app.source_control_mutations.is_empty(), "stale prepared successor is refused at its owned turn");
+                assert_eq!(String::from_utf8(git(&["diff", "--cached", "--name-only"])).unwrap().trim(), "other.txt");
+                assert!(app.notices.recent().any(|entry| entry.notice.message.contains("original Git source changed")));
+            } else {
+                let completed = worker_message(effect, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+                assert!(matches!(&completed, Message::SourceControlMutated { report: None, .. }));
+                drop(app.update(completed));
+                assert_eq!(String::from_utf8(git(&["show", ":file.txt"])).unwrap(), "changed\nkeep\n");
+                assert_eq!(String::from_utf8(git(&["diff", "--cached", "--name-only"])).unwrap().trim(), "file.txt");
+            }
+        }
+    }
+
 }
