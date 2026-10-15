@@ -9870,6 +9870,12 @@ mod tests {
         let boot_id = boot("indexed-closure");
         let store = StateStore::open(&path, boot_id.clone()).unwrap();
         let mut state = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(source) = &mut state.cards[0].kind else {
+            unreachable!()
+        };
+        source.resume_hint = None;
+        source.launch.program = "/bin/sh".into();
+        source.launch.arguments = vec!["-c".into(), "true".into()];
         let CardKind::Terminal(first) = state.cards[0].kind.clone() else {
             unreachable!()
         };

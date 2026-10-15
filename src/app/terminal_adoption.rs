@@ -225,6 +225,10 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for session in terminals {
+            // Even an ineligible or closed newer observation withdraws an
+            // older pending descriptor for this identity before health retry.
+            self.pending_adoptions
+                .retain(|pending| pending.id != session.id);
             let waiting = self
                 .durable
                 .cards
@@ -715,10 +719,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let mut new = hosted("/repo");
+        let mut withdrawn = hosted("/repo");
         let started = Instant::now();
-        drop(app.observe_hosted_terminals(vec![old.clone(), new.clone()]));
+        drop(app.observe_hosted_terminals(vec![old.clone(), new.clone(), withdrawn.clone()]));
         new.launch.arguments.push("latest-observation".into());
-        drop(app.observe_hosted_terminals(vec![new.clone()]));
+        withdrawn.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: withdrawn.launch.clone(),
+            last_exit: None,
+        };
+        drop(app.observe_hosted_terminals(vec![new.clone(), withdrawn.clone()]));
         let elapsed = started.elapsed();
         assert!(cards_for(&app, new.id).is_empty());
         assert_eq!(
@@ -752,6 +761,10 @@ mod tests {
         assert!(
             cards_for(&app, old.id).is_empty(),
             "the closed identity is never resurrected"
+        );
+        assert!(
+            cards_for(&app, withdrawn.id).is_empty(),
+            "a newer ineligible observation withdraws the queued live descriptor"
         );
         let adopted = cards_for(&app, new.id);
         assert_eq!(adopted.len(), 1);
