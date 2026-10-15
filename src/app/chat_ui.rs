@@ -24,6 +24,7 @@ mod find;
 mod flow_layout;
 mod fold;
 mod hover;
+mod hydration;
 mod images;
 mod layout;
 mod markdown;
@@ -179,6 +180,8 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    LogicalSourceLoaded(Target, hydration::Key, u64, Result<hydration::Loaded, String>),
+    RetryLogicalSources(Target),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     SignIn(Target, Account),
@@ -342,6 +345,7 @@ impl Action {
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
                 | Self::MarkdownPrepared(..)
+                | Self::LogicalSourceLoaded(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -1629,6 +1633,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    logical_sources: hydration::State,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
@@ -2222,6 +2227,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            logical_sources: hydration::State::default(),
             source_clock: None,
             finished_stamp: None,
             connection,
@@ -2318,6 +2324,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.logical_sources.clear();
         self.transcript_scope = self.transcript_scope.wrapping_add(1);
         self.copied = None;
         self.copy_authority.revoke();
@@ -2505,6 +2512,18 @@ impl Runtime {
         }
     }
 
+    pub(super) fn active_item(&self, id: &str) -> Option<&Arc<chat::Item>> {
+        let items = match self.selected_subagent.as_deref() {
+            Some(selected) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| agent.id == selected)
+                .map(|agent| agent.items.as_slice()),
+            None => Some(self.snapshot.items.as_slice()),
+        }?;
+        items.iter().find(|item| item.id == id)
+    }
     fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
         let mut presentation_changed = false;
         // Each transcript has its own streaming lifecycle: a child can keep
@@ -2728,6 +2747,7 @@ impl Runtime {
             self.source_clock = source_clock;
             return;
         }
+        snapshot=self.logical_sources.project(snapshot,self.selected_subagent.as_deref());
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -3118,6 +3138,7 @@ impl Runtime {
         result
     }
     fn release_transcript_caches(&mut self) {
+        self.logical_sources.clear();
         self.copy_authority.revoke();
         self.preparation.clear();
         self.cache = HashMap::new();
@@ -5085,6 +5106,7 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                subscriptions.extend(hydration::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.preparation.subscriptions(runtime.target));
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
@@ -8323,6 +8345,12 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.thumbnails.complete(&path, loaded);
                 }
+            }
+            Action::LogicalSourceLoaded(target,key,attempt,loaded) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::complete(runtime,&key,attempt,loaded);}
+            }
+            Action::RetryLogicalSources(target) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {hydration::retry(runtime);}
             }
             Action::ImageLoaded(target, item, attempt, loaded) => {
                 let explicit_pressure = self
