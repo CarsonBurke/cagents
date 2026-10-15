@@ -6650,6 +6650,7 @@ impl RepositoryRuntime {
         if stale_capture { return Task::none(); }
         if self.has_editor_recovery() && matches!(&action,
             RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }
+            | RepositoryAction::DiskMetadata { .. }
             | RepositoryAction::DiscardEdits { .. } | RepositoryAction::StageSelected { .. }) {
             return Task::none();
         }

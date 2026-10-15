@@ -121,6 +121,9 @@ mod tests {
         assert!(runtime.recovery.is_none(), "this is an admitted worker, not an invented error");
         let owned_nonce = runtime.recovery_capture_ticket;
         let old_identity = runtime.current_identity(card, "notes.txt".into());
+        let duplicate = runtime.update(RepositoryAction::DiskMetadata { identity: old_identity.clone(), ticket: 7, result: Ok(Some(stamp)) });
+        assert!(iced::runtime::task::into_stream(duplicate).is_none(), "old metadata cannot admit a second effectful capture");
+        assert_eq!(runtime.recovery_capture_ticket, owned_nonce);
         drop(runtime.update(RepositoryAction::DiskLoaded { identity: old_identity, ticket: 7, capture: None, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Io("older normal Runtime read".into())) }));
         assert_eq!(runtime.recovery_capture_ticket, owned_nonce, "a reconstructed Runtime can reuse both poll ticket and AsyncIdentity");
         assert!(runtime.has_editor_recovery());
