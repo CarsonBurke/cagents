@@ -643,9 +643,13 @@ const fn default_focus_follows_mouse() -> bool {
     false
 }
 
-const fn default_editor_auto_close() -> bool { true }
+const fn default_editor_auto_close() -> bool {
+    true
+}
 
-const fn default_editor_tab_width() -> u16 { 4 }
+const fn default_editor_tab_width() -> u16 {
+    4
+}
 
 const fn default_editor_auto_save() -> bool {
     true
@@ -1660,7 +1664,9 @@ impl AppSettings {
             ));
         }
         if !(1..=16).contains(&self.editor_tab_width) {
-            return Err(SettingsError::Invalid("editor_tab_width must be between 1 and 16".into()));
+            return Err(SettingsError::Invalid(
+                "editor_tab_width must be between 1 and 16".into(),
+            ));
         }
         if self
             .editor_font_size

@@ -4700,8 +4700,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4725,16 +4730,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4949,8 +4958,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -7285,21 +7294,37 @@ fn files_section<'a>(
         });
     }
     if !modal_open
-        && let Some((path, _, _)) = crate::editor_navigation::parse_location(state.files_query().trim()) {
+        && let Some((path, _, _)) =
+            crate::editor_navigation::parse_location(state.files_query().trim())
+    {
         let candidate = PathBuf::from(path);
-        let relative = if candidate.is_absolute() { candidate.strip_prefix(&key.canonical_path).ok().map(Path::to_path_buf) } else { Some(candidate) };
+        let relative = if candidate.is_absolute() {
+            candidate
+                .strip_prefix(&key.canonical_path)
+                .ok()
+                .map(Path::to_path_buf)
+        } else {
+            Some(candidate)
+        };
         if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
-            filter = filter.on_submit(SidebarAction::OpenFile { key: key.clone(), path });
+            filter = filter.on_submit(SidebarAction::OpenFile {
+                key: key.clone(),
+                path,
+            });
         }
     }
-    let folded = fold(&crate::editor_navigation::file_query(state.files_query().trim()));
+    let folded = fold(&crate::editor_navigation::file_query(
+        state.files_query().trim(),
+    ));
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
     let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
     {
         FileSearch::Pending { query }
-            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             let (visible, hidden) = file_row_page(
                 &source.files,
@@ -7316,12 +7341,17 @@ fn files_section<'a>(
             query,
             files,
             hidden,
-        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() => {
+        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+            == folded.as_ref()
+            && !folded.is_empty() =>
+        {
             let notice = files.is_empty().then_some("No files match this filter.");
             (files.iter().collect(), *hidden, notice)
         }
         FileSearch::Failed { query, message }
-            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             (Vec::new(), 0, Some(message.as_str()))
         }
@@ -10477,7 +10507,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11266,58 +11298,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 

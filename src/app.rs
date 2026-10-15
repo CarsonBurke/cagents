@@ -3587,8 +3587,16 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
-        SettingsField::EditorAutoClose => value.parse::<bool>().map(|enabled| next.editor_auto_close = enabled).map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
-        SettingsField::EditorTabWidth => value.parse::<u16>().ok().filter(|width| (1..=16).contains(width)).map(|width| next.editor_tab_width = width).ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
+        SettingsField::EditorAutoClose => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_auto_close = enabled)
+            .map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
+        SettingsField::EditorTabWidth => value
+            .parse::<u16>()
+            .ok()
+            .filter(|width| (1..=16).contains(width))
+            .map(|width| next.editor_tab_width = width)
+            .ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -10206,7 +10214,9 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
-        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim()).map(|(_, line, column)| (line, column));
+        let location =
+            crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim())
+                .map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
@@ -10242,7 +10252,7 @@ impl Cagents {
                         card,
                         path,
                         ignored,
-                    location,
+                        location,
                     });
                 }
                 task
@@ -10702,7 +10712,9 @@ impl Cagents {
             )));
             return Task::none();
         }
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.remember_jump_origin(); }
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.remember_jump_origin();
+        }
         self.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
@@ -10874,7 +10886,12 @@ impl Cagents {
             .take()
             .expect("the pending open was just matched");
         if let Some((line, column)) = open.location {
-            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation { card, path: open.path, line: line - 1, column: column - 1 }));
+            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation {
+                card,
+                path: open.path,
+                line: line - 1,
+                column: column - 1,
+            }));
         }
         let action = if open.ignored {
             let Ok(path) = RepoPath::parse(&open.path) else {
@@ -12578,7 +12595,10 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_auto_close != self.settings.editor_auto_close || previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_auto_close != self.settings.editor_auto_close
+            || previous.editor_tab_width != self.settings.editor_tab_width
+            || previous.editor_wrap_lines != wrap_lines
+            || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
@@ -12590,8 +12610,10 @@ impl Cagents {
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_editor_tab_width(self.settings.editor_tab_width);
-                        pane.runtime.set_editor_auto_close(self.settings.editor_auto_close);
+                        pane.runtime
+                            .set_editor_tab_width(self.settings.editor_tab_width);
+                        pane.runtime
+                            .set_editor_auto_close(self.settings.editor_auto_close);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -15970,11 +15992,15 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
-                if !captured && is_escape_press(&event)
+                if !captured
+                    && is_escape_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-                    && runtime.go_to_line_is_open() {
-                    return repository_task(runtime.update(RepositoryAction::CloseGoToLine { card }));
+                    && runtime.go_to_line_is_open()
+                {
+                    return repository_task(
+                        runtime.update(RepositoryAction::CloseGoToLine { card }),
+                    );
                 }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
@@ -26520,9 +26546,13 @@ mod tests {
     #[test]
     fn save_matches_the_physical_key_on_non_latin_layouts() {
         let event = keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character("ы".into()), modified_key: keyboard::Key::Character("ы".into()),
+            key: keyboard::Key::Character("ы".into()),
+            modified_key: keyboard::Key::Character("ы".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
-            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
         };
         assert!(is_save_press(&event));
     }
