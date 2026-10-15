@@ -1320,18 +1320,24 @@ impl Codex {
         }
         step.events.push(Event::Item(item));
     }
-    fn release_approval(&mut self, frame: &Value) {
+    fn release_approval(&mut self, frame: &Value, step: &mut Step) {
         if let Some(child_id) = frame["params"]["threadId"].as_str()
             && self.thread.as_deref() != Some(child_id)
             && let Some(child) = self.children.get_mut(child_id)
         {
-            child.release_approval(frame);
+            let mut local = Step::default();
+            child.release_approval(frame, &mut local);
+            step.events
+                .extend(chat::child_events(child_id, local.events));
             return;
         }
         if let Some(key) = Self::approval_item_key(frame)
             && self.approval_states.get(&key) == Some(&ToolStatus::AwaitingApproval)
         {
-            self.approval_states.remove(&key);
+            // The request no longer waits for this UI. The provider's next
+            // item supplies its terminal outcome; until then it is live, not
+            // awaiting a decision that can no longer be answered.
+            self.set_approval(frame, ToolStatus::Running, step);
         }
     }
     fn routed_approval(&mut self, frame: &Value, status: ToolStatus, step: &mut Step) {
@@ -2539,7 +2545,7 @@ impl Adapter for Codex {
                         request.frame["params"]["threadId"].as_str() == Some(id)
                     }) {
                         if let Some(request) = self.requests.remove(&request_id) {
-                            self.release_approval(&request.frame);
+                            self.release_approval(&request.frame, &mut step);
                         }
                         step.events.push(Event::RequestResolved { id: request_id });
                     }
@@ -2908,7 +2914,7 @@ impl Adapter for Codex {
             "serverRequest/resolved" => {
                 let id = rpc_id(&params["requestId"])?;
                 if let Some(request) = self.requests.remove(&id) {
-                    self.release_approval(&request.frame);
+                    self.release_approval(&request.frame, &mut step);
                 }
                 step.events.push(Event::RequestResolved { id });
             }
@@ -6770,5 +6776,53 @@ mod tests {
             if item.id == "turn/tool" && item.content.status() == Some(ToolStatus::Denied)))
         );
         assert_eq!(adapter.turn.as_deref(), Some("new-turn"));
+    }
+    #[test]
+    fn externally_resolved_approval_releases_parent_and_child_waiting_items() {
+        for child in [false, true] {
+            let mut parent = adapter();
+            let thread = if child { "child" } else { "thread-exact" };
+            if child {
+                let mut adapter = adapter();
+                adapter.thread = Some(thread.into());
+                adapter.is_child = true;
+                parent.children.insert(thread.into(), Box::new(adapter));
+            }
+            parent
+                .receive(approval_frame(
+                    thread,
+                    1,
+                    "item/commandExecution/requestApproval",
+                ))
+                .unwrap();
+            let resolved=parent.receive(json!({"method":"serverRequest/resolved","params":{"threadId":thread,"requestId":1}})).unwrap();
+            assert!(resolved.events.iter().any(|event| match event {
+                Event::Item(item) if !child => item.content.status() == Some(ToolStatus::Running),
+                Event::SubagentItem { id, item } if child && id == thread =>
+                    item.content.status() == Some(ToolStatus::Running),
+                _ => false,
+            }));
+            assert!(!resolved.events.iter().any(|event| match event {
+                Event::Item(item) | Event::SubagentItem { item, .. } =>
+                    item.content.status() == Some(ToolStatus::AwaitingApproval),
+                _ => false,
+            }));
+            parent
+                .receive(
+                    json!({"method":"item/commandExecution/outputDelta","params":{"threadId":thread,
+                "turnId":"turn","itemId":"tool","delta":"running now"}}),
+                )
+                .unwrap();
+            let adapter = if child {
+                parent.children[thread].as_ref()
+            } else {
+                &parent
+            };
+            assert_eq!(
+                adapter.active_items["turn/tool"].content.status(),
+                Some(ToolStatus::Running)
+            );
+            assert!(!adapter.approval_states.contains_key("turn/tool"));
+        }
     }
 }
