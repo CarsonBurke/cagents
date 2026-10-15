@@ -544,6 +544,21 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, None)
+    }
+
+    /// Current-protocol connection bounded across connect and handshake. It
+    /// neither starts a daemon nor accepts a different protocol's payload.
+    pub(super) fn connect_before(socket_path: &Path, deadline: Instant) -> Result<Self, ControlError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ControlError::Connect(io::ErrorKind::TimedOut.into()));
+        }
+        let stream = connect_control_socket(socket_path, remaining).map_err(ControlError::Connect)?;
+        Self::from_stream_inner(stream, Some(deadline))
+    }
+
+    fn from_stream_inner(stream: UnixStream, deadline: Option<Instant>) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -558,7 +573,7 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake()?;
+        let proof = client.handshake(deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
@@ -1660,12 +1675,10 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self) -> Result<HostSessionProof, ControlError> {
+    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        write_frame(
-            &mut self.stream,
-            &ClientEnvelope {
+        let request = ClientEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id,
                 proof: None,
@@ -1673,10 +1686,16 @@ impl HandshakeClient {
                     expected_host: None,
                     resume: Vec::new(),
                 },
-            },
-        )?;
+            };
+        match deadline {
+            Some(deadline) => write_frame(&mut DeadlineWriter {stream: &mut self.stream, deadline}, &request)?,
+            None => write_frame(&mut self.stream, &request)?,
+        }
         let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = read_frame(&mut self.stream)
+        let envelope: ServerEnvelope = match deadline {
+            Some(deadline) => read_frame(&mut DeadlineReader {stream: &mut self.stream, deadline}),
+            None => read_frame(&mut self.stream),
+        }
             .map_err(|error| reply_error(error, timeout))?
             .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {

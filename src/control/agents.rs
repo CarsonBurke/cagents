@@ -2239,10 +2239,11 @@ struct ConsoleConnection {
     client:Option<ControlClient>,
     retry_at:Instant,
     retry_delay:Duration,
+    epoch:u64,
 }
 impl ConsoleConnection {
     fn new(socket:PathBuf)->Self {
-        Self {socket,client:None,retry_at:Instant::now(),retry_delay:Duration::from_millis(250)}
+        Self {socket,client:None,retry_at:Instant::now(),retry_delay:Duration::from_millis(250),epoch:0}
     }
     fn lost(&mut self) {
         self.client=None;
@@ -2250,11 +2251,17 @@ impl ConsoleConnection {
         self.retry_delay=(self.retry_delay*2).min(Duration::from_secs(2));
     }
     fn read(&mut self,authority:&Authority,agent:AgentId,generation:Option<u64>,last_run:Option<(RunId,u64)>)->Result<Option<Reply>,ControlError> {
+        self.read_before(authority,agent,generation,last_run,Instant::now()+Duration::from_secs(2))
+    }
+    fn read_before(&mut self,authority:&Authority,agent:AgentId,generation:Option<u64>,last_run:Option<(RunId,u64)>,deadline:Instant)->Result<Option<Reply>,ControlError> {
         let mut fresh=false;
         if self.client.is_none() {
             if Instant::now()<self.retry_at {return Ok(None);}
-            match ControlClient::connect(&self.socket) {
-                Ok(client)=>{self.client=Some(client);fresh=true;}
+            match ControlClient::connect_before(&self.socket,deadline) {
+                Ok(client)=>{
+                    self.epoch=self.epoch.checked_add(1).ok_or_else(||ControlError::Frame(crate::terminal::ipc::FrameError::Io(io::Error::other("Console attachment epochs exhausted"))))?;
+                    self.client=Some(client);fresh=true;
+                }
                 Err(error) if console_transport_loss(&error)=>{self.lost();return Ok(None);}
                 Err(error)=>return Err(error),
             }
@@ -2264,7 +2271,7 @@ impl ConsoleConnection {
                 // Generations belong to an attachment; force a bounded full
                 // view after the new daemon handshake, keeping run evidence.
                 after_generation:if fresh {None} else {generation},after_run:last_run,
-            }},Some(Instant::now()+Duration::from_secs(2)));
+            }},Some(deadline));
         match result {
             Ok(reply)=>{self.retry_delay=Duration::from_millis(250);Ok(Some(reply))}
             Err(error) if console_transport_loss(&error)=>{self.lost();Ok(None)}
@@ -2291,6 +2298,20 @@ fn console_transport_loss(error:&ControlError)->bool {
     }
 }
 
+enum ConsoleInputDecision {
+    Quit,
+    Ignore,
+    Offline,
+    Command(crate::agent_execution::ConsoleCommand),
+    Invalid(String),
+}
+fn console_input_decision(line:&str,stamp:Option<u64>,current:Option<u64>)->ConsoleInputDecision {
+    if line=="/quit" {return ConsoleInputDecision::Quit;}
+    if line.trim().is_empty() {return ConsoleInputDecision::Ignore;}
+    if stamp.is_none() || stamp!=current {return ConsoleInputDecision::Offline;}
+    match console_input(line) {Ok(command)=>ConsoleInputDecision::Command(command),Err(error)=>ConsoleInputDecision::Invalid(error)}
+}
+
 fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     use std::io::{BufRead, Write};
     let authority = Authority::from_environment();
@@ -2303,6 +2324,8 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     let socket = terminal::ipc::daemon_socket_path().map_err(|e| AppError::new("daemon", e))?;
     let mut connection = ConsoleConnection::new(socket);
     let mut reconnect_notice=false;
+    let admitted_epoch=std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input_epoch=admitted_epoch.clone();
     let (sender, input) = std::sync::mpsc::sync_channel(8);
     thread::Builder::new()
         .name("console-input".into())
@@ -2325,8 +2348,10 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                         break;
                     }
                     Ok(_) => {
+                        let after=input_epoch.load(std::sync::atomic::Ordering::Acquire);
+                        let stamp=(after!=0).then_some(after);
                         if sender
-                            .send(Some(Ok(line.trim_end_matches(['\r', '\n']).to_owned())))
+                            .send(Some(Ok((stamp,line.trim_end_matches(['\r', '\n']).to_owned()))))
                             .is_err()
                         {
                             break;
@@ -2346,6 +2371,8 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     let mut last_requests = Vec::new();
     loop {
         let read=connection.read(&authority,agent,generation,last_run);
+        let current_epoch=(connection.client.is_some() && matches!(&read,Ok(Some(Reply::Console(_))))).then_some(connection.epoch);
+        admitted_epoch.store(current_epoch.unwrap_or(0),std::sync::atomic::Ordering::Release);
         if connection.client.is_none() && !reconnect_notice {
             eprintln!("Console connection unavailable; waiting for the daemon. Commands will not be replayed, and inputs are not sent while disconnected.");reconnect_notice=true;
         } else if read.is_ok() && connection.client.is_some() && reconnect_notice {
@@ -2411,34 +2438,26 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
             Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Ok(Some(Err(error))) => return Err(AppError::new("console_input", error)),
-            Ok(Some(Ok(line))) => {
-                if line == "/quit" {
-                    break;
-                }
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let command = match console_input(&line) {
-                    Ok(command) => command,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
+            Ok(Some(Ok((stamp,line)))) => {
+                let command=match console_input_decision(&line,stamp,current_epoch) {
+                    ConsoleInputDecision::Quit=>break,
+                    ConsoleInputDecision::Ignore=>continue,
+                    ConsoleInputDecision::Offline=>{eprintln!("Not sent: this input crossed a disconnected or changed console attachment. Re-enter it after recovery.");continue;}
+                    ConsoleInputDecision::Invalid(error)=>{eprintln!("{error}");continue;}
+                    ConsoleInputDecision::Command(command)=>command,
                 };
-                if connection.client.is_none() {
-                    eprintln!("Not sent while disconnected. Re-enter this input after the console reconnects.");
-                    continue;
-                }
                 match connection.command(&authority,agent,command) {
                     Ok(Reply::Accepted(accepted)) => println!("Accepted run {}", accepted.run.id),
                     Ok(_) => {}
                     Err(error) if console_transport_loss(&error) => eprintln!("The command acknowledgement was lost. It may have been accepted; it will not be sent again. Reconnecting to read its durable state: {error}"),
                     Err(error) => eprintln!("{error}"),
                 }
+                if connection.client.is_none() {admitted_epoch.store(0,std::sync::atomic::Ordering::Release);}
                 generation = None;
             }
         }
     }
+    admitted_epoch.store(0,std::sync::atomic::Ordering::Release);
     Ok(CommandOutput {
         command: "agent.console",
         data: json!({ "agent": agent, "detached": true }),
@@ -2525,11 +2544,41 @@ mod console_reconnect_tests {
         });
         let mut connection=ConsoleConnection::new(socket);
         assert!(matches!(connection.read(&authority,agent,Some(99),None).unwrap(),Some(Reply::Console(None))));
+        assert!(matches!(console_input_decision("queued while offline",None,Some(connection.epoch)),ConsoleInputDecision::Offline));
+        let previous_epoch=connection.epoch;
         let command=ConsoleCommand::Submit {prompt:"accepted exactly once".into(),idempotency_key:uuid::Uuid::new_v4().to_string()};
         assert!(connection.command(&authority,agent,command).is_err());
         assert!(connection.client.is_none());connection.retry_at=Instant::now();
         assert!(matches!(connection.read(&authority,agent,Some(99),None).unwrap(),Some(Reply::Console(None))));
         assert_eq!(connection.client.as_ref().unwrap().proof().host_incarnation.as_str(),"new");
+        assert!(matches!(console_input_decision("queued before host loss",Some(previous_epoch),Some(connection.epoch)),ConsoleInputDecision::Offline));
+        assert!(matches!(console_input_decision("/quit",None,Some(connection.epoch)),ConsoleInputDecision::Quit));
+        assert!(matches!(console_input_decision("new explicit input",Some(connection.epoch),Some(connection.epoch)),ConsoleInputDecision::Command(_)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn trickled_handshake_returns_to_offline_quit_under_one_absolute_budget() {
+        let root=tempfile::tempdir().unwrap();let socket=root.path().join("daemon.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let worker=thread::spawn(move || {
+            let (mut stream,_)=listener.accept().unwrap();
+            let request:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+            let proof=crate::model::HostSessionProof {host_session_id:"host".into(),boot_id:"boot".into(),host_incarnation:"instance".into()};
+            let envelope=ServerEnvelope {version:crate::terminal::ipc::PROTOCOL_VERSION,request_id:Some(request.request_id),proof:proof.clone(),message:ServerMessage::Response {response:ServerResponse::Connected {proof,terminals:Vec::new()}}};
+            let body=postcard::to_stdvec(&envelope).unwrap();
+            for byte in [(body.len() as u32).to_be_bytes().as_slice(),body.as_slice()].concat() {
+                if stream.write_all(&[byte]).is_err() {break;}
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut connection=ConsoleConnection::new(socket);
+        let authority=Authority::session(uuid::Uuid::new_v4().to_string());
+        let started=Instant::now();
+        assert!(connection.read_before(&authority,AgentId::new(),None,None,started+Duration::from_millis(45)).unwrap().is_none());
+        assert!(started.elapsed()<Duration::from_millis(500));
+        assert!(connection.client.is_none());
+        assert!(matches!(console_input_decision("/quit",None,None),ConsoleInputDecision::Quit));
         worker.join().unwrap();
     }
 
