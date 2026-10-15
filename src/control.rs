@@ -3943,6 +3943,24 @@ mod tests {
         let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert!(descriptor_flags >= 0 && descriptor_flags & libc::FD_CLOEXEC != 0);
         assert!(status_flags >= 0 && status_flags & libc::O_NONBLOCK != 0);
+        #[cfg(target_os = "macos")]
+        {
+            let mut enabled: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&enabled) as libc::socklen_t;
+            // SAFETY: the socket is live and both output buffers have the
+            // declared option size.
+            assert_eq!(unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&mut enabled as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            }, 0);
+            assert_eq!(length as usize, std::mem::size_of_val(&enabled));
+            assert_eq!(enabled, 1);
+        }
     }
 
     fn saturated_control_listener(

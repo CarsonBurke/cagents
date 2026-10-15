@@ -42,6 +42,22 @@ pub(crate) fn nonblocking_socket() -> io::Result<UnixStream> {
     }
     let stream = unsafe { UnixStream::from_raw_fd(raw) };
     configure(stream.as_fd())?;
+    // Match Apple's standard-library socket behavior independently of the
+    // application's process-wide SIGPIPE disposition.
+    let enabled: libc::c_int = 1;
+    // SAFETY: a live socket and correctly sized, initialized option value.
+    if unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(stream)
 }
 
