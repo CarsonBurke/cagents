@@ -98,7 +98,10 @@ pub(super) fn edit(
 pub(super) fn writer(
     host: &SharedHost,
 ) -> Result<std::sync::Arc<std::sync::Mutex<super::model::Registry>>, ProtocolError> {
-    host.lock().unwrap_or_else(|p| p.into_inner()).workspace_registry.clone()
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .workspace_registry
+        .clone()
         .ok_or_else(|| unavailable("The workspace model writer is unavailable"))
 }
 
@@ -122,16 +125,21 @@ pub(super) fn pending_terminal(
                 if let crate::model::CardKind::Terminal(session) = &candidate.kind {
                     if session.id == terminal_id {
                         return Ok(PendingTerminal {
-                            session: session.clone(), pane:candidate,
-                            scope:view.scope, revision:view.revision,
+                            session: session.clone(),
+                            pane: candidate,
+                            scope: view.scope,
+                            revision: view.revision,
                         });
                     }
                 }
             }
         }
     }
-    Err(ProtocolError::new(ProtocolErrorCode::TerminalNotFound,
-        "The automatic terminal reservation changed", false))
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalNotFound,
+        "The automatic terminal reservation changed",
+        false,
+    ))
 }
 
 /// Ignore only provider-observed hint metadata. Every launch and saved source
@@ -163,15 +171,18 @@ pub(super) fn complete_terminal(
     pane.pending_terminal_start = false;
     pane.kind = crate::model::CardKind::Terminal(session);
     let edit = ModelEdit::ChangeView {
-        scope:reservation.scope, expected_revision:reservation.revision,
-        operation:uuid::Uuid::new_v4(),
-        change:crate::workspace_model::views::Change::Update {
-            before:reservation.pane, pane,
+        scope: reservation.scope,
+        expected_revision: reservation.revision,
+        operation: uuid::Uuid::new_v4(),
+        change: crate::workspace_model::views::Change::Update {
+            before: reservation.pane,
+            pane,
         },
     };
     let applied = registry.apply(&edit)?;
     if applied.changed {
-        host.lock().unwrap_or_else(|p| p.into_inner())
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
             .announce_model_edit(0, applied.sequence, &edit);
     }
     Ok(())
@@ -184,7 +195,9 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn pending_publication_test_hook() {
     let hook = BEFORE_PENDING_PUBLICATION.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook { hook(); }
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]

@@ -3212,7 +3212,8 @@ fn finish_pending_terminal(
     session: TerminalSession,
 ) {
     let terminal_id = session.id;
-    if let Err(error) = super::workspace::complete_terminal(shared, registry, reservation, session) {
+    if let Err(error) = super::workspace::complete_terminal(shared, registry, reservation, session)
+    {
         tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation");
     }
 }
@@ -3350,12 +3351,19 @@ fn start_terminal_view_owned(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
-    let pending_writer = pending_pane.map(|_| super::workspace::writer(shared)).transpose()?;
+    let pending_writer = pending_pane
+        .map(|_| super::workspace::writer(shared))
+        .transpose()?;
     let holder_recovery = {
-        let mut registry = pending_writer.as_ref()
+        let mut registry = pending_writer
+            .as_ref()
             .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
         let reservation = match (registry.as_ref(), pending_pane) {
-            (Some(registry), Some(pane)) => Some(super::workspace::pending_terminal(registry, pane, terminal_id)?),
+            (Some(registry), Some(pane)) => Some(super::workspace::pending_terminal(
+                registry,
+                pane,
+                terminal_id,
+            )?),
             _ => None,
         };
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -3365,7 +3373,10 @@ fn start_terminal_view_owned(
                 // worker's current Live/Detached publication. Compare those
                 // exact descriptors; never infer identity from its ID alone.
                 let published = state.descriptor_as(
-                    matches!(reservation.session.continuity, TerminalContinuity::Live { .. }),
+                    matches!(
+                        reservation.session.continuity,
+                        TerminalContinuity::Live { .. }
+                    ),
                     terminal_id,
                 )?;
                 if !super::workspace::matches_pending(&reservation.session, &current.session)
@@ -3373,13 +3384,21 @@ fn start_terminal_view_owned(
                 {
                     return Err(not_found(terminal_id));
                 }
-                let current_session = if super::workspace::matches_pending(&reservation.session, &current.session) {
-                    current.session.clone()
-                } else { published.session };
+                let current_session =
+                    if super::workspace::matches_pending(&reservation.session, &current.session) {
+                        current.session.clone()
+                    } else {
+                        published.session
+                    };
                 let handle = current.handle.clone();
                 let descriptor = state.attach(client_id, terminal_id)?;
                 drop(state);
-                finish_pending_terminal(shared, registry.as_mut().unwrap(), reservation, current_session);
+                finish_pending_terminal(
+                    shared,
+                    registry.as_mut().unwrap(),
+                    reservation,
+                    current_session,
+                );
                 return Ok((descriptor, handle));
             }
             if !reservation.pane.pending_terminal_start
@@ -3542,7 +3561,8 @@ fn start_terminal_view_owned(
     // worker publication and exact reservation completion. Concurrent layout
     // edits cannot install a newer source between these steps. SQLite reads
     // and commits stay outside HostState, so input delivery remains independent.
-    let mut pending_registry = pending_writer.as_ref()
+    let mut pending_registry = pending_writer
+        .as_ref()
         .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
     let reservation = match (pending_registry.as_ref(), pending_pane) {
         (Some(registry), Some(pane)) => {
@@ -3550,12 +3570,19 @@ fn start_terminal_view_owned(
                 .and_then(|reservation| {
                     if reservation.pane.pending_terminal_start
                         && super::workspace::matches_pending(&reservation.session, &session)
-                    { Ok(reservation) } else { Err(not_found(terminal_id)) }
+                    {
+                        Ok(reservation)
+                    } else {
+                        Err(not_found(terminal_id))
+                    }
                 });
             match accepted {
                 Ok(reservation) => Some(reservation),
                 Err(error) => {
-                    shared.lock().unwrap_or_else(|p| p.into_inner()).cancel_spawn(terminal_id);
+                    shared
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .cancel_spawn(terminal_id);
                     drop(pending_registry);
                     // No model/Host guard may outlive this unpublished cleanup.
                     let _ = handle.shutdown();
@@ -3566,7 +3593,9 @@ fn start_terminal_view_owned(
         _ => None,
     };
     #[cfg(test)]
-    if reservation.is_some() { super::workspace::pending_publication_test_hook(); }
+    if reservation.is_some() {
+        super::workspace::pending_publication_test_hook();
+    }
     let (descriptor, current_session) = {
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
@@ -3592,7 +3621,12 @@ fn start_terminal_view_owned(
         (descriptor, current_session)
     };
     if let (Some(reservation), Some(session)) = (reservation, current_session) {
-        finish_pending_terminal(shared, pending_registry.as_mut().unwrap(), reservation, session);
+        finish_pending_terminal(
+            shared,
+            pending_registry.as_mut().unwrap(),
+            reservation,
+            session,
+        );
     }
     drop(pending_registry);
     let descriptor = match descriptor {
