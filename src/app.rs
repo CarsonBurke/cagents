@@ -2613,6 +2613,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsSearchChanged(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::SettingsNumberDraftChanged { .. }
         | Message::ResetSettings
         | Message::ResetSettingsCategory(_)
         | Message::OpenSettingsFile { .. }
@@ -2680,6 +2681,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+        | Message::SettingsNumberDraftChanged { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -3328,6 +3330,8 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    /// Exact numeric text shown while editing, before unit conversion.
+    numeric_display: HashMap<SettingsField, String>,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
@@ -3380,6 +3384,7 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            numeric_display: HashMap::new(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -4783,6 +4788,10 @@ pub enum Message {
     },
     /// Retains the typed draft until its per-field debounce expires.
     SettingsDraftChanged {
+        field: SettingsField,
+        value: String,
+    },
+    SettingsNumberDraftChanged {
         field: SettingsField,
         value: String,
     },
@@ -12945,6 +12954,12 @@ impl Cagents {
         };
     }
 
+    fn queue_number_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        let stored = settings_ui::number_setting_value(field, &value);
+        self.settings_draft.numeric_display.insert(field, value);
+        self.queue_setting_input(field, stored)
+    }
+
     fn queue_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_draft.set(field, value.clone());
         self.settings_generation = self.settings_generation.wrapping_add(1);
@@ -16804,9 +16819,16 @@ impl Application for Cagents {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
-            Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
+            Message::SettingsChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
+                self.apply_setting_input(field, value)
+            }
             Message::SettingsDraftChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
                 self.queue_setting_input(field, value)
+            }
+            Message::SettingsNumberDraftChanged { field, value } => {
+                self.queue_number_setting_input(field, value)
             }
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
