@@ -12653,6 +12653,28 @@ mod tests {
             chat_runtime(&app, card).handle().unwrap(),
             &handle
         ));
+
+        for navigation in [
+            Message::RunCommand(workspace_widget::GlobalShortcut::NextAttention),
+            Message::FocusAttention(card),
+        ] {
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+            app.sidebar_state.observe_card_update(card);
+            app.settings_reset_confirm = true;
+            drop(app.update(navigation.clone()));
+            assert_eq!(chat_runtime(&app, card).selected_subagent.as_deref(), Some("child"));
+            assert!(app.sidebar_state.has_card_update(card));
+            app.settings_reset_confirm = false;
+            drop(app.update(navigation));
+            assert!(chat_runtime(&app, card).selected_subagent.is_none());
+            assert!(!app.sidebar_state.has_card_update(card));
+            assert_eq!(chat_runtime(&app, card).session.id, parent);
+            assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle));
+        }
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(chat_runtime(&app, card).selected_subagent.as_deref(), Some("child"),
+            "ordinary pane focus preserves the selected child transcript");
     }
 
     #[test]

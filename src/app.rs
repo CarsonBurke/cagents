@@ -7504,12 +7504,21 @@ impl Cagents {
             })
         };
         let focus = self.focus_workspace_card(id);
-        let read = if self.workspace.focused() == Some(id) {
-            self.mark_cards_read(vec![id])
+        // Attention belongs to the native parent. Reveal its transcript before
+        // acknowledging it, but only after navigation has actually succeeded.
+        let (transcript, read) = if self.workspace.focused() == Some(id) {
+            let parent = match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => None,
+            };
+            let transcript = parent.map_or_else(Task::none, |target| {
+                self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
+            });
+            (transcript, self.mark_cards_read(vec![id]))
         } else {
-            Task::none()
+            (Task::none(), Task::none())
         };
-        Task::batch([scope, focus, read])
+        Task::batch([scope, focus, transcript, read])
     }
 
     fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
