@@ -230,6 +230,10 @@ pub enum LspSeverity {
 /// One diagnostic, already converted to editor-native coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspDiagnostic {
+    /// Original server metadata for code-action round trips. Shared across
+    /// tabs; outgoing action requests replace its range with current mapped
+    /// coordinates while preserving numeric codes and opaque data.
+    pub protocol: Option<Arc<lsp_types::Diagnostic>>,
     pub range: LspRange,
     pub severity: LspSeverity,
     pub message: String,
@@ -2090,6 +2094,7 @@ fn convert_diagnostic(
     // One unconvertible range must not discard the whole batch.
     let range = snapshot.range_from_utf16(diagnostic.range).ok()?;
     Some(LspDiagnostic {
+        protocol:Some(Arc::new(diagnostic.clone())),
         range,
         severity: match diagnostic.severity {
             Some(lsp_types::DiagnosticSeverity::WARNING) => LspSeverity::Warning,
@@ -2165,6 +2170,7 @@ fn client_capabilities() -> lsp_types::ClientCapabilities {
             }),
             publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
                 related_information: Some(true),
+                data_support:Some(true),
                 version_support: Some(true),
                 code_description_support: Some(true),
                 ..Default::default()
@@ -8946,8 +8952,12 @@ mod tests {
                 let request=if selection{manager.request_range_formatting(doc,range,LspFormattingOptions::default(),Duration::from_millis(1000))}else{manager.request_formatting(doc,LspFormattingOptions::default(),Duration::from_millis(1000))};
                 next_matching(&events,|e|match e{LspEvent::WorkspaceEdit{request:r,..}if *r==request=>Some(()),_=>None}).await;
             }
-            let request=manager.request_code_actions(doc,range,&[]);
+            handle.notify("textDocument/publishDiagnostics",json!({"uri":uri,"version":1,"diagnostics":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"message":"missing import","code":2304,"data":{"opaque_fix":7}}]}));
+            let diagnostics=next_matching(&events,|e|match e{LspEvent::Diagnostics{items,..}=>Some(items.clone()),_=>None}).await;
+            let request=manager.request_code_actions(doc,range,&diagnostics);
             let item=next_matching(&events,|e|match e{LspEvent::CodeActions{request:r,items,..}if *r==request=>items.first().cloned(),_=>None}).await;assert!(item.needs_resolve);
+            let context=handle.wait_for("textDocument/codeAction").await.params;
+            assert_eq!(context["context"]["diagnostics"][0]["code"],json!(2304));assert_eq!(context["context"]["diagnostics"][0]["data"]["opaque_fix"],json!(7));
             let request=manager.request_resolve_code_action(doc,item);
             let item=next_matching(&events,|e|match e{LspEvent::CodeActionResolved{request:r,item,..}if *r==request=>Some(item.clone()),_=>None}).await;assert_eq!(item.edit.as_ref().unwrap().documents.len(),2);
             assert_eq!(handle.wait_for("codeAction/resolve").await.params["data"]["opaque"],json!(7));

@@ -2461,6 +2461,7 @@ mod tests {
             message: message.to_owned(),
             source: None,
             code: None,
+            protocol:None,
         }
     }
 
