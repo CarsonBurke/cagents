@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 mod owned_late_decision;
 
 use super::*;
@@ -2039,6 +2040,7 @@ fn a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run() {
     between_turn_interrupt_ack_fixture(false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run() {
     owned_late_decision::run(
