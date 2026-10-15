@@ -213,6 +213,24 @@ mod tests {
     }
 
     #[test]
+    fn history_search_without_head_does_not_start_an_unfinishable_page() {
+        let (mut app, key, _, _) = fixture();
+        let mut source = SourceControlModel::loading(key.clone());
+        source.unborn = true;
+        app.sidebar_model.source_control = Some(source);
+        let generation = app.history_ui.page_generation;
+        drop(app.update(Message::Sidebar(SidebarAction::SearchHistory {
+            key,
+            query: "Author".into(),
+        })));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(!source.history_loading);
+        assert!(!source.history_requested());
+        assert!(source.history_query.is_empty());
+        assert_eq!(app.history_ui.page_generation, generation);
+    }
+
+    #[test]
     fn switching_commits_cancels_the_old_read_and_rejects_its_completion() {
         let (mut app, key, first, second) = fixture();
         drop(app.open_history_commit(key.clone(), first.clone()));

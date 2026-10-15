@@ -14795,11 +14795,21 @@ impl Application for Cagents {
                     // dialog it was driving is gone with it.
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::SearchHistory { key, query } => {
-                        if !self.source_control_is_bound(&key) { return Task::none(); }
+                        if !self.source_control_is_bound(&key) || crate::device::is_remote() {
+                            return Task::none();
+                        }
                         let Some(source) = self.sidebar_model.source_control.as_mut() else { return Task::none(); };
+                        // The page task needs an immutable HEAD. An unborn or
+                        // still-loading worktree has no walk to start; leave
+                        // its history idle rather than setting a spinner for
+                        // a task that cannot produce a completion.
+                        let Some(head) = source.head_oid.as_deref()
+                            .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()) else {
+                            return Task::none();
+                        };
                         source.search_history(query.clone());
                         Self::source_control_history_task(self.history_ui.next_page_request(), key,
-                            source.head_oid.as_deref().and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), 0, query, self.history_ui.page_cancellation())
+                            Some(head), 0, query, self.history_ui.page_cancellation())
                     }
                     SidebarAction::HistoryCommand { key, oid, command, mainline, message } => {
                         if !self.source_control_is_bound(&key) { return Task::none(); }

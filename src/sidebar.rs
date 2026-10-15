@@ -9423,8 +9423,10 @@ fn history_section<'a>(
     let submit_key = key.clone();
     let mut search = crate::ui_controls::field::search("Message, author or SHA — Enter to search", &state.history_query);
     if !modal_open {
-        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query })
-            .on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+        search = search.on_input(move |query| SidebarAction::HistoryQueryChanged { key: search_key.clone(), query });
+        if source.head_oid.is_some() {
+            search = search.on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
+        }
     }
     column = column.push(search);
     column = column.push(design::caption("Paste a commit SHA from another branch to find it here."));
