@@ -24,6 +24,20 @@ def action(cfg, request):
     return run_owned_command(cfg, [sys.executable, str(cfg['_case'] / 'action-driver.py'), str(request)])
 
 
+def request_quit(cfg, request):
+    """The driver process status and its bounded worker response are separate."""
+    result = action(cfg, request)
+    response = request.with_suffix('.response')
+    if not response.is_file() or response.stat().st_size > 600000:
+        raise RuntimeError('owned native close action has no bounded response')
+    value = json.loads(response.read_text())
+    accepted = result == 0 and type(value.get('exit_status')) is int and value['exit_status'] == 0
+    atomic_json(cfg['_case'] / 'heap-profile/quit-response.json', {
+        'driver_exit_status': result, 'worker_response': value, 'accepted': accepted})
+    if not accepted:
+        raise RuntimeError('owned native window-close action failed')
+
+
 def finish(cfg, ui, request):
     case = cfg['_case']
     manifest = verify_manifest(cfg['_bundle'] / 'manifest.json')
@@ -33,8 +47,7 @@ def finish(cfg, ui, request):
     quit_request = case / 'geometry-requests' / ('quit-' + str(uuid.uuid4()) + '.json')
     atomic_json(quit_request, {'action': 'chord', 'arguments': ['Alt_L+F4']})
     try:
-        if action(cfg, quit_request):
-            raise RuntimeError('owned native window-close action failed')
+        request_quit(cfg, quit_request)
     finally:
         quit_request.unlink(missing_ok=True)
         quit_request.with_suffix('.response').unlink(missing_ok=True)

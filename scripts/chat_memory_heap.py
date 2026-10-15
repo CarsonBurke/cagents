@@ -148,6 +148,37 @@ def monitor(cfg, ui):
     return {'raw_bytes': raw.stat().st_size, 'at_monotonic_ns': time.monotonic_ns()}
 
 
+def all_thread_children(process, owner, native):
+    """Take two bounded all-task observations; reject changing parent/task sets."""
+    process = Path(process)
+    def scan():
+        tasks = sorted((process / 'task').iterdir(), key=lambda task: int(task.name))
+        if len(tasks) > 4096:
+            raise RuntimeError('profile task census exceeds its bounded scope')
+        names = [task.name for task in tasks]
+        children = set()
+        identities = {}
+        for task in tasks:
+            before = (task / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+            raw = (task / 'children').read_text()
+            if len(raw) > 131072:
+                raise RuntimeError('profile thread children census exceeds its bounded scope')
+            children.update(int(pid) for pid in raw.split())
+            after = (task / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+            identities[task.name] = before
+            if before != after:
+                raise RuntimeError('thread identity changed during profile census')
+        if sorted(task.name for task in (process / 'task').iterdir()) != sorted(names):
+            raise RuntimeError('thread set changed during profile census')
+        return children, identities
+    if not native.current(owner):
+        raise RuntimeError('owned parent ended before all-thread census')
+    first, second = scan(), scan()
+    if first != second or not native.current(owner):
+        raise RuntimeError('parent or child set changed during profile census')
+    return sorted(first[0])
+
+
 def owned_children(cfg, manifest, ui):
     """Discover only frozen private daemon roots and their data-fenced children."""
     native = common()
@@ -187,8 +218,8 @@ def owned_children(cfg, manifest, ui):
         if process.stat().st_uid != os.getuid() or environment.get(b'XDG_DATA_HOME') != data_home:
             raise RuntimeError('child escaped the private profile data root')
         result.append(owner)
-        children = process.joinpath('task', str(owner['pid']), 'children').read_text().split()
-        pending.extend(native.identity(int(pid)) for pid in children)
+        children = all_thread_children(process, owner, native)
+        pending.extend(native.identity(pid) for pid in children)
         if not native.current(owner):
             raise RuntimeError('owned process changed while reading descendants')
     if not native.current(ui):

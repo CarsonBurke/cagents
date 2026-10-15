@@ -4,6 +4,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import select
+import signal
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import types
@@ -81,6 +85,80 @@ class ProfileRoute(unittest.TestCase):
         self.native.current = lambda identity: False
         with self.assertRaisesRegex(RuntimeError, 'exact native owner'):
             MODULE.monitor(self.cfg, {'pid': 123, 'start': 'fake'})
+
+
+class ProfileOwnership(unittest.TestCase):
+    def test_worker_thread_spawn_is_included_in_child_census(self):
+        # A real disposable process demonstrates Linux's per-thread children
+        # semantics without launching an application, provider, or profiler.
+        code = """import json, subprocess, sys, threading
+stop = threading.Event()
+def worker():
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    print(json.dumps({'child': child.pid, 'thread': threading.get_native_id()}), flush=True)
+    try:
+        stop.wait(20)
+    finally:
+        child.terminate()
+        child.wait(timeout=3)
+t = threading.Thread(target=worker)
+t.start()
+sys.stdin.readline()
+stop.set()
+t.join()
+"""
+        parent = subprocess.Popen([sys.executable, '-u', '-c', code], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            ready, _, _ = select.select([parent.stdout], [], [], 5)
+            self.assertTrue(ready, 'worker child did not become ready')
+            spawned = json.loads(parent.stdout.readline())
+            process = Path('/proc') / str(parent.pid)
+            main_children = (process / 'task' / str(parent.pid) / 'children').read_text().split()
+            self.assertNotIn(str(spawned['child']), main_children)
+            owner = {'pid': parent.pid}
+            native = types.SimpleNamespace(current=lambda value: parent.poll() is None)
+            self.assertIn(spawned['child'], MODULE.all_thread_children(process, owner, native))
+            parent.stdin.write('stop\n')
+            parent.stdin.flush()
+            self.assertEqual(parent.wait(timeout=5), 0)
+            self.assertFalse(Path('/proc', str(spawned['child'])).exists())
+        finally:
+            if parent.poll() is None:
+                os.killpg(parent.pid, signal.SIGKILL)
+                parent.wait(timeout=5)
+            parent.stdin.close()
+            parent.stdout.close()
+
+    def test_native_close_requires_worker_success_independent_of_driver(self):
+        fake_common = types.ModuleType('common')
+        for name in ('atomic_json', 'current', 'identity', 'load_config', 'monotonic_stamp',
+                     'private_environment', 'require_build_admission', 'run_owned_command',
+                     'verify_manifest', 'verify_source'):
+            setattr(fake_common, name, lambda *args: None)
+        holder_spec = importlib.util.spec_from_file_location('heap_holder',
+            Path(__file__).resolve().parents[1] / 'scripts/hold_chat_memory_profile.py')
+        holder = importlib.util.module_from_spec(holder_spec)
+        with patch.dict(sys.modules, {'common': fake_common, 'chat_memory_heap': MODULE}):
+            holder_spec.loader.exec_module(holder)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = root / 'quit.json'
+            response = request.with_suffix('.response')
+            cfg = {'_case': root}
+            with patch.object(holder, 'action', return_value=0), patch.object(holder, 'atomic_json') as record:
+                with self.assertRaisesRegex(RuntimeError, 'no bounded response'):
+                    holder.request_quit(cfg, request)
+                response.write_text(json.dumps({'exit_status': 1, 'stderr': 'native action failed'}))
+                with self.assertRaisesRegex(RuntimeError, 'window-close action failed'):
+                    holder.request_quit(cfg, request)
+                self.assertFalse(record.call_args.args[1]['accepted'])
+                response.write_text(json.dumps({'exit_status': 0}))
+                holder.request_quit(cfg, request)
+                self.assertTrue(record.call_args.args[1]['accepted'])
+            with patch.object(holder, 'action', return_value=1), patch.object(holder, 'atomic_json'):
+                with self.assertRaisesRegex(RuntimeError, 'window-close action failed'):
+                    holder.request_quit(cfg, request)
 
 
 if __name__ == '__main__':
