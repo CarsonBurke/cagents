@@ -56,9 +56,21 @@ fn selected_worktree(repository: &Path, path: &Path) -> Result<PathBuf, String> 
     Ok(path)
 }
 fn inside(directory: &Path, path: &Path) -> bool {
-    // Missing former launch directories still protect the actor's lexical
-    // scope. Canonicalization, when possible, also catches symlink aliases.
-    directory.starts_with(path) || directory.canonicalize().is_ok_and(|directory| directory.starts_with(path))
+    // Prefer the resolved directory: a path beneath the checkout can itself
+    // be a symlink leading outside it. A missing former launch directory is
+    // still attributable, but lexical `..` must not widen that attribution.
+    let directory = directory.canonicalize().unwrap_or_else(|_| {
+        let mut normalized = PathBuf::new();
+        for component in directory.components() {
+            match component {
+                std::path::Component::CurDir => {},
+                std::path::Component::ParentDir => { normalized.pop(); },
+                component => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    });
+    directory.starts_with(path)
 }
 fn candidates(host: &SharedHost) -> Result<Candidates, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -282,5 +294,11 @@ mod tests {
         assert!(inside(&root.path().join("alias/nested"), &selected));
         assert!(!inside(&root.path().join("other"), &selected));
         assert!(!inside(&root.path().join("worktree-sibling"), &selected));
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, selected.join("escape")).unwrap();
+        assert!(!inside(&selected.join("escape"), &selected));
+        assert!(!inside(&selected.join("../outside"), &selected));
+        assert!(!inside(&selected.join("missing/../../outside"), &selected));
     }
 }
