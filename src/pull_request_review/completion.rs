@@ -188,20 +188,25 @@ impl State {
         let Some(target)=&self.target else{return ActionTask::none();};
         let key=PullRequestKey::new(target.repository.clone(),target.pull_request.number).expect("verified PR key");
         self.completion.load_id=self.completion.load_id.wrapping_add(1);self.completion.loading=false;
-        let generation=self.generation;let api=Arc::clone(&self.api);let expected_head=self.context.as_ref().map(|context|context.head_oid.clone());let original=self.completion.published.as_ref().map(|edit|edit.original.clone());let expected_reviewers=self.completion.data.as_ref().map(|data|data.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>());self.completion.busy=true;self.completion.error=None;
+        let generation=self.generation;let api=Arc::clone(&self.api);let expected_context=self.context.clone();let expected_head=self.context.as_ref().map(|context|context.head_oid.clone());let original=self.completion.published.as_ref().map(|edit|edit.original.clone());let expected_reviewers=self.completion.data.as_ref().map(|data|data.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>());self.completion.busy=true;self.completion.error=None;
         iced::Task::perform(async move{
             let result=tokio::task::spawn_blocking(move||{
-                let cancellation=CancellationToken::new();let fresh=api.review_controls(&key,&cancellation).map_err(|error|error.to_string())?;
+                let cancellation=CancellationToken::new();
+                let expected_context=expected_context.ok_or_else(||"Refresh this review before changing the pull request.".to_owned())?;
+                let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;
+                discussion::same_identity(&expected_context,&context).map_err(|outcome| match outcome { discussion::Outcome::Refused(message)=>message, _=>"The pull request or signed-in account changed. Refresh before reviewing.".into() })?;
+                let fresh=api.review_controls(&key,&cancellation).map_err(|error|error.to_string())?;
+                if fresh.pull_request_id!=expected_context.pull_request_id{return Err("The pull request identity changed. Refresh before changing it.".into());}
                 match &mutation {
                     ReviewControlMutation::EditReviewBody{review,..}|ReviewControlMutation::EditIssueComment{comment:review,..}=>{
                         let conversation=api.conversation(&key,&cancellation).map_err(|error|error.to_string())?;
                         let comment=if matches!(mutation,ReviewControlMutation::EditReviewBody{..}){conversation.reviews.iter().filter(|review|review.state.0!="PENDING").map(|review|&review.comment).find(|comment|comment.id.as_ref()==Some(review))}else{conversation.comments.iter().find(|comment|comment.id.as_ref()==Some(review))};
                         if comment.is_none_or(|comment|!comment.viewer_did_author||!comment.viewer_can_update||comment.is_pending()||Some(&comment.body)!=original.as_ref()){return Err("The comment changed or can no longer be edited. Refresh before trying again.".into());}
                     }
-                    ReviewControlMutation::Merge{method,expected_head,..}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before merging.".into());}if fresh.head_oid!=*expected_head{return Err("The PR head changed; refresh and review it before merging.".into());}if let Some(reason)=fresh.merge_blocked{return Err(reason);}if !fresh.allowed_methods.contains(method){return Err("This merge method is no longer allowed by the repository.".into());}}
+                    ReviewControlMutation::Merge{method,expected_head,..}=>{if context.pending.is_some(){return Err("Submit or discard your pending review before merging.".into());}if fresh.head_oid!=*expected_head{return Err("The PR head changed; refresh and review it before merging.".into());}if let Some(reason)=fresh.merge_blocked{return Err(reason);}if !fresh.allowed_methods.contains(method){return Err("This merge method is no longer allowed by the repository.".into());}}
                     ReviewControlMutation::Reviewers(_)=>{if !fresh.is_open||!fresh.can_update||!fresh.reviewers_complete{return Err("GitHub does not permit changing this complete requested reviewer set.".into());}if Some(fresh.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>())!=expected_reviewers{return Err("Reviewer requests changed. Refresh before editing the requested set.".into());}}
                     ReviewControlMutation::Draft(_)=>{if !fresh.is_open||!fresh.can_update{return Err("GitHub does not permit changing this pull request.".into());}}
-                    ReviewControlMutation::AutoMerge{enabled:true,method}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if expected_head.as_deref()!=Some(fresh.head_oid.as_str())||context.head_oid!=fresh.head_oid{return Err("The PR head changed; refresh and review it before enabling auto-merge.".into());}if context.pending.is_some(){return Err("Submit or discard your pending review before enabling auto-merge.".into());}if !fresh.is_open||!fresh.allowed_methods.contains(method)||!fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
+                    ReviewControlMutation::AutoMerge{enabled:true,method}=>{if expected_head.as_deref()!=Some(fresh.head_oid.as_str())||context.head_oid!=fresh.head_oid{return Err("The PR head changed; refresh and review it before enabling auto-merge.".into());}if context.pending.is_some(){return Err("Submit or discard your pending review before enabling auto-merge.".into());}if !fresh.is_open||!fresh.allowed_methods.contains(method)||!fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
                     ReviewControlMutation::AutoMerge{enabled:false,..}=>{if !fresh.can_disable_auto_merge{return Err("Auto-merge cannot be disabled for this pull request.".into());}}
                     _=>{}
                 }
@@ -337,6 +342,32 @@ mod tests {
             *api.control_outcome.lock().unwrap()=ReviewMutationOutcome::NotApplied{failure:crate::process::ProcessFailure{kind:crate::process::ProcessFailureKind::Exit,program:"gh".into(),exit_code:Some(1),signal:None,stdout:Vec::new(),stderr:b"permission denied".to_vec(),message:"permission denied".into(),started:true}};
             let task=state.mutate_completion(mutation.clone());assert!(state.completion.busy);let outcome=receipt(task);drop(state.update_completion(outcome));
             assert_eq!(*api.controls_written.lock().unwrap(),vec![mutation]);assert!(!state.completion.busy);assert!(state.completion.error.as_ref().unwrap().contains("permission denied"));
+        }
+    }
+
+    #[test]
+    fn control_writes_refuse_a_changed_account_or_pull_request_identity() {
+        for changed_pr in [false, true] {
+            for mutation in [
+                ReviewControlMutation::Draft(false), ReviewControlMutation::Draft(true),
+                ReviewControlMutation::Reviewers(Vec::new()),
+                ReviewControlMutation::AutoMerge { enabled: true, method: MergeMethod::Squash },
+                ReviewControlMutation::AutoMerge { enabled: false, method: MergeMethod::Squash },
+                ReviewControlMutation::Merge { method: MergeMethod::Squash, title: "Merge".into(), body: String::new(), expected_head: "a".repeat(40) },
+            ] {
+                let (mut state, api) = state(); state.target = Some(target(1));
+                state.context = Some(loaded(Vec::new(), Vec::new()).context);
+                state.completion.data = Some(controls_fixture());
+                *api.controls.lock().unwrap() = Some(controls_fixture());
+                let mut current = state.context.clone().unwrap();
+                if changed_pr { current.pull_request_id = "PR_replaced".into(); }
+                else { current.viewer = "another-account".into(); }
+                *api.control_context.lock().unwrap() = Some(current);
+                let task = state.mutate_completion(mutation); let result = receipt(task);
+                drop(state.update_completion(result));
+                assert!(api.controls_written.lock().unwrap().is_empty());
+                assert!(state.completion.error.as_ref().unwrap().contains("signed-in account changed"));
+            }
         }
     }
 
