@@ -1886,6 +1886,8 @@ pub struct RepositoryRuntime {
     disk_poll: Option<(u64, Instant)>,
     next_disk_poll: u64,
     next_branch_refresh: u64,
+    branch_refresh: Option<u64>,
+    comparison_refresh_queued: bool,
     disk_comparison: Option<DiffState>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
@@ -2113,6 +2115,8 @@ impl RepositoryRuntime {
             disk_poll: None,
             next_disk_poll: 0,
             next_branch_refresh: 0,
+            branch_refresh: None,
+            comparison_refresh_queued: false,
             disk_comparison: None,
             generation: 0,
             file_list_generation: 0,
@@ -2902,23 +2906,32 @@ impl RepositoryRuntime {
 
     /// Whether a comparison reader already owns the single refresh slot.
     pub fn comparison_refresh_pending(&self) -> bool {
-        matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
+        self.branch_refresh.is_some()
+            || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
             || self.diffs.iter().any(|(_, state)| matches!(state, DiffState::Loading { .. }))
             || self.working_diff.active.is_some()
             || self.working_diff.timer.is_some()
     }
 
+    pub fn comparison_refresh_failed(&self) -> bool {
+        matches!(self.basis_resolution, Some(BasisResolution::Unavailable(_)))
+            || matches!(self.diff_state(&self.diff_basis), Some(DiffState::Ready(RenderedDiff::Error(_), _)))
+            || (self.editable_working_diff() && self.working_diff.error.is_some())
+    }
+
     /// Called by the shared Git watcher after index/ref changes. Immutable
     /// history comparisons retain their object identities and mounted model.
     pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.comparison_refresh_pending() { self.comparison_refresh_queued = true; return Task::none(); }
+        self.comparison_refresh_queued = false;
         if let DiffBasis::MergeBaseToHead { base_ref, .. } = &self.diff_basis {
-            if matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) { return Task::none(); }
             let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
             let identity = self.current_identity(card, path);
             let base_ref = base_ref.clone();
             let previous = self.diff_basis.clone();
             self.next_branch_refresh = self.next_branch_refresh.wrapping_add(1);
             let request = self.next_branch_refresh;
+            self.branch_refresh = Some(request);
             return cosmic::task::future(async move {
                 let worktree = identity.worktree.clone();
                 let result = tokio::task::spawn_blocking(move || resolved_branch_basis(&worktree, base_ref)).await.map_err(|error| error.to_string()).and_then(|result| result);
@@ -2929,6 +2942,29 @@ impl RepositoryRuntime {
         self.diffs.retain(|(basis, _)| basis.is_immutable());
         self.working_diff.applied = None;
         self.ensure_current_diff(card)
+    }
+
+    fn branch_basis_refreshed(&mut self, identity: AsyncIdentity, request: u64, previous: DiffBasis, result: Result<ResolvedBasis, String>) -> Task<RepositoryAction> {
+        if self.branch_refresh != Some(request) { return Task::none(); }
+        self.branch_refresh = None;
+        if !self.accepts_selected(&identity) || self.diff_basis != previous || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) {
+            Task::none()
+        } else {
+            match result {
+                Ok(ResolvedBasis::Ready(basis)) => {
+                    self.basis_resolution = None;
+                    if basis == previous && !self.comparison_refresh_failed() { Task::none() } else {
+                        self.capture_diff_viewport();
+                        self.diffs.retain(|(cached, _)| *cached != previous);
+                        if let Some((selected, _)) = &mut self.committed_selection && *selected == previous { *selected = basis.clone(); }
+                        self.diff_basis = basis;
+                        self.ensure_current_diff(identity.card)
+                    }
+                }
+                Err(error) => { self.basis_resolution = Some(BasisResolution::Unavailable(error)); Task::none() }
+                _ => Task::none(),
+            }
+        }
     }
 
     fn reload_disk_version(&mut self, card: CardId, version: crate::editor_reload::Version) -> Task<RepositoryAction> {
@@ -4827,7 +4863,9 @@ impl RepositoryRuntime {
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         let card = action.card();
         let task = self.update_inner(action);
-        Task::batch([task, self.find_task(card)])
+        let find = self.find_task(card);
+        let refresh = if self.comparison_refresh_queued && !self.comparison_refresh_pending() { self.refresh_open_comparison(card) } else { Task::none() };
+        Task::batch([task, find, refresh])
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
@@ -4846,20 +4884,7 @@ impl RepositoryRuntime {
         }
         match action {
             RepositoryAction::BranchBasisRefreshed { identity, request, previous, result } => {
-                if !self.accepts_selected(&identity) || request != self.next_branch_refresh || self.diff_basis != previous || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) { return Task::none(); }
-                match result {
-                    Ok(ResolvedBasis::Ready(basis)) => {
-                        self.basis_resolution = None;
-                        if basis == previous { return Task::none(); }
-                        self.capture_diff_viewport();
-                        self.diffs.retain(|(cached, _)| *cached != previous);
-                        if let Some((selected, _)) = &mut self.committed_selection && *selected == previous { *selected = basis.clone(); }
-                        self.diff_basis = basis;
-                        self.ensure_current_diff(identity.card)
-                    },
-                    Err(error) => { self.basis_resolution = Some(BasisResolution::Unavailable(error)); Task::none() },
-                    _ => Task::none(),
-                }
+                self.branch_basis_refreshed(identity, request, previous, result)
             }
             RepositoryAction::DiskMetadata { identity, ticket, result } => {
                 if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
@@ -12328,12 +12353,32 @@ mod tests {
     }
 
     #[test]
+    fn branch_refresh_is_single_flight_and_coalesces_a_followup_after_completion() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
+        let basis = DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(2), merge_base: fixture_oid(1) };
+        runtime.diff_basis = basis.clone();
+        let first = runtime.refresh_open_comparison(card);
+        assert_eq!(runtime.branch_refresh, Some(1));
+        assert!(runtime.comparison_refresh_pending());
+        drop(runtime.refresh_open_comparison(card));
+        assert_eq!(runtime.next_branch_refresh, 1);
+        assert!(runtime.comparison_refresh_queued);
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity, request: 1, previous: basis, result: Err("temporary resolver failure".into()) }));
+        assert_eq!(runtime.branch_refresh, Some(2));
+        assert_eq!(runtime.next_branch_refresh, 2);
+        assert!(!runtime.comparison_refresh_queued);
+        drop(first);
+    }
+
+    #[test]
     fn branch_ref_refresh_keeps_the_newest_result_and_commit_history_stays_fixed() {
         let card = CardId::new();
         let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
         let basis = |seed| DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(seed), merge_base: fixture_oid(1) };
         runtime.diff_basis = basis(2);
         runtime.next_branch_refresh = 2;
+        runtime.branch_refresh = Some(2);
         drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity: identity.clone(), request: 1, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(3))) }));
         assert_eq!(runtime.diff_basis, basis(2));
         drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity, request: 2, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(4))) }));
