@@ -7859,7 +7859,9 @@ impl Cagents {
         activity: Option<crate::agent::Activity>,
     ) {
         let parked = self.parked_chat_runtime(card);
-        let activity = parked.and_then(|runtime| runtime.native_activity()).or(activity);
+        let activity = parked
+            .and_then(|runtime| runtime.native_activity())
+            .or(activity);
         let outcome = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
             _ if parked.is_some() => parked.and_then(|runtime| runtime.activity_outcome()),
