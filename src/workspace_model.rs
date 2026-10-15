@@ -209,48 +209,7 @@ impl WorkspaceModel {
         &'a self,
         agent: &'a crate::agent_execution::Agent,
     ) -> Option<&'a views::Scope> {
-        use crate::agent_execution::{HostedSession, Surface};
-        use crate::model::{CardId, CardKind};
-        let id = CardId::from_uuid(agent.id.as_uuid());
-        let (chat, terminal) = if agent.spec.surface == Surface::Terminal {
-            (None, Some(agent.console.as_ref()?))
-        } else {
-            match agent.session.as_ref()? {
-                HostedSession::Chat(session) => (Some(session), None),
-                HostedSession::Terminal(session) => (None, Some(session)),
-            }
-        };
-        let mut found = None;
-        let mut removed = false;
-        for view in &self.views {
-            removed |= view.retired.contains(&id);
-            for pane in &view.panes {
-                let (resource, exact) = match (&pane.kind, chat, terminal) {
-                    (CardKind::Chat(current), Some(expected), _) => (
-                        current.id == expected.id,
-                        crate::agent_execution::same_chat_process(current, expected),
-                    ),
-                    (CardKind::Terminal(current), _, Some(expected)) => (
-                        current.id == expected.id,
-                        crate::agent_execution::same_terminal_process(current, expected),
-                    ),
-                    _ => (false, false),
-                };
-                if pane.id != id && !resource {
-                    continue;
-                }
-                // Aliases belong to shared-view reconciliation. Managed adoption
-                // cannot manufacture a second canonical card for their actor.
-                if pane.id != id || !exact {
-                    return None;
-                }
-                if found.is_some_and(|scope| scope != &view.scope) {
-                    return None;
-                }
-                found = Some(&view.scope);
-            }
-        }
-        found.or_else(|| (!removed).then_some(&agent.placement))
+        views::ManagedDisplayIndex::new(self).scope(agent)
     }
 
     /// Folds an observed edge into this cached copy.

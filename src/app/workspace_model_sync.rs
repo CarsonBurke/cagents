@@ -696,6 +696,7 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id);
         }
+        let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         for agent in &model.agents {
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
@@ -705,32 +706,23 @@ impl Cagents {
             ) {
                 continue;
             }
-            // Existing local panes (including tombstones) are reconciled by
-            // shared views. Resolve managed placement only for new adoptions.
-            if self
-                .durable
-                .cards
-                .iter()
-                .any(|card| card.id == CardId::from_uuid(agent.id.as_uuid()))
-            {
-                continue;
-            }
-            if let Some(task) = model
-                .agent_view_scope(agent)
-                .and_then(|placement| self.adopt_execution_agent_in_view(agent, placement))
+            if let Some(display) = display_index.resolve(agent)
+                && let Some(task) = self.adopt_execution_agent_display(agent, display)
             {
                 changed = true;
                 tasks.push(task);
             }
         }
         self.workspace_model = model;
+        // Fence inconsistent canonical evidence before persisting can publish
+        // any restored local projection into the incoming authoritative model.
+        tasks.push(self.reconcile_shared_views());
         if changed {
             self.sort_durable_channels();
             self.refresh_sidebar_channels();
             self.persist();
             tasks.push(self.sync_chrome());
         }
-        tasks.push(self.reconcile_shared_views());
         Task::batch(tasks)
     }
 
@@ -740,27 +732,27 @@ impl Cagents {
         &mut self,
         agent: &crate::agent_execution::Agent,
     ) -> Option<Task<Message>> {
-        let placement = self.workspace_model.agent_view_scope(agent)?.clone();
-        self.adopt_execution_agent_in_view(agent, &placement)
+        let display = crate::workspace_model::views::managed_display(&self.workspace_model, agent)?;
+        self.adopt_execution_agent_display(agent, display)
     }
 
-    fn adopt_execution_agent_in_view(
+    pub(super) fn adopt_execution_agent_display(
         &mut self,
         agent: &crate::agent_execution::Agent,
-        placement: &crate::workspace_model::views::Scope,
+        display: crate::workspace_model::views::ManagedDisplay,
     ) -> Option<Task<Message>> {
+        let placement = &display.scope;
         if agent.closed
-            || matches!(placement, crate::workspace_model::views::Scope::Channel(channel)
-                if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
+            || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
         {
             return None;
         }
-        let selected;
-        let session = if agent.spec.surface == crate::agent_execution::Surface::Terminal {
-            selected = crate::agent_execution::HostedSession::Terminal(agent.console.clone()?);
-            &selected
-        } else {
-            agent.session.as_ref()?
+        let session = match display.pane.as_ref().map(|pane| &pane.kind) {
+            Some(CardKind::Chat(session)) => crate::agent_execution::HostedSession::Chat(session.clone()),
+            Some(CardKind::Terminal(session)) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+            Some(_) => return None,
+            None if agent.spec.surface == crate::agent_execution::Surface::Terminal => crate::agent_execution::HostedSession::Terminal(agent.console.clone()?),
+            None => agent.session.clone()?,
         };
         let channel_index = match placement {
             crate::agent_execution::Placement::Channel(id) => Some(
@@ -790,10 +782,39 @@ impl Cagents {
         let card_id = CardId::from_uuid(agent.id.as_uuid());
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
-        if self.durable.cards.iter().any(|card| card.id == card_id) {
-            return None;
+        if let Some(existing) = self.durable.cards.iter().find(|card| card.id == card_id) {
+            if !existing.existence.is_open() { return None; }
+            let current = match &existing.kind {
+                CardKind::Chat(session) => crate::agent_execution::HostedSession::Chat(session.clone()),
+                CardKind::Terminal(session) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+                _ => return None,
+            };
+            if !session.same_process(&current) { return None; }
+            let saved = display.pane.as_ref()?;
+            let in_place = match placement {
+                crate::agent_execution::Placement::Channel(channel) => self.durable.channels.iter().any(|owner| owner.id == *channel && owner.cards.contains(&card_id)),
+                crate::agent_execution::Placement::Worktree { path, .. } => !self.durable.channels.iter().any(|owner| owner.cards.contains(&card_id)) && self.durable.card_scopes.get(&card_id) == Some(path),
+            };
+            if in_place { return None; }
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.worktree_focus.retain(|_, focused| *focused != card_id);
+            for channel in &mut durable.channels {
+                channel.cards.retain(|id| *id != card_id);
+                if channel.focused == Some(card_id) { channel.focused = channel.cards.first().copied(); }
+            }
+            if let Some(index) = channel_index {
+                durable.channels[index].cards.push(card_id);
+                durable.channels[index].focused.get_or_insert(card_id);
+                self.worktree_owners.remove(&card_id);
+                match &saved.scope { Some(scope) => { durable.card_scopes.insert(card_id, scope.clone()); }, None => { durable.card_scopes.remove(&card_id); } }
+            } else if let crate::agent_execution::Placement::Worktree { path, .. } = placement {
+                durable.card_scopes.insert(card_id, path.clone());
+                durable.worktree_focus.entry(path.clone()).or_insert(card_id);
+                self.worktree_owners.insert(card_id, path.clone());
+            }
+            return Some(self.refresh_managed_display_strip());
         }
-        let kind = match session {
+        let kind = match &session {
             crate::agent_execution::HostedSession::Chat(session) => CardKind::Chat(session.clone()),
             crate::agent_execution::HostedSession::Terminal(session) => {
                 CardKind::Terminal(session.clone())
@@ -802,8 +823,8 @@ impl Cagents {
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: format!("{} agent", agent.spec.provider.label()),
-            width_fraction: if matches!(kind, CardKind::Chat(_)) {
+            title: display.pane.as_ref().map(|pane| pane.title.clone()).unwrap_or_else(|| format!("{} agent", agent.spec.provider.label())),
+            width_fraction: if let Some(pane) = &display.pane { pane.width_fraction } else if matches!(kind, CardKind::Chat(_)) {
                 self.settings.default_native_pane_fraction
             } else {
                 self.settings.default_column_fraction
@@ -817,7 +838,7 @@ impl Cagents {
         durable.cards.push(card.clone());
         let scope_path = match placement {
             crate::agent_execution::Placement::Worktree { path, .. } => path.clone(),
-            crate::agent_execution::Placement::Channel(_) => agent.spec.target.directory.clone(),
+            crate::agent_execution::Placement::Channel(_) => display.pane.as_ref().and_then(|pane| pane.scope.clone()).unwrap_or_else(|| agent.spec.target.directory.clone()),
         };
         durable.card_scopes.insert(card_id, scope_path.clone());
         if let Some(index) = channel_index {
@@ -831,6 +852,9 @@ impl Cagents {
                 .or_insert(card_id);
             self.worktree_owners.insert(card_id, scope_path);
         }
+        if let Some(pane) = &display.pane {
+            match &pane.user_title { Some(title) => { self.chrome_ui.user_titles.insert(card_id, title.clone()); }, None => { self.chrome_ui.user_titles.remove(&card_id); } }
+        }
         self.cards.insert(card_id, CardRuntime::Loading);
         self.lifecycle.register(
             card_id,
@@ -842,7 +866,7 @@ impl Cagents {
         // initialize_runtimes does after a window restart. The deferred
         // lifecycle hydrator only starts terminal/browser surfaces; leaving a
         // newly adopted chat Loading there would never subscribe to its actor.
-        let attach = match session {
+        let attach = match &session {
             crate::agent_execution::HostedSession::Chat(session) => {
                 self.open_chat(card_id, session.clone(), crate::chat::Intent::Restore)
             }
@@ -1718,6 +1742,84 @@ mod tests {
             app.adopt_execution_agent(&agent).is_none(),
             "wait for the exact paired console descriptor"
         );
+    }
+
+    fn managed_display_fixture() -> (Cagents, crate::agent_execution::Agent, crate::workspace_model::views::Pane, ChannelId) {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target};
+        let (mut app, project, repository) = app_with_project();
+        let original = ChannelId::new();
+        let destination = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(local(original, project, "Original", 0));
+        durable.channels.push(local(destination, project, "Current", 1));
+        let CardKind::Terminal(mut console) = super::super::tests::terminal_card_state().kind else { unreachable!() };
+        console.launch.working_directory = "/repo".into();
+        console.continuity = TerminalContinuity::Live { host_session_id: crate::model::HostSessionId::new("managed-display"), boot_id: crate::model::BootId::new("managed-display"), host_incarnation: crate::model::HostIncarnation::new("managed-display") };
+        let placement = Placement::Channel(original);
+        let agent = Agent { id: crate::model::AgentId::new(), name: None, origin: Origin::User,
+            spec: Spec { provider: crate::agent::Provider::Claude, account: None, target: Target { repository: repository.clone(), directory: "/repo".into(), placement: Some(placement.clone()) }, surface: Surface::Terminal, model: None, permission_mode: None, reasoning_effort: None },
+            placement, session: Some(HostedSession::Terminal(console.clone())), console: Some(console.clone()), created_ms: 0, closed: false,
+        };
+        let pane = crate::workspace_model::views::Pane { id: CardId::from_uuid(agent.id.as_uuid()), title: "Current managed title".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.6, kind: CardKind::Terminal(console), scope: Some("/repo".into()) };
+        app.workspace_model = registry(vec![shared(original, &repository, "Original", 0), shared(destination, &repository, "Current", 1)]);
+        let mut source = crate::workspace_model::views::View::empty(original);
+        source.retired.push(pane.id);
+        app.workspace_model.views = vec![source, crate::workspace_model::views::View { scope: Placement::Channel(destination), revision: 9, panes: vec![pane.clone()], retired: vec![] }];
+        app.workspace_model.agents.push(agent.clone());
+        (app, agent, pane, destination)
+    }
+
+    #[test]
+    fn attention_first_model_sync_adopts_current_managed_membership_before_stale_placement() {
+        for worktree in [false, true] {
+            let (mut app, agent, pane, destination) = managed_display_fixture();
+            let original = agent.channel().unwrap();
+            if worktree { app.workspace_model.views[1].scope = crate::agent_execution::Placement::Worktree { repository: agent.spec.target.repository.clone(), path: "/repo".into() }; }
+            let incoming = std::mem::take(&mut app.workspace_model);
+            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            let target = app.card_state(pane.id).expect("first incoming snapshot adopted its exact managed pane");
+            assert_eq!(target.kind, pane.kind);
+            assert_eq!(target.title, pane.title);
+            assert!(app.durable.channels.iter().find(|channel| channel.id == original).unwrap().cards.is_empty());
+            if worktree {
+                assert!(!app.durable.channels.iter().any(|channel| channel.cards.contains(&pane.id)));
+                assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&PathBuf::from("/repo")));
+            } else { assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id)); }
+            assert_eq!(app.workspace_model.agents[0], agent, "display adoption preserves immutable launch and execution ownership");
+        }
+    }
+
+    #[test]
+    fn attention_first_model_sync_relocates_existing_exact_managed_runtime_without_rehosting() {
+        let (mut app, agent, pane, destination) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display = crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        let runtime = app.cards.remove(&pane.id).unwrap();
+        app.cards.insert(pane.id, runtime);
+        let actor = app.card_state(pane.id).unwrap().kind.clone();
+        drop(app.reconcile_workspace_model());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, actor);
+        assert!(matches!(app.cards.get(&pane.id), Some(CardRuntime::Loading)));
+        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id));
+        assert!(!app.durable.channels.iter().find(|channel| channel.id == agent.channel().unwrap()).unwrap().cards.contains(&pane.id));
+    }
+
+    #[test]
+    fn attention_model_sync_never_recreates_removed_replaced_or_ambiguous_managed_panes_at_old_target() {
+        for state in ["removed", "replaced", "ambiguous"] {
+            let (mut app, _, pane, _) = managed_display_fixture();
+            match state {
+                "removed" => app.workspace_model.views[1].panes.clear(),
+                "replaced" => { let CardKind::Terminal(session) = &mut app.workspace_model.views[1].panes[0].kind else { unreachable!() }; session.id = TerminalId::new(); },
+                _ => { let mut duplicate = app.workspace_model.views[1].clone(); duplicate.scope = crate::agent_execution::Placement::Channel(ChannelId::new()); app.workspace_model.views.push(duplicate); },
+            }
+            let incoming = std::mem::take(&mut app.workspace_model);
+            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            assert!(app.card_state(pane.id).is_none(), "{state} canonical evidence cannot fall back to the original placement");
+            assert!(!app.durable.channels.iter().any(|channel| channel.cards.contains(&pane.id)));
+        }
     }
 
     /// A window whose project is keyed the way a real one is: by the common Git

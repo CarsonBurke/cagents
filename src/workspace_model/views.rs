@@ -80,6 +80,123 @@ pub struct View {
     pub retired: Vec<CardId>,
 }
 
+/// Current display ownership of one canonical managed pane. This never changes
+/// its accepted execution placement, launch directory, or runtime descriptor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManagedDisplay {
+    pub scope: Scope,
+    /// The saved descriptor is authoritative when present. An unpublished actor
+    /// has no pane yet and may use its accepted placement for first adoption.
+    pub pane: Option<Pane>,
+}
+
+/// Resolve against the incoming authoritative snapshot, before local adoption.
+/// Canonical identity bounds the lookup; legacy inventory aliases are reconciled
+/// separately. A removed, replaced or ambiguous pane grants no fallback authority.
+/// A transfer's retired source does not override its one exact current owner.
+pub fn managed_display(model: &super::WorkspaceModel, agent: &crate::agent_execution::Agent) -> Option<ManagedDisplay> {
+    ManagedDisplayIndex::new(model).resolve(agent)
+}
+
+/// Build once per incoming model, then resolve each managed actor in constant
+/// time. Repeated agent adoption never rescans every saved pane per actor.
+pub struct ManagedDisplayIndex<'a> {
+    owners: std::collections::HashMap<CardId, Option<(&'a Scope, &'a Pane)>>,
+    retired: std::collections::HashSet<CardId>,
+    resources: std::collections::HashMap<(u8, crate::model::TerminalId), std::collections::HashSet<CardId>>,
+}
+
+impl<'a> ManagedDisplayIndex<'a> {
+    pub fn new(model: &'a super::WorkspaceModel) -> Self {
+        let mut owners = std::collections::HashMap::new();
+        let mut retired = std::collections::HashSet::new();
+        let mut resources: std::collections::HashMap<_, std::collections::HashSet<CardId>> = std::collections::HashMap::new();
+        for view in &model.views {
+            retired.extend(view.retired.iter().copied());
+            for pane in &view.panes {
+                if let Some(resource) = pane_resource(&pane.kind) { resources.entry(resource).or_default().insert(pane.id); }
+                owners.entry(pane.id).and_modify(|entry| *entry = None).or_insert(Some((&view.scope, pane)));
+            }
+        }
+        Self { owners, retired, resources }
+    }
+
+    /// Shared alias reconciliation may retire an alias before canonical
+    /// adoption. Fence replaced/ambiguous canonical evidence without blocking
+    /// that existing migration path merely because an alias is present.
+    pub(crate) fn permits_projection(&self, agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        if pane.id != id || !managed_pane_matches(agent, pane) { return false; }
+        match self.owners.get(&id) {
+            Some(Some((_, saved))) => managed_pane_matches(agent, saved),
+            Some(None) => false,
+            None => !self.retired.contains(&id),
+        }
+    }
+
+    pub fn resolve(&self, agent: &crate::agent_execution::Agent) -> Option<ManagedDisplay> {
+        let scope = self.scope(agent)?.clone();
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let pane = self.owners.get(&id).and_then(Option::as_ref).map(|(_, pane)| (*pane).clone());
+        Some(ManagedDisplay { scope, pane })
+    }
+
+    pub fn scope<'b>(&self, agent: &'b crate::agent_execution::Agent) -> Option<&'b Scope> where 'a: 'b {
+        use crate::agent_execution::{HostedSession, Surface};
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let owner = match self.owners.get(&id) {
+            Some(owner) => Some(owner.as_ref()?),
+            None => None,
+        };
+        let resource = if let Some((_, pane)) = owner {
+            pane_resource(&pane.kind)?
+        } else if agent.spec.surface == Surface::Terminal {
+            (1, agent.console.as_ref()?.id)
+        } else {
+            match agent.session.as_ref()? { HostedSession::Chat(session) => (0, session.id), HostedSession::Terminal(session) => (1, session.id) }
+        };
+        // Leave inventory aliases to their existing reconciliation. Adoption
+        // cannot manufacture a second canonical pane for an already shown actor.
+        if self.resources.get(&resource).is_some_and(|cards| cards.iter().any(|card| *card != id)) { return None; }
+        if let Some((scope, pane)) = owner {
+            if !managed_pane_matches(agent, pane) { return None; }
+            return Some(*scope);
+        }
+        if self.retired.contains(&id) { return None; }
+        Some(&agent.placement)
+    }
+}
+
+fn pane_resource(kind: &CardKind) -> Option<(u8, crate::model::TerminalId)> {
+    match kind { CardKind::Chat(session) => Some((0, session.id)), CardKind::Terminal(session) => Some((1, session.id)), _ => None }
+}
+
+/// An ended automation console is display evidence only: its closed owner may
+/// convert it to a saved native read view, never hydrate or relaunch the console.
+/// All descriptor fields except the observed terminal end state must match.
+pub fn archived_console_matches(agent: &crate::agent_execution::Agent, current: &crate::model::TerminalSession) -> bool {
+    if !agent.closed || !matches!(agent.origin, crate::agent_execution::Origin::Automation { .. })
+        || !matches!(current.continuity, crate::model::TerminalContinuity::Exited { .. } | crate::model::TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })
+    { return false; }
+    let Some(mut original) = agent.console.clone() else { return false; };
+    original.continuity = current.continuity.clone();
+    original == *current
+}
+
+pub(crate) fn managed_pane_matches(agent: &crate::agent_execution::Agent, pane: &Pane) -> bool {
+    use crate::agent_execution::HostedSession;
+    if let CardKind::Terminal(current) = &pane.kind
+        && archived_console_matches(agent, current)
+    { return true; }
+    let current = match &pane.kind {
+        CardKind::Chat(session) if session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete) => HostedSession::Chat(session.clone()),
+        CardKind::Terminal(session) if session.continuity.live_proof().is_some_and(|proof| proof.is_complete()) => HostedSession::Terminal(session.clone()),
+        _ => return false,
+    };
+    agent.session.as_ref().is_some_and(|session| session.same_process(&current))
+        || agent.console.as_ref().is_some_and(|session| HostedSession::Terminal(session.clone()).same_process(&current))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Change {
     Insert {
@@ -475,5 +592,106 @@ pub fn same_resource(left: &CardKind, right: &CardKind) -> bool {
         (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
         (CardKind::Browser(a), CardKind::Browser(b)) => a.id == b.id,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod managed_display_tests {
+    use super::*;
+    use crate::{agent::Provider, agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target}, model::*};
+
+    fn fixture() -> (Agent, Pane, Pane) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("display-host"), boot_id: BootId::new("display-boot"), host_incarnation: HostIncarnation::new("display-incarnation"),
+        };
+        let recipe = LaunchRecipe {
+            program: "claude".into(), arguments: vec![], working_directory: "/execution/cwd".into(), environment: Default::default(), unset_environment: Default::default(),
+        };
+        let console = TerminalSession {
+            id: TerminalId::new(), owned_codex_listener: None, recovery_origin: None, predecessor: None, launch: recipe.clone(), transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() },
+        };
+        let native = crate::chat::Session {
+            id: console.id, launch: crate::chat::Launch { provider: Provider::Claude, session_id: Some("existing-conversation".into()), recipe },
+            proof: Some(proof), terminal: None, owned_codex_listener: None, native_continuity: Default::default(),
+        };
+        let placement = Scope::Channel(ChannelId::new());
+        let agent = Agent { id: AgentId::new(), name: None, origin: Origin::User,
+            spec: Spec { provider: Provider::Claude, account: None, target: Target { repository: "/execution/.git".into(), directory: "/execution/cwd".into(), placement: Some(placement.clone()) },
+                surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None },
+            placement, session: Some(HostedSession::Chat(native.clone())), console: Some(console.clone()), created_ms: 0, closed: false,
+        };
+        let pane = Pane { id: CardId::from_uuid(agent.id.as_uuid()), title: "Saved title".into(), user_title: Some("User title".into()), pending_terminal_start: false, width_fraction: 0.6,
+            kind: CardKind::Chat(native), scope: Some("/display/scope".into()) };
+        let terminal = Pane { kind: CardKind::Terminal(console), ..pane.clone() };
+        (agent, pane, terminal)
+    }
+
+    #[test]
+    fn attention_managed_display_uses_exact_saved_native_or_console_membership_without_mutation() {
+        let (agent, native, terminal) = fixture();
+        let original = agent.clone();
+        for pane in [native, terminal] {
+            for scope in [Scope::Channel(ChannelId::new()), Scope::Worktree { repository: "/legacy-display/.git".into(), path: "/legacy-display/worktree".into() }] {
+                let mut source = View::empty(agent.placement.clone());
+                source.retired.push(pane.id);
+                let target = View { scope: scope.clone(), revision: 8, panes: vec![pane.clone()], retired: vec![] };
+                let model = super::super::WorkspaceModel { views: vec![source, target], ..Default::default() };
+                let display = managed_display(&model, &agent).unwrap();
+                assert_eq!(display.scope, scope);
+                assert_eq!(display.pane.as_ref(), Some(&pane));
+                assert_eq!(agent, original, "display resolution cannot rewrite accepted execution ownership");
+            }
+        }
+    }
+
+    #[test]
+    fn attention_archived_console_display_tolerates_only_its_observed_end_state() {
+        let (mut agent, _, mut pane) = fixture();
+        agent.closed = true;
+        agent.origin = Origin::Automation { id: uuid::Uuid::new_v4() };
+        let CardKind::Terminal(console) = &mut pane.kind else { unreachable!() };
+        let exit = TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 };
+        console.continuity = TerminalContinuity::Exited { last_exit: exit.clone() };
+        let mut model = super::super::WorkspaceModel { views: vec![View { scope: Scope::Channel(ChannelId::new()), revision: 1, panes: vec![pane.clone()], retired: vec![] }], ..Default::default() };
+        assert!(managed_display(&model, &agent).is_some());
+        let CardKind::Terminal(console) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        console.continuity = TerminalContinuity::RelaunchAvailable { recipe: console.launch.clone(), last_exit: Some(exit) };
+        assert!(managed_display(&model, &agent).is_some());
+        let CardKind::Terminal(console) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        console.continuity = TerminalContinuity::Live { host_session_id: HostSessionId::new("display-host"), boot_id: BootId::new("display-boot"), host_incarnation: HostIncarnation::new("replacement") };
+        assert!(managed_display(&model, &agent).is_none(), "archive display cannot accept a conflicting live owner");
+        let CardKind::Terminal(console) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        console.continuity = TerminalContinuity::Exited { last_exit: TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1 } };
+        console.launch.working_directory = "/different".into();
+        assert!(managed_display(&model, &agent).is_none());
+        model.views[0].panes[0] = pane;
+        agent.closed = false;
+        assert!(managed_display(&model, &agent).is_none(), "live actor lookup always requires its exact live proof");
+    }
+
+    #[test]
+    fn attention_managed_display_rejects_removed_replaced_ambiguous_and_unproven_canonical_panes() {
+        let (agent, pane, _) = fixture();
+        let scope = Scope::Channel(ChannelId::new());
+        let mut model = super::super::WorkspaceModel { views: vec![View::empty(scope.clone())], ..Default::default() };
+        assert_eq!(managed_display(&model, &agent).unwrap().scope, agent.placement);
+        model.views[0].retired.push(pane.id);
+        assert!(managed_display(&model, &agent).is_none(), "removal must not recreate the old target");
+        model.views[0].panes.push(pane.clone());
+        assert!(managed_display(&model, &agent).is_some(), "one exact current owner beats its retired transfer source");
+        model.views.push(View { scope: Scope::Channel(ChannelId::new()), revision: 1, panes: vec![pane.clone()], retired: vec![] });
+        assert!(managed_display(&model, &agent).is_none());
+        model.views.pop();
+        let CardKind::Chat(session) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        session.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("replacement");
+        assert!(managed_display(&model, &agent).is_none(), "matching session ID never substitutes a replacement process");
+        let CardKind::Chat(session) = &mut model.views[0].panes[0].kind else { unreachable!() };
+        session.proof = None;
+        assert!(managed_display(&model, &agent).is_none());
+        model.views[0].panes[0] = pane.clone();
+        model.views[0].panes[0].id = CardId::new();
+        model.views[0].retired.clear();
+        assert!(managed_display(&model, &agent).is_none(), "legacy aliases must not manufacture a second canonical managed pane");
     }
 }
