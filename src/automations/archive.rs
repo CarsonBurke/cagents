@@ -4,6 +4,10 @@ use super::ArchivedConversation;
 use crate::{agent_execution::HostedSession, chat::Session, model::AgentId};
 
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+/// First deliberately versioned registry checkpoint defining archive authority.
+/// The campaign owner must renumber this floor with its final migration union.
+#[cfg(feature = "host")]
+pub const ARCHIVE_REGISTRY_SCHEMA_FLOOR: u32 = 13;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchivedPaneReadiness {
@@ -267,6 +271,11 @@ pub fn inspect_completed_automation_pane(
     model
         .busy_timeout(std::time::Duration::from_millis(100))
         .map_err(|_| "The source automation registry is unavailable")?;
+    let registry_version: u32 = model.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| "The source automation registry version is unreadable")?;
+    if registry_version > crate::host::model::SCHEMA_VERSION {
+        return Err("The source automation registry requires a newer archive inspector".into());
+    }
     let schema:bool=model.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automation_snapshots')",[],|row|row.get(0)).map_err(|_|"The source automation registry is unreadable")?;
     if !schema {
         return if claim.is_some() {
@@ -274,6 +283,9 @@ pub fn inspect_completed_automation_pane(
         } else {
             Ok(None)
         };
+    }
+    if registry_version < ARCHIVE_REGISTRY_SCHEMA_FLOOR {
+        return Err("The source automation archive has no supported versioned authority".into());
     }
     let owner:Option<String>=model.query_row("SELECT record FROM agents WHERE id=?1 AND closed=1 AND json_type(record,'$.origin.Automation')='object' AND length(CAST(record AS BLOB))<=4194304",[expected.to_string()],|row|row.get(0)).optional().map_err(|_|"The source automation owner is unreadable")?;
     let Some(owner) = owner else {
@@ -558,6 +570,7 @@ mod tests {
         );
         let model = Connection::open(&registry).unwrap();
         model.execute_batch("CREATE TABLE agents(id TEXT,closed INTEGER,record TEXT);CREATE TABLE automation_snapshots(agent TEXT,snapshot TEXT);").unwrap();
+        model.pragma_update(None, "user_version", ARCHIVE_REGISTRY_SCHEMA_FLOOR).unwrap();
         model
             .execute(
                 "INSERT INTO agents VALUES(?1,1,?2)",
@@ -595,6 +608,15 @@ mod tests {
             ),
             "no migration or source writes"
         );
+        let versioned = Connection::open(&registry).unwrap();
+        for version in [ARCHIVE_REGISTRY_SCHEMA_FLOOR - 1, crate::host::model::SCHEMA_VERSION + 1] {
+            versioned.pragma_update(None,"user_version",version).unwrap();
+            let before_version = std::fs::read(&registry).unwrap();
+            assert!(inspect_archived_pane(&window,&registry,card,&session).is_err(),"unsupported archive authority version {version}");
+            assert_eq!(std::fs::read(&registry).unwrap(),before_version,"inspection must not rewrite unsupported schemas");
+        }
+        versioned.pragma_update(None,"user_version",ARCHIVE_REGISTRY_SCHEMA_FLOOR).unwrap();
+        drop(versioned);
         #[cfg(unix)]
         {
             let alias = directory.path().join("alias");
@@ -619,7 +641,7 @@ mod tests {
         let legacy = directory.path().join("legacy.sqlite3");
         Connection::open(&legacy)
             .unwrap()
-            .execute_batch("CREATE TABLE metadata(id TEXT);")
+            .execute_batch("CREATE TABLE metadata(id TEXT); PRAGMA user_version=12;")
             .unwrap();
         assert!(
             inspect_completed_automation_pane(
