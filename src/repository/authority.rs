@@ -18,7 +18,17 @@ impl fmt::Debug for WorktreeAuthority {
 }
 
 impl WorktreeAuthority {
+    /// Strong Git mutation authority currently uses Linux's parent-owned
+    /// descriptor namespace. Basic Git reads and ordinary file editing do not
+    /// require this capability and must not substitute an unpinned mutation.
+    pub const fn supported() -> bool { cfg!(target_os = "linux") }
+
+    pub const fn unsupported_reason() -> Option<&'static str> {
+        if Self::supported() { None } else { Some("Git mutations are currently supported on Linux only. You can still edit files and inspect Git changes.") }
+    }
+
     pub fn capture(path: &Path) -> Result<Self, RepositoryError> {
+        if let Some(reason) = Self::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
         if !path.is_absolute() { return Err(ValidationError::InvalidWorktree(path.display().to_string()).into()); }
         let root = fs_safety::Root::open(path).map_err(|error| ValidationError::Io(error.to_string()))?;
         let metadata = root.metadata().map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -32,6 +42,7 @@ impl WorktreeAuthority {
     pub fn path(&self) -> &Path { self.root.path() }
 
     pub fn validate(&self) -> Result<(), RepositoryError> {
+        if let Some(reason) = Self::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
         let named = fs_safety::Root::open(self.path()).map_err(|error| ValidationError::Io(format!("The original worktree is no longer available: {error}")))?;
         let metadata = named.metadata().map_err(|error| ValidationError::Io(error.to_string()))?;
         if (metadata.dev(), metadata.ino()) != self.identity {
