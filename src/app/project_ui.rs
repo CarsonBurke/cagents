@@ -1,8 +1,8 @@
 use super::*;
-use crate::worktree_control::BusyAgent;
 use crate::repository::{
     CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor, WorktreeSafetySnapshot,
 };
+use crate::worktree_control::BusyAgent;
 use crate::{
     github::avatar::{self, OwnerKey},
     model::WorktreeId,
@@ -18,11 +18,18 @@ struct AutomaticAttempt {
 }
 
 impl AutomaticAttempt {
-    fn retry_due(&self, now: Instant) -> bool { now.saturating_duration_since(self.at) >= Duration::from_secs(30) }
+    fn retry_due(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) >= Duration::from_secs(30)
+    }
 }
 
 fn cleanup_kept_detail(reason: &str) -> String {
-    reason.trim().strip_prefix("Kept:").unwrap_or(reason.trim()).trim().to_owned()
+    reason
+        .trim()
+        .strip_prefix("Kept:")
+        .unwrap_or(reason.trim())
+        .trim()
+        .to_owned()
 }
 
 #[derive(Debug, Default)]
@@ -78,7 +85,10 @@ impl State {
     }
 
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.remove_dialog.is_some() || self.cleanup_dialog.is_some() || !self.force_branches.is_empty()
+        self.dialog.is_some()
+            || self.remove_dialog.is_some()
+            || self.cleanup_dialog.is_some()
+            || !self.force_branches.is_empty()
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -148,7 +158,9 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if !self.force_branches.is_empty() { return widget::Id::new("dialog.branch.keep"); }
+        if !self.force_branches.is_empty() {
+            return widget::Id::new("dialog.branch.keep");
+        }
         if let Some(dialog) = &self.cleanup_dialog {
             return widget::Id::new(if dialog.loading {
                 "dialog.project.cleanup.cancel"
@@ -197,10 +209,20 @@ struct Dialog {
 }
 
 #[derive(Debug, Clone)]
-pub struct BranchDeletion { id: crate::model::OperationId, repository: PathBuf, branch: String, expected_oid: String, warnings: Vec<String> }
+pub struct BranchDeletion {
+    id: crate::model::OperationId,
+    repository: PathBuf,
+    branch: String,
+    expected_oid: String,
+    warnings: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
-pub struct DeleteOptions { branch_elsewhere: bool, stale_lock: bool, lock_error: Option<String> }
+pub struct DeleteOptions {
+    branch_elsewhere: bool,
+    stale_lock: bool,
+    lock_error: Option<String>,
+}
 
 #[derive(Debug)]
 struct CleanupPolicyDialog {
@@ -236,13 +258,22 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
-    DeleteOptionsRead { request: u64, result: Result<DeleteOptions, String> },
+    DeleteOptionsRead {
+        request: u64,
+        result: Result<DeleteOptions, String>,
+    },
     DeleteBranchChanged(bool),
-    BranchDeleted { request: BranchDeletion, result: Result<(), crate::worktree_branch::BranchDeleteFailure> },
+    BranchDeleted {
+        request: BranchDeletion,
+        result: Result<(), crate::worktree_branch::BranchDeleteFailure>,
+    },
     ForceDeleteBranch(crate::model::OperationId),
     KeepBranch(crate::model::OperationId),
     BusyAgentsConfirmed(bool),
-    StaleUnlocked { request: u64, result: Result<(), String> },
+    StaleUnlocked {
+        request: u64,
+        result: Result<(), String>,
+    },
     SafetyRead {
         request: u64,
         confirming: bool,
@@ -269,9 +300,20 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
-    DeletionSessionsClosed { target: Target, started_at: Instant, result: Result<(), String> },
-    DeletionProtectionsReleased { target: Target, started_at: Instant, result: Result<(), String> },
-    RemovalCompleted { target: Target, result: Result<Vec<String>, String> },
+    DeletionSessionsClosed {
+        target: Target,
+        started_at: Instant,
+        result: Result<(), String>,
+    },
+    DeletionProtectionsReleased {
+        target: Target,
+        started_at: Instant,
+        result: Result<(), String>,
+    },
+    RemovalCompleted {
+        target: Target,
+        result: Result<Vec<String>, String>,
+    },
     AutomaticallyDeleted {
         target: Target,
         result: Result<RemovedWorktree, String>,
@@ -290,10 +332,21 @@ pub enum Action {
 
 impl Action {
     fn user_input(&self) -> bool {
-        matches!(self, Self::Command { .. } | Self::ConfirmDelete | Self::DeleteBranchChanged(_)
-            | Self::ForceDeleteBranch(_) | Self::KeepBranch(_) | Self::BusyAgentsConfirmed(_)
-            | Self::OpenCleanupPolicy(_) | Self::CleanupPolicyChanged(_) | Self::SaveCleanupPolicy
-            | Self::ConfirmRemove | Self::RetryDelete(_) | Self::Dismiss)
+        matches!(
+            self,
+            Self::Command { .. }
+                | Self::ConfirmDelete
+                | Self::DeleteBranchChanged(_)
+                | Self::ForceDeleteBranch(_)
+                | Self::KeepBranch(_)
+                | Self::BusyAgentsConfirmed(_)
+                | Self::OpenCleanupPolicy(_)
+                | Self::CleanupPolicyChanged(_)
+                | Self::SaveCleanupPolicy
+                | Self::ConfirmRemove
+                | Self::RetryDelete(_)
+                | Self::Dismiss
+        )
     }
 }
 
@@ -340,8 +393,12 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
-        paths.retain(|path| !self.project_ui.deletions.iter().any(|(id, deletion)|
-            self.project_ui.released_delete_protections.contains(id) && path.starts_with(&deletion.target.path)));
+        paths.retain(|path| {
+            !self.project_ui.deletions.iter().any(|(id, deletion)| {
+                self.project_ui.released_delete_protections.contains(id)
+                    && path.starts_with(&deletion.target.path)
+            })
+        });
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
@@ -360,49 +417,143 @@ impl Cagents {
             || self.project_ui.deletion_running()
             || !self.project_ui.automatic_in_flight.is_empty()
             || self.session.is_none()
-        { return Task::none(); }
-        let Some(repository) = self.review_repositories.get(&project_id).cloned() else { return Task::none(); };
-        let current_ids = records.iter().map(|(record, _)| record.id).collect::<HashSet<_>>();
-        self.project_ui.automatic_attempts.retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
+        {
+            return Task::none();
+        }
+        let Some(repository) = self.review_repositories.get(&project_id).cloned() else {
+            return Task::none();
+        };
+        let current_ids = records
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect::<HashSet<_>>();
+        self.project_ui
+            .automatic_attempts
+            .retain(|id, attempt| attempt.project != project_id || current_ids.contains(id));
         let mut candidates = Vec::new();
         for (record, _) in records {
-            let source = self.sidebar_model.project(project_id).and_then(|project| project.worktrees.iter()
-                .find(|row| row.id == record.id && row.path == record.path)).and_then(|row| row.head_repository.clone());
-            let Some(source) = source else { continue; };
-            let merged = matching_attached_pr(record, &source, pull_requests)
-                .filter(|pr| pr.state.0 == "MERGED" && record.head_oid.as_deref() == Some(pr.head_ref_oid.as_str()));
-            let Some(pr) = merged else { self.project_ui.automatic_attempts.remove(&record.id); continue; };
-            let Some(target) = self.project_target(project_id, Some(record.id)) else { continue; };
+            let source = self
+                .sidebar_model
+                .project(project_id)
+                .and_then(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .find(|row| row.id == record.id && row.path == record.path)
+                })
+                .and_then(|row| row.head_repository.clone());
+            let Some(source) = source else {
+                continue;
+            };
+            let merged = matching_attached_pr(record, &source, pull_requests).filter(|pr| {
+                pr.state.0 == "MERGED"
+                    && record.head_oid.as_deref() == Some(pr.head_ref_oid.as_str())
+            });
+            let Some(pr) = merged else {
+                self.project_ui.automatic_attempts.remove(&record.id);
+                continue;
+            };
+            let Some(target) = self.project_target(project_id, Some(record.id)) else {
+                continue;
+            };
             if let Some(reason) = self.automatic_worktree_keep_reason(&target, record) {
-                let unchanged = self.project_ui.automatic_attempts.get(&record.id)
-                    .is_some_and(|attempt| attempt.local && attempt.reason.as_deref() == Some(reason.as_str()));
-                if !unchanged { self.project_ui.automatic_attempts.insert(record.id, AutomaticAttempt { project: project_id, at: Instant::now(), reason: Some(reason), local: true }); }
+                let unchanged = self
+                    .project_ui
+                    .automatic_attempts
+                    .get(&record.id)
+                    .is_some_and(|attempt| {
+                        attempt.local && attempt.reason.as_deref() == Some(reason.as_str())
+                    });
+                if !unchanged {
+                    self.project_ui.automatic_attempts.insert(
+                        record.id,
+                        AutomaticAttempt {
+                            project: project_id,
+                            at: Instant::now(),
+                            reason: Some(reason),
+                            local: true,
+                        },
+                    );
+                }
                 continue;
             }
             // A local pane/session closing is a relevant event: do not make
             // that worktree wait for its old local refusal's timer as well.
-            if self.project_ui.automatic_attempts.get(&record.id).is_some_and(|attempt| attempt.local) {
+            if self
+                .project_ui
+                .automatic_attempts
+                .get(&record.id)
+                .is_some_and(|attempt| attempt.local)
+            {
                 self.project_ui.automatic_attempts.remove(&record.id);
             }
-            if self.project_ui.automatic_attempts.get(&record.id).is_some_and(|attempt| !attempt.retry_due(Instant::now())) { continue; }
-            let Some(branch) = record.branch.as_deref().and_then(|branch| branch.strip_prefix("refs/heads/")) else { continue; };
-            let Some(head_oid) = record.head_oid.clone() else { continue; };
-            candidates.push((target, crate::worktree_cleanup::RemovalRequest {
-                repository: self.sidebar_model.project(project_id).unwrap().repository.clone(), path: record.path.clone(),
-                branch: branch.to_owned(), head_oid, source_repository: source,
-                pull_request: crate::github::PullRequestKey { repository: repository.clone(), number: pr.number },
-            }));
+            if self
+                .project_ui
+                .automatic_attempts
+                .get(&record.id)
+                .is_some_and(|attempt| !attempt.retry_due(Instant::now()))
+            {
+                continue;
+            }
+            let Some(branch) = record
+                .branch
+                .as_deref()
+                .and_then(|branch| branch.strip_prefix("refs/heads/"))
+            else {
+                continue;
+            };
+            let Some(head_oid) = record.head_oid.clone() else {
+                continue;
+            };
+            candidates.push((
+                target,
+                crate::worktree_cleanup::RemovalRequest {
+                    repository: self
+                        .sidebar_model
+                        .project(project_id)
+                        .unwrap()
+                        .repository
+                        .clone(),
+                    path: record.path.clone(),
+                    branch: branch.to_owned(),
+                    head_oid,
+                    source_repository: source,
+                    pull_request: crate::github::PullRequestKey {
+                        repository: repository.clone(),
+                        number: pr.number,
+                    },
+                },
+            ));
         }
         // A declined worktree cannot monopolize the queue ahead of unseen ones.
-        let candidate = candidates.into_iter().min_by_key(|(target, _)| target.worktree
-            .and_then(|id| self.project_ui.automatic_attempts.get(&id).map(|attempt| attempt.at)));
-        let Some((target, request)) = candidate else { self.sync_worktree_deletion_rows(); return Task::none(); };
+        let candidate = candidates.into_iter().min_by_key(|(target, _)| {
+            target.worktree.and_then(|id| {
+                self.project_ui
+                    .automatic_attempts
+                    .get(&id)
+                    .map(|attempt| attempt.at)
+            })
+        });
+        let Some((target, request)) = candidate else {
+            self.sync_worktree_deletion_rows();
+            return Task::none();
+        };
         let id = target.worktree.unwrap();
-        self.project_ui.automatic_attempts.entry(id).and_modify(|attempt| attempt.at = Instant::now())
-            .or_insert(AutomaticAttempt { project: project_id, at: Instant::now(), reason: None, local: false });
+        self.project_ui
+            .automatic_attempts
+            .entry(id)
+            .and_modify(|attempt| attempt.at = Instant::now())
+            .or_insert(AutomaticAttempt {
+                project: project_id,
+                at: Instant::now(),
+                reason: None,
+                local: false,
+            });
         // Checking with the daemon is not a deletion. Keep the last quiet
         // refusal on the row while it checks; accepted removals disappear.
-        self.project_ui.automatic_in_flight.insert(id, target.clone());
+        self.project_ui
+            .automatic_in_flight
+            .insert(id, target.clone());
         self.sync_worktree_deletion_rows();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
@@ -419,20 +570,46 @@ impl Cagents {
         })
     }
 
-    fn automatic_worktree_keep_reason(&self, target: &Target, record: &WorktreeRecord) -> Option<String> {
-        if record.lock.locked { return Some("worktree locked".into()); }
-        let sessions = self.durable.cards.iter().filter(|card| card.existence.is_open() && card_belongs_to(card, &target.path)).collect::<Vec<_>>();
-        if sessions.iter().any(|card| self.sidebar_state.card_activity(card.id).is_some_and(|activity| activity.state == crate::agent::ActivityState::Working)) {
+    fn automatic_worktree_keep_reason(
+        &self,
+        target: &Target,
+        record: &WorktreeRecord,
+    ) -> Option<String> {
+        if record.lock.locked {
+            return Some("worktree locked".into());
+        }
+        let sessions = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && card_belongs_to(card, &target.path))
+            .collect::<Vec<_>>();
+        if sessions.iter().any(|card| {
+            self.sidebar_state
+                .card_activity(card.id)
+                .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working)
+        }) {
             return Some("agent running".into());
         }
-        if sessions.iter().any(|card| matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_))) { return Some("session open in this window".into()); }
+        if sessions
+            .iter()
+            .any(|card| matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+        {
+            return Some("session open in this window".into());
+        }
         if sessions.iter().any(|card| match &card.kind {
             CardKind::Repository(view) => view.selected_file.is_some()
                 || self.durable.repository_navigation.get(&card.id).is_some_and(|navigation| navigation.selected_file.is_some())
                 || matches!(self.cards.get(&card.id), Some(CardRuntime::Repository(runtime)) if runtime.selected_path().is_some() || runtime.blocks_navigation()),
             _ => false,
         }) { return Some("editor open in this window".into()); }
-        if self.active_workspace.as_ref().is_some_and(|active| active.starts_with(&target.path)) { return Some("open in this window".into()); }
+        if self
+            .active_workspace
+            .as_ref()
+            .is_some_and(|active| active.starts_with(&target.path))
+        {
+            return Some("open in this window".into());
+        }
         self.worktree_deletion_blocker(target)
     }
 
@@ -511,7 +688,10 @@ impl Cagents {
             busy_confirmed: None,
             stale_lock: false,
         });
-        let options = self.session.as_ref().filter(|_| loading).map(|session| delete_options_task(target.clone(), request, session.operation_store()));
+        let options =
+            self.session.as_ref().filter(|_| loading).map(|session| {
+                delete_options_task(target.clone(), request, session.operation_store())
+            });
         let read = if loading {
             safety_read_task(target, request, false)
         } else {
@@ -1008,32 +1188,59 @@ impl Cagents {
 
     fn project_dialog_on_top(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
-        if self.browser_import.open() { return false; }
-        self.project_ui.modal_open() && !self.update_prepared
-            && self.update_ui.confirmation.is_none() && !self.session_recovery.open()
-            && !self.daemon_health_ui.confirmation && !self.automation_approval_open()
-            && self.transient_work_close.is_none() && !self.automation_ui.draft_dialog_open()
-            && !self.device_ui.open && self.chat_ui.image_viewer.is_none()
-            && self.terminal_paste.is_none() && !self.terminal_close_dialog_visible()
-            && !self.settings_reset_confirm && self.sidebar_state.pending_discard().is_none()
-            && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
+        if self.browser_import.open() {
+            return false;
+        }
+        self.project_ui.modal_open()
+            && !self.update_prepared
+            && self.update_ui.confirmation.is_none()
+            && !self.session_recovery.open()
+            && !self.daemon_health_ui.confirmation
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+            && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none()
+            && !self.terminal_close_dialog_visible()
+            && !self.settings_reset_confirm
+            && self.sidebar_state.pending_discard().is_none()
+            && self.dirty_repository_close.is_none()
+            && self.sidebar_selection_ui.dialog.is_none()
     }
 
     fn worktree_delete_dialog_on_top(&self) -> bool {
-        self.project_dialog_on_top() && self.project_ui.force_branches.is_empty()
-            && self.project_ui.cleanup_dialog.is_none() && self.project_ui.dialog.is_some()
+        self.project_dialog_on_top()
+            && self.project_ui.force_branches.is_empty()
+            && self.project_ui.cleanup_dialog.is_none()
+            && self.project_ui.dialog.is_some()
     }
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         let hidden_control = match &action {
-            Action::ForceDeleteBranch(_) | Action::KeepBranch(_) => self.project_ui.force_branches.is_empty(),
-            Action::CleanupPolicyChanged(_) | Action::SaveCleanupPolicy => !self.project_ui.force_branches.is_empty() || self.project_ui.cleanup_dialog.is_none(),
-            Action::ConfirmDelete | Action::DeleteBranchChanged(_) | Action::BusyAgentsConfirmed(_) => !self.worktree_delete_dialog_on_top(),
-            Action::ConfirmRemove => !self.project_ui.force_branches.is_empty() || self.project_ui.cleanup_dialog.is_some() || self.project_ui.dialog.is_some(),
+            Action::ForceDeleteBranch(_) | Action::KeepBranch(_) => {
+                self.project_ui.force_branches.is_empty()
+            }
+            Action::CleanupPolicyChanged(_) | Action::SaveCleanupPolicy => {
+                !self.project_ui.force_branches.is_empty()
+                    || self.project_ui.cleanup_dialog.is_none()
+            }
+            Action::ConfirmDelete
+            | Action::DeleteBranchChanged(_)
+            | Action::BusyAgentsConfirmed(_) => !self.worktree_delete_dialog_on_top(),
+            Action::ConfirmRemove => {
+                !self.project_ui.force_branches.is_empty()
+                    || self.project_ui.cleanup_dialog.is_some()
+                    || self.project_ui.dialog.is_some()
+            }
             _ => false,
         };
-        if hidden_control { return Task::none(); }
-        if action.user_input() && (self.update_prepared || (self.modal_is_open() && !self.project_dialog_on_top())) {
+        if hidden_control {
+            return Task::none();
+        }
+        if action.user_input()
+            && (self.update_prepared || (self.modal_is_open() && !self.project_dialog_on_top()))
+        {
             return Task::none();
         }
         match action {
@@ -1062,16 +1269,18 @@ impl Cagents {
                     request,
                 });
                 let read = cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        read_cleanup_policy(&repository)
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+                    let result =
+                        tokio::task::spawn_blocking(move || read_cleanup_policy(&repository))
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result);
                     Message::ProjectUi(Action::CleanupPolicyRead { request, result })
                 });
-                return Task::batch([read, iced::widget::operation::focus(self.project_ui.focus_target())
-                    .map(cosmic::Action::App)]);
+                return Task::batch([
+                    read,
+                    iced::widget::operation::focus(self.project_ui.focus_target())
+                        .map(cosmic::Action::App),
+                ]);
             }
             Action::CleanupPolicyRead { request, result } => {
                 let Some(dialog) = self
@@ -1140,8 +1349,11 @@ impl Cagents {
                     .and_then(|result| result);
                     Message::ProjectUi(Action::CleanupPolicySaved { request, result })
                 });
-                return Task::batch([save, iced::widget::operation::focus(self.project_ui.focus_target())
-                    .map(cosmic::Action::App)]);
+                return Task::batch([
+                    save,
+                    iced::widget::operation::focus(self.project_ui.focus_target())
+                        .map(cosmic::Action::App),
+                ]);
             }
             Action::CleanupPolicySaved { request, result } => {
                 let Some(dialog) = self
@@ -1434,7 +1646,9 @@ impl Cagents {
                 }
             }
             Action::Dismiss => {
-                if self.project_ui.force_branches.pop_front().is_some() { return self.project_dialog_closed(); }
+                if self.project_ui.force_branches.pop_front().is_some() {
+                    return self.project_dialog_closed();
+                }
                 self.project_ui.cleanup_dialog = None;
                 self.project_ui.pending_delete.clear();
                 self.project_ui.remove_dialog = None;
@@ -1527,58 +1741,147 @@ impl Cagents {
                 }
             },
             Action::BranchDeleted { request, result } => {
-                if !self.project_ui.branch_requests.remove(&request.id) { return Task::none(); }
+                if !self.project_ui.branch_requests.remove(&request.id) {
+                    return Task::none();
+                }
                 match result {
-                    Ok(()) => self.status = Some(if request.warnings.is_empty() {
-                        TransientNotice::success(format!("Worktree and branch {} deleted.", request.branch))
-                    } else { TransientNotice::warning(format!("Worktree and branch {} deleted; {}", request.branch, request.warnings.join("; "))) }),
-                    Err(failure) if failure.kind == crate::worktree_branch::BranchDeleteFailureKind::Unmerged => {
-                        self.project_ui.force_branches.push_back((request, failure.detail));
-                        return iced::widget::operation::focus(widget::Id::new("dialog.branch.keep")).map(cosmic::Action::App);
+                    Ok(()) => {
+                        self.status = Some(if request.warnings.is_empty() {
+                            TransientNotice::success(format!(
+                                "Worktree and branch {} deleted.",
+                                request.branch
+                            ))
+                        } else {
+                            TransientNotice::warning(format!(
+                                "Worktree and branch {} deleted; {}",
+                                request.branch,
+                                request.warnings.join("; ")
+                            ))
+                        })
                     }
-                    Err(failure) => self.status = Some(TransientNotice::warning(format!("Worktree deleted; branch {} retained: {}", request.branch, failure.detail))),
+                    Err(failure)
+                        if failure.kind
+                            == crate::worktree_branch::BranchDeleteFailureKind::Unmerged =>
+                    {
+                        self.project_ui
+                            .force_branches
+                            .push_back((request, failure.detail));
+                        return iced::widget::operation::focus(widget::Id::new(
+                            "dialog.branch.keep",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    Err(failure) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "Worktree deleted; branch {} retained: {}",
+                            request.branch, failure.detail
+                        )))
+                    }
                 }
             }
             Action::KeepBranch(id) => {
-                if !self.project_ui.force_branches.front().is_some_and(|(request, _)| request.id == id) { return Task::none(); }
+                if !self
+                    .project_ui
+                    .force_branches
+                    .front()
+                    .is_some_and(|(request, _)| request.id == id)
+                {
+                    return Task::none();
+                }
                 self.project_ui.force_branches.pop_front();
                 return self.project_dialog_closed();
             }
             Action::ForceDeleteBranch(id) => {
-                if !self.project_ui.force_branches.front().is_some_and(|(request, _)| request.id == id) { return Task::none(); }
-                let Some((request, _)) = self.project_ui.force_branches.pop_front() else { return Task::none(); };
+                if !self
+                    .project_ui
+                    .force_branches
+                    .front()
+                    .is_some_and(|(request, _)| request.id == id)
+                {
+                    return Task::none();
+                }
+                let Some((request, _)) = self.project_ui.force_branches.pop_front() else {
+                    return Task::none();
+                };
                 self.project_ui.branch_requests.insert(request.id);
-                return Task::batch([branch_deletion_task(request, true), self.project_dialog_closed()]);
+                return Task::batch([
+                    branch_deletion_task(request, true),
+                    self.project_dialog_closed(),
+                ]);
             }
             Action::DeleteOptionsRead { request, result } => {
-                let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| dialog.request == request) else { return Task::none(); };
+                let Some(dialog) = self
+                    .project_ui
+                    .dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.request == request)
+                else {
+                    return Task::none();
+                };
                 dialog.options_loading = false;
                 match result {
-                    Ok(options) => { dialog.branch_elsewhere = options.branch_elsewhere; dialog.stale_lock = options.stale_lock;
-                        if options.branch_elsewhere { dialog.delete_branch = false; }
-                        if let Some(error) = options.lock_error { dialog.blocker = Some(error); }
+                    Ok(options) => {
+                        dialog.branch_elsewhere = options.branch_elsewhere;
+                        dialog.stale_lock = options.stale_lock;
+                        if options.branch_elsewhere {
+                            dialog.delete_branch = false;
+                        }
+                        if let Some(error) = options.lock_error {
+                            dialog.blocker = Some(error);
+                        }
                     }
-                    Err(error) => dialog.blocker = Some(format!("Could not verify worktree ownership: {error}")),
+                    Err(error) => {
+                        dialog.blocker =
+                            Some(format!("Could not verify worktree ownership: {error}"))
+                    }
                 }
             }
             Action::DeleteBranchChanged(value) => {
-                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| !dialog.branch_elsewhere && !dialog.options_loading && !dialog.loading) {
-                    dialog.delete_branch = value; dialog.branch_choice_edited = true;
+                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| {
+                    !dialog.branch_elsewhere && !dialog.options_loading && !dialog.loading
+                }) {
+                    dialog.delete_branch = value;
+                    dialog.branch_choice_edited = true;
                 }
             }
             Action::BusyAgentsConfirmed(value) => {
-                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| !dialog.loading && !dialog.options_loading) { dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone()); }
+                if let Some(dialog) = self
+                    .project_ui
+                    .dialog
+                    .as_mut()
+                    .filter(|dialog| !dialog.loading && !dialog.options_loading)
+                {
+                    dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone());
+                }
             }
             Action::StaleUnlocked { request, result } => {
-                let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| dialog.request == request) else { return Task::none(); };
+                let Some(dialog) = self
+                    .project_ui
+                    .dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.request == request)
+                else {
+                    return Task::none();
+                };
                 match result {
                     Ok(()) => {
                         dialog.stale_lock = false;
                         let target = dialog.target.clone();
-                        if let Some(row) = self.sidebar_model.projects.iter_mut().flat_map(|project| &mut project.worktrees).find(|row| Some(row.id) == target.worktree && row.path == target.path) { row.locked = false; }
+                        if let Some(row) = self
+                            .sidebar_model
+                            .projects
+                            .iter_mut()
+                            .flat_map(|project| &mut project.worktrees)
+                            .find(|row| Some(row.id) == target.worktree && row.path == target.path)
+                        {
+                            row.locked = false;
+                        }
                         return safety_read_task(target, request, true);
                     }
-                    Err(error) => { dialog.loading = false; dialog.blocker = Some(format!("Could not unlock safely: {error}")); }
+                    Err(error) => {
+                        dialog.loading = false;
+                        dialog.blocker = Some(format!("Could not unlock safely: {error}"));
+                    }
                 }
             }
             Action::ConfirmDelete => {
@@ -1587,11 +1890,17 @@ impl Cagents {
                 };
                 let target = dialog.target.clone();
                 let busy = self.worktree_busy_agents(&target);
-                if dialog.blocker.is_some() || dialog.loading || dialog.options_loading || dialog.safety.is_none()
-                    || (busy > 0 && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents)) {
+                if dialog.blocker.is_some()
+                    || dialog.loading
+                    || dialog.options_loading
+                    || dialog.safety.is_none()
+                    || (busy > 0 && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents))
+                {
                     return Task::none();
                 }
-                if let Some(blocker) = self.worktree_deletion_blocker_ignoring_lock(&target, dialog.stale_lock) {
+                if let Some(blocker) =
+                    self.worktree_deletion_blocker_ignoring_lock(&target, dialog.stale_lock)
+                {
                     let dialog = self.project_ui.dialog.as_mut().unwrap();
                     dialog.blocker = Some(blocker);
                     dialog.failure = None;
@@ -1604,8 +1913,17 @@ impl Cagents {
                     let store = self.session.as_ref().unwrap().operation_store();
                     let allow_local = crate::device::selected().is_none();
                     return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || unlock_stale_worktree_for_window(&store, &target.repository, &target.path, allow_local))
-                            .await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let result = tokio::task::spawn_blocking(move || {
+                            unlock_stale_worktree_for_window(
+                                &store,
+                                &target.repository,
+                                &target.path,
+                                allow_local,
+                            )
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
                         Message::ProjectUi(Action::StaleUnlocked { request, result })
                     });
                 }
@@ -1617,8 +1935,17 @@ impl Cagents {
                 result,
             } => {
                 let on_top = self.worktree_delete_dialog_on_top();
-                let default_branch = self.project_ui.dialog.as_ref().filter(|dialog| dialog.request == request)
-                    .and_then(|dialog| result.as_ref().ok().map(|(snapshot, _)| self.delete_branch_default(&dialog.target, snapshot))).unwrap_or(false);
+                let default_branch = self
+                    .project_ui
+                    .dialog
+                    .as_ref()
+                    .filter(|dialog| dialog.request == request)
+                    .and_then(|dialog| {
+                        result.as_ref().ok().map(|(snapshot, _)| {
+                            self.delete_branch_default(&dialog.target, snapshot)
+                        })
+                    })
+                    .unwrap_or(false);
                 let Some(dialog) = self
                     .project_ui
                     .dialog
@@ -1636,17 +1963,26 @@ impl Cagents {
                         ));
                     }
                     Ok((snapshot, agents)) => {
-                        let agents_changed = dialog.busy_agents != agents.agents || dialog.session_census != agents.census;
-                        dialog.busy_agents = agents.agents; dialog.session_census = agents.census;
+                        let agents_changed = dialog.busy_agents != agents.agents
+                            || dialog.session_census != agents.census;
+                        dialog.busy_agents = agents.agents;
+                        dialog.session_census = agents.census;
                         let busy = dialog.busy_agents.len();
                         if confirming && !on_top {
-                            dialog.safety = Some(snapshot); dialog.busy_confirmed = None;
+                            dialog.safety = Some(snapshot);
+                            dialog.busy_confirmed = None;
                             dialog.failure = Some("Confirmation was interrupted. Review this worktree again when the dialog is exposed.".into());
                             return Task::none();
                         }
                         let unchanged = dialog.safety.as_ref() == Some(&snapshot);
-                        if !dialog.branch_choice_edited && !dialog.branch_elsewhere { dialog.delete_branch = default_branch; }
-                        if confirming && (agents_changed || (busy > 0 && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents))) {
+                        if !dialog.branch_choice_edited && !dialog.branch_elsewhere {
+                            dialog.delete_branch = default_branch;
+                        }
+                        if confirming
+                            && (agents_changed
+                                || (busy > 0
+                                    && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents)))
+                        {
                             dialog.safety = Some(snapshot);
                             dialog.busy_confirmed = None;
                             dialog.failure = Some("The working agents or their active turns changed. Review and confirm their interruption again.".into());
@@ -1654,17 +1990,36 @@ impl Cagents {
                         }
                         if confirming && unchanged {
                             let target = dialog.target.clone();
-                            let branch = dialog.delete_branch.then(|| snapshot.branch.clone().zip(snapshot.head_oid.clone())).flatten();
-                            let consented_agents = AgentCensus { agents: dialog.busy_agents.clone(), census: dialog.session_census.clone() };
+                            let branch = dialog
+                                .delete_branch
+                                .then(|| snapshot.branch.clone().zip(snapshot.head_oid.clone()))
+                                .flatten();
+                            let consented_agents = AgentCensus {
+                                agents: dialog.busy_agents.clone(),
+                                census: dialog.session_census.clone(),
+                            };
                             if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                                 self.project_ui.dialog.as_mut().unwrap().blocker = Some(blocker);
                                 return Task::none();
                             }
                             if let Some(id) = target.worktree {
                                 if let Some((branch, expected_oid)) = branch {
-                                    self.project_ui.branch_deletions.insert(id, BranchDeletion { id: crate::model::OperationId::new(), repository: target.repository.clone(), branch, expected_oid, warnings: Vec::new() });
-                                } else { self.project_ui.branch_deletions.remove(&id); }
-                                self.project_ui.deletion_busy_agents.insert(id, consented_agents);
+                                    self.project_ui.branch_deletions.insert(
+                                        id,
+                                        BranchDeletion {
+                                            id: crate::model::OperationId::new(),
+                                            repository: target.repository.clone(),
+                                            branch,
+                                            expected_oid,
+                                            warnings: Vec::new(),
+                                        },
+                                    );
+                                } else {
+                                    self.project_ui.branch_deletions.remove(&id);
+                                }
+                                self.project_ui
+                                    .deletion_busy_agents
+                                    .insert(id, consented_agents);
                                 self.project_ui.deletion_authorizations.insert(id, snapshot);
                             }
                             self.project_ui.dialog = None;
@@ -1707,198 +2062,272 @@ impl Cagents {
                 return self.open_worktree_delete_dialog(target);
             }
             Action::RemovalCompleted { target, result } => {
-                let result = result.map(|warnings| { if let Some(id) = target.worktree { self.project_ui.deletion_warnings.insert(id, warnings); } });
+                let result = result.map(|warnings| {
+                    if let Some(id) = target.worktree {
+                        self.project_ui.deletion_warnings.insert(id, warnings);
+                    }
+                });
                 return self.handle_project_action(Action::Deleted { target, result });
             }
-            Action::DeletionSessionsClosed { target, started_at, result } => {
-                let Some(id) = target.worktree else { return Task::none(); };
-                if !self.project_ui.deletions.get(&id).is_some_and(|deletion| deletion.started_at == started_at && deletion.failure.is_none() && deletion.target.path == target.path) { return Task::none(); }
-                if let Err(failure) = result { return self.handle_project_action(Action::Deleted { target, result: Err(failure) }); }
+            Action::DeletionSessionsClosed {
+                target,
+                started_at,
+                result,
+            } => {
+                let Some(id) = target.worktree else {
+                    return Task::none();
+                };
+                if !self.project_ui.deletions.get(&id).is_some_and(|deletion| {
+                    deletion.started_at == started_at
+                        && deletion.failure.is_none()
+                        && deletion.target.path == target.path
+                }) {
+                    return Task::none();
+                }
+                if let Err(failure) = result {
+                    return self.handle_project_action(Action::Deleted {
+                        target,
+                        result: Err(failure),
+                    });
+                }
                 self.project_ui.released_delete_protections.insert(id);
                 // Sessions have stopped, and reopening this target is fenced by
                 // the running deletion. Release only our own target leases so
                 // the owning daemon can acquire an exclusive removal guard.
                 self.sync_worktree_protections();
-                return self.handle_project_action(Action::DeletionProtectionsReleased { target, started_at, result: Ok(()) });
+                return self.handle_project_action(Action::DeletionProtectionsReleased {
+                    target,
+                    started_at,
+                    result: Ok(()),
+                });
             }
-            Action::DeletionProtectionsReleased { target, started_at, result } => {
-                let Some(id) = target.worktree else { return Task::none(); };
+            Action::DeletionProtectionsReleased {
+                target,
+                started_at,
+                result,
+            } => {
+                let Some(id) = target.worktree else {
+                    return Task::none();
+                };
                 if !self.project_ui.released_delete_protections.contains(&id)
-                    || !self.project_ui.deletions.get(&id).is_some_and(|deletion| deletion.started_at == started_at && deletion.failure.is_none() && deletion.target.path == target.path) { return Task::none(); }
-                if let Err(failure) = result { return self.handle_project_action(Action::Deleted { target, result: Err(failure) }); }
+                    || !self.project_ui.deletions.get(&id).is_some_and(|deletion| {
+                        deletion.started_at == started_at
+                            && deletion.failure.is_none()
+                            && deletion.target.path == target.path
+                    })
+                {
+                    return Task::none();
+                }
+                if let Err(failure) = result {
+                    return self.handle_project_action(Action::Deleted {
+                        target,
+                        result: Err(failure),
+                    });
+                }
                 return self.remove_worktree_after_sessions(target);
             }
             Action::AutomaticallyDeleted { target, result } => {
-                let Some(id) = target.worktree else { return Task::none(); };
-                let Some(in_flight) = self.project_ui.automatic_in_flight.remove(&id) else { return Task::none(); };
-                if in_flight.path != target.path { return Task::none(); }
+                let Some(id) = target.worktree else {
+                    return Task::none();
+                };
+                let Some(in_flight) = self.project_ui.automatic_in_flight.remove(&id) else {
+                    return Task::none();
+                };
+                if in_flight.path != target.path {
+                    return Task::none();
+                }
                 match result {
                     Ok(receipt) if receipt.path == target.path => {
                         self.project_ui.automatic_attempts.remove(&id);
-                        return self.handle_project_action(Action::Deleted { target, result: Ok(()) });
+                        return self.handle_project_action(Action::Deleted {
+                            target,
+                            result: Ok(()),
+                        });
                     }
                     result => {
                         let reason = match result {
                             Err(reason) => cleanup_kept_detail(&reason),
                             Ok(_) => "Cleanup returned a different worktree identity".into(),
                         };
-                        self.project_ui.automatic_attempts.insert(id, AutomaticAttempt {
-                            project: target.project, at: Instant::now(), reason: Some(reason), local: false,
-                        });
+                        self.project_ui.automatic_attempts.insert(
+                            id,
+                            AutomaticAttempt {
+                                project: target.project,
+                                at: Instant::now(),
+                                reason: Some(reason),
+                                local: false,
+                            },
+                        );
                     }
                 }
                 self.sync_worktree_deletion_rows();
                 return self.lifecycle_sweep();
             }
             Action::Deleted { target, result } => {
-                if let Some(id) = target.worktree { self.project_ui.released_delete_protections.remove(&id); }
+                if let Some(id) = target.worktree {
+                    self.project_ui.released_delete_protections.remove(&id);
+                }
                 match result {
-                Err(failure) => {
-                    if let Some(id) = target.worktree {
-                        self.project_ui.branch_deletions.remove(&id);
-                        self.project_ui.deletion_authorizations.remove(&id);
-                        self.project_ui.deletion_busy_agents.remove(&id);
-                    }
-                    // A blocker names what to resolve, so it outranks Git's
-                    // own account of the same refusal.
-                    let reason = self.worktree_deletion_blocker(&target).unwrap_or(failure);
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not delete {}: {reason}",
-                        target.label
-                    )));
-                    if let Some(deletion) = target
-                        .worktree
-                        .and_then(|id| self.project_ui.deletions.get_mut(&id))
-                    {
-                        deletion.failure = Some(reason);
-                    }
-                    self.sync_worktree_operation_rows();
-                    // The worktree stays, so the cards the sweep held back
-                    // while it was going can mount again, and the agents
-                    // whose rows waited on it can be attached.
-                    let sweep = self.lifecycle_sweep();
-                    return Task::batch([sweep, self.attach_next_restored_agent()]);
-                }
-                Ok(()) => {
-                    let safety = target
-                        .worktree
-                        .and_then(|id| self.project_ui.deletion_authorizations.remove(&id));
-                    if let Some(id) = target.worktree {
-                        self.project_ui.deletions.remove(&id);
-                        self.project_ui.deletion_busy_agents.remove(&id);
-                    }
-                    // The daemon has already closed every terminal and chat in
-                    // the directory, so their cards are tombstoned here without
-                    // a second close request: dropping a runtime only detaches.
-                    let ids = self
-                        .durable
-                        .cards
-                        .iter()
-                        .filter(|card| {
-                            card.existence.is_open() && card_belongs_to(card, &target.path)
-                        })
-                        .map(|card| card.id)
-                        .collect::<Vec<_>>();
-                    for &id in &ids {
-                        self.retire_lsp_card(id);
-                        self.sidebar_state.clear_agent_activity(id);
-                        self.sidebar_state.acknowledge_agent_update(id);
-                        self.chat_discard(id);
-                        self.cards.remove(&id);
-                        self.lifecycle.remove(id);
-                        if let Some(card) = self.card_state_mut(id) {
-                            card.existence = removed_existence("worktree removed");
+                    Err(failure) => {
+                        if let Some(id) = target.worktree {
+                            self.project_ui.branch_deletions.remove(&id);
+                            self.project_ui.deletion_authorizations.remove(&id);
+                            self.project_ui.deletion_busy_agents.remove(&id);
                         }
-                    }
-                    // A card filed under the worktree without running in it -
-                    // an adopted terminal or a provider sign-in, whose
-                    // directories no worktree owns - outlives the deletion,
-                    // so it moves to the repository rather than stay filed
-                    // under a row that no longer exists, where no strip would
-                    // show it again.
-                    let durable = Arc::make_mut(&mut self.durable);
-                    for id in &ids {
-                        durable.card_scopes.remove(id);
-                    }
-                    for scope in durable.card_scopes.values_mut() {
-                        if scope.starts_with(&target.path) {
-                            *scope = target.repository.clone();
+                        // A blocker names what to resolve, so it outranks Git's
+                        // own account of the same refusal.
+                        let reason = self.worktree_deletion_blocker(&target).unwrap_or(failure);
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not delete {}: {reason}",
+                            target.label
+                        )));
+                        if let Some(deletion) = target
+                            .worktree
+                            .and_then(|id| self.project_ui.deletions.get_mut(&id))
+                        {
+                            deletion.failure = Some(reason);
                         }
+                        self.sync_worktree_operation_rows();
+                        // The worktree stays, so the cards the sweep held back
+                        // while it was going can mount again, and the agents
+                        // whose rows waited on it can be attached.
+                        let sweep = self.lifecycle_sweep();
+                        return Task::batch([sweep, self.attach_next_restored_agent()]);
                     }
-                    let emptied = self.close_emptied_channels(&ids);
-                    self.worktree_offsets.remove(&target.path);
-                    self.worktree_focus.remove(&target.path);
-                    let removed = self
-                        .sidebar_model
-                        .projects
-                        .iter_mut()
-                        .find(|project| project.id == target.project)
-                        .and_then(|project| {
-                            let index = project
-                                .worktrees
-                                .iter()
-                                .position(|worktree| Some(worktree.id) == target.worktree)?;
-                            Some(project.worktrees.remove(index))
+                    Ok(()) => {
+                        let safety = target
+                            .worktree
+                            .and_then(|id| self.project_ui.deletion_authorizations.remove(&id));
+                        if let Some(id) = target.worktree {
+                            self.project_ui.deletions.remove(&id);
+                            self.project_ui.deletion_busy_agents.remove(&id);
+                        }
+                        // The daemon has already closed every terminal and chat in
+                        // the directory, so their cards are tombstoned here without
+                        // a second close request: dropping a runtime only detaches.
+                        let ids = self
+                            .durable
+                            .cards
+                            .iter()
+                            .filter(|card| {
+                                card.existence.is_open() && card_belongs_to(card, &target.path)
+                            })
+                            .map(|card| card.id)
+                            .collect::<Vec<_>>();
+                        for &id in &ids {
+                            self.retire_lsp_card(id);
+                            self.sidebar_state.clear_agent_activity(id);
+                            self.sidebar_state.acknowledge_agent_update(id);
+                            self.chat_discard(id);
+                            self.cards.remove(&id);
+                            self.lifecycle.remove(id);
+                            if let Some(card) = self.card_state_mut(id) {
+                                card.existence = removed_existence("worktree removed");
+                            }
+                        }
+                        // A card filed under the worktree without running in it -
+                        // an adopted terminal or a provider sign-in, whose
+                        // directories no worktree owns - outlives the deletion,
+                        // so it moves to the repository rather than stay filed
+                        // under a row that no longer exists, where no strip would
+                        // show it again.
+                        let durable = Arc::make_mut(&mut self.durable);
+                        for id in &ids {
+                            durable.card_scopes.remove(id);
+                        }
+                        for scope in durable.card_scopes.values_mut() {
+                            if scope.starts_with(&target.path) {
+                                *scope = target.repository.clone();
+                            }
+                        }
+                        let emptied = self.close_emptied_channels(&ids);
+                        self.worktree_offsets.remove(&target.path);
+                        self.worktree_focus.remove(&target.path);
+                        let removed =
+                            self.sidebar_model
+                                .projects
+                                .iter_mut()
+                                .find(|project| project.id == target.project)
+                                .and_then(|project| {
+                                    let index = project.worktrees.iter().position(|worktree| {
+                                        Some(worktree.id) == target.worktree
+                                    })?;
+                                    Some(project.worktrees.remove(index))
+                                });
+                        // Queued behind any save of the open worktree, so the
+                        // tombstone is the catalog's last word on it.
+                        if let Some(id) = target.worktree {
+                            self.refresh_ui.git.forget_worktree(target.project, id);
+                        }
+                        if let (Some(id), Some(session)) = (target.worktree, &self.session) {
+                            session.save_worktrees([WorktreeState {
+                                id,
+                                project_id: target.project,
+                                generation: 0,
+                                path: target.path.clone(),
+                                branch: removed.and_then(|worktree| worktree.branch),
+                                existence: removed_existence("worktree removed"),
+                            }]);
+                        }
+                        self.forget_worktree_creation(&target.path);
+                        // The window may have moved anywhere while Git worked, a
+                        // channel included, so the scope it is on is re-selected
+                        // to drop the retired cards rather than replaced.
+                        let select = match self.durable.active_channel {
+                            Some(channel) => self.select_channel(channel),
+                            None => {
+                                let scope = self
+                                    .active_workspace
+                                    .clone()
+                                    .filter(|active| !active.starts_with(&target.path))
+                                    .unwrap_or_else(|| target.repository.clone());
+                                self.select_worktree(scope, false)
+                            }
+                        };
+                        self.persist();
+                        let detail = match safety.as_ref() {
+                            Some(snapshot) if snapshot.detached_only_commits > 0 => {
+                                "Worktree deleted; detached commits preserved in a rescue branch."
+                            }
+                            Some(snapshot) if snapshot.branch.is_none() => {
+                                "Detached worktree deleted."
+                            }
+                            _ => "Worktree deleted; branch retained.",
+                        };
+                        let warnings = target
+                            .worktree
+                            .and_then(|id| self.project_ui.deletion_warnings.remove(&id))
+                            .unwrap_or_default();
+                        self.status = Some(if warnings.is_empty() {
+                            TransientNotice::success(detail)
+                        } else {
+                            TransientNotice::warning(format!("{detail} {}", warnings.join("; ")))
                         });
-                    // Queued behind any save of the open worktree, so the
-                    // tombstone is the catalog's last word on it.
-                    if let Some(id) = target.worktree {
-                        self.refresh_ui.git.forget_worktree(target.project, id);
+                        let branch_delete = target
+                            .worktree
+                            .and_then(|id| self.project_ui.branch_deletions.remove(&id))
+                            .map(|mut request| {
+                                request.warnings = warnings.clone();
+                                self.project_ui.branch_requests.insert(request.id);
+                                branch_deletion_task(request, false)
+                            })
+                            .unwrap_or_else(Task::none);
+                        let refresh = self.repository_load_task(
+                            target.repository,
+                            Some(target.project),
+                            false,
+                        );
+                        return Task::batch([
+                            select,
+                            emptied,
+                            refresh,
+                            branch_delete,
+                            self.lifecycle_sweep(),
+                            self.sync_chrome(),
+                        ]);
                     }
-                    if let (Some(id), Some(session)) = (target.worktree, &self.session) {
-                        session.save_worktrees([WorktreeState {
-                            id,
-                            project_id: target.project,
-                            generation: 0,
-                            path: target.path.clone(),
-                            branch: removed.and_then(|worktree| worktree.branch),
-                            existence: removed_existence("worktree removed"),
-                        }]);
-                    }
-                    self.forget_worktree_creation(&target.path);
-                    // The window may have moved anywhere while Git worked, a
-                    // channel included, so the scope it is on is re-selected
-                    // to drop the retired cards rather than replaced.
-                    let select = match self.durable.active_channel {
-                        Some(channel) => self.select_channel(channel),
-                        None => {
-                            let scope = self
-                                .active_workspace
-                                .clone()
-                                .filter(|active| !active.starts_with(&target.path))
-                                .unwrap_or_else(|| target.repository.clone());
-                            self.select_worktree(scope, false)
-                        }
-                    };
-                    self.persist();
-                    let detail = match safety.as_ref() {
-                        Some(snapshot) if snapshot.detached_only_commits > 0 => {
-                            "Worktree deleted; detached commits preserved in a rescue branch."
-                        }
-                        Some(snapshot) if snapshot.branch.is_none() => "Detached worktree deleted.",
-                        _ => "Worktree deleted; branch retained.",
-                    };
-                    let warnings = target.worktree.and_then(|id| self.project_ui.deletion_warnings.remove(&id)).unwrap_or_default();
-                    self.status = Some(if warnings.is_empty() { TransientNotice::success(detail) }
-                        else { TransientNotice::warning(format!("{detail} {}", warnings.join("; "))) });
-                    let branch_delete = target.worktree.and_then(|id| self.project_ui.branch_deletions.remove(&id)).map(|mut request| {
-                        request.warnings = warnings.clone();
-                        self.project_ui.branch_requests.insert(request.id);
-                        branch_deletion_task(request, false)
-                    }).unwrap_or_else(Task::none);
-                    let refresh =
-                        self.repository_load_task(target.repository, Some(target.project), false);
-                    return Task::batch([
-                        select,
-                        emptied,
-                        refresh,
-                        branch_delete,
-                        self.lifecycle_sweep(),
-                        self.sync_chrome(),
-                    ]);
                 }
-                }
-            },
+            }
             Action::Finished(result) => {
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(error));
@@ -1951,9 +2380,21 @@ impl Cagents {
                 Message::ProjectUi(Action::AwaitSessions(target))
             });
         }
-        let authorization = target.worktree.and_then(|id| self.project_ui.deletion_authorizations.get(&id)).cloned();
-        let consented_agents = target.worktree.and_then(|id| self.project_ui.deletion_busy_agents.get(&id)).cloned();
-        let Some(started_at) = target.worktree.and_then(|id| self.project_ui.deletions.get(&id)).map(|deletion| deletion.started_at) else { return Task::none(); };
+        let authorization = target
+            .worktree
+            .and_then(|id| self.project_ui.deletion_authorizations.get(&id))
+            .cloned();
+        let consented_agents = target
+            .worktree
+            .and_then(|id| self.project_ui.deletion_busy_agents.get(&id))
+            .cloned();
+        let Some(started_at) = target
+            .worktree
+            .and_then(|id| self.project_ui.deletions.get(&id))
+            .map(|deletion| deletion.started_at)
+        else {
+            return Task::none();
+        };
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -1976,13 +2417,20 @@ impl Cagents {
                     _ => Err("Unexpected guarded worktree session close response".into()),
                 }
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
-            Message::ProjectUi(Action::DeletionSessionsClosed { target, started_at, result })
+            Message::ProjectUi(Action::DeletionSessionsClosed {
+                target,
+                started_at,
+                result,
+            })
         })
     }
 
     fn remove_worktree_after_sessions(&mut self, target: Target) -> Task<Message> {
         let allow_local = crate::device::selected().is_none();
-        let authorization = target.worktree.and_then(|id| self.project_ui.deletion_authorizations.get(&id)).cloned();
+        let authorization = target
+            .worktree
+            .and_then(|id| self.project_ui.deletion_authorizations.get(&id))
+            .cloned();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let request = target.clone();
@@ -2093,8 +2541,16 @@ impl Cagents {
             .flat_map(|project| &mut project.worktrees)
         {
             worktree.deletion = self.project_ui.row_deletion(worktree.id);
-            worktree.cleanup_kept = self.settings.auto_delete_merged_worktrees.then(|| self.project_ui.automatic_attempts
-                .get(&worktree.id).and_then(|attempt| attempt.reason.clone())).flatten();
+            worktree.cleanup_kept = self
+                .settings
+                .auto_delete_merged_worktrees
+                .then(|| {
+                    self.project_ui
+                        .automatic_attempts
+                        .get(&worktree.id)
+                        .and_then(|attempt| attempt.reason.clone())
+                })
+                .flatten();
         }
     }
 
@@ -2102,7 +2558,11 @@ impl Cagents {
         self.worktree_deletion_blocker_ignoring_lock(target, false)
     }
 
-    fn worktree_deletion_blocker_ignoring_lock(&self, target: &Target, allow_lock: bool) -> Option<String> {
+    fn worktree_deletion_blocker_ignoring_lock(
+        &self,
+        target: &Target,
+        allow_lock: bool,
+    ) -> Option<String> {
         if self.session.is_none() {
             return Some(
                 "Session storage is unavailable; deletion cannot be recorded safely.".into(),
@@ -2151,18 +2611,37 @@ impl Cagents {
     }
 
     fn worktree_busy_agents(&self, target: &Target) -> usize {
-        self.project_ui.dialog.as_ref().filter(|dialog| dialog.target.worktree == target.worktree && dialog.target.path == target.path)
+        self.project_ui
+            .dialog
+            .as_ref()
+            .filter(|dialog| {
+                dialog.target.worktree == target.worktree && dialog.target.path == target.path
+            })
             .map_or(0, |dialog| dialog.busy_agents.len())
     }
 
     fn delete_branch_default(&self, target: &Target, snapshot: &WorktreeSafetySnapshot) -> bool {
-        let Some(project) = self.sidebar_model.project(target.project) else { return false; };
-        let Some(source) = project.worktrees.iter().find(|row| Some(row.id) == target.worktree).and_then(|row| row.head_repository.as_ref()) else { return false; };
-        let Some(branch) = snapshot.branch.as_deref() else { return false; };
-        project.pull_requests.iter().any(|pr| pr.state == Some(crate::sidebar::WorktreePullRequestState::Merged)
-            && pr.head_ref == branch
-            && pr.head_oid.as_ref() == snapshot.head_oid.as_ref() && snapshot.head_oid.is_some()
-            && pr.head_repository.as_ref() == Some(source))
+        let Some(project) = self.sidebar_model.project(target.project) else {
+            return false;
+        };
+        let Some(source) = project
+            .worktrees
+            .iter()
+            .find(|row| Some(row.id) == target.worktree)
+            .and_then(|row| row.head_repository.as_ref())
+        else {
+            return false;
+        };
+        let Some(branch) = snapshot.branch.as_deref() else {
+            return false;
+        };
+        project.pull_requests.iter().any(|pr| {
+            pr.state == Some(crate::sidebar::WorktreePullRequestState::Merged)
+                && pr.head_ref == branch
+                && pr.head_oid.as_ref() == snapshot.head_oid.as_ref()
+                && snapshot.head_oid.is_some()
+                && pr.head_repository.as_ref() == Some(source)
+        })
     }
 
     /// What the deletion takes with it: the open terminal and chat cards
@@ -2338,10 +2817,18 @@ impl Cagents {
             )));
             if let Some(branch) = &snapshot.branch {
                 if dialog.branch_elsewhere {
-                    rows.push(super::notice_detail(format!("Branch {branch} is checked out elsewhere and will be retained.")));
+                    rows.push(super::notice_detail(format!(
+                        "Branch {branch} is checked out elsewhere and will be retained."
+                    )));
                 } else {
-                    rows.push(crate::settings_widgets::toggle("Delete branch too", dialog.delete_branch,
-                        |value| Message::ProjectUi(Action::DeleteBranchChanged(value))).into());
+                    rows.push(
+                        crate::settings_widgets::toggle(
+                            "Delete branch too",
+                            dialog.delete_branch,
+                            |value| Message::ProjectUi(Action::DeleteBranchChanged(value)),
+                        )
+                        .into(),
+                    );
                     rows.push(super::notice_detail(format!("Branch {branch} uses Git's safe deletion check. Unmerged commits require a separate confirmation.")));
                 }
             } else if snapshot.detached_only_commits > 0 {
@@ -2364,11 +2851,22 @@ impl Cagents {
         }
         let busy = self.worktree_busy_agents(target);
         if busy > 0 {
-            rows.push(super::notice_body(format!("{busy} {} working in this worktree.", if busy == 1 { "agent is" } else { "agents are" })));
-            rows.push(crate::settings_widgets::toggle("Interrupt these agents and delete", dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents),
-                |value| Message::ProjectUi(Action::BusyAgentsConfirmed(value))).into());
+            rows.push(super::notice_body(format!(
+                "{busy} {} working in this worktree.",
+                if busy == 1 { "agent is" } else { "agents are" }
+            )));
+            rows.push(
+                crate::settings_widgets::toggle(
+                    "Interrupt these agents and delete",
+                    dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents),
+                    |value| Message::ProjectUi(Action::BusyAgentsConfirmed(value)),
+                )
+                .into(),
+            );
         }
-        if dialog.stale_lock { rows.push(super::notice_detail("The cagents creation has settled and its process lease is free. Unlocking is checked again before deletion.")); }
+        if dialog.stale_lock {
+            rows.push(super::notice_detail("The cagents creation has settled and its process lease is free. Unlocking is checked again before deletion."));
+        }
         if dialog.loading || dialog.options_loading {
             rows.push(super::notice_body("Checking current files and commits…"));
         }
@@ -2386,9 +2884,12 @@ impl Cagents {
         // Reopened from a row whose deletion failed, the dialog says why and
         // confirming runs it again; `ConfirmDelete` re-checks every
         // precondition first either way.
-        let confirm = (dialog.blocker.is_none() && !dialog.loading && !dialog.options_loading && dialog.safety.is_some()
+        let confirm = (dialog.blocker.is_none()
+            && !dialog.loading
+            && !dialog.options_loading
+            && dialog.safety.is_some()
             && (busy == 0 || dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents)))
-            .then_some(Message::ProjectUi(Action::ConfirmDelete));
+        .then_some(Message::ProjectUi(Action::ConfirmDelete));
         let label = match dialog.safety.as_ref() {
             Some(snapshot) if snapshot.detached_only_commits > 0 => {
                 if snapshot.files_to_discard() > 0 {
@@ -2418,7 +2919,11 @@ impl Cagents {
             }
             _ => "Delete worktree".to_owned(),
         };
-        let label = if dialog.stale_lock { format!("Unlock and {}", label.to_lowercase()) } else { label };
+        let label = if dialog.stale_lock {
+            format!("Unlock and {}", label.to_lowercase())
+        } else {
+            label
+        };
         let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
@@ -2427,8 +2932,11 @@ impl Cagents {
                 .id(widget::Id::new("dialog.project.confirm"))
                 .on_press_maybe(confirm),
         );
-        let form = widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(Length::Shrink))
-            .max_height((self.window_height - 180.0).max(120.0));
+        let form = widget::container(
+            widget::scrollable(widget::column::with_children(rows).spacing(space::M))
+                .height(Length::Shrink),
+        )
+        .max_height((self.window_height - 180.0).max(120.0));
 
         Some(super::dialog_ui::surface(
             widget::column::with_children(vec![form.into(), actions]).spacing(space::M),
@@ -2865,7 +3373,10 @@ fn remove_project_from_cagents(
 /// Returns what was removed, by which its creation is released, or `None`
 /// when Git could not say where the worktree's administrative files were.
 #[cfg(test)]
-fn delete_worktree(target: &Target, confirmed: &WorktreeSafetySnapshot) -> Result<Option<RemovedWorktree>, String> {
+fn delete_worktree(
+    target: &Target,
+    confirmed: &WorktreeSafetySnapshot,
+) -> Result<Option<RemovedWorktree>, String> {
     delete_worktree_inner(target, confirmed, true)
 }
 
@@ -2912,7 +3423,9 @@ fn delete_worktree_inner(
         })
         .ok();
     verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
-    if close_sessions { close_worktree_sessions(target)?; }
+    if close_sessions {
+        close_worktree_sessions(target)?;
+    }
     // Processes may have written during shutdown; consent covers only the
     // inspected state, not changes produced after confirmation.
     verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
@@ -2972,30 +3485,55 @@ fn verify_worktree_safety(
     Ok(())
 }
 
-fn confirmed_removal_operation(target: &Target, confirmed: &WorktreeSafetySnapshot) -> Result<crate::worktree_control::Operation, String> {
+fn confirmed_removal_operation(
+    target: &Target,
+    confirmed: &WorktreeSafetySnapshot,
+) -> Result<crate::worktree_control::Operation, String> {
     // The control protocol currently represents removal targets as UTF-8.
     // A lossy path could name a different checkout and must never be sent.
     let path = target.path.to_str().ok_or("This worktree path cannot be represented by the daemon protocol; remove it explicitly in Git")?;
     Ok(crate::worktree_control::Operation::Remove {
-        repository: target.repository.clone(), target: path.to_owned(),
-        force: confirmed.files_to_discard() > 0, delete_branch: false,
+        repository: target.repository.clone(),
+        target: path.to_owned(),
+        force: confirmed.files_to_discard() > 0,
+        delete_branch: false,
         expected_fingerprint: Some(confirmed.fingerprint.clone()),
         resolved_path: None,
     })
 }
 
-fn worktree_control_request(operation: crate::worktree_control::Operation) -> Result<crate::worktree_control::Reply, String> {
-    match crate::device_service::request(crate::device_service::Operation::Worktree { operation })? {
+fn worktree_control_request(
+    operation: crate::worktree_control::Operation,
+) -> Result<crate::worktree_control::Reply, String> {
+    match crate::device_service::request(crate::device_service::Operation::Worktree { operation })?
+    {
         crate::device_service::Reply::Worktree(reply) => Ok(reply),
         _ => Err("Unexpected worktree control response".into()),
     }
 }
 
-fn unlock_stale_worktree_for_window(store: &crate::persistence::StateStore, repository: &Path, path: &Path, allow_local: bool) -> Result<(), String> {
-    let local = if allow_local { RepositoryService::system("git").unlock_stale_worktree(store, repository, path, &CancellationToken::new()) }
-        else { Err("This worktree belongs to the selected device".into()) };
+fn unlock_stale_worktree_for_window(
+    store: &crate::persistence::StateStore,
+    repository: &Path,
+    path: &Path,
+    allow_local: bool,
+) -> Result<(), String> {
+    let local = if allow_local {
+        RepositoryService::system("git").unlock_stale_worktree(
+            store,
+            repository,
+            path,
+            &CancellationToken::new(),
+        )
+    } else {
+        Err("This worktree belongs to the selected device".into())
+    };
     local.or_else(|local_error| {
-        match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: repository.to_path_buf(), path: path.to_path_buf(), unlock: true }) {
+        match worktree_control_request(crate::worktree_control::Operation::StaleLock {
+            repository: repository.to_path_buf(),
+            path: path.to_path_buf(),
+            unlock: true,
+        }) {
             Ok(crate::worktree_control::Reply::StaleLock { unlocked: true }) => Ok(()),
             Ok(_) => Err("Unexpected stale-lock unlock response".into()),
             Err(error) => Err(format!("{local_error}; {error}")),
@@ -3008,75 +3546,162 @@ fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
         let worker = request.clone();
         let result = tokio::task::spawn_blocking(move || {
             let expected_branch = worker.branch.clone();
-            let other = |detail| crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail };
-            match worktree_control_request(crate::worktree_control::Operation::DeleteBranch { repository: worker.repository, branch: worker.branch, force, expected_oid: Some(worker.expected_oid) }).map_err(other)? {
-                crate::worktree_control::Reply::BranchDeleted { branch } if branch == expected_branch => Ok(()),
+            let other = |detail| crate::worktree_branch::BranchDeleteFailure {
+                kind: crate::worktree_branch::BranchDeleteFailureKind::Other,
+                detail,
+            };
+            match worktree_control_request(crate::worktree_control::Operation::DeleteBranch {
+                repository: worker.repository,
+                branch: worker.branch,
+                force,
+                expected_oid: Some(worker.expected_oid),
+            })
+            .map_err(other)?
+            {
+                crate::worktree_control::Reply::BranchDeleted { branch }
+                    if branch == expected_branch =>
+                {
+                    Ok(())
+                }
                 crate::worktree_control::Reply::BranchDeleteRefused { failure } => Err(failure),
                 _ => Err(other("Unexpected branch deletion response".into())),
             }
-        }).await.unwrap_or_else(|error| Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail: error.to_string() }));
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(crate::worktree_branch::BranchDeleteFailure {
+                kind: crate::worktree_branch::BranchDeleteFailureKind::Other,
+                detail: error.to_string(),
+            })
+        });
         Message::ProjectUi(Action::BranchDeleted { request, result })
     })
 }
 
-fn delete_options_task(target: Target, request: u64, store: crate::persistence::StateStore) -> Task<Message> {
+fn delete_options_task(
+    target: Target,
+    request: u64,
+    store: crate::persistence::StateStore,
+) -> Task<Message> {
     let allow_local = crate::device::selected().is_none();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let crate::worktree_control::Reply::Listed { worktrees: records } = worktree_control_request(crate::worktree_control::Operation::List { repository: target.repository.clone() })? else { return Err("Unexpected worktree listing response".into()); };
-            let record = records.iter().find(|record| record.path == target.path).ok_or("Worktree no longer registered")?;
-            let branch_elsewhere = record.branch.as_ref().is_some_and(|branch| records.iter().any(|other| other.path != record.path && other.branch.as_ref() == Some(branch)));
+            let crate::worktree_control::Reply::Listed { worktrees: records } =
+                worktree_control_request(crate::worktree_control::Operation::List {
+                    repository: target.repository.clone(),
+                })?
+            else {
+                return Err("Unexpected worktree listing response".into());
+            };
+            let record = records
+                .iter()
+                .find(|record| record.path == target.path)
+                .ok_or("Worktree no longer registered")?;
+            let branch_elsewhere = record.branch.as_ref().is_some_and(|branch| {
+                records
+                    .iter()
+                    .any(|other| other.path != record.path && other.branch.as_ref() == Some(branch))
+            });
             let lock = record.locked.then(|| {
-                let local = if allow_local { RepositoryService::system("git").stale_worktree_lock(&store, &target.repository, &target.path, &CancellationToken::new()) }
-                    else { Err("This worktree belongs to the selected device".into()) };
+                let local = if allow_local {
+                    RepositoryService::system("git").stale_worktree_lock(
+                        &store,
+                        &target.repository,
+                        &target.path,
+                        &CancellationToken::new(),
+                    )
+                } else {
+                    Err("This worktree belongs to the selected device".into())
+                };
                 local.or_else(|local_error| {
-                    match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: target.repository.clone(), path: target.path.clone(), unlock: false }) {
+                    match worktree_control_request(crate::worktree_control::Operation::StaleLock {
+                        repository: target.repository.clone(),
+                        path: target.path.clone(),
+                        unlock: false,
+                    }) {
                         Ok(crate::worktree_control::Reply::StaleLock { unlocked: false }) => Ok(()),
                         Ok(_) => Err("Unexpected stale-lock inspection response".into()),
                         Err(error) => Err(format!("{local_error}; {error}")),
                     }
                 })
             });
-            Ok(DeleteOptions { branch_elsewhere, stale_lock: matches!(&lock, Some(Ok(()))), lock_error: lock.and_then(Result::err) })
-        }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            Ok(DeleteOptions {
+                branch_elsewhere,
+                stale_lock: matches!(&lock, Some(Ok(()))),
+                lock_error: lock.and_then(Result::err),
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
         Message::ProjectUi(Action::DeleteOptionsRead { request, result })
     })
 }
 
 /// All paths belong to the selected device. The UI never opens a remote
 /// path with local Git or reads a different clone's cleanup policy.
-fn inspect_worktree(repository: &Path, path: &Path) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
+fn inspect_worktree(
+    repository: &Path,
+    path: &Path,
+) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
     let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
         operation: crate::worktree_control::Operation::Inspect {
-            repository: repository.to_owned(), path: path.to_owned(),
+            repository: repository.to_owned(),
+            path: path.to_owned(),
         },
     })?;
     inspected_worktree(reply)
 }
 
-fn inspected_worktree(reply: crate::device_service::Reply) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
+fn inspected_worktree(
+    reply: crate::device_service::Reply,
+) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
     let crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
-        snapshot, disposable_ignored_directories,
-    }) = reply else { return Err("The selected device returned an unexpected worktree inspection reply.".into()); };
-    let safety = serde_json::from_str(&snapshot)
-        .map_err(|error| format!("The selected device returned invalid worktree safety data: {error}"))?;
+        snapshot,
+        disposable_ignored_directories,
+    }) = reply
+    else {
+        return Err("The selected device returned an unexpected worktree inspection reply.".into());
+    };
+    let safety = serde_json::from_str(&snapshot).map_err(|error| {
+        format!("The selected device returned invalid worktree safety data: {error}")
+    })?;
     Ok((safety, disposable_ignored_directories))
-
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct AgentCensus { agents: Vec<BusyAgent>, census: Vec<BusyAgent> }
+pub struct AgentCensus {
+    agents: Vec<BusyAgent>,
+    census: Vec<BusyAgent>,
+}
 
 fn busy_worktree_agents(repository: &Path, path: &Path) -> Result<AgentCensus, String> {
-    let reply = worktree_control_request(crate::worktree_control::Operation::BusySessions { repository: repository.to_owned(), path: path.to_owned() })?;
+    let reply = worktree_control_request(crate::worktree_control::Operation::BusySessions {
+        repository: repository.to_owned(),
+        path: path.to_owned(),
+    })?;
     checked_busy_worktree_agents(reply)
 }
 
-fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result<AgentCensus, String> {
-    let crate::worktree_control::Reply::BusySessions { mut agents, mut census } = reply else { return Err("Unexpected worktree agent census response".into()); };
-    agents.sort(); census.sort();
-    if [&agents, &census].into_iter().any(|rows| rows.windows(2).any(|pair| pair[0].session == pair[1].session))
-        || agents.iter().any(|agent| census.binary_search(agent).is_err()) {
+fn checked_busy_worktree_agents(
+    reply: crate::worktree_control::Reply,
+) -> Result<AgentCensus, String> {
+    let crate::worktree_control::Reply::BusySessions {
+        mut agents,
+        mut census,
+    } = reply
+    else {
+        return Err("Unexpected worktree agent census response".into());
+    };
+    agents.sort();
+    census.sort();
+    if [&agents, &census].into_iter().any(|rows| {
+        rows.windows(2)
+            .any(|pair| pair[0].session == pair[1].session)
+    }) || agents
+        .iter()
+        .any(|agent| census.binary_search(agent).is_err())
+    {
         return Err("The daemon returned ambiguous active agent identities".into());
     }
     Ok(AgentCensus { agents, census })
@@ -3087,15 +3712,20 @@ fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result
 fn read_cleanup_policy(repository: &Path) -> Result<Vec<String>, String> {
     let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
         operation: crate::worktree_control::Operation::GetDisposableIgnoredDirectories {
-            repository: repository.to_owned(), path: repository.to_owned(),
+            repository: repository.to_owned(),
+            path: repository.to_owned(),
         },
     })?;
     disposable_ignored_directories(reply)
 }
 
-fn disposable_ignored_directories(reply: crate::device_service::Reply) -> Result<Vec<String>, String> {
+fn disposable_ignored_directories(
+    reply: crate::device_service::Reply,
+) -> Result<Vec<String>, String> {
     match reply {
-        crate::device_service::Reply::Worktree(crate::worktree_control::Reply::DisposableIgnoredDirectories { directories }) => Ok(directories),
+        crate::device_service::Reply::Worktree(
+            crate::worktree_control::Reply::DisposableIgnoredDirectories { directories },
+        ) => Ok(directories),
         _ => Err("The selected device returned an unexpected project cleanup policy reply.".into()),
     }
 }
@@ -3202,36 +3832,67 @@ mod tests {
     fn cleanup_policy_reply_does_not_require_a_deletion_snapshot() {
         let directories = vec!["build,data".to_owned(), "cache ".to_owned()];
         let decoded = disposable_ignored_directories(crate::device_service::Reply::Worktree(
-            crate::worktree_control::Reply::DisposableIgnoredDirectories { directories: directories.clone() },
-        )).unwrap();
+            crate::worktree_control::Reply::DisposableIgnoredDirectories {
+                directories: directories.clone(),
+            },
+        ))
+        .unwrap();
         assert_eq!(decoded, directories);
-        assert!(disposable_ignored_directories(crate::device_service::Reply::Worktree(
-            crate::worktree_control::Reply::Inspected { snapshot: "{}".into(), disposable_ignored_directories: vec![] },
-        )).is_err());
+        assert!(
+            disposable_ignored_directories(crate::device_service::Reply::Worktree(
+                crate::worktree_control::Reply::Inspected {
+                    snapshot: "{}".into(),
+                    disposable_ignored_directories: vec![]
+                },
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn worktree_inspection_rejects_wrong_or_malformed_device_reply() {
-        assert!(inspected_worktree(crate::device_service::Reply::Worktree(
-            crate::worktree_control::Reply::Listed { worktrees: Vec::new() })).is_err());
-        assert!(inspected_worktree(crate::device_service::Reply::Worktree(
-            crate::worktree_control::Reply::Inspected { snapshot: "{}".into(), disposable_ignored_directories: vec![] })).is_err());
+        assert!(
+            inspected_worktree(crate::device_service::Reply::Worktree(
+                crate::worktree_control::Reply::Listed {
+                    worktrees: Vec::new()
+                }
+            ))
+            .is_err()
+        );
+        assert!(
+            inspected_worktree(crate::device_service::Reply::Worktree(
+                crate::worktree_control::Reply::Inspected {
+                    snapshot: "{}".into(),
+                    disposable_ignored_directories: vec![]
+                }
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn worktree_inspection_preserves_byte_exact_ignored_paths_and_policy_names() {
         let safety = WorktreeSafetySnapshot {
-            fingerprint: "fresh-device-snapshot".into(), modified: 0, untracked: 1,
-            notable_ignored: vec![crate::repository::RepoPath::from_bytes(b"ignored-\xff").unwrap()],
-            unpushed_commits: 2, detached_only_commits: 0, branch: Some("feature".into()), head_oid: Some("abcd".into()),
+            fingerprint: "fresh-device-snapshot".into(),
+            modified: 0,
+            untracked: 1,
+            notable_ignored: vec![
+                crate::repository::RepoPath::from_bytes(b"ignored-\xff").unwrap(),
+            ],
+            unpushed_commits: 2,
+            detached_only_commits: 0,
+            branch: Some("feature".into()),
+            head_oid: Some("abcd".into()),
         };
         let directories = vec!["build,data".to_owned(), "cache ".to_owned()];
-        let reply = crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
-            snapshot: serde_json::to_string(&safety).unwrap(), disposable_ignored_directories: directories.clone(),
-        });
-        let (decoded,policy) = inspected_worktree(reply).unwrap();
-        assert_eq!(decoded,safety);
-        assert_eq!(policy,directories);
+        let reply =
+            crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
+                snapshot: serde_json::to_string(&safety).unwrap(),
+                disposable_ignored_directories: directories.clone(),
+            });
+        let (decoded, policy) = inspected_worktree(reply).unwrap();
+        assert_eq!(decoded, safety);
+        assert_eq!(policy, directories);
     }
 
     use super::*;
@@ -3257,8 +3918,18 @@ mod tests {
             return;
         };
         let request = dialog.request;
-        let agents = AgentCensus { agents: dialog.busy_agents.clone(), census: dialog.session_census.clone() };
-        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+        let agents = AgentCensus {
+            agents: dialog.busy_agents.clone(),
+            census: dialog.session_census.clone(),
+        };
+        drop(app.handle_project_action(Action::DeleteOptionsRead {
+            request,
+            result: Ok(DeleteOptions {
+                branch_elsewhere: false,
+                stale_lock: false,
+                lock_error: None,
+            }),
+        }));
         let snapshot = clean_snapshot();
         drop(app.handle_project_action(Action::SafetyRead {
             request,
@@ -3311,11 +3982,21 @@ mod tests {
     #[test]
     fn opened_project_and_worktree_removal_focus_the_cancel_button() {
         let repository = PathBuf::from("/focus-repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let task = app.handle_project_action(Action::Command {
-            project_id: project, worktree_id: None, command: ProjectCommand::Remove,
+            project_id: project,
+            worktree_id: None,
+            command: ProjectCommand::Remove,
         });
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
@@ -3324,8 +4005,11 @@ mod tests {
         // The primary worktree refusal is synchronous, so the actual opening
         // task contains only focus operations and cannot start a daemon.
         let task = app.open_worktree_delete_dialog(Target {
-            project, worktree: Some(primary.id), repository: repository.clone(),
-            path: repository, label: "main".into(),
+            project,
+            worktree: Some(primary.id),
+            repository: repository.clone(),
+            path: repository,
+            label: "main".into(),
         });
         assert!(app.project_ui.remove_dialog.is_none());
         assert!(app.project_ui.dialog.as_ref().unwrap().blocker.is_some());
@@ -3339,17 +4023,23 @@ mod tests {
     fn loaded_cleanup_policy_focuses_its_actual_editable_field() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.project_ui.cleanup_dialog = Some(CleanupPolicyDialog {
-            repository: PathBuf::from("/focus-repo"), name: "repo".into(),
-            directories: String::new(), loading: true, error: None, request: 19,
+            repository: PathBuf::from("/focus-repo"),
+            name: "repo".into(),
+            directories: String::new(),
+            loading: true,
+            error: None,
+            request: 19,
         });
-        let loading_focus = iced::widget::operation::focus(app.project_ui.focus_target()).map(cosmic::Action::App);
+        let loading_focus =
+            iced::widget::operation::focus(app.project_ui.focus_target()).map(cosmic::Action::App);
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), loading_focus),
             Some(widget::Id::new("dialog.project.cleanup.cancel")),
             "the disabled loading field must not consume initial focus",
         );
         let task = app.handle_project_action(Action::CleanupPolicyRead {
-            request: 19, result: Ok(vec!["target".into()]),
+            request: 19,
+            result: Ok(vec!["target".into()]),
         });
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
@@ -3368,16 +4058,36 @@ mod tests {
     #[test]
     fn branch_delete_defaults_require_exact_merged_head_and_repository() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let mut linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
-        let source = crate::github::GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let mut linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
+        let source =
+            crate::github::GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
         linked.head_repository = Some(source.clone());
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
-        let mut snapshot = clean_snapshot(); snapshot.head_oid = Some("a".repeat(40));
-        let mut pr = crate::sidebar::SidebarPullRequest::new(project, 1, "Merged feature".into(), Url::parse("https://github.com/example/repo/pull/1").unwrap(), "feature".into(), None, false, crate::sidebar::CheckStatus::Passing);
+        let mut snapshot = clean_snapshot();
+        snapshot.head_oid = Some("a".repeat(40));
+        let mut pr = crate::sidebar::SidebarPullRequest::new(
+            project,
+            1,
+            "Merged feature".into(),
+            Url::parse("https://github.com/example/repo/pull/1").unwrap(),
+            "feature".into(),
+            None,
+            false,
+            crate::sidebar::CheckStatus::Passing,
+        );
         pr.state = Some(crate::sidebar::WorktreePullRequestState::Merged);
-        pr.head_oid = snapshot.head_oid.clone(); pr.head_repository = Some(source);
+        pr.head_oid = snapshot.head_oid.clone();
+        pr.head_repository = Some(source);
         app.sidebar_model.projects[0].pull_requests.push(pr);
         assert!(app.delete_branch_default(&target, &snapshot));
         // The safety snapshot already contains a local name, including a
@@ -3391,9 +4101,11 @@ mod tests {
         snapshot.head_oid = Some("b".repeat(40));
         assert!(!app.delete_branch_default(&target, &snapshot));
         snapshot.head_oid = Some("a".repeat(40));
-        app.sidebar_model.projects[0].pull_requests[0].state = Some(crate::sidebar::WorktreePullRequestState::Open);
+        app.sidebar_model.projects[0].pull_requests[0].state =
+            Some(crate::sidebar::WorktreePullRequestState::Open);
         assert!(!app.delete_branch_default(&target, &snapshot));
-        app.sidebar_model.projects[0].pull_requests[0].state = Some(crate::sidebar::WorktreePullRequestState::Merged);
+        app.sidebar_model.projects[0].pull_requests[0].state =
+            Some(crate::sidebar::WorktreePullRequestState::Merged);
         app.sidebar_model.projects[0].pull_requests[0].head_repository = None;
         assert!(!app.delete_branch_default(&target, &snapshot));
     }
@@ -3401,14 +4113,27 @@ mod tests {
     #[test]
     fn working_agents_need_separate_counted_consent() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
         drop(app.open_worktree_delete_dialog(target));
         // No current-window card exists for this detached daemon agent.
         assert!(app.durable.cards.is_empty());
-        let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) };
+        let agent = BusyAgent {
+            session: TerminalId::new(),
+            instance: uuid::Uuid::new_v4(),
+            close_revision: Some(1),
+            turn_generation: Some(3),
+        };
         app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![agent.clone()];
         app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent];
         confirm_deletion_fixture(&mut app);
@@ -3422,13 +4147,26 @@ mod tests {
     fn replacing_an_agent_or_its_turn_invalidates_counted_consent() {
         for change in 0..4 {
             let repository = PathBuf::from("/repo");
-            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-            let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.join("linked"),
+                Some("feature".into()),
+            );
             let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
             let target = app.project_target(project, Some(linked.id)).unwrap();
             drop(app.open_worktree_delete_dialog(target));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
-            let original = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) };
+            let original = BusyAgent {
+                session: TerminalId::new(),
+                instance: uuid::Uuid::new_v4(),
+                close_revision: Some(1),
+                turn_generation: Some(3),
+            };
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
             app.project_ui.dialog.as_mut().unwrap().session_census = vec![original.clone()];
             confirm_deletion_fixture(&mut app);
@@ -3441,102 +4179,277 @@ mod tests {
                 2 => changed.close_revision = Some(2),
                 _ => changed.turn_generation = Some(4),
             }
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus { agents: vec![changed.clone()], census: vec![changed] })) }));
+            drop(app.handle_project_action(Action::SafetyRead {
+                request,
+                confirming: true,
+                result: Ok((
+                    clean_snapshot(),
+                    AgentCensus {
+                        agents: vec![changed.clone()],
+                        census: vec![changed],
+                    },
+                )),
+            }));
             assert!(!app.project_ui.is_deleting(linked.id));
-            assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
+            assert!(
+                app.project_ui
+                    .dialog
+                    .as_ref()
+                    .unwrap()
+                    .busy_confirmed
+                    .is_none()
+            );
         }
     }
 
     #[test]
     fn an_idle_actor_change_requires_a_fresh_deletion_confirmation() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
         drop(app.open_worktree_delete_dialog(target));
         let request = app.project_ui.dialog.as_ref().unwrap().request;
-        let mut actor = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(0) };
-        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
-        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus { agents: vec![], census: vec![actor.clone()] })) }));
+        let mut actor = BusyAgent {
+            session: TerminalId::new(),
+            instance: uuid::Uuid::new_v4(),
+            close_revision: Some(1),
+            turn_generation: Some(0),
+        };
+        drop(app.handle_project_action(Action::DeleteOptionsRead {
+            request,
+            result: Ok(DeleteOptions {
+                branch_elsewhere: false,
+                stale_lock: false,
+                lock_error: None,
+            }),
+        }));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: false,
+            result: Ok((
+                clean_snapshot(),
+                AgentCensus {
+                    agents: vec![],
+                    census: vec![actor.clone()],
+                },
+            )),
+        }));
         drop(app.handle_project_action(Action::ConfirmDelete));
         actor.close_revision = Some(2);
-        drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus { agents: vec![], census: vec![actor] })) }));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: true,
+            result: Ok((
+                clean_snapshot(),
+                AgentCensus {
+                    agents: vec![],
+                    census: vec![actor],
+                },
+            )),
+        }));
         assert!(!app.project_ui.is_deleting(linked.id));
-        assert!(app.project_ui.dialog.as_ref().unwrap().failure.as_deref().unwrap().contains("changed"));
+        assert!(
+            app.project_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("changed")
+        );
     }
 
     #[test]
     fn malformed_or_duplicate_busy_census_is_never_treated_as_idle() {
-        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
-        let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) };
-        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone()], census: vec![] }).is_err());
-        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent.clone()], census: vec![agent] }).is_err());
+        assert!(
+            checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock {
+                unlocked: false
+            })
+            .is_err()
+        );
+        let agent = BusyAgent {
+            session: TerminalId::new(),
+            instance: uuid::Uuid::new_v4(),
+            close_revision: Some(1),
+            turn_generation: Some(1),
+        };
+        assert!(
+            checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
+                agents: vec![agent.clone()],
+                census: vec![]
+            })
+            .is_err()
+        );
+        assert!(
+            checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
+                agents: vec![agent.clone(), agent.clone()],
+                census: vec![agent]
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn deletion_controls_and_late_confirmations_wait_for_their_exposed_dialog() {
         for update in [false, true] {
             let repository = PathBuf::from("/repo");
-            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-            let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.join("linked"),
+                Some("feature".into()),
+            );
             let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
             let target = app.project_target(project, Some(linked.id)).unwrap();
             drop(app.open_worktree_delete_dialog(target));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
-            drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
-            app.update_prepared = update; app.settings_reset_confirm = !update;
+            drop(app.handle_project_action(Action::DeleteOptionsRead {
+                request,
+                result: Ok(DeleteOptions {
+                    branch_elsewhere: false,
+                    stale_lock: false,
+                    lock_error: None,
+                }),
+            }));
+            drop(app.handle_project_action(Action::SafetyRead {
+                request,
+                confirming: false,
+                result: Ok((clean_snapshot(), AgentCensus::default())),
+            }));
+            app.update_prepared = update;
+            app.settings_reset_confirm = !update;
             drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
             assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
             drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
-            assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
+            assert!(
+                app.project_ui
+                    .dialog
+                    .as_ref()
+                    .unwrap()
+                    .busy_confirmed
+                    .is_none()
+            );
             drop(app.handle_project_action(Action::ConfirmDelete));
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+            drop(app.handle_project_action(Action::SafetyRead {
+                request,
+                confirming: true,
+                result: Ok((clean_snapshot(), AgentCensus::default())),
+            }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.is_some());
         }
-        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::ForceDeleteBranch(crate::model::OperationId::new()))));
-        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::BusyAgentsConfirmed(true))));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(
+            Action::ForceDeleteBranch(crate::model::OperationId::new())
+        )));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(
+            Action::BusyAgentsConfirmed(true)
+        )));
     }
 
     #[test]
     fn force_confirmation_blocks_retained_lower_delete_controls_and_async_confirmation() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
         drop(app.open_worktree_delete_dialog(target));
         let request = app.project_ui.dialog.as_ref().unwrap().request;
-        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
-        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
-        let force = BranchDeletion { id: crate::model::OperationId::new(), repository, branch: "other".into(), expected_oid: "a".repeat(40), warnings: vec![] };
-        app.project_ui.force_branches.push_back((force, "Unmerged".into()));
+        drop(app.handle_project_action(Action::DeleteOptionsRead {
+            request,
+            result: Ok(DeleteOptions {
+                branch_elsewhere: false,
+                stale_lock: false,
+                lock_error: None,
+            }),
+        }));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: false,
+            result: Ok((clean_snapshot(), AgentCensus::default())),
+        }));
+        let force = BranchDeletion {
+            id: crate::model::OperationId::new(),
+            repository,
+            branch: "other".into(),
+            expected_oid: "a".repeat(40),
+            warnings: vec![],
+        };
+        app.project_ui
+            .force_branches
+            .push_back((force, "Unmerged".into()));
         drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
         assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
         drop(app.handle_project_action(Action::ConfirmDelete));
-        drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: true,
+            result: Ok((clean_snapshot(), AgentCensus::default())),
+        }));
         assert!(!app.project_ui.is_deleting(linked.id));
         assert!(app.project_ui.dialog.is_some());
         drop(app.handle_project_action(Action::Dismiss));
         assert!(app.project_ui.force_branches.is_empty());
-        assert!(app.project_ui.dialog.is_some(), "dismissing the upper force dialog preserves lower deletion");
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "dismissing the upper force dialog preserves lower deletion"
+        );
     }
 
     #[test]
     fn unmerged_branch_refusal_requires_a_separate_force_confirmation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let request = BranchDeletion { id: crate::model::OperationId::new(), repository: "/repo".into(), branch: "feature".into(), expected_oid: "a".repeat(40), warnings: Vec::new() };
+        let request = BranchDeletion {
+            id: crate::model::OperationId::new(),
+            repository: "/repo".into(),
+            branch: "feature".into(),
+            expected_oid: "a".repeat(40),
+            warnings: Vec::new(),
+        };
         app.project_ui.branch_requests.insert(request.id);
-        drop(app.handle_project_action(Action::BranchDeleted { request: request.clone(), result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Unmerged, detail: "Branch is not merged".into() }) }));
+        drop(app.handle_project_action(Action::BranchDeleted {
+            request: request.clone(),
+            result: Err(crate::worktree_branch::BranchDeleteFailure {
+                kind: crate::worktree_branch::BranchDeleteFailureKind::Unmerged,
+                detail: "Branch is not merged".into(),
+            }),
+        }));
         assert_eq!(app.project_ui.force_branches.len(), 1);
         assert!(app.project_ui.branch_requests.is_empty());
         drop(app.handle_project_action(Action::KeepBranch(request.id)));
         assert!(app.project_ui.force_branches.is_empty());
         // Checked-out branches never offer the destructive fallback.
         app.project_ui.branch_requests.insert(request.id);
-        drop(app.handle_project_action(Action::BranchDeleted { request, result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere, detail: "Checked out elsewhere".into() }) }));
+        drop(app.handle_project_action(Action::BranchDeleted {
+            request,
+            result: Err(crate::worktree_branch::BranchDeleteFailure {
+                kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere,
+                detail: "Checked out elsewhere".into(),
+            }),
+        }));
         assert!(app.project_ui.force_branches.is_empty());
     }
 
@@ -3544,11 +4457,22 @@ mod tests {
     fn stale_branch_buttons_cannot_confirm_a_later_branch() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let stale = crate::model::OperationId::new();
-        let current = BranchDeletion { id: crate::model::OperationId::new(), repository: "/repo".into(), branch: "current".into(), expected_oid: "b".repeat(40), warnings: Vec::new() };
-        app.project_ui.force_branches.push_back((current.clone(), "Unmerged".into()));
+        let current = BranchDeletion {
+            id: crate::model::OperationId::new(),
+            repository: "/repo".into(),
+            branch: "current".into(),
+            expected_oid: "b".repeat(40),
+            warnings: Vec::new(),
+        };
+        app.project_ui
+            .force_branches
+            .push_back((current.clone(), "Unmerged".into()));
         drop(app.handle_project_action(Action::ForceDeleteBranch(stale)));
         drop(app.handle_project_action(Action::KeepBranch(stale)));
-        assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current.id);
+        assert_eq!(
+            app.project_ui.force_branches.front().unwrap().0.id,
+            current.id
+        );
         assert!(app.project_ui.branch_requests.is_empty());
         drop(app.handle_project_action(Action::KeepBranch(current.id)));
         assert!(app.project_ui.force_branches.is_empty());
@@ -3556,16 +4480,45 @@ mod tests {
 
     #[test]
     fn confirmed_rpc_keeps_branch_and_file_discard_consent_separate() {
-        let target = Target { project: ProjectId::new(), worktree: Some(WorktreeId::new()), repository: "/repo".into(), path: "/repo/linked".into(), label: "feature".into() };
-        let mut snapshot = clean_snapshot(); snapshot.unpushed_commits = 3;
-        let crate::worktree_control::Operation::Remove { force, delete_branch, expected_fingerprint, .. } = confirmed_removal_operation(&target, &snapshot).unwrap() else { panic!("wrong operation") };
-        assert!(!force, "unpushed commits do not authorize force-removing files");
-        assert!(!delete_branch, "branch deletion gets its own typed result and second confirmation");
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(WorktreeId::new()),
+            repository: "/repo".into(),
+            path: "/repo/linked".into(),
+            label: "feature".into(),
+        };
+        let mut snapshot = clean_snapshot();
+        snapshot.unpushed_commits = 3;
+        let crate::worktree_control::Operation::Remove {
+            force,
+            delete_branch,
+            expected_fingerprint,
+            ..
+        } = confirmed_removal_operation(&target, &snapshot).unwrap()
+        else {
+            panic!("wrong operation")
+        };
+        assert!(
+            !force,
+            "unpushed commits do not authorize force-removing files"
+        );
+        assert!(
+            !delete_branch,
+            "branch deletion gets its own typed result and second confirmation"
+        );
         assert_eq!(expected_fingerprint.as_deref(), Some("fixture"));
         snapshot.untracked = 1;
-        assert!(matches!(confirmed_removal_operation(&target, &snapshot).unwrap(), crate::worktree_control::Operation::Remove { force: true, .. }));
+        assert!(matches!(
+            confirmed_removal_operation(&target, &snapshot).unwrap(),
+            crate::worktree_control::Operation::Remove { force: true, .. }
+        ));
         use std::os::unix::ffi::OsStringExt;
-        let invalid = Target { path: PathBuf::from(std::ffi::OsString::from_vec(b"/repo/non-utf8-\xff".to_vec())), ..target };
+        let invalid = Target {
+            path: PathBuf::from(std::ffi::OsString::from_vec(
+                b"/repo/non-utf8-\xff".to_vec(),
+            )),
+            ..target
+        };
         assert!(confirmed_removal_operation(&invalid, &snapshot).is_err());
     }
 
@@ -3575,7 +4528,11 @@ mod tests {
         let target = app.project_ui.begin_deleting("/repo/linked".into());
         let id = target.worktree.unwrap();
         let started_at = app.project_ui.deletions[&id].started_at;
-        drop(app.handle_project_action(Action::DeletionSessionsClosed { target, started_at: started_at - Duration::from_secs(1), result: Ok(()) }));
+        drop(app.handle_project_action(Action::DeletionSessionsClosed {
+            target,
+            started_at: started_at - Duration::from_secs(1),
+            result: Ok(()),
+        }));
         assert!(app.project_ui.released_delete_protections.is_empty());
         assert!(app.project_ui.is_deleting(id));
     }
@@ -3587,31 +4544,61 @@ mod tests {
         let id = target.worktree.unwrap();
         let started_at = app.project_ui.deletions[&id].started_at;
         app.project_ui.released_delete_protections.insert(id);
-        let stale = app.handle_project_action(Action::DeletionProtectionsReleased { target: target.clone(), started_at: started_at - Duration::from_secs(1), result: Ok(()) });
+        let stale = app.handle_project_action(Action::DeletionProtectionsReleased {
+            target: target.clone(),
+            started_at: started_at - Duration::from_secs(1),
+            result: Ok(()),
+        });
         assert!(cosmic::iced::runtime::task::into_stream(stale).is_none());
         assert!(app.project_ui.is_deleting(id));
         app.project_ui.released_delete_protections.remove(&id);
-        let unreleased = app.handle_project_action(Action::DeletionProtectionsReleased { target, started_at, result: Ok(()) });
+        let unreleased = app.handle_project_action(Action::DeletionProtectionsReleased {
+            target,
+            started_at,
+            result: Ok(()),
+        });
         assert!(cosmic::iced::runtime::task::into_stream(unreleased).is_none());
     }
 
     #[test]
     fn automatic_cleanup_refusals_are_quiet_and_backed_off() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("worktrees/feature"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         app.settings.auto_delete_merged_worktrees = true;
         let target = app.project_target(project, Some(linked.id)).unwrap();
         // Each refusal category, including Git safety text, must survive to
         // the row without putting it in manual deletion or retry state.
-        for reason in ["Kept: ignored files .env", "agent running", "ownership uncertain", "daemon upgrading", "cleanup protection unavailable"] {
-            app.project_ui.automatic_in_flight.insert(linked.id, target.clone());
-            drop(app.handle_project_action(Action::AutomaticallyDeleted { target: target.clone(), result: Err(reason.into()) }));
+        for reason in [
+            "Kept: ignored files .env",
+            "agent running",
+            "ownership uncertain",
+            "daemon upgrading",
+            "cleanup protection unavailable",
+        ] {
+            app.project_ui
+                .automatic_in_flight
+                .insert(linked.id, target.clone());
+            drop(app.handle_project_action(Action::AutomaticallyDeleted {
+                target: target.clone(),
+                result: Err(reason.into()),
+            }));
             let attempt = &app.project_ui.automatic_attempts[&linked.id];
             assert!(!attempt.retry_due(attempt.at + Duration::from_secs(29)));
             assert!(attempt.retry_due(attempt.at + Duration::from_secs(30)));
-            assert_eq!(row(&app, linked.id).unwrap().cleanup_kept.as_deref(), Some(cleanup_kept_detail(reason).as_str()));
+            assert_eq!(
+                row(&app, linked.id).unwrap().cleanup_kept.as_deref(),
+                Some(cleanup_kept_detail(reason).as_str())
+            );
             assert!(row(&app, linked.id).unwrap().deletion.is_none());
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.automatic_in_flight.is_empty());
@@ -3624,11 +4611,22 @@ mod tests {
     #[test]
     fn automatic_cleanup_ignores_late_or_unrequested_refusal() {
         let repository = PathBuf::from("/repo");
-        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("worktrees/feature"), Some("feature".into()));
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
-        drop(app.handle_project_action(Action::AutomaticallyDeleted { target, result: Err("obsolete refusal".into()) }));
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {
+            target,
+            result: Err("obsolete refusal".into()),
+        }));
         assert!(app.project_ui.automatic_attempts.is_empty());
     }
 
@@ -4688,7 +5686,14 @@ mod tests {
             command: ProjectCommand::Delete,
         }));
         let request = app.project_ui.dialog.as_ref().unwrap().request;
-        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+        drop(app.handle_project_action(Action::DeleteOptionsRead {
+            request,
+            result: Ok(DeleteOptions {
+                branch_elsewhere: false,
+                stale_lock: false,
+                lock_error: None,
+            }),
+        }));
         drop(app.handle_project_action(Action::ConfirmDelete));
         assert!(!app.project_ui.is_deleting(linked.id));
         let mut observed = clean_snapshot();

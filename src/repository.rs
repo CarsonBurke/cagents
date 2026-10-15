@@ -11811,17 +11811,76 @@ mod worktree_journal_tests {
         fixture.git(&["worktree", "lock", "--reason", &label, destination]);
         let journal = fixture.journal(fixture.request.operation_id);
         let live = worktree_lease(&journal.lease_path, false).unwrap();
-        assert!(fixture.service.stale_worktree_lock(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
-        assert!(fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
+        assert!(
+            fixture
+                .service
+                .stale_worktree_lock(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .service
+                .unlock_stale_worktree(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
         drop(live);
-        fixture.service.stale_worktree_lock(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).unwrap();
-        fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).unwrap();
-        assert!(!fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap().lock.locked);
+        fixture
+            .service
+            .stale_worktree_lock(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        fixture
+            .service
+            .unlock_stale_worktree(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        assert!(
+            !fixture
+                .service
+                .list_worktrees(&fixture.request.repository, &token)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.path == fixture.request.destination)
+                .unwrap()
+                .lock
+                .locked
+        );
         // Foreign locks and plausible cagents labels without the matching
         // durable operation cannot be cleared by this action.
-        for reason in ["another tool".to_owned(), format!("cagents:{}", OperationId::new())] {
+        for reason in [
+            "another tool".to_owned(),
+            format!("cagents:{}", OperationId::new()),
+        ] {
             fixture.git(&["worktree", "lock", "--reason", &reason, destination]);
-            assert!(fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
+            assert!(
+                fixture
+                    .service
+                    .unlock_stale_worktree(
+                        &fixture.store,
+                        &fixture.request.repository,
+                        &fixture.request.destination,
+                        &token
+                    )
+                    .is_err()
+            );
             fixture.git(&["worktree", "unlock", destination]);
         }
     }
