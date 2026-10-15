@@ -744,9 +744,7 @@ pub(crate) mod handoff {
                                 .is_some_and(|source| source.id == terminal.source.id)
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
-                if paired_codex
-                    && !matches!(chat.source.native_continuity, chat::NativeContinuity::Durable { .. })
-                {
+                if paired_codex {
                     let original = chat.source.terminal.as_ref().expect("checked pair");
                     let terminal = self.terminals.iter().find(|terminal| terminal.source.id == original.id)
                         .expect("checked paired terminal");
