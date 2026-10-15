@@ -860,11 +860,13 @@ fn restore_missing_native_with_carried_scope(
     original: &crate::terminal::holder::Record,
 ) {
     use crate::upgrade::handoff::{Carried, Chat, Checkpoint, Phase};
-    // The terminal holder and child are real. Encode a valid checkpoint whose
-    // native holder is deliberately unavailable to exercise the actual
-    // unattached-chat branch, without claiming prior native provider issuance.
+    // The terminal holder and child are real. A distinct native conversation
+    // deliberately has no holder, exercising the actual unattached-chat branch
+    // without claiming prior native provider issuance. Carried terminals and
+    // native checkpoint entries must have separate IDs.
+    let native_id = TerminalId::new();
     let mut source = Session {
-        id: issued.id,
+        id: native_id,
         launch: Launch {
             provider: Provider::Codex,
             recipe: LaunchRecipe {
@@ -879,8 +881,7 @@ fn restore_missing_native_with_carried_scope(
         native_continuity: NativeContinuity::ReconnectOnly,
     };
     assert!(source.claim_owned_codex_listener(root, previous_proof));
-    source.launch.session_id = Some(ID.into());
-    source.terminal = Some(issued.clone());
+    source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
     source.native_continuity = NativeContinuity::Durable {
         provider_version: "0.157.1".into(),
     };
@@ -924,7 +925,7 @@ fn restore_missing_native_with_carried_scope(
     };
     let unattached = Store::open(&store_root).unwrap().unattached().unwrap();
     assert_eq!(unattached.len(), 1);
-    assert_eq!(unattached[0].summary.id, issued.id);
+    assert_eq!(unattached[0].summary.id, native_id);
     let selected = PathBuf::from(&effective.environment["CODEX_HOME"]);
     let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), selected);
     let account_store = crate::account::registry::Store::at(root.join("account-registry"));
