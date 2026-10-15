@@ -4260,7 +4260,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .into());
         }
-        ignore_path::add(worktree, path).map_err(|error| ValidationError::Io(error).into())
+        let root = self.captured_worktree_root(worktree)?;
+        ignore_path::add(&root, path).map_err(|error| ValidationError::Io(error).into())
     }
 
     pub fn status(

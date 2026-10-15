@@ -20,13 +20,12 @@ pub(super) fn pattern(path: &RepoPath) -> Result<Vec<u8>, String> {
     Ok(pattern)
 }
 
-pub(super) fn add(worktree: &std::path::Path, path: &RepoPath) -> Result<(), String> {
-    use crate::fs_safety::{self, Root};
+pub(super) fn add(root: &crate::fs_safety::Root, path: &RepoPath) -> Result<(), String> {
+    use crate::fs_safety;
     use std::{io::Write, os::unix::fs::MetadataExt, path::Path};
     let rule = pattern(path)?;
-    let root = Root::open(worktree).map_err(|error| error.to_string())?;
     let name = Path::new(".gitignore");
-    let original = match fs_safety::open_beneath(&root, name) {
+    let original = match fs_safety::open_beneath(root, name) {
         Ok(mut file) => {
             let metadata = fs_safety::metadata_of(&file).map_err(|error| error.to_string())?;
             if !metadata.is_file() {
@@ -57,7 +56,7 @@ pub(super) fn add(worktree: &std::path::Path, path: &RepoPath) -> Result<(), Str
     bytes.extend_from_slice(&rule);
     bytes.push(b'\n');
     let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(&root, if original.is_some() { 0o600 } else { 0o644 })
+        fs_safety::create_temporary_in(root, if original.is_some() { 0o600 } else { 0o644 })
             .map_err(|error| error.to_string())?;
     let result = (|| {
         if let Some((file, _, _)) = &original {
@@ -79,7 +78,7 @@ pub(super) fn add(worktree: &std::path::Path, path: &RepoPath) -> Result<(), Str
         temporary.sync_all().map_err(|error| error.to_string())?;
         if let Some((_, metadata, original_bytes)) = &original {
             let mut current =
-                fs_safety::open_beneath(&root, name).map_err(|error| error.to_string())?;
+                fs_safety::open_beneath(root, name).map_err(|error| error.to_string())?;
             let current_metadata =
                 fs_safety::metadata_of(&current).map_err(|error| error.to_string())?;
             if (
@@ -100,18 +99,18 @@ pub(super) fn add(worktree: &std::path::Path, path: &RepoPath) -> Result<(), Str
                     ".gitignore changed while adding this rule; retry with the current file".into(),
                 );
             }
-            fs_safety::rename_within(&root, &temporary_name, name.as_os_str())
+            fs_safety::rename_within(root, &temporary_name, name.as_os_str())
                 .map_err(|error| error.to_string())?;
         } else {
-            fs_safety::rename_new_within(&root, &temporary_name, name.as_os_str())
+            fs_safety::rename_new_within(root, &temporary_name, name.as_os_str())
                 .map_err(|error| error.to_string())?;
         }
-        fs_safety::sync_directory(&root).map_err(|error| {
+        fs_safety::sync_directory(root).map_err(|error| {
             format!("Ignore rule was written, but its directory could not be synced: {error}")
         })
     })();
     if result.is_err() {
-        let _ = fs_safety::unlink_within(&root, &temporary_name);
+        let _ = fs_safety::unlink_within(root, &temporary_name);
     }
     result
 }
@@ -120,6 +119,19 @@ pub(super) fn add(worktree: &std::path::Path, path: &RepoPath) -> Result<(), Str
 mod tests {
     use super::*;
     use std::{fs, process::Command};
+
+    #[test]
+    fn ignore_rule_updates_the_retained_directory_after_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("worktree"); let original = directory.path().join("original");
+        fs::create_dir(&worktree).unwrap(); fs::write(worktree.join(".gitignore"), b"original-rule\n").unwrap();
+        let root = crate::fs_safety::Root::open(&worktree).unwrap();
+        fs::rename(&worktree, &original).unwrap(); fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join(".gitignore"), b"replacement-rule\n").unwrap();
+        add(&root, &RepoPath::parse("scratch [draft].txt").unwrap()).unwrap();
+        assert_eq!(fs::read(original.join(".gitignore")).unwrap(), b"original-rule\n/scratch\\ \\[draft\\].txt\n");
+        assert_eq!(fs::read(worktree.join(".gitignore")).unwrap(), b"replacement-rule\n");
+    }
 
     #[test]
     fn special_names_are_ignored_literally_without_hiding_neighboring_paths() {
@@ -169,14 +181,14 @@ mod tests {
         fs::write(&ignore, b"# existing rule\nprivate/").unwrap();
         fs::set_permissions(&ignore, fs::Permissions::from_mode(0o640)).unwrap();
         let path = RepoPath::parse("new [literal].txt").unwrap();
-        add(directory.path(), &path).unwrap();
+        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
         assert_eq!(
             fs::read(&ignore).unwrap(),
             b"# existing rule\nprivate/\n/new\\ \\[literal\\].txt\n"
         );
         assert_eq!(fs::metadata(&ignore).unwrap().mode() & 0o777, 0o640);
         let before = fs::read(&ignore).unwrap();
-        add(directory.path(), &path).unwrap();
+        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
         assert_eq!(fs::read(&ignore).unwrap(), before);
     }
 
@@ -190,11 +202,11 @@ mod tests {
         let ignore = directory.path().join(".gitignore");
         let path = RepoPath::parse("new.txt").unwrap();
         symlink(&victim, &ignore).unwrap();
-        assert!(add(directory.path(), &path).is_err());
+        assert!(add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"keep\n");
         fs::remove_file(&ignore).unwrap();
         fs::hard_link(&victim, &ignore).unwrap();
-        add(directory.path(), &path).unwrap();
+        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"keep\n");
         assert_eq!(fs::read(&ignore).unwrap(), b"keep\n/new.txt\n");
     }
