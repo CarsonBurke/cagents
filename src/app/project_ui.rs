@@ -2983,6 +2983,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn original_project_completion_waits_for_actual_hidden_publisher_receipt() {
+        use cosmic::iced::futures::StreamExt;
+        for fail_write in [false,true] {
+            let directory=tempfile::tempdir().unwrap();let repository=directory.path().to_path_buf();
+            let original="fn old() {}\n";
+            for name in ["participant.rs","unopened.rs"] {std::fs::write(repository.join(name),original).unwrap();}
+            let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+            let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+            let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+            app.settings.language_servers.clear();app.lsp=LspManager::new(Vec::new());
+            drop(app.add_terminal(repository.clone()));let card=app.durable.cards.last().unwrap().id;
+            let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"participant.rs",original);
+            runtime.descriptor.project=project;runtime.descriptor.repository=repository.clone();runtime.descriptor.worktree=repository.clone();
+            app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+            app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+            // Teardown was admitted first; the real publisher then freezes
+            // this exact owned participant before its result is polled.
+            app.project_ui.closing.insert(project,repository.clone());app.project_ui.close_generation.insert(project,7);
+            let publishing=app.project_editor_publication_fixture(card,&repository,95);
+            assert!(app.card_has_project_editor_write(card));
+            drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::HidePublication(95))));
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(project,7,Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])))));
+            assert!(app.cards.contains_key(&card));assert!(app.sidebar_model.project(project).is_some());
+            assert_eq!(app.project_ui.recovery_closures[&project].0,7);
+            if fail_write {std::fs::write(repository.join("unopened.rs"),"external change\n").unwrap();}
+            let mut delivered=0;let mut stream=iced::runtime::task::into_stream(publishing).unwrap();
+            while let Some(action)=stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::EditorFeatures(super::super::editor_features::Action::Published{..})))=action {
+                    delivered+=1;drop(app.update(message));
+                }
+            }
+            assert_eq!(delivered,1,"deliver the original actual publisher result");
+            if fail_write {
+                assert_eq!(std::fs::read_to_string(repository.join("unopened.rs")).unwrap(),"external change\n");
+                assert!(app.sidebar_model.project(project).is_none(),"released clean editor completes the original close without another teardown");
+                assert!(!app.project_ui.recovery_closures.contains_key(&project));
+            } else {
+                let Some(CardRuntime::Repository(runtime))=app.cards.get(&card) else {panic!("published edits retained")};
+                assert!(!runtime.is_saving());assert!(runtime.is_dirty());
+                assert_eq!(runtime.editor_text().as_deref(),Some("fn renamed() {}\n"));
+                assert_eq!(std::fs::read_to_string(repository.join("unopened.rs")).unwrap(),"fn renamed() {}\n");
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.sidebar_model.project(project).is_some());assert_eq!(app.project_ui.recovery_closures[&project].0,7);
+            }
+        }
+    }
+
     #[test]
     fn cancellation_retires_only_the_original_recovery_closure() {
         let mut app=super::super::tests::context_inspector_test_app(false);
