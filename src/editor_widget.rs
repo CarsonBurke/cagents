@@ -162,13 +162,27 @@ impl SearchSnapshot {
         options: crate::editor_search::FindOptions,
         preserve: bool,
     ) -> Result<String, String> {
+        self.replace_matches_with_cancellation(matches, query, replacement, options, preserve, || false)
+    }
+
+    pub(crate) fn replace_matches_with_cancellation(
+        &self,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        if cancelled() { return Err("Replacement cancelled.".into()); }
         let replacement =
             crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
         let text = self.source.text();
         let mut result = String::with_capacity(text.len());
         let mut copied = 0;
         let mut cached_line: Option<(usize, Line<'_>, usize)> = None;
-        for item in matches {
+        for (index, item) in matches.into_iter().enumerate() {
+            if index % 256 == 0 && cancelled() { return Err("Replacement cancelled.".into()); }
             let &(start, end) = std::borrow::Borrow::borrow(&item);
             if start.line != end.line {
                 return Err("A search match crosses a line boundary.".into());
@@ -4061,6 +4075,19 @@ mod tests {
         );
         assert!(lines.last().unwrap().shape_opt().is_none());
         assert!(lines.last().unwrap().layout_opt().is_none());
+    }
+
+    #[test]
+    fn dense_replacement_cancellation_discards_partial_output_and_keeps_source() {
+        let text = "λa".repeat(2048);
+        let snapshot = SearchSnapshot { source: TextSnapshot::from_lines([(text.as_str(), LineEnding::None, "")]) };
+        let matches = snapshot.find_matches("a", || false).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let result = snapshot.replace_matches_with_cancellation(&matches, "a", "β", Default::default(), false, || {
+            let calls = checks.get() + 1; checks.set(calls); calls >= 3
+        });
+        assert_eq!(result.unwrap_err(), "Replacement cancelled.");
+        assert_eq!(snapshot.source.text().as_ref(), text);
     }
 
     #[test]

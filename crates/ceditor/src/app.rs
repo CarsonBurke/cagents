@@ -683,6 +683,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
+            | RepositoryAction::FindReplacementLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::DiagramsRendered { .. }
@@ -7473,6 +7474,7 @@ mod tests {
     #[test]
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
+        assert!(repository_action_allowed_while_modal(&RepositoryAction::FindReplacementLoaded { card, ticket: card.as_uuid(), result: Ok(None) }));
         assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,

@@ -87,8 +87,8 @@ pub fn find_in_lines<T: AsRef<str>>(
                     .map(|(start, _)| (start, start + query.len())),
             )
         };
-        for (index, (start, end)) in spans.enumerate() {
-            if index % 1024 == 0 && cancelled() {
+        for (start, end) in spans {
+            if cancelled() {
                 return Ok(None);
             }
             if options.whole_word && !options.regex && !whole_word(text, start, end) {
