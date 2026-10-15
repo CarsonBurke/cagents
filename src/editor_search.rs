@@ -15,8 +15,15 @@ fn output_limit_error() -> String {
     "Replacement exceeds the result size limit (8 MiB, or the current buffer size if larger). Use a smaller replacement or replace fewer matches.".into()
 }
 
-pub(crate) fn checked_output_size(current: usize, additional: usize, limit: usize) -> Result<usize, String> {
-    current.checked_add(additional).filter(|size| *size <= limit).ok_or_else(output_limit_error)
+pub(crate) fn checked_output_size(
+    current: usize,
+    additional: usize,
+    limit: usize,
+) -> Result<usize, String> {
+    current
+        .checked_add(additional)
+        .filter(|size| *size <= limit)
+        .ok_or_else(output_limit_error)
 }
 
 fn reserve_output(result: &mut String, additional: usize, limit: usize) -> Result<(), String> {
@@ -40,7 +47,11 @@ pub(crate) fn append_output(result: &mut String, text: &str, limit: usize) -> Re
 // arbitrary braced name, numeric index when parseable, missing groups empty,
 // malformed references literal, and $$ escapes a dollar. Visit borrowed pieces
 // to count EXACT bytes before invoking the library's expansion allocator.
-fn expanded_size(captures: &regex::Captures<'_>, mut text: &str, limit: usize) -> Result<usize, String> {
+fn expanded_size(
+    captures: &regex::Captures<'_>,
+    mut text: &str,
+    limit: usize,
+) -> Result<usize, String> {
     let mut size = 0;
     while let Some(dollar) = text.find('$') {
         size = checked_output_size(size, dollar, limit)?;
@@ -53,7 +64,11 @@ fn expanded_size(captures: &regex::Captures<'_>, mut text: &str, limit: usize) -
         let reference = if text.starts_with("${") {
             text[2..].find('}').map(|end| (&text[2..2 + end], 3 + end))
         } else {
-            let end = text.as_bytes()[1..].iter().take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_').count() + 1;
+            let end = text.as_bytes()[1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                .count()
+                + 1;
             (end > 1).then(|| (&text[1..end], end))
         };
         if let Some((name, end)) = reference {
@@ -79,7 +94,9 @@ fn converted_size(text: &str, case: ReplacementCase, limit: usize) -> Result<usi
         let bytes = match case {
             ReplacementCase::Upper => character.to_uppercase().map(char::len_utf8).sum(),
             ReplacementCase::Lower => character.to_lowercase().map(char::len_utf8).sum(),
-            ReplacementCase::Title if index == 0 => character.to_uppercase().map(char::len_utf8).sum(),
+            ReplacementCase::Title if index == 0 => {
+                character.to_uppercase().map(char::len_utf8).sum()
+            }
             ReplacementCase::Title => character.to_lowercase().map(char::len_utf8).sum(),
             ReplacementCase::Unchanged => character.len_utf8(),
         };
@@ -281,7 +298,13 @@ impl<'a> Replacement<'a> {
         self.expand_bounded(line, start, end, replacement_budget(line.len()))
     }
 
-    pub(crate) fn expand_bounded(&self, line: &str, start: usize, end: usize, limit: usize) -> Result<String, String> {
+    pub(crate) fn expand_bounded(
+        &self,
+        line: &str,
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> Result<String, String> {
         let mut result = String::new();
         self.append_bounded(line, start, end, &mut result, limit)?;
         Ok(result)
@@ -299,7 +322,14 @@ impl<'a> Replacement<'a> {
         self.append_bounded(line, start, end, result, replacement_budget(line.len()))
     }
 
-    pub(crate) fn append_bounded(&self, line: &str, start: usize, end: usize, result: &mut String, limit: usize) -> Result<(), String> {
+    pub(crate) fn append_bounded(
+        &self,
+        line: &str,
+        start: usize,
+        end: usize,
+        result: &mut String,
+        limit: usize,
+    ) -> Result<(), String> {
         if let Some(regex) = &self.regex {
             let captures = regex
                 .captures_at(line, start)
@@ -311,7 +341,9 @@ impl<'a> Replacement<'a> {
                 .ok_or_else(|| {
                     "The selected match changed; search again before replacing.".to_owned()
                 })?;
-            let available = limit.checked_sub(result.len()).ok_or_else(output_limit_error)?;
+            let available = limit
+                .checked_sub(result.len())
+                .ok_or_else(output_limit_error)?;
             let bytes = expanded_size(&captures, self.text, available)?;
             reserve_output(result, bytes, limit)?;
             captures.expand(self.text, result);
@@ -324,7 +356,9 @@ impl<'a> Replacement<'a> {
                 // replacement operation, preserving Unicode context without
                 // allocating an intermediate String for every match.
                 let case = matched_case(matched);
-                let available = limit.checked_sub(result.len()).ok_or_else(output_limit_error)?;
+                let available = limit
+                    .checked_sub(result.len())
+                    .ok_or_else(output_limit_error)?;
                 let cached = match case {
                     ReplacementCase::Upper => self.uppercase.get(),
                     ReplacementCase::Lower => self.lowercase.get(),
@@ -386,39 +420,91 @@ mod tests {
         let regex = regex::Regex::new(r"(?P<名字>λ)(a)?(b)(c)(d)(e)(f)(g)(h)(i)").unwrap();
         let line = "λbcdefghi";
         let captures = regex.captures(line).unwrap();
-        let options = FindOptions { regex: true, ..Default::default() };
+        let options = FindOptions {
+            regex: true,
+            ..Default::default()
+        };
         for text in [
-            "$0:$1:$2:$10", "$10x:${10}x:$1_suffix:${1}_suffix",
+            "$0:$1:$2:$10",
+            "$10x:${10}x:$1_suffix:${1}_suffix",
             "${名字}:$名字:${missing}:$99999999999999999999999999999999999",
-            "$$:${}:$:$-:${unclosed", "$2$2$2", "λ${0}🦀$$",
+            "$$:${}:$:$-:${unclosed",
+            "$2$2$2",
+            "λ${0}🦀$$",
         ] {
             let mut expected = String::new();
             captures.expand(text, &mut expected);
             let replacement = Replacement::new(regex.as_str(), text, options, false).unwrap();
-            assert_eq!(expanded_size(&captures, text, expected.len()).unwrap(), expected.len(), "{text}");
-            assert_eq!(replacement.expand_bounded(line, 0, line.len(), expected.len()).unwrap(), expected, "{text}");
+            assert_eq!(
+                expanded_size(&captures, text, expected.len()).unwrap(),
+                expected.len(),
+                "{text}"
+            );
+            assert_eq!(
+                replacement
+                    .expand_bounded(line, 0, line.len(), expected.len())
+                    .unwrap(),
+                expected,
+                "{text}"
+            );
             if !expected.is_empty() {
-                assert!(replacement.expand_bounded(line, 0, line.len(), expected.len() - 1).unwrap_err().contains("result size limit"), "{text}");
+                assert!(
+                    replacement
+                        .expand_bounded(line, 0, line.len(), expected.len() - 1)
+                        .unwrap_err()
+                        .contains("result size limit"),
+                    "{text}"
+                );
             }
         }
         // Missing groups do not justify rejecting a long but empty expansion.
-        assert_eq!(Replacement::new("(a)", &"$99".repeat(200), options, false).unwrap().expand_bounded("a", 0, 1, 0).unwrap(), "");
+        assert_eq!(
+            Replacement::new("(a)", &"$99".repeat(200), options, false)
+                .unwrap()
+                .expand_bounded("a", 0, 1, 0)
+                .unwrap(),
+            ""
+        );
         assert!(checked_output_size(usize::MAX, 1, usize::MAX).is_err());
     }
 
     #[test]
     fn bounded_preserve_case_counts_unicode_before_caching_or_appending() {
-        for (matched, text) in [("foo", "ΟΣ\u{301}"), ("foo", "Ⱥ"), ("FOO", "ΐ"), ("FOO", "ßﬃ"), ("Foo", "ßΟΣ"), ("fOo", "λ🦀")] {
+        for (matched, text) in [
+            ("foo", "ΟΣ\u{301}"),
+            ("foo", "Ⱥ"),
+            ("FOO", "ΐ"),
+            ("FOO", "ßﬃ"),
+            ("Foo", "ßΟΣ"),
+            ("fOo", "λ🦀"),
+        ] {
             let replacement = Replacement::new(matched, text, Default::default(), true).unwrap();
             let expected = preserve_case(matched, text);
-            assert!(replacement.expand_bounded(matched, 0, matched.len(), expected.len() - 1).is_err());
-            assert!(replacement.uppercase.get().is_none() && replacement.lowercase.get().is_none() && replacement.titlecase.get().is_none());
-            assert_eq!(replacement.expand_bounded(matched, 0, matched.len(), expected.len()).unwrap(), expected);
+            assert!(
+                replacement
+                    .expand_bounded(matched, 0, matched.len(), expected.len() - 1)
+                    .is_err()
+            );
+            assert!(
+                replacement.uppercase.get().is_none()
+                    && replacement.lowercase.get().is_none()
+                    && replacement.titlecase.get().is_none()
+            );
+            assert_eq!(
+                replacement
+                    .expand_bounded(matched, 0, matched.len(), expected.len())
+                    .unwrap(),
+                expected
+            );
         }
         let replacement = Replacement::new("a", "λλ", Default::default(), false).unwrap();
         let mut result = "prefix".to_owned();
         let before = result.clone();
-        assert!(replacement.append_bounded("a", 0, 1, &mut result, 9).is_err());
+        assert!(
+            replacement
+                .append_bounded("a", 0, 1, &mut result, 9)
+                .is_err()
+        );
         assert_eq!(result, before);
     }
 

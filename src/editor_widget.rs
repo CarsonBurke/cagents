@@ -120,8 +120,14 @@ impl SearchSnapshot {
         options: crate::editor_search::FindOptions,
         preserve: bool,
     ) -> Result<Vec<(Position, Position, String)>, String> {
-        self.replacement_edits_bounded(matches, query, replacement, options, preserve,
-            crate::editor_search::replacement_budget(self.source.len()))
+        self.replacement_edits_bounded(
+            matches,
+            query,
+            replacement,
+            options,
+            preserve,
+            crate::editor_search::replacement_budget(self.source.len()),
+        )
     }
 
     fn replacement_edits_bounded(
@@ -159,9 +165,16 @@ impl SearchSnapshot {
             if to < from || from < copied {
                 return Err("Search matches overlap.".into());
             }
-            output_bytes = crate::editor_search::checked_output_size(output_bytes, from - copied, limit)?;
-            let inserted = replacement.expand_bounded(&line.text, start.column, end.column, limit - output_bytes)?;
-            output_bytes = crate::editor_search::checked_output_size(output_bytes, inserted.len(), limit)?;
+            output_bytes =
+                crate::editor_search::checked_output_size(output_bytes, from - copied, limit)?;
+            let inserted = replacement.expand_bounded(
+                &line.text,
+                start.column,
+                end.column,
+                limit - output_bytes,
+            )?;
+            output_bytes =
+                crate::editor_search::checked_output_size(output_bytes, inserted.len(), limit)?;
             if line.text.get(start.column..end.column) != Some(inserted.as_str()) {
                 edits.push((start, end, inserted));
             }
@@ -198,8 +211,15 @@ impl SearchSnapshot {
         preserve: bool,
         cancelled: impl Fn() -> bool,
     ) -> Result<String, String> {
-        self.replace_matches_bounded(matches, query, replacement, options, preserve, cancelled,
-            crate::editor_search::replacement_budget(self.source.len()))
+        self.replace_matches_bounded(
+            matches,
+            query,
+            replacement,
+            options,
+            preserve,
+            cancelled,
+            crate::editor_search::replacement_budget(self.source.len()),
+        )
     }
 
     fn replace_matches_bounded(
@@ -255,11 +275,19 @@ impl SearchSnapshot {
             if to < from || from < copied {
                 return Err("Search matches overlap.".into());
             }
-            crate::editor_search::append_output(&mut result, text.get(copied..from).ok_or("Invalid search position.")?, limit)?;
+            crate::editor_search::append_output(
+                &mut result,
+                text.get(copied..from).ok_or("Invalid search position.")?,
+                limit,
+            )?;
             replacement.append_bounded(&line.text, start.column, end.column, &mut result, limit)?;
             copied = to;
         }
-        crate::editor_search::append_output(&mut result, text.get(copied..).ok_or("Invalid search position.")?, limit)?;
+        crate::editor_search::append_output(
+            &mut result,
+            text.get(copied..).ok_or("Invalid search position.")?,
+            limit,
+        )?;
         Ok(result)
     }
 
@@ -4122,45 +4150,188 @@ mod tests {
     #[test]
     fn replacement_output_budget_counts_prefix_tail_and_sparse_aggregate() {
         let original = "λa🦀aZ";
-        let snapshot = SearchSnapshot { source: TextSnapshot::from_lines([(original, LineEnding::None, "")]) };
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original, LineEnding::None, "")]),
+        };
         let matches = snapshot.find_matches("a", || false).unwrap();
         let expected = "λββ🦀ββZ";
-        assert_eq!(snapshot.replace_matches_bounded(&matches, "a", "ββ", Default::default(), false, || false, expected.len()).unwrap(), expected);
-        assert!(snapshot.replace_matches_bounded(&matches, "a", "ββ", Default::default(), false, || false, expected.len() - 1).is_err());
-        let edits = snapshot.replacement_edits_bounded(&matches, "a", "ββ", Default::default(), false, expected.len()).unwrap();
+        assert_eq!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    || false,
+                    expected.len()
+                )
+                .unwrap(),
+            expected
+        );
+        assert!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    || false,
+                    expected.len() - 1
+                )
+                .is_err()
+        );
+        let edits = snapshot
+            .replacement_edits_bounded(
+                &matches,
+                "a",
+                "ββ",
+                Default::default(),
+                false,
+                expected.len(),
+            )
+            .unwrap();
         assert_eq!(edits.len(), 2);
-        assert!(snapshot.replacement_edits_bounded(&matches, "a", "ββ", Default::default(), false, expected.len() - 1).is_err());
+        assert!(
+            snapshot
+                .replacement_edits_bounded(
+                    &matches,
+                    "a",
+                    "ββ",
+                    Default::default(),
+                    false,
+                    expected.len() - 1
+                )
+                .is_err()
+        );
         assert_eq!(snapshot.source.text().as_ref(), original);
 
         // Growth at an early match followed by shrinkage is valid; don't use
         // source-size-plus-intermediate-deltas as the allocation budget.
         let original = "a long";
-        let snapshot = SearchSnapshot { source: TextSnapshot::from_lines([(original, LineEnding::None, "")]) };
-        let options = crate::editor_search::FindOptions { regex: true, ..Default::default() };
-        let matches = snapshot.find_matches_with("(a)|long", options, || false).unwrap().unwrap();
-        assert_eq!(snapshot.replace_matches_bounded(&matches, "(a)|long", "$1$1$1", options, false, || false, original.len()).unwrap(), "aaa ");
-        assert_eq!(snapshot.replacement_edits_bounded(&matches, "(a)|long", "$1$1$1", options, false, original.len()).unwrap().len(), 2);
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original, LineEnding::None, "")]),
+        };
+        let options = crate::editor_search::FindOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let matches = snapshot
+            .find_matches_with("(a)|long", options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .replace_matches_bounded(
+                    &matches,
+                    "(a)|long",
+                    "$1$1$1",
+                    options,
+                    false,
+                    || false,
+                    original.len()
+                )
+                .unwrap(),
+            "aaa "
+        );
+        assert_eq!(
+            snapshot
+                .replacement_edits_bounded(
+                    &matches,
+                    "(a)|long",
+                    "$1$1$1",
+                    options,
+                    false,
+                    original.len()
+                )
+                .unwrap()
+                .len(),
+            2
+        );
         for text in ["${0}${0}${0}", "λ$0🦀"] {
-            let expected = regex::Regex::new("(a)|long").unwrap().replace_all(original, text).into_owned();
-            assert_eq!(snapshot.replace_matches_bounded(&matches, "(a)|long", text, options, false, || false, expected.len()).unwrap(), expected);
-            assert!(snapshot.replace_matches_bounded(&matches, "(a)|long", text, options, false, || false, expected.len() - 1).is_err());
-            assert!(snapshot.replacement_edits_bounded(&matches, "(a)|long", text, options, false, expected.len() - 1).is_err());
+            let expected = regex::Regex::new("(a)|long")
+                .unwrap()
+                .replace_all(original, text)
+                .into_owned();
+            assert_eq!(
+                snapshot
+                    .replace_matches_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        || false,
+                        expected.len()
+                    )
+                    .unwrap(),
+                expected
+            );
+            assert!(
+                snapshot
+                    .replace_matches_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        || false,
+                        expected.len() - 1
+                    )
+                    .is_err()
+            );
+            assert!(
+                snapshot
+                    .replacement_edits_bounded(
+                        &matches,
+                        "(a)|long",
+                        text,
+                        options,
+                        false,
+                        expected.len() - 1
+                    )
+                    .is_err()
+            );
             assert_eq!(snapshot.source.text().as_ref(), original);
         }
     }
 
     #[test]
     fn oversized_existing_buffer_replacements_allow_only_shrink_or_nongrowth() {
-        let original = format!("λ{}", "x".repeat(crate::editor::MAX_EDITABLE_FILE_BYTES as usize));
-        let snapshot = SearchSnapshot { source: TextSnapshot::from_lines([(original.as_str(), LineEnding::None, "")]) };
-        let matches = [(Position { line: 0, column: 0 }, Position { line: 0, column: 2 })];
+        let original = format!(
+            "λ{}",
+            "x".repeat(crate::editor::MAX_EDITABLE_FILE_BYTES as usize)
+        );
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([(original.as_str(), LineEnding::None, "")]),
+        };
+        let matches = [(
+            Position { line: 0, column: 0 },
+            Position { line: 0, column: 2 },
+        )];
         for replacement in ["a", "zz"] {
-            let output = snapshot.replace_matches_with(&matches, "λ", replacement, Default::default(), false).unwrap();
+            let output = snapshot
+                .replace_matches_with(&matches, "λ", replacement, Default::default(), false)
+                .unwrap();
             assert_eq!(output.len(), original.len() - 2 + replacement.len());
-            assert!(snapshot.replacement_edits(&matches, "λ", replacement, Default::default(), false).is_ok());
+            assert!(
+                snapshot
+                    .replacement_edits(&matches, "λ", replacement, Default::default(), false)
+                    .is_ok()
+            );
         }
-        assert!(snapshot.replace_matches_with(&matches, "λ", "zzz", Default::default(), false).unwrap_err().contains("result size limit"));
-        assert!(snapshot.replacement_edits(&matches, "λ", "zzz", Default::default(), false).is_err());
+        assert!(
+            snapshot
+                .replace_matches_with(&matches, "λ", "zzz", Default::default(), false)
+                .unwrap_err()
+                .contains("result size limit")
+        );
+        assert!(
+            snapshot
+                .replacement_edits(&matches, "λ", "zzz", Default::default(), false)
+                .is_err()
+        );
         assert_eq!(snapshot.source.text().as_ref(), original);
     }
 
