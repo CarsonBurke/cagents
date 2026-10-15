@@ -220,7 +220,6 @@ fn prepare_target(
     Ok((validated.0, validated.2, guard))
 }
 
-
 /// Protect an executable's immutable launch directory independently of its
 /// administrative filing scope, then validate the entire mapping after BOTH
 /// guards exist. All filesystem work stays on the blocking worker.
@@ -233,20 +232,43 @@ fn prepare_chat_target(
     mut canonicalize: impl FnMut(&Path) -> std::io::Result<PathBuf>,
     mut protect: impl FnMut(&Path) -> std::io::Result<Option<crate::worktree_cleanup::Protection>>,
 ) -> Result<Prepared, String> {
-    watch.register(&[(path.clone(), path.clone()), (launch.clone(), launch.clone())]);
+    watch.register(&[
+        (path.clone(), path.clone()),
+        (launch.clone(), launch.clone()),
+    ]);
     let (selected, mut canonical, guard) = prepare_target(
-        path.clone(), roots.clone(), cached, watch, &mut canonicalize, &mut protect,
+        path.clone(),
+        roots.clone(),
+        cached,
+        watch,
+        &mut canonicalize,
+        &mut protect,
     )?;
-    let physical = canonical.iter().find(|(key, _)| key == &selected)
-        .map(|(_, physical)| physical.clone()).ok_or("Missing prepared filing mapping")?;
+    let physical = canonical
+        .iter()
+        .find(|(key, _)| key == &selected)
+        .map(|(_, physical)| physical.clone())
+        .ok_or("Missing prepared filing mapping")?;
     let (launch_owner, launch_paths, launch_guard) = prepare_target(
-        launch.clone(), roots, None, watch, &mut canonicalize,
-        |target| if target == physical.as_path() { Ok(None) } else { protect(target) },
+        launch.clone(),
+        roots,
+        None,
+        watch,
+        &mut canonicalize,
+        |target| {
+            if target == physical.as_path() {
+                Ok(None)
+            } else {
+                protect(target)
+            }
+        },
     )?;
     for (key, value) in launch_paths {
         if let Some((_, previous)) = canonical.iter().find(|(path, _)| path == &key) {
             if previous != &value {
-                return Err("The conversation's launch or filing alias changed during preparation".into());
+                return Err(
+                    "The conversation's launch or filing alias changed during preparation".into(),
+                );
             }
         } else {
             canonical.push((key, value));
@@ -260,7 +282,10 @@ fn prepare_chat_target(
             Err(_) => key.clone(),
         };
         if &observed != expected {
-            return Err("The conversation's launch or filing alias changed while acquiring protection".into());
+            return Err(
+                "The conversation's launch or filing alias changed while acquiring protection"
+                    .into(),
+            );
         }
     }
     Ok(Prepared {
@@ -304,7 +329,9 @@ impl Cagents {
         let cancelled = self.cancel_worktree_selection();
         let launch = chat_launch_directory(&intent).map(Path::to_owned);
         if local_window {
-            self.worktree_selection.additional_paths.extend(launch.iter().cloned());
+            self.worktree_selection
+                .additional_paths
+                .extend(launch.iter().cloned());
         }
         let epoch = local_window.then(|| self.worktree_owner_paths.invalidate_watched());
         let resolved = self.refresh_worktree_owners(Some(&path));
@@ -337,7 +364,8 @@ impl Cagents {
         // exact same commit path after off-thread preparation.
         if !local_window {
             let scope = self.commit_worktree_selection_scope(path, create, &intent, None);
-            let initialization = self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
+            let initialization =
+                self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
             let after = self.finish_worktree_selection(intent);
             return Task::batch([
                 cancelled,
@@ -368,7 +396,12 @@ impl Cagents {
         #[cfg(test)]
         let guard_runtime = self.worktree_selection.guard_runtime_override.clone();
         let prepare = self.prepare_worktree_selection_receipt(
-            generation, path, create, intent, epoch, move |path| {
+            generation,
+            path,
+            create,
+            intent,
+            epoch,
+            move |path| {
                 let canonicalize = move |path: &Path| {
                     #[cfg(test)]
                     if let Some(calls) = &canonicalize_calls {
@@ -379,19 +412,27 @@ impl Cagents {
                 let protect = |path: &Path| {
                     #[cfg(test)]
                     if let Some(runtime) = &guard_runtime {
-                        return crate::worktree_cleanup::fixture_protection(runtime, path, false).map(Some);
+                        return crate::worktree_cleanup::fixture_protection(runtime, path, false)
+                            .map(Some);
                     }
                     crate::worktree_cleanup::protect(path)?
-                        .ok_or_else(|| std::io::Error::other("local worktree protection became unavailable"))
+                        .ok_or_else(|| {
+                            std::io::Error::other("local worktree protection became unavailable")
+                        })
                         .map(Some)
                 };
                 if let Some(launch) = launch {
                     prepare_chat_target(path, launch, roots, cached, &watch, canonicalize, protect)
                 } else {
-                    prepare_target(path, roots, cached, &watch, canonicalize, protect)
-                        .map(|(path, canonical, guard)| Prepared {
-                            path, canonical, guard, resume: None, additional_guards: Vec::new(),
-                        })
+                    prepare_target(path, roots, cached, &watch, canonicalize, protect).map(
+                        |(path, canonical, guard)| Prepared {
+                            path,
+                            canonical,
+                            guard,
+                            resume: None,
+                            additional_guards: Vec::new(),
+                        },
+                    )
                 }
             },
         );
@@ -661,7 +702,8 @@ impl Cagents {
             &intent,
             prepared.resume.as_ref(),
         );
-        let initialization = self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
+        let initialization =
+            self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
         let after = self.finish_worktree_selection_with_context(intent, context_scope);
         Task::batch([
             selected,
@@ -675,13 +717,20 @@ impl Cagents {
         self.initialize_prepared_scope_runtimes_with_default(true)
     }
 
-    fn initialize_prepared_scope_runtimes_with_default(&mut self, default_pane: bool) -> Task<Message> {
+    fn initialize_prepared_scope_runtimes_with_default(
+        &mut self,
+        default_pane: bool,
+    ) -> Task<Message> {
         if !self.worktree_selection.initialize_runtimes || self.worktree_selection.pending {
             return Task::none();
         }
         self.worktree_selection.initialize_runtimes = false;
         let initialize = self.initialize_runtimes();
-        let pane = if default_pane { self.ensure_default_pane() } else { Task::none() };
+        let pane = if default_pane {
+            self.ensure_default_pane()
+        } else {
+            Task::none()
+        };
         Task::batch([initialize, pane])
     }
 
@@ -767,7 +816,7 @@ impl Cagents {
                         Task::none()
                     }
                 }
-            },
+            }
             Intent::Chat {
                 session,
                 beside,

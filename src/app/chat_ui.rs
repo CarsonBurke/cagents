@@ -4461,13 +4461,15 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&working_directory) {
             return Task::none();
         }
-        let intent = match self.native_chat_selection_intent(provider, working_directory.clone(), ephemeral) {
-            Ok(intent) => intent,
-            Err(error) => {
-                self.status = Some(TransientNotice::error(error));
-                return Task::none();
-            }
-        };
+        let intent =
+            match self.native_chat_selection_intent(provider, working_directory.clone(), ephemeral)
+            {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
+                }
+            };
         // Filing in a channel and launching in another directory are separate
         // authorities. The prepared receipt protects both before exposing a draft.
         if let Some(channel) = self.durable.active_channel {
@@ -4492,7 +4494,8 @@ impl Cagents {
     ) -> Result<worktree_ui::selection::Intent, String> {
         let account = self.default_account_for_directory(provider, &directory);
         let automatic = self.automatic_accounts_for_directory(provider, &directory);
-        let session = fresh_chat_session(provider, TerminalId::new(), directory, &account, automatic)?;
+        let session =
+            fresh_chat_session(provider, TerminalId::new(), directory, &account, automatic)?;
         Ok(worktree_ui::selection::Intent::Chat {
             session,
             beside: None,
@@ -7585,7 +7588,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7680,7 +7684,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11436,14 +11441,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11462,7 +11472,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
