@@ -6162,10 +6162,22 @@ impl GitFileLock {
         }
         let parent = index.parent().ok_or("Git reported no index parent")?;
         let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
-        let mut name = index
-            .file_name()
-            .ok_or("Git reported no index name")?
-            .to_owned();
+        let name = index.file_name().ok_or("Git reported no index name")?;
+        Self::acquire_in(parent, name)
+    }
+
+    /// Lock an actual registered administrative directory already retained by
+    /// its common namespace, without reopening a mutable checkout locator.
+    pub(crate) fn acquire_beneath(parent: &fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        if !matches!((Path::new(name).components().next(), Path::new(name).components().count()),
+            (Some(std::path::Component::Normal(_)), 1)) {
+            return Err("Git lock name must be one ordinary component".into());
+        }
+        Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
+    }
+
+    fn acquire_in(parent: fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        let mut name = name.to_owned();
         name.push(".lock");
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
@@ -6193,6 +6205,13 @@ impl GitFileLock {
             file,
             active: true,
         })
+    }
+
+    pub(crate) fn retained_identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        self.owns_lock()?;
+        let metadata = self.file.metadata().map_err(|error| error.to_string())?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
@@ -10781,6 +10800,16 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    pub(crate) fn uses_files_ref_storage(&self, repository: &Path,
+        cancellation: &CancellationToken) -> Result<bool, RepositoryError>
+    {
+        let command=self.git_read(repository,["config","--local","--get","extensions.refStorage"]);
+        let output=self.run(&command,cancellation)?;
+        if output.exit_code==Some(1) { return Ok(true); }
+        if output.success { return Ok(trim_one_line_ending(&output.stdout)==b"files"); }
+        Err(git_failure(&command,output).into())
+    }
+
     /// The canonical common directory of `repository`, the one a creation
     /// journal records and its identity is keyed by.
     pub fn common_dir(
