@@ -1908,10 +1908,8 @@ impl Cagents {
 
     /// The status bar was shown or hidden, or the Accounts pane opened.
     pub(super) fn accounts_surface_changed(&mut self) -> Task<Message> {
-        if !self.settings.show_status_bar {
-            self.account_ui.popover = None;
-        }
-        self.probe_accounts(Trigger::Focus)
+        if !self.settings.show_status_bar { self.account_ui.popover = None; }
+        self.refresh_draft_accounts()
     }
 
     /// Called with the main window's focus changes, after `refresh_ui` has
@@ -1927,10 +1925,8 @@ impl Cagents {
             self.account_ui.popover = None;
             self.account_ui.table.close_popups();
         }
-        if !regained {
-            return Task::none();
-        }
-        Task::batch([self.reload_registry(), self.probe_accounts(Trigger::Focus)])
+        if !regained { return Task::none(); }
+        self.refresh_draft_accounts()
     }
 
     /// The account popups' share of a key event, like the chrome's popups:
@@ -5325,6 +5321,19 @@ mod tests {
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn returning_from_setup_redetects_without_statusbar_or_accounts_pane() {
+        let mut app = context_inspector_test_app(false);
+        app.settings.show_status_bar = false;
+        let before = app.account_ui.discovery_generation;
+        drop(app.accounts_focus_changed(false, false));
+        assert_eq!(app.account_ui.discovery_generation, before);
+        drop(app.accounts_focus_changed(true, true));
+        assert_eq!(app.account_ui.discovery_generation, before + 1);
+        assert!(app.account_ui.installed.is_empty(), "async setup is not performed by the view/focus handler");
+    }
+
 
     #[test]
     fn older_discovery_cannot_undo_newer_cli_home_and_daemon_usage_evidence() {
