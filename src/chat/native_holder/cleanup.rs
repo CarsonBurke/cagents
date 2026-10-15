@@ -158,7 +158,7 @@ impl Startup {
                 && receipt.record.terminal == self.terminal
                 && receipt.record.holder == self.holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == self.proof.boot_id
                 && receipt.proof == self.proof
         })
@@ -277,7 +277,7 @@ fn find_source(
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()

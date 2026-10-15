@@ -13,7 +13,7 @@ use serde_json::{Value,json};
 use std::{collections::BTreeMap,fs::File,io::{Read,Write},os::{fd::{AsRawFd,FromRawFd,RawFd},unix::{net::{UnixStream,UnixListener},process::CommandExt,fs::MetadataExt}},path::PathBuf,process::{Command as ChildCommand,Stdio},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant}};
 const ARGUMENT:&str="--cagents-native-actor";
 const PROTOCOL:u32=1;
-const CAPABILITY:&str="claude-actor-v1";
+const CAPABILITY:&str=registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT:Duration=Duration::from_secs(5);
 const MAX_FRAME:usize=34*1024*1024;
 #[derive(Serialize,Deserialize)]
@@ -504,7 +504,7 @@ fn published_source(source:&chat::Session,confirmed:Option<&str>,continuity:&cha
     projected.native_continuity=continuity.clone();projected
 }
 fn validate_pair(source:&chat::Session,console:Option<&crate::model::LaunchRecipe>,pair:Option<&crate::terminal::holder::Record>,previous:Option<&crate::terminal::holder::Record>)->Result<(),String> {
-    if source.terminal.is_some()!=pair.is_some() || pair.is_some_and(|record|record.terminal!=source.id || record.kind!=Kind::Terminal || record.application!=crate::instance::APPLICATION_ID || source.proof.as_ref().is_none_or(|proof|proof.boot_id!=record.boot) || previous.is_some_and(|old|old!=record)) {
+    if source.terminal.is_some()!=pair.is_some() || pair.is_some_and(|record|record.terminal!=source.id || record.kind!=Kind::Terminal || !registry::record_application_matches(record) || source.proof.as_ref().is_none_or(|proof|proof.boot_id!=record.boot) || previous.is_some_and(|old|old!=record)) {
         return Err("Paired view does not retain the exact original terminal holder".into());
     }
     if (console.is_some()&&source.terminal.is_none()) || source.terminal.as_ref().is_some_and(|terminal|terminal.id!=source.id || terminal.continuity.live_proof().as_ref()!=source.proof.as_ref() || match console {Some(recipe)=> &terminal.launch!=recipe || terminal.owned_codex_listener.is_some(),None=>terminal.owned_codex_listener!=source.owned_codex_listener}) {
@@ -796,7 +796,7 @@ impl Server {
 }
 
 fn validate_record(record:&Record)->Result<(),String> {
-    if record.kind!=Kind::Native || record.application!=crate::instance::APPLICATION_ID || !record.holder.is_current() || record.boot!=crate::daemon::read_boot_id().map_err(|error|error.to_string())? || !record.build.as_ref().is_some_and(|build|build.capabilities.iter().any(|capability|capability==CAPABILITY)) {return Err("Native holder is incompatible with retained Claude actor protocol; no input was replayed".into());}
+    if record.kind!=Kind::Native || !registry::record_application_matches(record) || !record.holder.is_current() || record.boot!=crate::daemon::read_boot_id().map_err(|error|error.to_string())? || !record.build.as_ref().is_some_and(|build|build.capabilities.iter().any(|capability|capability==CAPABILITY)) {return Err("Native holder is incompatible with retained Claude actor protocol; no input was replayed".into());}
     Ok(())
 }
 fn verify_peer(control:&UnixStream,record:&Record)->Result<(),String> {

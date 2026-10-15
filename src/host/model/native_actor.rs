@@ -30,7 +30,7 @@ impl Registry {
         runs: &[RunId], reason: &str, now_ms: u64,
     ) -> Result<bool, String> {
         if actor.is_nil() || runs.len() > 4096 || reason.is_empty() || reason.len() > 4096
-            || owner.kind != Kind::Native || owner.application != crate::instance::APPLICATION_ID
+            || owner.kind != Kind::Native || !crate::daemon::holder_registry::record_application_matches(owner)
             || owner.terminal != source.id || !source.proof.as_ref().is_some_and(|proof| proof.is_complete() && proof.boot_id == owner.boot)
         { return Err("Native actor loss has invalid exact ownership or bounds".into()); }
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
@@ -66,7 +66,7 @@ impl Registry {
         sequence: u64, event: &NativeActorEvent, now_ms: u64,
     ) -> Result<bool, String> {
         if actor.is_nil() || sequence == 0 || sequence > i64::MAX as u64
-            || owner.kind != Kind::Native || owner.application != crate::instance::APPLICATION_ID
+            || owner.kind != Kind::Native || !crate::daemon::holder_registry::record_application_matches(owner)
             || owner.terminal != source.id || !source.proof.as_ref().is_some_and(|proof| proof.is_complete() && proof.boot_id == owner.boot)
         { return Err("Native actor receipt has invalid ownership or sequence".into()); }
         let identity = serde_json::to_string(owner).map_err(|error| error.to_string())?;
