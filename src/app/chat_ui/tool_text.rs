@@ -66,18 +66,10 @@ impl Preview {
             // is the path or the pattern it was given.
             ItemContent::Command {
                 command,
-                label,
                 action: chat::CommandAction::Run,
                 output,
                 ..
-            } if label.is_empty() || label == command => {
-                (turn::first_line(command), Language::Shell, output.as_str())
-            }
-            ItemContent::Command {
-                action: chat::CommandAction::Run,
-                output,
-                ..
-            } => (turn::step_label(content), Language::Plain, output.as_str()),
+            } => (turn::first_line(command), Language::Shell, output.as_str()),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
             ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
@@ -90,7 +82,7 @@ impl Preview {
             _ => (turn::step_label(content), Language::Plain, ""),
         };
         // Bound preview work independently of the complete source kept for
-        // expansion and copying. Layout also caps wrapped text at two rows.
+        // expansion and copying. Layout caps the primary label at one row.
         let bounded = |source: &str| {
             let mut chars = source.chars();
             let mut text: String = chars.by_ref().take(512).collect();
@@ -137,14 +129,14 @@ impl Preview {
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill)
             .ellipsize(iced::advanced::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
         // Rich text keeps the full paragraph's intrinsic height even with a
-        // line-count ellipsis. Supply the matching layout limit as well;
+        // line-count ellipsis. Supply the matching one-row layout limit as well;
         // Shrink preserves a single row for short previews.
         widget::container(text)
             .width(Length::Fill)
-            .max_height(design::TEXT_BODY * 1.3 * 2.0)
+            .max_height(design::TEXT_BODY * 1.3)
             .clip(true)
             .into()
     }
@@ -527,8 +519,8 @@ mod tests {
             ),
             (
                 command("Run the tests", "cargo test", Run, "ok\n"),
-                "Run the tests",
-                Language::Plain,
+                "cargo test",
+                Language::Shell,
                 "ok",
             ),
             // A read's command is a path, its output is the file, and a
@@ -712,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_preview_is_limited_to_two_visual_lines() {
+    fn narrow_preview_is_limited_to_one_visual_line() {
         use iced::advanced::{layout, renderer::Headless, widget::Tree};
         let renderer = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -734,9 +726,8 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(110.0, 1000.0)),
             );
-            assert!(node.size().height > design::TEXT_BODY * 1.3);
             assert!(
-                node.size().height <= design::TEXT_BODY * 1.3 * 2.0 + 1.0,
+                node.size().height <= design::TEXT_BODY * 1.3 + 1.0,
                 "{:?}",
                 node.size()
             );

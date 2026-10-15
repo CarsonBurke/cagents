@@ -1030,6 +1030,7 @@ impl Runtime {
             chat::ToolStatus::Failed => "Failed",
             chat::ToolStatus::Denied => "Denied",
             chat::ToolStatus::Stopped => "Stopped",
+            chat::ToolStatus::AwaitingApproval => "Awaiting approval",
         }
     }
 
@@ -1112,6 +1113,16 @@ impl Runtime {
         } else {
             (Some(Icon::AgentWorking), "Connecting")
         }
+    }
+
+    fn turn_elapsed(&self) -> Option<String> {
+        let start = self.snapshot.turn_started_at.or(self.turn_started_at)?;
+        let end = if self.snapshot.is_working() {
+            self.source_now_ms()?
+        } else {
+            self.snapshot.finished_at?
+        };
+        Some(format_duration(end.saturating_sub(start)))
     }
 
     fn view<'a>(
@@ -1381,15 +1392,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -1554,12 +1562,14 @@ impl Runtime {
                                 .requests
                                 .iter()
                                 .map(|request| {
-                                    request_view(
+                                    request_view_with_redirect(
                                         self.target,
                                         request,
                                         &self.answers,
                                         available,
                                         RequestSurface::Transcript,
+                                        (self.session.launch.provider == Provider::Claude)
+                                            .then(|| !self.composer.text().trim().is_empty()),
                                     )
                                 })
                                 .collect::<Vec<_>>(),
@@ -2182,6 +2192,11 @@ impl Runtime {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             );
+        }
+        // The footer is outside retained turn bodies, so even prose-only
+        // work gets a live counter without rebuilding a long answer each tick.
+        if let Some(elapsed) = self.turn_elapsed() {
+            status.push(design::caption(elapsed).into());
         }
         if let Some(channel) = &place.channel {
             status.push(
@@ -2857,7 +2872,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2947,14 +2967,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -3053,7 +3077,13 @@ impl Runtime {
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
             now.and_then(|now| turn.working_for(now))
-                .map(|millis| if turn.running { millis / 1_000 } else { millis })
+                .map(|millis| {
+                    if turn.running || turn.glyph() == Some(chat::ToolStatus::AwaitingApproval) {
+                        millis / 1_000
+                    } else {
+                        millis
+                    }
+                })
                 .hash(&mut hasher);
         }
         let placed = turn.prompt.iter().map(|index| (*index, None)).chain(
@@ -4057,6 +4087,17 @@ pub(super) fn request_view<'a>(
     available: bool,
     surface: RequestSurface,
 ) -> Element<'a, Message> {
+    request_view_with_redirect(target, request, answers, available, surface, None)
+}
+
+pub(super) fn request_view_with_redirect<'a>(
+    target: Target,
+    request: &'a chat::Request,
+    answers: &'a Answers,
+    available: bool,
+    surface: RequestSurface,
+    redirect: Option<bool>,
+) -> Element<'a, Message> {
     let (question, context) = question_and_context(&request.description);
     let mut rows: Vec<Element<'a, Message>> = vec![
         widget::row::with_children(vec![
@@ -4095,7 +4136,27 @@ pub(super) fn request_view<'a>(
         rows.push(field_view(target, request, field, answers, available));
     }
     rows.push(answers_view(target, request, available, surface));
-    widget::container(
+    if let Some(has_text) = redirect.filter(|_| {
+        request.kind == chat::RequestKind::Approval
+            && request.actions.iter().any(|choice| choice.id == "deny")
+    }) {
+        rows.push(
+            crate::ui_controls::button::secondary(if has_text {
+                "Deny with message"
+            } else {
+                "Deny with instructions…"
+            })
+            .on_press_maybe(available.then(|| {
+                action(Action::DenyInstructions(
+                    target,
+                    request.id.clone(),
+                    has_text,
+                ))
+            }))
+            .into(),
+        );
+    }
+    let content: Element<'a, Message> = widget::container(
         widget::column::with_children(rows)
             .spacing(step::GAP_M)
             .width(Length::Fill),
@@ -4107,7 +4168,37 @@ pub(super) fn request_view<'a>(
     ))
     .padding(step::GAP_M)
     .width(Length::Fill)
-    .into()
+    .into();
+    if available && request.kind == chat::RequestKind::Approval {
+        let once = request
+            .actions
+            .iter()
+            .find(|choice| stake(choice) == Stake::Once);
+        let deny = request
+            .actions
+            .iter()
+            .find(|choice| stake(choice) == Stake::Refuse);
+        if let (Some(once), Some(deny)) = (once, deny) {
+            return crate::interaction::focused_decisions(
+                card_control_id(
+                    target.card,
+                    &format!(
+                        "chat-approval-{}-{}-{}",
+                        match surface {
+                            RequestSurface::Transcript => "transcript",
+                            RequestSurface::Permissions => "permissions",
+                        },
+                        target.generation,
+                        request.id
+                    ),
+                ),
+                content,
+                move || action(Action::Answer(target, request.id.clone(), once.id.clone())),
+                move || action(Action::Answer(target, request.id.clone(), deny.id.clone())),
+            );
+        }
+    }
+    content
 }
 
 /// One thing a question asks for: its own prompt, the answers the
@@ -4322,10 +4413,19 @@ fn answers_view<'a>(
                     request.id.clone(),
                     choice.id.clone(),
                 )));
-                let control = if primary == Some(&choice.id) {
-                    crate::ui_controls::button::primary(choice.label.as_str())
+                let label = if request.kind == chat::RequestKind::Approval {
+                    match stake(choice) {
+                        Stake::Once => format!("{} (Enter)", choice.label),
+                        Stake::Refuse => format!("{} (Esc)", choice.label),
+                        Stake::Session => choice.label.clone(),
+                    }
                 } else {
-                    crate::ui_controls::button::secondary(choice.label.as_str())
+                    choice.label.clone()
+                };
+                let control = if primary == Some(&choice.id) {
+                    crate::ui_controls::button::primary(label)
+                } else {
+                    crate::ui_controls::button::secondary(label)
                 }
                 .on_press_maybe(message);
                 // Custom IDs retain state globally in iced. The transcript
@@ -4889,6 +4989,137 @@ mod tests {
         );
         runtime.disconnected = true;
         assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn turn_timer_survives_paging_and_resets_for_a_new_turn() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let user = chat::Item {
+            id: "user-one".into(),
+            role: chat::Role::User,
+            started_at: Some(1_000),
+            at: Some(1_000),
+            content: ItemContent::Text {
+                text: "first".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            generation: 1,
+            turn_generation: 1,
+            sampled_at: Some(2_000),
+            items: vec![Arc::new(user)],
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        snapshot.items.clear();
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_started_at,
+            Some(1_000),
+            "paging cannot discard turn timing metadata"
+        );
+        snapshot.busy = false;
+        snapshot.finished_at = Some(4_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
+        snapshot.busy = true;
+        snapshot.finished_at = None;
+        snapshot.turn_generation = 2;
+        snapshot.generation += 1;
+        snapshot.sampled_at = Some(5_000);
+        snapshot.turn_started_at = Some(5_000);
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_started_at,
+            Some(5_000),
+            "a new turn resets the previous start"
+        );
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "user-two".into(),
+            role: chat::Role::User,
+            started_at: Some(5_100),
+            at: Some(5_100),
+            content: ItemContent::Text {
+                text: "second".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        }));
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(5_100));
+    }
+
+    #[test]
+    fn first_attachment_times_a_paged_out_prompt_without_child_wakes_restarting_it() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            generation: 1,
+            turn_generation: 1,
+            turn_started_at: Some(1_000),
+            sampled_at: Some(6_000),
+            has_earlier: true,
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        assert!(runtime.turn_elapsed().is_some());
+        snapshot.busy = false;
+        snapshot.subagents.push(native_child_fixture());
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
+        snapshot.finished_at = Some(6_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("5.0s"));
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("5.0s"));
+    }
+
+    #[test]
+    fn prose_only_turn_elapsed_advances_and_stops_at_settlement() {
+        let user = chat::Item {
+            id: "user".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "Write an answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: Some(1_000),
+            at: Some(1_000),
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[user]);
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.busy = true;
+        state.turn_started_at = Some(1_000);
+        assert!(
+            runtime.turn_elapsed().is_some(),
+            "no tool rows are needed for elapsed time"
+        );
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.busy = false;
+        state.finished_at = Some(4_000);
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
     }
 
     #[test]
@@ -7349,8 +7580,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7600,10 +7837,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(

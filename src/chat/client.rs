@@ -1505,6 +1505,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pre_approval_protocol_peer_is_rejected_before_chat_publications() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let proof = handoff_proof();
+        let response = ServerEnvelope {
+            version: 77,
+            request_id: Some(1),
+            proof: proof.clone(),
+            message: ServerMessage::Response {
+                response: ServerResponse::ShutdownAccepted,
+            },
+        };
+        FrameCodec::new(ipc::MAX_FRAME_BYTES)
+            .write(&mut server, &response)
+            .unwrap();
+        let error = receive(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            1,
+            Some(&proof),
+        )
+        .unwrap_err();
+        assert!(error.contains("version mismatch"), "{error}");
+    }
+
+    #[test]
     fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
         let received = Instant::now();
         // The daemon can be arbitrarily ahead of or behind the display

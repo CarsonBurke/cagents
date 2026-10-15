@@ -2524,6 +2524,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::TurnStarted => {
             state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
+            state.turn_started_at = observed_at();
             state.finished_at = None;
         }
         Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
@@ -2557,6 +2558,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
             state.finished_at = None;
+            state.turn_started_at = None;
             state.prompt_suggestion = None;
             state.branch_points.clear();
             state.forked = None;
@@ -3792,6 +3794,28 @@ mod tests {
         }
         apply_event(&mut state, &mut indices, Event::TurnStarted);
         assert_eq!(state.turn_generation, 3);
+        assert!(state.turn_started_at.is_some());
+        let started = state.turn_started_at;
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: true,
+                detail: "Working".into(),
+            },
+        );
+        apply_event(&mut state, &mut indices, Event::TurnSettled);
+        assert_eq!(
+            state.turn_started_at, started,
+            "status and completion do not restart the clock"
+        );
+        state.turn_started_at = Some(1);
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert_ne!(
+            state.turn_started_at,
+            Some(1),
+            "queued or autonomous turns get a new source timestamp"
+        );
         assert_eq!(state.generation, 0, "publication generation is independent");
     }
 

@@ -870,6 +870,10 @@ pub struct Snapshot {
     /// and autonomous turns, even when publications coalesce the idle state.
     #[serde(default)]
     pub turn_generation: u64,
+    /// Daemon source-clock time at the observed turn boundary. Kept in resident
+    /// metadata so a first attachment can time work whose prompt is paged out.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
     /// Daemon wall-clock time when a provider-confirmed turn and its delegated
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
@@ -1218,6 +1222,19 @@ pub struct Answer {
     pub values: Vec<String>,
 }
 
+impl Answer {
+    /// An optional denial redirect, carried through the existing structured
+    /// answer transport. This field is not a provider question answer.
+    pub const DENIAL_INSTRUCTIONS: &str = "__cagents_denial_instructions";
+
+    pub fn denial_instructions(text: String) -> Self {
+        Self {
+            field: Self::DENIAL_INSTRUCTIONS.into(),
+            values: vec![text],
+        }
+    }
+}
+
 /// Permission metadata supplied by the provider, without unrelated settings
 /// such as environment variables, hooks, or account credentials.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1309,6 +1326,8 @@ pub enum ToolStatus {
     /// Ended before it finished because it was asked to stop: cancelled by
     /// the user, or interrupted with the work that started it.
     Stopped,
+    /// The tool has been proposed and cannot run until the user answers.
+    AwaitingApproval,
 }
 
 /// What a shell command was actually for.
@@ -1631,6 +1650,15 @@ impl ItemContent {
         }
     }
 
+    pub fn set_status(&mut self, value: ToolStatus) {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => *status = value,
+            _ => {}
+        }
+    }
+
     pub fn status(&self) -> Option<ToolStatus> {
         match self {
             Self::Command { status, .. }
@@ -1677,7 +1705,8 @@ pub struct Field {
 /// What the provider is asking the reader to do, independent of its RPC envelope.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
-    /// Authorize a tool action or additional permissions. Never submit on Enter.
+    /// Authorize a tool action or additional permissions. Requires an explicit
+    /// decision; card shortcuts are active only after the user focuses it.
     #[default]
     Approval,
     /// Answer an ordinary question, including a yes/no confirmation.
