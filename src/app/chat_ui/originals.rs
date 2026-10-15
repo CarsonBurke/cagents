@@ -313,6 +313,17 @@ impl Runtime {
             command => command,
         }
     }
+    fn original_metadata_available(&self) -> bool {
+        self.snapshot.ready
+            && !self.snapshot.busy
+            && !self.snapshot.original_retry_pending
+            && !self.snapshot.waiting
+            && self.snapshot.requests.is_empty()
+            && self.snapshot.read_only_reason.is_none()
+            && self.pending.is_none()
+            && self.queued.is_none()
+            && self.selected_subagent.is_none()
+    }
     pub(super) fn sync_original(&mut self) {
         if !self.visible.load(Ordering::Relaxed) || self.disconnected || self.snapshot.exited {
             self.recovery.originals.clear();
@@ -326,16 +337,20 @@ impl Runtime {
             self.recovery.originals.clear();
             self.recovery.originals.context = Some(context.clone());
         }
-        if self.snapshot.ready
-            && !self.snapshot.busy
-            && !self.snapshot.original_retry_pending
-            && !self.snapshot.waiting
-            && self.snapshot.requests.is_empty()
-            && self.snapshot.read_only_reason.is_none()
-            && self.pending.is_none()
-            && self.queued.is_none()
-            && self.selected_subagent.is_none()
-            && !self.recovery.originals.attempted
+        // An idle prefetch can already exist when an approval or restoration
+        // arrives without changing the accepted-input Context. Withdraw that
+        // metadata probe, then rearm it when the same context becomes idle.
+        let eligible = self.original_metadata_available();
+        if !eligible {
+            if self.recovery.originals.query.as_ref().is_some_and(|query| {
+                matches!(query.purpose, Purpose::Metadata)
+            }) {
+                self.recovery.originals.query = None;
+                self.recovery.originals.attempted = false;
+            }
+            return;
+        }
+        if !self.recovery.originals.attempted
             && self.recovery.originals.query.is_none()
             && let Some(handle) = self.handle().cloned()
         {
@@ -372,6 +387,9 @@ impl Cagents {
             return None;
         }
         let query = runtime.recovery.originals.query.clone()?;
+        if matches!(query.purpose, Purpose::Metadata) && !runtime.original_metadata_available() {
+            return None;
+        }
         // Registry identity is only an invalidation hint. It grants no read
         // authority: the daemon independently validates the physical scope.
         let account_hint = self.chat_account(
@@ -699,6 +717,7 @@ mod tests {
     #[test]
     fn restoration_pending_does_not_prefetch_or_offer_another_original() {
         let mut runtime = runtime();
+        let idle_probe = runtime.recovery.originals.query_id_for_test();
         Arc::make_mut(&mut runtime.snapshot).original_retry_pending = true;
         runtime.sync_original();
         assert!(runtime.recovery.originals.query.is_none());
@@ -714,6 +733,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).original_retry_pending = false;
         runtime.sync_original();
         assert!(runtime.recovery.originals.query.is_some());
+        assert_ne!(runtime.recovery.originals.query_id_for_test(), idle_probe);
     }
 
     #[test]
@@ -893,6 +913,7 @@ mod tests {
     #[test]
     fn pending_approval_does_not_offer_turn_recovery_or_probe_latest_original() {
         let mut runtime = runtime();
+        let idle_probe = runtime.recovery.originals.query_id_for_test();
         Arc::make_mut(&mut runtime.snapshot).waiting = true;
         runtime.sync_original();
         assert!(runtime.recovery.originals.query.is_none());
@@ -900,6 +921,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).waiting = false;
         runtime.sync_original();
         assert!(runtime.recovery.originals.query.is_some());
+        assert_ne!(runtime.recovery.originals.query_id_for_test(), idle_probe);
         assert!(runtime.recovery_available());
     }
     #[test]
