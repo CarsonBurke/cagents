@@ -19872,7 +19872,9 @@ mod tests {
 
     #[test]
     fn settings_stale_invalid_snapshot_cannot_restore_a_resolved_banner() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
         let invalid = settings::LiveSettings::now(Err("invalid TOML".into()));
         let valid = settings::LiveSettings::now(Ok(app.settings.clone()));
         drop(app.reload_settings(valid));
@@ -19980,7 +19982,9 @@ mod tests {
 
     #[test]
     fn settings_external_reload_refreshes_controls_but_preserves_invalid_drafts() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
         let field = SettingsField::TerminalFontSize;
         app.settings_draft.set(field, "unfinished".into());
         app.settings_invalid.insert(field, "Enter a valid number".into());
