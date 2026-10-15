@@ -13767,10 +13767,18 @@ mod tests {
         let new_window = StateStore::open(&backup, boot).unwrap();
         let restored = new_window.load_workspace(saved.id, None).unwrap().unwrap();
         assert!(!restored.configured_chat_drafts.contains_key(&card));
-        assert_eq!(reopened.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts[&card], expected);
+        assert_eq!(
+            reopened
+                .load_workspace(saved.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts[&card],
+            expected
+        );
         let (&card, copied) = restored.configured_chat_drafts.iter().next().unwrap();
         assert_ne!(copied.id, expected.id);
-        let mut normalized = copied.clone(); normalized.id = expected.id;
+        let mut normalized = copied.clone();
+        normalized.id = expected.id;
         assert_eq!(normalized, expected);
         let expected = copied.clone();
         let CardKind::Chat(session) = restored
@@ -13841,23 +13849,46 @@ mod tests {
     }
 
     #[test]
-    fn settings_two_copied_windows_issue_distinct_configured_panes_without_replacing_either_actor() {
-        use crate::{persistence::{StateStore, SnapshotBase}, workspace_model::{ModelEdit, views::{View, Scope}}};
+    fn settings_two_copied_windows_issue_distinct_configured_panes_without_replacing_either_actor()
+    {
+        use crate::{
+            persistence::{SnapshotBase, StateStore},
+            workspace_model::{
+                ModelEdit,
+                views::{Scope, View},
+            },
+        };
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.sqlite3");
         let boot = crate::model::BootId::new("configured-two-windows");
         let store = StateStore::open(&source, boot.clone()).unwrap();
         let mut original = crate::app::tests::context_inspector_test_app(false);
         let channel = crate::model::ChannelId::new();
-        Arc::make_mut(&mut original.durable).channels.push(crate::model::ProjectChannel {
-            id: channel, project_id: crate::model::ProjectId::new(), title: "configured".into(), title_source: Default::default(),
-            ordinal: 0, shared: true, cards: vec![], focused: None,
-        });
+        Arc::make_mut(&mut original.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "configured".into(),
+                title_source: Default::default(),
+                ordinal: 0,
+                shared: true,
+                cards: vec![],
+                focused: None,
+            });
         Arc::make_mut(&mut original.durable).active_channel = Some(channel);
         drop(original.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let saved = original.persistent_workspace();
         let original_card = original.workspace.focused().unwrap();
-        store.save_workspace(&saved, SnapshotBase { workspace: 0, cards: &std::collections::BTreeMap::new() }).unwrap();
+        store
+            .save_workspace(
+                &saved,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
         let identity = uuid::Uuid::new_v4();
         let mut windows = Vec::new();
         for name in ["one.sqlite3", "two.sqlite3"] {
@@ -13867,7 +13898,16 @@ mod tests {
             let restored = copied.load_workspace(saved.id, None).unwrap().unwrap();
             let card = *restored.configured_chat_drafts.keys().next().unwrap();
             assert_ne!(card, original_card);
-            let CardKind::Chat(session) = restored.cards.iter().find(|state| state.id == card).unwrap().kind.clone() else { panic!("draft") };
+            let CardKind::Chat(session) = restored
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind
+                .clone()
+            else {
+                panic!("draft")
+            };
             let mut app = crate::app::tests::context_inspector_test_app(false);
             app.workspace = Cagents::rebuild_workspace(&restored);
             app.shared_views = shared_views::State::for_workspace(&restored);
@@ -13905,7 +13945,12 @@ mod tests {
                     canonical.apply(&change).unwrap();
                 }
             }
-            assert!(canonical.panes.iter().any(|pane| pane.id == *card && pane.kind == CardKind::Chat(exact.clone())));
+            assert!(
+                canonical
+                    .panes
+                    .iter()
+                    .any(|pane| pane.id == *card && pane.kind == CardKind::Chat(exact.clone()))
+            );
             issued_ids.push((*card, exact));
         }
         assert_eq!(canonical.panes.len(), 2);
@@ -13914,32 +13959,71 @@ mod tests {
             app.workspace_model.views = vec![canonical.clone()];
             drop(app.reconcile_shared_views());
             for (card, exact) in &issued_ids {
-                assert_eq!(app.card_state(*card).unwrap().kind, CardKind::Chat(exact.clone()));
+                assert_eq!(
+                    app.card_state(*card).unwrap().kind,
+                    CardKind::Chat(exact.clone())
+                );
             }
         }
-        assert!(store.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts.contains_key(&original_card));
+        assert!(
+            store
+                .load_workspace(saved.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts
+                .contains_key(&original_card)
+        );
     }
 
     #[test]
-    fn settings_empty_default_choices_survive_restart_and_new_window_without_promoting_picker_opens() {
-        use crate::persistence::{StateStore, SnapshotBase};
+    fn settings_empty_default_choices_survive_restart_and_new_window_without_promoting_picker_opens()
+     {
+        use crate::persistence::{SnapshotBase, StateStore};
         let directory = tempfile::tempdir().unwrap();
         for choice in ["model", "effort", "permission", "account"] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            drop(app.observe_listed_models(Provider::Claude, vec![fixture_model("model-one", &["low", "high"])]));
-            app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
-                model: Some("model-one".into()), effort: Some("low".into()), permission_mode: Some("plan".into()), ..Default::default()
-            });
-            drop(app.new_native_chat_with_lifetime(Provider::Claude, Some(directory.path().into()), true));
+            drop(app.observe_listed_models(
+                Provider::Claude,
+                vec![fixture_model("model-one", &["low", "high"])],
+            ));
+            app.settings.agents.insert(
+                "claude".into(),
+                settings::AgentLaunchSettings {
+                    model: Some("model-one".into()),
+                    effort: Some("low".into()),
+                    permission_mode: Some("plan".into()),
+                    ..Default::default()
+                },
+            );
+            drop(app.new_native_chat_with_lifetime(
+                Provider::Claude,
+                Some(directory.path().into()),
+                true,
+            ));
             let card = app.workspace.focused().unwrap();
             let target = chat_runtime(&app, card).target;
             assert!(app.chat_ui.default_chats.contains(&card));
-            assert!(!app.persistent_workspace().configured_chat_drafts.contains_key(&card));
+            assert!(
+                !app.persistent_workspace()
+                    .configured_chat_drafts
+                    .contains_key(&card)
+            );
             drop(app.update(Message::ChatUi(Action::ModelPicker(target, true))));
-            drop(app.update(Message::ChatUi(Action::PermissionMode(target, "invalid-mode".into()))));
-            let mut stale = target; stale.generation += 1;
-            drop(app.update(Message::ChatUi(Action::DraftModel(stale, Provider::Claude, None))));
-            assert!(app.chat_ui.default_chats.contains(&card), "picker/rejected callbacks: {choice}");
+            drop(app.update(Message::ChatUi(Action::PermissionMode(
+                target,
+                "invalid-mode".into(),
+            ))));
+            let mut stale = target;
+            stale.generation += 1;
+            drop(app.update(Message::ChatUi(Action::DraftModel(
+                stale,
+                Provider::Claude,
+                None,
+            ))));
+            assert!(
+                app.chat_ui.default_chats.contains(&card),
+                "picker/rejected callbacks: {choice}"
+            );
             let action = match choice {
                 "model" => Action::DraftModel(target, Provider::Claude, None),
                 "effort" => Action::Reasoning(target, "model-one".into(), "high".into()),
@@ -13948,18 +14032,39 @@ mod tests {
                 _ => unreachable!(),
             };
             drop(app.update(Message::ChatUi(action)));
-            assert!(!app.chat_ui.default_chats.contains(&card), "explicit {choice}");
+            assert!(
+                !app.chat_ui.default_chats.contains(&card),
+                "explicit {choice}"
+            );
             assert!(chat_runtime(&app, card).composer.is_empty());
             assert!(!app.chat_start_pending(card));
-            let expected = chat_runtime(&app, card).configured_start().unwrap().unwrap();
+            let expected = chat_runtime(&app, card)
+                .configured_start()
+                .unwrap()
+                .unwrap();
             let saved = app.persistent_workspace();
             assert_eq!(saved.configured_chat_drafts[&card], expected);
             let source = directory.path().join(format!("{choice}.sqlite3"));
             let boot = crate::model::BootId::new("empty-configured-choice");
             let store = StateStore::open(&source, boot.clone()).unwrap();
-            store.save_workspace(&saved, SnapshotBase { workspace: 0, cards: &std::collections::BTreeMap::new() }).unwrap();
+            store
+                .save_workspace(
+                    &saved,
+                    SnapshotBase {
+                        workspace: 0,
+                        cards: &std::collections::BTreeMap::new(),
+                    },
+                )
+                .unwrap();
             let restarted = StateStore::open(&source, boot.clone()).unwrap();
-            assert_eq!(restarted.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts[&card], expected);
+            assert_eq!(
+                restarted
+                    .load_workspace(saved.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .configured_chat_drafts[&card],
+                expected
+            );
             let copied = directory.path().join(format!("{choice}-copy.sqlite3"));
             StateStore::copy_window_snapshot(&source, &copied, boot.clone()).unwrap();
             let copied = StateStore::open(&copied, boot).unwrap();
@@ -13967,7 +14072,8 @@ mod tests {
             let (&new_card, actual) = copied.configured_chat_drafts.iter().next().unwrap();
             assert_ne!(new_card, card);
             assert_ne!(actual.id, expected.id);
-            let mut normalized = actual.clone(); normalized.id = expected.id;
+            let mut normalized = actual.clone();
+            normalized.id = expected.id;
             assert_eq!(normalized, expected, "copied explicit {choice}");
         }
     }
@@ -13983,14 +14089,24 @@ mod tests {
         let target = pending.target;
         let expected = app.persistent_workspace().configured_chat_drafts[&card].clone();
         assert!(app.configured_chat_is_local(card));
-        answer_start(&mut app, target, Err(chat::StartFailure::retry("private fixture refusal")));
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::retry("private fixture refusal")),
+        );
         let runtime = chat_runtime(&app, card);
         assert!(runtime.choosing());
-        assert_eq!(runtime.composer.text().trim(), "keep the configured first message");
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "keep the configured first message"
+        );
         assert_eq!(runtime.error.as_deref(), Some("private fixture refusal"));
         assert_eq!(runtime.configured_start().unwrap().unwrap(), expected);
         assert!(app.configured_chat_is_local(card));
-        assert_eq!(app.persistent_workspace().configured_chat_drafts[&card], expected);
+        assert_eq!(
+            app.persistent_workspace().configured_chat_drafts[&card],
+            expected
+        );
     }
 
     #[test]
@@ -14045,7 +14161,10 @@ mod tests {
             .unwrap()
             .id = TerminalId::new();
         drop(app.open_chat_draft(card, session.clone()));
-        assert!(app.configured_chat_is_local(card), "invalid saved intent must stay private");
+        assert!(
+            app.configured_chat_is_local(card),
+            "invalid saved intent must stay private"
+        );
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             panic!("typed draft")
         };

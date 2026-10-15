@@ -1319,7 +1319,10 @@ fn accounts() -> Result<Reply, String> {
             installed.insert(provider, false);
             continue;
         };
-        let configuration = policies.get(crate::settings::agents::provider_key(provider)).cloned().unwrap_or_default();
+        let configuration = policies
+            .get(crate::settings::agents::provider_key(provider))
+            .cloned()
+            .unwrap_or_default();
         let cli = probe::Cli::configured(provider, search_path.as_deref(), configuration).ok();
         installed.insert(provider, cli.is_some());
         if let Some((cache, cli)) = cache.as_ref().zip(cli.as_ref()) {

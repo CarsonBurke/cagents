@@ -629,7 +629,12 @@ impl StateStore {
 
     // Only the unpublished New Window copy uses false: applying startup
     // recovery here would rewrite unrelated issued continuity before launch.
-    fn open_connection(path: &Path, boot_id: BootId, options: StoreOptions, startup: bool) -> Result<Self> {
+    fn open_connection(
+        path: &Path,
+        boot_id: BootId,
+        options: StoreOptions,
+        startup: bool,
+    ) -> Result<Self> {
         if boot_id.as_str().is_empty() {
             return Err(StoreError::InvalidState(
                 "current boot ID must not be empty".into(),
@@ -654,7 +659,12 @@ impl StateStore {
         let recovery = if startup {
             reconcile_startup(&mut connection, &boot_id)?
         } else {
-            RecoveryReport { dirty_shutdown: false, boot_changed: false, operations_requiring_reconciliation: 0, terminals_downgraded: 0 }
+            RecoveryReport {
+                dirty_shutdown: false,
+                boot_changed: false,
+                operations_requiring_reconciliation: 0,
+                terminals_downgraded: 0,
+            }
         };
         enforce_private_database(path)?;
         enforce_sqlite_sidecars(path)?;

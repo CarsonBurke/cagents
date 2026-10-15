@@ -15267,7 +15267,11 @@ impl Application for Cagents {
                         "Could not open a new window: {error}"
                     )));
                 }
-                if refresh { self.refresh_account_policy() } else { Task::none() }
+                if refresh {
+                    self.refresh_account_policy()
+                } else {
+                    Task::none()
+                }
             }
             Message::SettingsSaved { generation, result } => {
                 let mut refresh_accounts = false;
@@ -15391,7 +15395,11 @@ impl Application for Cagents {
                 if generation != self.update_generation || !self.update_prepared {
                     let _ =
                         response.try_send("error: window update preparation was cancelled".into());
-                    return if refresh { self.refresh_account_policy() } else { Task::none() };
+                    return if refresh {
+                        self.refresh_account_policy()
+                    } else {
+                        Task::none()
+                    };
                 }
                 self.update_flush_pending = false;
                 match result {
@@ -15401,7 +15409,11 @@ impl Application for Cagents {
                             self.status = Some(TransientNotice::warning(
                                 "Updater disconnected; window is ready.",
                             ));
-                            return if refresh { self.refresh_account_policy() } else { Task::none() };
+                            return if refresh {
+                                self.refresh_account_policy()
+                            } else {
+                                Task::none()
+                            };
                         }
                         if committing {
                             self.update_committed = true;
@@ -15414,7 +15426,11 @@ impl Application for Cagents {
                         let _ = response.try_send(format!("error: {error}").replace('\n', " "));
                     }
                 }
-                if refresh { self.refresh_account_policy() } else { Task::none() }
+                if refresh {
+                    self.refresh_account_policy()
+                } else {
+                    Task::none()
+                }
             }
             Message::UiUpdateWatchdog(generation) => {
                 if self.update_prepared

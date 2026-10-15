@@ -337,8 +337,12 @@ mod tests {
         let account = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), account_home);
         let host = crate::host::AccountReservation::test_host();
         let _reservation = crate::host::AccountReservation::test_install(
-            &host, &[account], fixture.store.clone(), &fixture.homes,
-        ).unwrap();
+            &host,
+            &[account],
+            fixture.store.clone(),
+            &fixture.homes,
+        )
+        .unwrap();
         // Exercise the actual ingress. It must refuse before looking up the
         // installation's settings/registry or touching any provider endpoint.
         let failure = start(&host, 1, fixture.intent.clone()).unwrap_err();
