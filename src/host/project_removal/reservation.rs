@@ -154,6 +154,9 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
         ClientRequest::Spawn { session, .. } => ensure_available(host,None,Some(&session.launch.working_directory),Some(session.id))?,
         ClientRequest::ChatStart { session, .. } | ClientRequest::ChatStartSelected { session, .. } => ensure_available(host,None,Some(&session.launch.recipe.working_directory),Some(session.id))?,
         ClientRequest::ChatRecoverAccount { source, replacement, .. } => { ensure_available(host,None,Some(&source.launch.recipe.working_directory),Some(source.id))?; ensure_available(host,None,Some(&replacement.launch.recipe.working_directory),Some(replacement.id))?; },
+        ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Write { root, .. } } => ensure_available(host,Some(root),Some(root),None)?,
+        ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Git { root, operation } } if !matches!(operation, crate::device_service::GitOperation::Status | crate::device_service::GitOperation::Worktrees | crate::device_service::GitOperation::Diff { .. }) => ensure_available(host,Some(root),Some(root),None)?,
+        ClientRequest::DeviceOperation { operation: crate::device_service::Operation::RemoveMergedWorktree { request } } => ensure_available(host,Some(&request.repository),Some(&request.path),None)?,
         _ => {},
     }
     Ok(())

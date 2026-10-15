@@ -380,12 +380,14 @@ pub(super) fn process_request(
         let prepared = {
             let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
+            super::project_removal::ensure_available(host, Some(&request.repository), Some(&request.path), None)?;
             crate::worktree_cleanup::PreparedRemoval::prepare(request.clone())
         };
         let removed = match prepared {
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
+                super::project_removal::ensure_available(host, Some(&request.repository), Some(&request.path), None)?;
                 prepared
                     .remove(|windows| {
                         host.lock()

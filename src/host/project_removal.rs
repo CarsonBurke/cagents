@@ -184,6 +184,12 @@ mod tests {
         let transfer = ClientRequest::EditWorkspaceModel { edit: ModelEdit::ChangeView { scope: Scope::Worktree { repository: unrelated_dir.clone(), path: unrelated_dir }, expected_revision:0, operation:uuid::Uuid::new_v4(), change:crate::workspace_model::views::Change::Transfer { id: crate::model::CardId::new(), destination: Scope::Worktree { repository: fixture.root.clone(), path: fixture.root.clone() }, before:None } } };
         assert!(super::super::client::process_request(&fixture.host,1,transfer).unwrap_err().message.contains("being removed"));
         assert!(ensure_available(&fixture.host,None,Some(&fixture.root),None).is_err());
+        let github = crate::github_identity::GitHubRepoKey::new("github.com",None,"fixture","project").unwrap();
+        let cleanup = ClientRequest::DeviceOperation { operation: crate::device_service::Operation::RemoveMergedWorktree { request: crate::worktree_cleanup::RemovalRequest { repository: fixture.root.clone(), path: fixture.root.join("linked"), branch: "fixture".into(), head_oid: "a".repeat(40), source_repository: github.clone(), pull_request: crate::github_identity::PullRequestKey { repository: github, number: 1 } } } };
+        assert!(super::super::client::process_request(&fixture.host,1,cleanup).unwrap_err().message.contains("being removed"),"the early automatic-cleanup port must refuse before Git or GitHub preparation");
+        let save = ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Write { root: fixture.root.clone(), path: "pending.txt".into(), expected: String::new(), content: "must not save".into() } };
+        assert!(super::super::client::process_request(&fixture.host,1,save).unwrap_err().message.contains("being removed"));
+        assert!(!fixture.root.join("pending.txt").exists());
         release.0.send(()).unwrap(); let _ = command.join().unwrap();
         assert!(closing.recv_timeout(Duration::from_secs(5)).unwrap().is_ok()); close.join().unwrap();
         assert!(!fixture.handles[0].is_completed()); assert!(handle.is_completed());
