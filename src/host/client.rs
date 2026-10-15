@@ -2550,6 +2550,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_pane_source_updates_return_retryable_conflict_without_partial_success() {
+        use crate::{
+            model::{BootId, BrowserId, BrowserSession, CardId, CardKind, ChannelId,
+                HostIncarnation, HostSessionId},
+            workspace_model::{ModelEdit, views::{Change, Pane, Scope}},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        std::fs::create_dir(&repository).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("source-update"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            }),
+        ));
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.install_model(super::super::model::Registry::at(
+                &directory.path().join("model.sqlite3")).unwrap());
+            state.register_client(1);
+        }
+        let edit = |edit| process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit });
+        edit(ModelEdit::OpenProject { repository: repository.clone(), name: "project".into(),
+            kind: Default::default() }).unwrap();
+        let channel = ChannelId::new();
+        edit(ModelEdit::CreateChannel { id: channel, repository, title: "channel".into(),
+            title_source: Default::default() }).unwrap();
+        let original = Pane {
+            id: CardId::new(), title: "browser".into(), user_title: None,
+            pending_terminal_start: false, width_fraction: 0.5, scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(), current_url: "https://example.com".parse().unwrap(),
+                history: vec![], history_index: 0, scroll_x: 0., scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        edit(ModelEdit::SeedView { scope: Scope::Channel(channel),
+            panes: vec![original.clone()], closed: vec![] }).unwrap();
+        let read = || host.lock().unwrap_or_else(|p| p.into_inner()).read_model().unwrap();
+        let revision = |model: &crate::workspace_model::WorkspaceModel| model.views.iter()
+            .find(|view| view.scope == Scope::Channel(channel)).unwrap().revision;
+        let mut current = original.clone();
+        if let CardKind::Browser(browser) = &mut current.kind {
+            browser.current_url = "https://example.com/newer".parse().unwrap();
+        }
+        edit(ModelEdit::ChangeView { scope: Scope::Channel(channel),
+            expected_revision: revision(&read()), operation: uuid::Uuid::new_v4(),
+            change: Change::Update { before: original.clone(), pane: current } }).unwrap();
+        let mut stale = original.clone();
+        stale.title = "must not partly commit".into();
+        stale.scope = Some(directory.path().join("stale"));
+        let before = read();
+        let error = edit(ModelEdit::ChangeView { scope: Scope::Channel(channel),
+            expected_revision: revision(&before), operation: uuid::Uuid::new_v4(),
+            change: Change::Update { before: original, pane: stale } }).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+        assert!(error.retryable);
+        assert_eq!(read(), before);
+    }
+
     /// A shared-model edit reaches every window watching the model and never
     /// its originator, which already has the model the edit returned. A client
     /// that only reads - every CLI invocation - receives nothing at all.
