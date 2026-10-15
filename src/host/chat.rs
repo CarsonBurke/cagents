@@ -741,7 +741,7 @@ pub(super) fn start_execution(
 /// no launch authority. Recovery authenticates the complete issued descriptor
 /// with the holder before attaching, and never falls back to recipe execution.
 pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError> {
-    if session.launch.provider != Provider::Codex {
+    if !matches!(session.launch.provider, Provider::Codex | Provider::Claude) {
         return Ok(false);
     }
     use crate::daemon::holder_registry::{self as registry, Kind};

@@ -130,6 +130,9 @@ fn restore_reserved(
     let directory = registry::directory(Kind::Native)?;
     let record = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?
         .ok_or("The durable native holder is unavailable; this conversation was not restarted or resent")?;
+    if Handle::is_remote_record(&record) {
+        return super::retained_actor::restore(host, client, source, proof, record);
+    }
     let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());
@@ -382,7 +385,7 @@ fn restore_authenticated(
     Ok(response)
 }
 
-fn retained_upgrade_sources(
+pub(super) fn retained_upgrade_sources(
     sources: Vec<Session>,
     successor: &Session,
 ) -> Vec<crate::upgrade::handoff::ChatSource> {
@@ -425,8 +428,13 @@ pub(in crate::host) fn restore_orphaned_native(
         {
             continue;
         }
-        let result = chat::native_holder::inspect(&record, &proof)
-            .and_then(|(recovery, _)| restore(host, 0, &recovery.source));
+        let result = if Handle::is_remote_record(&record) {
+            Handle::inspect_remote(&record, proof.clone())
+                .and_then(|inspection| restore(host, 0, &inspection.source))
+        } else {
+            chat::native_holder::inspect(&record, &proof)
+                .and_then(|(recovery, _)| restore(host, 0, &recovery.source))
+        };
         if let Err(error) = result {
             tracing::warn!(session = %record.terminal, %error, "retained native conversation could not be reattached; holder evidence preserved");
         }

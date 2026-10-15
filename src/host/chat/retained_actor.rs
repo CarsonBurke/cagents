@@ -136,3 +136,61 @@ pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<b
         chat::protocol::LaunchOutcome::Uncertain => Err("The exact retained startup has not proved cleanup; no second provider was started".into()),
     }
 }
+
+/// Reattach to the resident Claude reducer; never open provider stdin, reload
+/// its transcript as a replacement, or reconstruct command/control UUIDs.
+pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, proof: &HostSessionProof, owner: crate::daemon::holder_registry::Record) -> Result<ServerResponse, String> {
+    let inspection = Handle::inspect_remote(&owner, proof.clone())?;
+    if inspection.identity.record != owner || inspection.source.id != requested.id
+        || inspection.source.launch.provider != Provider::Claude
+    { return Err("The retained Claude actor identity changed during inspection".into()); }
+    // Pair adoption is qualified independently against its retained worker;
+    // until that metadata is available, preserve ownership rather than drop it.
+    if requested.terminal.is_some() || inspection.source.terminal.is_some() {
+        return Err("The retained Claude actor has a paired terminal whose exact worker must be reconciled before attachment".into());
+    }
+    let weak = Arc::downgrade(host);
+    let id = requested.id;
+    let handle = Handle::adopt_remote(&owner, requested.clone(), proof.clone(), move |update| changed(&weak, id, update))?;
+    let identity = handle.actor_identity().ok_or("The retained actor did not provide its stable identity")?;
+    if identity != inspection.identity { return Err("The retained actor changed while attaching".into()); }
+    let mut session = requested.clone();
+    session.proof = Some(proof.clone());
+    session.launch.session_id = handle.confirmed_session_id().or(session.launch.session_id);
+    handle.update_native_source(session.clone(), None, None)?;
+    let mut sources = inspection.previous_sources;
+    sources.push(inspection.source);
+    sources.push(requested.clone());
+    sources.sort_by_key(|source| serde_json::to_vec(source).unwrap_or_default());
+    sources.dedup();
+    let registry = super::super::agent_execution::registry(host)?;
+    registry.lock().unwrap_or_else(|p| p.into_inner()).adopt_authenticated_agent_session(
+        &sources.iter().cloned().map(crate::agent_execution::HostedSession::Chat).collect::<Vec<_>>(),
+        &crate::agent_execution::HostedSession::Chat(session.clone()),
+    )?;
+    handle.commit_native_installation()?;
+    session.native_continuity = handle.native_continuity();
+    let observation = Observation { after_generation: handle.observe_next_update(), ..Observation::default() };
+    let previous_sources = super::native_recovery::retained_upgrade_sources(sources, &session);
+    let record = Record {
+        execution_instance: identity.instance, console_recipe: None, paired_terminal: None,
+        session, handle: handle.clone(), source_process: None,
+        subscribers: if client == 0 { BTreeMap::new() } else { BTreeMap::from([(client, false)]) },
+        observations: if client == 0 { BTreeMap::new() } else { BTreeMap::from([(client, observation)]) },
+        completion_observed: false, returning_terminal: false,
+    };
+    let response = session_snapshot(&record);
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down || state.proof() != proof {
+        return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
+    }
+    let retired = state.chats.insert(id, record);
+    state.upgrade_chats.insert(id, previous_sources);
+    state.native_adoption_failures.clear(id);
+    state.inventory_generation += 1;
+    drop(state);
+    drop(retired);
+    handle.wake_retained_outcomes();
+    super::super::state::retire_unattached_upgrade_chat(host, id);
+    Ok(response)
+}
