@@ -957,6 +957,8 @@ pub struct Snapshot {
     /// Original prose mutation boundary, independent of status/presentation updates.
     #[serde(default)]
     pub source_revision: u64,
+    #[serde(default)]
+    pub source_parts: Vec<cache::SourcePart>,
 }
 
 /// Readable provider failure with a separately expandable bounded stderr tail.

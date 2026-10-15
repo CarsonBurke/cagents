@@ -919,6 +919,8 @@ impl Handle {
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
+                    state.source_parts.retain(|part|part.source.agent_id.is_some());
+                    state.source_parts.extend(window.source_parts);
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -928,7 +930,7 @@ impl Handle {
                 }
             }
         }
-        state.source_revision = store.source_revision;
+        if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -966,6 +968,8 @@ impl Handle {
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
                     Ok(window) => {
+                        state.source_parts.retain(|part|part.source.agent_id.is_some());
+                        state.source_parts.extend(window.source_parts);
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
@@ -979,7 +983,7 @@ impl Handle {
             } else {
                 Vec::new()
             };
-            state.source_revision = store.source_revision;
+            if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
