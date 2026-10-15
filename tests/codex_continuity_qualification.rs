@@ -44,8 +44,9 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::{
-        fs::{PermissionsExt, symlink},
+        fs::{MetadataExt, PermissionsExt, symlink},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -453,7 +454,12 @@ impl Fixture {
             })
             .to_owned();
 
-        let root = tempfile::tempdir().unwrap();
+        // Keep native binaries/transcripts off a potentially tmpfs-backed /tmp.
+        let evidence = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE").map(PathBuf::from);
+        let directory = evidence.as_deref().and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("/var/tmp"));
+        fs::create_dir_all(directory).unwrap();
+        let root = tempfile::Builder::new().prefix("codex-continuity-").tempdir_in(directory).unwrap();
         for directory in [
             "home/.codex",
             "run",
@@ -651,6 +657,10 @@ unified_exec = true
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if thread::panicking() {
+            self.root.disable_cleanup(true);
+            eprintln!("Failed Codex qualification state retained at {}", self.root.path().display());
+        }
         let preflight = self.output(&["daemon", "preflight"]);
         if let Ok(value) = serde_json::from_slice::<Value>(&preflight.stdout)
             && let Some(capability) = value["data"].get("capability")
@@ -660,12 +670,13 @@ impl Drop for Fixture {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
         // A failed assertion can leave the provider and its holder running:
-        // a durable holder is meant to outlive its daemon. Nothing outside
-        // this fixture runs in, or names, its directory.
-        let root = self.root.path().to_str().unwrap().to_owned();
-        for ((pid, _), command) in processes() {
-            if command.contains(&root) && pid != std::process::id() {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // a durable holder is meant to outlive its daemon. Cleanup requires
+        // this private cwd and the same pinned process incarnation.
+        let root = self.root.path().to_path_buf();
+        for (identity, _) in processes() {
+            if let Err(error) = stop_fixture_process(identity, &root) {
+                self.root.disable_cleanup(true);
+                eprintln!("Could not clean exact fixture process {identity:?}: {error}; state retained");
             }
         }
         if thread::panicking() {
@@ -682,6 +693,66 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+/// Only private fixture processes qualify for teardown. Pin the process before
+/// a second identity/ownership check; a numeric PID from the census alone is
+/// never signal authority.
+fn stop_fixture_process(identity: Identity, root: &Path) -> std::io::Result<()> {
+    if identity.0 == std::process::id() || !fixture_process_matches(identity, root) {
+        return Ok(());
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.0, 0) as i32 };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) };
+    }
+    let pidfd = unsafe { fs::File::from_raw_fd(fd) };
+    if !fixture_process_matches(identity, root) { return Ok(()); }
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL,
+        std::ptr::null::<libc::siginfo_t>(), 0) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) }
+}
+
+fn fixture_process_matches((pid, start): Identity, root: &Path) -> bool {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    let start_matches = || fs::read_to_string(process.join("stat")).ok().and_then(|stat| {
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse::<u64>().ok()
+    }) == Some(start);
+    if !start_matches() || !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == unsafe { libc::geteuid() }) {
+        return false;
+    }
+    // Merely naming a fixture path in argv (for example, a log reader) does
+    // not make an unrelated process ours. All fixture launches and tools use
+    // this private cwd; anything else is left untouched.
+    let private = fs::read_link(process.join("cwd")).is_ok_and(|cwd| cwd.starts_with(root));
+    private && start_matches()
+}
+
+#[test]
+fn fixture_cleanup_requires_private_cwd_and_the_same_process_incarnation() {
+    struct Probe(Child);
+    impl Drop for Probe {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let private = tempfile::Builder::new().prefix("codex-cleanup-private-").tempdir_in("/var/tmp").unwrap();
+    let outside = tempfile::Builder::new().prefix("codex-cleanup-outside-").tempdir_in("/var/tmp").unwrap();
+    let spawn = |cwd: &Path| Probe(Command::new("/bin/sleep").arg("600").env_clear().current_dir(cwd)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut owned = spawn(private.path());
+    let mut unrelated = spawn(outside.path());
+    let identities = processes();
+    let identity = |pid| identities.iter().find(|((candidate, _), _)| *candidate == pid).unwrap().0;
+    let owned_identity = identity(owned.0.id());
+    stop_fixture_process((owned_identity.0, owned_identity.1 + 1), private.path()).unwrap();
+    assert!(owned.0.try_wait().unwrap().is_none(), "a stale start time must not authorize a signal");
+    stop_fixture_process(identity(unrelated.0.id()), private.path()).unwrap();
+    assert!(unrelated.0.try_wait().unwrap().is_none(), "an exact pidfd alone must not admit an outside process");
+    stop_fixture_process(owned_identity, private.path()).unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(owned.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
 /// Every process this user can read, with its start time, and its command
