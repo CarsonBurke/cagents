@@ -159,26 +159,32 @@ impl Store {
     /// Locks make recovery safe against another actor's active capture.
     fn recover_pending(&self)->Result<(),String>{
         use std::os::fd::AsRawFd;
-        let _publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|e.to_string())?;
-        let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 LIMIT 1024").map_err(|e|e.to_string())?;
-        let paths=statement.query_map([],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-        drop(statement);
-        for name in paths {
-            if !name.starts_with("capture-")||Path::new(&name).components().count()!=1{return Err("Invalid pending attachment identity".into());}
-            let path=self.directory.join(&name);
-            match crate::secure_file::open_existing_private_file(&path){
-                Ok(file)=>{
-                    // SAFETY: file is a live, validated regular descriptor.
-                    if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {continue;}
-                    if let Err(error)=fs::remove_file(&path) && error.kind()!=std::io::ErrorKind::NotFound{return Err(error.to_string());}
-                },
-                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
-                Err(error)=>return Err(error.to_string()),
+        let mut after=String::new();
+        loop {
+            let _publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|e.to_string())?;
+            let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+            let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 AND path>?1 ORDER BY path LIMIT 128").map_err(|e|e.to_string())?;
+            let paths=statement.query_map([&after],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            drop(statement);
+            if paths.is_empty(){break;}
+            after=paths.last().unwrap().clone();
+            for name in paths {
+                if !name.starts_with("capture-")||Path::new(&name).components().count()!=1{return Err("Invalid pending attachment identity".into());}
+                let path=self.directory.join(&name);
+                match crate::secure_file::open_existing_private_file(&path){
+                    Ok(file)=>{
+                        // SAFETY: file is a live, validated regular descriptor.
+                        if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {continue;}
+                        if let Err(error)=fs::remove_file(&path) && error.kind()!=std::io::ErrorKind::NotFound{return Err(error.to_string());}
+                    },
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+                    Err(error)=>return Err(error.to_string()),
+                }
+                transaction.execute("DELETE FROM retained_attachments WHERE path=?1 AND accepted=0",[name]).map_err(|e|e.to_string())?;
             }
-            transaction.execute("DELETE FROM retained_attachments WHERE path=?1 AND accepted=0",[name]).map_err(|e|e.to_string())?;
+            transaction.commit().map_err(|e|e.to_string())?;
         }
-        transaction.commit().map_err(|e|e.to_string())
+        Ok(())
     }
     /// Snapshot BEFORE dispatch and send this owned private path to the
     /// provider. The capture is retained only by a successful accept().
@@ -451,6 +457,18 @@ mod tests {
         let mut restored=Store::at(&annotations,&account,"actual-confirmed-session").unwrap();assert_eq!(fs::read(&sent_path).unwrap(),b"immutable actual dispatch");assert_eq!(restored.original(Some(&original.user_id),0,4).unwrap().original.attachments[0].path,sent_path);
         let mut other=Store::at(&annotations,&account,"another-session").unwrap();let other_original=prompt("actual-provider-user","else");other.accept(&other_original,"else",&[],&mut []).unwrap();
         restored.purge_current_session().unwrap();assert!(!sent_path.exists());assert!(matches!(restored.original(Some(&original.user_id),0,4),Err(OriginalError::Unavailable(_))));assert_eq!(other.original(Some(&original.user_id),0,4).unwrap().text,"else");
+    }
+
+    #[test]
+    fn explicit_session_purge_drains_more_than_1024_files_in_bounded_batches(){
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");let mut store=Store::at(&annotations,&account,"session-to-delete").unwrap();
+        let transaction=store.db.transaction().unwrap();
+        for index in 0..1100{let name=format!("capture-history-{index:04}");fs::write(store.directory.join(&name),b"").unwrap();fs::set_permissions(store.directory.join(&name),fs::Permissions::from_mode(0o600)).unwrap();transaction.execute("INSERT INTO retained_attachments VALUES(?1,1,0,'session-to-delete')",[name]).unwrap();}
+        transaction.commit().unwrap();
+        let preserved=store.directory.join("capture-other-session");fs::write(&preserved,b"other").unwrap();store.db.execute("INSERT INTO retained_attachments VALUES('capture-other-session',1,5,'other-session')",[]).unwrap();
+        store.purge_current_session().unwrap();
+        let remaining:usize=store.db.query_row("SELECT count(*) FROM retained_attachments",[],|row|row.get(0)).unwrap();assert_eq!(remaining,1);assert_eq!(fs::read(preserved).unwrap(),b"other");
+        assert_eq!(fs::read_dir(&store.directory).unwrap().filter_map(Result::ok).filter(|entry|entry.file_name().to_string_lossy().starts_with("capture-history-")).count(),0);
     }
 
 }
