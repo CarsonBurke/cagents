@@ -56,6 +56,7 @@ pub enum Instance {
 pub struct SurfaceTarget {
     modal: Modal,
     revision: u64,
+    instance: Option<Instance>,
 }
 
 #[derive(Default)]
@@ -258,10 +259,21 @@ impl Stack {
 }
 
 impl Cagents {
+    fn modal_instance(&self, modal: Modal) -> Option<Instance> {
+        match modal {
+            Modal::Project(role) => self.project_ui.modal_target(role).map(|target| target.request),
+            Modal::Worktree => self.worktree_dialog.as_ref().map(|dialog| Instance::Operation(dialog.request())),
+            Modal::ChatClose => self.chat_ui.close_dialog.as_ref().map(|dialog| Instance::Counter(dialog.generation())),
+            Modal::TerminalClose => self.terminal_close.as_ref().map(|intent| Instance::Counter(intent.generation)),
+            _ => None,
+        }
+    }
+
     pub(super) fn modal_surface_target(&self, modal: Modal) -> SurfaceTarget {
         SurfaceTarget {
             modal,
             revision: self.modal_stack.focus_revision.load(Ordering::Relaxed),
+            instance: self.modal_instance(modal),
         }
     }
 
@@ -270,6 +282,7 @@ impl Cagents {
             Message::ModalSurface { target, message } => {
                 (!self.update_prepared
                     && self.top_modal() == Some(target.modal)
+                    && self.modal_instance(target.modal) == target.instance
                     && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
                     && !matches!(&*message, Message::ModalSurface { .. }))
                 .then_some(*message)
@@ -372,19 +385,10 @@ impl Cagents {
             .first()
             .map(|frame| frame.restore.clone());
         let fallback = self.modal_restore_fallback();
-        let project_ui = &self.project_ui;
-        let chat_close = self.chat_ui.close_dialog.as_ref();
-        let terminal_close = self.terminal_close.as_ref();
-        let changed = self
-            .modal_stack
-            .reconcile_instances(&active, fallback.clone(), |kind| match kind {
-                Modal::Project(role) => project_ui.modal_target(role).map(|target| target.request),
-                Modal::ChatClose => chat_close.map(|dialog| Instance::Counter(dialog.generation())),
-                Modal::TerminalClose => {
-                    terminal_close.map(|intent| Instance::Counter(intent.generation))
-                }
-                _ => None,
-            });
+        let instances = active.iter().map(|kind| (*kind, self.modal_instance(*kind))).collect::<Vec<_>>();
+        let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
+            instances.iter().find(|(modal, _)| *modal == kind).and_then(|(_, instance)| *instance)
+        });
         if let Some((kind, _, pushed)) = changed {
             let initial = self.modal_initial_focus(kind);
             let target = if pushed {
