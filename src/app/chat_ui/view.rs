@@ -3094,6 +3094,9 @@ impl Runtime {
                     (
                         cached.token,
                         cached.revision,
+                        // Fixed footer strings change only when the displayed
+                        // minute/date changes, not on every provider heartbeat.
+                        cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
                         self.preview_request.as_deref() == Some(item.id.as_str()),
@@ -4631,6 +4634,27 @@ mod tests {
         let other_day = chat::local_time((at / 1000 + 172_800) as i64).unwrap();
         assert_eq!(recorded_message_stamp(at, Some(&other_day)), Some((at, full.clone(), full.clone())));
         assert_eq!(recorded_message_stamp(at, None), Some((at, full.clone(), full)));
+    }
+
+    #[test]
+    fn recorded_timestamp_changes_refresh_retained_footer_without_heartbeat_churn() {
+        let at = 1_700_000_000_000;
+        let item = chat::Item { id: "dated-retained-answer".into(), role: chat::Role::Assistant, at: Some(at), started_at: Some(at - 120_000),
+            content: ItemContent::Text { text: "Finished answer".into(), thinking: false, phase: chat::Phase::Final } };
+        let (mut runtime, handle) = frame_cost::live_runtime(&[item]);
+        let mut before = runtime.turn_fingerprint(&runtime.turns[0], false);
+        let revision = runtime.cache["dated-retained-answer"].revision;
+        for (recorded, changes_label) in [(Some(at + 1), false), (Some(at + 60_000), true), (None, true)] {
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            Arc::make_mut(&mut snapshot.items[0]).at = recorded;
+            handle.publish_snapshot_for_test(snapshot);
+            runtime.refresh();
+            assert_eq!(runtime.cache["dated-retained-answer"].revision, revision, "unchanged message body keeps prepared cache");
+            let after = runtime.turn_fingerprint(&runtime.turns[0], false);
+            assert_eq!(after != before, changes_label, "retained footer tracks its visible time, not subminute observations");
+            before = after;
+        }
     }
 
     #[test]
