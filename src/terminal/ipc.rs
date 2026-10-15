@@ -474,6 +474,10 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Close an exact existing conversation without attaching or restarting it.
+    ChatCloseSession {
+        session: crate::chat::Session,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

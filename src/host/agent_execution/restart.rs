@@ -14,6 +14,13 @@ pub(in crate::host) struct PairPlan {
 enum Kind { None, Execution, Codex(crate::model::LaunchRecipe) }
 impl PairPlan {
     pub(in crate::host) fn source(&self) -> &chat::Session { &self.source }
+    pub(in crate::host) fn release_completed(&mut self) {
+        // Lost-ACK replay needs only its source/receipt/current actor. Keeping
+        // the predecessor PTY handle here would retain its screen indefinitely.
+        self.paired=None;
+        self.registry=None;
+        self.agent=None;
+    }
 }
 
 pub(in crate::host) fn prepare_restart_pair(host: &SharedHost, source: &chat::Session) -> Result<PairPlan, String> {
@@ -121,7 +128,6 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
         }
         let mut retained = session.clone();
         retained.terminal = None;
-        chat::protocol::align_resume_identity(&mut retained.launch)?;
         handle.update_native_source(retained, None, None)?;
         {
             let mut state = host.lock().unwrap_or_else(|p|p.into_inner());
@@ -160,7 +166,6 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
 fn publish_pair(host:&SharedHost, session:&chat::Session, handle:&chat::runtime::Handle, terminal:&TerminalSession, worker:&crate::terminal::TerminalHandle) -> Result<(),String> {
     let mut retained = session.clone();
     retained.terminal = Some(terminal.clone());
-    chat::protocol::align_resume_identity(&mut retained.launch)?;
     handle.update_native_source(retained,Some(terminal.launch.clone()),worker.holder_identity().cloned())?;
     let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
     if state.terminals.get(&terminal.id).is_none_or(|record|!record.handle.same_worker(worker)) {

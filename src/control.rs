@@ -831,42 +831,19 @@ impl ControlClient {
         }
     }
 
-    /// Closes a native chat this client did not open.
-    ///
-    /// The daemon honours a close only from an attached client, so this
-    /// attaches first with the session as the inventory reported it. Closing
-    /// interrupts the provider's work and frees the conversation; it is what
-    /// worktree deletion does to the chats still running inside the directory.
-    /// Its response deadline covers the provider's interruption and process
-    /// termination grace periods; success still requires confirmed teardown.
-    ///
-    /// Attached, this connection is sent the chat's notifications until the
-    /// close removes it - the interrupt the close delivers is itself reported
-    /// as activity - so they are expected between the requests' responses.
+    /// Close an exact existing native chat without reopening history or
+    /// restarting a completed provider. Notifications may precede the result.
+    /// The deadline includes interruption and confirmed teardown.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
         let chat_id = session.id;
-        // The daemon subscribes this connection before it answers the
-        // attachment, so the chat's notifications can arrive ahead of that
-        // answer.
         self.attached_chats.insert(chat_id);
-        let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
-            Ok(ServerResponse::ChatAttached { .. }) => self
-                .request_with_deadline(
-                    ClientRequest::ChatClose { chat_id },
-                    Instant::now() + CHAT_CLOSE_TIMEOUT,
-                )
-                .and_then(|response| match response {
-                    ServerResponse::ChatClosed { .. } => Ok(()),
-                    response => Err(unexpected_response("a native chat close", &response)),
-                }),
-            Ok(response) => Err(unexpected_response("a native chat attachment", &response)),
-            // The daemon refuses an attachment before it subscribes anyone.
-            Err(error @ ControlError::Remote { .. }) => {
-                self.attached_chats.remove(&chat_id);
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+        let closed = self.request_with_deadline(
+            ClientRequest::ChatCloseSession { session },
+            Instant::now() + CHAT_CLOSE_TIMEOUT,
+        ).and_then(|response|match response {
+            ServerResponse::ChatClosed { .. }=>Ok(()),
+            response=>Err(unexpected_response("a native chat close",&response)),
+        });
         let detached = match &closed {
             // The daemon removed the chat, and every notification about it,
             // before answering.
@@ -1809,6 +1786,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradeImpact(_) => "upgrade_impact",
         ServerResponse::ShutdownOutcome(_) => "shutdown_outcome",
         ServerResponse::ChatAttached { .. } => "chat_attached",
+        ServerResponse::ChatRestarted { .. } => "chat_restarted",
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatClosed { .. } => "chat_closed",
@@ -4877,11 +4855,8 @@ mod tests {
         );
         server.join().unwrap();
     }
-    /// Closing a chat attaches this connection to it, and the interrupt the
-    /// close delivers is reported to every attached client before the answer.
-    /// Neither the close nor the requests after it may mistake that report for
-    /// a stray response; a chat this connection never attached still may not
-    /// interleave.
+    /// Atomic source-bound close may subscribe before its answer. Neither
+    /// its notifications nor a refused close may desynchronize later requests.
     #[test]
     fn closing_a_chat_survives_its_own_notifications_but_no_one_elses() {
         use crate::agent::ActivityState;
@@ -4943,111 +4918,30 @@ mod tests {
             )
             .unwrap();
 
-            // A close the daemon carries out.
-            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            let ClientRequest::ChatAttach { session } = attach.request else {
-                panic!("expected an attachment, got {:?}", attach.request);
-            };
-            assert_eq!(session.id, closed);
-            // Subscribed before the answer is queued, a working chat can
-            // report ahead of it.
-            send(
-                &mut server_stream,
-                None,
-                activity(closed, ActivityState::Working),
-            );
-            respond(
-                &mut server_stream,
-                attach.request_id,
-                ServerResponse::ChatAttached {
-                    session,
-                    snapshot: crate::chat::Snapshot::default(),
-                },
-            );
-            send(
-                &mut server_stream,
-                None,
-                ServerMessage::ChatObserved {
-                    chat_id: closed,
-                    epoch: 1,
-                },
-            );
+            // Exactly one source-bound close, with no ChatAttach/actor restart.
             let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(close.request, ClientRequest::ChatClose { chat_id: closed });
-            send(
-                &mut server_stream,
-                None,
-                activity(closed, ActivityState::Idle),
-            );
-            send(
-                &mut server_stream,
-                None,
-                ServerMessage::ChatChanged { chat_id: closed },
-            );
-            respond(
-                &mut server_stream,
-                close.request_id,
-                ServerResponse::ChatClosed {
-                    chat_id: closed,
-                    snapshot: crate::chat::Snapshot::default(),
-                },
-            );
-
-            // A close the daemon refuses: the connection detaches instead.
-            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            let ClientRequest::ChatAttach { session } = attach.request else {
-                panic!("expected an attachment, got {:?}", attach.request);
+            let ClientRequest::ChatCloseSession {session}=close.request else {
+                panic!("expected source-bound close");
             };
-            respond(
-                &mut server_stream,
-                attach.request_id,
-                ServerResponse::ChatAttached {
-                    session,
-                    snapshot: crate::chat::Snapshot::default(),
-                },
-            );
-            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            send(
-                &mut server_stream,
-                None,
-                activity(refused, ActivityState::Working),
-            );
-            send(
-                &mut server_stream,
-                Some(close.request_id),
-                ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    "The thread changed while its previous actor was closing.",
-                    false,
-                )),
-            );
-            let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(
-                detach.request,
-                ClientRequest::ChatDetach { chat_id: refused }
-            );
-            send(
-                &mut server_stream,
-                None,
-                activity(refused, ActivityState::Idle),
-            );
-            respond(
-                &mut server_stream,
-                detach.request_id,
-                ServerResponse::Detached,
-            );
+            assert_eq!(session.id,closed);
+            send(&mut server_stream,None,activity(closed, ActivityState::Working));
+            send(&mut server_stream,None,ServerMessage::ChatObserved{chat_id:closed,epoch:1});
+            send(&mut server_stream,None,activity(closed,ActivityState::Idle));
+            send(&mut server_stream,None,ServerMessage::ChatChanged{chat_id:closed});
+            respond(&mut server_stream,close.request_id,ServerResponse::ChatClosed{chat_id:closed,snapshot:crate::chat::Snapshot::default()});
 
-            // A refused attachment subscribes nothing, so nothing is detached.
-            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            send(
-                &mut server_stream,
-                Some(attach.request_id),
-                ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    "Exact native chat not found; no replacement process was spawned",
-                    false,
-                )),
-            );
+            // Both a post-subscription teardown failure and a source refusal
+            // are safely detached; neither path needs a provider attachment.
+            for (id,subscribed) in [(refused,true),(elsewhere,false)] {
+                let close:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(close.request,ClientRequest::ChatCloseSession{session} if session.id==id));
+                if subscribed {send(&mut server_stream,None,activity(id,ActivityState::Working));}
+                send(&mut server_stream,Some(close.request_id),ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,"Exact source could not be closed",false)));
+                let detach:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(detach.request,ClientRequest::ChatDetach{chat_id:id});
+                if subscribed {send(&mut server_stream,None,activity(id,ActivityState::Idle));}
+                respond(&mut server_stream,detach.request_id,ServerResponse::Detached);
+            }
 
             // The connection stays in step for the next request, and a chat it
             // never attached cannot answer for it.

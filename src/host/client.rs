@@ -690,6 +690,7 @@ pub(super) fn process_request(
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }
+        | ClientRequest::ChatCloseSession { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
         | ClientRequest::ChatList) => Ok((

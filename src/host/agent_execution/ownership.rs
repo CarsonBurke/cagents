@@ -27,6 +27,7 @@ pub(in crate::host) fn interactive(
         ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
         ClientRequest::ChatCommitTerminal { terminal_id } => (*terminal_id, false),
         ClientRequest::ChatClose { chat_id } => (*chat_id, false),
+        ClientRequest::ChatCloseSession { session } => (session.id, false),
         _ => return apply(request),
     };
     let registry = host

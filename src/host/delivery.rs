@@ -101,6 +101,7 @@ fn chat_page(message: &ServerMessage) -> bool {
         message,
         ServerMessage::Response {
             response: ServerResponse::ChatAttached { .. }
+                | ServerResponse::ChatRestarted { .. }
                 | ServerResponse::ChatSnapshot { .. }
                 | ServerResponse::ChatUpdate { .. }
                 | ServerResponse::ChatListed { .. }
