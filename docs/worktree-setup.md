@@ -54,3 +54,7 @@ The copy restores the source group and replaces inherited ACL identities while
 its temporary file is still private, before applying source mode bits. This
 also avoids granting a setgid destination's different group access to secrets.
 If the source group cannot be preserved, setup stops and keeps the worktree.
+
+Glob traversal is bounded to 64 directory levels as well as the existing entry
+and copy limits. A deeper selection fails setup before copying files; the new
+checkout remains available.
