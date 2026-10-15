@@ -6525,6 +6525,12 @@ mod tests {
         );
         // Non-ASCII forces a byte limit rather than a character-count limit.
         let oversized = "🦀".repeat(1024 * 1024 + 1);
+        // Deliberately corrupt a referenced terminal identity only inside this
+        // rollback-only fixture transaction. Otherwise SQLite correctly refuses
+        // the UPDATE before the read-only allocation guard can inspect it.
+        connection
+            .execute_batch("BEGIN; PRAGMA defer_foreign_keys=ON;")
+            .unwrap();
         for column in [
             "terminal_id",
             "recipe_json",
@@ -6574,6 +6580,7 @@ mod tests {
             read_migration_session_at(&connection, card, "terminal", None).unwrap(),
             workspace.cards[0].kind
         );
+        connection.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]
