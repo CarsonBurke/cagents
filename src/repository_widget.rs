@@ -6626,6 +6626,16 @@ impl RepositoryRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn pending_working_diff_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = tests::working_diff_runtime(card, "before\n", "after\n");
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.working_diff.applied = None;
+        runtime.working_diff.desired = None;
+        drop(runtime.take_lsp_intents());
+        runtime
+    }
+
+    #[cfg(test)]
     pub(crate) fn diff_snapshot_fixture(
         card: CardId,
         path: &str,
@@ -12055,7 +12065,7 @@ mod tests {
     /// The file is open for editing and the index baseline is known, which is
     /// what keeps that comparison in step with unsaved edits and what lets the
     /// editor tint the lines the author added.
-    fn working_diff_runtime(
+    pub(super) fn working_diff_runtime(
         card: CardId,
         before: &str,
         after: &str,

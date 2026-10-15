@@ -735,7 +735,7 @@ impl Cagents {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
-        self.set_workspace_surfaces_visible(false);
+        let hidden = self.set_workspace_surfaces_visible(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID
@@ -783,7 +783,7 @@ impl Cagents {
         // seen longest ago when the budget is full.
         let residency = self.lifecycle_sweep();
         let source_control = self.rebind_source_control();
-        Task::batch([viewport, residency, source_control])
+        Task::batch([hidden, viewport, residency, source_control])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
@@ -1592,6 +1592,28 @@ mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut offset);
         assert_eq!(offset.0, 240.0);
         cosmic::iced::advanced::widget::tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[tokio::test]
+    async fn switching_workspace_preserves_the_hidden_diff_debounce_task() {
+        use cosmic::iced::futures::StreamExt;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = app.workspace.focused().unwrap();
+        let runtime = RepositoryRuntime::pending_working_diff_fixture(card);
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let task = app.install_workspace_scope(WorkspaceState::default(), "/other".into(), None);
+        let due = tokio::time::timeout(Duration::from_secs(2), async move {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else { return None; };
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::Repository(action @ RepositoryAction::WorkingDiffDue { card: target, .. })
+                )) = action && target == card { return Some(action); }
+            }
+            None
+        }).await.expect("the hidden diff debounce must remain bounded");
+        assert!(due.is_some(), "workspace handoff must drive the debounce it recorded before hiding the previous pane");
+        assert!(app.lsp_documents.is_empty(), "visibility work must not open an editor LSP document");
     }
 
     #[test]
