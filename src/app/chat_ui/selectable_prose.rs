@@ -73,7 +73,7 @@ impl Shape {
             align_x: Default::default(),
             align_y: iced::alignment::Vertical::Top,
             shaping: iced::widget::text::Shaping::Advanced,
-            wrapping: Wrapping::default(),
+            wrapping: Wrapping::WordOrGlyph,
             ellipsize: Default::default(),
         }
     }
@@ -336,6 +336,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         self.child = iced::widget::rich_text(self.selected_spans(state))
             .size(self.size)
             .font(self.font)
+            .wrapping(Wrapping::WordOrGlyph)
             .into();
         tree.children[0].diff(&mut self.child);
         self.child
@@ -565,6 +566,60 @@ mod tests {
             selectable.hit(&state, Point::new(0.0, 400.0)),
             selectable.plain.len()
         );
+    }
+
+    #[test]
+    fn long_tokens_wrap_with_accessible_glyphs_and_matching_hit_geometry() {
+        let renderer = crate::app::tests::headless_renderer();
+        let source = "w".repeat(3000);
+        let spans: Arc<[Span<'static, String>]> =
+            vec![Span::new(source.clone()).link("https://example.com".to_owned())].into();
+        let mut selectable = Selectable {
+            plain: source.clone().into(),
+            spans,
+            matches: vec![],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            child: widget::text("").into(),
+        };
+        let mut tree =
+            Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        let node = selectable.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(240.0, f32::INFINITY)),
+        );
+        let state = tree.state.downcast_ref::<State>();
+        let runs: Vec<_> = state.paragraph().buffer().layout_runs().collect();
+        assert!(
+            runs.len() > 20,
+            "a long token must wrap to many visible lines"
+        );
+        for run in &runs {
+            for glyph in run.glyphs {
+                assert!(
+                    glyph.x >= -0.01 && glyph.x + glyph.w <= 240.01,
+                    "a token glyph is outside the reading column"
+                );
+            }
+        }
+        let last = runs.last().unwrap();
+        let last_glyph = last.glyphs.last().unwrap();
+        let position = Point::new(last_glyph.x + last_glyph.w * 0.5, last.line_top + 2.0);
+        assert!(
+            state.hit(position) > source.len() - 32,
+            "the tail remains hit-testable"
+        );
+        assert_eq!(state.link(position).as_deref(), Some("https://example.com"));
+        assert!(
+            (node.size().height - state.paragraph().min_bounds().height).abs() < 0.1,
+            "draw and hit-test paragraphs must have the same wrapped height"
+        );
+        assert_eq!(state.plain.as_ref(), source);
     }
 
     #[test]
