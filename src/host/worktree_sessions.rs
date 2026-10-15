@@ -61,7 +61,7 @@ struct Candidates {
 
 /// Validate an exact registered checkout; a subdirectory or another repository
 /// must never become authority to close a parent's actors.
-fn selected_worktree(repository: &Path, path: &Path) -> Result<PathBuf, String> {
+pub(super) fn selected_worktree(repository: &Path, path: &Path) -> Result<PathBuf, String> {
     let service = RepositoryService::system("git");
     let cancel = CancellationToken::new();
     let path = path.canonicalize().map_err(|error| error.to_string())?;
@@ -582,6 +582,7 @@ pub(super) fn close(
 /// All exact actors are fenced while control admission is excluded. Cleanup
 /// deliberately runs after that gate is released; records remain on failure.
 pub(super) struct PendingStop {
+    inspection: Option<super::worktree_inspections::Inspection>,
     path: PathBuf,
     actors: Vec<Actor>,
     terminals: Vec<crate::terminal::TerminalSessionStop>,
@@ -635,11 +636,35 @@ fn source_matches(host: &SharedHost, actor: &Actor) -> Result<(), String> {
     Ok(())
 }
 /// Caller holds exclusive control admission, never HostLock across actor ACKs.
-pub(super) fn prepare_stop(
+pub(super) fn prepare_inspected_stop(
+    host: &SharedHost,
+    client: super::state::ClientId,
+    repository: &Path,
+    path: &Path,
+    consent: &SessionStopConsent,
+    expected_fingerprint: &str,
+    token: uuid::Uuid,
+) -> Result<PendingStop, String> {
+    let inspection = super::worktree_inspections::take(host, client, token, repository, path, expected_fingerprint)?;
+    // No HostLock is held during Git or descriptor/path inspection. The caller
+    // retains exclusive operation admission through census and the first fence.
+    let mut pending = prepare_stop_checked(host, repository, path, consent, || inspection.validate())?;
+    pending.inspection = Some(inspection);
+    Ok(pending)
+}
+
+// Existing actor-fence unit fixtures intentionally test census/cleanup alone.
+// Production has only the connection-bound inspected entry above.
+#[cfg(test)]
+fn prepare_stop(host: &SharedHost, repository: &Path, path: &Path, consent: &SessionStopConsent) -> Result<PendingStop, String> {
+    prepare_stop_checked(host, repository, path, consent, || Ok(()))
+}
+fn prepare_stop_checked(
     host: &SharedHost,
     repository: &Path,
     path: &Path,
     consent: &SessionStopConsent,
+    before_effect: impl FnOnce() -> Result<(), String>,
 ) -> Result<PendingStop, String> {
     validate_stop_consent(consent)?;
     let path = selected_worktree(repository, path)?;
@@ -652,6 +677,7 @@ pub(super) fn prepare_stop(
     if actors.iter().any(|actor| actor.starting) {
         return Err("A session is starting or changing ownership; wait for it to settle before stopping sessions".into());
     }
+    before_effect()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut terminals = Vec::new();
     for actor in &actors {
@@ -672,6 +698,7 @@ pub(super) fn prepare_stop(
         }
     }
     Ok(PendingStop {
+        inspection: None,
         path,
         actors,
         terminals,
@@ -681,6 +708,7 @@ pub(super) fn prepare_stop(
 impl PendingStop {
     /// No HostLock or global control admission may be held by this caller.
     pub(super) fn cleanup(&mut self) -> Result<(), String> {
+        if let Some(inspection) = &self.inspection { inspection.validate()?; }
         for actor in &self.actors {
             if let Some(native) = &actor.native {
                 native.handle.close_until(self.deadline)?;

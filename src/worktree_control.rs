@@ -30,6 +30,11 @@ pub enum Operation {
         repository: PathBuf,
         path: PathBuf,
     },
+    /// Retain physical checkout authority for explicit session-stop consent.
+    InspectForSessionStop {
+        repository: PathBuf,
+        path: PathBuf,
+    },
     StaleLock {
         repository: PathBuf,
         path: PathBuf,
@@ -79,6 +84,8 @@ pub enum Operation {
         repository: PathBuf,
         path: PathBuf,
         consent: SessionStopConsent,
+        expected_fingerprint: String,
+        stop_authority: uuid::Uuid,
     },
 }
 
@@ -90,6 +97,7 @@ impl Operation {
             | Self::List { repository }
             | Self::Remove { repository, .. }
             | Self::Inspect { repository, .. }
+            | Self::InspectForSessionStop { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
             | Self::GetDisposableIgnoredDirectories { repository, .. }
@@ -108,6 +116,7 @@ impl Operation {
             Self::List { .. }
                 | Self::BusySessions { .. }
                 | Self::Inspect { .. }
+                | Self::InspectForSessionStop { .. }
                 | Self::ResolveProject { .. }
                 | Self::StaleLock { unlock: false, .. }
                 | Self::GetDisposableIgnoredDirectories { .. }
@@ -198,6 +207,8 @@ pub enum Reply {
     Inspected {
         snapshot: String,
         disposable_ignored_directories: Vec<String>,
+        /// Connection-bound physical inspection; absent on diagnostic/local execution.
+        stop_authority: Option<uuid::Uuid>,
     },
     DisposableIgnoredDirectories {
         directories: Vec<String>,

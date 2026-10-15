@@ -428,7 +428,8 @@ pub(crate) fn execute(
         }
         Operation::BusySessions { .. }
         | Operation::CloseSessions { .. }
-        | Operation::StopSessions { .. } => {
+        | Operation::StopSessions { .. }
+        | Operation::InspectForSessionStop { .. } => {
             Err("Session census and guarded close require the owning daemon".into())
         }
         Operation::ResumeSetup {
@@ -496,6 +497,7 @@ fn inspect(
         .worktree_safety(path, cancel)
         .map_err(|error| error.to_string())?;
     Ok(Reply::Inspected {
+        stop_authority: None,
         snapshot: serde_json::to_string(&snapshot).map_err(|error| error.to_string())?,
         disposable_ignored_directories: service
             .disposable_ignored_directories(path, cancel)

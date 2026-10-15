@@ -242,6 +242,7 @@ pub(crate) struct HostState {
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
+    pub(super) stop_inspections: BTreeMap<uuid::Uuid, super::worktree_inspections::Inspection>,
     /// Connections that asked for terminal-inventory edges. A client that never
     /// asked receives none, which is what keeps every strict request/response
     /// client free of unsolicited frames.
@@ -332,6 +333,7 @@ impl HostState {
             spawning_scopes: BTreeMap::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
+            stop_inspections: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
@@ -721,6 +723,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.stop_inspections.retain(|_, inspection| inspection.client != client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {

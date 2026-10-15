@@ -530,6 +530,8 @@ pub(super) fn process_request(
                         repository,
                         path,
                         consent,
+                        expected_fingerprint,
+                        stop_authority,
                     },
             },
     } = &request
@@ -540,7 +542,7 @@ pub(super) fn process_request(
             let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
-            super::worktree_sessions::prepare_stop(host, repository, path, consent)
+            super::worktree_sessions::prepare_inspected_stop(host, client_id, repository, path, consent, expected_fingerprint, *stop_authority)
                 .map_err(invalid)?
         };
         pending.cleanup().map_err(invalid)?;
@@ -596,6 +598,9 @@ pub(super) fn process_request(
             operation: crate::device_service::Operation::Worktree { operation },
         } => {
             let session_reply = match &operation {
+                crate::worktree_control::Operation::InspectForSessionStop { repository, path } => {
+                    Some(super::worktree_inspections::inspect(host, client_id, repository, path))
+                }
                 crate::worktree_control::Operation::BusySessions { repository, path } => {
                     Some(super::worktree_sessions::busy(host, repository, path))
                 }
