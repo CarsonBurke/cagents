@@ -9112,7 +9112,8 @@ fn editable_document_view<'a>(
                 .padding(space::M)
                 .into(),
             )
-        } else if runtime.language.hover_diagnostic.is_some() || !runtime.language.hover.is_empty() {
+        } else if runtime.language.hover_diagnostic.is_some() || !runtime.language.hover.is_empty()
+        {
             let settings = crate::design::markdown_settings(
                 &cosmic::theme::active(),
                 crate::design::TEXT_BODY,
@@ -9129,19 +9130,35 @@ fn editable_document_view<'a>(
                         })
                         .into()
                 });
-            let rows: Vec<Element<'_, RepositoryAction>> = if let Some(diagnostic) = &runtime.language.hover_diagnostic {
-                vec![crate::design::body(diagnostic.message_preview().into_owned())
-                    .wrapping(iced::widget::text::Wrapping::Word).width(Length::Fill).into()]
+            let rows: Vec<Element<'_, RepositoryAction>> = if let Some(diagnostic) =
+                &runtime.language.hover_diagnostic
+            {
+                vec![
+                    crate::design::body(diagnostic.message_preview().into_owned())
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .into(),
+                ]
             } else {
-                runtime.language.hover.iter().enumerate().map(|(index, item)| {
-                    markdown::item(&crate::document_link::PreviewViewer, settings, item, index)
-                        .map(move |uri| RepositoryAction::MarkdownLink { card, uri })
-                }).collect()
+                runtime
+                    .language
+                    .hover
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        markdown::item(&crate::document_link::PreviewViewer, settings, item, index)
+                            .map(move |uri| RepositoryAction::MarkdownLink { card, uri })
+                    })
+                    .collect()
             };
             Some(
                 widget::container(
-                    widget::scrollable(widget::column::with_children(rows).push_maybe(copy).spacing(space::M))
-                        .height(Length::Shrink),
+                    widget::scrollable(
+                        widget::column::with_children(rows)
+                            .push_maybe(copy)
+                            .spacing(space::M),
+                    )
+                    .height(Length::Shrink),
                 )
                 .max_height(240)
                 .max_width(420)
@@ -16648,7 +16665,10 @@ mod tests {
         runtime.set_editor_diagnostics(vec![item.clone()]);
         runtime.navigate_diagnostic(true);
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
-        assert!(runtime.language.hover.is_empty(), "diagnostics bypass Markdown parsing");
+        assert!(
+            runtime.language.hover.is_empty(),
+            "diagnostics bypass Markdown parsing"
+        );
         let copy = runtime.language.hover_diagnostic.as_ref().unwrap();
         let text = copy.message_preview();
         assert!(text.len() <= crate::lsp::DIAGNOSTIC_PREVIEW_BYTES);
@@ -16665,23 +16685,46 @@ mod tests {
     fn diagnostic_navigation_never_parses_html_metadata_or_empty_messages() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\n");
-        for message in ["<!--".to_owned() + &"x".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES),
-            "---\n".to_owned() + &"x".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES), String::new()] {
-            let item = crate::lsp::LspDiagnostic::new(LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 1)),
-                crate::lsp::LspSeverity::Error, message.clone(), None, None);
+        for message in [
+            "<!--".to_owned() + &"x".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES),
+            "---\n".to_owned() + &"x".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES),
+            String::new(),
+        ] {
+            let item = crate::lsp::LspDiagnostic::new(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 1)),
+                crate::lsp::LspSeverity::Error,
+                message.clone(),
+                None,
+                None,
+            );
             runtime.set_editor_diagnostics(vec![item.clone()]);
             runtime.navigate_diagnostic(true);
             assert!(runtime.language.hover.is_empty());
-            let shown = runtime.language.hover_diagnostic.as_ref().expect("plain popup and copy remain available");
+            let shown = runtime
+                .language
+                .hover_diagnostic
+                .as_ref()
+                .expect("plain popup and copy remain available");
             assert!(std::sync::Arc::ptr_eq(&shown.protocol, &item.protocol));
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&shown.copy_text()).unwrap()["message"], message);
-            if !message.is_empty() { assert!(shown.message_preview().contains("preview truncated")); }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&shown.copy_text()).unwrap()["message"],
+                message
+            );
+            if !message.is_empty() {
+                assert!(shown.message_preview().contains("preview truncated"));
+            }
             runtime.dismiss_editor_results();
             assert!(runtime.language.hover_diagnostic.is_none());
         }
-        runtime.set_editor_hover(Some("**actual hover markup**"), Some(LspPosition::new(0, 0)));
+        runtime.set_editor_hover(
+            Some("**actual hover markup**"),
+            Some(LspPosition::new(0, 0)),
+        );
         assert!(runtime.language.hover_diagnostic.is_none());
-        assert!(!runtime.language.hover.is_empty(), "actual server hover still uses Markdown");
+        assert!(
+            !runtime.language.hover.is_empty(),
+            "actual server hover still uses Markdown"
+        );
     }
 
     #[test]
