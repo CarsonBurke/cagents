@@ -2194,7 +2194,7 @@ mod tests {
     struct ReaderPeer {
         socket: UnixStream,
         release: crossbeam_channel::Sender<()>,
-        done: crossbeam_channel::Receiver<()>,
+        done: crossbeam_channel::Receiver<bool>,
         settled: bool,
         workers: Vec<JoinHandle<()>>,
     }
@@ -2202,7 +2202,7 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.release.try_send(());
             let _ = self.socket.shutdown(Shutdown::Both);
-            if !self.settled && self.done.recv_timeout(Duration::from_secs(6)).is_err() {
+            if !self.settled && self.done.recv_timeout(Duration::from_secs(6)) != Ok(true) {
                 eprintln!("Framed handoff peer did not acknowledge shutdown; outer guardian retains quiescence obligation");
             }
             // JoinHandle destruction detaches; a bounded fixture never calls
@@ -2232,9 +2232,9 @@ mod tests {
         let (wake, wakes) = crossbeam_channel::unbounded();
         let sent_binding = binding.clone(); let sent_receipt = receipt.clone(); let sent_proof = proof.clone();
         let worker = thread::spawn(move || {
-            struct Done(crossbeam_channel::Sender<()>);
-            impl Drop for Done { fn drop(&mut self) { let _ = self.0.try_send(()); } }
-            let _done = Done(done);
+            struct Done { send: crossbeam_channel::Sender<bool>, success: bool }
+            impl Drop for Done { fn drop(&mut self) { let _ = self.send.try_send(self.success); } }
+            let mut completion = Done { send: done, success: false };
             server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
@@ -2298,6 +2298,7 @@ mod tests {
                 }
                 let _ = released.recv_timeout(Duration::from_secs(5));
             }
+            completion.success = true;
         });
         let mut peer = ReaderPeer { socket, release, done: completed, settled: false, workers: vec![worker] };
         let handle = ClientHandle::connect_on(client, source, Intent::Attach, Some(proof), false, None, None,
@@ -2329,7 +2330,13 @@ mod tests {
         }
         let result = reply.recv_timeout(Duration::from_secs(5)).expect("actual reader must resolve the matched request");
         if matches!(case, ReaderCase::Backend | ReaderCase::Actor | ReaderCase::Thread | ReaderCase::ForeignProof | ReaderCase::WrongKind | ReaderCase::CurrentConflict) {
-            assert!(result.is_err(), "invalid receipt must not become a return success");
+            let error = result.expect_err("invalid receipt must not become a return success");
+            let expected = match case {
+                ReaderCase::WrongKind => "another pending command",
+                ReaderCase::CurrentConflict => "backend changed before terminal handoff publication",
+                _ => "inconsistent terminal handoff authority",
+            };
+            assert!(error.contains(expected), "protocol admission must refuse before payload effects, not succeed through peer EOF: {error}");
             assert_eq!(handle.snapshot().generation, if matches!(case, ReaderCase::CurrentConflict) { 2 } else { 1 }, "invalid final payload must not replace the current snapshot");
         } else {
             assert_eq!(result.unwrap(), if matches!(case, ReaderCase::Close) { None } else { Some(receipt) });
@@ -2342,7 +2349,7 @@ mod tests {
             }
         }
         let _ = peer.release.try_send(());
-        peer.done.recv_timeout(Duration::from_secs(6)).expect("finite actual peer completion");
+        assert!(peer.done.recv_timeout(Duration::from_secs(6)).expect("finite actual peer completion"), "the actual peer must finish its complete scripted exchange without panic");
         peer.settled = true;
     }
 
