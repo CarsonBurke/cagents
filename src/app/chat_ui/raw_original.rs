@@ -359,7 +359,7 @@ pub(super) fn copy(runtime:&Runtime,item:&str,field:RawSourceField,intent:clipbo
             }).await.map_err(|_|"Original copy stopped.".to_owned())?
         }).await.unwrap_or_else(|_|Err("The original call could not be copied in time.".into()));
         (proof,CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(value)),intent})))
-    },move |(proof,reply)|action(Action::RawOriginalCopied(target,context,proof,reply)))
+    },move |(proof,reply)|cosmic::Action::App(action(Action::RawOriginalCopied(target,context,proof,reply))))
 }
 pub(super) fn copied(runtime:&mut Runtime,context:u64,proof:ResidentRaw,reply:CopyReply)->Task<Message> {
     if !reply.0.intent.current() {return Task::none();}
