@@ -4,6 +4,8 @@ mod journal;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 mod deadline_io;
+#[cfg(all(test, target_os = "linux"))]
+mod deadline_preserve_tests;
 pub(crate) mod final_snapshot;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
