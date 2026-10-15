@@ -59,6 +59,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_list_uses_the_existing_framed_account_read_without_refresh_or_extra_requests() {
+        use std::{os::unix::net::UnixStream, thread};
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        server_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        // A private scripted peer exercises the actual codec/caller. It grants
+        // no host account authority and never starts a provider.
+        let server = thread::spawn(move || {
+            let proof = HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("account-list-peer"),
+                boot_id: crate::model::BootId::new("private-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("private-incarnation"),
+            };
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            write_frame(&mut server_stream, &ServerEnvelope {
+                version: PROTOCOL_VERSION, request_id: Some(connect.request_id), proof: proof.clone(),
+                message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } },
+            }).unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(request.proof.as_ref(), Some(&proof));
+            assert!(matches!(request.request, ClientRequest::Agent {
+                operation: crate::agent_execution::Operation::AccountInfo(Query {
+                    provider: Some(Provider::Codex), account: None, refresh: false,
+                }), ..
+            }));
+            let report = Report { sampled_at: 456, caller: None, accounts: vec![], diagnostics: vec![] };
+            write_frame(&mut server_stream, &ServerEnvelope {
+                version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof,
+                message: ServerMessage::Response { response: ServerResponse::Agent(crate::agent_execution::Reply::AccountInfo(report)) },
+            }).unwrap();
+            assert!(read_frame::<ClientEnvelope>(&mut server_stream).unwrap().is_none(), "metadata read must not issue another operation");
+        });
+        let result = ControlClient::from_stream(client_stream).map_err(protocol_error)
+            .and_then(|mut client| super::read_report(&mut client, Authority::default(), query(Some(Provider::Codex))));
+        // The client is dropped before joining, including on any returned error.
+        let settled = server.join();
+        settled.unwrap();
+        let report = result.unwrap();
+        assert_eq!(output(&report).data["sampled_at"], 456);
+    }
+
+    #[test]
     fn account_list_parses_provider_and_cannot_request_a_probe() {
         let parsed = Cli::try_parse_from(["cagents", "account", "list", "--provider", "codex", "--json"]).unwrap();
         assert!(parsed.json);

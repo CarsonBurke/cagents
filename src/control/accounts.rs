@@ -36,10 +36,22 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let report = read_report(&mut client, Authority::from_environment(), query)?;
+    if listing {
+        return Ok(list::output(&report));
+    }
+    Ok(CommandOutput {
+        command: "account.info",
+        human: human(&report),
+        data: serde_json::to_value(report).map_err(|e| AppError::new("account_info", e))?,
+    })
+}
+
+fn read_report(client: &mut ControlClient, authority: Authority, query: Query) -> Result<Report, AppError> {
     let deadline = query.refresh.then(|| Instant::now() + Duration::from_secs(90));
     let report = match client
         .agent_before(
-            Authority::from_environment(),
+            authority,
             crate::agent_execution::Operation::AccountInfo(query),
             deadline,
         )
@@ -53,14 +65,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             ));
         }
     };
-    if listing {
-        return Ok(list::output(&report));
-    }
-    Ok(CommandOutput {
-        command: "account.info",
-        human: human(&report),
-        data: serde_json::to_value(report).map_err(|e| AppError::new("account_info", e))?,
-    })
+    Ok(report)
 }
 
 fn human(report: &Report) -> String {
