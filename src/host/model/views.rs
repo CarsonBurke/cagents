@@ -129,6 +129,18 @@ pub(super) fn apply(
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
         _ => return Err("expected a workspace view edit".into()),
     };
+    if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, repository, .. }, .. } = edit {
+        let identity: String = transaction.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+        let scope_repository: String = match scope {
+            Scope::Channel(channel) => transaction.query_row("SELECT repository FROM channels WHERE id=?1", [channel.to_string()], |row| row.get(0)).map_err(|error| error.to_string())?,
+            Scope::Worktree { repository, .. } => repository_key(repository)?.to_owned(),
+        };
+        let open: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [repository_key(repository)?], |row| row.get(0)).map_err(|error| error.to_string())?;
+        if *registry == crate::workspace_model::NO_REGISTRY || identity != registry.to_string()
+            || scope_repository != repository_key(repository)? || !open {
+            return Err("workspace archived pane source conflict".into());
+        }
+    }
     if !exists(transaction, scope)? {
         return Ok(false);
     }
@@ -226,6 +238,17 @@ pub(super) fn apply(
                 }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
+                }
+                Change::RemoveArchivedAutomationSource { before, .. } => {
+                    if owner(transaction, before.id)?.as_ref() != Some(scope)
+                        || view.panes.iter().filter(|pane| pane.id == before.id).count() != 1
+                        || resource_owner(transaction, before)?.is_some()
+                        || super::automation_membership::archived_owner_in(transaction, before)?.is_none() {
+                        return Err("workspace archived pane source conflict".into());
+                    }
+                    let changed = view.apply(change)?;
+                    transaction.execute("DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2", params![before.id.to_string(), key(scope)?]).map_err(|error| error.to_string())?;
+                    changed
                 }
                 Change::Remove { id } => {
                     transaction

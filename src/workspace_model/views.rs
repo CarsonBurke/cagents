@@ -308,6 +308,13 @@ pub enum Change {
     InsertIfEmpty {
         pane: Pane,
     },
+    /// Membership-only consent for one exact closed automation archive.
+    /// Requires a future matched protocol allocation, explicitly not protocol90.
+    RemoveArchivedAutomationSource {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+        before: Pane,
+    },
 }
 
 impl View {
@@ -369,6 +376,16 @@ impl View {
             }
             Change::Transfer { .. } => {
                 return Err("a transfer must be applied to both views atomically".into());
+            }
+            Change::RemoveArchivedAutomationSource { before, .. } => {
+                let current = self.panes.iter().find(|pane| pane.id == before.id)
+                    .ok_or("workspace archived pane source conflict")?;
+                if current.kind != before.kind || current.scope != before.scope
+                    || current.pending_terminal_start || before.pending_terminal_start {
+                    return Err("workspace archived pane source conflict".into());
+                }
+                self.panes.retain(|pane| pane.id != before.id);
+                if !self.retired.contains(&before.id) { self.retired.push(before.id); }
             }
             Change::Remove { id } => {
                 self.panes.retain(|pane| pane.id != *id);

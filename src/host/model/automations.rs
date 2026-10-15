@@ -4765,6 +4765,163 @@ mod tests {
         );
     }
 
+    fn archived_membership_fixture() -> (Registry, tempfile::TempDir, crate::workspace_model::views::Pane, crate::workspace_model::views::Scope, crate::agent_execution::Agent) {
+        use crate::agent_execution::HostedSession;
+        let (mut registry, directory, mut definition) = fixture();
+        definition.session_mode = SessionMode::Fresh;
+        let (_, firing, agent) = completed_reusable_run(&mut registry, definition);
+        let Some(HostedSession::Chat(native)) = &agent.session else { panic!("native source") };
+        let proof = native.proof.as_ref().unwrap();
+        let console = crate::model::TerminalSession {
+            id: native.id,
+            launch: crate::model::LaunchRecipe {
+                program: "/bin/true".into(),
+                arguments: vec!["agent".into(), "console".into(), agent.id.to_string()],
+                working_directory: directory.path().into(),
+                environment: Default::default(), unset_environment: Default::default(),
+            },
+            transcript_path: None, resume_hint: None, owned_codex_listener: None,
+            recovery_origin: None, predecessor: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        };
+        let agent = registry.bind_agent_console(agent.id, agent.session.as_ref().unwrap(), console.clone()).unwrap();
+        registry.archive_automation_conversation(firing.id, &agent, crate::chat::Snapshot {
+            session_id: Some("retained-membership-thread".into()),
+            ..Default::default()
+        }).unwrap();
+        let agent = registry.close_agent(&agent.origin, agent.id).unwrap();
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()), title: "Saved result".into(),
+            user_title: None, pending_terminal_start: false, width_fraction: 1.0,
+            kind: crate::model::CardKind::Terminal(console), scope: None,
+        };
+        let scope = agent.placement.clone();
+        registry.apply(&ModelEdit::SeedView { scope: scope.clone(), panes: vec![pane.clone()], closed: vec![] }).unwrap();
+        (registry, directory, pane, scope, agent)
+    }
+
+    #[test]
+    fn archived_membership_removal_preserves_report_runs_and_requires_original_registry_source() {
+        use crate::workspace_model::views::Change;
+        let (mut registry, _directory, pane, scope, agent) = archived_membership_fixture();
+        let before = registry.model().unwrap();
+        let revision = before.views.iter().find(|view| view.scope == scope).unwrap().revision;
+        let snapshot = registry.archived_automation_conversation(agent.id).unwrap().snapshot;
+        let run = registry.latest_agent_run(agent.id).unwrap();
+        let operation = Uuid::new_v4();
+        let edit = ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision, operation,
+            change: Change::RemoveArchivedAutomationSource { registry: before.identity,
+                repository: agent.spec.target.repository.clone(), before: pane.clone() } };
+        let mut wrong = edit.clone();
+        if let ModelEdit::ChangeView { expected_revision, .. } = &mut wrong { *expected_revision += 1; }
+        assert!(registry.apply(&wrong).unwrap_err().contains("revision"));
+        let mut wrong = edit.clone();
+        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, .. }, .. } = &mut wrong { *registry = Uuid::new_v4(); }
+        assert!(registry.apply(&wrong).is_err());
+        let mut wrong = edit.clone();
+        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { repository, .. }, .. } = &mut wrong { *repository = "/foreign-workspace".into(); }
+        assert!(registry.apply(&wrong).is_err());
+        let mut wrong = edit.clone();
+        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { before, .. }, .. } = &mut wrong {
+            let crate::model::CardKind::Terminal(console) = &mut before.kind else { unreachable!() };
+            console.launch.working_directory = "/replacement-conversation".into();
+        }
+        assert!(registry.apply(&wrong).is_err());
+        let mut wrong = edit.clone();
+        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { before, .. }, .. } = &mut wrong {
+            let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone() else { unreachable!() };
+            native.terminal = agent.console.clone();
+            before.kind = crate::model::CardKind::Chat(native);
+        }
+        assert!(registry.apply(&wrong).is_err(), "local read-only projection cannot replace the captured canonical wire pane");
+        assert!(registry.apply(&edit).unwrap().changed);
+        assert!(!registry.apply(&edit).unwrap().changed, "exact operation replay has no new removal authority");
+        let after = registry.model().unwrap();
+        let view = after.views.iter().find(|view| view.scope == scope).unwrap();
+        assert!(view.panes.is_empty() && view.retired.contains(&pane.id));
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(), run);
+        assert_eq!(serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap().snapshot).unwrap(), serde_json::to_value(snapshot).unwrap());
+        let mut spoofed_replay = edit;
+        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, .. }, .. } = &mut spoofed_replay { *registry = Uuid::new_v4(); }
+        assert!(registry.apply(&spoofed_replay).is_err(), "operation UUID does not bypass workspace ownership");
+    }
+
+    #[test]
+    fn archived_membership_owner_requires_closed_private_receipt_and_exact_original_pair() {
+        let (mut registry, _directory, pane, _scope, agent) = archived_membership_fixture();
+        assert_eq!(registry.archived_automation_pane_owner(&pane).unwrap().unwrap(), agent);
+        let mut local = pane.clone();
+        let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone() else { unreachable!() };
+        native.terminal = agent.console.clone();
+        local.kind = crate::model::CardKind::Chat(native.clone());
+        assert!(registry.archived_automation_pane_owner(&local).unwrap().is_some());
+        native.terminal.as_mut().unwrap().launch.working_directory = "/invented-pair".into();
+        local.kind = crate::model::CardKind::Chat(native);
+        assert!(registry.archived_automation_pane_owner(&local).is_err());
+        let mut pending = pane.clone(); pending.pending_terminal_start = true;
+        assert!(registry.archived_automation_pane_owner(&pending).unwrap().is_none());
+        registry.db.execute("UPDATE agents SET closed=0 WHERE id=?1", [agent.id.to_string()]).unwrap();
+        assert!(registry.archived_automation_pane_owner(&pane).unwrap().is_none());
+        registry.db.execute("UPDATE agents SET closed=1 WHERE id=?1", [agent.id.to_string()]).unwrap();
+        let mut wrong = agent.clone(); wrong.origin = crate::agent_execution::Origin::User;
+        registry.db.execute("UPDATE agents SET record=?2 WHERE id=?1", params![agent.id.to_string(), encode(&wrong).unwrap()]).unwrap();
+        assert!(registry.archived_automation_pane_owner(&pane).is_err());
+        registry.db.execute("UPDATE agents SET record=?2 WHERE id=?1", params![agent.id.to_string(), encode(&agent).unwrap()]).unwrap();
+        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1", [agent.id.to_string()]).unwrap();
+        assert!(registry.archived_automation_pane_owner(&pane).unwrap().is_none(), "missing retained report grants no new typed authority");
+    }
+
+    #[test]
+    fn archived_membership_preserves_exact_observed_console_exit_and_saved_report() {
+        use crate::workspace_model::views::Change;
+        let (mut registry, _directory, original, scope, agent) = archived_membership_fixture();
+        let before = registry.model().unwrap();
+        let mut ended = original.clone();
+        let crate::model::CardKind::Terminal(console) = &mut ended.kind else { unreachable!() };
+        console.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1234 },
+        };
+        registry.apply(&ModelEdit::ChangeView { scope: scope.clone(), expected_revision: before.views.iter().find(|view| view.scope == scope).unwrap().revision,
+            operation: Uuid::new_v4(), change: Change::Update { before: original, pane: ended.clone() } }).unwrap();
+        let current = registry.model().unwrap();
+        let revision = current.views.iter().find(|view| view.scope == scope).unwrap().revision;
+        assert!(registry.archived_automation_pane_owner(&ended).unwrap().is_some());
+        registry.apply(&ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision,
+            operation: Uuid::new_v4(), change: Change::RemoveArchivedAutomationSource {
+                registry: current.identity, repository: agent.spec.target.repository.clone(), before: ended,
+            } }).unwrap();
+        assert!(registry.archived_automation_conversation(agent.id).is_ok());
+        assert!(registry.agent(agent.id).unwrap().closed);
+        assert!(registry.model().unwrap().views.iter().find(|view| view.scope == scope).unwrap().panes.is_empty());
+    }
+
+    #[test]
+    fn archived_membership_host_admits_no_worker_uuid_and_refuses_pending_native_identity() {
+        let (registry, _directory, pane, scope, agent) = archived_membership_fixture();
+        let model = registry.model().unwrap();
+        let revision = model.views.iter().find(|view| view.scope == scope).unwrap().revision;
+        let native = agent.session.as_ref().unwrap().id();
+        let proof = match agent.session.as_ref().unwrap() { crate::agent_execution::HostedSession::Chat(source) => source.proof.clone().unwrap(), _ => unreachable!() };
+        let mut host = crate::host::state::HostState::new(proof);
+        host.install_model(registry);
+        let edit = ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision, operation: Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource {
+                registry: model.identity, repository: agent.spec.target.repository.clone(), before: pane.clone(),
+            } };
+        host.reserve_spawn(native).unwrap();
+        assert!(host.edit_model(1, edit.clone()).is_err(), "an exact pending identity is not a retired worker");
+        host.cancel_spawn(native);
+        assert_eq!(host.inventory_count(), 0);
+        let after = host.edit_model(1, edit).unwrap();
+        assert!(after.views.iter().find(|view| view.scope == scope).unwrap().panes.is_empty(),
+            "membership-only authority needs no missing/nil/borrowed execution UUID");
+        assert_eq!(host.inventory_count(), 0);
+    }
+
     #[test]
     fn pending_automation_archive_reservations_do_not_invalidate_visible_discovery() {
         let (mut registry, _directory, mut definition) = fixture();

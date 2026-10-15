@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod automation_archive_clock;
+mod automation_membership;
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
