@@ -21,6 +21,16 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    close_retained_inner(host, source, false)
+}
+
+/// A proved-dead provider can be restarted without closing its accepted agent
+/// or dropping the old transcript. Live retained owners must be reattached.
+pub(super) fn close_for_restart(host: &SharedHost, source: &Session) -> Result<(), String> {
+    close_retained_inner(host, source, true)
+}
+
+fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool) -> Result<(), String> {
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -30,7 +40,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() {
+            if record.handle.owns_work() && !(restart && record.handle.is_completed()) {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
             let ServerResponse::ChatAttached {
@@ -54,6 +64,9 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         } else {
             None
         };
+        if restart && actor.as_ref().is_none_or(|handle| !handle.is_completed()) {
+            return Err("Only the exact completed native actor can prepare a restart".into());
+        }
         let pending = state.native_closing.get(&source.id).cloned();
         if pending
             .as_ref()
@@ -75,7 +88,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
         if let Some((record, true)) = &receipt {
-            retire_closed_execution(host, source, record, &proof)?;
+            if !restart { retire_closed_execution(host, source, record, &proof)?; }
             return Ok(());
         }
         let mut pending = match pending {
@@ -106,7 +119,8 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             None => {
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
-                let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
+                let (recovery, exited) = chat::native_holder::inspect(&record, &proof)?;
+                if restart && !exited { return Err("The retained provider is still alive; reattach its existing session instead of starting another writer".into()); }
                 if &recovery.source != source && !recovery.previous_sources.contains(source) {
                     return Err(
                         "Native holder does not recognize this exact issued descriptor".into(),
@@ -187,7 +201,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         chat::native_holder::confirm_pair_closed(source, &proof)?;
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        if !restart { retire_closed_execution(host, source, &pending.owner.record, &proof)?; }
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -205,15 +219,15 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                         .into(),
                 );
             }
-            state.chats.remove(&source.id);
+            if !restart { state.chats.remove(&source.id); }
         }
         state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
-        if let Some(notifications) = &state.notifications {
-            notifications.retire(source.id);
+        if !restart {
+            if let Some(notifications) = &state.notifications { notifications.retire(source.id); }
         }
         drop(state);
-        super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        if !restart { super::super::state::retire_unattached_upgrade_chat(host, source.id); }
     }
     result
 }

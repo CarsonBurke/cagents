@@ -2059,10 +2059,31 @@ pub(super) fn restart_completed_with_execution(
         let mut session = record.session.clone();
         session.proof = Some(state.proof().clone());
         session.launch.session_id = Some(id);
+        session.native_continuity = record.handle.native_continuity();
         (session, record.handle.restart_environment())
     };
+    let mut replacement = replacement;
+    if matches!(replacement.0.native_continuity, chat::NativeContinuity::Durable { .. }) {
+        use crate::daemon::holder_registry::{self as registry, Kind};
+        let directory = registry::directory(Kind::Native).map_err(unavailable)?;
+        if let Some(owner) = registry::evidence(&registry::socket(&directory, source.id), Kind::Native).map_err(unavailable)? {
+            let (_, exited) = chat::native_holder::inspect(&owner, replacement.0.proof.as_ref().unwrap()).map_err(unavailable)?;
+            if !exited {
+                return native_recovery::restore(host, client, &replacement.0).map(Some).map_err(unavailable);
+            }
+        }
+        // This also closes the exact paired console and records proof. It
+        // deliberately retains the old actor/store and accepted agent binding.
+        check_launch_account(&replacement.0.launch)?;
+        native_cleanup::close_for_restart(host, &replacement.0).map_err(unavailable)?;
+        if !chat::native_holder::closed_source(&replacement.0, replacement.0.proof.as_ref().unwrap()).map_err(unavailable)?.is_some_and(|(_, pair_closed)| pair_closed) {
+            return Err(unavailable("Native restart lacks its exact completed provider and paired console receipt"));
+        }
+        replacement.0.native_continuity = chat::NativeContinuity::ReconnectOnly;
+    }
     check_launch_account(&replacement.0.launch)?;
-    let launch = replacement.0.launch.clone();
+    let mut launch = replacement.0.launch.clone();
+    chat::protocol::align_resume_identity(&mut launch).map_err(error)?;
     start_with_execution(
         host,
         client,
