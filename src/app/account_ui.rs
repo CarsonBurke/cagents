@@ -3077,10 +3077,11 @@ impl Cagents {
             }
             Action::Removed {
                 id,
-                delete_requested: _,
+                delete_requested,
                 registry,
                 error,
             } => {
+                if delete_requested { self.finish_account_history_deletion(&id); }
                 self.account_ui.removing.remove(&id);
                 if let Some(registry) = registry {
                     self.account_ui.set_registry(registry);
@@ -4269,6 +4270,11 @@ impl Cagents {
             return Task::none();
         }
         let delete_requested = matches!(&operation, account::remote::Operation::DeleteFiles { .. });
+        if delete_requested && let Err(error)=self.prepare_account_history_deletion(&id) {
+            self.account_ui.removing.remove(&id);
+            self.status=Some(TransientNotice::warning(error));
+            return Task::none();
+        }
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 remote_lifecycle::<(Registry, Option<String>)>(operation)

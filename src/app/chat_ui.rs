@@ -1,4 +1,5 @@
 mod session_links;
+mod account_history;
 use super::*;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
@@ -488,6 +489,7 @@ pub(super) struct State {
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
     parked: HashMap<CardId, Box<Runtime>>,
+    history_deletions: account_history::State,
     /// The cards whose saved conversation cannot be resumed by trying again.
     ///
     /// A card in this set has no chat runtime to hold the offer, because its
@@ -513,6 +515,7 @@ impl Default for State {
             drafts: HashMap::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
+            history_deletions: Default::default(),
             fresh_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
             last_models: HashMap::new(),
@@ -6368,6 +6371,7 @@ impl Cagents {
                 let Some(result) = result else {
                     return Task::none();
                 };
+                self.fence_account_history_ready(target,&result);
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // The card was closed while this start was in flight.
                     // Whatever the start produced is given up now; a failed
