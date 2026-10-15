@@ -216,10 +216,15 @@ impl State {
         self.error = None;
         request
     }
+    fn owns(&self, request: &Request) -> bool {
+        self.request.as_ref().is_some_and(|loading| {
+            loading.request.id == request.id && loading.request.job.same_job(&request.job)
+        })
+    }
     fn take(&mut self, request: &Request) -> Option<Loading> {
-        self.request
-            .as_ref()
-            .filter(|loading| loading.request.id == request.id)?;
+        if !self.owns(request) {
+            return None;
+        }
         self.request.take()
     }
 }
@@ -614,6 +619,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        if !runtime.provider_exit_output.owns(&request) {
+            return Task::none();
+        }
         if !request.scope.matches(runtime) {
             runtime.provider_exit_output.clear();
             return Task::none();
@@ -642,7 +650,7 @@ impl Cagents {
             .provider_exit_output
             .request
             .as_mut()
-            .filter(|loading| loading.request.id == request.id)
+            .filter(|loading| loading.request.job.same_job(&request.job))
         else {
             return Task::none();
         };
@@ -1246,6 +1254,60 @@ mod tests {
         let (new, _completion) = held_read(&mut app, target, &handle, body, false);
         assert_ne!(new.id, request.id);
         assert!(!new.job.cancelled());
+    }
+    #[test]
+    fn old_runtime_completion_preserves_replacement_request_with_same_local_id() {
+        if isolated("old_runtime_completion_preserves_replacement_request_with_same_local_id") {
+            return;
+        }
+        let _guard = chat::client::diagnostic_test_guard();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for copy in [false, true] {
+                let body = b"complete retained diagnostic";
+                let (mut app, target, old_handle) = fixture(body);
+                let (old, completion) = held_read(&mut app, target, &old_handle, body, copy);
+                let old_action = if copy {
+                    let task = app.handle_chat_ui(Action::ProviderExitLoaded(
+                        target, old.clone(), completion,
+                    ));
+                    prepared_copy(task).await
+                } else {
+                    Action::ProviderExitLoaded(target, old.clone(), completion)
+                };
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                let replacement = Arc::new(ClientHandle::fixture(
+                    runtime.session.clone(), (*runtime.snapshot).clone(),
+                ));
+                runtime.connection = Connection::Live(replacement.clone());
+                runtime.snapshot = replacement.snapshot();
+                runtime.provider_exit_output = State::default();
+                runtime.provider_exit_output.reconcile(
+                    &runtime.snapshot, Some(Arc::downgrade(&replacement)),
+                );
+                let (new, current_completion) = held_read(
+                    &mut app, target, &replacement, body, false,
+                );
+                assert_eq!(old.id, new.id, "replacement restarts the local counter");
+                assert!(!old.job.same_job(&new.job));
+                let task = app.handle_chat_ui(old_action);
+                assert!(iced::runtime::task::into_stream(task).is_none());
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                assert!(runtime.provider_exit_output.owns(&new));
+                assert!(runtime.provider_exit_expanded);
+                assert!(runtime.provider_exit_output.error.is_none());
+                assert!(!new.job.cancelled());
+                let task = app.handle_chat_ui(Action::ProviderExitLoaded(
+                    target, new, current_completion,
+                ));
+                assert!(iced::runtime::task::into_stream(task).is_none());
+                assert_eq!(app.chat_runtime_mut(target).unwrap()
+                    .provider_exit_output.ready.as_ref().unwrap().output.as_str(),
+                    std::str::from_utf8(body).unwrap());
+                drop(app);
+                drop(old);
+                wait_capacity(0);
+            }
+        });
     }
     #[test]
     fn actual_copy_emits_clipboard_before_its_capacity_receipt_acknowledgement() {

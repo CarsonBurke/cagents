@@ -112,6 +112,10 @@ struct Job {
 #[derive(Clone)]
 pub(crate) struct DiagnosticReadRequest(Arc<Job>);
 impl DiagnosticReadRequest {
+    /// Identity of the original job, independent of UI-local request counters.
+    pub(crate) fn same_job(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(crate) fn source(&self) -> &DiagnosticSource {
         &self.0.source
     }
