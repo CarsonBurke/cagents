@@ -642,7 +642,9 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
 - Click, Shift-click, or drag to select diff rows; Up/Down moves the selection
   and Shift extends it. In Split, selection stays on the chosen side. **Ctrl+C**
   copies original source text. Right-click for **Copy**, **Copy line reference**
-  (`path:line`), and **Open in editor at line** when an editable source exists.
+  (`path:line`), and **Open in editor at line**. Historical and PR snapshots
+  offer **Open working file in editor at line**: it opens the current file at a
+  clamped location, which can differ from the snapshot. PR review stays open.
   Unified also offers **Copy old side**, **Copy new side**, and **Copy as patch**
   for selected changes.
 - **Ctrl+F** searches working, staged, branch, history, and pull request diffs.
