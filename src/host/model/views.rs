@@ -8,6 +8,14 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     if current >= 8 {
         return Ok(());
     }
+    let legacy: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_views')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if legacy { schema::require_legacy_views(tx)?; }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS shared_view_scopes(
             scope TEXT PRIMARY KEY,
@@ -29,15 +37,7 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
         ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
-    let legacy: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_views')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
     if legacy {
-        schema::require_legacy_views(tx)?;
         tx.execute_batch("INSERT INTO shared_view_scopes(scope,channel) SELECT json_object('Channel',channel), channel FROM workspace_views;
             INSERT INTO shared_views SELECT json_object('Channel',channel),revision,panes,retired FROM workspace_views;
             INSERT INTO shared_view_panes SELECT id,json_object('Channel',channel) FROM workspace_view_panes;

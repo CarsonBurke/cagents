@@ -290,8 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_legacy_view_columns_and_indexes_are_not_dropped() {
-        for extra in ["ALTER TABLE workspace_views ADD COLUMN secret TEXT; UPDATE workspace_views SET secret='keep me';", "CREATE INDEX unknown_legacy_index ON workspace_views(revision);"] {
+    fn unknown_legacy_view_columns_indexes_and_triggers_are_not_dropped() {
+        for extra in ["ALTER TABLE workspace_views ADD COLUMN secret TEXT; UPDATE workspace_views SET secret='keep me';", "CREATE INDEX unknown_legacy_index ON workspace_views(revision);", "CREATE TRIGGER unknown_legacy_trigger BEFORE DELETE ON workspace_views BEGIN SELECT RAISE(ABORT, 'keep'); END;"] {
             let dir=tempfile::tempdir().unwrap();let path=dir.path().join("unknown-legacy.sqlite3");let (_,channel)=legacy(&path,6);
             let db=Connection::open(&path).unwrap();
             db.execute_batch("CREATE TABLE workspace_views(channel TEXT PRIMARY KEY REFERENCES channels(id),revision INTEGER NOT NULL,panes TEXT NOT NULL,retired TEXT NOT NULL) STRICT;
