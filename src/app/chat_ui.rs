@@ -1545,6 +1545,14 @@ enum QueuedStep {
     Prompt,
 }
 
+struct FindReveal {
+    generation: u64,
+    navigation: u64,
+    scope: u64,
+    found: find::Match,
+    source: std::sync::Weak<chat::Item>,
+}
+
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
@@ -1565,6 +1573,7 @@ pub(super) struct Runtime {
     find_navigated: bool,
     find_navigation: u64,
     find_locating: Option<(u64, u64, u8)>,
+    find_reveal: Option<FindReveal>,
     find_disclosure: find::Disclosure,
     find_index: usize,
     copied: Option<(String, Instant)>,
@@ -2219,6 +2228,7 @@ impl Runtime {
             find_navigated: false,
             find_navigation: 0,
             find_locating: None,
+            find_reveal: None,
             find_disclosure: find::Disclosure::default(),
             find_index: 0,
             copied: None,
@@ -2305,6 +2315,7 @@ impl Runtime {
         self.find_scope_revision = self.find_scope_revision.wrapping_add(1);
         self.find_navigation = self.find_navigation.wrapping_add(1);
         self.find_locating = None;
+        self.find_reveal = None;
         self.find_waiting = None;
         self.find_worker = Default::default();
         self.find_matches = Default::default();
@@ -2584,6 +2595,7 @@ impl Runtime {
         prepared.install(cached,managed);
         self.presentation_revision=self.presentation_revision.wrapping_add(1);
         self.refresh_find();
+        if self.find_reveal.as_ref().is_some_and(|reveal| reveal.found.item.as_ref() == id) { self.resume_find_layout(); }
     }
 
     fn refresh(&mut self) {
@@ -2901,6 +2913,36 @@ impl Runtime {
             .count()
     }
 
+    fn find_reveal_source_current(&self) -> bool {
+        let Some(reveal) = &self.find_reveal else { return false; };
+        let current = self.cache.get(reveal.found.item.as_ref()).and_then(|cached| cached.item.as_ref());
+        reveal.source.upgrade().zip(current).is_some_and(|(source, current)| Arc::ptr_eq(&source, current))
+    }
+
+    fn resume_find_layout(&mut self) {
+        let Some(reveal) = &self.find_reveal else { return; };
+        if self.find.is_none() || !self.visible.load(Ordering::Relaxed)
+            || self.find_generation.load(Ordering::Relaxed) != reveal.generation
+            || self.find_navigation != reveal.navigation
+            || self.find_scope_revision != reveal.scope
+            || self.find_matches.get(self.find_index) != Some(&reveal.found) {
+            self.find_reveal = None;
+            self.find_locating = None;
+            return;
+        }
+        // Geometry-only completion may change CachedItem.revision. The exact
+        // immutable source Arc, rather than that paint/layout revision, proves
+        // the accepted ranges still belong to the current document. A newer
+        // source waits for a freshly accepted index result to renew this proof.
+        let generation = reveal.generation;
+        let navigation = reveal.navigation;
+        if !self.find_reveal_source_current() {
+            self.find_locating = None;
+            return;
+        }
+        if self.find_locating.is_none() { self.find_locating = Some((generation, navigation, 0)); }
+    }
+
     fn refresh_find(&mut self) {
         self.find_dirty |= self.find.as_ref().is_some_and(|query| !query.is_empty());
     }
@@ -3012,6 +3054,7 @@ impl Runtime {
             self.find_generation.fetch_add(1, Ordering::Relaxed);
             self.find_navigation = self.find_navigation.wrapping_add(1);
             self.find_locating = None;
+        self.find_reveal = None;
             self.find_waiting = None;
             self.find_worker = Default::default();
             self.find_matches = Default::default();
@@ -3973,6 +4016,8 @@ impl Cagents {
             if runtime
                 .find_disclosure
                 .item(&item.id, &mut runtime.expanded)
+                && !(CachedItem::prose(&item.content).is_some()
+                    && runtime.cache.get(&item.id).is_some_and(|cached| cached.coordination.is_none()))
             {
                 let previous = runtime.cache.remove(&item.id);
                 let mut cached = CachedItem::updated(
@@ -4002,6 +4047,9 @@ impl Cagents {
         runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
         let generation = runtime.find_generation.load(Ordering::Relaxed);
         let navigation = runtime.find_navigation;
+        runtime.find_reveal = runtime.cache.get(found.item.as_ref()).and_then(|cached| cached.item.as_ref())
+            .map(|item| FindReveal { generation, navigation, scope: runtime.find_scope_revision,
+                found: found.clone(), source: Arc::downgrade(item) });
         runtime.find_locating = Some((generation, navigation, 0));
         scroll::locate_logical(
             target,
@@ -6324,19 +6372,31 @@ impl Cagents {
                 }
             }
             Action::FlowReady(target, request, ready) => {
+                let blocked = self.modal_is_open();
                 if let Some(runtime)=self.chat_runtime_mut(target)
                     && let Some(entry)=flow_layout::find(target,&request)
                     && entry.borrow_mut().complete(&request,ready) {
+                    let mut matched = false;
                     for cached in runtime.cache.values_mut() {
                         let owns=cached.flow_cache.find(request.id).is_some()
                             || cached.tool_input.iter().chain(cached.tool_output.iter()).chain(cached.patches.iter())
                                 .any(|tool|tool.flow_cache.find(request.id).is_some());
-                        if owns {cached.revision=CachedItem::next_revision();}
+                        if owns {
+                            cached.revision=CachedItem::next_revision();
+                            matched |= runtime.find_reveal.as_ref().is_some_and(|reveal|
+                                cached.item.as_ref().is_some_and(|item| item.id.as_str() == reveal.found.item.as_ref()));
+                        }
                     }
+                    if blocked { runtime.find_reveal = None; runtime.find_locating = None; }
+                    else if matched { runtime.resume_find_layout(); }
                 }
             }
             Action::MarkdownPrepared(target,id,run,ready) => {
-                if let Some(runtime)=self.chat_runtime_mut(target) { runtime.markdown_prepared(target,&id,run,ready); }
+                let blocked = self.modal_is_open();
+                if let Some(runtime)=self.chat_runtime_mut(target) {
+                    runtime.markdown_prepared(target,&id,run,ready);
+                    if blocked { runtime.find_reveal = None; runtime.find_locating = None; }
+                }
             }
             Action::RetryMarkdown(target) => {
                 if let Some(runtime)=self.chat_runtime_mut(target)
@@ -7780,6 +7840,7 @@ impl Cagents {
                     runtime.find_generation.fetch_add(1, Ordering::Relaxed);
                     runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
                     runtime.find_locating = None;
+                    runtime.find_reveal = None;
                     runtime.find = Some(query);
                     runtime.find_waiting = None;
                     runtime.find_matches = Default::default();
@@ -7835,6 +7896,14 @@ impl Cagents {
                     runtime.find_turns = matches.turns.clone();
                     runtime.find_items = matches.items.clone();
                     runtime.update_find_paint();
+                    if let Some(reveal) = &mut runtime.find_reveal
+                        && runtime.find_matches.get(runtime.find_index) == Some(&reveal.found) {
+                        if let Some(item) = runtime.cache.get(reveal.found.item.as_ref()).and_then(|cached| cached.item.as_ref()) {
+                            reveal.source = Arc::downgrade(item);
+                        }
+                    }
+                    if may_reveal { runtime.resume_find_layout(); }
+                    else { runtime.find_reveal = None; runtime.find_locating = None; }
                     if !may_reveal {
                         runtime.find_auto_reveal = false;
                     }
@@ -7855,10 +7924,16 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                if blocked {
+                if !runtime.find_reveal_source_current() {
                     runtime.find_locating = None;
                     return Task::none();
                 }
+                if blocked {
+                    runtime.find_locating = None;
+                    runtime.find_reveal = None;
+                    return Task::none();
+                }
+                if location.as_ref().is_some_and(|location| location.exact) { runtime.find_reveal = None; }
                 runtime.find_locating = location
                     .as_ref()
                     .filter(|location| !location.exact && attempt < 5)
@@ -7877,6 +7952,7 @@ impl Cagents {
                     runtime.find_auto_reveal = false;
                     runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
                     runtime.find_locating = None;
+                    runtime.find_reveal = None;
                 }
             }
             Action::FindFrame => {
@@ -7884,6 +7960,7 @@ impl Cagents {
                     for card in self.cards.values_mut() {
                         if let CardRuntime::Chat(runtime) = card {
                             runtime.find_locating = None;
+                    runtime.find_reveal = None;
                         }
                     }
                     return Task::none();
@@ -7923,6 +8000,7 @@ impl Cagents {
                     runtime.find_generation.fetch_add(1, Ordering::Relaxed);
                     runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
                     runtime.find_locating = None;
+                    runtime.find_reveal = None;
                     runtime.find_waiting = None;
                     runtime.find_dirty = false;
                     runtime.find_worker = Default::default();
@@ -8316,6 +8394,7 @@ impl Cagents {
                         runtime.find_generation.fetch_add(1, Ordering::Relaxed);
                         runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
                         runtime.find_locating = None;
+                    runtime.find_reveal = None;
                         runtime.find_waiting = None;
                         runtime.find_origin = Some(runtime.active_scroll());
                         runtime.find_navigated = false;
@@ -11560,6 +11639,55 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_cold_geometry_completion_resumes_only_uncancelled_matching_source() {
+        use iced::futures::StreamExt;
+        for cancel in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("cold-find"));
+            let target = chat_runtime(&app, card).target;
+            let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+            snapshot.generation += 1;
+            snapshot.items = vec![Arc::new(chat::Item { id: "answer".into(), role: chat::Role::Assistant,
+                content: text(&"needle ".repeat(800)), at: None, started_at: None })];
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let prepared_revision = chat_runtime(&app, card).cache["answer"].revision;
+            drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+            complete_find_for_test(&mut app, target);
+            assert_eq!(chat_runtime(&app, card).cache["answer"].revision, prepared_revision,
+                "Find disclosure must retain worker-prepared prose rather than reparsing it on the UI thread");
+            let (generation, navigation, _) = chat_runtime(&app, card).find_locating.unwrap();
+            app.chat_runtime_mut(target).unwrap().find_locating = Some((generation, navigation, 5));
+            drop(app.handle_chat_ui(Action::FindLocated(target, generation, navigation, 5,
+                Some(scroll::LogicalLocation { offset: 0.0, exact: false, stage: 1, horizontal: Vec::new() }))));
+            assert!(chat_runtime(&app, card).find_locating.is_none(), "bounded coarse attempts exhausted");
+            assert!(chat_runtime(&app, card).find_reveal.is_some(), "cold worker still owns an unfinished navigation proof");
+            let flow = {
+                let runtime = chat_runtime(&app, card);
+                let cached = &runtime.cache["answer"];
+                let markdown::Item::Paragraph(body) = &cached.markdown.items()[0] else { panic!("paragraph fixture"); };
+                let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+                cached.flow_cache.markdown_entry(runtime.find_matches[0].identity, body.clone(), settings.style)
+            };
+            flow.borrow_mut().configure(720.0, design::TEXT_PROSE.into(), iced::Font::DEFAULT);
+            flow.borrow_mut().bind_target(target);
+            let request = flow.borrow_mut().request().unwrap();
+            if cancel { drop(app.handle_chat_ui(Action::FindNavigationInput(target))); }
+            let task = flow_layout::run(target, request).expect("isolated fixture worker admission");
+            let mut outputs = iced::runtime::task::into_stream(task).unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(output) = outputs.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action @ Action::FlowReady(..)))) = output { return action; }
+                }
+                panic!("flow produced no completion");
+            }).await.expect("bounded worker completion");
+            drop(app.handle_chat_ui(reply));
+            assert_eq!(chat_runtime(&app, card).find_locating.is_some(), !cancel,
+                "a real accepted geometry completion resumes only the original uncancelled search");
+            assert!(flow.borrow().prepared().is_some());
+        }
+    }
+
     #[test]
     fn find_bar_keeps_the_existing_native_scroll_tree_and_reading_offset() {
         use iced::advanced::{
@@ -13594,7 +13722,7 @@ mod tests {
                     tool_text::ToolText::update(None,&source,tool_text::Language::Plain).view(theme,None,target,None)
                 } else {
                     chat_runtime(app,card).cache["tool"].tool_output.as_ref().unwrap().view_logical_with_reader(
-                        theme,None,target,None,selectable_prose::Logical{identity:42,start:0},scroll::Memory::default(),None)
+                        theme,None,target,None,selectable_prose::Logical{identity:42,start:0, paint: None },scroll::Memory::default(),None)
                 }
             };
             let mut element=make(&app);let mut tree=Tree::new(&element);
