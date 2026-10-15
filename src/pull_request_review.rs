@@ -1288,7 +1288,7 @@ impl State {
                 }
                 ActionTask::none()
             }
-            Action::ExistingCheckout(action)=>self.update_existing_checkout(action),
+            Action::ExistingCheckout(action) => self.update_existing_checkout(action),
             Action::DismissNotice => {
                 self.notice = None;
                 ActionTask::none()
@@ -2069,8 +2069,12 @@ impl State {
         let mut controls: Vec<Element<'_, Action>> = vec![
             icon_button(Icon::Branch, "Check out pull request")
                 .on_press_maybe(
-                    (!modal_open && !busy && !self.existing_checkout.busy() && self.context.is_some() && self.range.is_some())
-                        .then(|| self.fenced(Action::Checkout)),
+                    (!modal_open
+                        && !busy
+                        && !self.existing_checkout.busy()
+                        && self.context.is_some()
+                        && self.range.is_some())
+                    .then(|| self.fenced(Action::Checkout)),
                 )
                 .into(),
             icon_button(
@@ -2185,7 +2189,7 @@ impl State {
         if self.completion.open {
             rows.push(self.completion_view(modal_open));
         }
-        if let Some(confirmation)=self.existing_checkout_view(modal_open) {
+        if let Some(confirmation) = self.existing_checkout_view(modal_open) {
             rows.push(confirmation);
         }
         widget::column::with_children(rows)

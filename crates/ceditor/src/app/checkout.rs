@@ -4,8 +4,8 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, WorktreeInput, WorktreeOperationReport, WorktreeOperationState,
-        VerifiedPrCheckout,
+        CreateWorktreeRequest, VerifiedPrCheckout, WorktreeInput, WorktreeOperationReport,
+        WorktreeOperationState,
     },
 };
 
@@ -32,7 +32,7 @@ pub(crate) enum Action {
     ),
     Create,
     ReconcileExisting,
-    ExistingFinished(OperationId,Result<VerifiedPrCheckout,String>),
+    ExistingFinished(OperationId, Result<VerifiedPrCheckout, String>),
     Finished(OperationId, Result<WorktreeOperationReport, String>),
     Cancel,
     Edit,
@@ -56,11 +56,15 @@ impl Dialog {
         self.cancellation.is_some()
     }
     #[cfg(test)]
-    pub(super) fn fixture_pending_existing(&mut self)->OperationId {
-        self.accepted=true;self.cancellation=Some(CancellationToken::new());self.id
+    pub(super) fn fixture_pending_existing(&mut self) -> OperationId {
+        self.accepted = true;
+        self.cancellation = Some(CancellationToken::new());
+        self.id
     }
     #[cfg(test)]
-    pub(super) fn error_for_test(&self)->Option<&str> {self.error.as_deref()}
+    pub(super) fn error_for_test(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
 }
 
 impl Editor {
@@ -279,31 +283,72 @@ impl Editor {
                     }
                 }
             }
-            Action::ReconcileExisting=>{
-                let Some(dialog)=self.checkout_dialog.as_mut().filter(|dialog|!dialog.busy()&&!dialog.accepted) else{return Task::none()};
-                let Some(plan)=dialog.prepared.as_ref().and_then(|prepared|prepared.reconciliation.clone()) else{return Task::none()};
-                if plan.request().expected_head!=dialog.target.head {return Task::none()}
-                dialog.accepted=true;dialog.error=None;
-                let cancellation=CancellationToken::new();dialog.cancellation=Some(cancellation.clone());
-                let id=dialog.id;
+            Action::ReconcileExisting => {
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| !dialog.busy() && !dialog.accepted)
+                else {
+                    return Task::none();
+                };
+                let Some(plan) = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.reconciliation.clone())
+                else {
+                    return Task::none();
+                };
+                if plan.request().expected_head != dialog.target.head {
+                    return Task::none();
+                }
+                dialog.accepted = true;
+                dialog.error = None;
+                let cancellation = CancellationToken::new();
+                dialog.cancellation = Some(cancellation.clone());
+                let id = dialog.id;
                 return cosmic::task::future(async move {
-                    let result=tokio::task::spawn_blocking(move||RepositoryService::system("git")
-                        .reconcile_existing_pr_checkout(&plan,&cancellation).map_err(|error|error.to_string()))
-                        .await.map_err(|error|error.to_string()).and_then(|result|result);
-                    Message::Checkout(Action::ExistingFinished(id,result))
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .reconcile_existing_pr_checkout(&plan, &cancellation)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::Checkout(Action::ExistingFinished(id, result))
                 });
             }
-            Action::ExistingFinished(id,result)=>{
-                let Some(dialog)=self.checkout_dialog.as_mut().filter(|dialog|dialog.id==id) else{return Task::none()};
-                dialog.cancellation=None;
+            Action::ExistingFinished(id, result) => {
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                else {
+                    return Task::none();
+                };
+                dialog.cancellation = None;
                 match result {
-                    Ok(receipt)=>{
-                        let path=dialog.prepared.as_ref().and_then(|prepared|prepared.reconciliation.as_ref())
-                            .ok_or_else(||"The checkout plan was replaced. Prepare checkout again.".to_owned())
-                            .and_then(|plan|cagents::pull_request_review::checkout::verified_existing_path(&dialog.target,plan,&receipt));
-                        match path {Ok(path)=>dialog.completed=Some(path),Err(error)=>dialog.error=Some(error)}
+                    Ok(receipt) => {
+                        let path = dialog
+                            .prepared
+                            .as_ref()
+                            .and_then(|prepared| prepared.reconciliation.as_ref())
+                            .ok_or_else(|| {
+                                "The checkout plan was replaced. Prepare checkout again.".to_owned()
+                            })
+                            .and_then(|plan| {
+                                cagents::pull_request_review::checkout::verified_existing_path(
+                                    &dialog.target,
+                                    plan,
+                                    &receipt,
+                                )
+                            });
+                        match path {
+                            Ok(path) => dialog.completed = Some(path),
+                            Err(error) => dialog.error = Some(error),
+                        }
                     }
-                    Err(error)=>dialog.error=Some(error),
+                    Err(error) => dialog.error = Some(error),
                 }
             }
             Action::Create => {
@@ -446,9 +491,18 @@ impl Editor {
         let dialog = self.checkout_dialog.as_ref()?;
         let action = |a| Message::Checkout(a);
         let mut body = vec![
-            widget::text::title3(if dialog.prepared.as_ref().is_some_and(|prepared|prepared.reconciliation.is_some()) {
-                "Reconcile PR worktree"
-            } else {"Create PR worktree"}).into(),
+            widget::text::title3(
+                if dialog
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.reconciliation.is_some())
+                {
+                    "Reconcile PR worktree"
+                } else {
+                    "Create PR worktree"
+                },
+            )
+            .into(),
             design::caption(format!(
                 "PR #{} · {}",
                 dialog.target.number,
@@ -466,11 +520,28 @@ impl Editor {
                     .on_press(action(Action::Open(path.clone())))
                     .into(),
             );
-        } else if let Some(plan)=dialog.prepared.as_ref().and_then(|prepared|prepared.reconciliation.as_ref()) {
-            body.push(widget::text::body(format!("Existing worktree: {}",plan.path().display())).into());
-            if dialog.accepted&&!dialog.busy() {body.push(design::caption("Inspect this outcome, then close and prepare checkout again before retrying.").into());}
-            body.push(widget::button::suggested(if dialog.busy() {"Reconciling checkout…"} else {"Confirm checkout reconciliation"})
-                .on_press_maybe((!dialog.busy()&&!dialog.accepted).then(||action(Action::ReconcileExisting))).into());
+        } else if let Some(plan) = dialog
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.reconciliation.as_ref())
+        {
+            body.push(
+                widget::text::body(format!("Existing worktree: {}", plan.path().display())).into(),
+            );
+            if dialog.accepted && !dialog.busy() {
+                body.push(design::caption("Inspect this outcome, then close and prepare checkout again before retrying.").into());
+            }
+            body.push(
+                widget::button::suggested(if dialog.busy() {
+                    "Reconciling checkout…"
+                } else {
+                    "Confirm checkout reconciliation"
+                })
+                .on_press_maybe(
+                    (!dialog.busy() && !dialog.accepted).then(|| action(Action::ReconcileExisting)),
+                )
+                .into(),
+            );
         } else if let Some(request) = &dialog.request {
             body.push(
                 widget::text::body(format!(

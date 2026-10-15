@@ -273,7 +273,9 @@ impl State {
     /// Local review input and write receipts must survive until explicitly resolved.
     pub fn restart_blocker(&self) -> Option<&'static str> {
         if self.existing_checkout.busy() {
-            Some("Wait for checkout reconciliation to settle before closing or updating the window.")
+            Some(
+                "Wait for checkout reconciliation to settle before closing or updating the window.",
+            )
         } else if let Some(reason) = self.completion.blocker() {
             Some(reason)
         } else if self.discussion.busy {

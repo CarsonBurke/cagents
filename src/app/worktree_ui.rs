@@ -2923,7 +2923,10 @@ mod owner_path_cache_tests {
                 "unchanged reload scheduled owner I/O"
             );
             assert!(app.worktree_owner_paths.take_batch().is_none());
-            assert!(!app.worktree_selection.pending, "unchanged active reload prepared navigation");
+            assert!(
+                !app.worktree_selection.pending,
+                "unchanged active reload prepared navigation"
+            );
             assert_eq!(app.active_workspace.as_ref(), Some(&selected));
             assert_eq!(calls.load(Ordering::Relaxed), initial);
         }
@@ -2934,11 +2937,16 @@ mod owner_path_cache_tests {
         assert!(app.worktree_selection.pending);
         app.repository_generations.insert(project, 4);
         drop(app.update(Message::RepositoryLoaded {
-            open_cards: false, project_id: project, generation: 4,
+            open_cards: false,
+            project_id: project,
+            generation: 4,
             result: Ok(Box::new(loaded.clone())),
         }));
         assert!(app.worktree_selection.pending);
-        assert_eq!(app.worktree_selection.generation_for_test(), pending_generation);
+        assert_eq!(
+            app.worktree_selection.generation_for_test(),
+            pending_generation
+        );
         assert_eq!(app.active_workspace.as_ref(), Some(&selected));
         assert_eq!(calls.load(Ordering::Relaxed), initial);
         #[cfg(unix)]
@@ -2950,31 +2958,53 @@ mod owner_path_cache_tests {
             std::fs::create_dir(&second).unwrap();
             std::os::unix::fs::symlink(&first, &alias).unwrap();
             app.force_selection_guard_runtime_for_test(runtime.path().to_owned());
-            let task = app.select_worktree_then(alias.clone(), false, selection::Intent::EnsureDefaultPane);
+            let task = app.select_worktree_then(
+                alias.clone(),
+                false,
+                selection::Intent::EnsureDefaultPane,
+            );
             let prepared = super::super::tests::task_app_message(task);
             assert!(app.worktree_selection.pending);
-            assert!(matches!(
-                crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-            ), "the uncommitted receipt must actually hold the first target lease");
+            assert!(
+                matches!(
+                    crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "the uncommitted receipt must actually hold the first target lease"
+            );
             app.repository_generations.insert(project, 5);
             drop(app.update(Message::RepositoryLoaded {
-                open_cards: false, project_id: project, generation: 5,
+                open_cards: false,
+                project_id: project,
+                generation: 5,
                 result: Ok(Box::new(loaded)),
             }));
-            let Message::WorktreeSelectionPrepared { generation, receipt, .. } = &prepared else {
+            let Message::WorktreeSelectionPrepared {
+                generation,
+                receipt,
+                ..
+            } = &prepared
+            else {
                 panic!("expected a prepared physical selection receipt");
             };
-            assert!(app.prepared_selection_navigates(*generation, receipt),
-                "reload must leave the held receipt valid before the deliberate retarget");
-            assert_eq!(app.worktree_owner_paths.watch.observed_for_test(&alias), Some(first.canonicalize().unwrap()),
-                "reload must retain the exact lexical-to-physical pending mapping");
+            assert!(
+                app.prepared_selection_navigates(*generation, receipt),
+                "reload must leave the held receipt valid before the deliberate retarget"
+            );
+            assert_eq!(
+                app.worktree_owner_paths.watch.observed_for_test(&alias),
+                Some(first.canonicalize().unwrap()),
+                "reload must retain the exact lexical-to-physical pending mapping"
+            );
             let epoch = app.worktree_owner_paths.watch.epoch();
             std::fs::remove_file(&alias).unwrap();
             std::os::unix::fs::symlink(&second, &alias).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while app.worktree_owner_paths.watch.epoch() == epoch {
-                assert!(Instant::now() < deadline, "reload dropped the pending alias watch");
+                assert!(
+                    Instant::now() < deadline,
+                    "reload dropped the pending alias watch"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
             // Consume the original receipt without delivering a UI notify
@@ -2984,8 +3014,10 @@ mod owner_path_cache_tests {
             assert_eq!(app.active_workspace.as_ref(), Some(&selected));
             assert!(app.worktree_selection.pending);
             assert_ne!(app.worktree_selection.generation_for_test(), old_generation);
-            assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true).is_ok(),
-                "stale physical lease must retire without exposing the retargeted alias");
+            assert!(
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true).is_ok(),
+                "stale physical lease must retire without exposing the retargeted alias"
+            );
         }
     }
 

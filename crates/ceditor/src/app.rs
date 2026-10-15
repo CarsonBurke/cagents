@@ -2407,7 +2407,7 @@ impl Editor {
                 // selection has nothing to update here.
                 pull_request_review::Effect::SelectionChanged(_) => {}
                 pull_request_review::Effect::Checkout(target) => checkout_target = Some(target),
-                pull_request_review::Effect::OpenCheckout(path)=>checkout_open=Some(path),
+                pull_request_review::Effect::OpenCheckout(path) => checkout_open = Some(path),
                 pull_request_review::Effect::CleanupMergedHead(_) => cleanup_requested = true,
             }
         }
@@ -2417,9 +2417,9 @@ impl Editor {
         if let Some(target) = checkout_target {
             self.begin_checkout(target);
         }
-        if let Some(path)=checkout_open {
-            self.selection_epoch=self.selection_epoch.wrapping_add(1);
-            tasks.push(Self::open(path,self.selection_epoch));
+        if let Some(path) = checkout_open {
+            self.selection_epoch = self.selection_epoch.wrapping_add(1);
+            tasks.push(Self::open(path, self.selection_epoch));
         }
         Task::batch(tasks)
     }
@@ -6876,20 +6876,36 @@ mod tests {
 
     #[test]
     fn accepted_existing_pr_checkout_keeps_window_open_until_its_receipt_settles() {
-        let mut app=editor();
+        let mut app = editor();
         app.begin_checkout(cagents::pull_request_review::CheckoutTarget::read_only(
-            "/fixture".into(),7,cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
+            "/fixture".into(),
+            7,
+            cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
         ));
-        let id=app.checkout_dialog.as_mut().unwrap().fixture_pending_existing();
+        let id = app
+            .checkout_dialog
+            .as_mut()
+            .unwrap()
+            .fixture_pending_existing();
         drop(app.update(Message::CloseWindow));
-        assert!(!app.exiting);assert!(app.checkout_dialog.as_ref().unwrap().busy());
+        assert!(!app.exiting);
+        assert!(app.checkout_dialog.as_ref().unwrap().busy());
         assert!(app.notice.as_deref().unwrap().contains("Cancel or finish"));
         drop(app.checkout_action(checkout::Action::Cancel));
         drop(app.update(Message::CloseWindow));
-        assert!(!app.exiting,"requesting cancellation does not certify settlement");
-        drop(app.checkout_action(checkout::Action::ExistingFinished(id,Err("Checkout preserved.".into()))));
+        assert!(
+            !app.exiting,
+            "requesting cancellation does not certify settlement"
+        );
+        drop(app.checkout_action(checkout::Action::ExistingFinished(
+            id,
+            Err("Checkout preserved.".into()),
+        )));
         assert!(!app.checkout_dialog.as_ref().unwrap().busy());
-        assert_eq!(app.checkout_dialog.as_ref().unwrap().error_for_test(),Some("Checkout preserved."));
+        assert_eq!(
+            app.checkout_dialog.as_ref().unwrap().error_for_test(),
+            Some("Checkout preserved.")
+        );
     }
 
     #[test]
