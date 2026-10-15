@@ -372,6 +372,37 @@ mod tests {
     }
 
     #[test]
+    fn undo_pending_holding_keeps_exact_cleanup_lease_until_explicit_resolution() {
+        let (directory, recovery, holding) = fixture();
+        holding.publication.directory().metadata().unwrap();
+        // Retire the fixture's empty holding before acquiring a real protected
+        // context; every new effect below uses that context's reservation.
+        let mut original = holding;
+        original.publication.cleanup_empty().unwrap();
+        drop(original);
+        let runtime = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        let count = protection.retained_descriptor_count();
+        let context = RecoveryContext::with_guard(protection, count).unwrap();
+        let holding = Holding::create(&root, &recovery, &context).unwrap();
+        let private = holding.root.try_clone().unwrap();
+        fs::write(private.path().join("unresolved"), b"preserve").unwrap();
+        holding.retain(&recovery);
+        drop(context);
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
+        let service = RepositoryService::system("git");
+        assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
+        fs_safety::unlink_within(&private, OsStr::new("unresolved")).unwrap();
+        service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
+        assert!(!recovery.live_recovery.needs_resolution());
+        let exclusive = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).unwrap();
+        drop(exclusive);
+    }
+
+    #[test]
     fn undo_blob_authenticated_proof_refuses_existing_fd_write_during_own_chmod_window() {
         let (_directory, _recovery, mut holding) = fixture();
         let path = Path::new("generated");
