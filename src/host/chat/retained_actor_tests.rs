@@ -1273,6 +1273,62 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
         started.elapsed() < Duration::from_secs(2),
         "pending-owner admission must not invoke its held cleanup RPC"
     );
+    // F-HOST-10: this is the same REAL failed pre-discovery startup, with
+    // live helper/provider and Unknown outcome, not a fabricated startup map.
+    // A healthy owned roster must remain wholly untouched; a project proved
+    // foreign by exact saved source membership remains independently usable.
+    {
+        use crate::agent_execution::HostedSession;
+        use crate::model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalSession};
+        use crate::project_recovery::SessionClose;
+        use crate::workspace_model::views::{Pane,Scope};
+        let foreign=root.join("foreign-project");fs::create_dir(&foreign).unwrap();
+        let mut registry=super::super::model::Registry::at(&root.join("startup-removal.sqlite3")).unwrap();
+        for directory in [root.join("project"),foreign.clone()] {
+            registry.apply(&ModelEdit::OpenProject{repository:directory,checkout:None,primary_checkout:None,name:"Startup scope".into(),kind:ProjectKind::Folder}).unwrap();
+        }
+        let own=root.join("project");
+        registry.apply(&ModelEdit::SeedView{scope:Scope::Worktree{repository:own.clone(),path:own.clone()},closed:Vec::new(),panes:vec![Pane{id:CardId::from_uuid(source.id.as_uuid()),title:"Unresolved startup".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:CardKind::Chat(evidence.source.clone()),scope:Some(own.clone())}]}).unwrap();
+        let original_model=registry.model().unwrap();
+        let project=crate::project_recovery::ProjectInstance{registry:original_model.identity,repository:own.clone(),ordinal:original_model.project(&own).unwrap().ordinal};
+        let other=crate::project_recovery::ProjectInstance{registry:original_model.identity,repository:foreign.clone(),ordinal:original_model.project(&foreign).unwrap().ordinal};
+        {let mut state=host.lock().unwrap();state.install_model(registry);state.register_client(0);}
+        struct Terminals(Vec<crate::terminal::TerminalHandle>);
+        impl Drop for Terminals{fn drop(&mut self){for handle in &self.0{let _=handle.shutdown();}}}
+        let mut terminals=Terminals(Vec::new());
+        let mut spawn=|directory:&std::path::Path| {
+            let mut recipe=LaunchRecipe::shell(directory.to_owned()).unwrap();recipe.program="/bin/cat".into();recipe.arguments.clear();
+            let session=TerminalSession{id:TerminalId::new(),launch:recipe.clone(),owned_codex_listener:None,recovery_origin:None,predecessor:None,transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable{recipe,last_exit:None}};
+            let handle=crate::terminal::TerminalHandle::spawn(session.clone(),Default::default(),|_|{}).unwrap();
+            let descriptor={let mut state=host.lock().unwrap();state.reserve_spawn(session.id).unwrap();state.finish_spawn(0,session,handle.clone(),true).unwrap()};
+            terminals.0.push(handle);
+            SessionClose{source:HostedSession::Terminal(descriptor.session),execution_instance:Some(descriptor.execution_instance),provider:None}
+        };
+        let healthy=spawn(&own);let unrelated=spawn(&foreign);
+        let started=Instant::now();
+        let inventory=super::super::client::process_request(&host,0,ClientRequest::ProjectCloseInventory{project:project.clone()}).unwrap_err();
+        assert!(inventory.message.contains("startup"),"{inventory:?}");
+        let refused=super::super::client::process_request(&host,0,ClientRequest::CloseProjectGuarded{project:project.clone(),sessions:vec![healthy.clone()]}).unwrap_err();
+        assert!(refused.message.contains("startup"),"{refused:?}");
+        assert!(started.elapsed()<Duration::from_secs(2),"negative scope inventory cannot invoke held startup cleanup");
+        assert!(!terminals.0[0].is_completed()&&!terminals.0[1].is_completed());
+        assert!(evidence.helper.is_current()&&evidence.provider.is_current());
+        assert!(Arc::ptr_eq(&host.lock().unwrap().native_actor_startups[&source.id].context,&context));
+        assert_eq!(host.lock().unwrap().read_model().unwrap(),original_model,"whole model remains unchanged before first close");
+        assert!(host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(super::super::client::process_request(&host,0,ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"independent during Unknown startup\n".to_vec()}).is_ok());
+        let listed=super::super::client::process_request(&host,0,ClientRequest::ProjectCloseInventory{project:other.clone()}).unwrap();
+        assert!(matches!(listed.0,ServerResponse::ProjectCloseInventory{..}));
+        let closed=super::super::client::process_request(&host,0,ClientRequest::CloseProjectGuarded{project:other,sessions:vec![unrelated]}).unwrap();
+        assert!(matches!(closed.0,ServerResponse::WorkspaceModel{..}));
+        assert!(!terminals.0[0].is_completed()&&terminals.0[1].is_completed());
+        let model=host.lock().unwrap().read_model().unwrap();assert!(model.project(&own).is_some()&&model.project(&foreign).is_none());
+        assert!(evidence.helper.is_current()&&evidence.provider.is_current());
+        // No residual real PTY is allowed to mask the startup-only shutdown
+        // assertions below, after exact startup cleanup finally succeeds.
+        let done=super::super::client::process_request(&host,0,ClientRequest::CloseTerminalSourceChecked{source:match healthy.source{HostedSession::Terminal(source)=>source,_=>unreachable!()},execution_instance:healthy.execution_instance.unwrap(),allow_active:true});
+        assert!(done.is_ok());
+    }
     // A deliberate start retry invokes exact cleanup and may wait for the
     // latch then legitimately launch a successor. It is not a nonblocking
     // admission probe; only the shutdown/upgrade guards above claim that.
