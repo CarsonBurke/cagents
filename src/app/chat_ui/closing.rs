@@ -601,12 +601,19 @@ mod tests {
     }
     fn attach_durable_owner(app: &mut Cagents, card: CardId) -> chat::Session {
         let mut session = app.chat_return_session(card).unwrap();
-        session.proof = Some(crate::model::HostSessionProof {
+        let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("modal-close-owner"),
             boot_id: crate::model::BootId::new("modal-close-boot"),
             host_incarnation: crate::model::HostIncarnation::new("modal-close-incarnation"),
-        });
-        session.native_continuity = chat::NativeContinuity::Durable { provider_version: "fixture".into() };
+        };
+        // Allocate the same owned endpoint shape as production before the
+        // fixture learns its thread. No socket or daemon process is started.
+        let thread = session.launch.session_id.take();
+        assert!(session.claim_owned_codex_listener(Path::new("/modal-fixture-host"), &proof));
+        session.launch.session_id = thread;
+        session.proof = Some(proof);
+        session.native_continuity = chat::NativeContinuity::Durable { provider_version: "1.0".into() };
+        assert!(session.has_valid_native_continuity());
         app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
         let handle = Arc::new(ClientHandle::fixture(session.clone(), Snapshot {session_id: session.launch.session_id.clone(), ready: true, ..Snapshot::default()}));
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("runtime"); };
