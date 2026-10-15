@@ -905,12 +905,13 @@ mod tests {
         let(mut state,source,expanded)=open(&page,"visible part");let request=state.entries[&page.source].patch_requests[&0];
         let pending=ready(&page,text).await;let weak=Arc::downgrade(&pending.0.lock().unwrap().as_ref().unwrap().text);
         assert!(state.complete_patch(&page.source,0,request,Ok(pending)));
-        state.evict(false);flush_retired();flush_retired();assert!(weak.upgrade().is_none());assert_eq!(state.retained_bytes(),0);
+        state.evict(false);flush_retired();assert!(weak.upgrade().is_none());assert_eq!(state.retained_bytes(),0);
         assert!(state.entries[&page.source].opened.contains(&0));assert!(state.entries[&page.source].manual_pages.contains(&0));
         assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0],vec![7,0,0]]);
         state.project(source.clone(),None,&expanded,false);let request=state.entries[&page.source].requested[&0];
         assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
         assert_eq!(state.pending_paths(&page.source.source_id),vec![vec![6,0]]);
+        state.reconcile_demand(&expanded,false);
         let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
         assert_eq!(state.copy_patch(&page.source.source_id,0).unwrap().as_ref(),text);assert!(state.pending_paths(&page.source.source_id).is_empty());
         state.evict(false);let mut replacement=(*source).clone();replacement.changes_parts[0].epoch.revision+=1;
