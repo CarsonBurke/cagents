@@ -1343,11 +1343,12 @@ fn preflight_inner(
     }
     let mut count = ByteCounter(0);
     serde_json::to_writer(&mut count, &metadata).map_err(|error| error.to_string())?;
-    // Child transcripts are bounded presentation items, not long-lived
-    // request/model metadata. The actor checks that metadata alone stays
-    // under STATE_LIMIT after applying this initial batch.
+    // Initial advisory events take the same bounded reduction path as live
+    // metadata. In particular, 64 valid denial previews can exceed 4 MiB
+    // before the actor replaces their oldest inputs with omission markers.
+    // Rejecting the batch here would bypass that non-fatal byte budgeting.
     if count.0 > 4 * STATE_LIMIT {
-        return Err("Provider initial presentation exceeds IPC capacity".into());
+        tracing::warn!(bytes=count.0,"Reducing large initial provider presentation metadata");
     }
     initial.events = metadata;
     Ok(store)
