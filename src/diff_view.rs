@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex},
 };
 
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -38,38 +38,78 @@ pub struct SharedLine {
 
 impl SharedLine {
     fn slice(source: &Arc<str>, text: &str) -> Self {
-        let start = (text.as_ptr() as usize).checked_sub(source.as_ptr() as usize)
+        let start = (text.as_ptr() as usize)
+            .checked_sub(source.as_ptr() as usize)
             .expect("display line belongs to its source");
         let end = start.checked_add(text.len()).expect("line end fits source");
         assert!(end <= source.len(), "display line belongs to its source");
-        Self { source: Arc::clone(source), start: u32::try_from(start).expect("bounded diff source"),
-            end: u32::try_from(end).expect("bounded diff source") }
+        Self {
+            source: Arc::clone(source),
+            start: u32::try_from(start).expect("bounded diff source"),
+            end: u32::try_from(end).expect("bounded diff source"),
+        }
     }
-    pub fn as_str(&self) -> &str { &self.source[self.start as usize..self.end as usize] }
+    pub fn as_str(&self) -> &str {
+        &self.source[self.start as usize..self.end as usize]
+    }
 }
 impl std::ops::Deref for SharedLine {
     type Target = str;
-    fn deref(&self) -> &str { self.as_str() }
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
 }
-impl AsRef<str> for SharedLine { fn as_ref(&self) -> &str { self.as_str() } }
+impl AsRef<str> for SharedLine {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
 impl std::fmt::Debug for SharedLine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.as_str().fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
 }
 impl std::fmt::Display for SharedLine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.as_str().fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
 }
-impl PartialEq for SharedLine { fn eq(&self, other: &Self) -> bool { self.as_str() == other.as_str() } }
+impl PartialEq for SharedLine {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
 impl Eq for SharedLine {}
-impl PartialEq<&str> for SharedLine { fn eq(&self, other: &&str) -> bool { self.as_str() == *other } }
-impl PartialEq<String> for SharedLine { fn eq(&self, other: &String) -> bool { self.as_str() == other } }
+impl PartialEq<&str> for SharedLine {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl PartialEq<String> for SharedLine {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
 impl From<Arc<str>> for SharedLine {
     fn from(source: Arc<str>) -> Self {
         let end = u32::try_from(source.len()).expect("bounded diff source");
-        Self { source, start: 0, end }
+        Self {
+            source,
+            start: 0,
+            end,
+        }
     }
 }
-impl From<String> for SharedLine { fn from(text: String) -> Self { Arc::<str>::from(text).into() } }
-impl From<&str> for SharedLine { fn from(text: &str) -> Self { Arc::<str>::from(text).into() } }
+impl From<String> for SharedLine {
+    fn from(text: String) -> Self {
+        Arc::<str>::from(text).into()
+    }
+}
+impl From<&str> for SharedLine {
+    fn from(text: &str) -> Self {
+        Arc::<str>::from(text).into()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineDiffRow {
@@ -132,17 +172,32 @@ pub struct SyntaxSpan {
 impl SyntaxSpan {
     fn new(range: Range<usize>, color: Option<[u8; 4]>, font: Option<cosmic::iced::Font>) -> Self {
         use cosmic::iced::font;
-        Self { start: u32::try_from(range.start).expect("bounded syntax line"),
-            end: u32::try_from(range.end).expect("bounded syntax line"), color,
-            font: font.map_or(0, |font| 1 | u8::from(font.weight == font::Weight::Bold) << 1
-                | u8::from(font.style == font::Style::Italic) << 2) }
+        Self {
+            start: u32::try_from(range.start).expect("bounded syntax line"),
+            end: u32::try_from(range.end).expect("bounded syntax line"),
+            color,
+            font: font.map_or(0, |font| {
+                1 | u8::from(font.weight == font::Weight::Bold) << 1
+                    | u8::from(font.style == font::Style::Italic) << 2
+            }),
+        }
     }
-    fn range(&self) -> Range<usize> { self.start as usize..self.end as usize }
+    fn range(&self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
     fn font(&self) -> Option<cosmic::iced::Font> {
         use cosmic::iced::{Font, font};
         (self.font != 0).then_some(Font {
-            weight: if self.font & 2 != 0 { font::Weight::Bold } else { font::Weight::Normal },
-            style: if self.font & 4 != 0 { font::Style::Italic } else { font::Style::Normal },
+            weight: if self.font & 2 != 0 {
+                font::Weight::Bold
+            } else {
+                font::Weight::Normal
+            },
+            style: if self.font & 4 != 0 {
+                font::Style::Italic
+            } else {
+                font::Style::Normal
+            },
             ..Font::MONOSPACE
         })
     }
@@ -372,7 +427,11 @@ impl HighlightParser {
         cancellation: &CancellationToken,
     ) -> Result<[Vec<SyntaxSpan>; 2], Cancelled> {
         check_cancelled(cancellation)?;
-        #[cfg(test)] WORK_COUNTS.with(|counts| { let (highlight, shape) = counts.get(); counts.set((highlight + 1, shape)); });
+        #[cfg(test)]
+        WORK_COUNTS.with(|counts| {
+            let (highlight, shape) = counts.get();
+            counts.set((highlight + 1, shape));
+        });
         let line = line
             .strip_suffix("\r\n")
             .or_else(|| line.strip_suffix('\n'))
@@ -409,7 +468,9 @@ impl HighlightParser {
                             resolved
                         });
                 for (palette, style) in resolved.into_iter().enumerate() {
-                    let color = style.foreground.map(|color| [color.r, color.g, color.b, color.a]);
+                    let color = style
+                        .foreground
+                        .map(|color| [color.r, color.g, color.b, color.a]);
                     let font = style.font_style.and_then(|style| {
                         use cosmic::iced::{Font, font};
                         let bold = style.contains(highlighting::FontStyle::BOLD);
@@ -458,146 +519,221 @@ fn highlight_lines(
     Ok(lines)
 }
 
-/// Baselines are keyed by exact bytes, grammar and palette pair. Checkpoints
-/// carry lexical state only: replaying up to 127 lines does not recolor them.
+/// Only source and immutable colored spans are retained. Native parser state
+/// owns private, potentially deep grammar stacks and is never cached per line.
 struct BaselineSyntax {
     text: Arc<str>,
     hash: blake3::Hash,
     token: String,
     theme: crate::settings::EditorSyntaxTheme,
     syntax: Arc<SyntaxLines>,
-    line_ranges: Vec<Range<usize>>,
-    checkpoints: Vec<(usize, parsing::ParseState, parsing::ScopeStack)>,
     retained_bytes: usize,
 }
 
-impl BaselineSyntax {
-    fn parser_at(&self, line: usize, cancellation: &CancellationToken) -> Result<HighlightParser, Cancelled> {
-        let mut parser = HighlightParser::new(&self.token, self.theme);
-        let (start, state, stack) = self.checkpoints.iter().rev().find(|(at, ..)| *at <= line)
-            .expect("baseline has an initial checkpoint");
-        parser.parser = state.clone();
-        parser.stack = stack.clone();
-        for range in &self.line_ranges[*start..line] {
-            check_cancelled(cancellation)?;
-            let text = &self.text[range.clone()];
-            let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text);
-            for (_, op) in parser.parser.parse_line(text, parser.syntaxes).unwrap_or_default() {
-                let _ = parser.stack.apply(&op);
-            }
-        }
-        Ok(parser)
+struct BaselineFlight {
+    text: Arc<str>,
+    hash: blake3::Hash,
+    token: String,
+    theme: crate::settings::EditorSyntaxTheme,
+    finished: Mutex<bool>,
+    ready: Condvar,
+}
+
+/// Cancellation or a failed builder wakes waiters, which may retry. The
+/// global cache lock never spans parsing, waiting, or renderer/font work.
+struct BaselineBuilder(Arc<BaselineFlight>);
+impl Drop for BaselineBuilder {
+    fn drop(&mut self) {
+        BASELINES.lock().unwrap_or_else(|error| error.into_inner()).pending
+            .retain(|entry| !Arc::ptr_eq(entry, &self.0));
+        *self.0.finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        self.0.ready.notify_all();
     }
 }
 
 #[derive(Default)]
-struct BaselineCache { entries: VecDeque<Arc<BaselineSyntax>>, bytes: usize }
+struct BaselineCache {
+    entries: VecDeque<Arc<BaselineSyntax>>,
+    pending: Vec<Arc<BaselineFlight>>,
+    bytes: usize,
+}
 
 const BASELINE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const BASELINE_CACHE_ENTRIES: usize = 8;
-static BASELINES: LazyLock<Mutex<BaselineCache>> = LazyLock::new(|| Mutex::new(BaselineCache::default()));
+static BASELINES: LazyLock<Mutex<BaselineCache>> =
+    LazyLock::new(|| Mutex::new(BaselineCache::default()));
 
-fn baseline_syntax(before: &Arc<str>, token: &str, theme: crate::settings::EditorSyntaxTheme,
-    cancellation: &CancellationToken) -> Result<Arc<BaselineSyntax>, Cancelled> {
+fn baseline_syntax(before: &Arc<str>, token: &str,
+    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken,
+) -> Result<Arc<BaselineSyntax>, Cancelled> {
     let hash = blake3::hash(before.as_bytes());
-    // This lock never crosses rendering/font-system code. Serializing cache
-    // misses ensures simultaneous views do not highlight the same blob twice.
-    let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
-    check_cancelled(cancellation)?;
-    if let Some(index) = cache.entries.iter().position(|entry| entry.hash == hash
-        && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()) {
-        let entry = cache.entries.remove(index).expect("matched baseline");
-        cache.entries.push_back(Arc::clone(&entry));
-        return Ok(entry);
-    }
+    let builder = loop {
+        check_cancelled(cancellation)?;
+        let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = cache.entries.iter().position(|entry| entry.hash == hash
+            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()) {
+            let entry = cache.entries.remove(index).expect("matched baseline");
+            cache.entries.push_back(Arc::clone(&entry));
+            return Ok(entry);
+        }
+        if let Some(flight) = cache.pending.iter().find(|entry| entry.hash == hash
+            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()).cloned() {
+            drop(cache);
+            let mut finished = flight.finished.lock().unwrap_or_else(|error| error.into_inner());
+            while !*finished {
+                check_cancelled(cancellation)?;
+                finished = flight.ready.wait_timeout(finished, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|error| error.into_inner()).0;
+            }
+        } else {
+            let flight = Arc::new(BaselineFlight { text: Arc::clone(before), hash, token: token.to_owned(), theme,
+                finished: Mutex::new(false), ready: Condvar::new() });
+            cache.pending.push(Arc::clone(&flight));
+            break BaselineBuilder(flight);
+        }
+    };
     let mut parser = HighlightParser::new(token, theme);
     let mut syntax: SyntaxLines = Default::default();
-    let mut checkpoints = Vec::new();
-    let mut line_count = 0;
-    let mut line_ranges = Vec::new();
-    let mut offset = 0;
-    for (line, text) in before.split_inclusive('\n').enumerate() {
-        check_cancelled(cancellation)?;
-        if line % 128 == 0 { checkpoints.push((line, parser.parser.clone(), parser.stack.clone())); }
+    for text in before.split_inclusive('\n') {
         for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) { lines.push(spans.into()); }
-        line_count = line + 1;
-        line_ranges.push(offset..offset + text.len());
-        offset += text.len();
     }
-    checkpoints.push((line_count, parser.parser.clone(), parser.stack.clone()));
-    let retained_bytes = before.len() + line_ranges.capacity() * std::mem::size_of::<Range<usize>>() + syntax.iter().map(|lines| lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
-        + lines.iter().map(|spans| std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()).sum::<usize>()).sum::<usize>()
-        + checkpoints.iter().map(|(_, _, stack)| 512 + stack.scopes.len() * std::mem::size_of::<parsing::Scope>()).sum::<usize>();
-    let baseline = Arc::new(BaselineSyntax { text: Arc::clone(before), hash, token: token.to_owned(), theme,
-        syntax: Arc::new(syntax), line_ranges, checkpoints, retained_bytes });
-    if retained_bytes <= BASELINE_CACHE_BYTES {
-        while cache.entries.len() >= BASELINE_CACHE_ENTRIES || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES {
-            let Some(oldest) = cache.entries.pop_front() else { break; };
-            cache.bytes -= oldest.retained_bytes;
+    // This is a payload bound, including Arc headers/vector capacities. The
+    // allocator's metadata/fragmentation and in-flight requests are measured
+    // separately; no opaque parser heap is retained inside this cache.
+    let retained_bytes = std::mem::size_of::<BaselineSyntax>() + before.len()
+        + 6 * std::mem::size_of::<usize>() + token.len()
+        + syntax.iter().map(|lines| lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+            + lines.iter().map(|spans| std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()).sum::<usize>()).sum::<usize>();
+    let baseline = Arc::new(BaselineSyntax { text: Arc::clone(before), hash,
+        token: token.to_owned(), theme, syntax: Arc::new(syntax), retained_bytes });
+    {
+        let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
+        if retained_bytes <= BASELINE_CACHE_BYTES {
+            while cache.entries.len() >= BASELINE_CACHE_ENTRIES || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES {
+                let Some(oldest) = cache.entries.pop_front() else { break; };
+                cache.bytes -= oldest.retained_bytes;
+            }
+            cache.bytes += retained_bytes;
+            cache.entries.push_back(Arc::clone(&baseline));
         }
-        cache.bytes += retained_bytes;
-        cache.entries.push_back(Arc::clone(&baseline));
     }
+    drop(builder);
     Ok(baseline)
+}
+
+/// State-only forward parsing is linear in the baseline, with at most one
+/// live old-side stack. Sharing a colored run never stores deep checkpoints.
+fn advance_lexical(parser: &mut HighlightParser, lines: &[&str], cursor: &mut usize,
+    end: usize, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+    debug_assert!(*cursor <= end);
+    for text in &lines[*cursor..end] {
+        check_cancelled(cancellation)?;
+        let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text);
+        for (_, op) in parser.parser.parse_line(text, parser.syntaxes).unwrap_or_default() {
+            let _ = parser.stack.apply(&op);
+        }
+    }
+    *cursor = end;
+    Ok(())
 }
 
 /// Reuse each unchanged run independently. Several distant edits must not
 /// recolor the entire interval between their first and last changed lines.
 #[cfg(test)]
-fn highlight_comparison(before: &Arc<str>, after: &str, path: &Path,
-    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken) -> Result<DiffSyntax, Cancelled> {
+fn highlight_comparison(
+    before: &Arc<str>,
+    after: &str,
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    cancellation: &CancellationToken,
+) -> Result<DiffSyntax, Cancelled> {
     let model = build_diff_rows(before, after, cancellation)?;
     highlight_comparison_model(before, after, path, theme, cancellation, &model)
 }
 
-fn highlight_comparison_model(before: &Arc<str>, after: &str, path: &Path,
-    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken, model: &DiffModel) -> Result<DiffSyntax, Cancelled> {
+fn highlight_comparison_model(
+    before: &Arc<str>,
+    after: &str,
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    cancellation: &CancellationToken,
+    model: &DiffModel,
+) -> Result<DiffSyntax, Cancelled> {
     let token = highlighter_settings(path, theme, false).token;
     let baseline = baseline_syntax(before, &token, theme, cancellation)?;
-    if before.as_ref() == after { return Ok(DiffSyntax { old: Arc::clone(&baseline.syntax),
-        new: Arc::clone(&baseline.syntax), theme }); }
+    if before.as_ref() == after {
+        return Ok(DiffSyntax {
+            old: Arc::clone(&baseline.syntax),
+            new: Arc::clone(&baseline.syntax),
+            theme,
+        });
+    }
     let old_lines: Vec<_> = before.split_inclusive('\n').collect();
     let new_lines: Vec<_> = after.split_inclusive('\n').collect();
     let mut corresponding = vec![None; new_lines.len()];
     for row in &model.split_rows {
         check_cancelled(cancellation)?;
-        if let (Some(old),Some(new)) = (row.old_line,row.new_line) {
+        if let (Some(old), Some(new)) = (row.old_line, row.new_line) {
             let old = old as usize - 1;
             let new = new as usize - 1;
             // Ignore-whitespace context is not necessarily lexically equal.
-            if old_lines[old] == new_lines[new] { corresponding[new] = Some(old); }
+            if old_lines[old] == new_lines[new] {
+                corresponding[new] = Some(old);
+            }
         }
     }
-    let mut parser = HighlightParser::new(&token,theme);
+    let mut parser = HighlightParser::new(&token, theme);
+    let mut old_parser = HighlightParser::new(&token, theme);
+    let mut old_cursor = 0;
     let mut new: SyntaxLines = std::array::from_fn(|_| Vec::with_capacity(new_lines.len()));
     let mut index = 0;
     let mut probe = 0;
     while index < new_lines.len() {
         check_cancelled(cancellation)?;
         if let Some(old) = corresponding[index] {
-            let starts_run = index == 0 || corresponding[index-1].is_none_or(|previous| previous+1 != old);
+            let starts_run =
+                index == 0 || corresponding[index - 1].is_none_or(|previous| previous + 1 != old);
             if starts_run || index >= probe {
-                let old_state = baseline.parser_at(old,cancellation)?;
-                if parser.parser == old_state.parser && parser.stack == old_state.stack {
-                    let mut end = index+1;
-                    while end < corresponding.len() && corresponding[end] == Some(old+end-index) { end += 1; }
+                advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old, cancellation)?;
+                if parser.parser == old_parser.parser && parser.stack == old_parser.stack {
+                    let mut end = index + 1;
+                    while end < corresponding.len() && corresponding[end] == Some(old + end - index)
+                    {
+                        end += 1;
+                    }
                     for (palette, lines) in new.iter_mut().enumerate() {
-                        for spans in &baseline.syntax[palette][old..old+end-index] {
-                            check_cancelled(cancellation)?; lines.push(Arc::clone(spans));
+                        for spans in &baseline.syntax[palette][old..old + end - index] {
+                            check_cancelled(cancellation)?;
+                            lines.push(Arc::clone(spans));
                         }
                     }
-                    parser = baseline.parser_at(old+end-index,cancellation)?;
-                    index = end; probe = index; continue;
+                    advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old + end - index, cancellation)?;
+                    parser.parser = old_parser.parser.clone();
+                    parser.stack = old_parser.stack.clone();
+                    index = end;
+                    probe = index;
+                    continue;
                 }
                 // A multiline delimiter may alter an arbitrarily long suffix.
-                // Check convergence at lexical checkpoints without quadratic replay.
-                probe = index + 128 - old%128;
+                // Check convergence at bounded intervals while advancing the old state only once.
+                probe = index + 128 - old % 128;
             }
-        } else { probe = index+1; }
-        for (lines,spans) in new.iter_mut().zip(parser.line(new_lines[index],cancellation)?) { lines.push(spans.into()); }
+        } else {
+            probe = index + 1;
+        }
+        for (lines, spans) in new
+            .iter_mut()
+            .zip(parser.line(new_lines[index], cancellation)?)
+        {
+            lines.push(spans.into());
+        }
         index += 1;
     }
-    Ok(DiffSyntax { old: Arc::clone(&baseline.syntax), new: Arc::new(new), theme })
+    Ok(DiffSyntax {
+        old: Arc::clone(&baseline.syntax),
+        new: Arc::new(new),
+        theme,
+    })
 }
 
 #[derive(Debug)]
@@ -638,17 +774,31 @@ pub fn build_document_diff_with_options(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
-    build_document_diff_sources(before.into(), Arc::from(after), path, theme, ignore_whitespace, cancellation)
+    build_document_diff_sources(
+        before.into(),
+        Arc::from(after),
+        path,
+        theme,
+        ignore_whitespace,
+        cancellation,
+    )
 }
 
 /// Snapshot entry point: both exact sources are retained without recopying.
 /// A Send editor snapshot can materialize its Arc on the worker and pass it here.
-pub fn build_document_diff_sources(before: Arc<str>, after: Arc<str>, path: &Path,
-    theme: crate::settings::EditorSyntaxTheme, ignore_whitespace: bool,
-    cancellation: &CancellationToken) -> Option<DiffModel> {
+pub fn build_document_diff_sources(
+    before: Arc<str>,
+    after: Arc<str>,
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
-    let mut model = build_diff_rows_from_sources(&before, &after, ignore_whitespace, cancellation).ok()?;
-    model.syntax = highlight_comparison_model(&before, &after, path, theme, cancellation, &model).ok()?;
+    let mut model =
+        build_diff_rows_from_sources(&before, &after, ignore_whitespace, cancellation).ok()?;
+    model.syntax =
+        highlight_comparison_model(&before, &after, path, theme, cancellation, &model).ok()?;
     measure_diff(&mut model, cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
     Some(model)
@@ -780,21 +930,55 @@ fn plain_line_width(line: &str, font: cosmic::iced::Font) -> f32 {
 
 /// Shape native fallbacks under one lock per small batch. The bounded batch
 /// releases the renderer's global font lock between groups of at most 64 rows.
-fn native_key_width(key: &ShapeKey<'_>, fonts: &mut cosmic::iced::advanced::graphics::text::cosmic_text::FontSystem) -> f32 {
+fn native_key_width(
+    key: &ShapeKey<'_>,
+    fonts: &mut cosmic::iced::advanced::graphics::text::cosmic_text::FontSystem,
+) -> f32 {
     use cosmic::iced::advanced::graphics::text::{self, cosmic_text};
-    #[cfg(test)] WORK_COUNTS.with(|counts| { let (highlight, shape) = counts.get(); counts.set((highlight, shape + 1)); });
-    let mut buffer = cosmic_text::Buffer::new(fonts, cosmic_text::Metrics::new(DIFF_FONT_SIZE, DIFF_LINE_HEIGHT));
+    #[cfg(test)]
+    WORK_COUNTS.with(|counts| {
+        let (highlight, shape) = counts.get();
+        counts.set((highlight, shape + 1));
+    });
+    let mut buffer = cosmic_text::Buffer::new(
+        fonts,
+        cosmic_text::Metrics::new(DIFF_FONT_SIZE, DIFF_LINE_HEIGHT),
+    );
     buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     buffer.set_wrap(cosmic_text::Wrap::None);
-    buffer.set_rich_text(key.fonts.iter().enumerate().map(|(index, (range, font))|
-        (&key.text[range.clone()], text::to_attributes(*font).metadata(index))),
-        &text::to_attributes(cosmic::iced::Font::MONOSPACE), cosmic_text::Shaping::Advanced, Some(cosmic_text::Align::Left));
+    buffer.set_rich_text(
+        key.fonts.iter().enumerate().map(|(index, (range, font))| {
+            (
+                &key.text[range.clone()],
+                text::to_attributes(*font).metadata(index),
+            )
+        }),
+        &text::to_attributes(cosmic::iced::Font::MONOSPACE),
+        cosmic_text::Shaping::Advanced,
+        Some(cosmic_text::Align::Left),
+    );
     buffer.shape_until_scroll(fonts, false);
-    text::align(&mut buffer, fonts, cosmic::iced::advanced::text::Alignment::Left).width
+    text::align(
+        &mut buffer,
+        fonts,
+        cosmic::iced::advanced::text::Alignment::Left,
+    )
+    .width
 }
 
-fn ascii_cell(font: cosmic::iced::Font, fonts: &mut cosmic::iced::advanced::graphics::text::cosmic_text::FontSystem) -> Option<f32> {
-    let measure = |text: &str, fonts: &mut _| native_key_width(&ShapeKey { text, fonts: vec![(0..text.len(), font)] }, fonts);
+fn ascii_cell(
+    font: cosmic::iced::Font,
+    fonts: &mut cosmic::iced::advanced::graphics::text::cosmic_text::FontSystem,
+) -> Option<f32> {
+    let measure = |text: &str, fonts: &mut _| {
+        native_key_width(
+            &ShapeKey {
+                text,
+                fonts: vec![(0..text.len(), font)],
+            },
+            fonts,
+        )
+    };
     let cell = measure("0000000000", fonts) / 10.0;
     // Font::MONOSPACE is resolved by the platform. Verify fixed advances for
     // narrow/wide ASCII and common programming ligatures before arithmetic.
@@ -803,15 +987,31 @@ fn ascii_cell(font: cosmic::iced::Font, fonts: &mut cosmic::iced::advanced::grap
         .then_some(cell)
 }
 
-fn arithmetic_width(key: &ShapeKey<'_>, cells: &HashMap<cosmic::iced::Font, Option<f32>>) -> Option<f32> {
-    if !key.text.is_ascii() || key.text.bytes().any(|byte| byte.is_ascii_control()) { return None; }
-    key.fonts.iter().try_fold(0.0, |width, (range, font)|
-        Some(width + range.len() as f32 * cells.get(font).copied().flatten()?))
+fn arithmetic_width(
+    key: &ShapeKey<'_>,
+    cells: &HashMap<cosmic::iced::Font, Option<f32>>,
+) -> Option<f32> {
+    if !key.text.is_ascii() || key.text.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    key.fonts.iter().try_fold(0.0, |width, (range, font)| {
+        Some(width + range.len() as f32 * cells.get(font).copied().flatten()?)
+    })
 }
 
 fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Result<(), Cancelled> {
     use cosmic::iced::advanced::graphics::text;
-    let palettes = if model.syntax.old.iter().chain(model.syntax.new.iter()).all(Vec::is_empty) { 1 } else { 2 };
+    let palettes = if model
+        .syntax
+        .old
+        .iter()
+        .chain(model.syntax.new.iter())
+        .all(Vec::is_empty)
+    {
+        1
+    } else {
+        2
+    };
     let mut widths = [0.0_f32; 2];
     let mut measured = HashMap::new();
     let mut cells = HashMap::new();
@@ -819,33 +1019,51 @@ fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Resu
         check_cancelled(cancellation)?;
         let mut pending = Vec::new();
         for row in rows {
-            for (old, line, source) in [(true, row.old_line, row.old_text.as_deref()),
-                (false, row.new_line, row.new_text.as_deref())] {
+            for (old, line, source) in [
+                (true, row.old_line, row.old_text.as_deref()),
+                (false, row.new_line, row.new_text.as_deref()),
+            ] {
                 if let Some(source) = source {
                     for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
                         let key = ShapeKey::new(source, model.syntax.line(old, line, palette == 1));
-                        if let Some(cached) = measured.get(&key) { *width = width.max(*cached); }
-                        else if let Some(arithmetic) = arithmetic_width(&key, &cells) { *width = width.max(arithmetic); }
-                        else { pending.push((palette, key)); }
+                        if let Some(cached) = measured.get(&key) {
+                            *width = width.max(*cached);
+                        } else if let Some(arithmetic) = arithmetic_width(&key, &cells) {
+                            *width = width.max(arithmetic);
+                        } else {
+                            pending.push((palette, key));
+                        }
                     }
                 }
             }
         }
-        if pending.is_empty() { continue; }
+        if pending.is_empty() {
+            continue;
+        }
         let mut system = text::font_system().write().expect("Write font system");
         for (palette, key) in pending {
             check_cancelled(cancellation)?;
             for (_, font) in &key.fonts {
-                cells.entry(*font).or_insert_with(|| ascii_cell(*font, system.raw()));
+                cells
+                    .entry(*font)
+                    .or_insert_with(|| ascii_cell(*font, system.raw()));
             }
-            let width = if let Some(cached) = measured.get(&key) { *cached }
-                else if let Some(arithmetic) = arithmetic_width(&key, &cells) { arithmetic }
-                else { native_key_width(&key, system.raw()) };
+            let width = if let Some(cached) = measured.get(&key) {
+                *cached
+            } else if let Some(arithmetic) = arithmetic_width(&key, &cells) {
+                arithmetic
+            } else {
+                native_key_width(&key, system.raw())
+            };
             widths[palette] = widths[palette].max(width);
-            if measured.len() < 32768 { measured.insert(key, width); }
+            if measured.len() < 32768 {
+                measured.insert(key, width);
+            }
         }
     }
-    if palettes == 1 { widths[1] = widths[0]; }
+    if palettes == 1 {
+        widths[1] = widths[0];
+    }
     model.max_line_width = widths.map(|width| width.ceil() as u32);
     Ok(())
 }
@@ -877,8 +1095,15 @@ impl DiffModel {
 
     /// New-side source line nearest a logical row, including deleted rows.
     pub fn new_line_at_row(&self, mode: DiffMode, row: usize) -> Option<u32> {
-        fn nearest(lines: impl DoubleEndedIterator<Item = Option<u32>> + Clone, row: usize) -> Option<u32> {
-            lines.clone().skip(row).flatten().next()
+        fn nearest(
+            lines: impl DoubleEndedIterator<Item = Option<u32>> + Clone,
+            row: usize,
+        ) -> Option<u32> {
+            lines
+                .clone()
+                .skip(row)
+                .flatten()
+                .next()
                 .or_else(|| lines.take(row.saturating_add(1)).flatten().last())
         }
         match mode {
@@ -889,9 +1114,16 @@ impl DiffModel {
 
     pub fn row_at_new_line(&self, mode: DiffMode, line: u32) -> Option<usize> {
         match mode {
-            DiffMode::Inline => self.inline_rows.iter().position(|row| row.new_line.is_some_and(|n| n >= line)),
-            DiffMode::Split => self.split_rows.iter().position(|row| row.new_line.is_some_and(|n| n >= line)),
-        }.or_else(|| self.row_count(mode).checked_sub(1))
+            DiffMode::Inline => self
+                .inline_rows
+                .iter()
+                .position(|row| row.new_line.is_some_and(|n| n >= line)),
+            DiffMode::Split => self
+                .split_rows
+                .iter()
+                .position(|row| row.new_line.is_some_and(|n| n >= line)),
+        }
+        .or_else(|| self.row_count(mode).checked_sub(1))
     }
 
     /// The syntax theme this model's spans were coloured with, so a cached
@@ -974,7 +1206,10 @@ impl RenderedDiff {
                         new_label,
                     });
                 }
-                let present = [!matches!(old, crate::repository::DiffSide::Absent), !matches!(new, crate::repository::DiffSide::Absent)];
+                let present = [
+                    !matches!(old, crate::repository::DiffSide::Absent),
+                    !matches!(new, crate::repository::DiffSide::Absent),
+                ];
                 let mut model = match build_document_diff_with_options(
                     old.text().unwrap_or_default(),
                     new.text().unwrap_or_default(),
@@ -1017,7 +1252,15 @@ pub fn load_repository_diff(
     theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
-    load_repository_diff_with_options(worktree, relative_path, basis, previous_path, theme, false, cancellation)
+    load_repository_diff_with_options(
+        worktree,
+        relative_path,
+        basis,
+        previous_path,
+        theme,
+        false,
+        cancellation,
+    )
 }
 
 pub fn load_repository_diff_with_options(
@@ -1047,23 +1290,41 @@ pub fn load_repository_diff_with_options(
         old_path,
     };
     match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content_with_options(content, relative_path, theme, ignore_whitespace, cancellation),
+        Ok(content) => RenderedDiff::from_content_with_options(
+            content,
+            relative_path,
+            theme,
+            ignore_whitespace,
+            cancellation,
+        ),
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
 
 /// The editor gutter needs only new-side changed line numbers. This path
 /// creates neither display rows nor syntax/width work, including for large files.
-pub fn build_line_changes(before: &str, after: &str, ignore_whitespace: bool,
-    cancellation: &CancellationToken) -> Option<Vec<usize>> {
+pub fn build_line_changes(
+    before: &str,
+    after: &str,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> Option<Vec<usize>> {
     check_cancelled(cancellation).ok()?;
-    if before == after { return Some(Vec::new()); }
+    if before == after {
+        return Some(Vec::new());
+    }
     let normalized;
     let (old, new) = if ignore_whitespace {
-        let normalize = |text: &str| text.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()).collect::<String>();
+        let normalize = |text: &str| {
+            text.chars()
+                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
+                .collect::<String>()
+        };
         normalized = (normalize(before), normalize(after));
         (normalized.0.as_str(), normalized.1.as_str())
-    } else { (before, after) };
+    } else {
+        (before, after)
+    };
     let input = InternedInput::new(old, new);
     check_cancelled(cancellation).ok()?;
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
@@ -1100,14 +1361,26 @@ fn build_diff_rows_with_options(
     ignore_whitespace: bool,
     cancellation: &CancellationToken,
 ) -> Result<DiffModel, Cancelled> {
-    let after_source = if before.as_ref() == after { Arc::clone(before) } else { Arc::<str>::from(after) };
+    let after_source = if before.as_ref() == after {
+        Arc::clone(before)
+    } else {
+        Arc::<str>::from(after)
+    };
     build_diff_rows_from_sources(before, &after_source, ignore_whitespace, cancellation)
 }
 
-fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
-    ignore_whitespace: bool, cancellation: &CancellationToken) -> Result<DiffModel, Cancelled> {
+fn build_diff_rows_from_sources(
+    before: &Arc<str>,
+    after_source: &Arc<str>,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> Result<DiffModel, Cancelled> {
     check_cancelled(cancellation)?;
-    let after_source = if before.as_ref() == after_source.as_ref() { before } else { after_source };
+    let after_source = if before.as_ref() == after_source.as_ref() {
+        before
+    } else {
+        after_source
+    };
     let after = after_source.as_ref();
     if before.as_ref() == after {
         // Keep every context row, but skip interning and line diffing entirely.
@@ -1137,7 +1410,8 @@ fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
         let mut old_cursor = 0;
         let mut new_cursor = 0;
         append_context(
-            before, after_source,
+            before,
+            after_source,
             &lines,
             &lines,
             &mut old_cursor,
@@ -1155,7 +1429,11 @@ fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
     let normalized;
     let (old_tokens, new_tokens) = if ignore_whitespace {
         // Retain line separators and final-newline identity. Do not join lines.
-        let normalize = |text: &str| text.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()).collect::<String>();
+        let normalize = |text: &str| {
+            text.chars()
+                .filter(|ch| *ch == '\n' || !ch.is_whitespace())
+                .collect::<String>()
+        };
         normalized = (normalize(before), normalize(after));
         (normalized.0.as_str(), normalized.1.as_str())
     } else {
@@ -1168,8 +1446,14 @@ fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
     diff.postprocess_lines(&input);
     check_cancelled(cancellation)?;
 
-    let before_lines = before.split_inclusive('\n').map(display_line).collect::<Vec<_>>();
-    let after_lines = after.split_inclusive('\n').map(display_line).collect::<Vec<_>>();
+    let before_lines = before
+        .split_inclusive('\n')
+        .map(display_line)
+        .collect::<Vec<_>>();
+    let after_lines = after
+        .split_inclusive('\n')
+        .map(display_line)
+        .collect::<Vec<_>>();
     let mut inline_rows = Vec::new();
     let mut split_rows = Vec::new();
     let mut inline_change_starts = Vec::new();
@@ -1185,7 +1469,8 @@ fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
     for hunk in diff.hunks() {
         check_cancelled(cancellation)?;
         append_context(
-            before, after_source,
+            before,
+            after_source,
             &before_lines,
             &after_lines,
             &mut old_cursor,
@@ -1309,7 +1594,8 @@ fn build_diff_rows_from_sources(before: &Arc<str>, after_source: &Arc<str>,
         new_cursor = new_end;
     }
     append_context(
-        before, after_source,
+        before,
+        after_source,
         &before_lines,
         &after_lines,
         &mut old_cursor,
@@ -1422,7 +1708,12 @@ pub(crate) fn line_spans<'a>(
         }
         if let Some(style) = style.filter(|span| span.range().contains(&cursor)) {
             if let Some(color) = style.color {
-                span = span.color(cosmic::iced::Color::from_rgba8(color[0], color[1], color[2], color[3] as f32 / 255.0));
+                span = span.color(cosmic::iced::Color::from_rgba8(
+                    color[0],
+                    color[1],
+                    color[2],
+                    color[3] as f32 / 255.0,
+                ));
             }
             if let Some(font) = style.font() {
                 span = span.font(font);
@@ -1462,7 +1753,16 @@ fn replacement_matches(
         }
         let old_end = hunk.before.end as usize;
         let new_end = hunk.after.end as usize;
-        matches.extend(weighted_replacement_matches(&before[old..old_end], &after[new..new_end], budget, cancellation)?.into_iter().map(|(a,b)| (old+a,new+b)));
+        matches.extend(
+            weighted_replacement_matches(
+                &before[old..old_end],
+                &after[new..new_end],
+                budget,
+                cancellation,
+            )?
+            .into_iter()
+            .map(|(a, b)| (old + a, new + b)),
+        );
         old = old_end;
         new = new_end;
     }
@@ -1783,22 +2083,55 @@ mod tests {
         assert!(ignored.is_empty());
         assert_eq!(ignored.before.as_ref(), before.as_ref());
         assert_eq!(ignored.after.as_ref(), after);
-        assert_eq!(ignored.split_rows[1].new_text.as_deref(), Some("\tlet answer = 42;  "));
-        let real = super::build_diff_rows_with_options(&before, &after.replace("42", "43"), true, &token).unwrap();
+        assert_eq!(
+            ignored.split_rows[1].new_text.as_deref(),
+            Some("\tlet answer = 42;  ")
+        );
+        let real =
+            super::build_diff_rows_with_options(&before, &after.replace("42", "43"), true, &token)
+                .unwrap();
         assert_eq!((real.additions, real.deletions), (1, 1));
-        let new_line = super::build_diff_rows_with_options(&before, &format!("{after}\n"), true, &token).unwrap();
-        assert_eq!(new_line.additions, 1, "normalization preserves line separators");
+        let new_line =
+            super::build_diff_rows_with_options(&before, &format!("{after}\n"), true, &token)
+                .unwrap();
+        assert_eq!(
+            new_line.additions, 1,
+            "normalization preserves line separators"
+        );
     }
 
     #[test]
     fn large_reindent_keeps_word_pairing_for_the_real_edit() {
-        let before = (0..180).map(|i| format!("    let value_{i} = {i};\n")).collect::<String>();
-        let after = before.replace("    ", "\t").replace("value_90 = 90", "value_90 = 900");
-        let model = super::build_diff_rows(&std::sync::Arc::from(before), &after, &super::CancellationToken::new()).unwrap();
-        let row = model.split_rows.iter().find(|row| row.new_line == Some(91)).unwrap();
-        let changed = row.new_changed.iter().map(|range| &row.new_text.as_ref().unwrap()[range.clone()]).collect::<Vec<_>>();
-        assert!(changed.contains(&"900"), "substantive edit must have a word highlight: {changed:?}");
-        assert!(!row.new_changed.contains(&(0..row.new_text.as_ref().unwrap().len())));
+        let before = (0..180)
+            .map(|i| format!("    let value_{i} = {i};\n"))
+            .collect::<String>();
+        let after = before
+            .replace("    ", "\t")
+            .replace("value_90 = 90", "value_90 = 900");
+        let model = super::build_diff_rows(
+            &std::sync::Arc::from(before),
+            &after,
+            &super::CancellationToken::new(),
+        )
+        .unwrap();
+        let row = model
+            .split_rows
+            .iter()
+            .find(|row| row.new_line == Some(91))
+            .unwrap();
+        let changed = row
+            .new_changed
+            .iter()
+            .map(|range| &row.new_text.as_ref().unwrap()[range.clone()])
+            .collect::<Vec<_>>();
+        assert!(
+            changed.contains(&"900"),
+            "substantive edit must have a word highlight: {changed:?}"
+        );
+        assert!(
+            !row.new_changed
+                .contains(&(0..row.new_text.as_ref().unwrap().len()))
+        );
     }
 
     #[test]
@@ -1863,10 +2196,20 @@ mod tests {
                                 .unwrap_or(line);
                             let spans = stream
                                 .highlight_line(line)
-                                .map(|(range, highlight)| SyntaxSpan::new(range, highlight.color().map(|color| [
-                                    (color.r * 255.0).round() as u8, (color.g * 255.0).round() as u8,
-                                    (color.b * 255.0).round() as u8, (color.a * 255.0).round() as u8,
-                                ]), highlight.font()))
+                                .map(|(range, highlight)| {
+                                    SyntaxSpan::new(
+                                        range,
+                                        highlight.color().map(|color| {
+                                            [
+                                                (color.r * 255.0).round() as u8,
+                                                (color.g * 255.0).round() as u8,
+                                                (color.b * 255.0).round() as u8,
+                                                (color.a * 255.0).round() as u8,
+                                            ]
+                                        }),
+                                        highlight.font(),
+                                    )
+                                })
                                 .collect::<Vec<_>>();
                             stream.commit();
                             Arc::<[SyntaxSpan]>::from(spans)
@@ -3191,9 +3534,14 @@ mod tests {
             ("same", "same"),
         ] {
             let cancellation = CancellationToken::new();
-            let result =
-                highlight_comparison(&Arc::from(before), after, Path::new("sample.rs"), AUTO, &cancellation)
-                    .unwrap();
+            let result = highlight_comparison(
+                &Arc::from(before),
+                after,
+                Path::new("sample.rs"),
+                AUTO,
+                &cancellation,
+            )
+            .unwrap();
             assert_eq!(
                 *result.old,
                 highlight_side(before, Path::new("sample.rs"), AUTO, &cancellation).unwrap(),
@@ -3217,20 +3565,48 @@ mod performance_receipt {
         let before: Arc<str> = (0..50_000).map(|line| format!("fn function_{line:05}() {{ let value = {line}; println!(\"value {{value}}\"); }}\n")).collect::<String>().into();
         let mut after = before.to_string();
         for line in [100, 25_000, 49_900] {
-            after = after.replacen(&format!("let value = {line};"), &format!("let value = {line} + 1;"), 1);
+            after = after.replacen(
+                &format!("let value = {line};"),
+                &format!("let value = {line} + 1;"),
+                1,
+            );
         }
         let started = std::time::Instant::now();
-        let model = build_document_diff(Arc::clone(&before), &after, Path::new("huge.rs"), crate::settings::EditorSyntaxTheme::Auto, &CancellationToken::new()).unwrap();
+        let model = build_document_diff(
+            Arc::clone(&before),
+            &after,
+            Path::new("huge.rs"),
+            crate::settings::EditorSyntaxTheme::Auto,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let cold_ms = started.elapsed().as_secs_f64() * 1000.;
         let started = std::time::Instant::now();
-        let second = build_document_diff(Arc::clone(&before), &after, Path::new("huge.rs"), crate::settings::EditorSyntaxTheme::Auto, &CancellationToken::new()).unwrap();
+        let second = build_document_diff(
+            Arc::clone(&before),
+            &after,
+            Path::new("huge.rs"),
+            crate::settings::EditorSyntaxTheme::Auto,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let warm_ms = started.elapsed().as_secs_f64() * 1000.;
         let resident = std::fs::read_to_string("/proc/self/status").unwrap();
-        let memory: Vec<_> = resident.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")).collect();
-        println!("DIFF_PERF lines=50000 source_bytes={} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} span_bytes={} inline_row_bytes={} split_row_bytes={} rows={} memory={memory:?}", before.len(), std::mem::size_of::<SyntaxSpan>(), std::mem::size_of::<InlineDiffRow>(), std::mem::size_of::<SplitDiffRow>(),model.inline_rows.len());
+        let memory: Vec<_> = resident
+            .lines()
+            .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+            .collect();
+        println!(
+            "DIFF_PERF lines=50000 source_bytes={} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} span_bytes={} inline_row_bytes={} split_row_bytes={} rows={} memory={memory:?}",
+            before.len(),
+            std::mem::size_of::<SyntaxSpan>(),
+            std::mem::size_of::<InlineDiffRow>(),
+            std::mem::size_of::<SplitDiffRow>(),
+            model.inline_rows.len()
+        );
         assert_eq!(model.additions, 3);
         assert_eq!(second.deletions, 3);
-        std::hint::black_box((model,second));
+        std::hint::black_box((model, second));
     }
 }
 
@@ -3243,15 +3619,34 @@ mod memory_contracts {
     fn rows_reference_two_exact_sources_without_context_text_copies() {
         let before: Arc<str> = Arc::from("fn preserved() {}\r\nlet old = 1;\nlast");
         let after: Arc<str> = Arc::from("fn preserved() {}\r\nlet new = 2;\nlast");
-        let model = build_document_diff_sources(Arc::clone(&before), Arc::clone(&after), Path::new("storage-contract.rs"), AUTO, false, &CancellationToken::new()).unwrap();
+        let model = build_document_diff_sources(
+            Arc::clone(&before),
+            Arc::clone(&after),
+            Path::new("storage-contract.rs"),
+            AUTO,
+            false,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&model.before, &before));
         assert!(Arc::ptr_eq(&model.after, &after));
         for row in &model.inline_rows {
-            assert!(Arc::ptr_eq(&row.text.source, &before) || Arc::ptr_eq(&row.text.source, &after));
+            assert!(
+                Arc::ptr_eq(&row.text.source, &before) || Arc::ptr_eq(&row.text.source, &after)
+            );
         }
-        assert!(Arc::ptr_eq(&model.split_rows[0].old_text.as_ref().unwrap().source, &before));
-        assert!(Arc::ptr_eq(&model.split_rows[0].new_text.as_ref().unwrap().source, &after));
-        assert_eq!(std::mem::size_of::<SharedLine>(), std::mem::size_of::<String>());
+        assert!(Arc::ptr_eq(
+            &model.split_rows[0].old_text.as_ref().unwrap().source,
+            &before
+        ));
+        assert!(Arc::ptr_eq(
+            &model.split_rows[0].new_text.as_ref().unwrap().source,
+            &after
+        ));
+        assert_eq!(
+            std::mem::size_of::<SharedLine>(),
+            std::mem::size_of::<String>()
+        );
         assert_eq!(std::mem::size_of::<SyntaxSpan>(), 16);
     }
 
@@ -3260,9 +3655,20 @@ mod memory_contracts {
         WORK_COUNTS.with(|counts| counts.set((0, 0)));
         let before = "fn gutter_contract() {\n    old();\n}\n";
         let after = "fn gutter_contract() {\n    new();\n    added();\n}\n";
-        assert_eq!(build_line_changes(before, after, false, &CancellationToken::new()), Some(vec![1,2]));
-        assert_eq!(WORK_COUNTS.with(std::cell::Cell::get), (0,0));
-        assert_eq!(build_line_changes(before, &before.replace("    ", "\t"), true, &CancellationToken::new()), Some(vec![]));
+        assert_eq!(
+            build_line_changes(before, after, false, &CancellationToken::new()),
+            Some(vec![1, 2])
+        );
+        assert_eq!(WORK_COUNTS.with(std::cell::Cell::get), (0, 0));
+        assert_eq!(
+            build_line_changes(
+                before,
+                &before.replace("    ", "\t"),
+                true,
+                &CancellationToken::new()
+            ),
+            Some(vec![])
+        );
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         assert!(build_line_changes(before, after, false, &cancellation).is_none());
@@ -3270,14 +3676,41 @@ mod memory_contracts {
 
     #[test]
     fn baseline_and_unchanged_line_spans_are_shared_across_edits() {
-        let before: Arc<str> = Arc::from("fn immutable_cache_contract() {\n    let first = 1;\n    let second = 2;\n}\n");
-        let a = build_document_diff(Arc::clone(&before), &before.replace("first = 1", "first = 3"), Path::new("cached.rs"), AUTO, &CancellationToken::new()).unwrap();
-        WORK_COUNTS.with(|counts| counts.set((0,0)));
-        let b = build_document_diff(Arc::clone(&before), &before.replace("first = 1", "first = 4"), Path::new("cached.rs"), AUTO, &CancellationToken::new()).unwrap();
+        let before: Arc<str> = Arc::from(
+            "fn immutable_cache_contract() {\n    let first = 1;\n    let second = 2;\n}\n",
+        );
+        let a = build_document_diff(
+            Arc::clone(&before),
+            &before.replace("first = 1", "first = 3"),
+            Path::new("cached.rs"),
+            AUTO,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        WORK_COUNTS.with(|counts| counts.set((0, 0)));
+        let b = build_document_diff(
+            Arc::clone(&before),
+            &before.replace("first = 1", "first = 4"),
+            Path::new("cached.rs"),
+            AUTO,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&a.syntax.old, &b.syntax.old));
         assert!(Arc::ptr_eq(&b.syntax.old[0][2], &b.syntax.new[0][2]));
-        assert_eq!(WORK_COUNTS.with(std::cell::Cell::get).0, 1, "only the changed new-side line is recolored");
-        let alternate = build_document_diff(Arc::clone(&before), &before, Path::new("cached.rs"), crate::settings::EditorSyntaxTheme::Mocha, &CancellationToken::new()).unwrap();
+        assert_eq!(
+            WORK_COUNTS.with(std::cell::Cell::get).0,
+            1,
+            "only the changed new-side line is recolored"
+        );
+        let alternate = build_document_diff(
+            Arc::clone(&before),
+            &before,
+            Path::new("cached.rs"),
+            crate::settings::EditorSyntaxTheme::Mocha,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&a.syntax.old, &alternate.syntax.old));
         let cache = BASELINES.lock().unwrap();
         assert!(cache.entries.len() <= BASELINE_CACHE_ENTRIES);
@@ -3285,17 +3718,72 @@ mod memory_contracts {
     }
 
     #[test]
+    fn nested_grammar_cache_retains_only_exact_source_and_colored_spans() {
+        let text: Arc<str> = ("/*\n".repeat(512) + &"*/\n".repeat(512)).into();
+        let baseline = baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
+        let spans: usize = baseline.syntax.iter().flat_map(|lines| lines.iter()).map(|line| line.len()).sum();
+        let payload = std::mem::size_of::<BaselineSyntax>() + text.len() + 6 * std::mem::size_of::<usize>() + baseline.token.len()
+            + baseline.syntax.iter().map(|lines| lines.capacity()*std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                + lines.len()*2*std::mem::size_of::<usize>()).sum::<usize>() + spans*std::mem::size_of::<SyntaxSpan>();
+        assert_eq!(baseline.retained_bytes, payload);
+        assert!(baseline.retained_bytes < text.len()*100, "no retained quadratic parser checkpoint heap");
+    }
+
+    #[test]
+    fn same_blob_baseline_builds_once_under_concurrent_requests() {
+        let text: Arc<str> = (0..64).map(|line| format!("fn concurrent_cache_{line}() {{}}\n")).collect::<String>().into();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|_| {
+            let text = Arc::clone(&text); let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                WORK_COUNTS.with(|counts| counts.set((0,0))); barrier.wait();
+                let baseline = baseline_syntax(&text,"rs",AUTO,&CancellationToken::new()).unwrap();
+                (baseline,WORK_COUNTS.with(std::cell::Cell::get).0)
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(results.iter().map(|(_,count)| count).sum::<usize>(),64);
+        assert!(results.iter().all(|(baseline,_)| Arc::ptr_eq(baseline,&results[0].0)));
+    }
+
+    #[test]
+    fn waiting_baseline_can_cancel_while_unrelated_blob_completes() {
+        let text: Arc<str> = Arc::from("fn held_cache_miss() {}\n");
+        let flight = Arc::new(BaselineFlight { text: Arc::clone(&text), hash: blake3::hash(text.as_bytes()), token:"rs".into(),
+            theme:AUTO,finished:Mutex::new(false),ready:Condvar::new() });
+        BASELINES.lock().unwrap().pending.push(Arc::clone(&flight));
+        let builder = BaselineBuilder(flight);
+        let cancellation = CancellationToken::new();
+        let worker_cancel = cancellation.clone();
+        let worker = std::thread::spawn(move || baseline_syntax(&text,"rs",AUTO,&worker_cancel).is_err());
+        let other: Arc<str> = Arc::from("fn unrelated_cache_miss() {}\n");
+        assert!(baseline_syntax(&other,"rs",AUTO,&CancellationToken::new()).is_ok());
+        cancellation.cancel();
+        assert!(worker.join().unwrap());
+        drop(builder);
+    }
+
+    #[test]
     fn compact_style_rendering_snapshot_preserves_colors_fonts_and_overlays() {
         use cosmic::iced::{Color, Font, font};
-        let bold = Font { weight: font::Weight::Bold, ..Font::MONOSPACE };
-        let syntax = [SyntaxSpan::new(0..3, Some([12,34,56,255]), Some(bold)), SyntaxSpan::new(3..5, Some([200,100,50,128]), None)];
-        let spans = line_spans("let x", &[4..5], &syntax, Color::from_rgb8(1,2,3));
+        let bold = Font {
+            weight: font::Weight::Bold,
+            ..Font::MONOSPACE
+        };
+        let syntax = [
+            SyntaxSpan::new(0..3, Some([12, 34, 56, 255]), Some(bold)),
+            SyntaxSpan::new(3..5, Some([200, 100, 50, 128]), None),
+        ];
+        let spans = line_spans("let x", &[4..5], &syntax, Color::from_rgb8(1, 2, 3));
         let text: Vec<_> = spans.iter().map(|span| span.text.as_ref()).collect();
         assert_eq!(text, vec!["let", " ", "x"]);
         assert_eq!(spans[0].font, Some(bold));
         assert_eq!(spans[1].font, None);
-        assert_eq!(spans[0].color, Some(Color::from_rgba8(12,34,56,1.0)));
-        assert_eq!(spans[2].color, Some(Color::from_rgba8(200,100,50,128.0/255.0)));
+        assert_eq!(spans[0].color, Some(Color::from_rgba8(12, 34, 56, 1.0)));
+        assert_eq!(
+            spans[2].color,
+            Some(Color::from_rgba8(200, 100, 50, 128.0 / 255.0))
+        );
         assert!(spans[0].background.is_none());
         assert!(spans[2].background.is_some());
     }
@@ -3307,27 +3795,37 @@ mod snapshot_performance_receipt {
     #[test]
     #[ignore = "50,000-line owning-thread edit/snapshot measurement"]
     fn fifty_thousand_line_edit_and_capture() {
-        use crate::editor_widget::{Content,Cursor,Edit,Position};
+        use crate::editor_widget::{Content, Cursor, Edit, Position};
         let source = (0..50_000).map(|line| format!("fn function_{line:05}() {{ let value = {line}; println!(\"value {{value}}\"); }}\n")).collect::<String>();
         let mut content: Content = Content::with_text(&source);
-        content.set_cursor(Cursor { position: Position { line: 25_000,column: 4 },selection:None });
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 25_000,
+                column: 4,
+            },
+            selection: None,
+        });
         let mut edit_us = Vec::new();
         let mut capture_us = Vec::new();
         for character in "abcdefghij".chars() {
             let started = std::time::Instant::now();
             content.perform_edit(Edit::Insert(character));
             std::hint::black_box(content.text_len());
-            edit_us.push(started.elapsed().as_secs_f64()*1_000_000.);
+            edit_us.push(started.elapsed().as_secs_f64() * 1_000_000.);
             let started = std::time::Instant::now();
             let snapshot = content.text_snapshot();
-            capture_us.push(started.elapsed().as_secs_f64()*1_000_000.);
+            capture_us.push(started.elapsed().as_secs_f64() * 1_000_000.);
             std::hint::black_box(snapshot);
         }
         let started = std::time::Instant::now();
         let snapshot = content.text_snapshot();
-        let pause_capture_us = started.elapsed().as_secs_f64()*1_000_000.;
-        println!("DIFF_TYPING_PERF lines=50000 source_bytes={} edit_us={edit_us:?} capture_us={capture_us:?} pause_capture_us={pause_capture_us:.3} snapshot_bytes={}",source.len(),snapshot.len());
-        assert_eq!(snapshot.len(),source.len()+10);
+        let pause_capture_us = started.elapsed().as_secs_f64() * 1_000_000.;
+        println!(
+            "DIFF_TYPING_PERF lines=50000 source_bytes={} edit_us={edit_us:?} capture_us={capture_us:?} pause_capture_us={pause_capture_us:.3} snapshot_bytes={}",
+            source.len(),
+            snapshot.len()
+        );
+        assert_eq!(snapshot.len(), source.len() + 10);
     }
 }
 
@@ -3336,15 +3834,40 @@ mod separated_change_contract {
     use super::*;
     #[test]
     fn distant_edits_reuse_each_intervening_unchanged_lexical_run() {
-        let before: Arc<str> = (0..1000).map(|line| format!("fn spaced_{line}() {{ let value = {line}; }}\n")).collect::<String>().into();
-        let after = before.replace("value = 10;","value = 11;").replace("value = 900;","value = 901;");
+        let before: Arc<str> = (0..1000)
+            .map(|line| format!("fn spaced_{line}() {{ let value = {line}; }}\n"))
+            .collect::<String>()
+            .into();
+        let after = before
+            .replace("value = 10;", "value = 11;")
+            .replace("value = 900;", "value = 901;");
         let cancellation = CancellationToken::new();
         let theme = crate::settings::EditorSyntaxTheme::Auto;
-        let _ = build_document_diff(Arc::clone(&before), &before, Path::new("separated.rs"), theme,&cancellation).unwrap();
-        WORK_COUNTS.with(|counts| counts.set((0,0)));
-        let model = build_document_diff(Arc::clone(&before), &after, Path::new("separated.rs"),theme,&cancellation).unwrap();
-        assert_eq!(WORK_COUNTS.with(std::cell::Cell::get).0,2);
-        assert!(Arc::ptr_eq(&model.syntax.old[0][500],&model.syntax.new[0][500]));
-        assert_eq!(model.syntax.new.as_ref(),&highlight_side(&after,Path::new("separated.rs"),theme,&cancellation).unwrap());
+        let _ = build_document_diff(
+            Arc::clone(&before),
+            &before,
+            Path::new("separated.rs"),
+            theme,
+            &cancellation,
+        )
+        .unwrap();
+        WORK_COUNTS.with(|counts| counts.set((0, 0)));
+        let model = build_document_diff(
+            Arc::clone(&before),
+            &after,
+            Path::new("separated.rs"),
+            theme,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(WORK_COUNTS.with(std::cell::Cell::get).0, 2);
+        assert!(Arc::ptr_eq(
+            &model.syntax.old[0][500],
+            &model.syntax.new[0][500]
+        ));
+        assert_eq!(
+            model.syntax.new.as_ref(),
+            &highlight_side(&after, Path::new("separated.rs"), theme, &cancellation).unwrap()
+        );
     }
 }
