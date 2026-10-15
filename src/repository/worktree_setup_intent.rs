@@ -117,7 +117,16 @@ pub(super) fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result
 pub fn worktree_setup_marker_matches(admin: &Path, creation: OperationId) -> io::Result<bool> {
     crate::secure_file::reject_symlink_components(admin)?;
     let admin = crate::fs_safety::Root::open(admin)?;
-    Ok(read_creation_marker(&admin)? == Some(creation))
+    worktree_setup_marker_matches_at(&admin, creation)
+}
+
+/// Validate the marker through the same retained admin directory used by setup.
+/// The caller separately retains and validates checkout/backlink identity.
+pub(crate) fn worktree_setup_marker_matches_at(
+    admin: &crate::fs_safety::Root,
+    creation: OperationId,
+) -> io::Result<bool> {
+    Ok(read_creation_marker(admin)? == Some(creation))
 }
 
 impl WorktreeSetupCreationIdentity {
