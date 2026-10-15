@@ -2889,11 +2889,8 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        self.set_diff_surface_visible(true);
-        let diff = Task::batch([self.ensure_current_diff(card), self.working_diff_task(card)]);
-        if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() {
-            return diff;
-        }
+        let diff = self.refresh_diff_visibility(card,true);
+        if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() { return diff; }
         self.background_file_refresh = true;
         let files = self.load_files(card);
         Task::batch([diff, files])
@@ -4147,13 +4144,23 @@ impl RepositoryRuntime {
 
     pub fn set_diff_surface_visible(&mut self, visible: bool) {
         self.diff_surface_visible = visible;
-        if !visible
-            && let Some(active) = &self.working_diff.active
-            && active.rich
-        {
-            active.cancellation.cancel();
+        if !visible {
+            if let Some(active) = &self.working_diff.active && active.rich { active.cancellation.cancel(); }
+            // Dropping the loading state cancels an initial repository diff as
+            // well as live-buffer work. Completed models remain reusable.
+            self.diffs.retain(|(_,state)| !matches!(state,DiffState::Loading { .. }));
         }
     }
+
+    /// Visibility transitions schedule work themselves: revealing a pane must
+    /// not wait for another edit, and overscan must not retain rich CPU work.
+    pub fn refresh_diff_visibility(&mut self, card:CardId, visible:bool)->Task<RepositoryAction> {
+        self.set_diff_surface_visible(visible);
+        Task::batch([self.ensure_current_diff(card),self.working_diff_task(card)])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diff_surface_is_visible(&self)->bool { self.diff_surface_visible }
 
     fn wants_rich_working_diff(&self) -> bool {
         self.diff_surface_visible && self.source_surface == SourceSurface::Diff
@@ -6129,8 +6136,8 @@ impl RepositoryRuntime {
     /// cached, but navigating away cancels unfinished work rather than merely
     /// discarding its expensive result later.
     fn ensure_current_diff(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let showing_diff =
-            self.source_surface == SourceSurface::Diff && self.basis_resolution.is_none();
+        let showing_diff = self.diff_surface_visible
+            && self.source_surface == SourceSurface::Diff && self.basis_resolution.is_none();
         self.diffs.retain(|(basis, state)| {
             !matches!(state, DiffState::Loading { .. })
                 || (showing_diff && *basis == self.diff_basis)
@@ -11441,6 +11448,31 @@ mod tests {
         assert!(runtime.working_diff.active.as_ref().unwrap().rich);
         finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.working_diff.applied_rich);
+    }
+
+    #[test]
+    fn hiding_diff_cancels_rich_worker_and_does_not_start_initial_rich_load() {
+        let card = CardId::new();
+        let (mut runtime,_) = working_diff_runtime(card,"old\n", "new\n");
+        runtime.working_diff.applied = None;
+        drop(runtime.working_diff_task(card));
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card,ticket));
+        let cancellation = runtime.working_diff.active.as_ref().unwrap().cancellation.clone();
+        assert!(!cancellation.is_cancelled());
+        drop(runtime.refresh_diff_visibility(card,false));
+        assert!(cancellation.is_cancelled());
+        runtime.diffs.clear();
+        drop(runtime.ensure_current_diff(card));
+        assert!(runtime.diffs.is_empty(),"an offscreen comparison must not invoke Git/highlight/shape initially");
+        runtime.set_diff_surface_visible(true);
+        drop(runtime.ensure_current_diff(card));
+        assert!(matches!(runtime.diff_state(&DiffBasis::IndexToWorktree),Some(DiffState::Loading { .. })));
+        let cancellation = match runtime.diff_state(&DiffBasis::IndexToWorktree).unwrap() { DiffState::Loading { cancellation,.. } => cancellation.clone(),_=>unreachable!() };
+        runtime.set_diff_surface_visible(false);
+        assert!(cancellation.is_cancelled());
+        assert!(runtime.diffs.is_empty());
     }
 
     #[test]

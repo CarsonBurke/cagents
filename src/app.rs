@@ -6382,7 +6382,8 @@ impl Cagents {
             self.worktree_owners.insert(card_id, scope);
         }
         self.register_channel_card(card_id);
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
@@ -6777,6 +6778,7 @@ impl Cagents {
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
         }
+        runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -6797,7 +6799,8 @@ impl Cagents {
             );
             return Task::none();
         }
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(self.workspace_surfaces_visible() && self.card_state(card).is_some_and(|state| state.existence.is_open() && state.exposure == Exposure::Visible));
         self.cards
             .insert(card, CardRuntime::PullRequests(Box::new(pane)));
         self.open_pending_pull_request(card)
@@ -8118,6 +8121,8 @@ impl Cagents {
                     let _ = runtime
                         .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
                 }
+                Some(CardRuntime::Repository(runtime)) => tasks.push(repository_task(runtime.refresh_diff_visibility(transition.id,transition.to == VisibilityClass::Visible && surfaces_visible))),
+                Some(CardRuntime::PullRequests(pane)) => tasks.push(repository_task(pane.runtime.refresh_diff_visibility(transition.id,transition.to == VisibilityClass::Visible && surfaces_visible))),
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
                     let _ = browser
@@ -11104,7 +11109,8 @@ impl Cagents {
         })
     }
 
-    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) -> Task<Message> {
+        let mut tasks = Vec::new();
         let visible_cards = self
             .durable
             .cards
@@ -11123,14 +11129,8 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
-                CardRuntime::Repository(runtime) => {
-                    runtime.set_diff_surface_visible(visible);
-                    Ok(())
-                }
-                CardRuntime::PullRequests(pane) => {
-                    pane.runtime.set_diff_surface_visible(visible);
-                    Ok(())
-                }
+                CardRuntime::Repository(runtime) => { tasks.push(repository_task(runtime.refresh_diff_visibility(*id,visible))); Ok(()) }
+                CardRuntime::PullRequests(pane) => { tasks.push(repository_task(pane.runtime.refresh_diff_visibility(*id,visible))); Ok(()) }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11152,6 +11152,7 @@ impl Cagents {
                 "could not update workspace visibility: {error}"
             )));
         }
+        Task::batch(tasks)
     }
 
     /// The focused card when it is a repository card showing an editable
@@ -11406,11 +11407,10 @@ impl Cagents {
         let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
-        if was_overlay != is_overlay {
-            let visible = self.workspace_surfaces_visible();
-            self.set_workspace_surfaces_visible(visible);
-        }
-        match context_overlay_change(was_overlay, is_overlay) {
+        let visibility = if was_overlay != is_overlay {
+            self.set_workspace_surfaces_visible(self.workspace_surfaces_visible())
+        } else { Task::none() };
+        let focus = match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
             ContextOverlayChange::Exited
                 if !self.context_inspector_open || self.workspace.focused().is_none() =>
@@ -11429,7 +11429,8 @@ impl Cagents {
                 Task::none()
             }
             ContextOverlayChange::Unchanged => Task::none(),
-        }
+        };
+        Task::batch([visibility,focus])
     }
 
     fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
@@ -24725,6 +24726,21 @@ mod tests {
                 Some(crate::settings_widgets::search_id())
             );
             assert_eq!(app.workspace.focused(), Some(pane));
+        }
+    }
+
+    #[test]
+    fn viewport_transitions_hide_and_reveal_diff_work_without_a_repository_action() {
+        use crate::workspace::VisibilityTransition;
+        let (mut app,card) = editing_repository_app();
+        for (from,to,expected) in [
+            (VisibilityClass::Visible,VisibilityClass::Overscan,false),
+            (VisibilityClass::Overscan,VisibilityClass::Offscreen,false),
+            (VisibilityClass::Offscreen,VisibilityClass::Visible,true),
+        ] {
+            drop(app.apply_viewport(ViewportUpdate { offset_changed:false,transitions:vec![VisibilityTransition { id:card,from,to }] },false,false));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("repository fixture") };
+            assert_eq!(runtime.diff_surface_is_visible(),expected);
         }
     }
 
