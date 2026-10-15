@@ -460,6 +460,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
+            let child_captured = shell.is_event_captured();
             if self.modal_keyboard {
                 if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
                     return; // Modifiers still update widgets below the dialog.
@@ -468,7 +469,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 // also update the base observer and publish the chord twice.
                 shell.capture_event();
             }
-            shell.publish(callback(event.clone(), shell.is_event_captured(), region));
+            shell.publish(callback(event.clone(), child_captured, region));
         }
     }
 
@@ -656,6 +657,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
+            let child_captured = shell.is_event_captured();
             if self.modal_keyboard {
                 if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
                     return;
@@ -668,7 +670,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
                 shell.capture_event();
             }
             if shell.is_event_captured() {
-                shell.publish(callback(event.clone(), true, region));
+                shell.publish(callback(event.clone(), if self.modal_keyboard { child_captured } else { true }, region));
             }
         }
     }
