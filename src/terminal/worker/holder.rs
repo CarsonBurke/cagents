@@ -753,6 +753,11 @@ impl Holder {
         if self.protocol < 5 {
             return Err("This terminal holder predates verified descendant cleanup; retain it for upgrade recovery".into());
         }
+        if self.reconcile_cleanup_receipt(deadline)? {
+            self.cleanup_acknowledged = true;
+            self.release_requested = true;
+            return self.finish_cleanup();
+        }
         let attempt = (|| -> Result<(),String> {
         if !self.release_requested {
             let remaining = deadline
@@ -794,18 +799,29 @@ impl Holder {
             // A registered holder may durably publish its exact family proof
             // and retire discovery before the control acknowledgement is lost.
             // Exit alone and anonymous holders never authorize reconciliation.
-            let reconciled = if self.registered {
-                match self.record.as_ref().zip(self.cleanup_source.as_ref()) {
-                    Some((record,source)) if self.pidfd.as_ref()
-                        .is_some_and(|fd|exits_within(fd,Duration::ZERO).unwrap_or(false)) =>
-                        source.confirmed(record).map_err(|reason|format!("{error}; durable cleanup receipt could not be verified: {reason}"))?,
-                    _ => false,
-                }
-            } else {false};
+            let reconciled = self.reconcile_cleanup_receipt(deadline)
+                .map_err(|reason|format!("{error}; durable cleanup receipt could not be verified: {reason}"))?;
             if !reconciled {return Err(error);}
             self.cleanup_acknowledged = true;
             self.release_requested = true;
         }
+        self.finish_cleanup()
+    }
+
+    fn reconcile_cleanup_receipt(&self, deadline: Instant) -> Result<bool,String> {
+        if Instant::now() >= deadline {return Err("Terminal cleanup deadline expired before receipt reconciliation; retry its exact owner".into());}
+        let receipt = if self.registered {
+            match self.record.as_ref().zip(self.cleanup_source.as_ref()) {
+                Some((record,source)) if self.pidfd.as_ref()
+                    .is_some_and(|fd|exits_within(fd,Duration::ZERO).unwrap_or(false)) => source.confirmed(record)?,
+                _ => false,
+            }
+        } else {false};
+        if Instant::now() >= deadline {return Err("Terminal receipt verification exceeded its deadline; retry its exact owner".into());}
+        Ok(receipt)
+    }
+
+    fn finish_cleanup(&mut self) -> Result<(),String> {
         if let Some(process) = self.process.as_mut() {
             process
                 .child
@@ -2596,6 +2612,10 @@ mod tests {
         held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&wrong).unwrap());
         assert!(held.holder.close_until(Instant::now()+Duration::from_secs(1)).is_err(),"root/holder exit plus another issued digest cannot confirm cleanup");
         held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&source).unwrap());
+        // A late/stalled watcher may retain its sender without delivering the
+        // lost ACK. A new retry must inspect the existing receipt first.
+        let (_undelivered,pending)=crossbeam_channel::bounded(1);
+        held.holder.cleanup=Some(pending);
         held.holder.close_until(Instant::now()+Duration::from_secs(1)).unwrap();
         assert!(held.holder.detached);
         assert!(held.holder.cleanup_acknowledged);
