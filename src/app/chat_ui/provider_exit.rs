@@ -835,8 +835,14 @@ mod tests {
     fn assert_no_actions(task: Task<Message>) {
         use iced::futures::{FutureExt as _, StreamExt as _};
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            assert!(stream.next().now_or_never().expect("no deferred work is permitted").is_none(),
-                "the refused or completed handler must emit no runtime effect");
+            assert!(
+                stream
+                    .next()
+                    .now_or_never()
+                    .expect("no deferred work is permitted")
+                    .is_none(),
+                "the refused or completed handler must emit no runtime effect"
+            );
         }
     }
     fn assert_recent_copy_action(task: Task<Message>, expected: Option<&str>) {
@@ -846,14 +852,27 @@ mod tests {
             return;
         };
         let mut stream = iced::runtime::task::into_stream(task).expect("actual clipboard task");
-        match stream.next().now_or_never().expect("recent copy is synchronous") {
-            Some(iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, target })) => {
+        match stream
+            .next()
+            .now_or_never()
+            .expect("recent copy is synchronous")
+        {
+            Some(iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                contents,
+                target,
+            })) => {
                 assert_eq!(contents, expected);
                 assert_eq!(target, iced::advanced::clipboard::Kind::Standard);
             }
             _ => panic!("current recent output must produce its actual clipboard write"),
         }
-        assert!(stream.next().now_or_never().expect("recent copy has no deferred work").is_none());
+        assert!(
+            stream
+                .next()
+                .now_or_never()
+                .expect("recent copy has no deferred work")
+                .is_none()
+        );
     }
     fn wait_capacity(expected: usize) {
         let until = Instant::now() + Duration::from_secs(5);
@@ -1069,8 +1088,10 @@ mod tests {
                 ));
                 app.status = None;
                 let task = app.handle_chat_ui(Action::CopyProviderExitRecent(target));
-                assert_recent_copy_action(task,
-                    (mutation == 0).then_some("Provider exited with status 3\n\nrecent tail"));
+                assert_recent_copy_action(
+                    task,
+                    (mutation == 0).then_some("Provider exited with status 3\n\nrecent tail"),
+                );
                 assert_eq!(app.status.is_some(), mutation == 0);
             }
         }
@@ -1291,7 +1312,9 @@ mod tests {
                 let (old, completion) = held_read(&mut app, target, &old_handle, body, copy);
                 let old_action = if copy {
                     let task = app.handle_chat_ui(Action::ProviderExitLoaded(
-                        target, old.clone(), completion,
+                        target,
+                        old.clone(),
+                        completion,
                     ));
                     prepared_copy(task).await
                 } else {
@@ -1299,17 +1322,17 @@ mod tests {
                 };
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 let replacement = Arc::new(ClientHandle::fixture(
-                    runtime.session.clone(), (*runtime.snapshot).clone(),
+                    runtime.session.clone(),
+                    (*runtime.snapshot).clone(),
                 ));
                 runtime.connection = Connection::Live(replacement.clone());
                 runtime.snapshot = replacement.snapshot();
                 runtime.provider_exit_output = State::default();
-                runtime.provider_exit_output.reconcile(
-                    &runtime.snapshot, Some(Arc::downgrade(&replacement)),
-                );
-                let (new, current_completion) = held_read(
-                    &mut app, target, &replacement, body, false,
-                );
+                runtime
+                    .provider_exit_output
+                    .reconcile(&runtime.snapshot, Some(Arc::downgrade(&replacement)));
+                let (new, current_completion) =
+                    held_read(&mut app, target, &replacement, body, false);
                 assert_eq!(old.id, new.id, "replacement restarts the local counter");
                 assert!(!old.job.same_job(&new.job));
                 let task = app.handle_chat_ui(old_action);
@@ -1319,13 +1342,20 @@ mod tests {
                 assert!(runtime.provider_exit_expanded);
                 assert!(runtime.provider_exit_output.error.is_none());
                 assert!(!new.job.cancelled());
-                let task = app.handle_chat_ui(Action::ProviderExitLoaded(
-                    target, new, current_completion,
-                ));
+                let task =
+                    app.handle_chat_ui(Action::ProviderExitLoaded(target, new, current_completion));
                 assert_no_actions(task);
-                assert_eq!(app.chat_runtime_mut(target).unwrap()
-                    .provider_exit_output.ready.as_ref().unwrap().output.as_str(),
-                    std::str::from_utf8(body).unwrap());
+                assert_eq!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .provider_exit_output
+                        .ready
+                        .as_ref()
+                        .unwrap()
+                        .output
+                        .as_str(),
+                    std::str::from_utf8(body).unwrap()
+                );
                 drop(app);
                 drop(old);
                 wait_capacity(0);

@@ -3685,7 +3685,9 @@ mod tests {
         const STAGE: &str = "CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
         let Some(directory) = std::env::var_os(STAGE) else {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+            use crate::process::{
+                CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+            };
             use std::os::unix::fs::PermissionsExt as _;
             for name in ["home", "config", "data", "cache", "runtime"] {
                 let path = directory.path().join(name);
@@ -3707,11 +3709,20 @@ mod tests {
                 .output_limits(256 * 1024, 64 * 1024);
             // Original Child/pipe ownership is bounded here; the strict outer
             // runner separately settles actual provider/holder descendants.
-            let output = SystemProcessExecutor.execute(&spec, &CancellationToken::new()).unwrap();
+            let output = SystemProcessExecutor
+                .execute(&spec, &CancellationToken::new())
+                .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.success && output.exit_code == Some(0) && output.signal.is_none(),
-                "stdout={stdout} stderr={}", String::from_utf8_lossy(&output.stderr));
-            assert!(stdout.lines().any(|line| line == format!("test {test} ... ok")));
+            assert!(
+                output.success && output.exit_code == Some(0) && output.signal.is_none(),
+                "stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {test} ... ok"))
+            );
             assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
             let general = std::fs::read_to_string(directory.path().join("general.log")).unwrap();
             assert!(
@@ -3986,51 +3997,111 @@ mod tests {
     #[test]
     fn parent_completion_preserves_native_item_and_delegated_statuses() {
         let tool = Arc::new(Item {
-            id: "remote-tool".into(), role: Role::Assistant,
-            started_at: None, at: None,
-            content: ItemContent::Tool { name: "mcp__external__job".into(),
-                input: "work".into(), output: "pending".into(), status: ToolStatus::Running },
+            id: "remote-tool".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "mcp__external__job".into(),
+                input: "work".into(),
+                output: "pending".into(),
+                status: ToolStatus::Running,
+            },
         });
         let mut command = (*tool).clone();
         command.id = "remote-command".into();
-        command.content = ItemContent::Command { label: "Remote command".into(),
-            command: "work".into(), working_directory: "/workspace".into(),
-            action: Default::default(), status: ToolStatus::Running,
-            exit_code: None, duration_ms: None, output: "pending".into() };
+        command.content = ItemContent::Command {
+            label: "Remote command".into(),
+            command: "work".into(),
+            working_directory: "/workspace".into(),
+            action: Default::default(),
+            status: ToolStatus::Running,
+            exit_code: None,
+            duration_ms: None,
+            output: "pending".into(),
+        };
         let mut changes = (*tool).clone();
         changes.id = "remote-change".into();
-        changes.content = ItemContent::Changes { changes: Vec::new(), status: ToolStatus::Running };
+        changes.content = ItemContent::Changes {
+            changes: Vec::new(),
+            status: ToolStatus::Running,
+        };
         let items = vec![tool.clone(), Arc::new(command), Arc::new(changes)];
-        for outcome in [crate::notifications::Kind::Cancelled,
-            crate::notifications::Kind::Failed, crate::notifications::Kind::Succeeded] {
-            let mut state = Snapshot { items: items.clone(), ..Default::default() };
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+            crate::notifications::Kind::Succeeded,
+        ] {
+            let mut state = Snapshot {
+                items: items.clone(),
+                ..Default::default()
+            };
             state.capabilities.interrupt_stops_background = true;
             for background in [false, true] {
-                let child = subagent(&mut state, if background {"background"} else {"foreground"});
+                let child = subagent(
+                    &mut state,
+                    if background {
+                        "background"
+                    } else {
+                        "foreground"
+                    },
+                );
                 child.background = background;
                 child.waiting = true;
                 child.items = vec![tool.clone()];
             }
             let mut indices = BTreeMap::from([(tool.id.clone(), 0)]);
-            apply_event(&mut state, &mut indices, Event::TurnFinished { key: None, outcome });
-            assert!(state.outcome.is_some(), "the parent scalar outcome is retained");
-            apply_event(&mut state, &mut indices, Event::Error { message: "Provider exited".into(), fatal: true });
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::TurnFinished { key: None, outcome },
+            );
+            assert!(
+                state.outcome.is_some(),
+                "the parent scalar outcome is retained"
+            );
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Error {
+                    message: "Provider exited".into(),
+                    fatal: true,
+                },
+            );
             apply_event(&mut state, &mut indices, Event::Exited { code: Some(3) });
             apply_event(&mut state, &mut indices, Event::TurnStarted);
             assert!(state.outcome.is_none());
-            assert_eq!(state.items, items, "parent completion/exit/next turn is not per-item evidence");
+            assert_eq!(
+                state.items, items,
+                "parent completion/exit/next turn is not per-item evidence"
+            );
             for child in &state.subagents {
                 assert_eq!(child.status, ToolStatus::Running);
-                assert!(child.waiting, "parent exit cannot settle an external child's request");
+                assert!(
+                    child.waiting,
+                    "parent exit cannot settle an external child's request"
+                );
                 assert_eq!(child.items[0].content, tool.content);
             }
             let mut completed = (*tool).clone();
-            if let ItemContent::Tool { status, .. } = &mut completed.content { *status = ToolStatus::Succeeded; }
+            if let ItemContent::Tool { status, .. } = &mut completed.content {
+                *status = ToolStatus::Succeeded;
+            }
             apply_event(&mut state, &mut indices, Event::Item(completed.clone()));
-            apply_event(&mut state, &mut indices, Event::SubagentItem { id: "foreground".into(), item: completed });
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::SubagentItem {
+                    id: "foreground".into(),
+                    item: completed,
+                },
+            );
             assert_eq!(state.items[0].content.status(), Some(ToolStatus::Succeeded));
-            assert_eq!(state.subagents[0].items[0].content.status(), Some(ToolStatus::Succeeded),
-                "an actual native child item completion still applies");
+            assert_eq!(
+                state.subagents[0].items[0].content.status(),
+                Some(ToolStatus::Succeeded),
+                "an actual native child item completion still applies"
+            );
         }
     }
 

@@ -1383,7 +1383,9 @@ mod tests {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_STDERR_TEST";
         if std::env::var_os(STAGE).is_none() {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+            use crate::process::{
+                CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+            };
             use std::os::unix::fs::PermissionsExt as _;
             for name in ["home", "config", "data", "cache", "runtime"] {
                 let path = directory.path().join(name);
@@ -1406,11 +1408,20 @@ mod tests {
             // The executor retains the original Child and bounds its pipes and
             // wait. Whole holder/provider-family settlement is the outer test
             // runner's responsibility, not a claim about this leader timeout.
-            let output = SystemProcessExecutor.execute(&spec, &CancellationToken::new()).unwrap();
+            let output = SystemProcessExecutor
+                .execute(&spec, &CancellationToken::new())
+                .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.success && output.exit_code == Some(0) && output.signal.is_none(),
-                "stdout={stdout} stderr={}", String::from_utf8_lossy(&output.stderr));
-            assert!(stdout.lines().any(|line| line == format!("test {test} ... ok")));
+            assert!(
+                output.success && output.exit_code == Some(0) && output.signal.is_none(),
+                "stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {test} ... ok"))
+            );
             assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
             return;
         }

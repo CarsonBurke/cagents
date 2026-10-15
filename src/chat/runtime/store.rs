@@ -1787,55 +1787,155 @@ mod tests {
     #[test]
     fn parent_completion_preserves_canonical_items_and_file_statuses() {
         use crate::chat::{ChangeKind, FileChange, Snapshot, ToolStatus};
-        for outcome in [crate::notifications::Kind::Cancelled,
-            crate::notifications::Kind::Failed, crate::notifications::Kind::Succeeded] {
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+            crate::notifications::Kind::Succeeded,
+        ] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
-            let item = |id: &str, content| Item { id: id.into(), role: Role::Assistant,
-                started_at: None, at: None, content };
-            let tool = item("remote-tool", ItemContent::Tool { name: "mcp__external__job".into(),
-                input: "retained input".repeat(1000), output: "retained output".repeat(1000),
-                status: ToolStatus::Running });
-            let command = item("remote-command", ItemContent::Command { label: "Remote command".into(),
-                command: "work".into(), working_directory: "/workspace".into(),
-                action: Default::default(), status: ToolStatus::Running, exit_code: None,
-                duration_ms: None, output: "retained command".repeat(1000) });
-            let edit = item("remote-edit", ItemContent::Changes { changes: vec![FileChange {
-                path: "tracked.rs".into(), kind: ChangeKind::Updated,
-                diff: "@@ -1 +1 @@\n-old\n+new\n".into() }], status: ToolStatus::Running });
+            let item = |id: &str, content| Item {
+                id: id.into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content,
+            };
+            let tool = item(
+                "remote-tool",
+                ItemContent::Tool {
+                    name: "mcp__external__job".into(),
+                    input: "retained input".repeat(1000),
+                    output: "retained output".repeat(1000),
+                    status: ToolStatus::Running,
+                },
+            );
+            let command = item(
+                "remote-command",
+                ItemContent::Command {
+                    label: "Remote command".into(),
+                    command: "work".into(),
+                    working_directory: "/workspace".into(),
+                    action: Default::default(),
+                    status: ToolStatus::Running,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: "retained command".repeat(1000),
+                },
+            );
+            let edit = item(
+                "remote-edit",
+                ItemContent::Changes {
+                    changes: vec![FileChange {
+                        path: "tracked.rs".into(),
+                        kind: ChangeKind::Updated,
+                        diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                    }],
+                    status: ToolStatus::Running,
+                },
+            );
             let originals = [tool, command, edit.clone()];
-            for item in &originals { store.apply(Event::Item(item.clone())).unwrap(); }
-            store.apply(Event::SubagentItem { id: "delegate".into(), item: edit.clone() }).unwrap();
-            let before: i64 = store.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-            for event in [Event::TurnFinished { key: None, outcome },
-                Event::Error { message: "Provider exited".into(), fatal: true },
-                Event::Exited { code: Some(3) }, Event::TurnStarted] { store.apply(event).unwrap(); }
-            let after: i64 = store.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-            assert_eq!(after, before, "parent failure must not rewrite canonical item/chunk/file rows");
+            for item in &originals {
+                store.apply(Event::Item(item.clone())).unwrap();
+            }
+            store
+                .apply(Event::SubagentItem {
+                    id: "delegate".into(),
+                    item: edit.clone(),
+                })
+                .unwrap();
+            let before: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            for event in [
+                Event::TurnFinished { key: None, outcome },
+                Event::Error {
+                    message: "Provider exited".into(),
+                    fatal: true,
+                },
+                Event::Exited { code: Some(3) },
+                Event::TurnStarted,
+            ] {
+                store.apply(event).unwrap();
+            }
+            let after: i64 = store
+                .db
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "parent failure must not rewrite canonical item/chunk/file rows"
+            );
             let page = store.window().unwrap();
             for original in &originals {
-                assert_eq!(page.items.iter().find(|item| item.id == original.id).unwrap().content,
-                    original.content);
+                assert_eq!(
+                    page.items
+                        .iter()
+                        .find(|item| item.id == original.id)
+                        .unwrap()
+                        .content,
+                    original.content
+                );
             }
             let mut snapshot = Snapshot::default();
             store.publish_files(&mut snapshot).unwrap();
-            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.pending).sum::<u64>(), 2);
+            assert_eq!(
+                snapshot
+                    .file_changes
+                    .files
+                    .iter()
+                    .map(|file| file.pending)
+                    .sum::<u64>(),
+                2
+            );
             for mut item in originals {
                 match &mut item.content {
-                    ItemContent::Tool {status, ..} | ItemContent::Command {status, ..}
-                    | ItemContent::Changes {status, ..} => *status = ToolStatus::Succeeded,
+                    ItemContent::Tool { status, .. }
+                    | ItemContent::Command { status, .. }
+                    | ItemContent::Changes { status, .. } => *status = ToolStatus::Succeeded,
                     _ => unreachable!(),
                 }
                 store.apply(Event::Item(item)).unwrap();
             }
             let mut completed_edit = edit;
-            if let ItemContent::Changes {status, ..} = &mut completed_edit.content { *status = ToolStatus::Succeeded; }
-            store.apply(Event::SubagentItem { id: "delegate".into(), item: completed_edit }).unwrap();
-            assert!(store.window().unwrap().items.iter().all(|item| item.content.status() == Some(ToolStatus::Succeeded)));
+            if let ItemContent::Changes { status, .. } = &mut completed_edit.content {
+                *status = ToolStatus::Succeeded;
+            }
+            store
+                .apply(Event::SubagentItem {
+                    id: "delegate".into(),
+                    item: completed_edit,
+                })
+                .unwrap();
+            assert!(
+                store
+                    .window()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .all(|item| item.content.status() == Some(ToolStatus::Succeeded))
+            );
             store.publish_files(&mut snapshot).unwrap();
-            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.pending).sum::<u64>(), 0);
-            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.succeeded).sum::<u64>(), 2,
-                "real native root/delegated edit completion still updates the canonical Files projection");
+            assert_eq!(
+                snapshot
+                    .file_changes
+                    .files
+                    .iter()
+                    .map(|file| file.pending)
+                    .sum::<u64>(),
+                0
+            );
+            assert_eq!(
+                snapshot
+                    .file_changes
+                    .files
+                    .iter()
+                    .map(|file| file.succeeded)
+                    .sum::<u64>(),
+                2,
+                "real native root/delegated edit completion still updates the canonical Files projection"
+            );
         }
     }
 
