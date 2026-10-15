@@ -6,6 +6,13 @@ pub mod changes;
 
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const SOURCE_BYTES: usize = 32 * 1024 * 1024;
+/// A rewrite revision is valid only within the exact ingestion Store that
+/// issued it. Execed actor replacement must never reuse an older read proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SourceEpoch {
+    pub incarnation: uuid::Uuid,
+    pub revision: u64,
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceKey {
     pub agent_id: Option<String>,
@@ -37,7 +44,7 @@ pub struct SourcePart {
     /// A bounded resident child placeholder represents no original bytes.
     pub replacement: bool,
     /// Changes only when the original source is replaced, never on append.
-    pub epoch: u64,
+    pub epoch: SourceEpoch,
     pub metadata: SourceMetadata,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,14 +52,14 @@ pub struct SourceQuery {
     pub source: SourceKey,
     pub offset: usize,
     pub limit: usize,
-    pub expected_epoch: Option<u64>,
+    pub expected_epoch: Option<SourceEpoch>,
     /// Prefix length from the first page. Appends do not extend this read.
     pub until: Option<usize>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePage {
     pub source: SourceKey,
-    pub epoch: u64,
+    pub epoch: SourceEpoch,
     /// Fixed prefix length for this read, rather than the latest streaming length.
     pub source_len: usize,
     pub offset: usize,
@@ -92,11 +99,12 @@ mod tests {
     #[test]
     fn source_queries_and_typed_replies_round_trip_on_matched_wire() {
         let source=SourceKey{agent_id:Some("child".into()),source_id:"original:native-part:1:text:0-8:0-0".into()};
-        let query=SourceQuery{source:source.clone(),offset:4,limit:PAGE_BYTES,expected_epoch:Some(17),until:Some(8)};
+        let epoch=SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:17};
+        let query=SourceQuery{source:source.clone(),offset:4,limit:PAGE_BYTES,expected_epoch:Some(epoch),until:Some(8)};
         let chat_id=TerminalId::new();
         let request=ClientRequest::ChatCommand{chat_id,command:Command::LoadSource{query}};
         assert_eq!(postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),request);
-        let page=SourcePage{source,epoch:17,source_len:8,offset:4,next_offset:8,text:"text".into(),complete:true,metadata:SourceMetadata{role:crate::chat::Role::Assistant,thinking:false,phase:crate::chat::Phase::Final,at:Some(1),started_at:Some(1)}};
+        let page=SourcePage{source,epoch,source_len:8,offset:4,next_offset:8,text:"text".into(),complete:true,metadata:SourceMetadata{role:crate::chat::Role::Assistant,thinking:false,phase:crate::chat::Phase::Final,at:Some(1),started_at:Some(1)}};
         for result in [Ok(page),Err(SourceError::NotFound),Err(SourceError::Unsupported),Err(SourceError::Changed),Err(SourceError::InvalidRange),Err(SourceError::TooLarge{source_len:SOURCE_BYTES+1,limit:SOURCE_BYTES}),Err(SourceError::Transport("closed".into()))] {
             let reply=ServerResponse::ChatSource{chat_id,result};
             assert_eq!(postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap()).unwrap(),reply);
