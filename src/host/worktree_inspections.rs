@@ -75,14 +75,32 @@ pub(super) struct Inspection {
     expires: Instant,
 }
 impl Inspection {
+    pub(super) fn captured_scope(&self) -> (&Path, &Path) {
+        (&self.physical.repository.path, &self.physical.checkout.path)
+    }
+    fn validate_requested_names(&self) -> Result<(), String> {
+        if self.repository_request.canonicalize().map_err(|_| REFRESH)? != self.physical.repository.path
+            || self.path_request.canonicalize().map_err(|_| REFRESH)? != self.physical.checkout.path {
+            return Err(REFRESH.into());
+        }
+        Ok(())
+    }
     pub(super) fn validate(&self) -> Result<(), String> {
-        if Instant::now() >= self.expires || self.connection.upgrade().is_none() { return Err(REFRESH.into()); }
+        self.validate_with_clock(Instant::now)
+    }
+    fn validate_with_clock(&self, now: impl Fn() -> Instant) -> Result<(), String> {
+        if now() >= self.expires || self.connection.upgrade().is_none() { return Err(REFRESH.into()); }
+        self.validate_requested_names()?;
         self.physical.validate()?;
         let snapshot = RepositoryService::system("git")
             .worktree_safety(&self.physical.checkout.path, &CancellationToken::new())
             .map_err(|error| error.to_string())?;
         if snapshot.fingerprint != self.fingerprint { return Err(REFRESH.into()); }
-        self.physical.validate()
+        self.physical.validate()?;
+        self.validate_requested_names()?;
+        // Slow Git/filesystem inspection cannot extend the original authority.
+        if now() >= self.expires || self.connection.upgrade().is_none() { return Err(REFRESH.into()); }
+        Ok(())
     }
 }
 
@@ -141,7 +159,14 @@ mod tests {
         host
     }
     fn git(path: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") { command.env_remove(key); }
+        }
+        let output = command.arg("-C").arg(path)
+            .args(["-c","core.hooksPath=/dev/null","-c","init.templateDir=","-c","user.name=Fixture","-c","user.email=fixture@example.invalid"])
+            .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
+            .args(args).output().unwrap();
         assert!(output.status.success(), "git {args:?}: {}",String::from_utf8_lossy(&output.stderr));
     }
     fn repository() -> (tempfile::TempDir, PathBuf) {
@@ -222,4 +247,36 @@ mod tests {
         inspect_target(&host,&root);
         assert_eq!(host.lock().unwrap().stop_inspections.len(),PER_CLIENT);
     }
+    #[test]
+    fn original_request_alias_cannot_select_a_sibling_registered_worktree() {
+        use std::os::unix::fs::symlink;
+        let (parent,root)=repository();let host=host();
+        git(&root,&["commit","--quiet","--allow-empty","-m","base"]);
+        let sibling=parent.path().join("sibling");
+        git(&root,&["worktree","add","--quiet","--detach",sibling.to_str().unwrap(),"HEAD"]);
+        let alias=parent.path().join("selected");symlink(&root,&alias).unwrap();
+        let (fingerprint,token)=match request(&host,1,Operation::InspectForSessionStop {repository:root.clone(),path:alias.clone()}).unwrap() {
+            Reply::Inspected {snapshot,stop_authority:Some(token),..} => {
+                let snapshot:crate::repository::WorktreeSafetySnapshot=serde_json::from_str(&snapshot).unwrap();
+                (snapshot.fingerprint,token)
+            }, _ => panic!("original authority required"),
+        };
+        std::fs::remove_file(&alias).unwrap();symlink(&sibling,&alias).unwrap();
+        let operation=Operation::StopSessions {repository:root.clone(),path:alias,consent:SessionStopConsent {sessions:vec![]},expected_fingerprint:fingerprint,stop_authority:token};
+        assert!(request(&host,1,operation).is_err(),"A token must never report or stop B under a changed alias");
+        assert!(root.join(".git").is_dir() && sibling.join(".git").is_file());
+    }
+    #[test]
+    fn expiry_during_actual_git_validation_refuses_at_the_effect_boundary() {
+        let (_parent,root)=repository();let host=host();let (fingerprint,token)=inspect_target(&host,&root);
+        let inspection=take(&host,1,token,&root,&root,&fingerprint).unwrap();
+        let calls=std::cell::Cell::new(0);
+        let before=Instant::now();let after=inspection.expires+Duration::from_nanos(1);
+        assert!(inspection.validate_with_clock(|| {
+            let call=calls.get();calls.set(call+1);
+            if call==0 {before} else {after}
+        }).is_err());
+        assert_eq!(calls.get(),2,"actual validation must recheck expiry after all Git/filesystem reads");
+    }
+
 }

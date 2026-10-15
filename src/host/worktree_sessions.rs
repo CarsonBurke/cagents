@@ -648,7 +648,8 @@ pub(super) fn prepare_inspected_stop(
     let inspection = super::worktree_inspections::take(host, client, token, repository, path, expected_fingerprint)?;
     // No HostLock is held during Git or descriptor/path inspection. The caller
     // retains exclusive operation admission through census and the first fence.
-    let mut pending = prepare_stop_checked(host, repository, path, consent, || inspection.validate())?;
+    let (captured_repository, captured_checkout) = inspection.captured_scope();
+    let mut pending = prepare_stop_checked(host, captured_repository, captured_checkout, consent, || inspection.validate())?;
     pending.inspection = Some(inspection);
     Ok(pending)
 }

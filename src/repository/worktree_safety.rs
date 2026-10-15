@@ -376,7 +376,12 @@ mod tests {
     use super::*;
 
     fn git(root: &Path, arguments: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") { command.env_remove(key); }
+        }
+        let output = command
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
             .arg("-C")
             .arg(root)
             .args([
@@ -387,6 +392,7 @@ mod tests {
             ])
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
