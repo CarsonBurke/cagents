@@ -8,6 +8,13 @@ use std::sync::{Arc,Mutex};
 pub(crate) const SOURCE_BYTES:usize=32*1024*1024;
 pub(crate) const RESIDENT_BYTES:usize=72*1024*1024;
 
+/// Full prose and patch readers share two slots, including their admission
+/// wait. Metadata-only manifest requests do not allocate complete bodies.
+pub(crate) fn readers()->&'static Arc<tokio::sync::Semaphore> {
+    static READERS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+    READERS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(2)))
+}
+
 /// A lease follows the actual immutable item through snapshots, parser caches
 /// and retained trees: weak owners disappear only when the last item owner is
 /// gone. Clearing a State cannot release a still-retained item's accounting.

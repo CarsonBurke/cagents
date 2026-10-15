@@ -302,8 +302,7 @@ fn stream(source:&Source)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Send>
     }))
 }
 async fn load(source:&Source)->Result<Loaded,String> {
-    static WORKERS:std::sync::OnceLock<tokio::sync::Semaphore>=std::sync::OnceLock::new();
-    let _permit=WORKERS.get_or_init(||tokio::sync::Semaphore::new(2)).acquire().await
+    let _permit=chat::source_owners::readers().clone().acquire_owned().await
         .map_err(|_|"Message loading stopped".to_owned())?;
     let reader_capacity=ReaderCapacity::default();
     let loaded=read_counted(&source.key,source.known.as_ref(),|query| {
