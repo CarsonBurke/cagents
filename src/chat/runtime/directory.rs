@@ -150,4 +150,25 @@ mod tests {
         let wrong = DirectoryIdentity::from_metadata(&std::fs::metadata(&replacement).unwrap());
         assert!(prove(&process, &actual, Some(wrong)).unwrap_err().contains("approved directory"));
     }
+
+    #[test]
+    fn adding_a_legacy_owned_directory_pin_preserves_shared_cleanup_authority() {
+        use super::super::super::protocol::{ExecutionContext, LaunchCleanup, LaunchOutcome};
+        struct Cleanup(Arc<std::sync::atomic::AtomicUsize>);
+        impl LaunchCleanup for Cleanup {
+            fn cleanup(&self) -> Result<LaunchOutcome,String> { self.0.fetch_add(1, Ordering::SeqCst); Ok(LaunchOutcome::TeardownProved) }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let context = Arc::new(ExecutionContext::new(None));
+        let other_owner = context.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        context.claim_owner(Arc::new(Cleanup(calls.clone())));
+        let pinned = ExecutionContext::capture(fixture.path()).unwrap();
+        context.pin_owned_directory(pinned.directory.unwrap()).unwrap();
+        assert!(other_owner.directory_identity().unwrap().is_some());
+        assert_eq!(other_owner.reconcile_cleanup().unwrap(), LaunchOutcome::TeardownProved);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let replacement = tempfile::tempdir().unwrap();
+        assert!(context.pin_owned_directory(ExecutionContext::capture(replacement.path()).unwrap().directory.unwrap()).is_err());
+    }
 }
