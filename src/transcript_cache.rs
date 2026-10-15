@@ -15,6 +15,9 @@ use std::{
 };
 
 #[cfg(feature = "host")]
+pub(crate) mod export;
+
+#[cfg(feature = "host")]
 const LEASE: &str = "lease.lock";
 
 #[derive(Debug, Default, serde::Serialize)]
