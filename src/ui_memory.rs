@@ -218,9 +218,13 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Weak};
 
-    struct Probe(Rc<RefCell<Weak<()>>>);
+    struct Probe(Rc<RefCell<Weak<()>>>, Option<cosmic::widget::Id>);
 
     impl Widget<(), Theme, Renderer> for Probe {
+        fn id(&self) -> Option<cosmic::widget::Id> {
+            self.1.clone()
+        }
+
         fn tag(&self) -> tree::Tag {
             tree::Tag::of::<Arc<()>>()
         }
@@ -256,8 +260,8 @@ mod tests {
     fn parking_drops_only_disposable_state_and_remount_rebuilds_it() {
         let presentation = Rc::new(RefCell::new(Weak::new()));
         let composer = Rc::new(RefCell::new(Weak::new()));
-        let mut gated = gate(Element::new(Probe(presentation.clone())));
-        let input = Element::new(Probe(composer.clone()));
+        let mut gated = gate(Element::new(Probe(presentation.clone(), None)));
+        let input = Element::new(Probe(composer.clone(), None));
         let mut root = Tree::empty();
         root.children = vec![Tree::new(&gated), Tree::new(&input)];
         let old_presentation = presentation.borrow().clone();
@@ -283,25 +287,25 @@ mod tests {
         let composer = Rc::new(RefCell::new(Weak::new()));
         let make = |scope| {
             scoped_gate(
-                cosmic::widget::container(Element::new(Probe(presentation.clone())))
-                    .id(cosmic::widget::Id::new("scope.transcript.reader")),
+                Element::new(Probe(presentation.clone(), Some(cosmic::widget::Id::new("scope.transcript.reader")))),
                 scope,
             )
         };
         let mut gate = make(7);
-        let input: Element<'_, ()> = cosmic::widget::container(Element::new(Probe(composer)))
-            .id(cosmic::widget::Id::new("scope.composer"))
-            .into();
+        let input = Element::new(Probe(composer.clone(), Some(cosmic::widget::Id::new("scope.composer"))));
         let mut root = Tree::empty();
         root.children = vec![Tree::new(&gate), Tree::new(&input)];
         let old_reader = presentation.borrow().clone();
-        let old_composer = root.children[1].children[0]
-            .state
-            .downcast_ref::<Arc<()>>()
-            .clone();
-        let weak_composer = Arc::downgrade(&old_composer);
-        drop(old_composer);
+        let weak_composer = composer.borrow().clone();
+        assert!(old_reader.upgrade().is_some() && weak_composer.upgrade().is_some());
+        // Container delegates its Tree shape to its content. Give the actual
+        // Probe nodes named IDs rather than assuming an extra container child.
+        assert_eq!(root.children[0].children[0].id, Some(cosmic::widget::Id::new("scope.transcript.reader")));
+        assert_eq!(root.children[1].id, Some(cosmic::widget::Id::new("scope.composer")));
         tree::NAMED.with(|named| *named.borrow_mut() = root.take_all_named());
+        assert_eq!(tree::NAMED.with(|named| named.borrow().len()), 2);
+        assert!(matches!(root.children[0].children[0].state, tree::State::None));
+        assert!(matches!(root.children[1].state, tree::State::None));
         root.children[0].diff(&mut gate);
         cosmic::iced::runtime::user_interface::restore_cached_named_states(&mut root);
         assert!(
