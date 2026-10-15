@@ -3554,6 +3554,7 @@ mod tests {
     };
     use serde_json::{Value, json};
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn native_account_admission_uses_the_pinned_operational_directory_before_provider_start() {
         const CHILD: &str = "CAGENTS_NATIVE_ACCOUNT_ADMISSION_FIXTURE";
