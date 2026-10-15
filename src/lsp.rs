@@ -7641,6 +7641,7 @@ mod tests {
                 1,
                 Arc::new(Snapshot::from_native(1, native_source("a😀\nnext\n"))),
                 worktree.clone(),
+                Arc::default(),
             );
             await_ready(&events, doc).await;
             let source = native_source("a😀x\nnext\n");
@@ -7695,6 +7696,7 @@ mod tests {
                 1,
                 Arc::new(Snapshot::from_native(1, native_source("a"))),
                 worktree.clone(),
+                Arc::default(),
             );
             await_ready(&events, doc).await;
             let mut sources = Vec::new();
