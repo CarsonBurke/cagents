@@ -90,8 +90,7 @@ impl Cagents {
             let after = self.finish_worktree_selection(intent);
             return Task::batch([scope, after, self.resolve_worktree_owner_paths()]);
         }
-        let epoch = self.worktree_owner_paths.watch.epoch();
-        self.worktree_owner_paths.invalidate_watched();
+        let epoch = self.worktree_owner_paths.invalidate_watched();
         self.refresh_worktree_owners(Some(&path));
         let generation = self.worktree_selection.generation;
         self.worktree_selection.pending = true;
@@ -227,6 +226,31 @@ mod tests {
         drop(app.worktree_selection_prepared(generation,create,receipt));
         assert_eq!(app.active_workspace.as_deref(),Some(Path::new("/newer")));
         assert_eq!(app.durable.cards.len(),before);
+    }
+
+    #[test]
+    fn failed_watch_does_not_invalidate_every_prepared_selection_receipt() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.worktree_owner_paths.watch.force_unavailable_for_test();
+        let fixture = tempfile::tempdir().unwrap();
+        for index in 0..2 {
+            let path = fixture.path().join(format!("selection-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            app.refresh_worktree_owners(Some(&path));
+            app.worktree_selection.cancel();
+            app.worktree_selection.pending = true;
+            let generation = app.worktree_selection.generation;
+            let epoch = app.worktree_owner_paths.invalidate_watched();
+            let monitor = app.worktree_owner_paths.watch.clone();
+            let task = app.prepare_worktree_selection(generation,path.clone(),false,Intent::Navigate,epoch,move |path| {
+                prepare_target(path,Vec::new(),None,&monitor,|path|path.canonicalize(), |_|Ok(None))
+            });
+            let Message::WorktreeSelectionPrepared {generation,create,receipt} = crate::app::tests::task_app_message(task) else {panic!("unexpected selection result")};
+            drop(app.worktree_selection_prepared(generation,create,receipt));
+            assert_eq!(app.worktree_selection.generation,generation,"failed watch restarted a completed preparation");
+            assert!(!app.worktree_selection.pending);
+            assert_eq!(app.active_workspace.as_deref(),Some(path.as_path()));
+        }
     }
 
     #[cfg(unix)]

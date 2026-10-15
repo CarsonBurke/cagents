@@ -12,6 +12,8 @@ struct Registration {
 
 pub(super) struct Monitor {
     registration: Mutex<Registration>,
+    #[cfg(test)]
+    unavailable: AtomicBool,
     observed: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     dirty: Arc<Mutex<HashSet<PathBuf>>>,
     epoch: Arc<AtomicU64>,
@@ -26,6 +28,8 @@ impl Default for Monitor {
         let (sender, receiver) = async_channel::bounded(1);
         Self {
             registration: Mutex::new(Registration::default()),
+            #[cfg(test)]
+            unavailable: AtomicBool::new(false),
             observed: Arc::new(Mutex::new(HashMap::new())),
             dirty: Arc::new(Mutex::new(HashSet::new())),
             epoch: Arc::new(AtomicU64::new(0)),
@@ -39,6 +43,12 @@ impl Default for Monitor {
 impl Monitor {
     /// Updated by the notify callback before any queued UI invalidation.
     pub(super) fn epoch(&self) -> u64 { self.epoch.load(Ordering::Acquire) }
+
+    #[cfg(test)]
+    pub(super) fn force_unavailable_for_test(&self) {
+        self.unavailable.store(true, Ordering::Release);
+        self.failed.store(true, Ordering::Release);
+    }
 
     /// Called only inside the existing blocking canonicalization task.
     pub(super) fn register(&self, results: &[(PathBuf, PathBuf)]) {
@@ -60,6 +70,11 @@ impl Monitor {
                 return;
             }
         }
+        #[cfg(test)]
+        if self.unavailable.load(Ordering::Acquire) {
+            self.failed.store(true, Ordering::Release);
+            return;
+        }
         if registration.watcher.is_none() {
             let observed = self.observed.clone();
             let dirty = self.dirty.clone();
@@ -79,8 +94,10 @@ impl Monitor {
                     }
                 };
                 if !changed.is_empty() {
+                    let mut pending = dirty.lock().unwrap_or_else(|error| error.into_inner());
+                    pending.extend(changed);
                     epoch.fetch_add(1, Ordering::AcqRel);
-                    dirty.lock().unwrap_or_else(|error| error.into_inner()).extend(changed);
+                    drop(pending);
                     let _ = sender.try_send(());
                 }
             }).ok();
@@ -133,9 +150,10 @@ impl Monitor {
     pub(super) fn invalidate_failed(&self) {
         if !self.failed.load(Ordering::Acquire) { return; }
         self.broken.store(true, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
         let observed = self.observed.lock().unwrap_or_else(|error| error.into_inner());
-        self.dirty.lock().unwrap_or_else(|error| error.into_inner()).extend(observed.keys().cloned());
+        let mut pending = self.dirty.lock().unwrap_or_else(|error| error.into_inner());
+        pending.extend(observed.keys().cloned());
+        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(super) fn subscription(&self, focused: bool) -> Subscription<Message> {

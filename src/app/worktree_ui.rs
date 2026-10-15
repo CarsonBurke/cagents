@@ -71,14 +71,29 @@ impl OwnerPaths {
         self.active = active;
     }
 
-    pub(super) fn invalidate_watched(&mut self) {
+    pub(super) fn invalidate_watched(&mut self) -> u64 {
         self.watch.invalidate_failed();
-        for path in self.watch.take_invalidated() {
-            if !self.active.contains(&path) { continue; }
-            self.cached.remove(&path);
-            if self.inflight.contains(&path) { self.invalidated.insert(path); }
-            else { self.queued.insert(path); }
+        // Take a coherent cache/epoch snapshot even when notify races this
+        // UI message. Dirty insertion and epoch publication share one mutex.
+        for _ in 0..3 {
+            let before = self.watch.epoch();
+            for path in self.watch.take_invalidated() {
+                if !self.active.contains(&path) { continue; }
+                self.cached.remove(&path);
+                if self.inflight.contains(&path) { self.invalidated.insert(path); }
+                else { self.queued.insert(path); }
+            }
+            let after = self.watch.epoch();
+            if before == after { return after; }
         }
+        // A constantly changing filesystem must not spin on the UI thread.
+        // Start uncached work instead; its receipt still fences later changes.
+        self.cached.clear();
+        for path in &self.active {
+            if self.inflight.contains(path) { self.invalidated.insert(path.clone()); }
+            else { self.queued.insert(path.clone()); }
+        }
+        self.watch.epoch()
     }
 
     pub(super) fn subscription(&self, focused: bool) -> Subscription<Message> {
