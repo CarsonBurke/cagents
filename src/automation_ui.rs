@@ -3625,6 +3625,30 @@ mod tests {
         state.update(Action::New);
         assert!(state.draft.as_ref().unwrap().accounts.is_empty());
     }
+
+    #[test]
+    fn editing_visibility_preserves_a_saved_terminal_surface() {
+        let mut existing = automation();
+        existing.definition.agent.surface = Surface::Terminal;
+        let account = AccountChoice {
+            label: "Fixture account".into(),
+            id: existing.definition.agent.account.clone().unwrap(),
+            provider: existing.definition.agent.provider,
+        };
+        let target = TargetChoice {
+            label: "Fixture target".into(),
+            target: existing.definition.agent.target.clone(),
+            defaults: BTreeMap::new(),
+        };
+        let mut draft = Draft::new(&[target], &[account], Some(&existing));
+        draft.headless = true;
+        let definition = draft.definition(&Models::new()).unwrap();
+        assert_eq!(definition.agent.surface, Surface::Terminal);
+        assert_eq!(
+            definition.visibility,
+            crate::automations::Visibility::Headless
+        );
+    }
 }
 fn history_state(firing: &Firing) -> String {
     if let Some(interval) = &firing.missed_interval {
@@ -3658,28 +3682,5 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
         Skipped => "Skipped",
         Cancelled => "Cancelled",
         Interrupted => "Outcome uncertain",
-    }
-    #[test]
-    fn editing_visibility_preserves_a_saved_terminal_surface() {
-        let mut existing = automation();
-        existing.definition.agent.surface = Surface::Terminal;
-        let account = AccountChoice {
-            label: "Fixture account".into(),
-            id: existing.definition.agent.account.clone().unwrap(),
-            provider: existing.definition.agent.provider,
-        };
-        let target = TargetChoice {
-            label: "Fixture target".into(),
-            target: existing.definition.agent.target.clone(),
-            defaults: BTreeMap::new(),
-        };
-        let mut draft = Draft::new(&[target], &[account], Some(&existing));
-        draft.headless = true;
-        let definition = draft.definition(&Models::new()).unwrap();
-        assert_eq!(definition.agent.surface, Surface::Terminal);
-        assert_eq!(
-            definition.visibility,
-            crate::automations::Visibility::Headless
-        );
     }
 }

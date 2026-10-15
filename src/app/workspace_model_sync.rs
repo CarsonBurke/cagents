@@ -1679,6 +1679,8 @@ mod tests {
                     timezone: "UTC".into(),
                 },
                 session_mode: SessionMode::Reuse,
+                visibility: Default::default(),
+                catch_up: Default::default(),
                 precheck: None,
             },
             firing: Firing {
@@ -1698,6 +1700,8 @@ mod tests {
                 agent: Some(automated.id),
                 run: None,
                 skip: None,
+                skipped_occurrences: None,
+                missed_interval: None,
                 diagnostic: None,
             },
             agent: Some(automated),
