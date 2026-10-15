@@ -1872,7 +1872,15 @@ finally:
         ));
         let confirmed_peer = handle.provider_process().expect("positively holder-authenticated WebSocket peer");
         assert!(confirmed_peer.is_current());
-        let binding = fixture.capture().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        let binding=loop {match fixture.capture() {
+            Ok(binding)=>break binding,
+            Err(error) if error.message.contains("metadata is busy")=> {
+                assert!(Instant::now()<deadline,"confirmed peer metadata did not settle: {error:?}");
+                thread::sleep(Duration::from_millis(2));
+            },
+            Err(error)=>panic!("confirmed owned peer did not authorize its exact binding: {error:?}"),
+        }};
         assert!(fixture.validates(&binding));
         handle
             .command(chat::Command::SetModel {
