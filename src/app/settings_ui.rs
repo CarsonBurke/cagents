@@ -1525,16 +1525,19 @@ mod keyboard_table_tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.settings_draft.keyboard_shortcuts.rename_pane = "Ctrl+Shift+1".into();
         app.settings_draft.keyboard_shortcuts.chat_model = "Ctrl+Shift+!".into();
-        let press = |value: &str, code, modifiers| keyboard::Event::KeyPressed {
+        let press = |value: &str, modified: &str, code, modifiers| keyboard::Event::KeyPressed {
             key: keyboard::Key::Character(value.into()),
-            modified_key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(modified.into()),
             physical_key: keyboard::key::Physical::Code(code),
             location: keyboard::Location::Standard,
             modifiers,
             text: None,
             repeat: false,
         };
+        // Native iced-winit events carry key_without_modifiers separately
+        // from the logical key after Shift.
         let shifted = press(
+            "1",
             "!",
             keyboard::key::Code::Digit1,
             keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
@@ -1591,6 +1594,7 @@ mod keyboard_table_tests {
         drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&press(
             "1",
+            "1",
             keyboard::key::Code::Numpad1,
             keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
         )));
@@ -1606,6 +1610,7 @@ mod keyboard_table_tests {
         );
         drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&press(
+            "à",
             "à",
             keyboard::key::Code::Digit0,
             keyboard::Modifiers::CTRL,
