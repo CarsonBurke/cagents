@@ -43,7 +43,7 @@ palette.
 
 The file uses schema version 3. `schema_version` identifies the format; all
 other missing keys take their defaults. Unknown keys are
-ignored and preserved on save. Values this build cannot read use their default
+ignored and preserved on save. At startup, values this build cannot read use their default
 with a warning and remain in the file until that setting is changed.
 Unsupported schema versions and malformed TOML are
 errors. A file that fails to load is reported when the
@@ -51,11 +51,22 @@ app starts. That session then runs on defaults and does not write the file, so
 your file is not overwritten. To replace a broken file from the app, use
 **Reset all settings**.
 
-Each window reads the file when it opens. A save re-reads the file and writes
-only the fields that window changed since its last save, so several windows can
-share the file and edits you make by hand while the app runs are kept. Running
-windows do not pick up hand edits; windows opened afterwards do. If a hand edit
-leaves the file invalid, saves from running windows fail until it is fixed.
+Use **Open settings.toml** or **Reveal settings.toml** in the command palette
+or **Settings > General**. Opening creates a file with the current values if
+one does not exist, including commented defaults for reference. Missing values
+always use the documented defaults.
+
+Every window watches the settings directory, including atomic file replacements.
+After a short quiet interval, valid hand edits and saves from other windows apply
+without restarting. Invalid TOML or invalid known values leave the last working
+settings active and show a persistent notice with **Open file** and error details.
+Unknown keys remain preserved. A save re-reads the file and merges only the fields
+that window changed, preserving other windows' preferences.
+
+**Reset all settings** and **Reset category** first write a private, timestamped
+`settings.toml.bak-<timestamp>-<suffix>` alongside the file. **Undo reset** restores
+the original bytes, including comments and hand-written tables. Backups remain on
+disk for recovery after closing the window. Conversations and panes are preserved.
 
 ### Example
 
@@ -95,7 +106,7 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 5
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -106,7 +117,8 @@ chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+W"]
-search_projects = ["Ctrl+F"]
+search_projects = ["Ctrl+Shift+F"]
+find_in_pane = ["Ctrl+F"]
 previous_column = ["Ctrl+PageUp"]
 next_column = ["Ctrl+PageDown"]
 cycle_pane_width = ["Alt+R"]
@@ -174,7 +186,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `5` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -182,6 +194,18 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `notifications.waiting` | boolean | `true` | Alerts when a supported provider needs attention |
 | `notifications.while_focused` | boolean | `false` | Also alerts for the focused pane in a focused window |
 | `notifications.review_requests` | boolean | `true` | Alerts for incoming GitHub review requests |
+| `custom_terminal_theme` | table | unset | Custom terminal color palette, selectable live as Custom. |
+| `auto_delete_merged_worktrees` | boolean | `false` | Clean up clean, inactive merged worktrees automatically; never discard changes or stop running work. |
+| `default_worktree_pane` | string | `"native_chat"` | `"native_chat"` or `"terminal"`; the first pane in an empty worktree. |
+| `default_channel_pane` | string | `"native_chat"` | `"native_chat"` or `"terminal"`; the first pane in an empty channel. |
+| `diff_hide_unchanged` | boolean | `true` | Hide unchanged lines in diff views. |
+| `chat_expand_tool_groups` | boolean | `false` | Start chat tool groups expanded. |
+| `chat_content_fraction` | float | `0.5` | Fraction of pane width used for chat content. |
+| `default_native_pane_fraction` | float | `0.5` | Initial width fraction of native chat and utility panes. |
+| `usage_preview_rows` | table | `{}` | Provider keys map to usage rows; an empty list hides that provider’s preview rows. |
+| `show_worktree_changes_icons` | boolean | `true` | Show dirty-worktree badges in Projects. |
+| `keyboard_shortcuts` | table | built-in chords | Action keys map to chord arrays. See Keyboard shortcuts. |
+| `notifications` | table | enabled | Notification event preferences. See the example above. |
 
 ## Keyboard shortcuts
 
@@ -202,9 +226,9 @@ modifiers, joined by `+`. Names are case-insensitive.
   with a letter or arrow, can be bound but then no longer reach a terminal.
   The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
   pane width, and **Ctrl+T** to create a native thread tab.
-- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
-  which opens terminal scrollback find. The same key finds in the focused
-  editor or chat transcript, and otherwise searches projects.
+- `search_projects` defaults to **Ctrl+Shift+F**. `find_in_pane` defaults to
+  **Ctrl+F**, opening find in the focused terminal, editor, or chat transcript.
+  In a pane without find, Ctrl+F searches projects.
   File and hunk navigation also works in local diff panes. Viewed-file commands
   act only in a pull request pane. The chords reach terminals outside that scope.
 - `chat_account`, `chat_model`, and `chat_permissions` apply only to the
@@ -231,7 +255,7 @@ There are 25 dark and light terminal presets. The values are `"dark"`,
 To make your own palette:
 
 1. Add a `[custom_terminal_theme]` table after the top-level keys.
-2. Restart the app.
+2. Save the file. Every open window reloads the palette automatically.
 3. Choose **Custom** in the terminal color theme dropdown.
 
 cagents keeps this table when you switch to a preset. On load, this table
@@ -343,6 +367,8 @@ them back as version 3 the next time it saves.
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
   | `new_native_thread` | `Ctrl+Shift+N` | `Ctrl+T`, `Ctrl+Shift+N` |
+  | `search_projects` | `Ctrl+F` (revisions 1–4) | `Ctrl+Shift+F` |
+  | `find_in_pane` | absent before revision 5 | `Ctrl+F` |
 
   An action the table leaves out counts as on its old default. A version-2
   file that spells `previous_column` as `"Alt+Q"` or `next_column` as
@@ -350,7 +376,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 5`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
