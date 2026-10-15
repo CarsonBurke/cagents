@@ -413,7 +413,6 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
-            | ClientRequest::CloseTerminalSourceChecked { .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -1270,9 +1269,10 @@ pub(super) fn process_admitted(host: &SharedHost, client_id: ClientId, request: 
     }
 }
 
-/// process_request holds exclusive control admission. Retain both exact owners
+/// process_request holds shared control admission. Retain both exact owners
 /// under HostState, perform bounded teardown outside it, then retire only the
-/// retained worker. Even an identical recipe under a reused ID is insufficient.
+/// retained worker. A concurrent successor with the same durable ID remains
+/// untouched, while unrelated input may proceed and upgrade writers wait.
 fn close_terminal_source_checked(
     host: &SharedHost,
     client_id: ClientId,
@@ -1855,6 +1855,15 @@ mod tests {
 
     #[test]
     fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        check_slow_close_admission(false);
+    }
+
+    #[test]
+    fn slow_source_checked_close_allows_reads_but_fences_upgrade_and_shutdown() {
+        check_slow_close_admission(true);
+    }
+
+    fn check_slow_close_admission(source_checked: bool) {
         use crate::{
             agent::Provider,
             chat::{
@@ -1920,27 +1929,47 @@ mod tests {
         )
         .unwrap();
         let chat_id = TerminalId::new();
+        let terminal = if source_checked {
+            let mut launch = recipe.clone(); launch.program = "/bin/true".into();
+            let session = crate::model::TerminalSession {
+                id: chat_id, launch: launch.clone(), owned_codex_listener: None,
+                recovery_origin: None, predecessor: None, transcript_path: None, resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable { recipe: launch, last_exit: None },
+            };
+            let worker = crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_completed() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Some((session, worker))
+        } else { None };
+        let mut close_source = None;
         let capability = {
             let mut state = host.lock().unwrap();
             state.register_client(1);
             state.register_client(2);
+            if let Some((session, worker)) = &terminal {
+                state.reserve_spawn(session.id).unwrap();
+                close_source = Some(state.finish_spawn(1, session.clone(), worker.clone(), false).unwrap());
+            }
             state.chats.insert(
                 chat_id,
                 super::super::chat::Record {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
-                    paired_terminal: None,
+                    paired_terminal: terminal.as_ref().map(|(_, worker)| worker.clone()),
                     session: chat::Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
-                            provider: Provider::Claude,
+                            provider: if source_checked { Provider::Codex } else { Provider::Claude },
                             recipe,
                             session_id: None,
                         },
                         proof: Some(proof),
-                        terminal: None,
+                        terminal: terminal.as_ref().map(|(session, _)| session.clone()),
                     },
                     handle: handle.clone(),
                     source_process: None,
@@ -1957,7 +1986,13 @@ mod tests {
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
         let close_host = Arc::clone(&host);
         let close = thread::spawn(move || {
-            process_request(&close_host, 1, ClientRequest::ChatClose { chat_id })
+            let request = match close_source {
+                Some(source) => ClientRequest::CloseTerminalSourceChecked {
+                    source: source.session, execution_instance: source.execution_instance, allow_active: true,
+                },
+                None => ClientRequest::ChatClose { chat_id },
+            };
+            process_request(&close_host, 1, request)
         });
         let gate = control_gate(&host);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2010,10 +2045,15 @@ mod tests {
         ));
         release.send(()).unwrap();
         let _ = command.join().unwrap();
-        assert!(matches!(
-            close.join().unwrap().unwrap().0,
-            ServerResponse::ChatClosed { chat_id: id, .. } if id == chat_id
-        ));
+        let closed = close.join().unwrap().unwrap().0;
+        if source_checked {
+            assert!(matches!(closed, ServerResponse::TerminalCloseChecked {
+                terminal_id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+            } if terminal_id == chat_id));
+            assert!(!host.lock().unwrap().terminals.contains_key(&chat_id));
+        } else {
+            assert!(matches!(closed, ServerResponse::ChatClosed { chat_id: id, .. } if id == chat_id));
+        }
         let error = upgrading
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
