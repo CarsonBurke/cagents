@@ -40,6 +40,9 @@ pub struct AdmissionTicket { id: AdmissionId, state: Arc<Mutex<State>> }
 /// Request retirement and keep the window/process alive until is_settled().
 #[derive(Debug, Default)]
 pub struct EditedRootAdmissions { entries: HashMap<AdmissionId, AdmissionTicket> }
+/// App/Ceditor retain this original window owner. Each Runtime gets the SAME
+/// Arc so internal file loads can reserve before constructing their first task.
+pub type SharedEditedRootAdmissions = Arc<Mutex<EditedRootAdmissions>>;
 
 #[derive(Debug, Clone)]
 pub struct AdmissionFailure { message: String, ticket: AdmissionTicket }
@@ -160,7 +163,8 @@ impl AdmissionTicket {
     }
 
     /// A physical Root check still belongs to a worker. This pure getter only
-    /// exposes the one successfully enrolled original lease while not retiring.
+    /// exposes the successfully enrolled original lease until the last actual
+    /// Source/Doc/Undo owner drains and sealed retirement takes custody.
     pub fn admitted(&self) -> Option<AdmittedRoot> {
         let state = self.lock();
         // A retirement request cannot erase the negative lease while actual
@@ -369,4 +373,122 @@ mod tests {
         custody.collect_settled();
         assert!(custody.is_empty());
     }
+
+    #[cfg(target_os = "linux")]
+    fn private_catalog_client() -> (tempfile::TempDir, crate::recovery_domain::RecoveryPlacementClient, std::thread::JoinHandle<()>) {
+        use crate::terminal_ipc::{read_frame, write_frame, ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use crate::model::{BootId, HostSessionId, HostIncarnation, HostSessionProof};
+        use crate::recovery_domain::{LocalRecoveryEndpoint, Operation, Reply, RecoveryPlacementClient};
+        use std::{io, os::unix::{fs::PermissionsExt, net::UnixListener}, thread, time::Duration};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("private-admission.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "owned private client did not connect");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("private accept: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let proof = HostSessionProof { boot_id: BootId::new("fixture-boot"), host_session_id: HostSessionId::new("fixture-session"), host_incarnation: HostIncarnation::new("fixture-incarnation") };
+            let hello: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(hello.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } } }).unwrap();
+            let catalog: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(catalog.request, ClientRequest::RecoveryPlacement { operation: Operation::Catalog }));
+            write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(catalog.request_id), proof, message: ServerMessage::Response { response: ServerResponse::RecoveryPlacement { reply: Reply::Catalog { registry, projects: vec![] } } } }).unwrap();
+            // These contracts exercise NO-RPC ownership preparation/retirement.
+            // Any unexpected Prepare/Release fails rather than being ignored.
+            assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
+        });
+        let endpoint = LocalRecoveryEndpoint::fixture(socket, Some(registry)).unwrap();
+        let client = RecoveryPlacementClient::connect_local_until(endpoint, Instant::now() + Duration::from_secs(2)).unwrap();
+        (directory, client, server)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_phase_one_delivery_keeps_actual_original_owner_and_retirement_custody() {
+        use crate::fs_safety::Root;
+        use std::time::Duration;
+        let (_runtime, client, server) = private_catalog_client();
+        let files = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(files.path()).unwrap());
+        let original = Arc::downgrade(&root);
+        let mut custody = EditedRootAdmissions::default();
+        let ticket = custody.reserve().unwrap();
+        let preparation = ticket.begin_preparation().unwrap();
+        let owner = client.prepare_edited_root_owner(root).unwrap();
+        let lost_message = preparation.prepared(owner);
+        drop(lost_message);
+        assert!(original.upgrade().is_some(), "original charged Root must survive message loss");
+        assert_eq!(ticket.phase(), AdmissionPhase::Prepared);
+        ticket.request_retirement();
+        let work = custody.next_retirement().unwrap().unwrap();
+        assert!(original.upgrade().is_some(), "sealed receipt retained BEFORE cleanup starts");
+        drop(work); // lost task/producer: Drop is memory-only and cannot release.
+        assert_eq!(ticket.phase(), AdmissionPhase::Interrupted);
+        assert!(original.upgrade().is_some());
+        assert!(custody.next_retirement().unwrap().is_none(), "uncertain cleanup is not automatically replayed");
+        ticket.retry_retirement();
+        custody.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(original.upgrade().is_none(), "positive effect-free settlement drops original Root");
+        assert!(custody.is_settled());
+        custody.collect_settled();
+        assert!(custody.is_empty());
+        drop(client); server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_passive_lease_owners_delay_retirement_but_status_tickets_do_not() {
+        use crate::fs_safety::Root;
+        use std::time::Duration;
+        let (_runtime, client, server) = private_catalog_client();
+        let files = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(files.path()).unwrap());
+        let mut custody = EditedRootAdmissions::default();
+        let ticket = custody.reserve().unwrap();
+        let prepared = client.prepare_edited_root_owner(root).unwrap();
+        let passive_original = prepared.clone();
+        ticket.begin_preparation().unwrap().prepared(prepared);
+        let diagnostic = ticket.clone();
+        ticket.request_retirement();
+        assert!(custody.next_retirement().unwrap().is_none(), "actual original Arc owner cannot be sealed early");
+        drop(passive_original);
+        custody.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(diagnostic.phase(), AdmissionPhase::Settled, "diagnostic ticket is not an Editable owner");
+        drop(client); server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_during_actual_phase_one_retains_late_owner_without_enrolling_it() {
+        use crate::fs_safety::Root;
+        use std::time::Duration;
+        let (_runtime, client, server) = private_catalog_client();
+        let files = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(files.path()).unwrap());
+        let mut custody = EditedRootAdmissions::default();
+        let ticket = custody.reserve().unwrap();
+        let work = ticket.begin_preparation().unwrap();
+        custody.request_all_retirements();
+        assert!(custody.next_retirement().unwrap().is_none());
+        let late = work.prepared(client.prepare_edited_root_owner(root).unwrap());
+        assert!(late.begin_enrollment().is_err(), "closed original source cannot publish a new editable actor");
+        custody.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(custody.is_settled());
+        drop(client); server.join().unwrap();
+    }
+
 }
