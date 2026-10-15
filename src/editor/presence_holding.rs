@@ -49,12 +49,15 @@ impl AuthenticatedLeaf {
     }
 }
 
+struct OwnedTemporary { file: File, name: OsString }
+
 pub(super) struct PresenceHolding {
     publication: fs_safety::DirectoryPublication,
     parent: Root,
     name: OsString,
     original: Option<AuthenticatedLeaf>,
     pre_acquire_source: Option<File>,
+    temporary: Option<OwnedTemporary>,
     pub(super) restore_original: bool,
     slot: Option<RecoverySlot>,
 }
@@ -71,7 +74,7 @@ impl PresenceHolding {
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor staging name already exists and was preserved.".into())),
             fs_safety::DirectoryCreation::Unverified { reason, .. } => return Err(FileIoError::Io(format!("Editor staging ownership could not be verified; the entry was preserved: {reason}"))),
         };
-        let holding = Self { publication, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, restore_original: false, slot: Some(slot) };
+        let holding = Self { publication, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
         let prepared = (|| {
             if let Some(error) = holding.publication.publication_error() { return Err(FileIoError::Io(error.into())); }
             fs_safety::set_directory_permissions(holding.directory(), 0o700).map_err(io_error)?;
@@ -83,6 +86,36 @@ impl PresenceHolding {
         match prepared { Ok(()) => Ok(holding), Err(error) => Err(holding.finish_error(error)) }
     }
     pub(super) fn directory(&self) -> &Root { self.publication.directory() }
+    pub(super) fn create_temporary(&mut self) -> Result<(), FileIoError> {
+        if self.temporary.is_some() { return Err(FileIoError::Io("An editor temporary file is already retained.".into())); }
+        let (file, name) = fs_safety::create_temporary_in(self.directory(), 0o600).map_err(resolve_error)?;
+        self.temporary = Some(OwnedTemporary { file, name });
+        Ok(())
+    }
+    pub(super) fn temporary(&self) -> &File { &self.temporary.as_ref().expect("temporary created").file }
+    pub(super) fn temporary_mut(&mut self) -> &mut File { &mut self.temporary.as_mut().expect("temporary created").file }
+    pub(super) fn temporary_name(&self) -> &std::ffi::OsStr { &self.temporary.as_ref().expect("temporary created").name }
+    fn verify_temporary(&self) -> Result<(), FileIoError> {
+        let Some(temporary) = &self.temporary else { return Ok(()); };
+        let actual = fs_safety::metadata_beneath(self.directory(), Path::new(&temporary.name)).map_err(resolve_error)?;
+        if !same_inode(&temporary.file.metadata().map_err(io_error)?, &actual) {
+            return Err(FileIoError::Io("The editor temporary name was replaced; its original descriptor and foreign entry were retained.".into()));
+        }
+        Ok(())
+    }
+    pub(super) fn unlink_temporary(&mut self) -> Result<File, FileIoError> {
+        self.verify_temporary()?;
+        let temporary = self.temporary.as_ref().expect("temporary created");
+        fs_safety::unlink_within(self.directory(), &temporary.name).map_err(resolve_error)?;
+        Ok(self.temporary.take().unwrap().file)
+    }
+    pub(super) fn publish_temporary(&mut self) -> Result<(), FileIoError> {
+        self.verify_temporary()?;
+        let temporary = self.temporary.as_ref().expect("temporary created");
+        fs_safety::rename_new_between(self.directory(), &temporary.name, &self.parent, &self.name).map_err(resolve_error)?;
+        self.temporary = None;
+        Ok(())
+    }
     pub(super) fn pin_source(&mut self, source: File) { self.pre_acquire_source = Some(source); }
     pub(super) fn capture_original(&mut self) -> Result<(), FileIoError> {
         self.capture_original_with_hooks(|root| fs_safety::open_beneath(root, Path::new("file")).map_err(resolve_error), |_| Ok(()))
@@ -104,6 +137,7 @@ impl PresenceHolding {
         Ok(())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
+        if self.temporary.is_some() { self.unlink_temporary().map_err(|error| error.to_string())?; }
         if self.restore_original {
             if let Some(original) = &self.original {
                 original.verify(self.directory(), std::ffi::OsStr::new("file")).map_err(|error| error.to_string())?;
@@ -133,7 +167,7 @@ impl PresenceHolding {
         let slot = self.slot.take().expect("presence reserves recovery before effects");
         let description = format!("Editor presence staging requires recovery. {error} Diagnostic opened spelling: {}", self.directory().path().display());
         // DirectoryPublication <=5 root descriptors, parent1, original1,
-        // pre-acquisition source1. The
+        // pre-acquisition source1, temporary1. The
         // closure captures the WHOLE owner (not disjoint fields), below16 FDs.
         let authority = slot.retain(description.clone(), move || self.retry_cleanup());
         FileIoError::Recovery { message: description, authority }
@@ -144,6 +178,22 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn private_writer_temporary_descriptor_survives_foreign_cleanup_and_failed_retry() {
+        let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();
+        let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("file")).unwrap();
+        holding.create_temporary().unwrap(); holding.temporary_mut().write_all(b"ours").unwrap();
+        let descriptor = holding.temporary().as_raw_fd();
+        let original = holding.directory().path().join(holding.temporary_name()); let saved = original.with_file_name("saved-writer");
+        fs::rename(&original, &saved).unwrap(); fs::write(&original, b"foreign").unwrap();
+        let error = holding.finish().unwrap_err(); let authority = error.recovery_authority().unwrap();
+        assert!(authority.retry().is_err());
+        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0);
+        assert_eq!(fs::read(&original).unwrap(), b"foreign");
+        fs::remove_file(&original).unwrap(); fs::rename(&saved, &original).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert!(!original.exists());
+    }
     #[test]
     fn presence_recovery_keeps_preopened_source_when_acquired_open_fails() {
         let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();

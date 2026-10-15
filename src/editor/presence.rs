@@ -136,55 +136,35 @@ fn restore_document_file(
     restoration: &FileRestoration,
 ) -> Result<SaveOutcome, FileIoError> {
     require_new_destination(parent, Path::new(name))?;
-    let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
+    let mut holding = PresenceHolding::create(parent, name)?;
+    if let Err(error) = holding.create_temporary() { return Err(holding.finish_error(error)); }
     let result = (|| {
-        fs_safety::copy_ownership(&restoration.source, &temporary).map_err(io_error)?;
-        fs_safety::copy_access_acl(&restoration.source, &temporary).map_err(io_error)?;
+        let temporary = holding.temporary_mut();
+        fs_safety::copy_ownership(&restoration.source, temporary).map_err(io_error)?;
+        fs_safety::copy_access_acl(&restoration.source, temporary).map_err(io_error)?;
         temporary.write_all(text.as_bytes()).map_err(io_error)?;
-        temporary
-            .set_permissions(restoration.permissions.clone())
-            .map_err(io_error)?;
-        fs_safety::copy_access_acl(&restoration.source, &temporary).map_err(io_error)?;
-        // A hard-link writer can still chmod the removed inode. The saved
-        // permissions, rather than that later mode, own this Undo restoration.
-        temporary
-            .set_permissions(restoration.permissions.clone())
-            .map_err(io_error)?;
-        let lost = fs_safety::copy_extended_attributes(&restoration.source, &temporary);
-        if !lost.is_empty() {
-            return Err(FileIoError::Io(format!(
-                "Could not restore file metadata: {}",
-                lost.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
+        temporary.set_permissions(restoration.permissions.clone()).map_err(io_error)?;
+        fs_safety::copy_access_acl(&restoration.source, temporary).map_err(io_error)?;
+        temporary.set_permissions(restoration.permissions.clone()).map_err(io_error)?;
+        let lost = fs_safety::copy_extended_attributes(&restoration.source, temporary);
+        if !lost.is_empty() { return Err(FileIoError::Io(format!("Could not restore file metadata: {}", lost.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))); }
         let restored = temporary.metadata().map_err(io_error)?;
         let template = restoration.source.metadata().map_err(io_error)?;
-        if restored.mode() != template.mode()
-            || restored.uid() != template.uid()
-            || restored.gid() != template.gid()
-            || fs_safety::content_attributes(&temporary).map_err(io_error)?
-                != fs_safety::content_attributes(&restoration.source).map_err(io_error)?
-        {
-            return Err(FileIoError::Io(
-                "The file's access metadata could not be restored exactly.".into(),
-            ));
+        if restored.mode() != template.mode() || restored.uid() != template.uid() || restored.gid() != template.gid()
+            || fs_safety::content_attributes(temporary).map_err(io_error)? != fs_safety::content_attributes(&restoration.source).map_err(io_error)? {
+            return Err(FileIoError::Io("The file's access metadata could not be restored exactly.".into()));
         }
         temporary.sync_all().map_err(io_error)?;
-        fs_safety::rename_new_within(parent, &temporary_name, name).map_err(resolve_error)?;
-        Ok(())
+        holding.publish_temporary()
     })();
-    if let Err(error) = result {
-        let _ = fs_safety::unlink_within(parent, &temporary_name);
-        return Err(error);
-    }
-    Ok(SaveOutcome::Saved {
-        content_hash: blake3::hash(text.as_bytes()),
-        durability: sync_durability(parent),
-    })
+    if let Err(error) = result { return Err(holding.finish_error(error)); }
+    // Publication is already known. Cleanup/sync failures preserve that fact
+    // and the exact live authority instead of returning a false write refusal.
+    let durability = match holding.finish() {
+        Ok(()) => sync_durability(parent),
+        Err(error) => recovery_durability(error, "The restored file is now published."),
+    };
+    Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
 }
 
 fn sync_durability(parent: &Root) -> SaveDurability {
@@ -354,7 +334,7 @@ fn replace_or_remove_document_file(
                 "The file contents changed while Revert acquired it.".into(),
             ));
         }
-        immutable_metadata_template(holding.directory(), &held, &before, &attributes)
+        immutable_metadata_template(&mut holding, &held, &before, &attributes)
     })();
     let template = match verify { Ok(template) => template, Err(error) => return Err(put_back_acquired_file(holding, error)) };
     if let Some((restoration, text)) = replacement {
@@ -428,8 +408,8 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     // The metadata can be world-readable/writable. Until its temporary name
     // is removed, it must live behind a private directory, just as removal's
     // metadata capture does. Never expose it in the ordinary worktree parent.
-    let holding = PresenceHolding::create(&parent, &name)?;
-    let capture = immutable_metadata_template_with_hook(holding.directory(), &source, &before, &attributes, before_unlink);
+    let mut holding = PresenceHolding::create(&parent, &name)?;
+    let capture = immutable_metadata_template_with_hook(&mut holding, &source, &before, &attributes, before_unlink);
     let cleanup = holding.finish();
     let template = match (capture, cleanup) {
         (Ok(template), Ok(())) => template,
@@ -447,12 +427,13 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     Ok(Arc::new(FileRestoration { source: template, permissions: before.permissions(), _permit: permit }))
 }
 
-fn immutable_metadata_template(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> Result<File, FileIoError> {
-    immutable_metadata_template_with_hook(parent, source, before, attributes, |_, _| Ok(()))
+fn immutable_metadata_template(holding: &mut PresenceHolding, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> Result<File, FileIoError> {
+    immutable_metadata_template_with_hook(holding, source, before, attributes, |_, _| Ok(()))
 }
 
-fn immutable_metadata_template_with_hook(parent: &Root, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<File, FileIoError> {
-    let (template, name) = fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
+fn immutable_metadata_template_with_hook(holding: &mut PresenceHolding, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<File, FileIoError> {
+    holding.create_temporary()?;
+    let template = holding.temporary();
     let captured = (|| {
         fs_safety::copy_ownership(source, &template).map_err(io_error)?;
         fs_safety::copy_access_acl(source, &template).map_err(io_error)?;
@@ -466,10 +447,12 @@ fn immutable_metadata_template_with_hook(parent: &Root, source: &File, before: &
             || &fs_safety::content_attributes(&template).map_err(io_error)? != attributes {
             return Err(FileIoError::Io("The source metadata changed while retaining Undo metadata.".into()));
         }
-        before_unlink(parent, &name).map_err(io_error)?;
+        before_unlink(holding.directory(), holding.temporary_name()).map_err(io_error)?;
         Ok(())
     })();
-    fs_safety::unlink_within(parent, &name).map_err(resolve_error)?;
+    // The owned writer descriptor stays inside the holder until exact-leaf
+    // removal succeeds, including copy/hook/unlink failures.
+    let template = holding.unlink_temporary()?;
     captured?;
     if template.metadata().map_err(io_error)?.nlink() != 0 {
         return Err(FileIoError::Io("The Undo metadata template acquired an outside hard link.".into()));
@@ -531,6 +514,29 @@ mod tests {
         assert!(save_document_file_at(&root, Path::new("shared/file"), "", blake3::hash(b"original"), false, removal()).is_err());
         assert_eq!(fs::read_to_string(directory.path().join("shared/file")).unwrap(), "original");
         assert_eq!(fs::read_dir(directory.path().join("shared")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn metadata_template_unlink_failure_keeps_typed_original_authority_and_foreign_leaf() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "contents").unwrap();
+        let mut retained = None;
+        let error = capture_restoration_with_hook(&root, Path::new("file"), blake3::hash(b"contents"), |holding, name| {
+            let original = holding.path().join(name); let saved = holding.path().join("original-template");
+            fs::rename(&original, &saved)?; fs::write(&original, "foreign leaf")?;
+            retained = Some((original, saved)); Ok(())
+        }).unwrap_err();
+        let authority = error.recovery_authority().expect("exact template cleanup authority");
+        let (original, saved) = retained.unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(fs::read_to_string(&original).unwrap(), "foreign leaf");
+        assert!(saved.exists());
+        // Explicit fixture repair restores the original internal name; product
+        // retry itself must never discover/adopt a replacement witness.
+        fs::remove_file(&original).unwrap(); fs::rename(&saved, &original).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
