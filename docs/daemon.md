@@ -1,6 +1,7 @@
 # Daemon and upgrades
 
 - [How the daemon runs](#how-the-daemon-runs)
+- [Claude conversation ownership and privacy](#claude-conversation-ownership-and-privacy)
 - [Control CLI](#control-cli)
 - [Compatible upgrades](#compatible-upgrades)
 - [Full daemon upgrades](#full-daemon-upgrades)
@@ -44,6 +45,35 @@ pressure kill of one session does not select the UI, daemon, or another session
 as part of the same unit. Enrollment is bounded and verified. If it fails,
 launch continues through the existing process path and logs degraded isolation;
 direct providers also report any startup children created before enrollment.
+
+## Claude conversation ownership and privacy
+
+Claude's stream-json process runs under a native helper that owns its stdin,
+stdout and stderr. The helper retains the existing protocol actor, transcript
+store, active execution tracker and control request identities while the daemon
+is absent. Reattachment connects to that same actor; it does not resend prompts
+or rebuild a reducer by replaying provider output.
+
+The helper therefore sees prompt and response content. Its transcript cache,
+semantic outcome journal and input receipts are private to the current user:
+files use mode `0600` inside private directories. The transcript store's lifetime
+lease prevents a newly started daemon from sweeping a live helper's cache.
+Clean Stop or explicit End closes the provider tree and releases that cache;
+an upgrade preserves the helper until its successor reattaches.
+
+The journal has a bounded byte and entry budget. Execution and attention
+outcomes remain there until the daemon confirms its durable registry and
+notification transactions. Input receipts bind a sequence, request UUID and
+payload hash; an accepted or ambiguous input is never permission to send the
+prompt again. An overflow or storage failure produces a retained continuity-loss
+record. Its affected runs become Interrupted with that reason before recovery
+acknowledges the loss. Explicit restart resumes the same provider conversation
+and preserves its partial transcript; it sends no prompt on the user's behalf.
+
+Only the current daemon lease and the exact helper process incarnation can
+adopt or control a retained actor. A new attachment epoch rejects commands and
+acknowledgements from a superseded daemon. Holder build capabilities distinguish
+this protocol from the Codex app-server holder protocol.
 
 ## Control CLI
 
