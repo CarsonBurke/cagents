@@ -364,3 +364,30 @@ impl LspCodeAction {
         Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workspace_annotations_require_confirmation_and_bad_ranges_refuse_the_whole_batch(){
+        let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,4,Arc::from("a𝄞b"));
+        let value=json!({"changeAnnotations":{"confirm":{"label":"Rename export","needsConfirmation":true}},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[{"annotationId":"confirm","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":3}},"newText":"x"}]}]});
+        let converted=convert_workspace_edit(&store,serde_json::from_value(value.clone()).unwrap(),None).unwrap();
+        assert!(converted.requires_confirmation);assert_eq!(converted.documents[0].edits[0].range,LspRange::new(LspPosition::new(0,1),LspPosition::new(0,2)));
+        let mut missing=value.clone();missing["changeAnnotations"]=json!({});assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(missing).unwrap(),None),Err(LspError::Unsupported(_))));
+        let mut split=value;split["documentChanges"][0]["edits"][0]["range"]["start"]["character"]=json!(2);assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(split).unwrap(),None),Err(LspError::SplitSurrogate{..})));
+        let duplicate: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]},{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]}]})).unwrap();assert!(matches!(convert_workspace_edit(&store,duplicate,None),Err(LspError::Unsupported(_))));
+    }
+
+    #[test]
+    fn cancelled_server_edit_future_releases_preview_even_before_first_poll(){
+        let manager=LspManager::new(Vec::new());let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        manager.snapshots.register(LspDocumentId(1),&uri,&key,1,Arc::from("foo"));
+        let mut router=RouterState{key,snapshots:Arc::clone(&manager.snapshots),events:manager.events.clone(),retired:Arc::new(AtomicBool::new(false)),server_edits:Arc::clone(&manager.server_edits),configuration:serde_json::Value::Null};
+        let request=apply_workspace_edit(&mut router,lsp_types::ApplyWorkspaceEditParams{label:None,edit:Default::default()});
+        assert_eq!(manager.server_edits.pending.lock().unwrap().len(),1);drop(request);assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+    }
+}
