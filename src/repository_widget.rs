@@ -2461,7 +2461,7 @@ impl RepositoryRuntime {
     }
 
     pub fn can_step_editor_history(&self, redo: bool) -> bool {
-        if !self.editor_history_surface_visible() || self.search_mode || self.is_saving() { return false; }
+        if !self.editor_history_surface_visible() || self.search_mode { return false; }
         match &self.document {
             DocumentState::Editable(document) => if redo { document.history.can_redo() } else { document.history.can_undo() },
             _ => false,
@@ -17950,6 +17950,31 @@ mod tests {
         runtime.diff_basis = DiffBasis::IndexToWorktree;
         runtime.set_search_mode(true);
         assert!(!runtime.can_step_editor_history(false));
+    }
+
+    #[test]
+    fn registered_history_during_save_preserves_newer_buffer_and_late_completion() {
+        let card = CardId::new();
+        for working_diff in [false, true] {
+            let mut runtime = RepositoryRuntime::working_history_fixture(card);
+            if !working_diff { runtime.source_surface = SourceSurface::Editor; }
+            let captured = runtime.editor_text().unwrap();
+            drop(runtime.request_save_inner(card, false, false));
+            assert!(runtime.is_saving());
+            let completion = runtime.durable_active_save_completion();
+            assert!(runtime.can_step_editor_history(false), "ordinary saving does not freeze buffer editing");
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
+            drop(runtime.update(completion));
+            assert!(!runtime.is_saving());
+            assert_eq!(runtime.editor_text().as_deref(), Some("saved\n"));
+            assert!(runtime.is_dirty(), "late save published the captured changed bytes, not the newer Undo");
+            let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+            assert_eq!(document.saved_text, captured);
+            drop(runtime.update(RepositoryAction::Redo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(captured.as_str()));
+            assert!(!runtime.is_dirty());
+        }
     }
 
     #[test]

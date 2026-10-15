@@ -6281,6 +6281,7 @@ mod tests {
             assert!(!descriptor.label.is_empty());
             assert!(identities.insert(descriptor.id()), "registered IDs are unique");
             assert_eq!(descriptor.scope.is_native_editor(), crate::settings::is_editor_command(descriptor.id()), "native keyboard routing and configuration share the editor scope for {}", descriptor.id());
+            assert_eq!(descriptor.scope == ShortcutScope::Review, crate::settings::is_review_command(descriptor.id()), "shared review overlap classification for {}", descriptor.id());
             let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
             assert_eq!(keys, shortcuts.actions()[index]);

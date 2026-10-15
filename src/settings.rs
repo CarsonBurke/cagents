@@ -1251,7 +1251,18 @@ pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding
     { None } else { text_editing_shortcut_conflict(binding) }
 }
 
+/// Review vocabulary also owns editing chords on a live working comparison.
+/// History bindings must therefore collide with it even though ordinary native
+/// editor commands are disjoint from immutable review surfaces.
+pub fn is_review_command(action: &str) -> bool {
+    matches!(action, "review_toggle_viewed" | "review_next_file" | "review_previous_file" | "review_next_unviewed" | "review_next_change" | "review_previous_change" | "diff_copy" | "diff_copy_old" | "diff_copy_new" | "diff_copy_patch" | "diff_copy_line_reference" | "diff_open_in_editor" | "diff_select_all")
+}
+
 pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
+    if (matches!(left, "editor_undo" | "editor_redo") && is_review_command(right))
+        || (matches!(right, "editor_undo" | "editor_redo") && is_review_command(left))
+    { return true; }
+
     // Native editing chords already suppress ordinary workspace bindings in
     // an editable buffer; Reopen pane and Redo can therefore share CtrlShiftZ.
     let editor_left = is_editor_command(left);
@@ -3874,7 +3885,7 @@ mod tests {
         assert!(shortcut_binding_conflicts("editor_redo", "editor_undo", binding));
         assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none());
         assert!(shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some());
-        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_some());
+        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none());
         let mut sparse = toml::Table::new();
         sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
         preserve_introduced_shortcuts(&mut sparse);
@@ -3898,6 +3909,25 @@ mod tests {
         shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
         assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()), "two native editor commands cannot share Undo");
         assert!(shortcut_binding_conflicts("editor_undo", "future_editor_action", parse_shortcut("Ctrl+Z").unwrap()), "an unknown future scope is preserved conservatively");
+    }
+
+    #[test]
+    fn working_diff_history_conflicts_with_review_vocabulary_but_not_reopen() {
+        for history in ["editor_undo", "editor_redo"] {
+            for review in SHORTCUT_ACTIONS.into_iter().filter(|action| is_review_command(action)) {
+                for chord in ["Ctrl+C", "Ctrl+Z", "Ctrl+Shift+Z", "Alt+F9"] {
+                    let binding = parse_shortcut(chord).unwrap();
+                    assert!(shortcut_binding_conflicts(history, review, binding), "{history}/{review}/{chord}");
+                    assert!(shortcut_binding_conflicts(review, history, binding), "{review}/{history}/{chord}");
+                }
+            }
+        }
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.editor_undo = vec!["Ctrl+C".into()];
+        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()));
+        shortcuts.diff_copy.clear();
+        assert!(shortcuts.fault().is_none());
+        assert!(!shortcut_binding_conflicts("editor_redo", "reopen_pane", parse_shortcut("Ctrl+Shift+Z").unwrap()));
     }
 
     #[test]
