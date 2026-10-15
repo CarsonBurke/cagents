@@ -43,6 +43,29 @@ pub(crate) fn fixture_adapter() -> Box<dyn Adapter> {
 }
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None)
+}
+
+/// The retained helper executes the actual arguments prepared by its parent.
+/// Bind its fresh adapter to that SAME generated identity without turning a
+/// new conversation into resume/history. The complete canonical argv must
+/// agree, so a missing/duplicate/altered identity cannot become a new guess.
+pub(crate) fn create_from_prepared_arguments(
+    launch: &Launch,
+    prepared_arguments: &[String],
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    if launch.session_id.is_some() { return create(launch); }
+    let id = prepared_arguments.last().and_then(|argument| argument.strip_prefix("--session-id="))
+        .ok_or("Fresh retained Claude launch lacks its prepared session identity")?;
+    validate_id(id)?;
+    let prepared = create_inner(launch, Some(id))?;
+    if prepared.0.arguments != prepared_arguments {
+        return Err("Fresh retained Claude arguments differ from their prepared session contract".into());
+    }
+    Ok(prepared)
+}
+
+fn create_inner(launch: &Launch, prepared_fresh: Option<&str>) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.arguments = arguments(launch)?;
     let history = launch
@@ -57,7 +80,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     let session_id = launch
         .session_id
         .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| prepared_fresh.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
     if launch.session_id.is_none() {
         spec.arguments.push(format!("--session-id={session_id}"));
     }
@@ -9041,6 +9064,52 @@ mod tests {
     /// The CLI puts `session_id` only on the frames of a turn. A conversation
     /// resumed by a daemon restart and then left idle must not stay
     /// unconfirmed, or no later update can checkpoint it.
+    #[test]
+    fn retained_fresh_adapter_uses_actual_prepared_uuid_without_resume_or_history() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            provider: crate::agent::Provider::Claude,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(), arguments: Vec::new(), working_directory: root.path().into(),
+                environment: Default::default(), unset_environment: Default::default(),
+            },
+        };
+        let (parent, _) = create(&launch).unwrap();
+        let actual = parent.arguments.last().unwrap().strip_prefix("--session-id=").unwrap();
+        let (helper, mut adapter) = create_from_prepared_arguments(&launch, &parent.arguments).unwrap();
+        assert_eq!(helper.arguments, parent.arguments);
+        assert!(launch.session_id.is_none(), "issued fresh recipe remains fresh");
+        assert!(!helper.arguments.iter().any(|argument| argument.starts_with("--resume")));
+        let initial = adapter.initialize().unwrap();
+        assert!(!initial.events.iter().any(|event| matches!(event, Event::Session {..})),
+            "generated fresh UUID is expected identity, not provider-confirmed resume");
+        let step = adapter.receive(json!({"type":"system","subtype":"init","session_id":actual})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Session {id,..} if id == actual)));
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(adapter.receive(json!({"type":"system","subtype":"init","session_id":other})).unwrap_err().contains("different session ID"),
+            "actual wire identity equality remains strict");
+    }
+
+    #[test]
+    fn retained_fresh_adapter_refuses_missing_duplicate_or_modified_prepared_identity_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            provider: crate::agent::Provider::Claude, session_id: None,
+            recipe: crate::model::LaunchRecipe {program:"claude".into(), arguments:Vec::new(),
+                working_directory:root.path().into(), environment:Default::default(), unset_environment:Default::default()},
+        };
+        let (parent, _) = create(&launch).unwrap();
+        let mut missing = parent.arguments.clone(); missing.pop();
+        assert!(create_from_prepared_arguments(&launch, &missing).is_err());
+        let mut duplicate = parent.arguments.clone(); duplicate.push(parent.arguments.last().unwrap().clone());
+        assert!(create_from_prepared_arguments(&launch, &duplicate).is_err());
+        let mut changed = parent.arguments.clone(); changed.insert(0, "--resume=latest".into());
+        assert!(create_from_prepared_arguments(&launch, &changed).is_err());
+        let mut invalid = parent.arguments.clone(); *invalid.last_mut().unwrap()="--session-id=latest".into();
+        assert!(create_from_prepared_arguments(&launch, &invalid).is_err());
+    }
+
     #[test]
     fn initializing_confirms_a_resumed_conversation_but_not_an_unused_new_one() {
         let id = "00000000-0000-4000-8000-000000000001";
