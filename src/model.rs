@@ -270,8 +270,21 @@ impl LaunchRecipe {
     ) -> Result<Self, LoginShellError> {
         let program = if crate::device::is_remote() {
             terminal_shell()?
+        } else if let Some(shell) = settings.default_shell.as_deref() {
+            // This records accepted window policy on the reducer. The owning
+            // terminal worker executes this exact pin and reports failure;
+            // it never substitutes a login shell if the pin disappears.
+            if !crate::settings::agents::executable_path_syntax(shell) {
+                return Err(LoginShellError::ConfiguredUnavailable);
+            }
+            shell.to_owned()
         } else {
-            terminal_shell_from_preference(settings.default_shell.as_deref())?
+            // Device preparation already resolved the login shell on its
+            // worker; keep that descriptor when available.
+            match crate::device::shell() {
+                Some(shell) => terminal_shell_for_device(Some(shell))?,
+                None => login_shell()?,
+            }
         };
         Ok(Self::shell_program(working_directory, program))
     }
@@ -1561,6 +1574,17 @@ mod tests {
         active = Some(ChannelId::new());
         normalize_project_channels(&mut channels, &mut active, &HashSet::from([first]));
         assert_eq!(active, None);
+    }
+
+    #[test]
+    fn captured_shell_pin_is_recorded_without_a_reducer_filesystem_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("unavailable-shell");
+        let settings = crate::settings::AppSettings { default_shell: Some(pin.to_str().unwrap().into()), ..Default::default() };
+        let launch = crate::settings::agents::without_executable_checks(|| LaunchRecipe::shell_with_settings(directory.path().into(), &settings)).unwrap();
+        assert_eq!(launch.program, pin.to_str().unwrap());
+        assert!(launch.arguments.is_empty());
+        assert_eq!(terminal_shell_from_preference(settings.default_shell.as_deref()), Err(LoginShellError::ConfiguredUnavailable));
     }
 
     #[test]

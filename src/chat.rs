@@ -2701,6 +2701,18 @@ pub(crate) fn fresh_session_configured(
     fresh_session_from_policy(provider, id, working_directory, account, configuration, overrides, true)
 }
 
+/// Draft construction checks policy syntax but grants no launch permission.
+/// The existing start worker validates the captured program before connecting.
+/// Provider default-mode metadata keeps its existing lookup behavior.
+#[cfg(feature = "ui")]
+pub(crate) fn fresh_session_draft(
+    provider: Provider, id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf, account: &crate::account::Account,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Result<Session, String> {
+    fresh_session_from_policy(provider, id, working_directory, account, configuration, Default::default(), false)
+}
+
 /// Read-only history can describe an unavailable binary. This helper does
 /// not grant permission to start it; activation validates on a worker.
 #[cfg(any(feature = "host", feature = "ui"))]

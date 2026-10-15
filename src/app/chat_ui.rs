@@ -2986,13 +2986,12 @@ fn fresh_chat_session(
     automatic: bool,
     configuration: &settings::AgentLaunchSettings,
 ) -> Result<chat::Session, String> {
-    let mut session = chat::fresh_session_configured(
+    let mut session = chat::fresh_session_draft(
         provider,
         id,
         working_directory,
         account,
         configuration,
-        Default::default(),
     )?;
     if automatic {
         session
@@ -3002,6 +3001,17 @@ fn fresh_chat_session(
             .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
     }
     Ok(session)
+}
+
+/// Called only by the blocking start worker. An absolute recorded program
+/// is an explicit choice; failure cannot authorize a PATH/default fallback.
+fn validate_draft_program(session: &chat::Session) -> Result<(), chat::StartFailure> {
+    let program = &session.launch.recipe.program;
+    if !crate::device::is_remote() && std::path::Path::new(program).is_absolute()
+        && !settings::agents::executable_available(program) {
+        return Err(chat::StartFailure::retry(format!("The configured {} executable is unavailable. Repair its path in Agents before starting this conversation.", session.launch.provider.label())));
+    }
+    Ok(())
 }
 
 /// What a draft for `provider` shows before anything runs: the models the
@@ -5210,6 +5220,9 @@ impl Cagents {
                 // UI thread then only sees a join error and can still draw.
                 Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || {
+                        if intent == chat::Intent::Start && source.is_none() && session.is_unstarted() && session.terminal.is_none() {
+                            validate_draft_program(&session)?;
+                        }
                         ClientHandle::connect(
                             session,
                             intent,
@@ -13347,6 +13360,46 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn settings_draft_keeps_unavailable_pin_until_the_actual_start_worker_refuses_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("private-claude");
+        std::fs::write(&pin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let configuration = settings::AgentLaunchSettings {
+            executable: Some(pin.to_str().unwrap().into()),
+            arguments: vec!["--synthetic".into(), "one spaced value".into()],
+            environment: [("EXAMPLE".into(), "synthetic".into())].into(),
+            permission_mode: Some("plan".into()), ..Default::default()
+        };
+        let account = Account::system(Provider::Claude);
+        let session = settings::agents::without_executable_checks(|| fresh_chat_session(
+            Provider::Claude, TerminalId::new(), directory.path().into(), &account, false, &configuration,
+        )).unwrap();
+        assert_eq!(session.launch.recipe.program, pin.to_str().unwrap());
+        assert!(session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--synthetic", "one spaced value"]));
+        assert_eq!(session.launch.recipe.environment["EXAMPLE"], "synthetic");
+        assert!(validate_draft_program(&session).is_ok());
+        std::fs::remove_file(&pin).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.agents.insert("claude".into(), configuration);
+        settings::agents::without_executable_checks(|| {
+            drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        });
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("draft exists before a provider starts") };
+        assert_eq!(runtime.session.launch.recipe.program, pin.to_str().unwrap());
+        let session = runtime.session.clone();
+        let before = app.durable.cards.len();
+        let message = crate::app::tests::task_app_message(settings::agents::without_executable_checks(|| app.start_chat(card, session, chat::Intent::Start, None, false)));
+        let Message::ChatUi(Action::Ready(_, ready)) = &message else { panic!("actual start worker refusal") };
+        assert!(matches!(ready.0.lock().unwrap().as_ref().unwrap(), Err(error) if error.to_string().contains("Agents")));
+        drop(app.update(message));
+        assert_eq!(app.durable.cards.len(), before);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.error.as_deref().is_some_and(|reason| reason.contains("Agents"))));
     }
 
     #[test]
