@@ -11136,7 +11136,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ],
                 );
                 fetch.inherited_lease = Some(lease.as_raw_fd());
-                fetch.timeout = Some(Duration::from_secs(3));
                 if let Err(failure) = self.run_checked(&fetch, cancellation) {
                     if cached.is_none() || cancellation.is_cancelled() { return Err(failure.into()); }
                     remote_refresh_warning = Some(format!("Remote refresh failed; using cached {reference}: {}", failure.reported_detail()));
@@ -12164,6 +12163,25 @@ mod worktree_journal_tests {
         assert_ne!(fixture.git(&["rev-parse", "topic"]), old);
         assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
         assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "origin");
+    }
+
+    #[test]
+    fn uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new(); let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        let bare = fixture.directory.path().join("bare.git");
+        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        let upload_pack = fixture.directory.path().join("slow-upload-pack");
+        fs::write(&upload_pack, "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n").unwrap();
+        fs::set_permissions(&upload_pack, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.git(&["config", "remote.origin.uploadpack", upload_pack.to_str().unwrap()]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(upload_pack.with_file_name("slow-upload-pack.ran").exists());
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
     }
 
     #[test]
