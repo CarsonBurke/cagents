@@ -2953,12 +2953,27 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
+    migrate_reserved(connection)
+}
+
+// The outer schema read is only a fast path. Another compatible opener can
+// commit while this connection waits, so DDL and its stamp must be admitted
+// again under the actual SQLite writer reservation.
+fn migrate_reserved(connection: &mut Connection) -> Result<()> {
     // SQLite cannot alter a CHECK constraint. Rebuild its parent table with
     // foreign keys temporarily disabled outside the transaction, preserving
     // every child row and checking the complete graph before commit.
     connection.pragma_update(None, "foreign_keys", false)?;
     let result = (|| -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if current > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {found: current, supported: CURRENT_SCHEMA_VERSION});
+        }
+        if current == CURRENT_SCHEMA_VERSION {
+            transaction.commit()?;
+            return Ok(());
+        }
         if current < 1 {
             migrate_to_v1(&transaction)?;
         }
@@ -8351,7 +8366,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw, "{malformed", "migration must preserve forensic bytes");
-        SaveLane::default().save(&migrated, &restored).unwrap();
+        let stored = migrated.stored_generations(restored.id).unwrap();
+        let mut lane = SaveLane {workspace: stored.workspace, cards: stored.cards};
+        lane.save(&migrated, &restored).unwrap();
+    }
+
+    fn retirement_v11_migration_connection(path: &Path) -> Connection {
+        let store = StateStore::open(path, boot("reservation-race")).unwrap();
+        store.shutdown().unwrap();
+        drop(store);
+        let connection = Connection::open(path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        connection.execute_batch("DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired; PRAGMA user_version = 11;").unwrap();
+        connection
+    }
+
+    #[test]
+    fn retirement_migration_admits_second_compatible_opener_under_writer_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut delayed = retirement_v11_migration_connection(&path);
+        let observed: u32 = delayed.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(observed, 11, "the delayed outer branch sees old schema");
+        let mut winner = Connection::open(&path).unwrap();
+        configure_connection(&winner, DEFAULT_BUSY_TIMEOUT).unwrap();
+        migrate(&mut winner).unwrap();
+        let changes = delayed.total_changes();
+        // The production stale outer branch now reaches its real helper after
+        // another connection committed all12 DDL and the stamp atomically.
+        migrate_reserved(&mut delayed).unwrap();
+        assert_eq!(delayed.total_changes(), changes, "compatible completed migration does no writes");
+        assert_eq!(delayed.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0)).unwrap(), 12);
+        assert_eq!(delayed.pragma_query_value::<u32, _>(None, "foreign_keys", |row| row.get(0)).unwrap(), 1);
+        assert_eq!(delayed.query_row("SELECT COUNT(*) FROM pragma_table_info('cards') WHERE name='retired'", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn retirement_migration_refuses_future_schema_committed_after_outer_observation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut delayed = retirement_v11_migration_connection(&path);
+        let observed: u32 = delayed.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(observed, 11);
+        let winner = Connection::open(&path).unwrap();
+        winner.execute_batch("BEGIN IMMEDIATE; CREATE TABLE future_owned(value TEXT NOT NULL) STRICT;
+            INSERT INTO future_owned VALUES ('preserve future intent'); PRAGMA user_version=13; COMMIT;").unwrap();
+        let before: Vec<(String, Option<String>)> = winner.prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name").unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(matches!(migrate_reserved(&mut delayed), Err(StoreError::UnsupportedSchema {found:13,supported:12})));
+        assert_eq!(delayed.pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0)).unwrap(), 13);
+        assert_eq!(delayed.pragma_query_value::<u32, _>(None, "foreign_keys", |row| row.get(0)).unwrap(), 1);
+        let after: Vec<(String, Option<String>)> = delayed.prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name").unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(before, after, "future schema must receive no retirement DDL");
+        assert_eq!(delayed.query_row("SELECT value FROM future_owned", [], |row| row.get::<_,String>(0)).unwrap(), "preserve future intent");
     }
 
     #[test]
