@@ -1415,12 +1415,12 @@ impl Runtime {
         }
         if opened {
             if let Some(input) = &cached.tool_input {
-                builder.plain(&item.id, &[4], input.text.clone());
+                builder.indexed(&item.id, &[4], input.text.clone(), input.reader_source.prefixes());
             }
             if let Some(output) = &cached.tool_output
                 && !output.text.is_empty()
             {
-                builder.plain(&item.id, &[5], output.text.clone());
+                builder.indexed(&item.id, &[5], output.text.clone(), output.reader_source.prefixes());
             }
             if let ItemContent::Changes { changes, .. } = &item.content {
                 for (index, change) in changes.iter().enumerate() {
@@ -1431,7 +1431,7 @@ impl Runtime {
                     if let Some(patch) = cached.patches.get(index)
                         && !patch.text.is_empty()
                     {
-                        builder.plain(&item.id, &[6, index as u32], patch.text.clone());
+                        builder.indexed(&item.id, &[6, index as u32], patch.text.clone(), patch.reader_source.prefixes());
                     }
                 }
             }
