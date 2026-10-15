@@ -37,6 +37,10 @@ use std::{
     ptr,
 };
 
+#[path = "fs_safety/directory.rs"]
+mod directory;
+pub use directory::DirectoryNames;
+
 #[cfg(target_os = "macos")]
 #[path = "fs_safety/darwin.rs"]
 mod platform;
@@ -252,6 +256,32 @@ impl ResolveError {
             write_refused: false,
         }
     }
+}
+
+/// Streams names from a directory beneath `root`, without following symlinks.
+///
+/// Each stream opens an independent file description, so repeated/concurrent
+/// enumeration does not share offsets. An empty relative path enumerates the
+/// retained root itself even when its original name has moved or been replaced.
+/// Child names must still be resolved beneath `root`; this grants no new write
+/// authority. Callers retain control over entry and cancellation limits.
+///
+/// # Errors
+///
+/// Refuses symlinks, non-directories, escaping paths and unreadable directories.
+pub fn directory_names_beneath(
+    root: &Root,
+    relative: &Path,
+) -> Result<DirectoryNames, ResolveError> {
+    let reported = root.path.join(relative);
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let descriptor = if relative.as_os_str().is_empty() {
+        open_at(root.descriptor(), OsStr::new("."), flags | libc::O_NOFOLLOW)
+            .map_err(|error| ResolveError::io(&reported, &error))?
+    } else {
+        resolve(root, relative, flags, resolver())?
+    };
+    DirectoryNames::new(descriptor).map_err(|error| ResolveError::io(&reported, &error))
 }
 
 /// Opens `relative` beneath `root` for reading, following no symlink in any
@@ -1155,6 +1185,72 @@ pub(crate) mod tests {
         io::Write,
         os::unix::fs::{MetadataExt, PermissionsExt},
     };
+
+    #[test]
+    fn directory_names_remain_on_the_retained_root_and_refuse_symlink_walks() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("original");
+        let retained = parent.path().join("retained");
+        fs::create_dir_all(original.join("nested")).unwrap();
+        fs::write(original.join("nested/original.txt"), "original").unwrap();
+        std::os::unix::fs::symlink(parent.path(), original.join("outside")).unwrap();
+        let root = Root::open(&original).unwrap();
+        fs::rename(&original, &retained).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("replacement.txt"), "replacement").unwrap();
+
+        let names = directory_names_beneath(&root, Path::new(""))
+            .unwrap().collect::<io::Result<std::collections::BTreeSet<_>>>().unwrap();
+        assert_eq!(names, [OsString::from("nested"), OsString::from("outside")].into());
+        let nested = directory_names_beneath(&root, Path::new("nested"))
+            .unwrap().collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(nested, [OsString::from("original.txt")]);
+        assert!(directory_names_beneath(&root, Path::new("outside")).is_err());
+        assert!(directory_names_beneath(&root, Path::new("nested/original.txt")).is_err());
+        assert!(directory_names_beneath(&root, Path::new("../original")).is_err());
+    }
+
+    #[test]
+    fn directory_names_have_independent_positions_for_repeated_and_concurrent_reads() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        for index in 0..256 {
+            let name = OsString::from(format!("file-{index:03}"));
+            fs::write(parent.path().join(&name), "contents").unwrap();
+            expected.insert(name);
+        }
+        let root = Root::open(parent.path()).unwrap();
+        let mut first = directory_names_beneath(&root, Path::new("")).unwrap();
+        let initial = first.next().unwrap().unwrap();
+        let second = directory_names_beneath(&root, Path::new(""))
+            .unwrap().collect::<io::Result<std::collections::BTreeSet<_>>>().unwrap();
+        assert_eq!(second, expected);
+        let mut first = first.collect::<io::Result<std::collections::BTreeSet<_>>>().unwrap();
+        first.insert(initial);
+        assert_eq!(first, expected);
+
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                directory_names_beneath(&root, Path::new(""))
+                    .unwrap().collect::<io::Result<std::collections::BTreeSet<_>>>().unwrap()
+            })).collect();
+            for reader in readers {
+                assert_eq!(reader.join().unwrap(), expected);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn directory_names_preserve_non_utf8_name_bytes() {
+        let parent = tempfile::tempdir().unwrap();
+        let name = OsString::from_vec(b"raw-\xff".to_vec());
+        fs::write(parent.path().join(&name), "contents").unwrap();
+        let root = Root::open(parent.path()).unwrap();
+        let names = directory_names_beneath(&root, Path::new(""))
+            .unwrap().collect::<io::Result<Vec<_>>>().unwrap();
+        assert_eq!(names, [name]);
+    }
 
     /// Select an actually permitted non-primary group for owned fixtures.
     pub(crate) fn shared_group(file: &File) -> Option<libc::gid_t> {

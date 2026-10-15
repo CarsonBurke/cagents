@@ -6940,24 +6940,18 @@ pub(crate) fn load_directory_listing(
     root: &Path,
     relative: &Path,
 ) -> Result<Vec<RepositoryFile>, String> {
-    use std::os::fd::AsRawFd;
     let handle_root = crate::fs_safety::Root::open(root).map_err(|error| error.to_string())?;
-    let handle = if relative.as_os_str().is_empty() {
-        std::fs::File::open(root).map_err(|error| error.to_string())?
-    } else {
-        crate::fs_safety::open_beneath(&handle_root, relative).map_err(|error| error.to_string())?
-    };
-    let descriptor_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
+    let names = crate::fs_safety::directory_names_beneath(&handle_root, relative)
+        .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
     let mut entries = 0usize;
-    for entry in std::fs::read_dir(descriptor_path).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    for name in names {
+        let name = name.map_err(|error| error.to_string())?;
         entries += 1;
         if entries > 20_000 {
             return Err("This folder has more than 20,000 entries; open a narrower folder.".into());
         }
-        let name = entry.file_name();
-        if name == "." || name == ".." || name == ".git" {
+        if name == ".git" {
             continue;
         }
         let path = if relative.as_os_str().is_empty() {
