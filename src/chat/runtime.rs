@@ -2153,6 +2153,10 @@ impl Actor {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
             }
+            if matches!(&command,ActorCommand::CloseIfRevision{..}|ActorCommand::CloseIfIdle{..}) && !self.close_input_is_clear() {
+                let _=reply.send(Err("Provider input is still arriving; refresh close confirmation or stop the agent before closing".into()));
+                continue;
+            }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
@@ -2218,10 +2222,6 @@ impl Actor {
                     continue;
                 }
                 ActorCommand::CloseIfRevision {revision} => {
-                    if !self.close_input_is_clear() {
-                        let _=reply.send(Err("Provider input is still arriving; refresh close confirmation or stop the agent before closing".into()));
-                        continue;
-                    }
                     let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                     let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                     let unchanged=close.revision==revision;
@@ -2358,7 +2358,7 @@ impl Actor {
         Ok(())
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.control_replies.is_empty() {
+        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.control_replies.is_empty() || !self.close_input_is_clear() {
             UpdateReadiness::Unready
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
@@ -3812,6 +3812,7 @@ mod tests {
         let consent=handle.close_observation();
         let command=handle.enqueue_command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
         observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let idle_generation=handle.0.state.lock().unwrap().generation;
         std::fs::write(directory.path().join("release"),b"").unwrap();
         let deadline=Instant::now()+Duration::from_secs(2);
         while !directory.path().join("emitted").exists() {assert!(Instant::now()<deadline,"provider never wrote the new turn");thread::sleep(Duration::from_millis(5));}
@@ -3819,9 +3820,12 @@ mod tests {
         // completed its write. This must not overtake the unread TurnStarted.
         let (reply,response)=crossbeam_channel::bounded(1);
         handle.0.commands.send((ActorCommand::CloseIfRevision{revision:consent.close_revision},reply)).unwrap();handle.wake();
+        let (idle_reply,idle_response)=crossbeam_channel::bounded(1);
+        handle.0.commands.send((ActorCommand::CloseIfIdle{generation:idle_generation},idle_reply)).unwrap();handle.wake();
         resume.send(()).unwrap();command.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
         let refusal=response.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
         assert!(refusal.contains("input") || refusal.contains("changed"));
+        assert!(idle_response.recv_timeout(Duration::from_secs(1)).unwrap().is_err(),"legacy idle close must observe the same unread turn barrier");
         assert!(!handle.close_observation().closing);
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
