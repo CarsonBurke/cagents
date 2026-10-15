@@ -2967,7 +2967,7 @@ mod owner_path_cache_tests {
             };
             assert!(app.prepared_selection_navigates(*generation, receipt),
                 "reload must leave the held receipt valid before the deliberate retarget");
-            assert_eq!(app.worktree_owner_paths.watch.observed_for_test(&alias), Some(first.clone()),
+            assert_eq!(app.worktree_owner_paths.watch.observed_for_test(&alias), Some(first.canonicalize().unwrap()),
                 "reload must retain the exact lexical-to-physical pending mapping");
             let epoch = app.worktree_owner_paths.watch.epoch();
             std::fs::remove_file(&alias).unwrap();
