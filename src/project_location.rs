@@ -12,6 +12,7 @@ use crate::model::ProjectKind;
 pub struct ProjectLocation {
     pub key: PathBuf,
     pub kind: ProjectKind,
+    pub checkout: Option<PathBuf>,
 }
 
 /// Preserve an already-open folder identity before interpreting new Git
@@ -23,8 +24,9 @@ pub(crate) fn resolve(
     let from = fs::canonicalize(path).map_err(|error| error.to_string())?;
     if let Some(project) = model.and_then(|model| model.project(&from)) {
         return Ok(ProjectLocation {
-            key: from,
+            key: from.clone(),
             kind: project.kind,
+            checkout: project.checkout.clone().or_else(|| (project.kind == ProjectKind::Folder).then(|| from.clone())),
         });
     }
     discover(&from)
@@ -49,7 +51,7 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
     if output.status.success() {
         let key = String::from_utf8(output.stdout)
             .map_err(|_| "git reported a repository path that is not valid UTF-8".to_owned())?;
-        let key = key.trim_end();
+        let key = key.strip_suffix('\n').unwrap_or(&key);
         if key.is_empty() {
             return Err("git reported an empty repository path".into());
         }
@@ -57,6 +59,7 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
             key: fs::canonicalize(key)
                 .map_err(|error| format!("could not resolve Git directory {key}: {error}"))?,
             kind: ProjectKind::Git,
+            checkout: discover_checkout(&directory)?,
         });
     }
     let diagnostic = String::from_utf8_lossy(&output.stderr);
@@ -73,8 +76,9 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         fs::read_dir(&directory)
             .map_err(|error| format!("could not read folder {}: {error}", directory.display()))?;
         return Ok(ProjectLocation {
-            key: directory,
+            key: directory.clone(),
             kind: ProjectKind::Folder,
+            checkout: Some(directory),
         });
     }
     Err(format!(
@@ -82,6 +86,21 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         directory.display(),
         diagnostic
     ))
+}
+
+fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .env("LC_ALL", "C").current_dir(directory).stdin(Stdio::null()).output()
+        .map_err(|error| format!("could not discover checkout: {error}"))?;
+    if !output.status.success() {
+        // A bare or metadata-only open has no discoverable checkout. Do not
+        // guess from the metadata directory's spelling.
+        return Ok(None);
+    }
+    let root = String::from_utf8(output.stdout).map_err(|_| "git reported a checkout path that is not valid UTF-8")?;
+    let root = root.strip_suffix('\n').unwrap_or(&root);
+    fs::canonicalize(root).map(Some).map_err(|error| error.to_string())
 }
 
 fn exists(path: &Path) -> Result<bool, String> {
@@ -205,10 +224,25 @@ mod tests {
         assert_eq!(
             discover(&selected).unwrap(),
             ProjectLocation {
+                checkout: Some(root.path().canonicalize().unwrap()),
                 key: root.path().canonicalize().unwrap(),
                 kind: ProjectKind::Folder,
             }
         );
+    }
+
+    #[test]
+    fn separate_git_directory_keeps_the_verified_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout with spaces");
+        let metadata = root.path().join("metadata elsewhere");
+        let output = Command::new("git").args(["init", "--separate-git-dir"])
+            .arg(&metadata).arg(&checkout).output().unwrap();
+        assert!(output.status.success());
+        let location = discover(&checkout).unwrap();
+        assert_eq!(location.key, metadata.canonicalize().unwrap());
+        assert_eq!(location.checkout, Some(checkout.canonicalize().unwrap()));
+        assert_eq!(discover(&metadata).unwrap().checkout, None);
     }
 
     #[test]
@@ -267,6 +301,7 @@ mod tests {
             "a checkout outside every open project has no project"
         );
         model.projects.push(crate::workspace_model::ModelProject {
+            checkout: None,
             repository: key.clone(),
             name: "repository".into(),
             kind: ProjectKind::Git,

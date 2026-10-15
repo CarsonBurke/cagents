@@ -18,6 +18,9 @@ pub struct State {
     pub(super) select_on_load: Option<PathBuf>,
     /// Reserve one identity while registry adoption and CLI activation race.
     pub(super) pending_loads: HashMap<PathBuf, ProjectId>,
+    /// Discovery roots keyed by canonical repository identity. Device values
+    /// remain in that device's namespace and are never inspected locally.
+    pub(super) checkout_roots: HashMap<PathBuf, PathBuf>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -245,6 +248,21 @@ impl Cagents {
             return Task::none();
         }
         self.project_load_task(repository, id, false, kind)
+    }
+
+    pub(super) fn known_project_checkout(&self, repository: &Path, project_id: ProjectId) -> Option<(PathBuf, PathBuf)> {
+        if let Some(checkout) = self.project_ui.checkout_roots.get(repository) {
+            return Some((checkout.clone(), repository.to_owned()));
+        }
+        let project = self.sidebar_model.project(project_id)?;
+        if project.kind == ProjectKind::Folder {
+            return Some((project.repository.clone(), project.repository.clone()));
+        }
+        let checkout = project.worktrees.iter().find(|row| {
+            project.repository.file_name().is_some_and(|name| name == ".git")
+                && project.repository.parent() == Some(row.path.as_path())
+        }).or_else(|| project.worktrees.iter().find(|row| row.path != project.repository))?;
+        Some((checkout.path.clone(), project.repository.clone()))
     }
 
     pub(super) fn sync_worktree_protections(&mut self) {
@@ -2899,12 +2917,14 @@ mod tests {
         let model = WorkspaceModel {
             projects: vec![
                 ModelProject {
+                    checkout: None,
                     repository: child.clone(),
                     name: "Child folder".into(),
                     kind: ProjectKind::Folder,
                     ordinal: 1,
                 },
                 ModelProject {
+                    checkout: None,
                     repository: git_root.join(".git"),
                     name: "Other Git".into(),
                     kind: ProjectKind::Git,
