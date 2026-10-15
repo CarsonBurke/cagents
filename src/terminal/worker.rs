@@ -1279,12 +1279,8 @@ impl TerminalHandle {
             order.handoff = true;
         }
         let reopen = || {
-            self.inner
-                .published
-                .input_order
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .handoff = false
+            self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = false;
+            joins::ownership_changed();
         };
         let (reply, result) = crossbeam_channel::bounded(1);
         if let Err(error) = self.send_command(Command::Carry { socket, reply }) {
@@ -7226,6 +7222,46 @@ mod tests {
         drop(_cleanup);child.wait().unwrap();
         let deadline=Instant::now()+Duration::from_secs(2);
         while published.worker_join.load(Ordering::Acquire)==1 {assert!(Instant::now()<deadline);thread::yield_now();}
+    }
+
+    #[test]
+    fn failed_carry_rearms_a_parked_join_deadline_without_losing_the_original_owner() {
+        let mut child=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,child.id(),0)};assert!(descriptor>=0);
+        let published=Arc::new(PublishedState::new(true,Arc::new(|_|{})));
+        published.join_reservation.set(joins::reserve().unwrap()).unwrap();
+        published.shutdown_pidfd.set(unsafe {File::from_raw_fd(descriptor as i32)}).unwrap();
+        let (release,blocked)=crossbeam_channel::bounded(1);
+        struct Cleanup {owner:Arc<PublishedState>,release:Sender<()>}
+        impl Drop for Cleanup {fn drop(&mut self){let _=close_processes::signal(self.owner.shutdown_pidfd.get().unwrap(),libc::SIGKILL);let _=self.release.try_send(());}}
+        let cleanup=Cleanup {owner:Arc::clone(&published),release};
+        let slot=Arc::new(Mutex::new(Some(thread::spawn(move||{let _=blocked.recv();}))));
+        let (commands,receiver)=command_channel(4);
+        let handle=TerminalHandle {inner:Arc::new(HandleInner {commands,events:crossbeam_channel::unbounded().1,published:Arc::clone(&published),worker:Arc::clone(&slot)})};
+        assert!(!joins::join_until(&slot,&published,Instant::now()+Duration::from_secs(1),false,false));
+        let carrying=handle.clone();
+        let call=thread::spawn(move||carrying.carry(PathBuf::from("/unused-fixture-carry-socket")));
+        let Command::Carry {reply,..}=receiver.recv_timeout(Duration::from_secs(2)).unwrap() else {panic!("expected real carry admission");};
+        assert!(published.input_order.lock().unwrap().handoff);
+        assert!(!joins::join_until(&slot,&published,Instant::now()+Duration::from_millis(20),true,false));
+        thread::sleep(Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(),"provisional handoff must park escalation");
+        reply.send(Err("fixture refuses the carry before ownership transfer".into())).unwrap();
+        assert!(call.join().unwrap().unwrap_err().contains("fixture refuses"));
+        assert!(!published.input_order.lock().unwrap().handoff);
+        let started=Instant::now();drop(handle);assert!(started.elapsed()<Duration::from_millis(250));
+        let deadline=Instant::now()+Duration::from_secs(2);
+        let status=loop {
+            if let Some(status)=child.try_wait().unwrap(){break status;}
+            assert!(Instant::now()<deadline,"known failed carry must rearm the original pending join");thread::sleep(Duration::from_millis(5));
+        };
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(),Some(libc::SIGKILL));
+        assert_eq!(published.worker_join.load(Ordering::Acquire),1);
+        drop(cleanup);
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while published.worker_join.load(Ordering::Acquire)==1 {assert!(Instant::now()<deadline);thread::yield_now();}
+        assert_eq!(published.worker_join.load(Ordering::Acquire),2);
     }
 
     #[test]
