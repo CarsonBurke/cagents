@@ -474,6 +474,8 @@ fn watched(
         let _ = exits.try_send(Ok(exit_status(wait_status)));
     }
     let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+    let (cleanup, cleanup_acknowledged) = crossbeam_channel::bounded(1);
+    holder.cleanup = Some(cleanup_acknowledged);
     holder.acknowledged = Some(acknowledged);
     let reader = holder
         .control
@@ -492,6 +494,7 @@ fn watched(
             released,
             exits,
             acknowledge,
+            cleanup,
             exited.is_some(),
         )
         .await;
@@ -521,6 +524,7 @@ async fn watch_shared(
     released: std::io::PipeReader,
     exits: Sender<ChildExit>,
     acknowledge: Sender<Result<(), String>>,
+    cleanup: Sender<()>,
     mut reported: bool,
 ) {
     use tokio::io::unix::AsyncFd;
@@ -545,7 +549,7 @@ async fn watch_shared(
                 return;
             }
             Ok(Some(Report::CleanupProved)) => {
-                let _ = acknowledge.try_send(Ok(()));
+                let _ = cleanup.try_send(());
                 return;
             }
             Ok(Some(Report::ScreenCached | Report::AdoptionCommitted)) => {
@@ -644,6 +648,8 @@ pub(super) struct Holder {
     release: Option<std::io::PipeWriter>,
     /// The holder's answer to a detach, relayed by the watch.
     acknowledged: Option<Receiver<Result<(), String>>>,
+    /// Only Report::CleanupProved may satisfy this channel.
+    cleanup: Option<Receiver<()>>,
     detached: bool,
     adoption_pending: bool,
     registered: bool,
@@ -677,8 +683,8 @@ impl Holder {
         }
         if !self.cleanup_acknowledged {
             let remaining = deadline.checked_duration_since(Instant::now()).ok_or("Terminal family cleanup remains pending")?;
-            self.acknowledged.as_ref().ok_or("Terminal cleanup acknowledgement is unavailable")?
-                .recv_timeout(remaining).map_err(|_| "Terminal family cleanup remains pending; its exact holder is retained".to_owned())??;
+            self.cleanup.as_ref().ok_or("Terminal cleanup acknowledgement is unavailable")?
+                .recv_timeout(remaining).map_err(|_| "Terminal family cleanup remains pending; its exact holder is retained".to_owned())?;
             self.cleanup_acknowledged = true;
         }
         let remaining = deadline.checked_duration_since(Instant::now()).ok_or("Terminal cleanup receipt is pending")?;
@@ -752,6 +758,7 @@ impl Holder {
             watch: None,
             release: None,
             acknowledged: None,
+            cleanup: None,
             detached: false,
             adoption_pending: false,
             registered: false,
@@ -825,7 +832,7 @@ impl Drop for Holder {
                     self.detached = true;
                     let task = Holder {
                         control, process:self.process.take(), pidfd:self.pidfd.take(), protocol:self.protocol,
-                        watch:self.watch.take(), release:self.release.take(), acknowledged:self.acknowledged.take(),
+                        watch:self.watch.take(), release:self.release.take(), acknowledged:self.acknowledged.take(), cleanup:self.cleanup.take(),
                         detached:false, adoption_pending:false, registered:self.registered, screen_lost:self.screen_lost,
                         cleanup_proved:self.cleanup_proved, release_requested:self.release_requested,
                         cleanup_acknowledged:self.cleanup_acknowledged, record:self.record.take(),
@@ -2466,6 +2473,7 @@ mod tests {
             "discovery must exist before startup is acknowledged"
         );
         let record = records[0].clone();
+        assert_eq!(record.version,5,"fresh registered holder evidence must use the family-cleanup protocol");
         cleanup.holder = Some(open_pidfd(record.holder.pid).unwrap());
         cleanup.daemon.kill().unwrap();
         cleanup.daemon.wait().unwrap();
@@ -2634,6 +2642,15 @@ mod tests {
         );
         assert!(!socket.exists(), "explicit release removes its endpoint");
         assert!(registry::cleanup::confirmed(&original, &record, &final_proof).unwrap());
+        let receipt = holders.join(format!("{}-{}-{}.closed",record.terminal,record.holder.pid,record.holder.start));
+        let positive = std::fs::read(&receipt).unwrap();
+        let mut legacy:serde_json::Value=serde_json::from_slice(&positive).unwrap();
+        assert_eq!(legacy["family_reaped"],true);
+        legacy.as_object_mut().unwrap().remove("family_reaped");
+        std::fs::write(&receipt,serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!registry::cleanup::confirmed(&original,&record,&final_proof).unwrap(),"root-only legacy receipt cannot authorize family cleanup");
+        std::fs::write(&receipt,positive).unwrap();
+        assert!(registry::cleanup::confirmed(&original,&record,&final_proof).unwrap());
         let mut replacement = record.clone();
         replacement.holder.start += 1;
         assert!(
@@ -2917,6 +2934,29 @@ while not (root/'exit-root').exists(): time.sleep(.005)
         held.holder.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
         assert!(!child.is_current());
         assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"only the positive later retry releases setup authority");
+    }
+
+    #[test]
+    fn stale_screen_ack_and_holder_exit_do_not_prove_descendant_cleanup() {
+        struct Kill(File);
+        impl Drop for Kill {fn drop(&mut self){let _=signal(&self.0,libc::SIGKILL);}}
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut held,_exited,_lease,child)=setup_family_fixture(directory.path());
+        let _root_cleanup=Kill(open_pidfd(held.child.pid()).unwrap());
+        let _child_cleanup=Kill(open_pidfd(child.pid).unwrap());
+        let helper=held.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
+        signal(&helper,libc::SIGSTOP).unwrap();
+        assert!(held.holder.close_until(Instant::now()+Duration::from_millis(50)).is_err());
+        assert!(held.holder.release_requested);
+        // Simulate a CacheScreen acknowledgement arriving after that method's
+        // deadline. It is not a cleanup response, even if the helper exits.
+        let (screen,screen_ack)=crossbeam_channel::bounded(1);
+        screen.send(Ok(())).unwrap();held.holder.acknowledged=Some(screen_ack);
+        signal(&helper,libc::SIGKILL).unwrap();
+        assert!(exits_within(&helper,Duration::from_secs(1)).unwrap());
+        assert!(child.is_current(),"the escaped child must demonstrate why holder death is insufficient");
+        assert!(held.holder.close_until(Instant::now()+Duration::from_millis(50)).is_err(),"only CleanupProved may satisfy the cleanup barrier");
+        held.holder.leave_for_successor();
     }
 
 }

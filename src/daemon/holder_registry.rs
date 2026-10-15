@@ -233,7 +233,7 @@ impl Record {
 
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4),
+            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
             Kind::Native => matches!(self.version, 2 | 3 | 4),
         }
     }
@@ -585,10 +585,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_receipt_protocol_is_discovered_without_widening_native_versions() {
+    fn terminal_family_protocol_is_discovered_without_widening_native_versions() {
         let directory = tempfile::tempdir().unwrap();
         let mut terminal = record();
-        terminal.version = 4;
+        terminal.version = 5;
         terminal.create(directory.path()).unwrap();
         assert_eq!(
             evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
@@ -600,7 +600,7 @@ mod tests {
         );
         let mut native = record();
         native.kind = Kind::Native;
-        native.version = 4;
+        native.version = 5;
         native.create(directory.path()).unwrap();
         assert!(evidence(&socket(directory.path(), native.terminal), Kind::Native).is_err());
         assert!(
