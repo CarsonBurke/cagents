@@ -2999,7 +2999,8 @@ impl Adapter for Codex {
         }
         // This frame explicitly names a native turn. Bind only the actual
         // visible aliases emitted for that frame, including split text parts.
-        if let Some(turn_id) = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str()) {
+        if thread == self.thread.as_deref()
+            && let Some(turn_id) = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str()) {
             let mut bindings = Step::default();
             self.bind_turn_items(turn_id, step.events.iter().filter_map(|event| match event {
                 Event::Item(item) => Some(item.id.as_str()),
@@ -4131,6 +4132,8 @@ mod tests {
         assert!(!finished.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
         let unrelated = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"unrelated","turn":{"id":"unknown","status":"completed","items":[]}}})).unwrap();
         assert!(!unrelated.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
+        let unscoped = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"turnId":"unknown","itemId":"unscoped","delta":"text"}})).unwrap();
+        assert!(!unscoped.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
     }
 
     #[test]
