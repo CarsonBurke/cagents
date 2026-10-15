@@ -258,6 +258,7 @@ pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::Term
 /// Receipt-owned thread learning is narrower than ordinary logical-source
 /// matching. Known thread IDs and all other issued source fields remain exact.
 pub fn handoff_chat_source_matches(expected:&crate::chat::Session,confirmed:&crate::chat::Session)->bool {
+    if expected.archive_report.is_some() || confirmed.archive_report.is_some() {return false;}
     let mut confirmed=confirmed.clone();
     if expected.launch.session_id.is_none() {confirmed.launch.session_id=None;}
     same_card_source(&CardKind::Chat(expected.clone()),&CardKind::Chat(confirmed))
@@ -630,7 +631,7 @@ pub(crate) mod handoff_tests {
         let mut terminal=TerminalDescriptor::relaunchable(TerminalId::new(),recipe.clone(),None);
         terminal.execution_instance=uuid::Uuid::new_v4();
         terminal.session.continuity=TerminalContinuity::Live {host_session_id:HostSessionId::new("host"),boot_id:BootId::new("boot"),host_incarnation:HostIncarnation::new("incarnation")};
-        let chat=crate::chat::Session {id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe,session_id:None},proof:terminal.session.continuity.live_proof(),terminal:None,owned_codex_listener:None,native_continuity:Default::default()};
+        let chat=crate::chat::Session {id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe,session_id:None},proof:terminal.session.continuity.live_proof(),terminal:None,owned_codex_listener:None,native_continuity:Default::default(),archive_report:None};
         let before=Pane {id:CardId::new(),title:"Chat".into(),user_title:None,width_fraction:1.0,pending_terminal_start:false,kind:CardKind::Chat(chat.clone()),scope:None};
         let mut confirmed=chat;confirmed.launch.session_id=Some("confirmed".into());
         let execution_instance=uuid::Uuid::new_v4();
@@ -656,6 +657,10 @@ pub(crate) mod handoff_tests {
         assert!(same_removal_pane_source(&before,&current,Some(&promoted)),"metadata promotion does not replace the concrete source backend");
         promoted.source_binding.source.launch.session_id=Some("other-known-thread".into());
         assert!(!same_removal_pane_source(&before,&current,Some(&promoted)),"known backend conversation remains exact");
+        let mut report_receipt=receipt.clone();
+        report_receipt.source.archive_report=Some(crate::chat::ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()});
+        report_receipt.source_binding.source=report_receipt.source.clone();
+        assert!(!same_removal_pane_source(&before,&current,Some(&report_receipt)),"read-only report identity cannot become an executable handoff");
         for variant in 0..8 {
             let mut changed=current.clone();let mut proof=receipt.clone();
             match variant {
