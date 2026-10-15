@@ -2834,16 +2834,20 @@ pub struct WorktreeAttention<'a> {
     pub state: Option<AttentionState>,
     pub outcome: Option<&'a crate::agent::ActivityOutcome>,
     pub unread: bool,
+    outcome_card: Option<CardId>,
 }
 
 impl<'a> WorktreeAttention<'a> {
-    fn observe(&mut self, activity: Option<crate::agent::ActivityState>, unread: bool, outcome: Option<&'a crate::agent::ActivityOutcome>) {
+    fn observe(&mut self, card: CardId, activity: Option<crate::agent::ActivityState>, unread: bool, outcome: Option<&'a crate::agent::ActivityOutcome>) {
         self.state = self.state.max(attention_state(activity, unread, outcome));
         self.unread |= unread;
         if let Some(outcome) = outcome
-            && self.outcome.is_none_or(|previous| outcome_priority(outcome) > outcome_priority(previous))
+            && self.outcome.is_none_or(|previous| {
+                (outcome_priority(outcome), Some(card)) > (outcome_priority(previous), self.outcome_card)
+            })
         {
             self.outcome = Some(outcome);
+            self.outcome_card = Some(card);
         }
     }
 }
@@ -3179,7 +3183,7 @@ impl SidebarState {
             let Some((owner, worktree)) = entry.owner else { continue; };
             if owner == project {
                 summaries.entry(worktree).or_default().observe(
-                    Some(entry.activity.state), self.has_card_update(*card), self.card_outcome(*card));
+                    *card, Some(entry.activity.state), self.has_card_update(*card), self.card_outcome(*card));
             }
         }
         // Unread ownership survives a restart before the live activity map is
@@ -3188,7 +3192,7 @@ impl SidebarState {
             if let Some((owner, worktree)) = owner
                 && *owner == project
             {
-                summaries.entry(*worktree).or_default().observe(None, true, self.card_outcome(*card));
+                summaries.entry(*worktree).or_default().observe(*card, None, true, self.card_outcome(*card));
             }
         }
         summaries
@@ -12037,6 +12041,23 @@ pub(crate) mod tests {
         status.dirty.unstaged = 1;
         row.apply_status(&status);
         assert!(matches!(worktree_change_icon(&row), Icon::Changes));
+    }
+
+    #[test]
+    fn attention_summary_equal_failures_match_row_ties_even_after_unread_pass() {
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        let mut state = SidebarState::default();
+        let mut cards = [CardId::new(), CardId::new()];
+        cards.sort();
+        for (index, card) in cards.into_iter().enumerate() {
+            state.set_agent_activity(card, project, worktree, crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Idle });
+            state.set_card_outcome(card, Some(crate::agent::ActivityOutcome::Failed { reason: format!("failure {index}") }));
+        }
+        state.observe_agent_update(cards[0], project, worktree);
+        let summaries = state.worktree_attention_summaries(project);
+        assert_eq!(summaries[&worktree].outcome, state.worktree_outcome(project, worktree));
+        assert_eq!(summaries[&worktree].outcome.and_then(|outcome| outcome.reason()), Some("failure 1"));
     }
 
     #[test]
