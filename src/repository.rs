@@ -5,6 +5,7 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod managed_worktrees;
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{
     WorktreeSetupCreationIdentity, WorktreeSetupGuard, WorktreeSetupIntent, WorktreeSetupPlan,
@@ -11279,6 +11280,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            self.ensure_managed_directory_ignored(
+                &journal.request.repository,
+                &journal.request.managed_root,
+                cancellation,
+            )?;
+            self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;
             let plan = self.plan_worktree_creation(&journal.request)?;
