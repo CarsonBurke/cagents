@@ -2006,14 +2006,14 @@ impl Cagents {
                 if dialog.stale_lock {
                     let request = dialog.request;
                     let store = self.session.as_ref().unwrap().operation_store();
-                    let allow_local = crate::device::selected().is_none();
+                    let device = stop_device_key();
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             unlock_stale_worktree_for_window(
                                 &store,
                                 &target.repository,
                                 &target.path,
-                                allow_local,
+                                &device,
                             )
                         })
                         .await
@@ -3725,29 +3725,40 @@ fn unlock_stale_worktree_for_window(
     store: &crate::persistence::StateStore,
     repository: &Path,
     path: &Path,
-    allow_local: bool,
+    device: &Option<(String, String, String)>,
 ) -> Result<(), String> {
-    let local = if allow_local {
-        RepositoryService::system("git").unlock_stale_worktree(
-            store,
-            repository,
-            path,
-            &CancellationToken::new(),
-        )
-    } else {
-        Err("This worktree belongs to the selected device".into())
-    };
-    local.or_else(|local_error| {
-        match worktree_control_request(crate::worktree_control::Operation::StaleLock {
-            repository: repository.to_path_buf(),
-            path: path.to_path_buf(),
-            unlock: true,
-        }) {
-            Ok(crate::worktree_control::Reply::StaleLock { unlocked: true }) => Ok(()),
-            Ok(_) => Err("Unexpected stale-lock unlock response".into()),
-            Err(error) => Err(format!("{local_error}; {error}")),
-        }
-    })
+    stale_worktree_lock_for_window(store, repository, path, device, true)
+}
+
+fn stale_worktree_lock_for_window(
+    store: &crate::persistence::StateStore,
+    repository: &Path,
+    path: &Path,
+    device: &Option<(String, String, String)>,
+    unlock: bool,
+) -> Result<(), String> {
+    if *device != stop_device_key() {
+        return Err("The selected device changed. Refresh and review the worktree lock again.".into());
+    }
+    if device.is_none() {
+        // The durable creation receipt belongs to this original window store.
+        // A refusal must not retry against a daemon's unrelated journal.
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        return if unlock {
+            service.unlock_stale_worktree(store, repository, path, &cancellation)
+        } else {
+            service.stale_worktree_lock(store, repository, path, &cancellation)
+        };
+    }
+    // A remote path is never handed to local Git. The remote service can
+    // proceed only if it has genuine matching creation provenance of its own.
+    match worktree_control_request(crate::worktree_control::Operation::StaleLock {
+        repository: repository.to_path_buf(), path: path.to_path_buf(), unlock,
+    })? {
+        crate::worktree_control::Reply::StaleLock { unlocked } if unlocked == unlock => Ok(()),
+        _ => Err("Unexpected stale-lock response".into()),
+    }
 }
 
 fn delete_confirmed_worktree_branch(worker: BranchDeletion, force: bool)
@@ -3813,11 +3824,14 @@ fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
 fn delete_options_task(
     target: Target,
     request: u64,
-    store: crate::persistence::StateStore,
+    store: Arc<crate::persistence::StateStore>,
 ) -> Task<Message> {
-    let allow_local = crate::device::selected().is_none();
+    let device = stop_device_key();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
+            if device != stop_device_key() {
+                return Err("The selected device changed. Refresh and review again.".into());
+            }
             let crate::worktree_control::Reply::Listed { worktrees: records } =
                 worktree_control_request(crate::worktree_control::Operation::List {
                     repository: target.repository.clone(),
@@ -3835,28 +3849,13 @@ fn delete_options_task(
                     .any(|other| other.path != record.path && other.branch.as_ref() == Some(branch))
             });
             let lock = record.locked.then(|| {
-                let local = if allow_local {
-                    RepositoryService::system("git").stale_worktree_lock(
-                        &store,
-                        &target.repository,
-                        &target.path,
-                        &CancellationToken::new(),
-                    )
-                } else {
-                    Err("This worktree belongs to the selected device".into())
-                };
-                local.or_else(|local_error| {
-                    match worktree_control_request(crate::worktree_control::Operation::StaleLock {
-                        repository: target.repository.clone(),
-                        path: target.path.clone(),
-                        unlock: false,
-                    }) {
-                        Ok(crate::worktree_control::Reply::StaleLock { unlocked: false }) => Ok(()),
-                        Ok(_) => Err("Unexpected stale-lock inspection response".into()),
-                        Err(error) => Err(format!("{local_error}; {error}")),
-                    }
-                })
+                stale_worktree_lock_for_window(
+                    &store, &target.repository, &target.path, &device, false,
+                )
             });
+            if device != stop_device_key() {
+                return Err("The selected device changed. Refresh and review again.".into());
+            }
             Ok(DeleteOptions {
                 branch_elsewhere,
                 stale_lock: matches!(&lock, Some(Ok(()))),
@@ -4468,6 +4467,53 @@ mod tests {
             }
             drop(inspection); server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn local_stale_lock_uses_the_original_window_journal_and_rechecks_its_live_lease() {
+        use crate::repository::{BaseRevision, CreateWorktreeRequest, ValidatedBranchName};
+        use std::os::fd::AsRawFd;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("repository");
+        git(&root, &["init", "-b", "main", "repository"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "base"]);
+        let (session, _) = SessionRuntime::open(&root.join("window.sqlite3"), crate::model::BootId::new("lock-window")).unwrap();
+        let store = session.operation_store();
+        let request = CreateWorktreeRequest {
+            repository: repository.clone(), managed_root: root.join("managed"),
+            destination: root.join("managed/feature"),
+            branch: ValidatedBranchName::parse("feature").unwrap(),
+            base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
+            track: false, operation_id: crate::model::OperationId::new(), setup_intent: None,
+        };
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        let (progress, _) = async_channel::bounded(8);
+        let report = service.create_worktree_journaled(&store, &request, 7, &cancellation, &progress);
+        assert_eq!(report.state, crate::repository::WorktreeOperationState::Created, "{report:?}");
+        let reason = format!("cagents:{}", request.operation_id);
+        git(&repository, &["worktree", "lock", "--reason", &reason, request.destination.to_str().unwrap()]);
+        let locked = || service.list_worktrees(&repository, &cancellation).unwrap().into_iter()
+            .find(|record| record.path == request.destination).unwrap().lock.locked;
+        stale_worktree_lock_for_window(&store, &repository, &request.destination, &None, false).unwrap();
+        assert!(locked(), "eligibility must not unlock");
+        let unrelated = crate::persistence::StateStore::open(root.join("other.sqlite3"), crate::model::BootId::new("unrelated")).unwrap();
+        for unlock in [false, true] {
+            assert!(stale_worktree_lock_for_window(&unrelated, &repository, &request.destination, &None, unlock).unwrap_err().contains("No matching cagents creation receipt"));
+            assert!(locked(), "another store must not borrow the window's receipt");
+        }
+        let common = service.common_dir(&repository, &cancellation).unwrap();
+        let lease = std::fs::OpenOptions::new().read(true).write(true)
+            .open(common.join(format!("cagents-operation-{}.lease", request.operation_id))).unwrap();
+        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)}, 0);
+        assert!(unlock_stale_worktree_for_window(&store, &repository, &request.destination, &None).unwrap_err().contains("lease"));
+        assert!(locked());
+        drop(lease);
+        unlock_stale_worktree_for_window(&store, &repository, &request.destination, &None).unwrap();
+        assert!(!locked());
+        let wrong_device = Some(("other".into(), "example.invalid".into(), "cagents".into()));
+        assert!(stale_worktree_lock_for_window(&store, &repository, &request.destination, &wrong_device, true).unwrap_err().contains("selected device changed"));
     }
 
     #[test]
