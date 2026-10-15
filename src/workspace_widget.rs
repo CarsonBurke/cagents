@@ -434,6 +434,32 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
+/// Parse one configured chord for a native menu, including named keys.
+pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
+    use cosmic::widget::menu::{KeyBind, key_bind::Modifier};
+    use keyboard::{Key, key::Named};
+    let binding = crate::settings::parse_shortcut(raw).ok()?;
+    let modifiers = [(binding.control, Modifier::Ctrl), (binding.alt, Modifier::Alt), (binding.logo, Modifier::Super), (binding.shift, Modifier::Shift)]
+        .into_iter().filter_map(|(held, modifier)| held.then_some(modifier)).collect();
+    let key = match binding.key {
+        ShortcutKey::Character(ch) => Key::Character(ch.to_string().into()),
+        ShortcutKey::ArrowLeft => Key::Named(Named::ArrowLeft),
+        ShortcutKey::ArrowRight => Key::Named(Named::ArrowRight),
+        ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
+        ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
+        ShortcutKey::Tab => Key::Named(Named::Tab),
+        ShortcutKey::PageUp => Key::Named(Named::PageUp),
+        ShortcutKey::PageDown => Key::Named(Named::PageDown),
+        ShortcutKey::Function(number) => Key::Named(match number {
+            1 => Named::F1, 2 => Named::F2, 3 => Named::F3, 4 => Named::F4,
+            5 => Named::F5, 6 => Named::F6, 7 => Named::F7, 8 => Named::F8,
+            9 => Named::F9, 10 => Named::F10, 11 => Named::F11, 12 => Named::F12,
+            _ => return None,
+        }),
+    };
+    Some(KeyBind { modifiers, key })
+}
+
 /// The chords bound to `action`, in the one-line form the settings pane
 /// reads back.
 pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
