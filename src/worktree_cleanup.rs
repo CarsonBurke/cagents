@@ -132,8 +132,7 @@ impl PreparedRemoval {
         // Files-backend locks do not fence a reftable repository. Preserve
         // unsupported ref storage rather than claiming the same guarantee.
         use crate::process::ProcessExecutor;
-        let command = crate::process::CommandSpec::new("git")
-            .cwd(&request.repository)
+        let command = service.git_base(&request.repository, false)
             .args(["config", "--get", "extensions.refStorage"]);
         let output = crate::process::SystemProcessExecutor
             .execute(&command, &cancellation)
@@ -230,8 +229,7 @@ impl PreparedRemoval {
         {
             return Err("Worktree administrative identity changed".into());
         }
-        let command = crate::process::CommandSpec::new("git")
-            .cwd(&self.request.repository)
+        let command = service.git_base(&self.request.repository, false)
             .args(["worktree", "remove", "--"])
             .arg(self.request.path.as_os_str())
             .timeout(std::time::Duration::from_secs(30))
