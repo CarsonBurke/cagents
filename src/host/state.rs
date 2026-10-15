@@ -1,4 +1,6 @@
 mod presentation;
+#[cfg(test)]
+mod paired_upgrade_tests;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},

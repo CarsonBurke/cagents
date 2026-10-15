@@ -744,6 +744,20 @@ pub(crate) mod handoff {
                                 .is_some_and(|source| source.id == terminal.source.id)
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
+                if paired_codex
+                    && !chat.source.owns_codex_listener()
+                    && !matches!(chat.source.native_continuity, chat::NativeContinuity::Durable { .. })
+                {
+                    let original = chat.source.terminal.as_ref().expect("checked pair");
+                    let terminal = self.terminals.iter().find(|terminal| terminal.source.id == original.id)
+                        .expect("checked paired terminal");
+                    let mut replacement = terminal.source.clone();
+                    replacement.launch = terminal.recipe.clone();
+                    replacement.continuity = original.continuity.clone();
+                    if &replacement != original {
+                        return Err("Paired Codex terminal descriptor would change during restart; source was not stopped".into());
+                    }
+                }
                 if !chat_ids.insert(chat.source.id)
                     || (!ids.insert(chat.source.id) && !paired_codex)
                     || chat.source.proof.as_ref() != Some(&self.proof)
@@ -861,6 +875,18 @@ pub(crate) mod handoff {
                     .is_some_and(|proof| Some(proof) != source.proof.as_ref()))
         {
             return Err("Upgrade native terminal ownership is inconsistent".into());
+        }
+        // A legacy Codex attachment restarts from its paired terminal. That
+        // terminal's issued descriptor is part of the saved chat identity;
+        // normalizing fresh/shell argv to resume argv would change it after
+        // the source has stopped. Retained pairs keep their original worker.
+        if source.launch.provider == crate::agent::Provider::Codex
+            && !source.owns_codex_listener()
+            && !matches!(source.native_continuity, chat::NativeContinuity::Durable { .. })
+            && let Some(terminal) = &source.terminal
+            && Some(&terminal.launch) != launch.terminal_recipe().as_ref()
+        {
+            return Err("Paired Codex terminal needs a different restart recipe; close or recover its paired view before upgrading. Its existing provider remains active".into());
         }
         Ok(())
     }
