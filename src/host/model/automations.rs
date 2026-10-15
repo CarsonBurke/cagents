@@ -4915,8 +4915,20 @@ mod tests {
         host.reserve_spawn(native).unwrap();
         assert!(host.edit_model(1, edit.clone()).is_err(), "an exact pending identity is not a retired worker");
         host.cancel_spawn(native);
+        let Some(crate::agent_execution::HostedSession::Chat(source)) = &agent.session else { unreachable!() };
+        host.native_adoption_failures.remember_upgrade(&crate::upgrade::handoff::Chat {
+            source: source.clone(), previous_sources: vec![], launch: source.launch.clone(),
+        }, "fixture retained source refused restoration");
+        assert!(host.edit_model(1, edit.clone()).is_err(),
+            "a known unadopted retained source is not an absent actor");
+        host.native_adoption_failures = Default::default();
+        let mut unrelated = source.clone(); unrelated.id = crate::model::TerminalId::new();
+        host.native_adoption_failures.remember_upgrade(&crate::upgrade::handoff::Chat {
+            launch: unrelated.launch.clone(), source: unrelated, previous_sources: vec![],
+        }, "unrelated retained source");
         assert_eq!(host.inventory_count(), 0);
         let after = host.edit_model(1, edit).unwrap();
+        assert!(!host.native_adoption_failures.is_empty(), "unrelated restoration evidence survives membership removal");
         assert!(after.views.iter().find(|view| view.scope == scope).unwrap().panes.is_empty(),
             "membership-only authority needs no missing/nil/borrowed execution UUID");
         assert_eq!(host.inventory_count(), 0);

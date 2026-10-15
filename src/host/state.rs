@@ -627,6 +627,7 @@ impl HostState {
                 ids.extend(owner.console.iter().map(|console| console.id));
                 if self.execution_startups.contains_key(&owner.id) || ids.iter().any(|id| {
                     self.terminals.contains_key(id) || self.chats.contains_key(id)
+                        || self.native_adoption_failures.contains_id(*id)
                         || self.spawning.contains(id) || self.browser_logins_spawning.contains(id)
                         || self.chat_spawning.contains_key(id) || self.chat_bindings.contains_key(id)
                         || self.native_closing.contains_key(id) || self.upgrade_chats.contains_key(id)

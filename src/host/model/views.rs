@@ -242,7 +242,6 @@ pub(super) fn apply(
                 Change::RemoveArchivedAutomationSource { before, .. } => {
                     if owner(transaction, before.id)?.as_ref() != Some(scope)
                         || view.panes.iter().filter(|pane| pane.id == before.id).count() != 1
-                        || resource_owner(transaction, before)?.is_some()
                         || super::automation_membership::archived_owner_in(transaction, before)?.is_none() {
                         return Err("workspace archived pane source conflict".into());
                     }

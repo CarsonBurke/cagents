@@ -19,6 +19,12 @@ impl AdoptionFailures {
         self.0.is_empty()
     }
 
+    /// A known failed restore is an identity-scoped veto, never ownership or
+    /// cleanup authority. Descriptor aliases must not hide a retained source.
+    pub(in crate::host) fn contains_id(&self, id: TerminalId) -> bool {
+        self.0.iter().any(|failure| failure.id == id)
+    }
+
     const LIMIT: usize = 128;
     const MESSAGE_BYTES: usize = 4096;
 
