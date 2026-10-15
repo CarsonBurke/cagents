@@ -4,7 +4,8 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, WorktreeInput, WorktreeOperationReport, WorktreeOperationState, RetainedWorktreeCreation, SettledCreatedWorktree,
+        CreateWorktreeRequest, RetainedWorktreeCreation, SettledCreatedWorktree, WorktreeInput,
+        WorktreeOperationReport, WorktreeOperationState,
     },
 };
 
@@ -30,7 +31,9 @@ impl Journal {
         Err("Worktree creation requires the supported original editor journal owner on this platform.".into())
     }
     #[cfg(target_os = "linux")]
-    pub(super) fn original_creation_journal(&self) -> &cagents::original_creation_journal::OriginalCreationJournalStore {
+    pub(super) fn original_creation_journal(
+        &self,
+    ) -> &cagents::original_creation_journal::OriginalCreationJournalStore {
         &self.original
     }
 }
@@ -53,7 +56,10 @@ pub(crate) enum Action {
     Finished(OperationId, Result<RetainedWorktreeCreation, String>),
     CreatedOpened(u64, Result<(Opened, SettledCreatedWorktree), String>),
     RetryPrivate(OperationId),
-    PrivateRetried(OperationId, Result<cagents::repository::CreationPrivateRetry, String>),
+    PrivateRetried(
+        OperationId,
+        Result<cagents::repository::CreationPrivateRetry, String>,
+    ),
     Cancel,
     Edit,
     Open(PathBuf),
@@ -61,7 +67,10 @@ pub(crate) enum Action {
 
 #[derive(Clone)]
 enum Base {
-    PullRequest { target: CheckoutTarget, authority: Option<WorktreeAuthority> },
+    PullRequest {
+        target: CheckoutTarget,
+        authority: Option<WorktreeAuthority>,
+    },
     Commit {
         authority: WorktreeAuthority,
         head: cagents::repository::Oid,
@@ -144,7 +153,10 @@ impl Editor {
     }
 
     pub(super) fn begin_checkout(&mut self, target: CheckoutTarget) {
-        let authority = self.tabs.iter().find(|tab| tab.runtime.descriptor.worktree == target.repository)
+        let authority = self
+            .tabs
+            .iter()
+            .find(|tab| tab.runtime.descriptor.worktree == target.repository)
             .and_then(|tab| tab.worktree_authority.clone());
         self.begin_checkout_base(Base::PullRequest { target, authority });
     }
@@ -216,10 +228,13 @@ impl Editor {
                 }
             }
             Action::Open(path) => {
-                let created = self.checkout_dialog.as_ref()
+                let created = self
+                    .checkout_dialog
+                    .as_ref()
                     .filter(|d| d.completed.as_ref() == Some(&path))
                     .and_then(|d| self.checkout_owners.get(&d.id))
-                    .and_then(Option::as_ref).and_then(|retained| retained.created.clone());
+                    .and_then(Option::as_ref)
+                    .and_then(|retained| retained.created.clone());
                 if let Some(created) = created {
                     self.checkout_dialog = None;
                     return self.open_created_checkout(created);
@@ -362,14 +377,17 @@ impl Editor {
                         self.checkout_owners.remove(&id);
                     }
                     let report = &retained.report;
-                    self.checkout_history.retain(|r| r.operation_id != report.operation_id);
+                    self.checkout_history
+                        .retain(|r| r.operation_id != report.operation_id);
                     self.checkout_history.push(report.clone());
                     self.trim_checkout_history();
                 }
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
                     dialog.cancellation = None;
                     match result {
-                        Ok(retained) if retained.report.state == WorktreeOperationState::Created => {
+                        Ok(retained)
+                            if retained.report.state == WorktreeOperationState::Created =>
+                        {
                             if let Some(created) = &retained.created {
                                 dialog.completed = Some(created.record().path.clone());
                             } else {
@@ -380,7 +398,9 @@ impl Editor {
                         Err(error) => {
                             // Keep the admitted negative obligation. A join or
                             // transport error cannot prove no effects occurred.
-                            dialog.error = Some(format!("Checkout outcome needs reconciliation: {error}. Original ownership was not discarded."));
+                            dialog.error = Some(format!(
+                                "Checkout outcome needs reconciliation: {error}. Original ownership was not discarded."
+                            ));
                         }
                     }
                     dialog.request = None;
@@ -399,27 +419,54 @@ impl Editor {
                         // The producer only grants this SAME settled carrier
                         // after exact durable unlock and private-clear proof.
                         // Release duplicate archive ownership AFTER adoption.
-                        if self.checkout_owners.get(&operation).and_then(Option::as_ref).and_then(|retained| retained.created.as_ref()).is_some_and(|original| original.generation() == generation) {
+                        if self
+                            .checkout_owners
+                            .get(&operation)
+                            .and_then(Option::as_ref)
+                            .and_then(|retained| retained.created.as_ref())
+                            .is_some_and(|original| original.generation() == generation)
+                        {
                             self.checkout_owners.remove(&operation);
                         }
                     }
                     return task;
                 }
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(error) => self.notice = Some(error),
             },
             Action::RetryPrivate(id) => {
-                if self.checkout_retry_pending.contains(&id) { return Task::none(); }
-                let Some(owner) = self.checkout_owners.get(&id).and_then(Option::as_ref).and_then(|retained| retained.retention()).cloned() else { return Task::none(); };
-                if owner.recovery_summary().is_clear() { return Task::none(); }
+                if self.checkout_retry_pending.contains(&id) {
+                    return Task::none();
+                }
+                let Some(owner) = self
+                    .checkout_owners
+                    .get(&id)
+                    .and_then(Option::as_ref)
+                    .and_then(|retained| retained.retention())
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                if owner.recovery_summary().is_clear() {
+                    return Task::none();
+                }
                 self.checkout_retry_pending.insert(id);
                 return cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || owner.retry_private_steps().map_err(|error| error.to_string())).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    let result = tokio::task::spawn_blocking(move || {
+                        owner
+                            .retry_private_steps()
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
                     Message::Checkout(Action::PrivateRetried(id, result))
                 });
             }
             Action::PrivateRetried(id, result) => {
-                if !self.checkout_retry_pending.remove(&id) { return Task::none(); }
+                if !self.checkout_retry_pending.remove(&id) {
+                    return Task::none();
+                }
                 // A successful private retry never grants a new settled cap or
                 // reconciles an Unknown result, and never evicts its owner.
                 if self.checkout_owners.contains_key(&id) {
@@ -457,8 +504,18 @@ impl Editor {
     }
 
     fn retained_created_checkout(&self, operation: OperationId) -> Option<SettledCreatedWorktree> {
-        self.checkout_owners.get(&operation).and_then(Option::as_ref).and_then(|retained| retained.created.clone())
-            .or_else(|| self.tabs.iter().find_map(|tab| tab.created_worktree.as_ref().filter(|created| created.operation() == operation).cloned()))
+        self.checkout_owners
+            .get(&operation)
+            .and_then(Option::as_ref)
+            .and_then(|retained| retained.created.clone())
+            .or_else(|| {
+                self.tabs.iter().find_map(|tab| {
+                    tab.created_worktree
+                        .as_ref()
+                        .filter(|created| created.operation() == operation)
+                        .cloned()
+                })
+            })
     }
 
     fn open_created_checkout(&mut self, created: SettledCreatedWorktree) -> Task<Message> {
@@ -469,10 +526,22 @@ impl Editor {
             let result = tokio::task::spawn_blocking(move || {
                 created.validate().map_err(|error| error.to_string())?;
                 let authority = created.destination().clone();
-                let snapshot = read_display_snapshot(authority.path(), limit, Some(authority.clone()))?;
+                let snapshot =
+                    read_display_snapshot(authority.path(), limit, Some(authority.clone()))?;
                 created.validate().map_err(|error| error.to_string())?;
-                Ok((Opened { root: authority.path().to_owned(), file: None, snapshot: Some(snapshot), authority: Some(authority) }, created))
-            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                Ok((
+                    Opened {
+                        root: authority.path().to_owned(),
+                        file: None,
+                        snapshot: Some(snapshot),
+                        authority: Some(authority),
+                    },
+                    created,
+                ))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::Checkout(Action::CreatedOpened(epoch, result))
         })
     }
@@ -506,13 +575,25 @@ impl Editor {
                             let pending = owner.recovery_summary();
                             if !pending.is_clear() {
                                 rows.push(widget::text::body(format!("Private recovery pending: {} preparations, {} publications.", pending.pending_preparations, pending.pending_publications)).into());
-                                rows.push(widget::button::standard("Retry private recovery").on_press_maybe((!self.checkout_retry_pending.contains(id)).then_some(Message::Checkout(Action::RetryPrivate(*id)))).into());
+                                rows.push(
+                                    widget::button::standard("Retry private recovery")
+                                        .on_press_maybe(
+                                            (!self.checkout_retry_pending.contains(id)).then_some(
+                                                Message::Checkout(Action::RetryPrivate(*id)),
+                                            ),
+                                        )
+                                        .into(),
+                                );
                             } else if retained.created.is_none() {
                                 rows.push(widget::text::body("Private steps are clear. The original creation still needs journal reconciliation; its ownership is retained.").into());
                             }
                         }
                         if retained.created.is_some() {
-                            rows.push(widget::button::standard("Open retained worktree").on_press(Message::Checkout(Action::OpenRecorded(*id))).into());
+                            rows.push(
+                                widget::button::standard("Open retained worktree")
+                                    .on_press(Message::Checkout(Action::OpenRecorded(*id)))
+                                    .into(),
+                            );
                         }
                     } else {
                         rows.push(widget::text::body("The original worker outcome is pending or requires reconciliation. Its admission remains retained.").into());
@@ -531,7 +612,10 @@ impl Editor {
                     );
                 }
                 rows.push(design::caption(&report.detail).into());
-                if self.retained_created_checkout(report.operation_id).is_some() {
+                if self
+                    .retained_created_checkout(report.operation_id)
+                    .is_some()
+                {
                     rows.push(
                         widget::button::standard("Open worktree")
                             .on_press(Message::Checkout(Action::OpenRecorded(report.operation_id)))
@@ -657,94 +741,246 @@ mod tests {
 
     fn click_retained_checkout(app: &Editor, label: &str) -> Message {
         use iced::advanced::{Layout, Shell, layout, mouse, renderer::Headless, widget::Tree};
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let renderer = runtime.block_on(<cosmic::Renderer as Headless>::new(iced::Font::DEFAULT, iced::Pixels::from(16), Some("tiny-skia"))).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let renderer = runtime
+            .block_on(<cosmic::Renderer as Headless>::new(
+                iced::Font::DEFAULT,
+                iced::Pixels::from(16),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
         let mut view = app.checkout_view().expect("actual checkout surface");
         let mut tree = Tree::new(view.as_widget());
         let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0));
-        let node = view.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
         let point = {
-            let accessible = view.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-            let button = accessible.root().iter().chain(accessible.children()).find(|entry| entry.node().label() == Some(label)).expect("retained owner control stays mounted after history eviction");
-            assert!(!button.node().is_disabled()); let bounds = button.node().bounds().unwrap();
-            iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32)
+            let accessible =
+                view.as_widget()
+                    .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            let button = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|entry| entry.node().label() == Some(label))
+                .expect("retained owner control stays mounted after history eviction");
+            assert!(!button.node().is_disabled());
+            let bounds = button.node().bounds().unwrap();
+            iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            )
         };
         let mut messages = Vec::new();
-        for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
-            view.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), mouse::Cursor::Available(point), &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        for event in [
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ] {
+            view.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
         }
-        let message = messages.pop().expect("actual button emits its owner action"); assert!(messages.is_empty()); message
+        let message = messages
+            .pop()
+            .expect("actual button emits its owner action");
+        assert!(messages.is_empty());
+        message
     }
 
     #[test]
     fn actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open() {
-        use cosmic::iced::futures::StreamExt;
         use cagents::process::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        use cosmic::iced::futures::StreamExt;
         const MARKER: &str = "CAGENTS_CEDITOR_RETAINED_CREATION_FIXTURE";
-        const FULL: &str = concat!(module_path!(), "::actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open");
-        let name = FULL.strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::")).unwrap_or(FULL);
+        const FULL: &str = concat!(
+            module_path!(),
+            "::actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open"
+        );
+        let name = FULL
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(FULL);
         if std::env::var_os(MARKER).as_deref() != Some(std::ffi::OsStr::new(name)) {
-            let mut command = CommandSpec::new(std::env::current_exe().unwrap()).args(["--exact", name, "--nocapture"]);
-            for (key, _) in std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_")) { command = command.env_remove(key); }
-            command = command.env(MARKER, name).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null");
+            let mut command = CommandSpec::new(std::env::current_exe().unwrap()).args([
+                "--exact",
+                name,
+                "--nocapture",
+            ]);
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_"))
+            {
+                command = command.env_remove(key);
+            }
+            command = command
+                .env(MARKER, name)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
             command.timeout = Some(Duration::from_secs(60));
-            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
-            assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed"), "exact child must actually run once: {}", String::from_utf8_lossy(&output.stdout));
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
+            assert!(
+                output.success,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed"),
+                "exact child must actually run once: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             return;
         }
-        let repository = git_fixture(); let data = tempfile::tempdir().unwrap();
+        let repository = git_fixture();
+        let data = tempfile::tempdir().unwrap();
         let destination = data.path().join("created");
-        let mut app = editor(); app.settings_path = data.path().join("settings.toml");
-        let task = app.load_checkout_journal(); run_tasks(&mut app, task);
+        let mut app = editor();
+        app.settings_path = data.path().join("settings.toml");
+        let task = app.load_checkout_journal();
+        run_tasks(&mut app, task);
         let card = open_real_git(&mut app, repository.path(), None);
         let authority = app.tab(card).unwrap().worktree_authority.clone().unwrap();
-        let head = cagents::repository::Oid::parse(&git(repository.path(), &["rev-parse", "HEAD"])).unwrap();
+        let head = cagents::repository::Oid::parse(&git(repository.path(), &["rev-parse", "HEAD"]))
+            .unwrap();
         app.begin_commit_checkout(authority, head);
         drop(app.update(Message::Checkout(Action::Branch("retained-child".into()))));
-        drop(app.update(Message::Checkout(Action::Destination(destination.to_string_lossy().into_owned()))));
-        let task = app.update(Message::Checkout(Action::Resolve)); run_tasks(&mut app, task);
+        drop(app.update(Message::Checkout(Action::Destination(
+            destination.to_string_lossy().into_owned(),
+        ))));
+        let task = app.update(Message::Checkout(Action::Resolve));
+        run_tasks(&mut app, task);
         let id = app.checkout_dialog.as_ref().unwrap().id;
         let task = app.update(Message::Checkout(Action::Create));
-        assert!(app.checkout_owners.contains_key(&id), "reserve ownership before polling any effectful worker");
-        let receipt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
-            let mut stream = iced::runtime::task::into_stream(task).expect("real creation worker");
-            loop {
-                let action = stream.next().await.expect("creation must deliver its ownership");
-                if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::Checkout(Action::Finished(..)))) = action { break message; }
-            }
-        });
-        app.checkout_dialog = None; app.tabs.clear(); app.active = None;
+        assert!(
+            app.checkout_owners.contains_key(&id),
+            "reserve ownership before polling any effectful worker"
+        );
+        let receipt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut stream =
+                    iced::runtime::task::into_stream(task).expect("real creation worker");
+                loop {
+                    let action = stream
+                        .next()
+                        .await
+                        .expect("creation must deliver its ownership");
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::Checkout(Action::Finished(..)),
+                    )) = action
+                    {
+                        break message;
+                    }
+                }
+            });
+        app.checkout_dialog = None;
+        app.tabs.clear();
+        app.active = None;
         drop(app.update(receipt));
-        let retained = app.checkout_owners.get(&id).and_then(Option::as_ref).expect("late outcome retains original session before checking dialog");
-        assert!(retained.retention().is_some()); assert!(retained.created.is_some(), "{:?}", retained.authority_error);
+        let retained = app
+            .checkout_owners
+            .get(&id)
+            .and_then(Option::as_ref)
+            .expect("late outcome retains original session before checking dialog");
+        assert!(retained.retention().is_some());
+        assert!(retained.created.is_some(), "{:?}", retained.authority_error);
         let original_report = app.checkout_owners[&id].as_ref().unwrap().report.clone();
         for index in 0..20 {
-            let mut request = original_report.request.as_ref().unwrap().clone(); request.operation_id = OperationId::new();
-            let mut newer = RetainedWorktreeCreation::not_started(&request, 1, "actual typed preflight refusal fixture".into());
+            let mut request = original_report.request.as_ref().unwrap().clone();
+            request.operation_id = OperationId::new();
+            let mut newer = RetainedWorktreeCreation::not_started(
+                &request,
+                1,
+                "actual typed preflight refusal fixture".into(),
+            );
             newer.report.created_at_unix_ms = original_report.created_at_unix_ms + index + 1;
-            drop(app.update(Message::Checkout(Action::Finished(request.operation_id, Ok(newer)))));
+            drop(app.update(Message::Checkout(Action::Finished(
+                request.operation_id,
+                Ok(newer),
+            ))));
         }
         assert_eq!(app.checkout_history.len(), 20);
-        assert!(!app.checkout_history.iter().any(|report| report.operation_id == id), "serialized history evicts the old description");
-        assert!(app.checkout_owners.get(&id).and_then(Option::as_ref).is_some(), "live ownership is independent");
+        assert!(
+            !app.checkout_history
+                .iter()
+                .any(|report| report.operation_id == id),
+            "serialized history evicts the old description"
+        );
+        assert!(
+            app.checkout_owners
+                .get(&id)
+                .and_then(Option::as_ref)
+                .is_some(),
+            "live ownership is independent"
+        );
         drop(app.update(Message::CloseWindow));
-        assert!(!app.exiting, "unresolved transfer/lifecycle proof cannot disappear on exit");
-        let created = app.checkout_owners[&id].as_ref().unwrap().created.clone().unwrap();
+        assert!(
+            !app.exiting,
+            "unresolved transfer/lifecycle proof cannot disappear on exit"
+        );
+        let created = app.checkout_owners[&id]
+            .as_ref()
+            .unwrap()
+            .created
+            .clone()
+            .unwrap();
         drop(app.update(Message::Checkout(Action::History)));
         let emitted = click_retained_checkout(&app, "Open retained worktree");
-        assert!(matches!(emitted, Message::Checkout(Action::OpenRecorded(operation)) if operation == id), "actual mounted live-owner row names the evicted original");
-        let task = app.update(emitted); run_tasks(&mut app, task);
-        assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
-        assert!(app.checkout_owners.is_empty(), "the SAME settled carrier is now owned by the mounted tab");
-        app.tabs.clear(); app.active = None;
+        assert!(
+            matches!(emitted, Message::Checkout(Action::OpenRecorded(operation)) if operation == id),
+            "actual mounted live-owner row names the evicted original"
+        );
+        let task = app.update(emitted);
+        run_tasks(&mut app, task);
+        assert!(app.tabs.iter().any(|tab| {
+            tab.created_worktree
+                .as_ref()
+                .is_some_and(|cap| cap.operation() == id)
+        }));
+        assert!(
+            app.checkout_owners.is_empty(),
+            "the SAME settled carrier is now owned by the mounted tab"
+        );
+        app.tabs.clear();
+        app.active = None;
         std::fs::rename(&destination, data.path().join("parked")).unwrap();
-        std::fs::create_dir(&destination).unwrap(); std::fs::write(destination.join("foreign"), "untouched").unwrap();
-        let task = app.open_created_checkout(created); run_tasks(&mut app, task);
-        assert!(app.tabs.is_empty(), "the original created scope cannot recapture its replacement path");
-        assert_eq!(std::fs::read_to_string(destination.join("foreign")).unwrap(), "untouched");
-        assert!(app.checkout_owners.is_empty(), "clean ownership was transferred to the original mounted carrier, not reconstructed from history");
-        drop(app.update(Message::CloseWindow)); assert!(app.exiting, "clean successful adoption does not permanently starve ordinary exit");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("foreign"), "untouched").unwrap();
+        let task = app.open_created_checkout(created);
+        run_tasks(&mut app, task);
+        assert!(
+            app.tabs.is_empty(),
+            "the original created scope cannot recapture its replacement path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("foreign")).unwrap(),
+            "untouched"
+        );
+        assert!(
+            app.checkout_owners.is_empty(),
+            "clean ownership was transferred to the original mounted carrier, not reconstructed from history"
+        );
+        drop(app.update(Message::CloseWindow));
+        assert!(
+            app.exiting,
+            "clean successful adoption does not permanently starve ordinary exit"
+        );
     }
 
     #[test]
