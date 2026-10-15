@@ -5085,6 +5085,18 @@ impl LspManager {
         tests::open_ready_format_on_save(self, doc, path, worktree, text).await;
     }
 
+    /// Real framed test server for controller command-context regressions.
+    /// No provider process or production capability bypass is involved.
+    #[cfg(test)]
+    pub(crate) async fn fixture_ready_code_actions(doc:LspDocumentId,path:&Path,worktree:&Path,text:&str)->Self {
+        tests::ready_code_actions(doc,path,worktree,text).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fixture_code_action(&mut self,doc:LspDocumentId)->LspCodeAction {
+        tests::request_fixture_code_action(self,doc).await
+    }
+
     /// Replaces the process launcher. Tests inject in-process duplex
     /// transports so no language server has to be installed.
     #[cfg(test)]
@@ -5500,6 +5512,28 @@ mod tests {
         assert!(manager.capabilities(doc).ready && manager.capabilities(doc).format_document);
         assert_eq!(manager.formatting_settings(doc).map(|(enabled, _)| enabled), Some(true));
         manager
+    }
+
+    pub(super) async fn ready_code_actions(doc:LspDocumentId,path:&Path,worktree:&Path,text:&str)->LspManager {
+        let mut manager=rust_manager();manager.servers[0].format_on_save=true;
+        let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"documentFormattingProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["fixture.command"]}}),|incoming| {
+            let result=match incoming.method.as_str() {
+                "textDocument/codeAction"=>json!([{"title":"Run fixture command","command":"fixture.command"}]),
+                "workspace/executeCommand"=>Value::Null,
+                "textDocument/formatting"=>json!([]),
+                _=>return vec![],
+            };
+            vec![json!({"jsonrpc":"2.0","id":incoming.id,"result":result})]
+        });
+        let events=manager.events();manager.open_for_test(doc,path,worktree,rust_language(),1,text);
+        let _handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        assert!(manager.capabilities(doc).ready && manager.capabilities(doc).code_actions);
+        manager
+    }
+
+    pub(super) async fn request_fixture_code_action(manager:&mut LspManager,doc:LspDocumentId)->LspCodeAction {
+        let events=manager.events();let request=manager.request_code_actions(doc,LspRange::default(),&[]);
+        next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..} if *id==request=>items.first().cloned(),_=>None}).await
     }
 
     pub(super) async fn open_ready_format_on_save(manager: &mut LspManager, doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) {
