@@ -4153,13 +4153,20 @@ impl Claude {
                 });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented = known_tool
-                    .as_deref()
-                    .or_else(|| frame["tool_use_id"].as_str())
-                    .is_some_and(|tool| {
-                        self.tools.get(None,tool).is_some_and(|item|
-                        matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
-                    });
+                let represented=if let Some(tool)=known_tool.as_deref().or_else(||frame["tool_use_id"].as_str()) {
+                    let mut owners=self.tool_order.iter().filter(|key|key.item_id==tool);
+                    let owner=owners.next().cloned();
+                    if owners.next().is_some() {
+                        step.events.push(Event::Error {message:"Original task tool scope is ambiguous; preserving its existing source".into(),fatal:false});
+                        return Ok(());
+                    }
+                    let scope=owner.as_ref().and_then(|key|key.agent_id.as_deref());
+                    match self.cached_tool(scope,tool) {
+                        Ok(Some(item))=>matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent"),
+                        Ok(None)=>false,
+                        Err(message)=> {step.events.push(Event::Error {message,fatal:false});return Ok(());}
+                    }
+                } else {false};
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);

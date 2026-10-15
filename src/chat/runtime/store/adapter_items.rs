@@ -67,7 +67,7 @@ mod tests {
     }
     #[test]
     fn byte_evicted_write_results_and_replayed_calls_keep_the_exact_original_patch() {
-        use crate::chat::{ToolStatus,protocol::Adapter};
+        use crate::chat::ToolStatus;
         use serde_json::json;
         let store=Arc::new(Mutex::new(Store::new().unwrap()));
         let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -91,6 +91,18 @@ mod tests {
         assert!(missing.events.iter().any(|event|matches!(event,Event::Error {fatal:false,..})),"unavailable canonical source is explicit");
         assert!(!missing.events.iter().any(|event|matches!(event,Event::Item(_))),"source failure cannot invent a replacement tool");
     }
+    #[test]
+    fn byte_evicted_large_agent_call_does_not_reappear_as_a_duplicate_task_row() {
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+        let step=adapter.receive(json!({"type":"assistant","uuid":"agent-carrier","message":{"id":"agent-message","content":[{"type":"tool_use","id":"large-agent","name":"Agent","input":{"description":"x".repeat(3*1024*1024),"run_in_background":true}}]}})).unwrap();
+        commit(&store,adapter.as_mut(),step);
+        let progress=adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task-large","tool_use_id":"large-agent","status":"running","description":"Still running"})).unwrap();
+        assert!(!progress.events.iter().any(|event|matches!(event,Event::Error {..})),"exact canonical source remains available after byte eviction");
+        assert!(!progress.events.iter().any(|event|matches!(event,Event::Item(item) if item.id=="claude-task:task-large")),"a byte-evicted Agent call still represents its task");
+    }
+
     #[test]
     fn oversized_same_frame_call_and_result_are_available_until_store_commit() {
         use crate::chat::ToolStatus;
