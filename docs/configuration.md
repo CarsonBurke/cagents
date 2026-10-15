@@ -181,7 +181,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
-| `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
+| `keyboard_shortcuts.*` | array of strings | shown above | Action chord lists; see [Keyboard shortcuts](#keyboard-shortcuts) |
+| `keyboard_shortcuts.terminal_passthrough_actions` | array of strings | shown above | Action names whose keys reach terminal programs instead of invoking workspace commands |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
 | `notifications.failure` | boolean | `true` | Alerts for failures and cancellations |
@@ -212,7 +213,7 @@ modifiers, joined by `+`. Names are case-insensitive.
   review actions retain their pane scope and show **Scoped** instead.
 - **Ctrl+F** reaches the terminal by default. The configured `search_projects`
   chord (**Ctrl+Shift+F** by default) opens terminal scrollback find when the
-  terminal owns focus; elsewhere it focuses project search. The configured
+  live terminal owns focus; elsewhere it focuses project search. The configured
   `find_in_pane` chord (**Ctrl+F**) finds in the focused editor or chat transcript
   and falls back to project search on panes without find. A focused sidebar or
   inspector text field keeps its own keys.

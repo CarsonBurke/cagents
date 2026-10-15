@@ -89,7 +89,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Clone focused pane | `Ctrl+Shift+D` |
 | Close focused pane | `Ctrl+Shift+W` |
 | Find in the focused editor/chat, otherwise search projects | `Ctrl+F` |
-| Find terminal output / focus project search elsewhere | `Ctrl+Shift+F` |
+| Find live terminal output / focus project search elsewhere | `Ctrl+Shift+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
@@ -543,8 +543,8 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
-Press Ctrl+Shift+F in a terminal to search its output, including scrollback. Completed
-terminals keep read-only search, scrolling, selection and copying without keeping
+Press Ctrl+Shift+F in a live terminal to search its output, including scrollback.
+Completed terminals use Ctrl+F and keep read-only search, scrolling, selection and copying without keeping
 their process alive. Completed history is bounded to 8 MiB per terminal, including
 text, cell coordinates, colors and links. If older rows exceed this limit, a
 notice identifies how many rows were omitted. Closing the terminal releases its
@@ -899,7 +899,8 @@ the source for resumed history.
 
 ## Terminals and agent status
 
-- **Ctrl+Shift+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
+- **Ctrl+Shift+F** searches live terminal scrollback; completed panes use
+  **Ctrl+F**. **Enter** and **Shift+Enter**
   navigate matches; the search controls can match case. The current match has
   a stronger highlight than the other matches.
 - Right-click for copy, paste, select all, clear scrollback and link actions.
