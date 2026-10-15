@@ -144,7 +144,8 @@ use crate::{
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 /// Version 78 carries terminal provider outcomes and readable exit diagnostics.
-pub const PROTOCOL_VERSION: u16 = 78;
+/// Version 79 pages immutable retained provider output by opaque log identity.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -473,6 +474,12 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Read one bounded page from an opaque, immutable provider-exit log.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +787,16 @@ pub enum ServerResponse {
     ChatFileChangePatches {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
+    },
+    /// Raw pages preserve UTF-8 and ANSI sequences across frame boundaries;
+    /// the requesting client cleans the complete bounded output once.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+        next_offset: Option<u64>,
+        omitted: u64,
     },
 }
 
