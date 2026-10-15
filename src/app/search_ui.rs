@@ -15,6 +15,7 @@ pub(super) struct State {
     generation: u64,
     cancel: Option<CancellationToken>,
     matches: Vec<project_search::Match>,
+    snippet_fits: std::cell::RefCell<std::collections::BTreeMap<usize, CachedSnippet>>,
     counts: std::collections::BTreeMap<PathBuf, usize>,
     selected: usize,
     running: bool,
@@ -96,6 +97,7 @@ impl Cagents {
         }
         self.search_ui.generation = self.search_ui.generation.wrapping_add(1);
         self.search_ui.matches.clear();
+        self.search_ui.snippet_fits.borrow_mut().clear();
         self.search_ui.counts.clear();
         self.search_ui.selected = 0;
         self.search_ui.error = None;
@@ -475,50 +477,7 @@ impl Cagents {
                 );
                 previous = Some(&matched.path);
             }
-            use cosmic::iced::widget::text::Span;
-            let before = &matched.snippet[..matched.highlight.start];
-            let found = &matched.snippet[matched.highlight.clone()];
-            let after = &matched.snippet[matched.highlight.end..];
-            let snippet = cosmic::iced::widget::rich_text::<(), _, _, _>([
-                Span::new(format!("{}: ", matched.line + 1)),
-                Span::new(before),
-                Span::new(found)
-                    .color(design::accent_color(&cosmic::theme::active()))
-                    .font(cosmic::font::Font {
-                        weight: cosmic::iced::font::Weight::Bold,
-                        ..cosmic::font::default()
-                    }),
-                Span::new(after),
-            ])
-            .size(design::TEXT_BODY)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill);
-            rows = rows.push(crate::interaction::keyboard_list_row(
-                widget::button::custom(snippet)
-                    .name(format!(
-                        "{} line {} column {}: {}",
-                        matched.path.display(),
-                        matched.line + 1,
-                        matched.column + 1,
-                        matched.snippet
-                    ))
-                    .class(crate::ui_controls::control_style(
-                        index == state.selected && state.query_focused,
-                        None,
-                    ))
-                    .width(Length::Fill)
-                    .height(design::DENSE_ROW_HEIGHT)
-                    .padding([space::XS, space::S])
-                    .on_press_maybe(
-                        enabled
-                            .then(|| state.result_target(index))
-                            .flatten()
-                            .map(|target| Message::ProjectSearch(Action::OpenResult(target))),
-                    ),
-            ));
+            rows = rows.push(result_row(state, matched, index, enabled));
         }
         let pages = state.matches.len().div_ceil(PAGE_SIZE);
         if pages > 1 {
@@ -562,9 +521,297 @@ impl Cagents {
     }
 }
 
+#[derive(Debug)]
+struct SnippetPreview {
+    text: String,
+    highlight: std::ops::Range<usize>,
+}
+
+#[derive(Debug)]
+struct CachedSnippet {
+    width: u32,
+    font: cosmic::iced::Font,
+    preview: Arc<SnippetPreview>,
+}
+
+impl State {
+    fn snippet_preview(
+        &self,
+        index: usize,
+        matched: &project_search::Match,
+        width: f32,
+        font: cosmic::iced::Font,
+    ) -> Arc<SnippetPreview> {
+        if let Some(cached) = self.snippet_fits.borrow().get(&index)
+            && cached.width == width.to_bits()
+            && cached.font == font
+        {
+            return cached.preview.clone();
+        }
+        let preview = Arc::new(fit_snippet(matched, width.max(0.0), font));
+        let mut fits = self.snippet_fits.borrow_mut();
+        // At most one visible page. Query replacement clears this cache;
+        // appending streamed matches does not reshape already visible rows.
+        if fits.len() >= PAGE_SIZE && !fits.contains_key(&index) {
+            fits.clear();
+        }
+        fits.insert(
+            index,
+            CachedSnippet {
+                width: width.to_bits(),
+                font,
+                preview: preview.clone(),
+            },
+        );
+        preview
+    }
+}
+
+fn result_row<'a>(
+    state: &'a State,
+    matched: &'a project_search::Match,
+    index: usize,
+    enabled: bool,
+) -> Element<'a, Message> {
+    let snippet = crate::ui_controls::responsive(move |slot| {
+        let font = cosmic::font::default();
+        let preview = state.snippet_preview(index, matched, slot.width, font);
+        widget::container(
+            cosmic::iced::widget::rich_text::<(), _, _, _>(snippet_spans(
+                matched.line,
+                &preview,
+                font,
+            ))
+                .font(font)
+                .size(design::TEXT_BODY)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .into()
+    });
+    crate::interaction::keyboard_list_row(
+        widget::button::custom(snippet)
+            .name(format!(
+                "{} line {} column {}: {}",
+                matched.path.display(),
+                matched.line + 1,
+                matched.column + 1,
+                matched.snippet
+            ))
+            .class(crate::ui_controls::control_style(
+                index == state.selected && state.query_focused,
+                None,
+            ))
+            .width(Length::Fill)
+            .height(design::DENSE_ROW_HEIGHT)
+            .padding([space::XS, space::S])
+            .on_press_maybe(
+                enabled
+                    .then(|| state.result_target(index))
+                    .flatten()
+                    .map(|target| Message::ProjectSearch(Action::OpenResult(target))),
+            ),
+    )
+}
+
+fn snippet_spans(
+    line: usize,
+    preview: &SnippetPreview,
+    font: cosmic::iced::Font,
+) -> Vec<cosmic::iced::widget::text::Span<'static, (), cosmic::iced::Font>> {
+    use cosmic::iced::widget::text::Span;
+    vec![
+        Span::new(format!("{}: ", line + 1)),
+        Span::new(preview.text[..preview.highlight.start].to_owned()),
+        Span::new(preview.text[preview.highlight.clone()].to_owned())
+            .color(design::accent_color(&cosmic::theme::active()))
+            .font(cosmic::iced::Font {
+                weight: cosmic::iced::font::Weight::Bold,
+                ..font
+            }),
+        Span::new(preview.text[preview.highlight.end..].to_owned()),
+    ]
+}
+
+type SnippetParagraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+fn snippet_paragraph(
+    line: usize,
+    preview: &SnippetPreview,
+    font: cosmic::iced::Font,
+) -> SnippetParagraph {
+    use iced::advanced::text::Paragraph as _;
+    SnippetParagraph::with_spans(iced::advanced::text::Text {
+        content: &snippet_spans(line, preview, font),
+        bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
+        size: iced::Pixels(design::TEXT_BODY),
+        line_height: Default::default(),
+        font,
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: iced::advanced::text::Shaping::Advanced,
+        wrapping: iced::widget::text::Wrapping::None,
+        ellipsize: iced::widget::text::Ellipsize::None,
+    })
+}
+
+/// Fit real shaped spans, preserving the hit before context. A long regex
+/// match may itself need a shortened preview; its original result and editor
+/// range remain intact. Every cut is a UTF-8 boundary, with explicit ellipses.
+fn fit_snippet(
+    matched: &project_search::Match,
+    width: f32,
+    font: cosmic::iced::Font,
+) -> SnippetPreview {
+    use iced::advanced::text::Paragraph as _;
+    let before = &matched.snippet[..matched.highlight.start];
+    let hit = &matched.snippet[matched.highlight.clone()];
+    let after = &matched.snippet[matched.highlight.end..];
+    let mut before_count = before.chars().count().min(16);
+    let mut after_count = after.chars().count().min(32);
+    let mut hit_count = hit.chars().count();
+    loop {
+        let start = if before_count == 0 {
+            before.len()
+        } else {
+            before.char_indices().rev().nth(before_count - 1).unwrap().0
+        };
+        let hit_end = hit
+            .char_indices()
+            .nth(hit_count)
+            .map_or(hit.len(), |(index, _)| index);
+        let after_end = if hit_end < hit.len() {
+            0
+        } else {
+            after
+                .char_indices()
+                .nth(after_count)
+                .map_or(after.len(), |(index, _)| index)
+        };
+        let mut text = String::new();
+        if start > 0 {
+            text.push('…');
+        }
+        text.push_str(&before[start..]);
+        let highlight_start = text.len();
+        text.push_str(&hit[..hit_end]);
+        let highlight = highlight_start..text.len();
+        text.push_str(&after[..after_end]);
+        if hit_end < hit.len() || after_end < after.len() {
+            text.push('…');
+        }
+        let preview = SnippetPreview { text, highlight };
+        if snippet_paragraph(matched.line, &preview, font).min_width() <= width {
+            return preview;
+        }
+        if before_count > 0 || after_count > 0 {
+            before_count /= 2;
+            after_count /= 2;
+        } else if hit_count > 1 {
+            hit_count /= 2;
+        } else {
+            // No glyph fits this degenerate slot. Do not claim a different hit.
+            return SnippetPreview {
+                text: String::new(),
+                highlight: 0..0,
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit() {
+        use iced::advanced::{
+            Layout, layout,
+            text::Paragraph as _,
+            widget::{Operation, Tree},
+        };
+        use iced::{Rectangle, Size};
+        struct Bounds(Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, _: Option<&widget::Id>, bounds: Rectangle) {
+                self.0 = Some(bounds);
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let state = State::default();
+        for (prefix, hit, suffix) in [
+            ("W".repeat(120), "needle".into(), "tail".repeat(60)),
+            ("éλ".repeat(40), "λé".into(), "λé".repeat(50)),
+            ("prefix".into(), "λ".repeat(150), "suffix".into()),
+        ] {
+            let matched = project_search::Match {
+                path: "long.rs".into(),
+                line: 12,
+                column: prefix.len(),
+                length: hit.len(),
+                snippet: format!("{prefix}{hit}{suffix}"),
+                highlight: prefix.len()..prefix.len() + hit.len(),
+            };
+            // The original no-wrap spans put the W-prefixed hit outside 250px.
+            if prefix.starts_with('W') {
+                let original = SnippetPreview {
+                    text: matched.snippet.clone(),
+                    highlight: matched.highlight.clone(),
+                };
+                let paragraph = snippet_paragraph(matched.line, &original, cosmic::font::default());
+                assert!(paragraph.span_bounds(2)[0].x > 250.0);
+            }
+            state.snippet_fits.borrow_mut().clear();
+            for width in [180.0, 250.0, 430.0] {
+                let mut row = result_row(&state, &matched, 0, false);
+                let mut tree = Tree::new(row.as_widget());
+                let size = Size::new(width, design::DENSE_ROW_HEIGHT);
+                let limits = layout::Limits::new(size, size);
+                let node = row.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut bounds = Bounds(None);
+                row.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut bounds,
+                );
+                let fitted = state.snippet_fits.borrow();
+                let cached = fitted.get(&0).expect("mounted responsive row fitted its actual slot");
+                let preview = cached.preview.clone();
+                let slot = f32::from_bits(cached.width);
+                let mounted = bounds.0.expect("actual clipped snippet container");
+                assert!(slot > 0.0 && slot <= width);
+                assert!((mounted.width - slot).abs() <= 0.1);
+                let visible = &preview.text[preview.highlight.clone()];
+                assert!(!visible.is_empty() && hit.starts_with(visible));
+                let paragraph = snippet_paragraph(matched.line, &preview, cached.font);
+                assert!(paragraph.min_width() <= slot);
+                let highlighted = paragraph.span_bounds(2);
+                assert!(!highlighted.is_empty());
+                assert!(highlighted.iter().all(|ink| {
+                    let left = mounted.x + ink.x;
+                    let right = left + ink.width;
+                    left >= mounted.x && right <= mounted.x + mounted.width + 0.1
+                }));
+                drop(fitted);
+                drop(row);
+                let mut again = result_row(&state, &matched, 0, false);
+                let mut tree = Tree::new(again.as_widget());
+                again.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert!(Arc::ptr_eq(&preview, &state.snippet_fits.borrow()[&0].preview));
+                assert_eq!(matched.length, hit.len());
+            }
+        }
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.search_ui = state;
+        drop(app.update_project_search(Action::Query("new query".into())));
+        assert!(app.search_ui.snippet_fits.borrow().is_empty());
+    }
+
     #[test]
     fn opening_another_search_file_preserves_a_blocked_editor_and_explains_the_guard() {
         let mut app = super::super::tests::context_inspector_test_app(true);
