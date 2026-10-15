@@ -7,7 +7,7 @@ use crate::{editor_workspace_edit as workspace, lsp::*};
 pub enum Action {
     Rename(CardId),
     RenameDraft(CardId, String),
-    SubmitRename(CardId),
+    SubmitRename(CardId, String),
     CancelRename(CardId),
     Format { card: CardId, selection: bool, save_after: bool },
     CodeActions(CardId),
@@ -385,7 +385,7 @@ impl Cagents {
 
     pub(super) fn update_editor_features(&mut self, action: Action) -> Task<Message> {
         if (self.modal_is_open() || crate::device::is_remote()) && matches!(&action,
-            Action::Rename(_) | Action::RenameDraft(..) | Action::SubmitRename(_) | Action::Format { .. }
+            Action::Rename(_) | Action::RenameDraft(..) | Action::SubmitRename(..) | Action::Format { .. }
             | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..)) { return Task::none(); }
         match action {
             Action::Rename(card) => {
@@ -408,9 +408,10 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::SubmitRename(card) => {
-                let Some(rename) = self.editor_features.renames.remove(&card) else { return Task::none(); };
+            Action::SubmitRename(card, submitted) => {
+                let Some(mut rename) = self.editor_features.renames.remove(&card) else { return Task::none(); };
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_rename(None); }
+                rename.draft = submitted;
                 if rename.draft.trim().is_empty() || rename.draft.contains(['\r', '\n', '\0']) {
                     self.feature_failure(card, "Enter a nonempty symbol name");
                     return Task::none();
@@ -597,15 +598,16 @@ impl Cagents {
             Action::Published { ticket, result } => {
                 let Some(publication) = self.editor_features.publication.take() else { return Task::none(); };
                 if publication.ticket != ticket { self.editor_features.publication = Some(publication); return Task::none(); }
-                if let Err(error) = result {
-                    for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
-                    self.reject_server_edit(&publication.operation, &error);
-                    self.feature_failure(publication.operation.card, error);
-                    return self.save_after_feature(&publication.operation);
-                }
-                if let Ok(report) = &result {
-                    if !report.durability_warnings.is_empty() { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
-                }
+                let report = match result {
+                    Err(error) => {
+                        for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
+                        self.reject_server_edit(&publication.operation, &error);
+                        self.feature_failure(publication.operation.card, error);
+                        return self.save_after_feature(&publication.operation);
+                    }
+                    Ok(report) => report,
+                };
+                if !report.durability_warnings.is_empty() { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
                 let mut tasks = Vec::new();
                 let mut failure = None;
                 for card in publication.cards {

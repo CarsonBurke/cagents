@@ -10783,7 +10783,7 @@ impl Cagents {
         let feature = match &action {
             Action::Rename => Some(Feature::Rename(card)),
             Action::RenameDraft(draft) => Some(Feature::RenameDraft(card, draft.clone())),
-            Action::SubmitRename => Some(Feature::SubmitRename(card)),
+            Action::SubmitRename(value) => Some(Feature::SubmitRename(card, value.clone())),
             Action::CancelRename => Some(Feature::CancelRename(card)),
             Action::Format { selection } => Some(Feature::Format { card, selection: *selection, save_after: false }),
             Action::CodeActions => Some(Feature::CodeActions(card)),
@@ -10866,7 +10866,7 @@ impl Cagents {
                     _ => Task::none(),
                 }
             }
-            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
+            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
         }
     }
 

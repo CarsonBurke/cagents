@@ -320,7 +320,7 @@ pub enum LspIntent {
 pub enum EditorLspAction {
     Rename,
     RenameDraft(String),
-    SubmitRename,
+    SubmitRename(String),
     CancelRename,
     Format { selection: bool },
     CodeActions,
@@ -8854,9 +8854,9 @@ fn editable_document_view<'a>(
             crate::ui_controls::field::text("New symbol name", draft)
                 .id(RepositoryRuntime::rename_focus_id(card))
                 .on_input(move |draft| RepositoryAction::Language { card, action: EditorLspAction::RenameDraft(draft) })
-                .on_submit(move |_| RepositoryAction::Language { card, action: EditorLspAction::SubmitRename })
+                .on_submit(move |value| RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(value) })
                 .width(Length::Fill).into(),
-            crate::ui_controls::button::primary("Preview rename").on_press(RepositoryAction::Language { card, action: EditorLspAction::SubmitRename }).into(),
+            crate::ui_controls::button::primary("Preview rename").on_press(RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(draft.clone()) }).into(),
             crate::ui_controls::button::secondary("Cancel").on_press(RepositoryAction::Language { card, action: EditorLspAction::CancelRename }).into(),
         ]).spacing(space::S).align_y(Alignment::Center).into());
     }
