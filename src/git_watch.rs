@@ -1448,15 +1448,14 @@ pub(crate) mod tests {
 
     #[test]
     fn capped_inventory_keeps_native_directory_and_admin_coverage() {
+        if !fixture_isolated(
+            "git_watch::tests::capped_inventory_keeps_native_directory_and_admin_coverage",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .arg(root)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        init_fixture(root);
         std::fs::create_dir_all(root.join("z/nested")).unwrap();
         std::fs::create_dir_all(root.join("target/deep/ignored")).unwrap();
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
@@ -1467,7 +1466,12 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::default();
         let inventory = git.watch_files_projection(root, 1, &cancellation).unwrap();
         assert!(inventory.listing_truncated);
-        assert!(!inventory.paths.iter().any(|path| root.join(path.as_path()) == outside));
+        assert!(
+            !inventory
+                .paths
+                .iter()
+                .any(|path| root.join(path.as_path()) == outside)
+        );
         let records = git.list_worktrees(root, &cancellation).unwrap();
         let common = git.common_dir(root, &cancellation).unwrap();
         let id = ProjectId::new();
@@ -1480,12 +1484,20 @@ pub(crate) mod tests {
             &records.iter().map(|record| record.id).collect(),
             &BTreeMap::new(),
             1,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(plan.worktrees.len(), 1);
-        assert!(plan.worktrees[0].directories.contains(&root.join("z/nested")));
+        assert!(
+            plan.worktrees[0]
+                .directories
+                .contains(&root.join("z/nested"))
+        );
         assert!(!plan.worktrees[0].directories.contains(&root.join("target")));
         assert!(plan.metadata_paths().contains_key(&common));
-        assert_eq!(plan.polling.as_deref(), Some("directory watch limit reached"));
+        assert_eq!(
+            plan.polling.as_deref(),
+            Some("directory watch limit reached")
+        );
         let registrations = Registrations::within(
             &BTreeMap::from([(id, Arc::new(plan.clone()))]),
             watch_budget(),
@@ -1496,22 +1508,25 @@ pub(crate) mod tests {
         monitor.configure(vec![Arc::new(plan)]);
         wait_for(&monitor, id, |change| change.coverage.is_some());
         std::fs::write(&outside, "changed outside prefix\n").unwrap();
-        wait_for(&monitor, id, |change| change.worktrees.contains(&records[0].id));
+        wait_for(&monitor, id, |change| {
+            change.worktrees.contains(&records[0].id)
+        });
         std::fs::write(common.join("index"), "metadata event only\n").unwrap();
-        wait_for(&monitor, id, |change| change.metadata && change.worktrees.contains(&records[0].id));
+        wait_for(&monitor, id, |change| {
+            change.metadata && change.worktrees.contains(&records[0].id)
+        });
     }
 
     #[test]
     fn incomplete_ignored_inventory_does_not_descend_build_trees() {
+        if !fixture_isolated(
+            "git_watch::tests::incomplete_ignored_inventory_does_not_descend_build_trees",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .arg(root)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        init_fixture(root);
         for name in ["ignored-a", "ignored-b"] {
             std::fs::create_dir_all(root.join(name).join("deep/ignored")).unwrap();
             std::fs::write(root.join(name).join("deep/ignored/output"), "build\n").unwrap();
@@ -1529,23 +1544,29 @@ pub(crate) mod tests {
             &records.iter().map(|record| record.id).collect(),
             &BTreeMap::new(),
             1,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(plan.worktrees.len(), 1);
-        assert_eq!(plan.worktrees[0].directories, BTreeSet::from([root.to_owned()]));
-        assert_eq!(plan.polling.as_deref(), Some("directory watch limit reached"));
+        assert_eq!(
+            plan.worktrees[0].directories,
+            BTreeSet::from([root.to_owned()])
+        );
+        assert_eq!(
+            plan.polling.as_deref(),
+            Some("directory watch limit reached")
+        );
     }
 
     #[test]
     fn unreadable_index_keeps_initial_root_and_admin_watches() {
+        if !fixture_isolated(
+            "git_watch::tests::unreadable_index_keeps_initial_root_and_admin_watches",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .arg(root)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        init_fixture(root);
         std::fs::write(root.join(".git/index"), "not an index\n").unwrap();
         let git = RepositoryService::system("git");
         let cancellation = CancellationToken::default();
@@ -1559,7 +1580,8 @@ pub(crate) mod tests {
             None,
             &records.iter().map(|record| record.id).collect(),
             &BTreeMap::new(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(plan.worktrees.len(), 1);
         assert!(plan.worktrees[0].directories.contains(root));
         assert!(plan.metadata_paths().contains_key(&common));
