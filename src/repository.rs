@@ -689,6 +689,7 @@ pub struct SnapshotCache {
     numstats: BTreeMap<(ChangeArea, RepoPath), CachedNumstat>,
     numstats_ready: bool,
     numstat_policy: Option<NumstatPolicy>,
+    numstat_policy_stale: bool,
     numstat_attributes: BTreeMap<PathBuf, Option<FileIdentity>>,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
@@ -732,7 +733,9 @@ fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
 
 type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
 
-#[derive(Debug)]
+type NumstatBases = BTreeMap<(ChangeArea, RepoPath), [u8; 32]>;
+
+#[derive(Debug, PartialEq, Eq)]
 struct NumstatPolicy {
     attributes: Vec<PathBuf>,
     reusable: bool,
@@ -748,16 +751,17 @@ struct CachedNumstat {
     conflict: Option<ConflictKind>,
     submodule: bool,
     identity: Option<FileIdentity>,
+    basis: Option<[u8; 32]>,
     added: Option<u64>,
     removed: Option<u64>,
 }
 
 impl CachedNumstat {
-    fn matches(&self, entry: &ChangedPath, identity: Option<FileIdentity>) -> bool {
-        self.old_path == entry.old_path && self.kind == entry.kind
+    fn matches(&self, entry: &ChangedPath, identity: Option<FileIdentity>, basis: Option<[u8; 32]>) -> bool {
+        basis.is_some() && self.basis == basis && self.old_path == entry.old_path && self.kind == entry.kind
             && self.conflict == entry.conflict && self.submodule == entry.submodule
-            // The index and HEAD fingerprints, not working bytes, own staged
-            // counts. Metadata invalidation discards this cache altogether.
+            // Porcelain's HEAD/index object and mode fields own staged
+            // counts; working bytes are a separate unstaged dependency.
             && (entry.area == ChangeArea::Staged || (self.identity == identity
                 && (identity.is_some() || entry.kind == ChangeKind::Deleted)))
     }
@@ -931,10 +935,10 @@ impl SnapshotCache {
         if metadata {
             self.metadata = None;
             self.control_metadata = None;
-            self.numstats.clear();
-            self.numstats_ready = false;
-            self.numstat_policy = None;
-            self.numstat_attributes.clear();
+            // Refresh metadata/policy while retaining measured counts. Each
+            // row also fences its exact HEAD/index basis; unrelated refs and
+            // unchanged index entries need not remeasure working content.
+            self.numstat_policy_stale = true;
             self.fsmonitor_checked = false;
         }
     }
@@ -2183,6 +2187,11 @@ pub fn parse_worktree_list(output: &[u8]) -> Result<Vec<WorktreeRecord>, GitPars
 }
 
 pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
+    parse_status_details(output, false).map(|(status, _)| status)
+}
+
+fn parse_status_details(output: &[u8], collect_bases: bool) -> Result<(StatusSnapshot, NumstatBases), GitParseError> {
+    let mut bases = NumstatBases::new();
     let fields = nul_fields(output, "git status")?;
     let mut oid: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -2246,10 +2255,12 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
         match field[0] {
             b'1' => {
                 let record = parse_changed_record(field, index, 9)?;
+                if collect_bases { collect_numstat_bases(&mut bases, &record, index)?; }
                 push_changed_entries(&mut entries, &mut dirty, &record, None, index)?;
             }
             b'2' => {
                 let record = parse_changed_record(field, index, 10)?;
+                if collect_bases { collect_numstat_bases(&mut bases, &record, index)?; }
                 // The rename or copy source is its own NUL-delimited field
                 // immediately after the record.
                 index += 1;
@@ -2346,14 +2357,14 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
         },
         (upstream, _) => TrackingState::Unknown { upstream },
     };
-    Ok(StatusSnapshot {
+    Ok((StatusSnapshot {
         untracked_omitted: false,
         listing_truncated: false,
         head,
         tracking,
         dirty,
         entries,
-    })
+    }, bases))
 }
 
 /// The fields of a porcelain-v2 `1` or `2` record that this service uses.
@@ -2361,6 +2372,25 @@ struct ChangedRecord<'a> {
     xy: &'a [u8],
     submodule: bool,
     path: &'a [u8],
+    head_mode: &'a [u8],
+    index_mode: &'a [u8],
+    head_oid: &'a [u8],
+    index_oid: &'a [u8],
+}
+
+fn collect_numstat_bases(bases: &mut NumstatBases, record: &ChangedRecord<'_>, index: usize) -> Result<(), GitParseError> {
+    use sha2::Digest;
+    let path = repo_path_field(record.path, "git status", index)?;
+    for (code, area) in [(record.xy[0], ChangeArea::Staged), (record.xy[1], ChangeArea::Unstaged)] {
+        if code == b'.' { continue; }
+        let mut hash = sha2::Sha256::new();
+        for field in [record.index_mode, record.index_oid] { hash.update(field); hash.update([0]); }
+        if area == ChangeArea::Staged {
+            for field in [record.head_mode, record.head_oid] { hash.update(field); hash.update([0]); }
+        }
+        bases.insert((area, path.clone()), hash.finalize().into());
+    }
+    Ok(())
 }
 
 fn parse_changed_record<'a>(
@@ -2381,6 +2411,7 @@ fn parse_changed_record<'a>(
         xy,
         submodule: fields[2].first() == Some(&b'S'),
         path: fields[count - 1],
+        head_mode: fields[3], index_mode: fields[4], head_oid: fields[6], index_oid: fields[7],
     })
 }
 
@@ -4511,7 +4542,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if unchanged && root_unchanged { return Ok(None); }
         }
         cache.dirty = true;
-        let mut status = invalid_output(parse_status(&output.stdout), output)?;
+        let (mut status, bases) = invalid_output(parse_status_details(&output.stdout, true), output)?;
         status.untracked_omitted = !options.untracked_changes;
         status.listing_truncated = truncated;
         let root = fs_safety::Root::open(worktree).ok();
@@ -4529,8 +4560,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         if status.entries.iter().any(|entry| matches!(entry.area, ChangeArea::Staged | ChangeArea::Unstaged)) {
-            if cache.numstat_policy.is_none() {
-                cache.numstat_policy = Some(self.numstat_policy(worktree, cancellation)?);
+            if cache.numstat_policy.is_none() || cache.numstat_policy_stale {
+                let policy = self.numstat_policy(worktree, cancellation)?;
+                if cache.numstat_policy.as_ref().is_some_and(|previous| previous != &policy) {
+                    cache.numstats.clear(); cache.numstats_ready = false;
+                    cache.numstat_attributes.clear();
+                }
+                cache.numstat_policy = Some(policy);
+                cache.numstat_policy_stale = false;
             }
             // Shared ancestors are inserted once, keeping large flat lists
             // cheap. A bounded dependency graph degrades to complete reads.
@@ -4566,7 +4603,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             if !policy.reusable { cache.numstats_ready = false; }
         }
-        let numstats = self.snapshot_numstats(worktree, &mut status, options, cancellation, cache, &observed)?;
+        let numstats = self.snapshot_numstats(worktree, &mut status, options, cancellation, cache, &observed, &bases)?;
         measure_untracked_cached(
             worktree,
             &mut status.entries,
@@ -4744,8 +4781,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// A few edited files must not reread every modified file in a large
     /// worktree. Reuse only measured, unchanged rows and query the remaining
-    /// literal paths in small argument batches. Cold/index/config/ref changes
-    /// and large content batches retain the complete bounded listing policy.
+    /// literal paths in small argument batches. Cold/policy changes and large
+    /// content batches retain the complete bounded listing policy.
     fn snapshot_numstats(
         &self,
         worktree: &Path,
@@ -4754,6 +4791,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &SnapshotCache,
         observed: &BTreeMap<RepoPath, Option<FileIdentity>>,
+        bases: &NumstatBases,
     ) -> Result<BTreeMap<(ChangeArea, RepoPath), CachedNumstat>, RepositoryError> {
         const MAX_TARGETS: usize = 128;
         const MAX_TARGET_BYTES: usize = 32 * 1024;
@@ -4768,7 +4806,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 let key = (area, entry.path.clone());
                 let identity = observed.get(&entry.path).copied().flatten();
                 if reusable && let Some(previous) = cache.numstats.get(&key)
-                    && previous.matches(entry, identity) {
+                    && previous.matches(entry, identity, bases.get(&key).copied()) {
                     entry.added_lines = previous.added;
                     entry.removed_lines = previous.removed;
                     next.insert(key, previous.clone());
@@ -4819,6 +4857,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     old_path: entry.old_path.clone(), kind: entry.kind,
                     conflict: entry.conflict, submodule: entry.submodule,
                     identity: observed.get(&entry.path).copied().flatten(),
+                    basis: bases.get(&(area, entry.path.clone())).copied(),
                     added: record.added, removed: record.removed,
                 });
             }
@@ -8506,7 +8545,9 @@ mod tests {
     fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
         let mut outputs = cached_snapshot_outputs(b"", b"");
         outputs.push(success(&snapshot_status(b"")));
-        outputs.extend(cached_snapshot_outputs(b"", b""));
+        let mut metadata_outputs = cached_snapshot_outputs(b"", b"");
+        metadata_outputs.drain(2..4);
+        outputs.extend(metadata_outputs);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
@@ -8530,7 +8571,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 17);
+        assert_eq!(executor.commands.lock().unwrap().len(), 15);
     }
 
     #[test]
@@ -8857,6 +8898,21 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_porcelain_count_bases_separate_head_from_index_without_public_overhead() {
+        let record = |head: &str, index: &str| snapshot_status(format!("1 MM N... 100644 100644 100644 {head} {index} name\0").as_bytes());
+        let (status, none) = parse_status_details(&record("aaa", "bbb"), false).unwrap();
+        assert_eq!(status.entries.len(), 2); assert!(none.is_empty());
+        let (_, initial) = parse_status_details(&record("aaa", "bbb"), true).unwrap();
+        let (_, head) = parse_status_details(&record("ccc", "bbb"), true).unwrap();
+        let (_, index) = parse_status_details(&record("aaa", "ddd"), true).unwrap();
+        let staged = (ChangeArea::Staged, path("name")); let working = (ChangeArea::Unstaged, path("name"));
+        assert_ne!(initial[&staged], head[&staged]);
+        assert_eq!(initial[&working], head[&working]);
+        assert_ne!(initial[&staged], index[&staged]);
+        assert_ne!(initial[&working], index[&working]);
+    }
+
+    #[test]
     fn rejects_missing_rename_source_and_malformed_ab() {
         assert!(parse_status(b"2 R. N... 100644 100644 100644 a b R100 path\0").is_err());
         assert!(parse_status(b"# branch.ab +x -2\0").is_err());
@@ -9026,7 +9082,57 @@ mod tests {
             for name in &names { assert_eq!(measured(&staged, name, ChangeArea::Staged), (Some(2), Some(1))); }
             let commands = executor.commands.lock().unwrap();
             let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
-            assert_eq!(counts.len(), 2, "published index invalidates all measured comparisons");
+            assert_eq!(counts.len(), 2, "published index remeasures changed staged bases in bounded batches");
+            assert!(counts.iter().all(|command| command.arguments.iter().any(|arg| arg == "--cached")));
+        }
+
+        #[test]
+        fn cached_numstat_fences_each_object_basis_across_refs_index_and_head_changes() {
+            let directory = tempfile::tempdir().unwrap(); let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["first", "second"] { fs::write(root.join(name), "base\n").unwrap(); }
+            git(root, &["add", "-A"]); git(root, &["commit", "-m", "initial"]);
+            for name in ["first", "second"] { fs::write(root.join(name), "changed\n").unwrap(); }
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            executor.commands.lock().unwrap().clear();
+            git(root, &["branch", "unrelated"]);
+            let refs = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert!(refs.local_refs.iter().any(|reference| reference.name.as_str() == "refs/heads/unrelated"));
+            assert_eq!(measured(&refs, "first", ChangeArea::Unstaged), (Some(1), Some(1)));
+            assert!(!executor.commands.lock().unwrap().iter().any(|command| command.arguments.iter().any(|arg| arg == "--numstat")), "unrelated refs refresh metadata without discarding measured content");
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("first"), "one\ntwo\n").unwrap();
+            git(root, &["add", "first"]);
+            let staged = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&staged, "first", ChangeArea::Staged), (Some(2), Some(1)));
+            assert_eq!(measured(&staged, "second", ChangeArea::Unstaged), (Some(1), Some(1)));
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
+            assert_eq!(counts.len(), 1);
+            assert!(counts[0].arguments.iter().any(|arg| arg == "--cached"));
+            assert_eq!(counts[0].arguments.last(), Some(&OsString::from("first")));
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("first"), "working\nthree\nfour\n").unwrap();
+            let working = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&working, "first", ChangeArea::Staged), (Some(2), Some(1)));
+            assert_eq!(measured(&working, "first", ChangeArea::Unstaged), (Some(3), Some(2)));
+            executor.commands.lock().unwrap().clear();
+            git(root, &["commit", "-m", "partial"]);
+            let committed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&committed, "first", ChangeArea::Unstaged), (Some(3), Some(2)));
+            assert_eq!(measured(&committed, "second", ChangeArea::Unstaged), (Some(1), Some(1)));
+            assert!(!executor.commands.lock().unwrap().iter().any(|command| command.arguments.iter().any(|arg| arg == "--numstat")), "HEAD publication does not change an unchanged index-to-working basis");
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join(".git/info/attributes"), "second -diff\n").unwrap();
+            let attributes = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&attributes, "second", ChangeArea::Unstaged), (None, None));
+            let commands = executor.commands.lock().unwrap().clone();
+            let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
+            assert_eq!(counts.len(), 2, "semantic attribute changes still invalidate every measured basis");
             assert!(counts.iter().all(|command| !command.arguments.iter().any(|arg| arg == "--")));
         }
 
@@ -12660,12 +12766,12 @@ mod tests {
     #[test]
     fn cached_numstat_never_promotes_an_omitted_record_to_a_binary_measurement() {
         let directory = tempfile::tempdir().unwrap();
-        let mut status = parse_status(&snapshot_status(b"1 .M N... 100644 100644 100644 a b binary\x001 .M N... 100644 100644 100644 a b omitted\0")).unwrap();
+        let (mut status, bases) = parse_status_details(&snapshot_status(b"1 .M N... 100644 100644 100644 a b binary\x001 .M N... 100644 100644 100644 a b omitted\0"), true).unwrap();
         let service = fake_service(vec![success(b"-\t-\tbinary\0")]);
         let cancel = CancellationToken::new();
         let mut cache = SnapshotCache::default(); cache.numstats_ready = true;
         let observed = BTreeMap::from([(path("binary"), Some((1,1,1,1,1,1,1))), (path("omitted"), Some((1,2,1,1,1,1,1)))]);
-        let counts = service.snapshot_numstats(directory.path(), &mut status, SnapshotOptions::default(), &cancel, &cache, &observed).unwrap();
+        let counts = service.snapshot_numstats(directory.path(), &mut status, SnapshotOptions::default(), &cancel, &cache, &observed, &bases).unwrap();
         assert!(counts.contains_key(&(ChangeArea::Unstaged, path("binary"))));
         assert!(!counts.contains_key(&(ChangeArea::Unstaged, path("omitted"))));
     }
