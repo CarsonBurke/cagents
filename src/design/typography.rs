@@ -98,6 +98,62 @@ pub fn configure_typography(interface: &str, interface_size: f32, chat: &str, ch
     });
 }
 
+/// Restore a mounted fixture's UI-thread typography, including after a panic.
+#[cfg(test)]
+pub(crate) fn typography_test_guard() -> impl Drop {
+    struct Restore {
+        active: Typography,
+        request: Option<(String, f32, String, f32)>,
+        toolkit_family: String,
+        // A UI-thread snapshot must never be restored on another thread.
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            cosmic::widget::text::set_default_size(self.active.interface_size);
+            cosmic::config::COSMIC_TK
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .interface_font
+                .family = self.toolkit_family.clone();
+            TYPOGRAPHY.with(|active| {
+                let current = active.get();
+                let changed = (
+                    current.interface_font,
+                    current.interface_size,
+                    current.chat_font,
+                    current.chat_size,
+                ) != (
+                    self.active.interface_font,
+                    self.active.interface_size,
+                    self.active.chat_font,
+                    self.active.chat_size,
+                );
+                active.set(Typography {
+                    revision: if changed {
+                        current.revision.wrapping_add(1)
+                    } else {
+                        current.revision
+                    },
+                    ..self.active
+                });
+            });
+            REQUEST.with(|request| *request.borrow_mut() = self.request.take());
+        }
+    }
+    Restore {
+        active: TYPOGRAPHY.with(std::cell::Cell::get),
+        request: REQUEST.with(|request| request.borrow().clone()),
+        toolkit_family: cosmic::config::COSMIC_TK
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .interface_font
+            .family
+            .clone(),
+        _thread: std::marker::PhantomData,
+    }
+}
+
 /// Installed families are immutable for the running process, as is iced's font database.
 pub fn installed_font_families(monospace: bool) -> &'static Vec<String> {
     fn discover(monospace: bool) -> Vec<String> {

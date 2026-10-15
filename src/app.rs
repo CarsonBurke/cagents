@@ -7410,7 +7410,8 @@ impl TerminalTitleSource {
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
-/// is renamed instead of once per rendered frame. Reusing an id also keeps the
+/// is renamed or typography changes, instead of once per rendered frame.
+/// Reusing an id also keeps the
 /// card's accessibility node stable across frames.
 struct CardChrome {
     tooltip: String,
@@ -7430,6 +7431,7 @@ struct CardChrome {
     type_label: &'static str,
     title: String,
     title_width: f32,
+    typography_revision: u64,
     compact_title: Option<String>,
     terminal_ordinal_suffix: Option<String>,
     terminal_title_source: Option<TerminalTitleSource>,
@@ -7464,6 +7466,7 @@ impl CardChrome {
             type_label,
             title: title.to_owned(),
             title_width: chrome_ui::measure_tab_title(title),
+            typography_revision: design::typography_revision(),
             compact_title: None,
             terminal_ordinal_suffix: None,
             terminal_title_source: None,
@@ -7476,7 +7479,10 @@ impl CardChrome {
     }
 
     fn describes(&self, type_label: &str, title: &str, caption: &str) -> bool {
-        self.type_label == type_label && self.title == title && self.caption == caption
+        self.type_label == type_label
+            && self.title == title
+            && self.caption == caption
+            && self.typography_revision == design::typography_revision()
     }
 
     fn accessible_name(&self, focused: bool) -> &str {
@@ -10583,6 +10589,14 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        // Cache measurements with the settings this update will render, before
+        // view() gets its turn to configure the same thread-local typography.
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
