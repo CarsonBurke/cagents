@@ -79,11 +79,18 @@ pub struct CheckoutTarget {
     pub repository: PathBuf,
     pub number: u64,
     pub head: crate::repository::Oid,
+    pub pull_request: Option<PullRequestKey>,
+    pub head_ref_name: String,
 }
 
 impl CheckoutTarget {
+    /// A caller without a forge identity can still request a local commit checkout.
+    pub fn read_only(repository: PathBuf, number: u64, head: crate::repository::Oid) -> Self {
+        Self { repository, number, head, pull_request: None, head_ref_name: String::new() }
+    }
+
     pub fn suggested_branch(&self) -> String {
-        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+        if self.head_ref_name.is_empty() { format!("pr/{}", self.number) } else { self.head_ref_name.clone() }
     }
 }
 
@@ -1138,6 +1145,8 @@ impl State {
                         repository: target.worktree.clone(),
                         number: target.pull_request.number,
                         head: range.head.clone(),
+                        pull_request: Some(PullRequestKey::new(target.repository.clone(), target.pull_request.number).expect("validated PR identity")),
+                        head_ref_name: target.pull_request.head_ref_name.clone(),
                     }));
                 }
                 ActionTask::none()
@@ -4099,7 +4108,7 @@ pub(crate) mod tests {
         };
         assert_eq!(target.repository, PathBuf::from("/repo"));
         assert_eq!(target.head.as_str(), "a".repeat(40));
-        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        assert_eq!(target.suggested_branch(), "feature");
         state.context = None;
         drop(state.update(Action::Checkout));
         assert!(state.take_effects().is_empty());
