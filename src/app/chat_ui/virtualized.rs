@@ -24,12 +24,16 @@ pub(super) type Window = Rc<Cell<Option<Viewport>>>;
 /// aliases exist for explicit navigation operations, never pointer hit tests.
 pub(super) struct PlaceholderPolicy { pub visit: bool }
 
+#[derive(Clone)]
+pub(super) struct LogicalRange { pub identity: u64, pub bytes: std::ops::Range<usize>, pub chunk: bool }
+
 pub(super) struct Row<'a> {
     pub key: u64,
     pub revision: u64,
     pub estimate: f32,
     pub aliases: Vec<Id>,
     pub anchor: bool,
+    pub logical: Option<LogicalRange>,
     build: Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>,
     content: Option<Element<'a, Message>>,
 }
@@ -41,7 +45,7 @@ impl<'a> Row<'a> {
         id: Option<Id>,
         build: impl FnOnce() -> Element<'a, Message> + 'a,
     ) -> Self {
-        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, build: Some(Box::new(build)), content: None }
+        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, logical: None, build: Some(Box::new(build)), content: None }
     }
     fn element(&mut self) -> &mut Element<'a, Message> {
         if self.content.is_none() {
@@ -80,6 +84,8 @@ struct State {
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
+    logical: HashMap<u64, Vec<(std::ops::Range<usize>, usize, bool)>>,
+    aliased: Vec<usize>,
 }
 
 fn visible(offsets: &[f32], top: f32, height: f32) -> std::ops::Range<usize> {
@@ -103,6 +109,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         }
         state.positions = self.rows.iter().enumerate().map(|(index, row)| (row.key, index)).collect();
         state.anchors = self.rows.iter().filter(|row| row.anchor).map(|row| row.key).collect();
+        state.aliased = self.rows.iter().enumerate().filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index)).collect();
+        state.logical.clear();
+        for (index, row) in self.rows.iter().enumerate() {
+            if let Some(logical) = &row.logical {
+                state.logical.entry(logical.identity).or_default().push((logical.bytes.clone(), index, logical.chunk));
+            }
+        }
         // Retain only descriptors still loaded by the transcript window.
         let keys: HashSet<_> = self.rows.iter().map(|row| row.key).collect();
         state.heights.retain(|key, _| keys.contains(key));
@@ -166,7 +179,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // anchoring without constructing their text or widget trees.
         let mut placeholders = PlaceholderPolicy { visit: true };
         operation.custom(None, layout.bounds(), &mut placeholders);
-        if placeholders.visit { for (index, row) in self.rows.iter().enumerate() {
+        if placeholders.visit { for &index in &state.aliased {
+            let row = &self.rows[index];
             for id in &row.aliases {
                 operation.container(Some(id), Rectangle {
                     x: layout.bounds().x, y: layout.bounds().y + state.offsets[index],
@@ -238,6 +252,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
     }
 }
 
+/// Geometry from cheap row descriptions. Exact glyph geometry, when mounted,
+/// supersedes this estimate in scroll::locate_logical. No hidden builder runs.
+pub(super) fn logical_bounds(state: &dyn std::any::Any, bounds: Rectangle, identity: u64, byte: usize) -> Option<(Rectangle, u8)> {
+    let state = state.downcast_ref::<State>()?;
+    let ranges = state.logical.get(&identity)?;
+    let at = ranges.partition_point(|(range, _, _)| range.start <= byte).saturating_sub(1);
+    let (range, index, chunk) = ranges.get(at)?;
+    if byte > range.end { return None; }
+    let top = state.offsets[*index];
+    let height = state.offsets[*index + 1] - top;
+    let fraction = byte.saturating_sub(range.start) as f32 / range.len().max(1) as f32;
+    Some((Rectangle { x: bounds.x, y: bounds.y + top + height * fraction,
+        width: bounds.width, height: 1.0 }, if *chunk { 2 } else { 1 }))
+}
+
 /// Fine-grained anchors include the visible window and previously anchored
 /// rows even when corrected estimates moved them outside the current window.
 /// No hidden row is realized to answer this geometry request.
@@ -261,6 +290,8 @@ pub(super) struct UpdateViewport {
     clip: Option<Rectangle>,
     pending: Option<(Rectangle, Vector)>,
     pub changed: bool,
+    touches: usize,
+    exchanges: Vec<usize>,
 }
 impl Operation for UpdateViewport {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -281,12 +312,19 @@ impl Operation for UpdateViewport {
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
         if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() { policy.visit = false; return; }
+        if let Some(invalidation) = state.downcast_mut::<retained::LayoutInvalidation>() {
+            match invalidation {
+                retained::LayoutInvalidation::Enter => self.exchanges.push(self.touches),
+                retained::LayoutInvalidation::Exit { changed } => *changed = self.exchanges.pop().is_some_and(|before| before != self.touches),
+            }
+            return;
+        }
         if let (Some(state), Some(viewport)) = (state.downcast_mut::<State>(), self.clip) {
             let top = (viewport.y + self.translation.y - bounds.y).max(0.0);
             let wanted = visible(&state.offsets, top, viewport.height);
             let mounted = state.mounted.first().map_or(0, |(index, _)| *index)
                 ..state.mounted.last().map_or(0, |(index, _)| *index + 1);
-            self.changed |= wanted != mounted;
+            if wanted != mounted { self.changed = true; self.touches += 1; }
             state.observed = Some(Viewport { top, height: viewport.height, bottom: false });
         }
     }
@@ -296,6 +334,20 @@ impl Operation for UpdateViewport {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn logical_navigation_uses_only_descriptor_offsets_until_a_chunk_is_mounted() {
+        let mut state = State { offsets: vec![0.0, 1000.0, 1500.0], ..Default::default() };
+        state.logical.insert(42, vec![(0..100, 0, true), (100..200, 1, true)]);
+        let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(720.0, 1500.0));
+        let (first, stage) = logical_bounds(&state, bounds, 42, 50).unwrap();
+        assert_eq!((first.y, stage), (520.0, 2));
+        assert_eq!(logical_bounds(&state, bounds, 42, 100).unwrap().0.y, 1020.0);
+        assert_eq!(logical_bounds(&state, bounds, 42, 200).unwrap().0.y, 1520.0);
+        assert!(logical_bounds(&state, bounds, 42, 201).is_none());
+        assert!(logical_bounds(&state, bounds, 43, 50).is_none());
+        assert!(state.mounted.is_empty(), "no offscreen row was instantiated");
+    }
 
     #[test]
     fn only_viewport_rows_are_instantiated_and_evicted_trees_are_released() {

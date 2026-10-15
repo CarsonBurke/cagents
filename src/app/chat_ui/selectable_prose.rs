@@ -101,6 +101,31 @@ impl State {
             })
     }
 
+    /// A mounted glyph cluster containing a logical byte. This inspects the
+    /// existing bounded paragraph and never shapes an offscreen source.
+    pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {
+        let logical = self.logical.as_ref()?;
+        if logical.identity != identity || byte < logical.start { return None; }
+        let byte = byte - logical.start;
+        if byte > self.plain.len() { return None; }
+        let paragraph = self.paragraph();
+        let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
+        let mut offset = 0;
+        for line in &paragraph.buffer().lines {
+            prefixes.push(offset); offset += line.text().len() + line.ending().as_str().len();
+        }
+        let mut last = None;
+        for run in paragraph.buffer().layout_runs() {
+            for glyph in run.glyphs {
+                let bounds = Rectangle::new(Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
+                    Size::new(glyph.w.abs(), run.line_height));
+                if prefixes[run.line_i] + glyph.start <= byte && byte < prefixes[run.line_i] + glyph.end { return Some(bounds); }
+                last = Some(bounds);
+            }
+        }
+        (byte == self.plain.len()).then_some(last).flatten()
+    }
+
     pub(super) fn hit(&self, position: Point) -> usize {
         hit(self.paragraph(), &self.plain, position)
     }
@@ -273,6 +298,14 @@ impl Selectable {
 /// is independent of syntax span count and never reshapes selected text.
 fn paint_ranges(renderer: &mut cosmic::Renderer, paragraph: &ParagraphBuffer,
     ranges: &[std::ops::Range<usize>], translation: iced::Vector, color: iced::Color) {
+    visit_range_bounds(paragraph, ranges, |bounds| {
+        renderer.fill_quad(renderer::Quad { bounds: Rectangle { x: bounds.x + translation.x,
+            y: bounds.y + translation.y, ..bounds }, ..Default::default() }, color);
+    });
+}
+
+fn visit_range_bounds(paragraph: &ParagraphBuffer, ranges: &[std::ops::Range<usize>],
+    mut paint: impl FnMut(Rectangle)) {
     if ranges.is_empty() { return; }
     let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
     let mut offset = 0;
@@ -285,10 +318,8 @@ fn paint_ranges(renderer: &mut cosmic::Renderer, paragraph: &ParagraphBuffer,
         let mut bounds: Option<(f32, f32)> = None;
         let mut flush = |bounds: &mut Option<(f32, f32)>| {
             if let Some((left, right)) = bounds.take() {
-                renderer.fill_quad(renderer::Quad {
-                    bounds: Rectangle::new(Point::new(left, run.line_top) + translation,
-                        Size::new(right - left, run.line_height)), ..Default::default()
-                }, color);
+                paint(Rectangle::new(Point::new(left, run.line_top),
+                    Size::new(right - left, run.line_height)));
             }
         };
         for glyph in run.glyphs {
@@ -663,6 +694,33 @@ mod tests {
             selectable.hit(&state, Point::new(0.0, 400.0)),
             selectable.plain.len()
         );
+    }
+
+    #[test]
+    fn direct_paint_and_logical_navigation_use_bounded_unicode_glyph_geometry() {
+        let renderer = crate::app::tests::headless_renderer();
+        let source = "Latin fi e\u{301} αβ العربية text";
+        let identity = 0x1234;
+        let mut element = logical_text(vec![Span::new(source.to_owned())].into(),
+            design::TEXT_PROSE.into(), iced::Font::default(),
+            Target { card: CardId::new(), generation: 0 }, None, Logical { identity, start: 100 });
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)));
+        let state = tree.state.downcast_ref::<State>();
+        for (byte, ch) in source.char_indices().filter(|(_, ch)| !ch.is_whitespace()) {
+            let mut painted = Vec::new();
+            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| painted.push(bounds));
+            assert!(!painted.is_empty(), "every selected grapheme paints its existing cluster");
+            for bounds in painted {
+                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <=150.5);
+                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height +0.5);
+            }
+            assert!(state.logical_byte_bounds(identity, 100 + byte).is_some());
+        }
+        assert!(state.logical_byte_bounds(identity, 99).is_none());
+        assert!(state.logical_byte_bounds(identity +1, 100).is_none());
+        assert_eq!(state.paragraph_builds.get(), 1, "paint/navigation reuse the same paragraph");
     }
 
     #[test]

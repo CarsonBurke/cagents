@@ -341,12 +341,18 @@ impl Renderer {
                 markdown::Item::CodeBlock { code, .. } => (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32) * settings.code_size.0 * 1.3 + 48.0,
                 _ => 80.0,
             } + if index == 0 { 0.0 } else { settings.spacing.0 };
+            let logical_len = match item {
+                markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => Some(text.len()),
+                markdown::Item::CodeBlock { code, .. } => Some(code.len()), _ => None,
+            };
             let item = item.clone();
             let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
                 retained::kept(revision, move || widget::container(renderer.item(&item, index, settings))
                     .padding(iced::Padding::ZERO.top(if index == 0 { 0.0 } else { settings.spacing.0 })).into())
             });
-            row.anchor = true; row
+            row.anchor = true;
+            row.logical = logical_len.map(|len| virtualized::LogicalRange { identity: key, bytes: 0..len, chunk: false });
+            row
         }).collect();
         virtualized::column(rows, Default::default())
     }
@@ -660,6 +666,8 @@ pub(super) fn code_text(
         let estimate = ((range.len() as f32 * size.0 * 0.6 / design::READABLE_MEASURE).ceil().max(1.0)
             + text[range.clone()].matches('\n').count() as f32) * size.0 * 1.3;
         let text = text.clone(); let spans = spans.clone(); let starts = starts.clone(); let find = find.clone();
+        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
         let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
         let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
             retained::kept(revision, move || {
@@ -668,7 +676,7 @@ pub(super) fn code_text(
                 leaf_text(spans, size, font, target, find.as_deref(), logical.clone())
             })
         });
-        row.anchor = true; row
+        row.anchor = true; row.logical = descriptor; row
     }).collect();
     virtualized::column(rows, Default::default())
 }
@@ -731,6 +739,8 @@ fn paragraph(
         let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0)
             + plain[range.clone()].matches('\n').count() as f32) * settings.text_size.0 * 1.3;
         let text = text.clone(); let find = find.clone();
+        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
         let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
         let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
             retained::kept(revision, move || {
@@ -739,6 +749,7 @@ fn paragraph(
             })
         });
         row.anchor = true;
+        row.logical = descriptor;
         row
     }).collect();
     virtualized::column(rows, Default::default())
