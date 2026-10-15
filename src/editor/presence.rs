@@ -426,7 +426,8 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     })();
     let cleanup = (|| {
         let named = fs_safety::metadata_beneath(&parent, Path::new(&holding_name)).map_err(resolve_error)?;
-        if !same_inode(&named, &holding.metadata().map_err(io_error)?) {
+        let held = holding.metadata().map_err(io_error)?;
+        if !named.is_dir() || !held.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
             return Err(FileIoError::Io("The private Undo metadata directory was moved or replaced; no replacement directory was removed.".into()));
         }
         fs_safety::remove_directory_within(&parent, &holding_name).map_err(resolve_error)
