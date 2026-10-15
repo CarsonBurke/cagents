@@ -23,7 +23,11 @@ pub(super) fn candidate(db: &Connection, agent: &Agent, pane: &crate::workspace_
     let CardKind::Terminal(ended) = &pane.kind else {
         return Err("Only an ended managed terminal presentation can require this consent".into());
     };
-    if pane.id != CardId::from_uuid(agent.id.as_uuid()) || pane.pending_terminal_start || !ended_terminal(ended) {
+    let record = terminal_source(db, pane.id)?;
+    let located_end = record.as_ref().is_some_and(|record| record.matches_end(ended));
+    if pane.id != CardId::from_uuid(agent.id.as_uuid()) || pane.pending_terminal_start
+        || !(ended_terminal(ended) || located_end)
+    {
         return Err("The current pane is not an ended managed presentation".into());
     }
     // These public identifiers identify which presentation to show for consent.
@@ -32,8 +36,11 @@ pub(super) fn candidate(db: &Connection, agent: &Agent, pane: &crate::workspace_
         crate::agent_execution::HostedSession::Terminal(session) => Some(session), _ => None,
     }).chain(agent.console.iter()).any(|source| source.id == ended.id && source.launch == ended.launch);
     if !identified { return Err("The current pane is not identified by this agent".into()); }
-    if terminal_source(db, pane.id)?.is_some() {
+    if record.as_ref().is_some_and(|record| record.original_source().is_some()) {
         return Err("Recorded terminal provenance exists; presentation-only repair cannot override it".into());
+    }
+    if record.is_some() && !located_end {
+        return Err("The located presentation no longer matches its exact historical basis".into());
     }
     Ok(())
 }
