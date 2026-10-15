@@ -91,6 +91,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Close focused pane | `Ctrl+Shift+W` |
 | Find in editor/chat / otherwise search projects | `Ctrl+F` |
 | Search projects / find in terminal | `Ctrl+Shift+F` |
+| Search file contents in the active project | `Ctrl+Alt+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
@@ -131,6 +132,8 @@ determine which models and permission modes are available.
   highlighted pane, or press **Escape** to cancel.
 - Use the command palette to search commands, panes, channels and workspaces.
   Prefix the query with `>` for commands, `@` for panes, or `#` for workspaces.
+  **Search in project** (`Ctrl+Alt+F`) opens content search in the active
+  worktree; **Search projects** filters workspace navigation.
   Exact and prefix matches lead looser matches; matching characters are
   highlighted. With an empty query, recent actions appear first and survive
   restarts. Panes include inactive workspaces, show their activity status, and
