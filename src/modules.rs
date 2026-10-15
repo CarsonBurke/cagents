@@ -85,6 +85,8 @@ pub mod process;
 pub mod project_location;
 pub mod project_recovery;
 #[cfg(feature = "ui")]
+pub mod project_search;
+#[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
 pub mod reorder;
