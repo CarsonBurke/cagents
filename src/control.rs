@@ -2567,8 +2567,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::Start => {
-            let socket = terminal::ensure_daemon_ready()
-                .map_err(|error| AppError::new("daemon_start", error))?;
+            let socket = control_daemon_socket()?;
             let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
             // Installers discard a successful start's output, but a daemon that
             // came up without some retained conversations must still say so.

@@ -49,7 +49,7 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
     let fixture = Fixture::new();
     for environment in [false, true] {
         for args in [vec!["agent", "list"], vec!["automation", "list"], vec!["channel", "list"],
-            vec!["terminal", "list"], vec!["project", "list"], vec!["sessions"], vec!["whoami"], vec!["account", "info"]] {
+            vec!["terminal", "list"], vec!["project", "list"], vec!["sessions"], vec!["whoami"], vec!["account", "info"], vec!["daemon", "start"]] {
             let mut arguments = args;
             if !environment { arguments.push("--no-start"); }
             let output = fixture.output(&arguments, environment);
