@@ -5740,6 +5740,7 @@ fn compact_project_identity(
     selected: bool,
     modal_open: bool,
     state: &SidebarState,
+    summaries: &HashMap<WorktreeId, WorktreeAttention<'_>>,
 ) -> Element<'static, SidebarAction> {
     let (initials, color) = project_identity(&project.name);
     let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
@@ -5769,8 +5770,7 @@ fn compact_project_identity(
     // The app's NavigationCache retains this entire widget and hint across
     // unchanged terminal wakes. On an invalidation, scan pane ownership once,
     // rather than again for every hidden worktree in the hover description.
-    let summaries = state.worktree_attention_summaries(project.id);
-    let attention = compact_project_attention_from_summaries(project, &summaries);
+    let attention = compact_project_attention_from_summaries(project, summaries);
     let mut description = project.name.clone();
     for worktree in &project.worktrees {
         use std::fmt::Write as _;
@@ -5849,7 +5849,7 @@ fn compact_project<'a>(
             if project_id == entity.id
     );
     let header = context_controls(
-        compact_project_identity(entity, selected, modal_open, project.state),
+        compact_project_identity(entity, selected, modal_open, project.state, &project.attention),
         entity.id,
         None,
         modal_open,
