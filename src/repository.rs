@@ -6,7 +6,7 @@
 //! straightforward to test with a fake executor.
 
 mod worktree_setup_intent;
-pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan};
+pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan, worktree_setup_marker_matches};
 
 use std::{
     borrow::Cow,
@@ -11572,7 +11572,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         let admin_dir = self.created_admin_dir(journal);
         if residual.branch_exists && owned && admin_dir.is_some() {
-            journal.admin_dir = admin_dir;
+            let (admin, admin_root, _checkout_root) = admin_dir.expect("admin identity checked");
+            journal.admin_dir = Some(admin);
+            if let Err(error) = worktree_setup_intent::record_creation_identity(&admin_root, journal.request.operation_id) {
+                journal.state = WorktreeOperationState::ReconcileRequired;
+                journal.detail = format!("Worktree created; creation identity publication requires reconciliation: {error}");
+                return;
+            }
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
                 worktree: residual.registered_worktree.expect("ownership checked"),
@@ -11622,13 +11628,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
+    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)> {
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
+        crate::secure_file::reject_symlink_components(destination).ok()?;
+        let checkout_root = fs_safety::Root::open(destination).ok()?;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
             return None;
         }
         let git_dir = self.git_dir(destination, &token).ok()?;
+        crate::secure_file::reject_symlink_components(&git_dir).ok()?;
+        let admin_root = fs_safety::Root::open(&git_dir).ok()?;
+        let same_named_directory = |root: &fs_safety::Root| {
+            use std::os::unix::fs::MetadataExt;
+            root.metadata().ok().zip(fs::symlink_metadata(root.path()).ok()).is_some_and(|(held, named)|
+                named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino())
+        };
         // A linked worktree must resolve to its own administrative directory,
         // whose backlink names exactly this destination's .git file.
         if git_dir.parent() != Some(journal.common_dir.join("worktrees").as_path())
@@ -11647,7 +11662,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return None;
         }
         if journal.checkout_completed {
-            return Some(git_dir);
+            return (same_named_directory(&checkout_root) && same_named_directory(&admin_root)).then_some((git_dir, admin_root, checkout_root));
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
@@ -11663,7 +11678,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &token,
                 )
                 .is_ok_and(|output| output.stdout.is_empty());
-        clean.then_some(git_dir)
+        (clean && same_named_directory(&checkout_root) && same_named_directory(&admin_root)).then_some((git_dir, admin_root, checkout_root))
     }
 
     /// Only the original live request may clean up its own Git lock. Startup
@@ -12138,6 +12153,7 @@ mod worktree_journal_tests {
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         let identity = fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap().unwrap();
         assert_eq!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()));
+        assert!(identity.matches_checkout(&identity.common_dir, identity.admin_dir.as_deref().unwrap()).unwrap());
         fixture.git(&["worktree", "remove", fixture.request.destination.to_str().unwrap()]);
         let replacement = fixture.request.managed_root.join("replacement");
         fixture.git(&["worktree", "add", replacement.to_str().unwrap(), fixture.request.branch.as_str()]);
@@ -12146,6 +12162,12 @@ mod worktree_journal_tests {
         assert_eq!(record.branch.as_deref(), Some(fixture.request.branch.full_ref().as_str()));
         assert_eq!(identity.common_dir, fixture.service.common_dir(&fixture.request.repository, &token).unwrap());
         assert_ne!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()), "same branch and path do not prove creation identity");
+        assert!(!identity.matches_checkout(&identity.common_dir, &fixture.service.git_dir(&fixture.request.destination, &token).unwrap()).unwrap());
+        fixture.git(&["worktree", "remove", fixture.request.destination.to_str().unwrap()]);
+        fixture.git(&["worktree", "add", fixture.request.destination.to_str().unwrap(), fixture.request.branch.as_str()]);
+        let reused_admin = fixture.service.git_dir(&fixture.request.destination, &token).unwrap();
+        assert_eq!(identity.admin_dir.as_ref(), Some(&reused_admin), "Git reuses the original administrative pathname");
+        assert!(!identity.matches_checkout(&identity.common_dir, &reused_admin).unwrap(), "direct same-path replacement must not inherit setup authority");
         assert_eq!(fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap(), Some(identity), "a read must retain the original receipt rather than reconcile it to the replacement");
     }
 

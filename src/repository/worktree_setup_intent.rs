@@ -33,8 +33,66 @@ pub struct WorktreeSetupIntent {
 /// not authorize resuming setup in a replacement checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeSetupCreationIdentity {
+    pub creation_id: OperationId,
     pub common_dir: PathBuf,
     pub admin_dir: Option<PathBuf>,
+}
+
+const CREATION_MARKER: &str = "cagents-setup-creation";
+
+fn read_creation_marker(admin: &crate::fs_safety::Root) -> io::Result<Option<OperationId>> {
+    let mut file = match crate::fs_safety::open_beneath(admin, Path::new(CREATION_MARKER)) {
+        Ok(file) => file,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    if !file.metadata()?.is_file() { return Err(io::Error::other("Invalid worktree creation identity marker")); }
+    let bytes = crate::fs_safety::read_bounded(&mut file, 64)?;
+    let value = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    value.trim_end_matches('\n').parse().map(Some).map_err(io::Error::other)
+}
+
+/// Verify a recorded generation without a database lookup, mutation or Git.
+/// The caller separately proves the current registered common/admin identity.
+pub fn worktree_setup_marker_matches(admin: &Path, creation: OperationId) -> io::Result<bool> {
+    crate::secure_file::reject_symlink_components(admin)?;
+    let admin = crate::fs_safety::Root::open(admin)?;
+    Ok(read_creation_marker(&admin)? == Some(creation))
+}
+
+impl WorktreeSetupCreationIdentity {
+    /// A marker belonging to the exact original creation survives a move but
+    /// disappears when Git removes its admin directory, even if its path or
+    /// filesystem inode number is later reused. Never infer it for legacy rows.
+    pub fn matches_checkout(&self, common: &Path, admin: &Path) -> io::Result<bool> {
+        if self.common_dir != common || self.admin_dir.as_deref() != Some(admin) { return Ok(false); }
+        worktree_setup_marker_matches(admin, self.creation_id)
+    }
+}
+
+/// Publish through the already-held original admin descriptor, only while
+/// the operation's Git lock and exclusive lease prove creation ownership.
+/// Never initialize or repair a marker from a setup resume callback.
+pub(super) fn record_creation_identity(admin: &crate::fs_safety::Root, creation: OperationId) -> io::Result<()> {
+    use std::io::Write;
+    match read_creation_marker(admin)? {
+        Some(existing) if existing == creation => return Ok(()),
+        Some(_) => return Err(io::Error::other("Worktree creation identity belongs to another generation")),
+        None => {}
+    }
+    let (mut file, temporary) = crate::fs_safety::create_temporary_in(admin, 0o600).map_err(io::Error::other)?;
+    let result = (|| {
+        writeln!(file, "{creation}")?;
+        file.sync_all()?;
+        match crate::fs_safety::rename_new_within(admin, &temporary, std::ffi::OsStr::new(CREATION_MARKER)) {
+            Ok(()) => {},
+            Err(error) if error.is_already_exists() && read_creation_marker(admin)? == Some(creation) => {},
+            Err(error) => return Err(io::Error::other(error)),
+        }
+        crate::fs_safety::sync_directory(admin)
+    })();
+    let _ = crate::fs_safety::unlink_within(admin, &temporary);
+    result
 }
 
 fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
@@ -124,7 +182,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Option<WorktreeSetupCreationIdentity>, StoreError> {
         let Some(operation) = store.journaled_worktree_operation(creation_id)? else { return Ok(None); };
         let journal = settled_setup_journal(&operation)?;
-        Ok(Some(WorktreeSetupCreationIdentity { common_dir: journal.common_dir, admin_dir: journal.admin_dir }))
+        Ok(Some(WorktreeSetupCreationIdentity { creation_id, common_dir: journal.common_dir, admin_dir: journal.admin_dir }))
     }
 
     /// Update metadata on a settled creation without reconciling or executing
@@ -242,6 +300,41 @@ mod tests {
     }
 
     #[test]
+    fn creation_marker_is_private_idempotent_bounded_and_never_replaced() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::fs_safety::Root::open(directory.path()).unwrap();
+        let creation = OperationId::new();
+        assert!(!worktree_setup_marker_matches(directory.path(), creation).unwrap());
+        record_creation_identity(&root, creation).unwrap();
+        record_creation_identity(&root, creation).unwrap();
+        assert!(worktree_setup_marker_matches(directory.path(), creation).unwrap());
+        assert_eq!(fs::metadata(directory.path().join(CREATION_MARKER)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(record_creation_identity(&root, OperationId::new()).is_err());
+        assert!(worktree_setup_marker_matches(directory.path(), creation).unwrap());
+        fs::write(directory.path().join(CREATION_MARKER), vec![b'a'; 65]).unwrap();
+        assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
+        fs::remove_file(directory.path().join(CREATION_MARKER)).unwrap();
+        symlink("/dev/null", directory.path().join(CREATION_MARKER)).unwrap();
+        assert!(worktree_setup_marker_matches(directory.path(), creation).is_err());
+    }
+
+    #[test]
+    fn late_marker_publication_stays_with_the_held_original_admin_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = directory.path().join("admin");
+        let moved = directory.path().join("old-admin");
+        fs::create_dir(&admin).unwrap();
+        let original = crate::fs_safety::Root::open(&admin).unwrap();
+        fs::rename(&admin, &moved).unwrap();
+        fs::create_dir(&admin).unwrap();
+        let creation = OperationId::new();
+        record_creation_identity(&original, creation).unwrap();
+        assert!(worktree_setup_marker_matches(&moved, creation).unwrap());
+        assert!(!worktree_setup_marker_matches(&admin, creation).unwrap(), "an asynchronous callback cannot initialize the replacement generation");
+    }
+
+    #[test]
     fn old_requests_and_intents_deserialize_without_setup_fields() {
         let mut value = serde_json::to_value(request(Path::new("/fixture"))).unwrap();
         value.as_object_mut().unwrap().remove("setup_intent");
@@ -327,7 +420,7 @@ mod tests {
         let journal = journal(request.clone());
         seed(&store, &journal, PendingOperationStatus::Applied);
         let before = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload;
-        assert_eq!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap(), Some(WorktreeSetupCreationIdentity { common_dir: journal.common_dir.clone(), admin_dir: journal.admin_dir.clone() }));
+        assert_eq!(service.worktree_setup_creation_identity(&store, request.operation_id).unwrap(), Some(WorktreeSetupCreationIdentity { creation_id: request.operation_id, common_dir: journal.common_dir.clone(), admin_dir: journal.admin_dir.clone() }));
         assert_eq!(store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
         let mut legacy = journal.clone(); legacy.admin_dir = None;
         store.update_operation(request.operation_id, &before, &serde_json::to_value(&legacy).unwrap(), PendingOperationStatus::Applied).unwrap();
