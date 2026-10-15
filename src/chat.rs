@@ -384,6 +384,14 @@ pub struct Attachment {
     pub path: std::path::PathBuf,
 }
 
+/// File bytes to dispatch, with an optional non-authoritative display label.
+/// The display path is never opened, resolved, or used for account authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedAttachment {
+    pub path: std::path::PathBuf,
+    pub display_path: Option<std::path::PathBuf>,
+}
+
 /// The file extensions every provider's image input recognises.
 pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
@@ -1250,6 +1258,13 @@ pub enum Command {
         session_id:String,
         original:annotations::OriginalPrompt,
         turn_generation:u64,
+    },
+    /// Send new intent while preserving attachment display names from Edit.
+    /// Only `path` supplies bytes; `display_path` is presentation metadata.
+    PromptNamed {
+        text: String,
+        attachments: Vec<NamedAttachment>,
+        mode: PromptMode,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

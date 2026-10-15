@@ -25,11 +25,16 @@ impl Authority {
     /// Captures immutable operator bytes before any provider dispatch. Mutation
     /// of attachment paths happens only after the complete durable publication.
     pub(super) fn prepare(&mut self,command:&mut crate::chat::Command,cwd:&std::path::Path)->Result<Option<String>,OriginalError>{
+        self.prepare_named(command,cwd,&[])
+    }
+    pub(super) fn prepare_named(&mut self,command:&mut crate::chat::Command,cwd:&std::path::Path,names:&[Option<std::path::PathBuf>])->Result<Option<String>,OriginalError>{
         let crate::chat::Command::Prompt{text,attachments,..}=command else{return Ok(None);};
+        if (!names.is_empty() && names.len()!=attachments.len()) || names.iter().flatten().any(|name|name.as_os_str().as_encoded_bytes().len()>4096){return Err(OriginalError::TooLarge);}
         if self.session.is_none() && self.unconfirmed_commands.len()>=64{return Err(OriginalError::TooLarge);}
         let mut pending=self.pending_store().map_err(OriginalError::Unavailable)?;
         let mut captured_text=pending.capture_text(text)?;
         let mut captures=attachments.iter().map(|attachment|pending.retain_attachment(&if attachment.path.is_absolute(){attachment.path.clone()}else{cwd.join(&attachment.path)})).collect::<Result<Vec<_>,_>>()?;
+        for (capture,name) in captures.iter_mut().zip(names){if let Some(name)=name{capture.attachment.original_path=name.clone();}}
         let id=uuid::Uuid::new_v4().to_string();
         let prepared=pending.prepare_command(&id,self.session.as_deref(),&mut captured_text,&mut captures)?;
         if self.session.is_none(){self.unconfirmed_commands.push(id.clone());}
@@ -386,6 +391,13 @@ while True:
     }
 
     #[test]
+    fn named_edit_attachments_capture_only_dispatch_bytes_and_retain_display_hint(){
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();let mut authority=Authority::new(Ok(scope));authority.root=Some(root.path().join("annotations"));
+        let actual=root.path().join("private-capture-uuid");std::fs::write(&actual,b"actual bytes").unwrap();let display=root.path().join("other-account-original.png");assert!(!display.exists());let mut prompt=Command::Prompt{text:"edited new intent".into(),attachments:vec![crate::chat::Attachment{path:actual}],mode:crate::chat::PromptMode::Send};let id=authority.prepare_named(&mut prompt,root.path(),&[Some(display.clone())]).unwrap().unwrap();let stored=authority.pending_store().unwrap().prepared(&id).unwrap();assert_eq!(stored.attachments[0].original_path,display);assert_eq!(std::fs::read(&stored.attachments[0].path).unwrap(),b"actual bytes");assert!(!stored.attachments[0].original_path.exists());
+        let encoded=postcard::to_stdvec(&Command::PromptNamed{text:"edit".into(),attachments:vec![crate::chat::NamedAttachment{path:stored.attachments[0].path.clone(),display_path:Some(display)}],mode:crate::chat::PromptMode::Send}).unwrap();assert!(matches!(postcard::from_bytes::<Command>(&encoded).unwrap(),Command::PromptNamed{..}));
+    }
+
+    #[test]
     fn original_store_recovery_without_presentation_events_advances_snapshot_generation(){
         use super::super::Handle;
         struct MetadataRecovery(bool);
@@ -397,7 +409,7 @@ while True:
         fn wait(mut condition:impl FnMut()->bool){let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);while !condition(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(5));}}
         let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
         let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().to_owned(),environment:Default::default()};let mut initial=Step::default();let cache=super::super::preflight(&spec,&mut initial).unwrap();let handle=Handle::start_inner(spec,Box::new(MetadataRecovery(true)),initial,cache,None,None,Ok(scope),|_|{}).unwrap();let blocked=root.path().join("annotations");std::fs::write(&blocked,b"not a directory").unwrap();handle.0.annotations.lock().unwrap().root=Some(blocked.clone());
-        handle.command(Command::Compact).unwrap();wait(||handle.0.annotations.lock().unwrap().notice.is_some());let before=handle.snapshot(None).unwrap();std::fs::remove_file(blocked).unwrap();handle.0.annotations.lock().unwrap().retry_at=Some(std::time::Instant::now());handle.command(Command::Compact).unwrap();wait(||handle.0.annotations.lock().unwrap().store.is_some());
+        handle.command(Command::Compact).unwrap();wait(||handle.0.annotations.lock().unwrap().notice.is_some());let before=handle.snapshot(None).unwrap();std::fs::remove_file(blocked).unwrap();handle.0.annotations.lock().unwrap().retry_at=Some(std::time::Instant::now());handle.command(Command::Compact).unwrap();wait(||handle.0.state.lock().unwrap().original_revision>before.original_revision);
         let after=handle.snapshot(Some(before.generation)).expect("Eligibility-only change must pass ChatRead generation gate");assert!(after.generation>before.generation);assert!(after.original_revision>before.original_revision);handle.close().unwrap();
     }
 
