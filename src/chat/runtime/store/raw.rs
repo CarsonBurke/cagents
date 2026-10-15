@@ -74,6 +74,13 @@ fn insert(tx:&Transaction<'_>,source:&SourceKey,field:i64,bytes:&[u8])->Result<u
     for (index,chunk) in bytes.chunks(PART_BYTES).enumerate() {statement.execute(params![agent(source),source.source_id,field,index*PART_BYTES,chunk]).map_err(err)?;}
     Ok(bytes.len().div_ceil(PART_BYTES))
 }
+// Charge both table and primary-key copies, plus the future tombstone reserved
+// while an original body is retained after an identity ambiguity. This is a
+// logical namespace budget; SQLite page/WAL overhead belongs to the same Store.
+fn key_bytes(source:&SourceKey)->usize{agent(source).len().saturating_add(source.source_id.len())}
+fn source_cost(source:&SourceKey,name:&str)->usize{name.len().saturating_add(key_bytes(source).saturating_mul(4)).saturating_add(384)}
+fn chunk_cost(source:&SourceKey)->usize{key_bytes(source).saturating_mul(2).saturating_add(128)}
+fn tombstone_cost(source:&SourceKey)->usize{key_bytes(source).saturating_mul(2).saturating_add(192)}
 fn command_bytes(command:Option<&RawCommandCall>)->Result<Vec<u8>,String> {
     command.map(serde_json::to_vec).transpose().map_err(err).map(|value|value.unwrap_or_default())
 }
@@ -117,7 +124,7 @@ impl Store {
         let command=command_bytes(command)?;
         if input.len().saturating_add(command.len())>RAW_SOURCE_BYTES {return self.raw_refused("Original tool call exceeds its bounded capture limit".into());}
         let chunk_count=input.len().div_ceil(PART_BYTES)+command.len().div_ceil(PART_BYTES);
-        let cost=input.len().saturating_add(command.len()).saturating_add(name.len()).saturating_add(agent(source).len()).saturating_add(source.source_id.len()).saturating_add(192).saturating_add(chunk_count.saturating_mul(agent(source).len()+source.source_id.len()+64));
+        let cost=input.len().saturating_add(command.len()).saturating_add(source_cost(source,name)).saturating_add(chunk_count.saturating_mul(chunk_cost(source)));
         let current_open=self.raw_sources.open.get(source).copied().unwrap_or(0);
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         let (bytes,keys,chunks):(usize,usize,usize)=tx.query_row("SELECT bytes,keys,chunks FROM raw_source_schema WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(err)?;
@@ -159,7 +166,7 @@ impl Store {
             return Ok(None);
         }
         let (bytes,keys):(usize,usize)=tx.query_row("SELECT bytes,keys FROM raw_source_schema WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-        let cost=192+name.len()+source.source_id.len();
+        let cost=source_cost(source,name);
         if keys>=KEYS||bytes.saturating_add(cost).saturating_add(self.raw_sources.open_bytes)>DISK_BYTES{drop(tx);return self.raw_refused("Original tool history identity budget reached".into());}
         let epoch=revision(&tx)?;
         tx.execute("INSERT INTO raw_tool_sources VALUES(?1,?2,?3,0,0,0,0,NULL,?4,?5)",params![agent(source),source.source_id,name,epoch,cost]).map_err(err)?;
@@ -194,7 +201,7 @@ impl Store {
         for row in rows{let (position,length)=row.map_err(err)?;let length=usize::try_from(length).map_err(|_|"Invalid original input chunk")?;if position!=cursor as i64||length==0||length>PART_BYTES{return Err("Original input chunks have a gap, overlap or oversized row".into());}cursor=cursor.checked_add(length).ok_or("Original input size overflow")?;count+=1;}
         drop(query);if cursor!=input_len{return Err("Original input body was shortened; no raw call was substituted".into());}
         let command_count=command.len().div_ceil(PART_BYTES);let new_chunks=count+command_count;
-        let cost=old_cost.saturating_add(input_len).saturating_add(command.len()).saturating_add(new_chunks.saturating_mul(source.source_id.len()+64));
+        let cost=old_cost.saturating_add(input_len).saturating_add(command.len()).saturating_add(new_chunks.saturating_mul(chunk_cost(source)));
         let (bytes,chunks):(usize,usize)=tx.query_row("SELECT bytes,chunks FROM raw_source_schema WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         if bytes.saturating_sub(old_cost).saturating_add(cost).saturating_add(self.raw_sources.open_bytes.saturating_sub(input_len))>DISK_BYTES||chunks.saturating_add(new_chunks)>CHUNKS{drop(tx);return self.raw_refused("Original tool source storage budget reached".into());}
         // SQL-owned transfer: raw arguments survive the next Changes rewrite.
@@ -248,7 +255,7 @@ impl Store {
             tx.execute("DELETE FROM raw_tool_sources WHERE agent='' AND id=?1",[id]).map_err(err)?;
             tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES('',?1)",[id]).map_err(err)?;
             // The identity/key charge remains reserved by its tombstone.
-            tx.execute("UPDATE raw_source_schema SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",params![cost,id.len()+192,chunks]).map_err(err)?;
+            tx.execute("UPDATE raw_source_schema SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",params![cost,tombstone_cost(&key("",id)),chunks]).map_err(err)?;
         }
         tx.commit().map_err(err)?;
         for id in ids{if let Some(length)=self.raw_sources.open.remove(&key("",id)){self.raw_sources.open_bytes=self.raw_sources.open_bytes.saturating_sub(length);}}
