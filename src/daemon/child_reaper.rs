@@ -23,15 +23,22 @@ pub(crate) struct Reservation {
 }
 impl std::fmt::Debug for Reservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChildReaperReservation").field("slot", &self.slot)
-            .field("ticket", &self.ticket).finish_non_exhaustive()
+        f.debug_struct("ChildReaperReservation")
+            .field("slot", &self.slot)
+            .field("ticket", &self.ticket)
+            .finish_non_exhaustive()
     }
 }
 
 pub(crate) fn reserve() -> io::Result<Reservation> {
-    let service = SERVICE.get_or_init(|| Service::start(CAPACITY)
-        .map(|(service, _worker)| service).map_err(|error| error.to_string()))
-        .as_ref().map_err(|error| io::Error::other(error.clone()))?;
+    let service = SERVICE
+        .get_or_init(|| {
+            Service::start(CAPACITY)
+                .map(|(service, _worker)| service)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?;
     service.reserve()
 }
 
@@ -44,7 +51,10 @@ pub(crate) struct RetryReport {
 }
 pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
     match SERVICE.get() {
-        None => Ok(RetryReport { rearmed: 0, retained: 0 }),
+        None => Ok(RetryReport {
+            rearmed: 0,
+            retained: 0,
+        }),
         Some(Ok(service)) => service.retry_preserved(),
         Some(Err(error)) => Err(io::Error::other(error.clone())),
     }
@@ -98,15 +108,32 @@ impl Reservation {
         }
         if state.stopping {
             drop(state);
-            return Err((io::Error::other("Exact-child reaper is stopping"), child, pidfd, self));
+            return Err((
+                io::Error::other("Exact-child reaper is stopping"),
+                child,
+                pidfd,
+                self,
+            ));
         }
         let slot = self.slot.expect("a live reservation owns one credit");
         debug_assert!(state.entries[slot].is_none());
-        state.entries[slot] = Some(Entry { child, pidfd: Some(pidfd), ticket: self.ticket, suspended: false });
+        state.entries[slot] = Some(Entry {
+            child,
+            pidfd: Some(pidfd),
+            ticket: self.ticket,
+            suspended: false,
+        });
         if let Err(error) = service.wake() {
-            let entry = state.entries[slot].take().expect("transfer remains private under its lock");
+            let entry = state.entries[slot]
+                .take()
+                .expect("transfer remains private under its lock");
             drop(state);
-            return Err((error, entry.child, entry.pidfd.expect("normal transfer retains a pidfd"), self));
+            return Err((
+                error,
+                entry.child,
+                entry.pidfd.expect("normal transfer retains a pidfd"),
+                self,
+            ));
         }
         self.slot = None;
         Ok(())
@@ -120,10 +147,18 @@ impl Reservation {
     pub(crate) fn preserve_suspended(mut self, child: Child, pidfd: Option<File>, reason: &str) {
         let service = self.service.clone();
         let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
-        let slot = self.slot.take().expect("a live reservation owns one credit");
+        let slot = self
+            .slot
+            .take()
+            .expect("a live reservation owns one credit");
         debug_assert!(state.entries[slot].is_none());
         let pid = child.id();
-        state.entries[slot] = Some(Entry { child, pidfd, ticket: self.ticket, suspended: true });
+        state.entries[slot] = Some(Entry {
+            child,
+            pidfd,
+            ticket: self.ticket,
+            suspended: true,
+        });
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
         }
@@ -135,18 +170,27 @@ impl Drop for Reservation {
         if let Some(slot) = self.slot.take() {
             let empty = {
                 let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
-                if state.quarantined[slot] == Some(self.ticket) { state.quarantined[slot] = None; }
+                if state.quarantined[slot] == Some(self.ticket) {
+                    state.quarantined[slot] = None;
+                }
                 state.free.push(slot);
                 state.free.len() == state.entries.len()
             };
             // No timer retries the idle census. Publish eligibility before
             // waking its owner, without borrowing the reaper's mutex.
-            if empty { crate::daemon::wake(); }
+            if empty {
+                crate::daemon::wake();
+            }
         }
     }
 }
 
-struct Entry { child: Child, pidfd: Option<File>, ticket: u64, suspended: bool }
+struct Entry {
+    child: Child,
+    pidfd: Option<File>,
+    ticket: u64,
+    suspended: bool,
+}
 struct State {
     entries: Vec<Option<Entry>>,
     quarantined: Vec<Option<u64>>,
@@ -176,51 +220,89 @@ impl Service {
 
     fn start(capacity: usize) -> io::Result<(Arc<Self>, JoinHandle<()>)> {
         if capacity == 0 || capacity > CAPACITY {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid exact-child reaper capacity"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid exact-child reaper capacity",
+            ));
         }
         let mut entries = Vec::new();
-        entries.try_reserve_exact(capacity).map_err(io::Error::other)?;
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
         entries.resize_with(capacity, || None);
         let mut quarantined = Vec::new();
-        quarantined.try_reserve_exact(capacity).map_err(io::Error::other)?;
+        quarantined
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
         quarantined.resize(capacity, None);
         let mut free = Vec::new();
         free.try_reserve_exact(capacity).map_err(io::Error::other)?;
         free.extend((0..capacity).rev());
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 { return Err(io::Error::last_os_error()); }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let service = Arc::new(Self {
             event: unsafe { File::from_raw_fd(fd) },
-            state: Mutex::new(State { entries, quarantined, free, next_ticket: 1, failure: None, fatal: false, worker_alive: true, stopping: false }),
-            #[cfg(test)] fail_wake: std::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(State {
+                entries,
+                quarantined,
+                free,
+                next_ticket: 1,
+                failure: None,
+                fatal: false,
+                worker_alive: true,
+                stopping: false,
+            }),
+            #[cfg(test)]
+            fail_wake: std::sync::atomic::AtomicBool::new(false),
         });
         let owner = service.clone();
-        let worker = thread::Builder::new().name("cagentsd-child-reaper".into()).spawn(move || owner.run())?;
+        let worker = thread::Builder::new()
+            .name("cagentsd-child-reaper".into())
+            .spawn(move || owner.run())?;
         Ok((service, worker))
     }
     fn reserve(self: &Arc<Self>) -> io::Result<Reservation> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(error) = state.failure.as_ref() { return Err(io::Error::other(error.clone())); }
-        if state.stopping { return Err(io::Error::other("Exact-child reaper is stopping")); }
+        if let Some(error) = state.failure.as_ref() {
+            return Err(io::Error::other(error.clone()));
+        }
+        if state.stopping {
+            return Err(io::Error::other("Exact-child reaper is stopping"));
+        }
         let ticket = state.next_ticket;
-        let next = ticket.checked_add(1).ok_or_else(|| io::Error::other("Exact-child reaper tickets exhausted"))?;
+        let next = ticket
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Exact-child reaper tickets exhausted"))?;
         let capacity = state.entries.len();
         let slot = state.free.pop().ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock,
             format!("Helper child ownership capacity is full ({capacity}/{capacity}); existing helpers were retained")))?;
         debug_assert!(state.quarantined[slot].is_none());
         state.next_ticket = next;
-        Ok(Reservation { service: self.clone(), slot: Some(slot), ticket })
+        Ok(Reservation {
+            service: self.clone(),
+            slot: Some(slot),
+            ticket,
+        })
     }
     fn retry_preserved(&self) -> io::Result<RetryReport> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.stopping || state.fatal || !state.worker_alive {
-            return Err(io::Error::other(state.failure.clone()
-                .unwrap_or_else(|| "Exact-child reaper worker is unavailable".into())));
+            return Err(io::Error::other(state.failure.clone().unwrap_or_else(
+                || "Exact-child reaper worker is unavailable".into(),
+            )));
         }
         let mut rearmed = Vec::new();
         for (slot, entry) in state.entries.iter_mut().enumerate() {
-            let Some(entry) = entry.as_mut().filter(|entry| entry.suspended) else { continue; };
-            if entry.pidfd.as_ref().is_some_and(|pidfd| validate_pidfd(&entry.child, pidfd).is_ok()) {
+            let Some(entry) = entry.as_mut().filter(|entry| entry.suspended) else {
+                continue;
+            };
+            if entry
+                .pidfd
+                .as_ref()
+                .is_some_and(|pidfd| validate_pidfd(&entry.child, pidfd).is_ok())
+            {
                 entry.suspended = false;
                 rearmed.push(slot);
             }
@@ -229,16 +311,32 @@ impl Service {
         if !rearmed.is_empty() {
             if let Err(error) = self.wake() {
                 for slot in rearmed {
-                    state.entries[slot].as_mut().expect("retained under the state lock").suspended = true;
+                    state.entries[slot]
+                        .as_mut()
+                        .expect("retained under the state lock")
+                        .suspended = true;
                 }
                 state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
                 return Err(error);
             }
         }
-        let retained = state.entries.iter().flatten().filter(|entry| entry.suspended).count();
-        if retained == 0 { state.failure = None; }
-        else { state.failure = Some(format!("{retained} original helper child owner(s) remain suspended without validated reaping authority")); }
-        Ok(RetryReport { rearmed: rearmed.len(), retained })
+        let retained = state
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.suspended)
+            .count();
+        if retained == 0 {
+            state.failure = None;
+        } else {
+            state.failure = Some(format!(
+                "{retained} original helper child owner(s) remain suspended without validated reaping authority"
+            ));
+        }
+        Ok(RetryReport {
+            rearmed: rearmed.len(),
+            retained,
+        })
     }
 
     fn wake(&self) -> io::Result<()> {
@@ -248,9 +346,17 @@ impl Service {
         }
         let value = 1_u64;
         loop {
-            let written = unsafe { libc::write(self.event.as_raw_fd(), (&value as *const u64).cast(), 8) };
-            if written == 8 { return Ok(()); }
-            if written >= 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "Incomplete exact-child eventfd wake")); }
+            let written =
+                unsafe { libc::write(self.event.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            if written == 8 {
+                return Ok(());
+            }
+            if written >= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "Incomplete exact-child eventfd wake",
+                ));
+            }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
@@ -263,9 +369,17 @@ impl Service {
     fn drain_wake(&self) -> io::Result<()> {
         let mut value = 0_u64;
         loop {
-            let read = unsafe { libc::read(self.event.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
-            if read == 8 { return Ok(()); }
-            if read >= 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete exact-child eventfd read")); }
+            let read =
+                unsafe { libc::read(self.event.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+            if read == 8 {
+                return Ok(());
+            }
+            if read >= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete exact-child eventfd read",
+                ));
+            }
             let error = io::Error::last_os_error();
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
@@ -292,7 +406,9 @@ impl Service {
                 state.worker_alive = false;
                 if !state.stopping {
                     state.fatal = true;
-                    state.failure.get_or_insert_with(|| "Exact-child reaper worker stopped".into());
+                    state
+                        .failure
+                        .get_or_insert_with(|| "Exact-child reaper worker stopped".into());
                 }
             }
         }
@@ -300,42 +416,77 @@ impl Service {
         loop {
             let snapshot = {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                if state.stopping { return; }
-                state.entries.iter().enumerate().filter_map(|(slot, entry)| {
-                    let entry = entry.as_ref().filter(|entry| !entry.suspended)?;
-                    Some((slot, entry.ticket, entry.pidfd.as_ref()?.as_raw_fd()))
-                }).collect::<Vec<_>>()
+                if state.stopping {
+                    return;
+                }
+                state
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, entry)| {
+                        let entry = entry.as_ref().filter(|entry| !entry.suspended)?;
+                        Some((slot, entry.ticket, entry.pidfd.as_ref()?.as_raw_fd()))
+                    })
+                    .collect::<Vec<_>>()
             };
             let mut poll = Vec::with_capacity(snapshot.len() + 1);
-            poll.push(libc::pollfd { fd: self.event.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-            poll.extend(snapshot.iter().map(|(_, _, fd)| libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 }));
+            poll.push(libc::pollfd {
+                fd: self.event.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            poll.extend(snapshot.iter().map(|(_, _, fd)| libc::pollfd {
+                fd: *fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }));
             let result = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, -1) };
             if result < 0 {
                 let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted { continue; }
-                self.fail(error); return;
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.fail(error);
+                return;
             }
             if poll[0].revents != 0 {
-                if let Err(error) = self.drain_wake() { self.fail(error); return; }
+                if let Err(error) = self.drain_wake() {
+                    self.fail(error);
+                    return;
+                }
             }
             for ((slot, ticket, _), ready) in snapshot.iter().zip(&poll[1..]) {
-                if ready.revents == 0 { continue; }
+                if ready.revents == 0 {
+                    continue;
+                }
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                let Some(entry) = state.entries[*slot].as_mut().filter(|entry| entry.ticket == *ticket) else { continue; };
+                let Some(entry) = state.entries[*slot]
+                    .as_mut()
+                    .filter(|entry| entry.ticket == *ticket)
+                else {
+                    continue;
+                };
                 // Only this original Child is queried after its pinned pidfd
                 // became ready. No process-wide wait or numeric PID signal.
                 let reaped = match entry.child.try_wait() {
                     Ok(Some(_)) => {
                         state.entries[*slot].take();
-                        if state.quarantined[*slot] == Some(*ticket) { state.quarantined[*slot] = None; }
+                        if state.quarantined[*slot] == Some(*ticket) {
+                            state.quarantined[*slot] = None;
+                        }
                         state.free.push(*slot);
                         true
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     result => {
                         entry.suspended = true;
-                        let error = match result { Ok(None) => "pidfd readiness did not confirm the exact child's exit".into(),
-                            Err(error) => format!("exact child could not be reaped: {error}"), _ => unreachable!() };
+                        let error = match result {
+                            Ok(None) => {
+                                "pidfd readiness did not confirm the exact child's exit".into()
+                            }
+                            Err(error) => format!("exact child could not be reaped: {error}"),
+                            _ => unreachable!(),
+                        };
                         state.failure = Some(error.clone());
                         tracing::error!(%error, "Retained exact child and its credit; no polling retry is armed");
                         false
@@ -343,7 +494,9 @@ impl Service {
                 };
                 let empty = reaped && state.free.len() == state.entries.len();
                 drop(state);
-                if empty { crate::daemon::wake(); }
+                if empty {
+                    crate::daemon::wake();
+                }
             }
         }
     }
@@ -352,12 +505,21 @@ impl Service {
 fn validate_pidfd(child: &Child, pidfd: &File) -> io::Result<()> {
     let fd = pidfd.as_raw_fd();
     if fs::read_link(format!("/proc/self/fd/{fd}"))? != std::path::Path::new("anon_inode:[pidfd]") {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Child reaping requires its original pidfd"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Child reaping requires its original pidfd",
+        ));
     }
     let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
-    let actual = info.lines().find_map(|line| line.strip_prefix("Pid:").and_then(|pid| pid.trim().parse::<u32>().ok()));
+    let actual = info.lines().find_map(|line| {
+        line.strip_prefix("Pid:")
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+    });
     if actual != Some(child.id()) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The retained pidfd does not identify this exact Child"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "The retained pidfd does not identify this exact Child",
+        ));
     }
     Ok(())
 }
@@ -365,19 +527,34 @@ fn validate_pidfd(child: &Child, pidfd: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Stdio, sync::atomic::Ordering, time::{Duration, Instant}};
+    use std::{
+        process::Stdio,
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
 
-    struct TestService { service: Arc<Service>, worker: Option<JoinHandle<()>> }
+    struct TestService {
+        service: Arc<Service>,
+        worker: Option<JoinHandle<()>>,
+    }
     impl TestService {
         fn new(capacity: usize) -> Self {
             let (service, worker) = Service::start(capacity).unwrap();
-            Self { service, worker: Some(worker) }
+            Self {
+                service,
+                worker: Some(worker),
+            }
         }
-        fn free(&self) -> usize { self.service.state.lock().unwrap().free.len() }
+        fn free(&self) -> usize {
+            self.service.state.lock().unwrap().free.len()
+        }
         fn await_free(&self, expected: usize) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.free() != expected {
-                assert!(Instant::now() < deadline, "exact child was not reaped; credit remains retained");
+                assert!(
+                    Instant::now() < deadline,
+                    "exact child was not reaped; credit remains retained"
+                );
                 thread::sleep(Duration::from_millis(2));
             }
         }
@@ -385,11 +562,24 @@ mod tests {
     impl Drop for TestService {
         fn drop(&mut self) {
             self.service.fail_wake.store(false, Ordering::Release);
-            self.service.state.lock().unwrap_or_else(|p| p.into_inner()).stopping = true;
+            self.service
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stopping = true;
             let _ = self.service.wake();
-            if let Some(worker) = self.worker.take() { let _ = worker.join(); }
-            let entries = self.service.state.lock().unwrap_or_else(|p| p.into_inner()).entries.iter_mut()
-                .filter_map(Option::take).collect::<Vec<_>>();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            let entries = self
+                .service
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .iter_mut()
+                .filter_map(Option::take)
+                .collect::<Vec<_>>();
             for mut entry in entries {
                 // Test teardown alone may stop its own fixture child after a
                 // failing assertion; production service never sends signals.
@@ -397,8 +587,15 @@ mod tests {
                 // Test teardown owns the original Child and may kill it here.
                 if !entry.suspended {
                     let pidfd = entry.pidfd.as_ref().unwrap();
-                    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(), 0); }
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                    }
                 } else {
                     let _ = entry.child.kill();
                 }
@@ -407,33 +604,55 @@ mod tests {
         }
     }
 
-    struct Probe { child: Option<Child>, pidfd: File }
+    struct Probe {
+        child: Option<Child>,
+        pidfd: File,
+    }
     impl Probe {
         fn spawn(arguments: &[&str]) -> Self {
-            let mut child = std::process::Command::new("/bin/sh").args(arguments)
-                .env_clear().env("PATH", "/usr/bin:/bin")
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(arguments)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
             if fd < 0 {
                 let error = io::Error::last_os_error();
-                let _ = child.kill(); let _ = child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 panic!("fixture pidfd capture failed: {error}");
             }
-            Self { child: Some(child), pidfd: unsafe { File::from_raw_fd(fd) } }
+            Self {
+                child: Some(child),
+                pidfd: unsafe { File::from_raw_fd(fd) },
+            }
         }
         fn handoff(&mut self, reservation: Reservation) {
             let child = self.child.take().unwrap();
             match reservation.retain(child, self.pidfd.try_clone().unwrap()) {
                 Ok(()) => {}
                 Err((error, child, pidfd, reservation)) => {
-                    self.child = Some(child); drop(pidfd); drop(reservation);
+                    self.child = Some(child);
+                    drop(pidfd);
+                    drop(reservation);
                     panic!("fixture child transfer failed: {error}");
                 }
             }
         }
         fn signal(&self, signal: i32) {
-            let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.pidfd.as_raw_fd(), signal,
-                std::ptr::null::<libc::siginfo_t>(), 0) };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
             assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
         }
     }
@@ -441,9 +660,18 @@ mod tests {
         fn drop(&mut self) {
             // Only this fixture's pinned exact child is signalled, including
             // panic cleanup after the original Child moved into the service.
-            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.pidfd.as_raw_fd(), libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(), 0); }
-            if let Some(child) = self.child.as_mut() { let _ = child.wait(); }
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
         }
     }
 
@@ -456,8 +684,15 @@ mod tests {
         let pid = owned.child.as_ref().unwrap().id();
         owned.handoff(reservation);
         reaper.await_free(1);
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "the original child status must be consumed, not merely observed");
-        assert_eq!(unrelated.child.as_mut().unwrap().wait().unwrap().code(), Some(19), "the reaper must never wait on another owner's child");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the original child status must be consumed, not merely observed"
+        );
+        assert_eq!(
+            unrelated.child.as_mut().unwrap().wait().unwrap().code(),
+            Some(19),
+            "the reaper must never wait on another owner's child"
+        );
         assert!(reaper.service.reserve().is_ok());
     }
 
@@ -466,17 +701,32 @@ mod tests {
         let reaper = TestService::new(1);
         assert!(!reaper.service.has_outstanding_ownership());
         let reservation = reaper.service.reserve().unwrap();
-        assert!(reaper.service.has_outstanding_ownership(), "pre-registry spawn ownership must fence idle exit");
-        assert!(!reaper.service.has_retained_ownership(), "a caller-held credit is not an independent retained child");
-        assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            reaper.service.has_outstanding_ownership(),
+            "pre-registry spawn ownership must fence idle exit"
+        );
+        assert!(
+            !reaper.service.has_retained_ownership(),
+            "a caller-held credit is not an independent retained child"
+        );
+        assert_eq!(
+            reaper.service.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         owned.handoff(reservation);
         assert!(reaper.service.has_retained_ownership());
         assert_eq!(reaper.free(), 0);
-        assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            reaper.service.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         owned.signal(libc::SIGKILL);
         reaper.await_free(1);
-        assert!(!reaper.service.has_outstanding_ownership(), "only exact reaping releases the idle ownership fence");
+        assert!(
+            !reaper.service.has_outstanding_ownership(),
+            "only exact reaping releases the idle ownership fence"
+        );
         assert!(!reaper.service.has_retained_ownership());
         assert!(reaper.service.reserve().is_ok());
     }
@@ -490,13 +740,27 @@ mod tests {
         assert!(!reaper.service.has_retained_ownership());
         reservation.quarantine();
         reservation.quarantine();
-        assert!(reaper.service.has_retained_ownership(), "the final-cleanup queue must not hide this original child");
+        assert!(
+            reaper.service.has_retained_ownership(),
+            "the final-cleanup queue must not hide this original child"
+        );
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, pidfd, reservation) = reservation.retain(owned.child.take().unwrap(), owned.pidfd.try_clone().unwrap()).unwrap_err();
+        let (error, child, pidfd, reservation) = reservation
+            .retain(
+                owned.child.take().unwrap(),
+                owned.pidfd.try_clone().unwrap(),
+            )
+            .unwrap_err();
         owned.child = Some(child);
         assert!(error.to_string().contains("injected"));
-        assert!(reaper.service.has_retained_ownership(), "a rolled-back transfer still belongs to final cleanup");
-        assert_eq!(reaper.service.state.lock().unwrap().quarantined[0], Some(ticket));
+        assert!(
+            reaper.service.has_retained_ownership(),
+            "a rolled-back transfer still belongs to final cleanup"
+        );
+        assert_eq!(
+            reaper.service.state.lock().unwrap().quarantined[0],
+            Some(ticket)
+        );
         drop(pidfd);
         reaper.service.fail_wake.store(false, Ordering::Release);
         owned.handoff(reservation);
@@ -506,7 +770,10 @@ mod tests {
         assert!(!reaper.service.has_retained_ownership());
         let next = reaper.service.reserve().unwrap();
         assert_ne!(next.ticket, ticket);
-        assert!(!reaper.service.has_retained_ownership(), "a recycled slot must not inherit the previous owner's quarantine");
+        assert!(
+            !reaper.service.has_retained_ownership(),
+            "a recycled slot must not inherit the previous owner's quarantine"
+        );
     }
 
     #[test]
@@ -516,8 +783,14 @@ mod tests {
         let mut owned = Probe::spawn(&["-c", "exit 23"]);
         reservation.quarantine();
         assert!(reaper.service.has_retained_ownership());
-        assert_eq!(owned.child.as_mut().unwrap().wait().unwrap().code(), Some(23));
-        assert!(reaper.service.has_retained_ownership(), "the caller must publish its completed ownership release");
+        assert_eq!(
+            owned.child.as_mut().unwrap().wait().unwrap().code(),
+            Some(23)
+        );
+        assert!(
+            reaper.service.has_retained_ownership(),
+            "the caller must publish its completed ownership release"
+        );
         drop(reservation);
         assert!(!reaper.service.has_retained_ownership());
         assert!(!reaper.service.has_outstanding_ownership());
@@ -528,7 +801,11 @@ mod tests {
     fn failed_spawn_and_unused_reservation_drop_return_their_credit() {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
-        assert!(std::process::Command::new("/nonexistent/cagents-fixture-child").spawn().is_err());
+        assert!(
+            std::process::Command::new("/nonexistent/cagents-fixture-child")
+                .spawn()
+                .is_err()
+        );
         drop(reservation);
         assert_eq!(reaper.free(), 1);
         assert!(!reaper.service.has_outstanding_ownership());
@@ -542,16 +819,27 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let mut unrelated = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap(); let pid = child.id();
-        let wrong = unrelated.pidfd.try_clone().unwrap(); let fd = wrong.as_raw_fd();
+        let child = owned.child.take().unwrap();
+        let pid = child.id();
+        let wrong = unrelated.pidfd.try_clone().unwrap();
+        let fd = wrong.as_raw_fd();
         let (error, child, returned, reservation) = reservation.retain(child, wrong).unwrap_err();
         owned.child = Some(child);
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(owned.child.as_ref().unwrap().id(), pid);
         assert_eq!(returned.as_raw_fd(), fd);
         assert_eq!(reaper.free(), 0);
-        assert!(unrelated.child.as_mut().unwrap().try_wait().unwrap().is_none());
-        drop(returned); drop(reservation);
+        assert!(
+            unrelated
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        drop(returned);
+        drop(reservation);
         assert_eq!(reaper.free(), 1);
     }
 
@@ -561,8 +849,10 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let ticket = reservation.ticket;
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap(); let pid = child.id();
-        let pidfd = owned.pidfd.try_clone().unwrap(); let fd = pidfd.as_raw_fd();
+        let child = owned.child.take().unwrap();
+        let pid = child.id();
+        let pidfd = owned.pidfd.try_clone().unwrap();
+        let fd = pidfd.as_raw_fd();
         reaper.service.fail_wake.store(true, Ordering::Release);
         let (error, child, returned, reservation) = reservation.retain(child, pidfd).unwrap_err();
         owned.child = Some(child);
@@ -571,8 +861,18 @@ mod tests {
         assert_eq!(returned.as_raw_fd(), fd);
         assert_eq!(reservation.ticket, ticket);
         assert_eq!(reaper.free(), 0);
-        assert!(reaper.service.state.lock().unwrap().entries.iter().all(Option::is_none));
-        drop(returned); drop(reservation);
+        assert!(
+            reaper
+                .service
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none)
+        );
+        drop(returned);
+        drop(reservation);
         assert_eq!(reaper.free(), 1);
     }
 
@@ -581,9 +881,12 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap(); let pid = child.id();
+        let child = owned.child.take().unwrap();
+        let pid = child.id();
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, pidfd, reservation) = reservation.retain(child, owned.pidfd.try_clone().unwrap()).unwrap_err();
+        let (error, child, pidfd, reservation) = reservation
+            .retain(child, owned.pidfd.try_clone().unwrap())
+            .unwrap_err();
         reservation.preserve_suspended(child, Some(pidfd), &error.to_string());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
@@ -592,7 +895,10 @@ mod tests {
         assert!(state.free.is_empty());
         assert!(state.failure.as_ref().unwrap().contains("injected"));
         drop(state);
-        assert!(reaper.service.reserve().is_err(), "suspended ownership must stop new admission");
+        assert!(
+            reaper.service.reserve().is_err(),
+            "suspended ownership must stop new admission"
+        );
     }
 
     #[test]
@@ -600,9 +906,13 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let child = owned.child.take().unwrap(); let pid = child.id();
+        let child = owned.child.take().unwrap();
+        let pid = child.id();
         reservation.preserve_suspended(child, None, "spawn-time pidfd capture failed");
-        assert!(reaper.service.has_outstanding_ownership(), "missing registry/pidfd cannot make an owned child disappear from the idle census");
+        assert!(
+            reaper.service.has_outstanding_ownership(),
+            "missing registry/pidfd cannot make an owned child disappear from the idle census"
+        );
         assert!(reaper.service.has_retained_ownership());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
@@ -611,7 +921,10 @@ mod tests {
         assert!(state.free.is_empty());
         drop(state);
         assert!(reaper.service.reserve().is_err());
-        assert!(owned.pidfd.metadata().is_ok(), "the fixture retains its own independent cleanup authority");
+        assert!(
+            owned.pidfd.metadata().is_ok(),
+            "the fixture retains its own independent cleanup authority"
+        );
     }
 
     #[test]
@@ -621,14 +934,32 @@ mod tests {
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let child = owned.child.take().unwrap();
         reservation.quarantine();
-        reservation.preserve_suspended(child, Some(owned.pidfd.try_clone().unwrap()), "fixture transfer failure");
+        reservation.preserve_suspended(
+            child,
+            Some(owned.pidfd.try_clone().unwrap()),
+            "fixture transfer failure",
+        );
         reaper.service.fail_wake.store(true, Ordering::Release);
         assert!(reaper.service.retry_preserved().is_err());
-        assert!(reaper.service.state.lock().unwrap().entries[0].as_ref().unwrap().suspended);
+        assert!(
+            reaper.service.state.lock().unwrap().entries[0]
+                .as_ref()
+                .unwrap()
+                .suspended
+        );
         assert_eq!(reaper.free(), 0);
         reaper.service.fail_wake.store(false, Ordering::Release);
-        assert_eq!(reaper.service.retry_preserved().unwrap(), RetryReport { rearmed: 1, retained: 0 });
-        assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            reaper.service.retry_preserved().unwrap(),
+            RetryReport {
+                rearmed: 1,
+                retained: 0
+            }
+        );
+        assert_eq!(
+            reaper.service.reserve().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         owned.signal(libc::SIGKILL);
         reaper.await_free(1);
         assert!(!reaper.service.has_retained_ownership());
@@ -645,11 +976,39 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         missing_reservation.preserve_suspended(missing.child.take().unwrap(), None, "missing fd");
         reaper.service.reserve().unwrap_err();
-        reservation.preserve_suspended(wrong.child.take().unwrap(), Some(unrelated.pidfd.try_clone().unwrap()), "wrong fd");
-        assert_eq!(reaper.service.retry_preserved().unwrap(), RetryReport { rearmed: 0, retained: 2 });
+        reservation.preserve_suspended(
+            wrong.child.take().unwrap(),
+            Some(unrelated.pidfd.try_clone().unwrap()),
+            "wrong fd",
+        );
+        assert_eq!(
+            reaper.service.retry_preserved().unwrap(),
+            RetryReport {
+                rearmed: 0,
+                retained: 2
+            }
+        );
         assert!(reaper.service.reserve().is_err());
-        assert!(reaper.service.state.lock().unwrap().entries.iter().flatten().all(|entry| entry.suspended));
-        assert!(unrelated.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(
+            reaper
+                .service
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .flatten()
+                .all(|entry| entry.suspended)
+        );
+        assert!(
+            unrelated
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -657,14 +1016,23 @@ mod tests {
         let mut reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        reservation.preserve_suspended(owned.child.take().unwrap(), Some(owned.pidfd.try_clone().unwrap()), "fixture failure");
+        reservation.preserve_suspended(
+            owned.child.take().unwrap(),
+            Some(owned.pidfd.try_clone().unwrap()),
+            "fixture failure",
+        );
         reaper.service.state.lock().unwrap().stopping = true;
         reaper.service.wake().unwrap();
         reaper.worker.take().unwrap().join().unwrap();
         reaper.service.state.lock().unwrap().stopping = false;
         assert!(reaper.service.retry_preserved().is_err());
         assert_eq!(reaper.free(), 0);
-        assert!(reaper.service.state.lock().unwrap().entries[0].as_ref().unwrap().suspended);
+        assert!(
+            reaper.service.state.lock().unwrap().entries[0]
+                .as_ref()
+                .unwrap()
+                .suspended
+        );
     }
 
     #[test]
@@ -674,11 +1042,23 @@ mod tests {
         for _ in 0..8 {
             let reservation = reaper.service.reserve().unwrap();
             let mut child = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-            child.handoff(reservation); children.push(child);
+            child.handoff(reservation);
+            children.push(child);
         }
         assert_eq!(reaper.free(), 0);
-        for child in &children { child.signal(libc::SIGKILL); }
+        for child in &children {
+            child.signal(libc::SIGKILL);
+        }
         reaper.await_free(8);
-        assert!(reaper.service.state.lock().unwrap().entries.iter().all(Option::is_none));
+        assert!(
+            reaper
+                .service
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none)
+        );
     }
 }
