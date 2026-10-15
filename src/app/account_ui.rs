@@ -8167,7 +8167,9 @@ mod app_tests {
         let recipe = recipe_on(&app,&id);
         assert_eq!(app.chat_account(Provider::Codex,&recipe),Some(id.clone()));
         drop(app.account_reported(Provider::Codex,&recipe,vec![(LiveReport::CodexLimits(account::codex::LimitsUpdate {
-            windows: vec![],credits: None,plan: Some("pro".into()),limited: false,
+            windows: vec![UsageWindow { key: "codex:session".into(),kind: account::WindowKind::Session,
+                label: "Session".into(),used: 0.2,resets_at: None,span_secs: None,binding: true }],
+            credits: None,plan: Some("pro".into()),limited: false,
         }),101)]));
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(state.snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
