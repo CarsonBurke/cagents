@@ -4126,6 +4126,10 @@ impl Cagents {
             let Some(card)=self.durable.cards.iter().find_map(|state|matches!(&state.kind,CardKind::Chat(session) if session.id==session_id).then_some(state.id)) else {
                 return Task::batch(tasks);
             };
+            if let Some(scope)=self.active_workspace.clone() {
+                self.durable_mut().card_scopes.insert(card,scope.clone());
+                self.worktree_owners.insert(card,scope);
+            }
             card
         };
         self.chat_ui.default_chats.remove(&card);
@@ -12328,6 +12332,7 @@ mod tests {
         assert_eq!(chat_runtime(&app,card).composer.text(),"Review without sending");
         assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,PathBuf::from(FIXTURE_DIRECTORY));
         assert_eq!(app.worktree_selection.generation_for_test(),generation);
+        assert_eq!(app.durable.card_scopes.get(&card),Some(&PathBuf::from(FIXTURE_DIRECTORY)));
         assert!(chat_runtime(&app,card).is_draft());
         assert!(!app.chat_start_pending(card));
     }
@@ -12383,9 +12388,10 @@ mod tests {
         std::fs::create_dir(&physical).unwrap();std::os::unix::fs::symlink(&physical,&alias).unwrap();
         let mut app=crate::app::tests::context_inspector_test_app(false);
         drop(app.select_worktree(physical.clone(),false));
-        drop(app.finish_pr_agent_context(alias.clone(),None,"Alias context".into(),Provider::Codex,Some(physical)));
+        drop(app.finish_pr_agent_context(alias.clone(),None,"Alias context".into(),Provider::Codex,Some(physical.clone())));
         let card=app.workspace.focused().unwrap();
         assert_eq!(chat_runtime(&app,card).session.launch.recipe.working_directory,alias);
+        assert_eq!(app.durable.card_scopes.get(&card),Some(&physical));
         assert_eq!(chat_runtime(&app,card).composer.text(),"Alias context");
         assert!(!app.chat_start_pending(card));
     }
