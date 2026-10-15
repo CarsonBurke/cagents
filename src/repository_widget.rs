@@ -21102,7 +21102,7 @@ mod tests {
         }
         runtime.diff_basis = DiffBasis::IndexToWorktree;
         runtime.set_search_mode(true);
-        assert!(!runtime.can_step_editor_history(false));
+        assert!(runtime.can_step_editor_history(false), "Find preserves working-buffer Undo; native field scope controls where the chord is delivered");
     }
 
     #[test]
@@ -21249,9 +21249,9 @@ mod tests {
         drop(runtime.update(editor_command_action(card, Command::EditorSelectAll).unwrap()));
         assert_ne!(runtime.editor_command_capabilities() & 12, 0);
         assert_eq!(runtime.selected_text().as_deref(), Some(changed.as_str()));
+        let before_find = runtime.editor_command_capabilities();
         runtime.set_search_mode(true);
-        assert_eq!(runtime.editor_command_capabilities() & (1 | 2 | 4 | 16), 0);
-        assert_ne!(runtime.editor_command_capabilities() & 8, 0);
+        assert_eq!(runtime.editor_command_capabilities(), before_find, "opening Find preserves editing capabilities; its field retains native text-input scope");
     }
 
     #[test]

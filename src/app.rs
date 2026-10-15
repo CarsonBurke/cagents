@@ -3174,6 +3174,10 @@ impl SettingsField {
         Self::EditorFontFamily,
         Self::EditorFontSize,
         Self::TerminalScrollbackMib,
+        Self::AlwaysShowTerminalReviewBar,
+        Self::TerminalClipboardWrite,
+        Self::TerminalScrollToBottomOnInput,
+        Self::GitStatusLimit,
         Self::ManagedWorktreeDirectory,
         Self::AutoDeleteMergedWorktrees,
         Self::WorktreeSort,
@@ -5185,6 +5189,10 @@ impl SettingsDraft {
             SettingsField::TerminalScrollbackMib => {
                 self.terminal_scrollback_mib = previous.terminal_scrollback_mib.clone()
             }
+            SettingsField::AlwaysShowTerminalReviewBar => self.always_show_terminal_review_bar = previous.always_show_terminal_review_bar,
+            SettingsField::TerminalClipboardWrite => self.terminal_clipboard_write = previous.terminal_clipboard_write.clone(),
+            SettingsField::TerminalScrollToBottomOnInput => self.terminal_scroll_to_bottom_on_input = previous.terminal_scroll_to_bottom_on_input,
+            SettingsField::GitStatusLimit => self.git_status_limit = previous.git_status_limit.clone(),
             SettingsField::ManagedWorktreeDirectory => {
                 self.managed_worktree_directory = previous.managed_worktree_directory.clone()
             }
