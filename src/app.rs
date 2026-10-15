@@ -34,6 +34,7 @@ mod onboarding_ui;
 mod palette_ui;
 mod project_ui;
 mod project_creation;
+mod recovery_placement;
 mod pull_request_ui;
 mod refresh_ui;
 mod resume_ui;
