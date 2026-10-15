@@ -23,6 +23,24 @@ mod worker;
 pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
+pub(crate) fn local_host_name() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut buffer = [0u8; 256];
+        // SAFETY: gethostname receives a valid writable buffer and its size.
+        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+            return None;
+        }
+        // An unterminated truncated hostname must not match a different host.
+        std::ffi::CStr::from_bytes_until_nul(&buffer)
+            .ok()?
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    })
+    .as_deref()
+}
+
 pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
 };
@@ -35,7 +53,7 @@ pub use surface::TerminalSurface;
 pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
     TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,
-    TerminalStartError, TerminalWake,
+    TerminalStartError, TerminalWake, default_scroll_to_bottom_on_input,
 };
 #[cfg(feature = "ui")]
 pub(crate) use widget::ReviewInputBarrier;

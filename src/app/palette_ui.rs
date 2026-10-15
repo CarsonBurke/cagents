@@ -366,6 +366,19 @@ impl Cagents {
             Command::CloseFocusedCard => close_focused_message(&self.workspace)
                 .map_or_else(Task::none, |message| self.update(message)),
             Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
+            Command::TerminalReview => {
+                let Some(card) = self.workspace.focused() else {
+                    return Task::none();
+                };
+                let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                self.update(Message::TerminalReviewMode {
+                    card,
+                    terminal: handle.terminal_id(),
+                    active: self.terminal_review_card != Some(card),
+                })
+            }
             Command::FindInPane => {
                 if self.settings_card_focused() {
                     return iced::widget::operation::focus(crate::settings_widgets::search_id())
@@ -517,6 +530,7 @@ impl SettingsField {
             Self::ShortcutClonePane => Some(Command::ClonePane),
             Self::ShortcutCloseFocusedColumn => Some(Command::CloseFocusedCard),
             Self::ShortcutSearchProjects => Some(Command::FocusProjectSearch),
+            Self::ShortcutTerminalReview => Some(Command::TerminalReview),
             Self::ShortcutFindInPane => Some(Command::FindInPane),
             Self::ShortcutPreviousColumn => Some(Command::FocusAdjacent(
                 crate::workspace::FocusDirection::Left,
@@ -574,6 +588,7 @@ impl ShortcutDraft {
             ),
             (Command::FocusProjectSearch, self.search_projects.as_str()),
             (Command::FindInPane, self.find_in_pane.as_str()),
+            (Command::TerminalReview, self.terminal_review.as_str()),
             (
                 Command::FocusAdjacent(crate::workspace::FocusDirection::Left),
                 self.previous_column.as_str(),

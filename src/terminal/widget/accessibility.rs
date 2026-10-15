@@ -126,12 +126,86 @@ pub(super) struct View {
 struct ConsumedInputs {
     keys: Vec<keyboard::key::Physical>,
     buttons: Vec<mouse::Button>,
+    owned: Vec<OwnedKey>,
+    native_review: Option<crate::model::TerminalId>,
+}
+const MAX_OWNED_KEYS: usize = 512;
+struct OwnedKey {
+    physical: keyboard::key::Physical,
+    surface: super::TerminalSurface,
+    proof: Option<crate::model::HostSessionProof>,
+    input: super::KeyInput,
+    orphaned: bool,
 }
 /// One barrier per application window, shared across mounted cards and retained
 /// while cards unmount. A review key-up must not become input to a new focus.
 #[derive(Clone, Default)]
 pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
+    pub(crate) fn note_review(&self, terminal: crate::model::TerminalId, active: bool) {
+        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if active { shared.native_review=Some(terminal); }
+        else if shared.native_review==Some(terminal) { shared.native_review=None; }
+    }
+    pub(crate) fn confirm_review(&self, previous: Option<crate::model::TerminalId>, current: Option<crate::model::TerminalId>) {
+        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if current.is_some() || shared.native_review==previous { shared.native_review=current; }
+    }
+    pub(super) fn can_admit(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) -> bool {
+        let shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match shared.owned.iter().find(|key| key.physical==physical) {
+            Some(key) => !key.orphaned && key.surface.same_attachment(surface),
+            None => shared.owned.len()<MAX_OWNED_KEYS,
+        }
+    }
+    pub(super) fn admitted(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) {
+        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(key)=shared.owned.iter_mut().find(|key| key.physical==physical) { key.input=input; return; }
+        debug_assert!(shared.owned.len()<MAX_OWNED_KEYS,"admission must reserve a bounded slot");
+        shared.owned.push(OwnedKey { physical,surface:surface.clone(),proof:surface.host_proof(),input,orphaned:false });
+    }
+    pub(super) fn owns_admitted(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) -> bool {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).owned.iter()
+            .any(|key| key.physical==physical && key.surface.same_attachment(surface))
+    }
+    pub(super) fn paired(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).owned.retain(|key|
+            key.physical!=physical || !key.surface.same_attachment(surface));
+    }
+    pub(super) fn unmounted(&self, surface: &super::TerminalSurface) {
+        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let ConsumedInputs { owned,keys,.. }=&mut *shared;
+        for key in owned.iter_mut().filter(|key| key.surface.same_attachment(surface)) {
+            key.orphaned=true;
+            if !keys.contains(&key.physical) { keys.push(key.physical); }
+        }
+    }
+    /// Runs at the window keyboard boundary too, so releases remain owned even
+    /// when no terminal widget is mounted. Existing mounted widgets retire
+    /// their own pairs before this application message is dispatched.
+    pub(crate) fn observe_key_event(&self, event: &keyboard::Event) {
+        if let keyboard::Event::KeyReleased { physical_key,modifiers,.. }=event {
+            let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+            shared.keys.retain(|key| key!=physical_key);
+            if let Some(key)=shared.owned.iter_mut().find(|key| key.orphaned && key.physical==*physical_key) {
+                key.orphaned=true;
+                key.input.modifiers=super::map_iced_modifiers(*modifiers);
+            }
+        }
+    }
+    /// Drops stale attachments rather than forwarding an old owned release to
+    /// a replacement host. A full client queue retains the exact bounded pair.
+    pub(crate) fn flush_orphans(&self, review_active: bool) {
+        if review_active { return; }
+        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.native_review.is_some() { return; }
+        shared.owned.retain_mut(|key| {
+            if !key.orphaned { return true; }
+            if key.proof.as_ref().is_some_and(|proof| key.surface.host_proof().as_ref().is_some_and(|current| current!=proof)) { return false; }
+            let mut input=key.input.clone(); input.action=super::KeyAction::Release; input.text=None;
+            matches!(key.surface.key(input),Err(super::TerminalSendError::Full))
+        });
+    }
     pub fn owns_keyboard(&self, event: &Event) -> bool {
         let physical = match event {
             Event::Keyboard(

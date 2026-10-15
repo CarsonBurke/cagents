@@ -205,6 +205,7 @@ enum TranscriptMessage {
 #[derive(Debug)]
 enum Effect {
     PtyWrite(Vec<u8>),
+    Clipboard { primary: bool, text: String },
     Bell,
     Title(String),
     WorkingDirectoryChanged,
@@ -219,11 +220,21 @@ struct Effects {
     bell: bool,
     title: Option<usize>,
     cwd: bool,
+    clipboard: [Option<usize>; 2],
 }
 
 impl Effects {
     fn push(&mut self, effect: Effect) {
         match effect {
+            Effect::Clipboard { primary, text } => {
+                let slot = &mut self.clipboard[usize::from(primary)];
+                if let Some(index) = *slot {
+                    self.ordered[index] = Effect::Clipboard { primary, text };
+                } else {
+                    *slot = Some(self.ordered.len());
+                    self.ordered.push(Effect::Clipboard { primary, text });
+                }
+            }
             Effect::Bell => {
                 if !std::mem::replace(&mut self.bell, true) {
                     self.ordered.push(Effect::Bell);
@@ -1569,6 +1580,9 @@ impl Worker {
             })
             .map_err(|error| format!("register working directory effect: {error}"))?;
 
+        register_clipboard_write(&mut terminal, Rc::clone(&effects))
+            .map_err(|error| format!("register clipboard effect: {error}"))?;
+
         let mut command = match &config.execution_environment {
             Some(environment) => {
                 let mut command = CommandBuilder::new(&session.launch.program);
@@ -2261,7 +2275,9 @@ impl Worker {
                 let process = self.observe_agent_process().cloned();
                 let _ = sender.send(process);
             }
-            Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
+            Command::Input(bytes) => {
+                self.write_pty(&bytes, "write terminal input");
+            }
             Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
@@ -2284,7 +2300,9 @@ impl Worker {
                     focus::Event::Lost
                 };
                 match event.encode(&mut buffer) {
-                    Ok(written) => self.write_pty(&buffer[..written], "write focus report"),
+                    Ok(written) => {
+                        self.write_pty(&buffer[..written], "write focus report");
+                    }
                     Err(error) => self.error("encode focus report", error.to_string()),
                 }
             }
@@ -2367,8 +2385,37 @@ impl Worker {
     }
 
     fn encode_key(&mut self, input: KeyInput) {
+        let follow = input.scroll_to_bottom_on_input
+            && input.action != KeyAction::Release
+            && !input.key.is_modifier()
+            && !(input.modifiers.shift
+                && !input.modifiers.control
+                && !input.modifiers.alt
+                && !input.modifiers.super_key
+                && matches!(
+                    input.key,
+                    TerminalKey::PageUp
+                        | TerminalKey::PageDown
+                        | TerminalKey::Home
+                        | TerminalKey::End
+                ));
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
-            Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
+            Ok(encoded) => {
+                let admitted = self.write_pty(&encoded, "write encoded key");
+                if admitted
+                    && follow
+                    && !encoded.is_empty()
+                    && self
+                        .terminal
+                        .scrollbar()
+                        .is_ok_and(|bar| bar.offset.saturating_add(bar.len) < bar.total)
+                {
+                    self.terminal.scroll_viewport(ScrollViewport::Bottom);
+                    if self.visibility == Visibility::Visible {
+                        self.publish_snapshot(false);
+                    }
+                }
+            }
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -2423,7 +2470,9 @@ impl Worker {
             });
         let mut encoded = Vec::with_capacity(32);
         match self.mouse_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => self.write_pty(&encoded, "write encoded mouse event"),
+            Ok(()) => {
+                self.write_pty(&encoded, "write encoded mouse event");
+            }
             Err(error) => self.error("encode mouse event", error.to_string()),
         }
     }
@@ -2678,14 +2727,19 @@ impl Worker {
         let effects = std::mem::take(&mut *self.effects.borrow_mut());
         for effect in effects.ordered {
             match effect {
-                Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
+                Effect::Clipboard { primary, text } => {
+                    self.emit(TerminalEvent::ClipboardWrite { primary, text })
+                }
+                Effect::PtyWrite(bytes) => {
+                    self.write_pty(&bytes, "write terminal response");
+                }
                 Effect::Bell => {
                     self.bell.pending = true;
                     self.publish_bell();
                 }
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
-                    let path = working_directory_path(raw, local_host_name());
+                    let path = working_directory_path(raw, super::local_host_name());
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
                     }
@@ -2959,16 +3013,20 @@ impl Worker {
         }
     }
 
-    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
+    fn write_pty(&mut self, bytes: &[u8], operation: &'static str) -> bool {
         if bytes.is_empty() {
-            return;
+            return true;
         }
-        if let Err(error) = self
+        match self
             .writer
             .write_all(bytes)
             .and_then(|()| self.writer.flush())
         {
-            self.error(operation, error.to_string());
+            Ok(()) => true,
+            Err(error) => {
+                self.error(operation, error.to_string());
+                false
+            }
         }
     }
 
@@ -3562,6 +3620,52 @@ impl TranscriptWriter {
     }
 }
 
+const MAX_CLIPBOARD_WRITE_BYTES: usize = 1024 * 1024;
+
+fn register_clipboard_write(
+    terminal: &mut Terminal<'static, 'static>,
+    effects: Rc<RefCell<Effects>>,
+) -> Result<(), libghostty_vt::Error> {
+    terminal
+        .on_clipboard_write(move |_, write| {
+            use libghostty_vt::terminal::{ClipboardLocation, ClipboardWriteError};
+            let primary = match write.location() {
+                ClipboardLocation::Standard => false,
+                ClipboardLocation::Primary => true,
+                // iced exposes the standard and primary clipboards. OSC 52's
+                // separate Selection target cannot be silently rerouted.
+                ClipboardLocation::Selection => return Err(ClipboardWriteError::Unsupported),
+            };
+            let mut total = 0usize;
+            let mut text = None;
+            let mut representations = 0;
+            for content in write.contents() {
+                representations += 1;
+                total = total.saturating_add(content.data.len());
+                if total > MAX_CLIPBOARD_WRITE_BYTES {
+                    tracing::warn!(bytes = total, "terminal clipboard write exceeds size limit");
+                    return Err(ClipboardWriteError::Denied);
+                }
+                if content.mime == "text/plain" || content.mime.starts_with("text/plain;") {
+                    text = Some(content.data);
+                }
+            }
+            // No representations requests a clear. Unsupported MIME types cannot
+            // replace the clipboard with an accidental empty value.
+            let text = match text {
+                Some(text) => text,
+                None if representations == 0 => "",
+                None => return Err(ClipboardWriteError::Denied),
+            };
+            effects.borrow_mut().push(Effect::Clipboard {
+                primary,
+                text: text.to_owned(),
+            });
+            Ok(())
+        })
+        .map(|_| ())
+}
+
 fn encode_key_input(
     terminal: &Terminal<'_, '_>,
     encoder: &mut KeyEncoder<'_>,
@@ -3730,6 +3834,96 @@ fn map_key(input: TerminalKey) -> key::Key {
         TerminalKey::ArrowDown => key::Key::ArrowDown,
         TerminalKey::ArrowLeft => key::Key::ArrowLeft,
         TerminalKey::ArrowRight => key::Key::ArrowRight,
+        TerminalKey::Numpad0 => key::Key::Numpad0,
+        TerminalKey::Numpad1 => key::Key::Numpad1,
+        TerminalKey::Numpad2 => key::Key::Numpad2,
+        TerminalKey::Numpad3 => key::Key::Numpad3,
+        TerminalKey::Numpad4 => key::Key::Numpad4,
+        TerminalKey::Numpad5 => key::Key::Numpad5,
+        TerminalKey::Numpad6 => key::Key::Numpad6,
+        TerminalKey::Numpad7 => key::Key::Numpad7,
+        TerminalKey::Numpad8 => key::Key::Numpad8,
+        TerminalKey::Numpad9 => key::Key::Numpad9,
+        TerminalKey::NumpadAdd => key::Key::NumpadAdd,
+        TerminalKey::NumpadBackspace => key::Key::NumpadBackspace,
+        TerminalKey::NumpadClear => key::Key::NumpadClear,
+        TerminalKey::NumpadClearEntry => key::Key::NumpadClearEntry,
+        TerminalKey::NumpadComma => key::Key::NumpadComma,
+        TerminalKey::NumpadDecimal => key::Key::NumpadDecimal,
+        TerminalKey::NumpadDivide => key::Key::NumpadDivide,
+        TerminalKey::NumpadEnter => key::Key::NumpadEnter,
+        TerminalKey::NumpadEqual => key::Key::NumpadEqual,
+        TerminalKey::NumpadMemoryAdd => key::Key::NumpadMemoryAdd,
+        TerminalKey::NumpadMemoryClear => key::Key::NumpadMemoryClear,
+        TerminalKey::NumpadMemoryRecall => key::Key::NumpadMemoryRecall,
+        TerminalKey::NumpadMemoryStore => key::Key::NumpadMemoryStore,
+        TerminalKey::NumpadMemorySubtract => key::Key::NumpadMemorySubtract,
+        TerminalKey::NumpadMultiply => key::Key::NumpadMultiply,
+        TerminalKey::NumpadParenLeft => key::Key::NumpadParenLeft,
+        TerminalKey::NumpadParenRight => key::Key::NumpadParenRight,
+        TerminalKey::NumpadSubtract => key::Key::NumpadSubtract,
+        TerminalKey::NumpadSeparator => key::Key::NumpadSeparator,
+        TerminalKey::NumpadUp => key::Key::NumpadUp,
+        TerminalKey::NumpadDown => key::Key::NumpadDown,
+        TerminalKey::NumpadRight => key::Key::NumpadRight,
+        TerminalKey::NumpadLeft => key::Key::NumpadLeft,
+        TerminalKey::NumpadBegin => key::Key::NumpadBegin,
+        TerminalKey::NumpadHome => key::Key::NumpadHome,
+        TerminalKey::NumpadEnd => key::Key::NumpadEnd,
+        TerminalKey::NumpadInsert => key::Key::NumpadInsert,
+        TerminalKey::NumpadDelete => key::Key::NumpadDelete,
+        TerminalKey::NumpadPageUp => key::Key::NumpadPageUp,
+        TerminalKey::NumpadPageDown => key::Key::NumpadPageDown,
+
+        TerminalKey::AltLeft => key::Key::AltLeft,
+        TerminalKey::AltRight => key::Key::AltRight,
+        TerminalKey::ControlLeft => key::Key::ControlLeft,
+        TerminalKey::ControlRight => key::Key::ControlRight,
+        TerminalKey::SuperLeft => key::Key::MetaLeft,
+        TerminalKey::SuperRight => key::Key::MetaRight,
+        TerminalKey::ShiftLeft => key::Key::ShiftLeft,
+        TerminalKey::ShiftRight => key::Key::ShiftRight,
+        TerminalKey::CapsLock => key::Key::CapsLock,
+        TerminalKey::NumLock => key::Key::NumLock,
+        TerminalKey::IntlBackslash => key::Key::IntlBackslash,
+        TerminalKey::IntlRo => key::Key::IntlRo,
+        TerminalKey::IntlYen => key::Key::IntlYen,
+        TerminalKey::ContextMenu => key::Key::ContextMenu,
+        TerminalKey::Convert => key::Key::Convert,
+        TerminalKey::KanaMode => key::Key::KanaMode,
+        TerminalKey::NonConvert => key::Key::NonConvert,
+        TerminalKey::Help => key::Key::Help,
+        TerminalKey::Fn => key::Key::Fn,
+        TerminalKey::FnLock => key::Key::FnLock,
+        TerminalKey::PrintScreen => key::Key::PrintScreen,
+        TerminalKey::ScrollLock => key::Key::ScrollLock,
+        TerminalKey::Pause => key::Key::Pause,
+        TerminalKey::BrowserBack => key::Key::BrowserBack,
+        TerminalKey::BrowserFavorites => key::Key::BrowserFavorites,
+        TerminalKey::BrowserForward => key::Key::BrowserForward,
+        TerminalKey::BrowserHome => key::Key::BrowserHome,
+        TerminalKey::BrowserRefresh => key::Key::BrowserRefresh,
+        TerminalKey::BrowserSearch => key::Key::BrowserSearch,
+        TerminalKey::BrowserStop => key::Key::BrowserStop,
+        TerminalKey::Eject => key::Key::Eject,
+        TerminalKey::LaunchApp1 => key::Key::LaunchApp1,
+        TerminalKey::LaunchApp2 => key::Key::LaunchApp2,
+        TerminalKey::LaunchMail => key::Key::LaunchMail,
+        TerminalKey::MediaPlayPause => key::Key::MediaPlayPause,
+        TerminalKey::MediaSelect => key::Key::MediaSelect,
+        TerminalKey::MediaStop => key::Key::MediaStop,
+        TerminalKey::MediaTrackNext => key::Key::MediaTrackNext,
+        TerminalKey::MediaTrackPrevious => key::Key::MediaTrackPrevious,
+        TerminalKey::Power => key::Key::Power,
+        TerminalKey::Sleep => key::Key::Sleep,
+        TerminalKey::AudioVolumeDown => key::Key::AudioVolumeDown,
+        TerminalKey::AudioVolumeMute => key::Key::AudioVolumeMute,
+        TerminalKey::AudioVolumeUp => key::Key::AudioVolumeUp,
+        TerminalKey::WakeUp => key::Key::WakeUp,
+        TerminalKey::Copy => key::Key::Copy,
+        TerminalKey::Cut => key::Key::Cut,
+        TerminalKey::Paste => key::Key::Paste,
+
         TerminalKey::Function(number) => match number {
             1 => key::Key::F1,
             2 => key::Key::F2,
@@ -3800,24 +3994,6 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
             _ => mouse::Button::Unknown,
         },
     }
-}
-
-fn local_host_name() -> Option<&'static str> {
-    static NAME: OnceLock<Option<String>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let mut buffer = [0u8; 256];
-        // SAFETY: gethostname receives a valid writable buffer and its size.
-        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-            return None;
-        }
-        // An unterminated truncated hostname must not match a different host.
-        std::ffi::CStr::from_bytes_until_nul(&buffer)
-            .ok()?
-            .to_str()
-            .ok()
-            .map(str::to_owned)
-    })
-    .as_deref()
 }
 
 fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf> {
@@ -5615,6 +5791,7 @@ mod tests {
             modifiers: KeyModifiers::default(),
             text: text.map(str::to_owned),
             unshifted_codepoint,
+            scroll_to_bottom_on_input: true,
         }
     }
 
@@ -6724,6 +6901,194 @@ mod tests {
             (bottom_per_event.offset, &bottom_per_event.screen),
             (bottom_per_event.origin.0, &bottom_per_event.origin.1),
             "returning to the bottom must show the live screen again"
+        );
+    }
+    #[test]
+    fn terminal_input_follows_prompt_except_modifiers_releases_or_disabled_policy() {
+        let (mut worker, _) = capture_worker_with(
+            LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), "sleep 30".into()],
+                working_directory: "/".into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            TerminalConfig {
+                max_scrollback: 1 << 20,
+                ..TerminalConfig::default()
+            },
+        );
+        worker.terminal.vt_write(&b"row\r\n".repeat(100));
+        let bar = worker.terminal.scrollbar().unwrap();
+        assert!(
+            bar.total > bar.len,
+            "fixture requires genuine retained history"
+        );
+        worker.terminal.scroll_viewport(ScrollViewport::Top);
+        assert!(
+            worker.terminal.scrollbar().unwrap().offset
+                < worker.terminal.scrollbar().unwrap().total
+        );
+        let mut input = key_input(
+            KeyAction::Press,
+            TerminalKey::Character('x'),
+            Some("x"),
+            Some('x'),
+        );
+        input.scroll_to_bottom_on_input = false;
+        worker.encode_key(input.clone());
+        let held = worker.terminal.scrollbar().unwrap().offset;
+        assert_eq!(held, 0);
+        worker.encode_key(key_input(
+            KeyAction::Press,
+            TerminalKey::ShiftLeft,
+            None,
+            None,
+        ));
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset, held);
+        worker.encode_key(key_input(
+            KeyAction::Release,
+            TerminalKey::Character('x'),
+            None,
+            Some('x'),
+        ));
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset, held);
+        let mut page = key_input(KeyAction::Press, TerminalKey::PageUp, None, None);
+        page.modifiers.shift = true;
+        worker.encode_key(page);
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset, held);
+        input.scroll_to_bottom_on_input = true;
+        worker.encode_key(input);
+        let bar = worker.terminal.scrollbar().unwrap();
+        assert_eq!(bar.offset + bar.len, bar.total);
+        worker.terminal.scroll_viewport(ScrollViewport::Top);
+        worker.writer = File::open("/dev/null").unwrap(); // Read-only: input is refused.
+        worker.encode_key(key_input(
+            KeyAction::Press,
+            TerminalKey::Character('x'),
+            Some("x"),
+            Some('x'),
+        ));
+        assert_eq!(worker.terminal.scrollbar().unwrap().offset, 0);
+        worker.published.request_shutdown();
+        worker.run();
+    }
+
+    #[test]
+    fn terminal_keypad_and_modifier_keys_use_ghostty_protocols() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let mut encoder = KeyEncoder::new().unwrap();
+        terminal.vt_write(b"\x1b=");
+        for (key, expected) in [
+            (TerminalKey::Numpad0, b"\x1bOp".as_slice()),
+            (TerminalKey::Numpad9, b"\x1bOy".as_slice()),
+            (TerminalKey::NumpadEnter, b"\x1bOM".as_slice()),
+        ] {
+            assert_eq!(
+                encode_key_input(
+                    &terminal,
+                    &mut encoder,
+                    key_input(KeyAction::Press, key, None, None)
+                )
+                .unwrap(),
+                expected
+            );
+            if key == TerminalKey::Numpad0 {
+                assert_eq!(
+                    encode_key_input(
+                        &terminal,
+                        &mut encoder,
+                        key_input(KeyAction::Press, key, Some("0"), Some('0'))
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+        terminal.vt_write(b"\x1b[>10u"); // Report events and all keys, including modifiers.
+        for key in [
+            TerminalKey::ShiftLeft,
+            TerminalKey::ShiftRight,
+            TerminalKey::ControlLeft,
+            TerminalKey::AltRight,
+            TerminalKey::SuperLeft,
+        ] {
+            let press = encode_key_input(
+                &terminal,
+                &mut encoder,
+                key_input(KeyAction::Press, key, None, None),
+            )
+            .unwrap();
+            let release = encode_key_input(
+                &terminal,
+                &mut encoder,
+                key_input(KeyAction::Release, key, None, None),
+            )
+            .unwrap();
+            assert!(
+                press.starts_with(b"\x1b["),
+                "missing modifier press: {key:?}"
+            );
+            assert!(
+                release.ends_with(b":3u"),
+                "missing modifier release: {key:?}: {release:?}"
+            );
+            assert_ne!(press, release);
+        }
+    }
+
+    #[test]
+    fn osc52_is_decoded_coalesced_bounded_and_never_reads_clipboard() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let effects = Rc::new(RefCell::new(Effects::default()));
+        register_clipboard_write(&mut terminal, effects.clone()).unwrap();
+        terminal.vt_write(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(
+            matches!(effects.borrow().ordered.as_slice(), [Effect::Clipboard { primary: false, text }] if text == "hello")
+        );
+        terminal.vt_write(b"\x1b]52;c;d29ybGQ=\x07");
+        assert!(
+            matches!(effects.borrow().ordered.as_slice(), [Effect::Clipboard { primary: false, text }] if text == "world")
+        );
+        terminal.vt_write(b"\x1b]52;c;?\x07");
+        assert_eq!(effects.borrow().ordered.len(), 1);
+        // Repeated base64 'a' groups decode to more than the cap.
+        let mut oversized = b"\x1b]52;c;".to_vec();
+        oversized.extend(b"YWFh".repeat((MAX_CLIPBOARD_WRITE_BYTES / 3) + 1));
+        oversized.push(7);
+        terminal.vt_write(&oversized);
+        assert!(
+            matches!(effects.borrow().ordered.as_slice(), [Effect::Clipboard { text, .. }] if text == "world")
+        );
+    }
+
+    #[test]
+    fn osc52_primary_destination_is_distinct_and_unsupported_selection_is_denied() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let effects = Rc::new(RefCell::new(Effects::default()));
+        register_clipboard_write(&mut terminal, effects.clone()).unwrap();
+        terminal.vt_write(b"\x1b]52;p;cHJpbWFyeQ==\x07");
+        assert!(
+            matches!(effects.borrow().ordered.as_slice(), [Effect::Clipboard { primary: true, text }] if text == "primary")
+        );
+        terminal.vt_write(b"\x1b]52;s;dW5zdXBwb3J0ZWQ=\x07");
+        assert!(
+            matches!(effects.borrow().ordered.as_slice(), [Effect::Clipboard { primary: true, text }] if text == "primary")
         );
     }
 }

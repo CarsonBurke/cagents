@@ -277,6 +277,7 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    pub terminal_review: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -319,6 +320,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_8: vec!["Alt+8".to_owned()],
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
+            terminal_review: vec!["Ctrl+Alt+Shift+R".into()],
             rename_pane: vec!["F2".to_owned()],
         }
     }
@@ -329,7 +331,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 39] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -369,6 +371,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_9,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.terminal_review,
         ]
     }
 
@@ -414,7 +417,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 39] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -453,6 +456,7 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_9",
     "toggle_projects",
     "rename_pane",
+    "terminal_review",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -780,6 +784,24 @@ impl DefaultPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalClipboardWritePolicy {
+    Allow,
+    #[default]
+    Ask,
+    Deny,
+}
+impl TerminalClipboardWritePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Settings are forward compatible, because mixed builds share one file and an
 /// older one must neither refuse to start nor erase what a newer one wrote. A
 /// key this build does not know is ignored, and a value it cannot read - a
@@ -802,6 +824,12 @@ pub struct AppSettings {
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
     pub terminal_scroll_speed: f32,
+    #[serde(default = "crate::terminal::default_scroll_to_bottom_on_input")]
+    pub terminal_scroll_to_bottom_on_input: bool,
+    #[serde(default)]
+    pub terminal_clipboard_write: TerminalClipboardWritePolicy,
+    #[serde(default)]
+    pub always_show_terminal_review_bar: bool,
     #[serde(default = "default_terminal_padding")]
     pub terminal_padding: f32,
     #[serde(default = "default_terminal_scroll_size")]
@@ -933,6 +961,9 @@ impl Default for AppSettings {
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
+            terminal_scroll_to_bottom_on_input: true,
+            terminal_clipboard_write: TerminalClipboardWritePolicy::Ask,
+            always_show_terminal_review_bar: false,
             ui_scale: default_ui_scale(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
@@ -1368,7 +1399,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 34] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1402,6 +1433,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "terminal_review",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -2809,6 +2841,20 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn introduced_terminal_review_preserves_existing_custom_binding() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "cycle_pane_width".into(),
+            toml::Value::Array(vec![toml::Value::String("Ctrl+Alt+Shift+R".into())]),
+        );
+        preserve_introduced_shortcuts(&mut table);
+        assert_eq!(
+            table["cycle_pane_width"].as_array().unwrap()[0].as_str(),
+            Some("Ctrl+Alt+Shift+R")
+        );
+        assert!(table["terminal_review"].as_array().unwrap().is_empty());
+    }
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
@@ -4993,5 +5039,47 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+    #[test]
+    fn terminal_integration_settings_have_safe_backwards_compatible_defaults() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.always_show_terminal_review_bar);
+        assert!(defaults.terminal_scroll_to_bottom_on_input);
+        assert_eq!(
+            defaults.terminal_clipboard_write,
+            TerminalClipboardWritePolicy::Ask
+        );
+        assert_eq!(
+            defaults.keyboard_shortcuts.terminal_review,
+            ["Ctrl+Alt+Shift+R"]
+        );
+        let mut text = toml::to_string(&defaults).unwrap();
+        text = text
+            .lines()
+            .filter(|line| {
+                !line.starts_with("always_show_terminal_review_bar =")
+                    && !line.starts_with("terminal_scroll_to_bottom_on_input =")
+                    && !line.starts_with("terminal_clipboard_write =")
+                    && !line.starts_with("terminal_review =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            old.always_show_terminal_review_bar,
+            defaults.always_show_terminal_review_bar
+        );
+        assert_eq!(
+            old.terminal_scroll_to_bottom_on_input,
+            defaults.terminal_scroll_to_bottom_on_input
+        );
+        assert_eq!(
+            old.terminal_clipboard_write,
+            defaults.terminal_clipboard_write
+        );
+        assert_eq!(
+            old.keyboard_shortcuts.terminal_review,
+            defaults.keyboard_shortcuts.terminal_review
+        );
     }
 }
