@@ -27,6 +27,9 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+mod provider_exit;
+pub(crate) use provider_exit::Output as ProviderExitOutput;
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -145,6 +148,7 @@ struct Inner {
     reader: Mutex<Option<JoinHandle<()>>>,
     pending: Pending,
     file_pending: FilePending,
+    diagnostic_pending: provider_exit::Pending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -489,6 +493,7 @@ impl ClientHandle {
                 reader: Mutex::new(None),
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
                 file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                diagnostic_pending: Arc::new(Mutex::new(BTreeMap::new())),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             }),
@@ -934,6 +939,7 @@ impl ClientHandle {
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
+        let diagnostic_pending: provider_exit::Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -954,6 +960,7 @@ impl ClientHandle {
             reader: Mutex::new(None),
             pending: pending.clone(),
             file_pending: file_pending.clone(),
+            diagnostic_pending: diagnostic_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1040,8 +1047,19 @@ impl ClientHandle {
                         let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
+                    provider_exit::disconnected(&diagnostic_pending, "Chat was explicitly closed");
                     wake(Wake::Changed);
                     return;
+                }
+                if let Some(reply) = envelope.request_id.and_then(|request| diagnostic_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&request)) {
+                    let result = match envelope.message {
+                        ServerMessage::Response { response: ServerResponse::ChatProviderExitOutput { chat_id, log_id, offset, bytes, next_offset, omitted } } if chat_id == id =>
+                            Ok(provider_exit::Page { log_id, offset, bytes, next_offset, omitted }),
+                        ServerMessage::Error(error) => Err(error.message),
+                        _ => Err("Unexpected provider output reply".into()),
+                    };
+                    let _ = reply.try_send(result);
+                    continue;
                 }
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
@@ -1139,6 +1157,7 @@ impl ClientHandle {
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
             }
+            provider_exit::disconnected(&diagnostic_pending, &failure);
             wake(Wake::Disconnected(failure));
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
@@ -2908,6 +2927,128 @@ mod tests {
             matches!(&handle.snapshot().items[0].content, ItemContent::Text { text, .. } if text == "resynchronized")
         );
         advance_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn provider_output_authenticated_wire_pages_ignore_coalesced_watch_updates() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let raw = format!("{}\x1b[31mred\x1b[0m €\n", "x".repeat(256 * 1024 - 2)).into_bytes();
+        let expected = format!("{}red €\n", "x".repeat(256 * 1024 - 2));
+        let log = super::super::ProviderExitLog {
+            id: "immutable-exit".into(),
+            bytes: raw.len() as u64,
+            omitted: 17,
+        };
+        let server_log = log.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("diagnostic-host");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond =
+                |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                    codec
+                        .write(
+                            server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id,
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot::default(),
+                },
+            );
+            let mut offset = 0;
+            for generation in 1..=2 {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatProviderExitOutput {
+                    chat_id: requested_chat,
+                    log_id,
+                    offset: requested_offset,
+                } = request.request
+                else {
+                    panic!("output page expected");
+                };
+                assert_eq!(requested_chat, chat_id);
+                assert_eq!(log_id, server_log.id);
+                assert_eq!(requested_offset, offset as u64);
+                respond(
+                    &mut codec,
+                    &mut server,
+                    None,
+                    ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Snapshot {
+                            generation,
+                            ..Default::default()
+                        },
+                    },
+                );
+                let end = (offset + 256 * 1024).min(raw.len());
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(request.request_id),
+                    ServerResponse::ChatProviderExitOutput {
+                        chat_id,
+                        log_id,
+                        offset: requested_offset,
+                        bytes: raw[offset..end].to_vec(),
+                        next_offset: (end < raw.len()).then_some(end as u64),
+                        omitted: server_log.omitted,
+                    },
+                );
+                offset = end;
+            }
+            assert_eq!(offset, raw.len());
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let output = handle
+            .provider_exit_output(&log, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(output.text.as_str(), expected);
+        assert_eq!(output.omitted, 17);
+        assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+        done_tx.send(()).unwrap();
         worker.join().unwrap();
     }
 
