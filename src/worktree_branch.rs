@@ -197,7 +197,9 @@ mod branch_delete_tests {
 
     fn git(path: &Path, args: &[&str]) -> String {
         let mut command = Command::new("git");
-        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+        for (name, _) in
+            std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+        {
             command.env_remove(name);
         }
         let output = command
@@ -496,7 +498,10 @@ exec /usr/bin/git "$@"
             }
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "{mode}: child did not execute its owning regression: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{mode}: child did not execute its owning regression: {output:?}"
+            );
         }
     }
 
@@ -755,7 +760,10 @@ exec /usr/bin/git "$@"
             }
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "{mode}: child did not execute its owning regression: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{mode}: child did not execute its owning regression: {output:?}"
+            );
         }
     }
 
@@ -811,7 +819,18 @@ exec /usr/bin/git "$@"
     fn registered_head_fences_accept_separate_checkout_without_configured_backlink() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        git(root, &["init", "-q", "-b", "main", "--separate-git-dir", "metadata", "checkout"]);
+        git(
+            root,
+            &[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                "--separate-git-dir",
+                "metadata",
+                "checkout",
+            ],
+        );
         let checkout = root.join("checkout");
         let metadata = root.join("metadata");
         fs::write(checkout.join("file"), "base").unwrap();
@@ -819,12 +838,27 @@ exec /usr/bin/git "$@"
         git(&checkout, &["commit", "-qm", "base"]);
         git(&checkout, &["branch", "topic"]);
         let oid = git(&checkout, &["rev-parse", "refs/heads/topic"]);
-        delete_branch_checked_at(&checkout, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+        delete_branch_checked_at(
+            &checkout,
+            "topic",
+            true,
+            Some(&oid),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         git(&checkout, &["branch", "topic"]);
-        let unknown = delete_branch_checked_at(&metadata, "topic", true, Some(&oid), &CancellationToken::new());
-        assert!(unknown.is_err(), "metadata without a primary backlink must not guess a checkout");
+        let unknown = delete_branch_checked_at(
+            &metadata,
+            "topic",
+            true,
+            Some(&oid),
+            &CancellationToken::new(),
+        );
+        assert!(
+            unknown.is_err(),
+            "metadata without a primary backlink must not guess a checkout"
+        );
         assert_eq!(git(&checkout, &["rev-parse", "refs/heads/topic"]), oid);
         assert_eq!(git(&checkout, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     }
-
 }
