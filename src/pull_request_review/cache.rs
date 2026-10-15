@@ -635,8 +635,8 @@ impl Store for JsonStore {
 
 #[cfg(test)]
 mod draft_durability_tests {
-    use crate::pull_request_review::cache;
     use super::*;
+    use crate::pull_request_review::cache;
     #[test]
     fn json_recovery_text_has_order_conflict_and_eviction_protection() {
         let directory = tempfile::tempdir().unwrap();

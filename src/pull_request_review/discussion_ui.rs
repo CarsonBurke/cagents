@@ -1800,14 +1800,26 @@ mod tests {
 
     #[test]
     fn a_fenced_reanchor_receipt_can_finish_while_an_unrelated_modal_is_open() {
-        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
-        let mut mapped=anchor();mapped.line=12;mapped.start_line=12;
-        let callback=crate::pull_request_review::Action::Discussion(Action::Reanchored{
-            generation:state.generation,composer_revision:state.discussion.composer_revision,
-            context:state.context.clone().unwrap(),result:Ok(mapped.clone())});
-        assert!(callback.allowed_while_modal(),"the shell must deliver this worker receipt beneath a modal");
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let mut mapped = anchor();
+        mapped.line = 12;
+        mapped.start_line = 12;
+        let callback = crate::pull_request_review::Action::Discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision: state.discussion.composer_revision,
+            context: state.context.clone().unwrap(),
+            result: Ok(mapped.clone()),
+        });
+        assert!(
+            callback.allowed_while_modal(),
+            "the shell must deliver this worker receipt beneath a modal"
+        );
         drop(state.update(callback));
-        assert_eq!(state.discussion.composer.as_ref().unwrap().destination,Destination::Line(mapped));
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::Line(mapped)
+        );
     }
 
     #[test]
