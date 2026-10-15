@@ -25,7 +25,7 @@ pub(super) struct State {
     statuses: HashMap<PathBuf, WorktreeSetupStatus>,
     terminals: HashMap<PathBuf, (u64, TerminalId)>,
     recovered: HashMap<PathBuf, (OperationId, SetupIntent)>,
-    authorized_runs: HashSet<OperationId>,
+    authorized_runs: std::sync::Mutex<HashSet<OperationId>>,
 }
 
 impl Drop for State {
@@ -35,7 +35,7 @@ impl Drop for State {
 impl State {
     pub(super) fn authorized_run(&self, session: &TerminalSession) -> Option<OperationId> {
         let run = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")?.parse().ok()?;
-        self.authorized_runs.contains(&run).then_some(run)
+        self.authorized_runs.lock().expect("setup launch authorization lock").remove(&run).then_some(run)
     }
     pub fn preparing(&self, path: &Path) -> bool { self.pending.contains_key(path) }
     pub fn protected_directories(&self) -> impl Iterator<Item = &PathBuf> { self.pending.keys() }
@@ -134,7 +134,7 @@ impl Cagents {
         }
         let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64).unwrap_or_default();
-        self.setup_ui.authorized_runs.insert(operation);
+        self.setup_ui.authorized_runs.lock().expect("setup launch authorization lock").insert(operation);
         let launch = LaunchRecipe {
             program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: worktree.clone(),
             environment: [("CAGENTS_WORKTREE_SETUP".into(), "1".into()), ("CAGENTS_WORKTREE_SETUP_ID".into(), operation.to_string()), ("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), started_at.to_string())].into(),
@@ -340,7 +340,7 @@ mod tests {
         app.recover_worktree_setup(creation, path.clone(), intent.clone());
         assert!(matches!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Interrupted(_)));
         assert!(app.setup_ui.pending.is_empty());
-        assert!(app.setup_ui.authorized_runs.is_empty());
+        assert!(app.setup_ui.authorized_runs.lock().unwrap().is_empty());
         assert!(!app.setup_ui.active());
         let mut copied = intent.clone(); copied.copy_done = true;
         app.recover_worktree_setup(creation, path.clone(), copied);
@@ -348,6 +348,18 @@ mod tests {
         let mut skipped = intent; skipped.skip = true;
         app.recover_worktree_setup(creation, path.clone(), skipped);
         assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Skipped);
+    }
+
+    #[test]
+    fn setup_launch_authorization_is_consumed_once_and_is_not_restored() {
+        let state = State::default();
+        let run = OperationId::new();
+        let mut session = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
+        assert!(state.authorized_run(&session).is_none());
+        state.authorized_runs.lock().unwrap().insert(run);
+        assert_eq!(state.authorized_run(&session), Some(run));
+        assert!(state.authorized_run(&session).is_none());
     }
 
     #[test]
