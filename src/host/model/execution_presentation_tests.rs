@@ -169,7 +169,7 @@ fn presentation_repair_service_authenticates_without_any_hosted_provider() {
         host_incarnation: crate::model::HostIncarnation::new("repair-incarnation"),
     });
     state.install_model(registry);
-    let host = std::sync::Arc::new(std::sync::Mutex::new(state));
+    let host = std::sync::Arc::new(crate::host::state::HostLock::new(state));
     assert!(crate::host::agent_execution::process(&host, Authority::session("unissued".into()),
         Operation::ConfirmPresentationRepair {observed: target.clone()}).is_err());
     assert_eq!(crate::host::agent_execution::process(&host, Authority::default(),
