@@ -1421,6 +1421,11 @@ fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
     record_focused_window_at(runtime, slot, 1)
 }
 
+#[cfg(test)]
+pub(crate) fn activation_fixture_primary_socket(runtime: &Path) -> PathBuf {
+    runtime.join(slot_socket_name(PRIMARY_WINDOW))
+}
+
 /// Select a project in one running window, without starting the UI or a terminal.
 /// JSON preserves spaces and Unicode in canonical repository paths.
 pub fn activate_project(repository: &Path) -> io::Result<bool> {

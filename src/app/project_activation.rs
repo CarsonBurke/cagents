@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn cli_selection_reuses_adoption_load_and_never_creates_a_terminal() {
         const TEST: &str = "app::project_activation::tests::cli_selection_reuses_adoption_load_and_never_creates_a_terminal";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::test_git::isolated_test(TEST) { return; }
         for adoption_first in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn late_load_cannot_replace_newer_cli_or_manual_selection() {
         const TEST: &str = "app::project_activation::tests::late_load_cannot_replace_newer_cli_or_manual_selection";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::test_git::isolated_test(TEST) { return; }
         for manual in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let a = directory.path().join("a");
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn failed_cli_load_releases_its_intent_and_allows_repaired_retry() {
         const TEST: &str = "app::project_activation::tests::failed_cli_load_releases_its_intent_and_allows_repaired_retry";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::test_git::isolated_test(TEST) { return; }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("missing");
         std::fs::create_dir(&root).unwrap();
@@ -194,10 +194,10 @@ mod tests {
     #[test]
     fn cli_selection_never_navigates_to_a_bare_metadata_directory() {
         const TEST: &str = "app::project_activation::tests::cli_selection_never_navigates_to_a_bare_metadata_directory";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::test_git::isolated_test(TEST) { return; }
         let directory = tempfile::tempdir().unwrap();
         let bare = directory.path().join("metadata.git");
-        crate::git_watch::tests::run_fixture_command(crate::git_watch::tests::isolated_fixture_command(
+        crate::test_git::run(crate::test_git::isolated_command(
             crate::repository::CommandSpec::new("git").args(["-c", "init.templateDir=", "init", "--bare", "--template="]).arg(bare.as_os_str())));
         let mut app = super::super::tests::context_inspector_test_app(false);
         let read = app.project_load_task(bare.clone(), None, false, Some(ProjectKind::Git));
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn cli_selection_waits_for_modal_and_update_admission() {
         const TEST: &str = "app::project_activation::tests::cli_selection_waits_for_modal_and_update_admission";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::test_git::isolated_test(TEST) { return; }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
