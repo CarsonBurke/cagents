@@ -17,7 +17,7 @@ mod diff_actions;
 pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
-pub use diff_mutations::Request as DiffMutationRequest;
+pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 

@@ -12,19 +12,82 @@ pub struct Request {
     pub rows: Range<usize>,
 }
 
-pub(crate) struct Capture {
-    pub identity: AsyncIdentity,
-    pub model: Arc<DiffModel>,
-    pub kind: git_patch::Kind,
-    pub mode: DiffMode,
-    pub rows: Range<usize>,
-    pub old_path: RepoPath,
-    pub new_path: RepoPath,
-    pub buffer_revision: Option<u64>,
+pub struct Capture {
+    pub(crate) identity: AsyncIdentity,
+    pub(crate) model: Arc<DiffModel>,
+    pub(crate) kind: git_patch::Kind,
+    pub(crate) mode: DiffMode,
+    pub(crate) rows: Range<usize>,
+    pub(crate) old_path: RepoPath,
+    pub(crate) new_path: RepoPath,
+    pub(crate) buffer_revision: Option<u64>,
+    basis: DiffBasis,
+    layout_revision: u64,
+    selection: Option<crate::diff_interaction::Selection>,
     buffer_snapshot: Option<text_editor::TextSnapshot>,
 }
 
+/// A host receives an opaque prepared edit. Its source model, selection,
+/// buffer revision and native Undo metadata remain owned by this runtime.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    identity: AsyncIdentity,
+    model: Arc<DiffModel>,
+    kind: git_patch::Kind,
+    basis: DiffBasis,
+    mode: DiffMode,
+    layout_revision: u64,
+    selection: Option<crate::diff_interaction::Selection>,
+    buffer_revision: Option<u64>,
+    patch: git_patch::Patch,
+}
+
+impl Prepared {
+    pub fn identity(&self) -> &AsyncIdentity { &self.identity }
+
+    pub fn applies_to_buffer(&self) -> bool { self.buffer_revision.is_some() }
+
+    /// Cached Stage reads captured live text and leaves disk/buffers intact.
+    pub fn stages_live_buffer(&self) -> bool { self.kind == git_patch::Kind::Stage }
+
+    /// At the owned queue turn, refuse any change of the rendered source.
+    /// Buffer Revert is one native Undo transaction; disk effects are returned
+    /// to the host's existing ordered Git/recovery pipeline.
+    pub fn apply(self, runtime: &mut RepositoryRuntime) -> Result<Option<crate::repository::GitOperation>, String> {
+        let current = runtime.current_diff_model_snapshot();
+        if !runtime.accepts_selected(&self.identity)
+            || runtime.diff_basis != self.basis || runtime.diff_mode != self.mode
+            || runtime.diff_layout_revision != self.layout_revision
+            || runtime.diff_interaction.selection != self.selection
+            || !runtime.can_mutate_diff(self.kind)
+            || !current.is_some_and(|model| Arc::ptr_eq(&model, &self.model))
+        { return Err("The selected diff changed while the action was prepared. Try again.".into()); }
+        let mut patch = self.patch;
+        if let Some(revision) = self.buffer_revision {
+            let present = patch.working_present.ok_or("The selected change has no working-file presence state")?;
+            runtime.apply_diff_buffer_revert_with_presence(&self.identity, revision, patch.buffer_change.take(), present, patch.working_mode)?;
+            Ok(None)
+        } else {
+            Ok(Some(crate::repository::GitOperation::ApplyPatch {
+                patch: patch.patch, cached: patch.cached, reverse: patch.reverse, expected_head: patch.expected_head,
+            }))
+        }
+    }
+}
+
 impl Capture {
+    /// Build patch bytes and any minimal native buffer replacement off thread.
+    pub fn prepare(self) -> Option<Prepared> {
+        let model = self.model.clone();
+        let kind = self.kind;
+        let basis = self.basis.clone();
+        let mode = self.mode;
+        let layout_revision = self.layout_revision;
+        let selection = self.selection;
+        let (identity, buffer_revision, patch) = self.build()?;
+        Some(Prepared { identity, model, kind, basis, mode, layout_revision, selection, buffer_revision, patch })
+    }
+
     pub fn build(self) -> Option<(AsyncIdentity, Option<u64>, git_patch::Patch)> {
         let mut patch = git_patch::selected_patch(
             &self.model,
@@ -185,7 +248,7 @@ impl RepositoryRuntime {
                 .all(|(present, mode)| !present || matches!(mode, Some(0o100644 | 0o100755)))
     }
 
-    pub(crate) fn capture_diff_mutation(
+    pub fn capture_diff_mutation(
         &self,
         card: CardId,
         kind: git_patch::Kind,
@@ -247,6 +310,9 @@ impl RepositoryRuntime {
             new_path: RepoPath::parse(file.path).ok()?,
             buffer_revision,
             buffer_snapshot,
+            basis: self.diff_basis.clone(),
+            layout_revision: self.diff_layout_revision,
+            selection: self.diff_interaction.selection,
         })
     }
 
@@ -1041,6 +1107,35 @@ mod tests {
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
         runtime
+    }
+
+    #[test]
+    fn opaque_prepared_diff_refuses_selection_and_same_content_model_replacement() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(runtime.diff_mode, crate::diff_interaction::Side::New, 0));
+        assert!(prepared.apply(&mut runtime).is_err());
+        runtime.diff_interaction.selection = None;
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap().prepare().unwrap();
+        let model = runtime.current_diff_model_snapshot().unwrap();
+        let replacement = Arc::new((*model).clone());
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text { model: replacement, old_label: "Index".into(), new_label: "Working tree".into() }));
+        assert!(prepared.apply(&mut runtime).is_err());
+    }
+
+    #[test]
+    fn opaque_prepared_revert_uses_one_native_undo_transaction() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let request = runtime.diff_mutation_request(card, 0..2).unwrap();
+        let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap().prepare().unwrap();
+        assert!(prepared.applies_to_buffer());
+        assert!(prepared.apply(&mut runtime).unwrap().is_none());
+        assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
     }
 
     #[test]
