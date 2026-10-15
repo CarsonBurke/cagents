@@ -1043,7 +1043,7 @@ impl Cagents {
                 });
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        inspect_worktree(&repository, &repository).map(|(_, directories)| directories)
+                        read_cleanup_policy(&repository)
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -1111,7 +1111,7 @@ impl Cagents {
                                 path: repository.clone(), repository, directories,
                             },
                         })?;
-                        inspected_worktree(reply).map(|_| ())
+                        disposable_ignored_directories(reply).map(|_| ())
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -3043,6 +3043,24 @@ fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result
     Ok(agents)
 }
 
+// Policy controls must stay usable even when deletion safety cannot inventory a
+// protected directory. A save reply reports the policy readback, not a later census.
+fn read_cleanup_policy(repository: &Path) -> Result<Vec<String>, String> {
+    let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
+        operation: crate::worktree_control::Operation::GetDisposableIgnoredDirectories {
+            repository: repository.to_owned(), path: repository.to_owned(),
+        },
+    })?;
+    disposable_ignored_directories(reply)
+}
+
+fn disposable_ignored_directories(reply: crate::device_service::Reply) -> Result<Vec<String>, String> {
+    match reply {
+        crate::device_service::Reply::Worktree(crate::worktree_control::Reply::DisposableIgnoredDirectories { directories }) => Ok(directories),
+        _ => Err("The selected device returned an unexpected project cleanup policy reply.".into()),
+    }
+}
+
 fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -3142,6 +3160,18 @@ fn parse_disposable_directories(value: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cleanup_policy_reply_does_not_require_a_deletion_snapshot() {
+        let directories = vec!["build,data".to_owned(), "cache ".to_owned()];
+        let decoded = disposable_ignored_directories(crate::device_service::Reply::Worktree(
+            crate::worktree_control::Reply::DisposableIgnoredDirectories { directories: directories.clone() },
+        )).unwrap();
+        assert_eq!(decoded, directories);
+        assert!(disposable_ignored_directories(crate::device_service::Reply::Worktree(
+            crate::worktree_control::Reply::Inspected { snapshot: "{}".into(), disposable_ignored_directories: vec![] },
+        )).is_err());
+    }
+
+    #[test]
     fn worktree_inspection_rejects_wrong_or_malformed_device_reply() {
         assert!(inspected_worktree(crate::device_service::Reply::Worktree(
             crate::worktree_control::Reply::Listed { worktrees: Vec::new() })).is_err());
@@ -3237,6 +3267,49 @@ mod tests {
             Vec::new(),
         ));
         (app, directory, project)
+    }
+
+    #[test]
+    fn opened_project_and_worktree_removal_focus_the_cancel_button() {
+        let repository = PathBuf::from("/focus-repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let task = app.handle_project_action(Action::Command {
+            project_id: project, worktree_id: None, command: ProjectCommand::Remove,
+        });
+        assert_eq!(
+            super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
+            Some(widget::Id::new("dialog.project.remove.cancel")),
+        );
+        // The primary worktree refusal is synchronous, so the actual opening
+        // task contains only focus operations and cannot start a daemon.
+        let task = app.open_worktree_delete_dialog(Target {
+            project, worktree: Some(primary.id), repository: repository.clone(),
+            path: repository, label: "main".into(),
+        });
+        assert!(app.project_ui.remove_dialog.is_none());
+        assert!(app.project_ui.dialog.as_ref().unwrap().blocker.is_some());
+        assert_eq!(
+            super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
+            Some(widget::Id::new("dialog.project.close")),
+        );
+    }
+
+    #[test]
+    fn loaded_cleanup_policy_focuses_its_actual_editable_field() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.project_ui.cleanup_dialog = Some(CleanupPolicyDialog {
+            repository: PathBuf::from("/focus-repo"), name: "repo".into(),
+            directories: String::new(), loading: true, error: None, request: 19,
+        });
+        let task = app.handle_project_action(Action::CleanupPolicyRead {
+            request: 19, result: Ok(vec!["target".into()]),
+        });
+        assert_eq!(
+            super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
+            Some(widget::Id::new("dialog.project.cleanup.directories")),
+        );
     }
 
     fn row(app: &Cagents, id: WorktreeId) -> Option<&SidebarWorktree> {
