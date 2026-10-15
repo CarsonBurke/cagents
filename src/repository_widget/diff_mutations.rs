@@ -3,8 +3,10 @@
 use super::*;
 use crate::git_patch;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Request {
+    incarnation: Arc<()>,
+    model: std::sync::Weak<DiffModel>,
     pub identity: AsyncIdentity,
     pub basis: DiffBasis,
     pub mode: DiffMode,
@@ -12,7 +14,31 @@ pub struct Request {
     pub rows: Range<usize>,
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffMutationRequest")
+            .field("identity", &self.identity)
+            .field("basis", &self.basis)
+            .field("layout_revision", &self.layout_revision)
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.incarnation, &other.incarnation)
+            && std::sync::Weak::ptr_eq(&self.model, &other.model)
+            && self.identity == other.identity
+            && self.basis == other.basis
+            && self.mode == other.mode
+            && self.layout_revision == other.layout_revision
+            && self.rows == other.rows
+    }
+}
+impl Eq for Request {}
+
 pub struct Capture {
+    incarnation: Arc<()>,
     pub(crate) identity: AsyncIdentity,
     pub(crate) model: Arc<DiffModel>,
     pub(crate) kind: git_patch::Kind,
@@ -31,6 +57,7 @@ pub struct Capture {
 /// buffer revision and native Undo metadata remain owned by this runtime.
 #[derive(Debug, Clone)]
 pub struct Prepared {
+    incarnation: Arc<()>,
     identity: AsyncIdentity,
     model: Arc<DiffModel>,
     kind: git_patch::Kind,
@@ -68,7 +95,8 @@ impl Prepared {
         runtime: &mut RepositoryRuntime,
     ) -> Result<Option<crate::repository::GitOperation>, String> {
         let current = runtime.current_diff_model_snapshot();
-        if !runtime.accepts_selected(&self.identity)
+        if !Arc::ptr_eq(&self.incarnation, &runtime.command_incarnation)
+            || !runtime.accepts_selected(&self.identity)
             || runtime.diff_basis != self.basis
             || runtime.diff_mode != self.mode
             || runtime.diff_layout_revision != self.layout_revision
@@ -131,6 +159,7 @@ impl Capture {
 
     /// Build patch bytes and any minimal native buffer replacement off thread.
     pub fn prepare(self) -> Option<Prepared> {
+        let incarnation = self.incarnation.clone();
         let model = self.model.clone();
         let kind = self.kind;
         let basis = self.basis.clone();
@@ -139,6 +168,7 @@ impl Capture {
         let selection = self.selection;
         let (identity, buffer_revision, patch) = self.build()?;
         Some(Prepared {
+            incarnation,
             identity,
             model,
             kind,
@@ -184,7 +214,10 @@ impl RepositoryRuntime {
             return None;
         }
         let path = self.selected_path()?.to_owned();
+        let model = self.current_diff_model_snapshot()?;
         Some(Arc::new(Request {
+            incarnation: self.command_incarnation.clone(),
+            model: Arc::downgrade(&model),
             identity: self.current_identity(card, path),
             basis: self.diff_basis.clone(),
             mode: self.diff_mode,
@@ -311,6 +344,12 @@ impl RepositoryRuntime {
         kind == git_patch::Kind::Revert && self.editable_working_diff()
     }
 
+    fn diff_mutation_surface_owner(&self) -> (crate::model::OperationId, DiffMode, Option<crate::diff_interaction::Selection>, usize, Option<*const DiffModel>, [bool; 3]) {
+        (self.diff_surface_owner, self.diff_mode, self.diff_interaction.selection, self.diff_change,
+            self.diff_model().map(|model| model as *const DiffModel),
+            [git_patch::Kind::Stage, git_patch::Kind::Unstage, git_patch::Kind::Revert].map(|kind| self.can_mutate_diff(kind)))
+    }
+
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
         // A hunk edit keeps the current document open. Unsaved working
         // text is a valid source while its annotations match that revision;
@@ -368,7 +407,8 @@ impl RepositoryRuntime {
             return None;
         }
         if let Some(request) = request
-            && (!self.accepts_selected(&request.identity)
+            && (!Arc::ptr_eq(&request.incarnation, &self.command_incarnation)
+                || !self.accepts_selected(&request.identity)
                 || request.identity.card != card
                 || request.basis != self.diff_basis
                 || request.mode != self.diff_mode
@@ -377,6 +417,9 @@ impl RepositoryRuntime {
             return None;
         }
         let model = self.current_diff_model_snapshot()?;
+        if request.is_some_and(|request| !std::sync::Weak::ptr_eq(&request.model, &Arc::downgrade(&model))) {
+            return None;
+        }
         let rows = match request {
             Some(request) => request.rows.clone(),
             None => self.selected_diff_range().or_else(|| {
@@ -411,6 +454,7 @@ impl RepositoryRuntime {
             (None, None)
         };
         Some(Capture {
+            incarnation: self.command_incarnation.clone(),
             identity: self.current_identity(card, path.clone()),
             model,
             kind,
@@ -631,11 +675,13 @@ pub(super) fn selection_controls<'a>(
             registered_command_hint(runtime, command, label),
         ));
     }
-    widget::row::with_children(controls)
-        .spacing(space::XS)
-        .padding([space::XS, space::S])
-        .width(Length::Fill)
-        .into()
+    crate::interaction::owned_surface(
+        widget::row::with_children(controls)
+            .spacing(space::XS)
+            .padding([space::XS, space::S])
+            .width(Length::Fill),
+        runtime.diff_mutation_surface_owner(),
+    )
 }
 
 /// Hunk buttons occupy their own fixed gutter; line numbers stay readable and
@@ -708,10 +754,12 @@ pub(super) fn gutter<'a>(
             "Revert this hunk",
         ));
     }
-    widget::container(widget::row::with_children(controls).spacing(2.0))
-        .center_y(height)
-        .width(GUTTER_WIDTH)
-        .into()
+    crate::interaction::owned_surface(
+        widget::container(widget::row::with_children(controls).spacing(2.0))
+            .center_y(height)
+            .width(GUTTER_WIDTH),
+        (runtime.diff_mutation_surface_owner(), row),
+    )
 }
 
 #[cfg(test)]
@@ -1478,6 +1526,85 @@ mod tests {
         source.invalidate();
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
         assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diff_hunk_native_press_cannot_cross_runtime_or_model_replacement() {
+        use cosmic::iced::{
+            Event, Point, Size,
+            advanced::clipboard,
+            runtime::{UserInterface, user_interface::Cache},
+        };
+        let card = CardId::new();
+        let original = RepositoryRuntime::selected_diff_fixture(card);
+        let mut replacement = RepositoryRuntime::selected_diff_fixture_from_source(
+            card,
+            original.descriptor.clone(),
+            original.git_read_source().unwrap().clone(),
+        );
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut cache = Cache::default();
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut feed = |runtime: &RepositoryRuntime, events: &[Event]| {
+            let mut ui = UserInterface::build(
+                selection_controls(card, runtime),
+                Size::new(500.0, 80.0),
+                std::mem::take(&mut cache),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            ui.update(events, mouse::Cursor::Available(Point::new(30.0, 18.0)),
+                &mut renderer, &mut clipboard::Null, &mut messages);
+            cache = ui.into_cache();
+            messages
+        };
+        assert!(feed(&original, &[press.clone()]).is_empty());
+        let same = feed(&original, &[release.clone()]);
+        assert!(matches!(same.as_slice(), [RepositoryAction::ApplyDiffHunk { kind: crate::git_patch::Kind::Stage, .. }]));
+        assert!(feed(&original, &[press.clone()]).is_empty());
+        assert!(feed(&replacement, &[release.clone()]).is_empty(),
+            "an original Runtime press cannot activate a replacement Runtime");
+        assert!(matches!(feed(&replacement, &[press.clone(), release.clone()]).as_slice(),
+            [RepositoryAction::ApplyDiffHunk { kind: crate::git_patch::Kind::Stage, .. }]));
+        assert!(feed(&replacement, &[press.clone()]).is_empty());
+        // The same Runtime can install a newly read model at the same path.
+        // Even when its text is unchanged, the old native gesture is retired.
+        let content = crate::diff_view::load_repository_diff_with_read_source(
+            &replacement.descriptor.worktree, Path::new("file.txt"),
+            &DiffBasis::IndexToWorktree, None,
+            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+            &CancellationToken::default(), replacement.git_read_source(),
+        );
+        replacement.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
+        assert!(feed(&replacement, &[release.clone()]).is_empty(),
+            "a newly installed model retires the old press");
+        assert!(matches!(feed(&replacement, &[press, release]).as_slice(),
+            [RepositoryAction::ApplyDiffHunk { kind: crate::git_patch::Kind::Stage, .. }]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_hunk_requests_refuse_a_new_runtime_with_reused_numeric_counters() {
+        let card = CardId::new();
+        let original = selected_mutation_fixture(card);
+        let source = original.git_read_source().unwrap().clone();
+        let descriptor = original.descriptor.clone();
+        let replacement = selected_mutation_fixture_from_source(card, descriptor, source);
+        let request = original.diff_mutation_request(card, 0..1).unwrap();
+        assert_eq!(request.identity, replacement.current_identity(card, "file.txt".into()));
+        assert_eq!(request.layout_revision, replacement.diff_layout_revision);
+        assert!(original.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).is_some());
+        assert!(replacement.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).is_none());
+        assert!(replacement.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).is_none());
+        let model = original.current_diff_model_snapshot().unwrap();
+        let strong = Arc::strong_count(&model);
+        let another = original.diff_mutation_request(card, 0..1).unwrap();
+        assert_eq!(Arc::strong_count(&model), strong, "saved native messages hold only a weak model identity");
+        drop(model);
+        drop(original);
+        assert!(another.model.upgrade().is_none(), "obsolete diff bodies are not retained by unadmitted requests");
     }
 
     #[cfg(target_os = "linux")]
