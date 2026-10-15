@@ -2348,10 +2348,19 @@ impl Cagents {
     }
 
     fn live_editor_language_capabilities(&self, card: CardId) -> u8 {
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
-        let Some(doc) = self.lsp_document(card).filter(|doc| runtime.lsp_document() == Some(*doc)) else { return 0; };
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return 0;
+        };
+        let Some(doc) = self
+            .lsp_document(card)
+            .filter(|doc| runtime.lsp_document() == Some(*doc))
+        else {
+            return 0;
+        };
         let capabilities = self.lsp.capabilities(doc);
-        if !capabilities.ready { return 0; }
+        if !capabilities.ready {
+            return 0;
+        }
         let runtime_mask = runtime.editor_language_command_capabilities();
         [
             (Command::EditorComplete, capabilities.completion),
@@ -2361,9 +2370,15 @@ impl Cagents {
             // Diagnostics is the local panel for server-pushed diagnostics;
             // pull-diagnosticProvider does not describe that capability.
             (Command::ShowDiagnostics, true),
-        ].into_iter().filter_map(|(command, supported)| {
-            supported.then(|| workspace_widget::editor_language_command_bit(command)).flatten()
-        }).fold(0, |mask, bit| mask | bit) & runtime_mask
+        ]
+        .into_iter()
+        .filter_map(|(command, supported)| {
+            supported
+                .then(|| workspace_widget::editor_language_command_bit(command))
+                .flatten()
+        })
+        .fold(0, |mask, bit| mask | bit)
+            & runtime_mask
     }
 
     fn editor_feature_command_capabilities(&self, card: CardId) -> u8 {
@@ -2404,8 +2419,12 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
-        if command == Command::OpenAutomations { return self.open_automations(); }
-        if command == Command::OpenAgentAccounts { return self.open_agent_accounts(); }
+        if command == Command::OpenAutomations {
+            return self.open_automations();
+        }
+        if command == Command::OpenAgentAccounts {
+            return self.open_agent_accounts();
+        }
         if matches!(
             command,
             Command::SettingsOpenFile | Command::SettingsRevealFile
@@ -2759,7 +2778,10 @@ impl Cagents {
             )));
             return Task::none();
         }
-        if allow_sidebar && command.sidebar_command_bit().is_some() && self.sidebar_command_target().is_some() {
+        if allow_sidebar
+            && command.sidebar_command_bit().is_some()
+            && self.sidebar_command_target().is_some()
+        {
             return self.run_registered_command(command);
         }
         match command {
@@ -3301,7 +3323,6 @@ impl SettingsField {
             Self::ShortcutOpenAutomations => Some(Command::OpenAutomations),
             Self::ShortcutOpenAgentAccounts => Some(Command::OpenAgentAccounts),
 
-
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
             Self::ShortcutClonePane => Some(Command::ClonePane),
@@ -3744,8 +3765,10 @@ impl ShortcutDraft {
                 self.git_history_cherry_pick.as_str(),
             ),
             (Command::OpenAutomations, self.open_automations.as_str()),
-            (Command::OpenAgentAccounts, self.open_agent_accounts.as_str()),
-
+            (
+                Command::OpenAgentAccounts,
+                self.open_agent_accounts.as_str(),
+            ),
         ]
     }
 }
@@ -3762,51 +3785,92 @@ mod tests {
         runtime.descriptor.worktree = root.path().into();
         runtime.descriptor.repository = root.path().into();
         runtime.set_lsp_document(Some(doc));
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
-        app.lsp = crate::lsp::LspManager::fixture_ready_code_actions(doc,
-            &root.path().join("source.rs"), root.path(), "call();\n").await;
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp = crate::lsp::LspManager::fixture_ready_code_actions(
+            doc,
+            &root.path().join("source.rs"),
+            root.path(),
+            "call();\n",
+        )
+        .await;
         app.lsp_documents.insert(doc, card);
         app.lsp_contexts.entry(card).or_default().document = Some(doc);
         assert!(app.lsp.capabilities(doc).ready);
         assert!(app.lsp.document_version(doc).is_some());
-        let diagnostics = workspace_widget::editor_language_command_bit(Command::ShowDiagnostics).unwrap();
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, diagnostics,
-            "a Ready code-action-only server must expose local pushed diagnostics, without advertising unsupported providers");
+        let diagnostics =
+            workspace_widget::editor_language_command_bit(Command::ShowDiagnostics).unwrap();
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            diagnostics,
+            "a Ready code-action-only server must expose local pushed diagnostics, without advertising unsupported providers"
+        );
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(crate::lsp::LspDocumentId(80)));
         }
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
-            "another mounted document cannot borrow the manager's Ready capability");
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            0,
+            "another mounted document cannot borrow the manager's Ready capability"
+        );
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
         }
         app.lsp.begin_shutdown().await;
-        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
-            "retired session commands must disappear");
+        assert_eq!(
+            app.command_context(Some(card)).editor_language_commands,
+            0,
+            "retired session commands must disappear"
+        );
     }
 
     #[test]
     fn utility_destinations_are_registered_bindable_and_use_actual_workspace_dispatch() {
-        for (command, account) in [(Command::OpenAutomations, false), (Command::OpenAgentAccounts, true)] {
+        for (command, account) in [
+            (Command::OpenAutomations, false),
+            (Command::OpenAgentAccounts, true),
+        ] {
             let descriptor = workspace_widget::shortcut_descriptor(command);
             assert!(descriptor.default_chords().is_empty());
-            assert!(!descriptor.available(&workspace_widget::CommandContext { save_in_flight: true, ..Default::default() }));
+            assert!(!descriptor.available(&workspace_widget::CommandContext {
+                save_in_flight: true,
+                ..Default::default()
+            }));
             let mut app = crate::app::tests::context_inspector_test_app(false);
-            if account { app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()]; }
-            else { app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()]; }
-            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), "F10");
+            if account {
+                app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()];
+            } else {
+                app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()];
+            }
+            assert_eq!(
+                workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts),
+                "F10"
+            );
             assert!(app.command_available(command));
             app.palette.query = Some(">".into());
-            assert!(app.palette_entries().iter().any(|(_, _, message)| matches!(message, Message::RunCommand(found) if *found == command)));
+            assert!(app.palette_entries().iter().any(
+                |(_, _, message)| matches!(message, Message::RunCommand(found) if *found == command)
+            ));
             drop(app.update_palette(Action::Close));
             drop(app.update(Message::RunCommand(command)));
-            assert!(app.durable.cards.iter().any(|card| card.existence.is_open() && if account { matches!(card.kind, CardKind::Accounts) } else { matches!(card.kind, CardKind::Automations) }));
+            assert!(app.durable.cards.iter().any(|card| card.existence.is_open()
+                && if account {
+                    matches!(card.kind, CardKind::Accounts)
+                } else {
+                    matches!(card.kind, CardKind::Automations)
+                }));
         }
-        let remote = workspace_widget::CommandContext { remote_device: true, ..Default::default() };
-        assert!(!workspace_widget::shortcut_descriptor(Command::OpenAutomations).available(&remote));
-        assert!(workspace_widget::shortcut_descriptor(Command::OpenAgentAccounts).available(&remote));
+        let remote = workspace_widget::CommandContext {
+            remote_device: true,
+            ..Default::default()
+        };
+        assert!(
+            !workspace_widget::shortcut_descriptor(Command::OpenAutomations).available(&remote)
+        );
+        assert!(
+            workspace_widget::shortcut_descriptor(Command::OpenAgentAccounts).available(&remote)
+        );
     }
-
 
     #[test]
     fn pane_list_uses_shared_attention_ranking_and_preserves_unread_work() {
@@ -5170,7 +5234,11 @@ mod tests {
                     .is_some_and(|notice| notice.message.contains("selected diff changed"))
         );
         let (mut app, _, _) = diff_command_fixture();
-        app.sidebar_model.source_control.as_mut().unwrap().set_reloading(true);
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_reloading(true);
         assert!(!app.command_available(Command::DiffStageSelection));
         app.sidebar_model.source_control = None;
         for command in [
@@ -5762,13 +5830,14 @@ mod tests {
         let _ = app.update_palette(Action::Query("open settings".into()));
         // File-opening commands share these words. Choose the destination by
         // its command identity so this remains a pane-focus contract.
-        app.palette.selected_message = Some(app
-            .palette_entries()
-            .into_iter()
-            .find_map(|(_, _, message)| {
-                matches!(message, Message::RunCommand(Command::OpenSettings)).then_some(message)
-            })
-            .expect("the settings-pane command is listed"));
+        app.palette.selected_message = Some(
+            app.palette_entries()
+                .into_iter()
+                .find_map(|(_, _, message)| {
+                    matches!(message, Message::RunCommand(Command::OpenSettings)).then_some(message)
+                })
+                .expect("the settings-pane command is listed"),
+        );
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();

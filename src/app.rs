@@ -20,11 +20,11 @@ use crate::file_manager::{self, open_system_url};
 #[cfg(feature = "integrated-browser")]
 mod browser_backend;
 mod browser_host;
-mod file_ui;
 mod editor_features;
+mod file_ui;
+mod git_binding;
 mod git_group_ui;
 mod git_patch_ui;
-mod git_binding;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -2514,7 +2514,9 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 /// is exactly two variants, and neither can destroy anything the dialog did
 /// not already count and show.
 fn answers_discard_confirmation(action: &SidebarAction) -> bool {
-    if let SidebarAction::RunBound { action, .. } = action { return answers_discard_confirmation(action); }
+    if let SidebarAction::RunBound { action, .. } = action {
+        return answers_discard_confirmation(action);
+    }
     matches!(
         action,
         SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
@@ -2743,10 +2745,15 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
-    if let Message::Sidebar(SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. }) = message {
+    if let Message::Sidebar(
+        SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. },
+    ) = message
+    {
         return workspace_navigation_blocked_during_save(&Message::Sidebar((**action).clone()));
     }
-    if let Message::Sidebar(SidebarAction::RunUtilityCommand(command)) = message { return command.blocked_during_save(); }
+    if let Message::Sidebar(SidebarAction::RunUtilityCommand(command)) = message {
+        return command.blocked_during_save();
+    }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -2765,7 +2772,9 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
             | Message::ChromeUi(
-                chrome_ui::Action::Launch(_) | chrome_ui::Action::RunNewTab(_) | chrome_ui::Action::FocusNoticeCard(_)
+                chrome_ui::Action::Launch(_)
+                    | chrome_ui::Action::RunNewTab(_)
+                    | chrome_ui::Action::FocusNoticeCard(_)
             )
             | Message::MovePaneToChannel { .. }
             | Message::PaneDropToChannel { .. }
@@ -2820,7 +2829,10 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 }
 
 fn completion_navigates(message: &Message) -> bool {
-    if let Message::Sidebar(SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. }) = message {
+    if let Message::Sidebar(
+        SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. },
+    ) = message
+    {
         return completion_navigates(&Message::Sidebar((**action).clone()));
     }
     matches!(
@@ -3462,7 +3474,6 @@ impl SettingsField {
         Self::ShortcutGitHistoryCherryPick,
         Self::ShortcutOpenAutomations,
         Self::ShortcutOpenAgentAccounts,
-
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3698,7 +3709,6 @@ impl SettingsField {
             Self::ShortcutGitHistoryCherryPick => "Cherry-pick commit into this worktree",
             Self::ShortcutOpenAutomations => "Open automations",
             Self::ShortcutOpenAgentAccounts => "Open agent accounts",
-
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -4232,7 +4242,6 @@ struct ShortcutDraft {
     open_automations: String,
     open_agent_accounts: String,
 
-
     terminal_review: String,
     command_palette: String,
     new_native_thread: String,
@@ -4447,7 +4456,9 @@ impl ShortcutDraft {
             git_stage_all_conflicts: settings::format_chords(&shortcuts.git_stage_all_conflicts),
             git_unstage_all_staged: settings::format_chords(&shortcuts.git_unstage_all_staged),
             git_discard_all_unstaged: settings::format_chords(&shortcuts.git_discard_all_unstaged),
-            git_discard_all_untracked: settings::format_chords(&shortcuts.git_discard_all_untracked),
+            git_discard_all_untracked: settings::format_chords(
+                &shortcuts.git_discard_all_untracked,
+            ),
             editor_reload: settings::format_chords(&shortcuts.editor_reload),
             editor_overwrite: settings::format_chords(&shortcuts.editor_overwrite),
             editor_rename_symbol: settings::format_chords(&shortcuts.editor_rename_symbol),
@@ -4460,12 +4471,13 @@ impl ShortcutDraft {
             git_history_copy_sha: settings::format_chords(&shortcuts.git_history_copy_sha),
             git_history_copy_message: settings::format_chords(&shortcuts.git_history_copy_message),
             git_history_new_worktree: settings::format_chords(&shortcuts.git_history_new_worktree),
-            git_history_create_branch: settings::format_chords(&shortcuts.git_history_create_branch),
+            git_history_create_branch: settings::format_chords(
+                &shortcuts.git_history_create_branch,
+            ),
             git_history_revert: settings::format_chords(&shortcuts.git_history_revert),
             git_history_cherry_pick: settings::format_chords(&shortcuts.git_history_cherry_pick),
             open_automations: settings::format_chords(&shortcuts.open_automations),
             open_agent_accounts: settings::format_chords(&shortcuts.open_agent_accounts),
-
 
             terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -5024,30 +5036,73 @@ impl SettingsDraft {
             SettingsField::ShortcutChatToggleFastMode => {
                 self.keyboard_shortcuts.chat_toggle_fast_mode = value
             }
-            SettingsField::ShortcutGitStageAllUnstaged => { self.keyboard_shortcuts.git_stage_all_unstaged = value }
-            SettingsField::ShortcutGitStageAllUntracked => { self.keyboard_shortcuts.git_stage_all_untracked = value }
-            SettingsField::ShortcutGitStageAllConflicts => { self.keyboard_shortcuts.git_stage_all_conflicts = value }
-            SettingsField::ShortcutGitUnstageAllStaged => { self.keyboard_shortcuts.git_unstage_all_staged = value }
-            SettingsField::ShortcutGitDiscardAllUnstaged => { self.keyboard_shortcuts.git_discard_all_unstaged = value }
-            SettingsField::ShortcutGitDiscardAllUntracked => { self.keyboard_shortcuts.git_discard_all_untracked = value }
-            SettingsField::ShortcutEditorReload => { self.keyboard_shortcuts.editor_reload = value }
-            SettingsField::ShortcutEditorOverwrite => { self.keyboard_shortcuts.editor_overwrite = value }
-            SettingsField::ShortcutEditorRenameSymbol => self.keyboard_shortcuts.editor_rename_symbol = value,
-            SettingsField::ShortcutEditorFormatDocument => self.keyboard_shortcuts.editor_format_document = value,
-            SettingsField::ShortcutEditorFormatSelection => self.keyboard_shortcuts.editor_format_selection = value,
-            SettingsField::ShortcutEditorCodeActions => self.keyboard_shortcuts.editor_code_actions = value,
-            SettingsField::ShortcutEditorSignatureHelp => self.keyboard_shortcuts.editor_signature_help = value,
-            SettingsField::ShortcutSettingsOpenFile => self.keyboard_shortcuts.settings_open_file = value,
-            SettingsField::ShortcutSettingsRevealFile => self.keyboard_shortcuts.settings_reveal_file = value,
-            SettingsField::ShortcutGitHistoryCopySha => self.keyboard_shortcuts.git_history_copy_sha = value,
-            SettingsField::ShortcutGitHistoryCopyMessage => self.keyboard_shortcuts.git_history_copy_message = value,
-            SettingsField::ShortcutGitHistoryNewWorktree => self.keyboard_shortcuts.git_history_new_worktree = value,
-            SettingsField::ShortcutGitHistoryCreateBranch => self.keyboard_shortcuts.git_history_create_branch = value,
-            SettingsField::ShortcutGitHistoryRevert => self.keyboard_shortcuts.git_history_revert = value,
-            SettingsField::ShortcutGitHistoryCherryPick => self.keyboard_shortcuts.git_history_cherry_pick = value,
-            SettingsField::ShortcutOpenAutomations => self.keyboard_shortcuts.open_automations = value,
-            SettingsField::ShortcutOpenAgentAccounts => self.keyboard_shortcuts.open_agent_accounts = value,
-
+            SettingsField::ShortcutGitStageAllUnstaged => {
+                self.keyboard_shortcuts.git_stage_all_unstaged = value
+            }
+            SettingsField::ShortcutGitStageAllUntracked => {
+                self.keyboard_shortcuts.git_stage_all_untracked = value
+            }
+            SettingsField::ShortcutGitStageAllConflicts => {
+                self.keyboard_shortcuts.git_stage_all_conflicts = value
+            }
+            SettingsField::ShortcutGitUnstageAllStaged => {
+                self.keyboard_shortcuts.git_unstage_all_staged = value
+            }
+            SettingsField::ShortcutGitDiscardAllUnstaged => {
+                self.keyboard_shortcuts.git_discard_all_unstaged = value
+            }
+            SettingsField::ShortcutGitDiscardAllUntracked => {
+                self.keyboard_shortcuts.git_discard_all_untracked = value
+            }
+            SettingsField::ShortcutEditorReload => self.keyboard_shortcuts.editor_reload = value,
+            SettingsField::ShortcutEditorOverwrite => {
+                self.keyboard_shortcuts.editor_overwrite = value
+            }
+            SettingsField::ShortcutEditorRenameSymbol => {
+                self.keyboard_shortcuts.editor_rename_symbol = value
+            }
+            SettingsField::ShortcutEditorFormatDocument => {
+                self.keyboard_shortcuts.editor_format_document = value
+            }
+            SettingsField::ShortcutEditorFormatSelection => {
+                self.keyboard_shortcuts.editor_format_selection = value
+            }
+            SettingsField::ShortcutEditorCodeActions => {
+                self.keyboard_shortcuts.editor_code_actions = value
+            }
+            SettingsField::ShortcutEditorSignatureHelp => {
+                self.keyboard_shortcuts.editor_signature_help = value
+            }
+            SettingsField::ShortcutSettingsOpenFile => {
+                self.keyboard_shortcuts.settings_open_file = value
+            }
+            SettingsField::ShortcutSettingsRevealFile => {
+                self.keyboard_shortcuts.settings_reveal_file = value
+            }
+            SettingsField::ShortcutGitHistoryCopySha => {
+                self.keyboard_shortcuts.git_history_copy_sha = value
+            }
+            SettingsField::ShortcutGitHistoryCopyMessage => {
+                self.keyboard_shortcuts.git_history_copy_message = value
+            }
+            SettingsField::ShortcutGitHistoryNewWorktree => {
+                self.keyboard_shortcuts.git_history_new_worktree = value
+            }
+            SettingsField::ShortcutGitHistoryCreateBranch => {
+                self.keyboard_shortcuts.git_history_create_branch = value
+            }
+            SettingsField::ShortcutGitHistoryRevert => {
+                self.keyboard_shortcuts.git_history_revert = value
+            }
+            SettingsField::ShortcutGitHistoryCherryPick => {
+                self.keyboard_shortcuts.git_history_cherry_pick = value
+            }
+            SettingsField::ShortcutOpenAutomations => {
+                self.keyboard_shortcuts.open_automations = value
+            }
+            SettingsField::ShortcutOpenAgentAccounts => {
+                self.keyboard_shortcuts.open_agent_accounts = value
+            }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5189,10 +5244,19 @@ impl SettingsDraft {
             SettingsField::TerminalScrollbackMib => {
                 self.terminal_scrollback_mib = previous.terminal_scrollback_mib.clone()
             }
-            SettingsField::AlwaysShowTerminalReviewBar => self.always_show_terminal_review_bar = previous.always_show_terminal_review_bar,
-            SettingsField::TerminalClipboardWrite => self.terminal_clipboard_write = previous.terminal_clipboard_write.clone(),
-            SettingsField::TerminalScrollToBottomOnInput => self.terminal_scroll_to_bottom_on_input = previous.terminal_scroll_to_bottom_on_input,
-            SettingsField::GitStatusLimit => self.git_status_limit = previous.git_status_limit.clone(),
+            SettingsField::AlwaysShowTerminalReviewBar => {
+                self.always_show_terminal_review_bar = previous.always_show_terminal_review_bar
+            }
+            SettingsField::TerminalClipboardWrite => {
+                self.terminal_clipboard_write = previous.terminal_clipboard_write.clone()
+            }
+            SettingsField::TerminalScrollToBottomOnInput => {
+                self.terminal_scroll_to_bottom_on_input =
+                    previous.terminal_scroll_to_bottom_on_input
+            }
+            SettingsField::GitStatusLimit => {
+                self.git_status_limit = previous.git_status_limit.clone()
+            }
             SettingsField::ManagedWorktreeDirectory => {
                 self.managed_worktree_directory = previous.managed_worktree_directory.clone()
             }
@@ -5211,7 +5275,9 @@ impl SettingsDraft {
             }
             SettingsField::EditorAutoSave => self.editor_auto_save = previous.editor_auto_save,
             SettingsField::EditorWrapLines => self.editor_wrap_lines = previous.editor_wrap_lines,
-            SettingsField::EditorTabWidth => self.editor_tab_width = previous.editor_tab_width.clone(),
+            SettingsField::EditorTabWidth => {
+                self.editor_tab_width = previous.editor_tab_width.clone()
+            }
             SettingsField::EditorAutoClose => self.editor_auto_close = previous.editor_auto_close,
             SettingsField::DiffHideUnchanged => {
                 self.diff_hide_unchanged = previous.diff_hide_unchanged
@@ -5250,225 +5316,228 @@ impl SettingsDraft {
             SettingsField::PullRequestOpenTarget => {
                 self.pull_request_open_target = previous.pull_request_open_target
             }
-            SettingsField::ShortcutNewTerminal |
-            SettingsField::ShortcutNewChannel |
-            SettingsField::ShortcutClonePane |
-            SettingsField::ShortcutCloseFocusedColumn |
-            SettingsField::ShortcutSearchProjects |
-            SettingsField::ShortcutFindInPane |
-            SettingsField::ShortcutPreviousColumn |
-            SettingsField::ShortcutNextColumn |
-            SettingsField::ShortcutCyclePaneWidth |
-            SettingsField::ShortcutPreviousWorkspace |
-            SettingsField::ShortcutNextWorkspace |
-            SettingsField::ShortcutNextAttention |
-            SettingsField::ShortcutPreviousAttention |
-            SettingsField::ShortcutReviewToggleViewed |
-            SettingsField::ShortcutReviewNextFile |
-            SettingsField::ShortcutReviewPreviousFile |
-            SettingsField::ShortcutReviewNextUnviewed |
-            SettingsField::ShortcutReviewNextChange |
-            SettingsField::ShortcutReviewPreviousChange |
-            SettingsField::ShortcutCommandPalette |
-            SettingsField::ShortcutNewThread |
-            SettingsField::ShortcutChatPermissions |
-            SettingsField::ShortcutChatModel |
-            SettingsField::ShortcutChatAccount |
-            SettingsField::ShortcutToggleInspector |
-            SettingsField::ShortcutOpenSettings |
-            SettingsField::ShortcutMovePaneLeft |
-            SettingsField::ShortcutMovePaneRight |
-            SettingsField::ShortcutReopenPane |
-            SettingsField::ShortcutFocusPane1 |
-            SettingsField::ShortcutFocusPane2 |
-            SettingsField::ShortcutFocusPane3 |
-            SettingsField::ShortcutFocusPane4 |
-            SettingsField::ShortcutFocusPane5 |
-            SettingsField::ShortcutFocusPane6 |
-            SettingsField::ShortcutFocusPane7 |
-            SettingsField::ShortcutFocusPane8 |
-            SettingsField::ShortcutFocusPane9 |
-            SettingsField::ShortcutFocusLastPane |
-            SettingsField::ShortcutToggleProjects |
-            SettingsField::ShortcutRenamePane |
-            SettingsField::ShortcutNewBrowser |
-            SettingsField::ShortcutOpenFolder |
-            SettingsField::ShortcutNewWorktree |
-            SettingsField::ShortcutCloseOtherPanes |
-            SettingsField::ShortcutClosePanesToRight |
-            SettingsField::ShortcutCopyPath |
-            SettingsField::ShortcutRevealInProjects |
-            SettingsField::ShortcutForkConversation |
-            SettingsField::ShortcutFocusSidebarTree |
-            SettingsField::ShortcutRestartDaemon |
-            SettingsField::ShortcutToggleTheme |
-            SettingsField::ShortcutResumeConversation |
-            SettingsField::ShortcutSwitchPane |
-            SettingsField::ShortcutReviewConversationChanges |
-            SettingsField::ShortcutFocusProject1 |
-            SettingsField::ShortcutFocusProject2 |
-            SettingsField::ShortcutFocusProject3 |
-            SettingsField::ShortcutFocusProject4 |
-            SettingsField::ShortcutFocusProject5 |
-            SettingsField::ShortcutFocusProject6 |
-            SettingsField::ShortcutFocusProject7 |
-            SettingsField::ShortcutFocusProject8 |
-            SettingsField::ShortcutFocusProject9 |
-            SettingsField::ShortcutSettingsGeneral |
-            SettingsField::ShortcutSettingsAppearance |
-            SettingsField::ShortcutSettingsTerminal |
-            SettingsField::ShortcutSettingsLinks |
-            SettingsField::ShortcutSettingsKeyboard |
-            SettingsField::ShortcutSettingsNativeChat |
-            SettingsField::ShortcutSettingsEditor |
-            SettingsField::ShortcutSettingsAccounts |
-            SettingsField::ShortcutSettingsNotifications |
-            SettingsField::ShortcutSettingsAbout |
-            SettingsField::ShortcutMovePaneToChannel |
-            SettingsField::ShortcutDiffCopy |
-            SettingsField::ShortcutDiffCopyOld |
-            SettingsField::ShortcutDiffCopyNew |
-            SettingsField::ShortcutDiffCopyPatch |
-            SettingsField::ShortcutDiffCopyLineReference |
-            SettingsField::ShortcutDiffOpenInEditor |
-            SettingsField::ShortcutDiffSelectAll |
-            SettingsField::ShortcutNextDiagnostic |
-            SettingsField::ShortcutPreviousDiagnostic |
-            SettingsField::ShortcutEndConversation |
-            SettingsField::ShortcutEditorUndo |
-            SettingsField::ShortcutEditorRedo |
-            SettingsField::ShortcutEditorCut |
-            SettingsField::ShortcutEditorCopy |
-            SettingsField::ShortcutEditorPaste |
-            SettingsField::ShortcutEditorSelectAll |
-            SettingsField::ShortcutMarkAllRead |
-            SettingsField::ShortcutSearchInProject |
-            SettingsField::ShortcutCloneRepository |
-            SettingsField::ShortcutCopyBranch |
-            SettingsField::ShortcutOpenOrCreatePullRequest |
-            SettingsField::ShortcutNewWorktreeFromBranch |
-            SettingsField::ShortcutMoveProjectUp |
-            SettingsField::ShortcutMoveProjectDown |
-            SettingsField::ShortcutResetSidebarOrder |
-            SettingsField::ShortcutRevealInFileManager |
-            SettingsField::ShortcutOpenRepositoryUrl |
-            SettingsField::ShortcutOpenInExternalEditor |
-            SettingsField::ShortcutDeleteWorktree |
-            SettingsField::ShortcutRemoveProject |
-            SettingsField::ShortcutDeleteSelectedRows |
-            SettingsField::ShortcutRenameChannel |
-            SettingsField::ShortcutMarkChannelRead |
-            SettingsField::ShortcutDeleteChannel |
-            SettingsField::ShortcutMarkWorktreeRead |
-            SettingsField::ShortcutRenameFile |
-            SettingsField::ShortcutDuplicateFile |
-            SettingsField::ShortcutCopyRelativePath |
-            SettingsField::ShortcutStageSelectedChanges |
-            SettingsField::ShortcutUnstageSelectedChanges |
-            SettingsField::ShortcutDiscardSelectedChanges |
-            SettingsField::ShortcutOpenFile |
-            SettingsField::ShortcutRevealInFiles |
-            SettingsField::ShortcutIgnoreChangePath |
-            SettingsField::ShortcutGitFetch |
-            SettingsField::ShortcutGitPush |
-            SettingsField::ShortcutGitPublish |
-            SettingsField::ShortcutGitSync |
-            SettingsField::ShortcutGitSyncRebase |
-            SettingsField::ShortcutGitStash |
-            SettingsField::ShortcutGitStashUntracked |
-            SettingsField::ShortcutGitStashes |
-            SettingsField::ShortcutGitApplyStash |
-            SettingsField::ShortcutGitPopStash |
-            SettingsField::ShortcutGitDropStash |
-            SettingsField::ShortcutGitCommit |
-            SettingsField::ShortcutGitAmend |
-            SettingsField::ShortcutGitRefresh |
-            SettingsField::ShortcutGitAbort |
-            SettingsField::ShortcutGitContinue |
-            SettingsField::ShortcutGitOutput |
-            SettingsField::ShortcutGitAcceptOurs |
-            SettingsField::ShortcutGitAcceptTheirs |
-            SettingsField::ShortcutEditorComplete |
-            SettingsField::ShortcutGoToDefinition |
-            SettingsField::ShortcutFindReferences |
-            SettingsField::ShortcutShowHover |
-            SettingsField::ShortcutShowDiagnostics |
-            SettingsField::ShortcutEditorSave |
-            SettingsField::ShortcutEditorDiscardEdits |
-            SettingsField::ShortcutEditorEdit |
-            SettingsField::ShortcutEditorPreview |
-            SettingsField::ShortcutEditorDiff |
-            SettingsField::ShortcutPdfFirstPage |
-            SettingsField::ShortcutPdfPreviousPage |
-            SettingsField::ShortcutPdfNextPage |
-            SettingsField::ShortcutPdfLastPage |
-            SettingsField::ShortcutPdfZoomOut |
-            SettingsField::ShortcutPdfZoomIn |
-            SettingsField::ShortcutPdfFit |
-            SettingsField::ShortcutPdfToggleColors |
-            SettingsField::ShortcutDiffUnified |
-            SettingsField::ShortcutDiffSplit |
-            SettingsField::ShortcutDiffIgnoreWhitespace |
-            SettingsField::ShortcutDiffWorking |
-            SettingsField::ShortcutDiffStaged |
-            SettingsField::ShortcutDiffBranch |
-            SettingsField::ShortcutDiffHistory |
-            SettingsField::ShortcutStageFile |
-            SettingsField::ShortcutUnstageFile |
-            SettingsField::ShortcutStageOrUnstageFile |
-            SettingsField::ShortcutDiffRevert |
-            SettingsField::ShortcutDiffRetry |
-            SettingsField::ShortcutDiffStageSelection |
-            SettingsField::ShortcutDiffUnstageSelection |
-            SettingsField::ShortcutDiffRevertSelection |
-            SettingsField::ShortcutDiffStageHunk |
-            SettingsField::ShortcutDiffUnstageHunk |
-            SettingsField::ShortcutDiffRevertHunk |
-            SettingsField::ShortcutBrowserBack |
-            SettingsField::ShortcutBrowserForward |
-            SettingsField::ShortcutBrowserReload |
-            SettingsField::ShortcutBrowserStop |
-            SettingsField::ShortcutBrowserAddress |
-            SettingsField::ShortcutBrowserOpenSystem |
-            SettingsField::ShortcutBrowserImportLogins |
-            SettingsField::ShortcutChatSend |
-            SettingsField::ShortcutChatSteer |
-            SettingsField::ShortcutChatQueue |
-            SettingsField::ShortcutChatInterrupt |
-            SettingsField::ShortcutChatCompact |
-            SettingsField::ShortcutChatAttach |
-            SettingsField::ShortcutChatReasoning |
-            SettingsField::ShortcutChatLatest |
-            SettingsField::ShortcutChatTakeBackQueued |
-            SettingsField::ShortcutChatCancelQueued |
-            SettingsField::ShortcutChatToggleSteering |
-            SettingsField::ShortcutChatToggleFastMode |
-            SettingsField::ShortcutGitStageAllUnstaged |
-            SettingsField::ShortcutGitStageAllUntracked |
-            SettingsField::ShortcutGitStageAllConflicts |
-            SettingsField::ShortcutGitUnstageAllStaged |
-            SettingsField::ShortcutGitDiscardAllUnstaged |
-            SettingsField::ShortcutGitDiscardAllUntracked |
-            SettingsField::ShortcutEditorReload |
-            SettingsField::ShortcutEditorOverwrite |
-            SettingsField::ShortcutTerminalReview |
-            SettingsField::ShortcutEditorRenameSymbol |
-            SettingsField::ShortcutEditorFormatDocument |
-            SettingsField::ShortcutEditorFormatSelection |
-            SettingsField::ShortcutEditorCodeActions |
-            SettingsField::ShortcutEditorSignatureHelp |
-            SettingsField::ShortcutSettingsOpenFile |
-            SettingsField::ShortcutSettingsRevealFile |
-            SettingsField::ShortcutGitHistoryCopySha |
-            SettingsField::ShortcutGitHistoryCopyMessage |
-            SettingsField::ShortcutGitHistoryNewWorktree |
-            SettingsField::ShortcutGitHistoryCreateBranch |
-            SettingsField::ShortcutGitHistoryRevert |
-            SettingsField::ShortcutGitHistoryCherryPick |
-            SettingsField::ShortcutOpenAutomations |
-            SettingsField::ShortcutOpenAgentAccounts => {
+            SettingsField::ShortcutNewTerminal
+            | SettingsField::ShortcutNewChannel
+            | SettingsField::ShortcutClonePane
+            | SettingsField::ShortcutCloseFocusedColumn
+            | SettingsField::ShortcutSearchProjects
+            | SettingsField::ShortcutFindInPane
+            | SettingsField::ShortcutPreviousColumn
+            | SettingsField::ShortcutNextColumn
+            | SettingsField::ShortcutCyclePaneWidth
+            | SettingsField::ShortcutPreviousWorkspace
+            | SettingsField::ShortcutNextWorkspace
+            | SettingsField::ShortcutNextAttention
+            | SettingsField::ShortcutPreviousAttention
+            | SettingsField::ShortcutReviewToggleViewed
+            | SettingsField::ShortcutReviewNextFile
+            | SettingsField::ShortcutReviewPreviousFile
+            | SettingsField::ShortcutReviewNextUnviewed
+            | SettingsField::ShortcutReviewNextChange
+            | SettingsField::ShortcutReviewPreviousChange
+            | SettingsField::ShortcutCommandPalette
+            | SettingsField::ShortcutNewThread
+            | SettingsField::ShortcutChatPermissions
+            | SettingsField::ShortcutChatModel
+            | SettingsField::ShortcutChatAccount
+            | SettingsField::ShortcutToggleInspector
+            | SettingsField::ShortcutOpenSettings
+            | SettingsField::ShortcutMovePaneLeft
+            | SettingsField::ShortcutMovePaneRight
+            | SettingsField::ShortcutReopenPane
+            | SettingsField::ShortcutFocusPane1
+            | SettingsField::ShortcutFocusPane2
+            | SettingsField::ShortcutFocusPane3
+            | SettingsField::ShortcutFocusPane4
+            | SettingsField::ShortcutFocusPane5
+            | SettingsField::ShortcutFocusPane6
+            | SettingsField::ShortcutFocusPane7
+            | SettingsField::ShortcutFocusPane8
+            | SettingsField::ShortcutFocusPane9
+            | SettingsField::ShortcutFocusLastPane
+            | SettingsField::ShortcutToggleProjects
+            | SettingsField::ShortcutRenamePane
+            | SettingsField::ShortcutNewBrowser
+            | SettingsField::ShortcutOpenFolder
+            | SettingsField::ShortcutNewWorktree
+            | SettingsField::ShortcutCloseOtherPanes
+            | SettingsField::ShortcutClosePanesToRight
+            | SettingsField::ShortcutCopyPath
+            | SettingsField::ShortcutRevealInProjects
+            | SettingsField::ShortcutForkConversation
+            | SettingsField::ShortcutFocusSidebarTree
+            | SettingsField::ShortcutRestartDaemon
+            | SettingsField::ShortcutToggleTheme
+            | SettingsField::ShortcutResumeConversation
+            | SettingsField::ShortcutSwitchPane
+            | SettingsField::ShortcutReviewConversationChanges
+            | SettingsField::ShortcutFocusProject1
+            | SettingsField::ShortcutFocusProject2
+            | SettingsField::ShortcutFocusProject3
+            | SettingsField::ShortcutFocusProject4
+            | SettingsField::ShortcutFocusProject5
+            | SettingsField::ShortcutFocusProject6
+            | SettingsField::ShortcutFocusProject7
+            | SettingsField::ShortcutFocusProject8
+            | SettingsField::ShortcutFocusProject9
+            | SettingsField::ShortcutSettingsGeneral
+            | SettingsField::ShortcutSettingsAppearance
+            | SettingsField::ShortcutSettingsTerminal
+            | SettingsField::ShortcutSettingsLinks
+            | SettingsField::ShortcutSettingsKeyboard
+            | SettingsField::ShortcutSettingsNativeChat
+            | SettingsField::ShortcutSettingsEditor
+            | SettingsField::ShortcutSettingsAccounts
+            | SettingsField::ShortcutSettingsNotifications
+            | SettingsField::ShortcutSettingsAbout
+            | SettingsField::ShortcutMovePaneToChannel
+            | SettingsField::ShortcutDiffCopy
+            | SettingsField::ShortcutDiffCopyOld
+            | SettingsField::ShortcutDiffCopyNew
+            | SettingsField::ShortcutDiffCopyPatch
+            | SettingsField::ShortcutDiffCopyLineReference
+            | SettingsField::ShortcutDiffOpenInEditor
+            | SettingsField::ShortcutDiffSelectAll
+            | SettingsField::ShortcutNextDiagnostic
+            | SettingsField::ShortcutPreviousDiagnostic
+            | SettingsField::ShortcutEndConversation
+            | SettingsField::ShortcutEditorUndo
+            | SettingsField::ShortcutEditorRedo
+            | SettingsField::ShortcutEditorCut
+            | SettingsField::ShortcutEditorCopy
+            | SettingsField::ShortcutEditorPaste
+            | SettingsField::ShortcutEditorSelectAll
+            | SettingsField::ShortcutMarkAllRead
+            | SettingsField::ShortcutSearchInProject
+            | SettingsField::ShortcutCloneRepository
+            | SettingsField::ShortcutCopyBranch
+            | SettingsField::ShortcutOpenOrCreatePullRequest
+            | SettingsField::ShortcutNewWorktreeFromBranch
+            | SettingsField::ShortcutMoveProjectUp
+            | SettingsField::ShortcutMoveProjectDown
+            | SettingsField::ShortcutResetSidebarOrder
+            | SettingsField::ShortcutRevealInFileManager
+            | SettingsField::ShortcutOpenRepositoryUrl
+            | SettingsField::ShortcutOpenInExternalEditor
+            | SettingsField::ShortcutDeleteWorktree
+            | SettingsField::ShortcutRemoveProject
+            | SettingsField::ShortcutDeleteSelectedRows
+            | SettingsField::ShortcutRenameChannel
+            | SettingsField::ShortcutMarkChannelRead
+            | SettingsField::ShortcutDeleteChannel
+            | SettingsField::ShortcutMarkWorktreeRead
+            | SettingsField::ShortcutRenameFile
+            | SettingsField::ShortcutDuplicateFile
+            | SettingsField::ShortcutCopyRelativePath
+            | SettingsField::ShortcutStageSelectedChanges
+            | SettingsField::ShortcutUnstageSelectedChanges
+            | SettingsField::ShortcutDiscardSelectedChanges
+            | SettingsField::ShortcutOpenFile
+            | SettingsField::ShortcutRevealInFiles
+            | SettingsField::ShortcutIgnoreChangePath
+            | SettingsField::ShortcutGitFetch
+            | SettingsField::ShortcutGitPush
+            | SettingsField::ShortcutGitPublish
+            | SettingsField::ShortcutGitSync
+            | SettingsField::ShortcutGitSyncRebase
+            | SettingsField::ShortcutGitStash
+            | SettingsField::ShortcutGitStashUntracked
+            | SettingsField::ShortcutGitStashes
+            | SettingsField::ShortcutGitApplyStash
+            | SettingsField::ShortcutGitPopStash
+            | SettingsField::ShortcutGitDropStash
+            | SettingsField::ShortcutGitCommit
+            | SettingsField::ShortcutGitAmend
+            | SettingsField::ShortcutGitRefresh
+            | SettingsField::ShortcutGitAbort
+            | SettingsField::ShortcutGitContinue
+            | SettingsField::ShortcutGitOutput
+            | SettingsField::ShortcutGitAcceptOurs
+            | SettingsField::ShortcutGitAcceptTheirs
+            | SettingsField::ShortcutEditorComplete
+            | SettingsField::ShortcutGoToDefinition
+            | SettingsField::ShortcutFindReferences
+            | SettingsField::ShortcutShowHover
+            | SettingsField::ShortcutShowDiagnostics
+            | SettingsField::ShortcutEditorSave
+            | SettingsField::ShortcutEditorDiscardEdits
+            | SettingsField::ShortcutEditorEdit
+            | SettingsField::ShortcutEditorPreview
+            | SettingsField::ShortcutEditorDiff
+            | SettingsField::ShortcutPdfFirstPage
+            | SettingsField::ShortcutPdfPreviousPage
+            | SettingsField::ShortcutPdfNextPage
+            | SettingsField::ShortcutPdfLastPage
+            | SettingsField::ShortcutPdfZoomOut
+            | SettingsField::ShortcutPdfZoomIn
+            | SettingsField::ShortcutPdfFit
+            | SettingsField::ShortcutPdfToggleColors
+            | SettingsField::ShortcutDiffUnified
+            | SettingsField::ShortcutDiffSplit
+            | SettingsField::ShortcutDiffIgnoreWhitespace
+            | SettingsField::ShortcutDiffWorking
+            | SettingsField::ShortcutDiffStaged
+            | SettingsField::ShortcutDiffBranch
+            | SettingsField::ShortcutDiffHistory
+            | SettingsField::ShortcutStageFile
+            | SettingsField::ShortcutUnstageFile
+            | SettingsField::ShortcutStageOrUnstageFile
+            | SettingsField::ShortcutDiffRevert
+            | SettingsField::ShortcutDiffRetry
+            | SettingsField::ShortcutDiffStageSelection
+            | SettingsField::ShortcutDiffUnstageSelection
+            | SettingsField::ShortcutDiffRevertSelection
+            | SettingsField::ShortcutDiffStageHunk
+            | SettingsField::ShortcutDiffUnstageHunk
+            | SettingsField::ShortcutDiffRevertHunk
+            | SettingsField::ShortcutBrowserBack
+            | SettingsField::ShortcutBrowserForward
+            | SettingsField::ShortcutBrowserReload
+            | SettingsField::ShortcutBrowserStop
+            | SettingsField::ShortcutBrowserAddress
+            | SettingsField::ShortcutBrowserOpenSystem
+            | SettingsField::ShortcutBrowserImportLogins
+            | SettingsField::ShortcutChatSend
+            | SettingsField::ShortcutChatSteer
+            | SettingsField::ShortcutChatQueue
+            | SettingsField::ShortcutChatInterrupt
+            | SettingsField::ShortcutChatCompact
+            | SettingsField::ShortcutChatAttach
+            | SettingsField::ShortcutChatReasoning
+            | SettingsField::ShortcutChatLatest
+            | SettingsField::ShortcutChatTakeBackQueued
+            | SettingsField::ShortcutChatCancelQueued
+            | SettingsField::ShortcutChatToggleSteering
+            | SettingsField::ShortcutChatToggleFastMode
+            | SettingsField::ShortcutGitStageAllUnstaged
+            | SettingsField::ShortcutGitStageAllUntracked
+            | SettingsField::ShortcutGitStageAllConflicts
+            | SettingsField::ShortcutGitUnstageAllStaged
+            | SettingsField::ShortcutGitDiscardAllUnstaged
+            | SettingsField::ShortcutGitDiscardAllUntracked
+            | SettingsField::ShortcutEditorReload
+            | SettingsField::ShortcutEditorOverwrite
+            | SettingsField::ShortcutTerminalReview
+            | SettingsField::ShortcutEditorRenameSymbol
+            | SettingsField::ShortcutEditorFormatDocument
+            | SettingsField::ShortcutEditorFormatSelection
+            | SettingsField::ShortcutEditorCodeActions
+            | SettingsField::ShortcutEditorSignatureHelp
+            | SettingsField::ShortcutSettingsOpenFile
+            | SettingsField::ShortcutSettingsRevealFile
+            | SettingsField::ShortcutGitHistoryCopySha
+            | SettingsField::ShortcutGitHistoryCopyMessage
+            | SettingsField::ShortcutGitHistoryNewWorktree
+            | SettingsField::ShortcutGitHistoryCreateBranch
+            | SettingsField::ShortcutGitHistoryRevert
+            | SettingsField::ShortcutGitHistoryCherryPick
+            | SettingsField::ShortcutOpenAutomations
+            | SettingsField::ShortcutOpenAgentAccounts => {
                 let action = field.shortcut_action().expect("registered shortcut field");
-                let value = previous.keyboard_shortcuts.shortcut_values().into_iter()
+                let value = previous
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
                     .find_map(|(candidate, value)| (candidate == action).then_some(value))
                     .expect("registered shortcut draft");
                 self.set(field, value.to_owned());
@@ -6126,30 +6195,98 @@ fn settings_update(
             next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value);
             Ok(())
         }
-        SettingsField::ShortcutGitStageAllUnstaged => { next.keyboard_shortcuts.git_stage_all_unstaged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitStageAllUntracked => { next.keyboard_shortcuts.git_stage_all_untracked = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitStageAllConflicts => { next.keyboard_shortcuts.git_stage_all_conflicts = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitUnstageAllStaged => { next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitDiscardAllUnstaged => { next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitDiscardAllUntracked => { next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorReload => { next.keyboard_shortcuts.editor_reload = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorOverwrite => { next.keyboard_shortcuts.editor_overwrite = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorRenameSymbol => { next.keyboard_shortcuts.editor_rename_symbol = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorFormatDocument => { next.keyboard_shortcuts.editor_format_document = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorFormatSelection => { next.keyboard_shortcuts.editor_format_selection = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorCodeActions => { next.keyboard_shortcuts.editor_code_actions = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutEditorSignatureHelp => { next.keyboard_shortcuts.editor_signature_help = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutSettingsOpenFile => { next.keyboard_shortcuts.settings_open_file = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutSettingsRevealFile => { next.keyboard_shortcuts.settings_reveal_file = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryCopySha => { next.keyboard_shortcuts.git_history_copy_sha = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryCopyMessage => { next.keyboard_shortcuts.git_history_copy_message = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryNewWorktree => { next.keyboard_shortcuts.git_history_new_worktree = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryCreateBranch => { next.keyboard_shortcuts.git_history_create_branch = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryRevert => { next.keyboard_shortcuts.git_history_revert = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitHistoryCherryPick => { next.keyboard_shortcuts.git_history_cherry_pick = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutOpenAutomations => { next.keyboard_shortcuts.open_automations = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutOpenAgentAccounts => { next.keyboard_shortcuts.open_agent_accounts = settings::parse_chords(value); Ok(()) }
-
+        SettingsField::ShortcutGitStageAllUnstaged => {
+            next.keyboard_shortcuts.git_stage_all_unstaged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStageAllUntracked => {
+            next.keyboard_shortcuts.git_stage_all_untracked = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStageAllConflicts => {
+            next.keyboard_shortcuts.git_stage_all_conflicts = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitUnstageAllStaged => {
+            next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitDiscardAllUnstaged => {
+            next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitDiscardAllUntracked => {
+            next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorReload => {
+            next.keyboard_shortcuts.editor_reload = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorOverwrite => {
+            next.keyboard_shortcuts.editor_overwrite = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorRenameSymbol => {
+            next.keyboard_shortcuts.editor_rename_symbol = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorFormatDocument => {
+            next.keyboard_shortcuts.editor_format_document = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorFormatSelection => {
+            next.keyboard_shortcuts.editor_format_selection = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorCodeActions => {
+            next.keyboard_shortcuts.editor_code_actions = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorSignatureHelp => {
+            next.keyboard_shortcuts.editor_signature_help = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsOpenFile => {
+            next.keyboard_shortcuts.settings_open_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsRevealFile => {
+            next.keyboard_shortcuts.settings_reveal_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryCopySha => {
+            next.keyboard_shortcuts.git_history_copy_sha = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryCopyMessage => {
+            next.keyboard_shortcuts.git_history_copy_message = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryNewWorktree => {
+            next.keyboard_shortcuts.git_history_new_worktree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryCreateBranch => {
+            next.keyboard_shortcuts.git_history_create_branch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryRevert => {
+            next.keyboard_shortcuts.git_history_revert = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitHistoryCherryPick => {
+            next.keyboard_shortcuts.git_history_cherry_pick = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenAutomations => {
+            next.keyboard_shortcuts.open_automations = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenAgentAccounts => {
+            next.keyboard_shortcuts.open_agent_accounts = settings::parse_chords(value);
+            Ok(())
+        }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -6347,8 +6484,16 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
-        SettingsField::EditorAutoClose => value.parse::<bool>().map(|enabled| next.editor_auto_close = enabled).map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
-        SettingsField::EditorTabWidth => value.parse::<u16>().ok().filter(|width| (1..=16).contains(width)).map(|width| next.editor_tab_width = width).ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
+        SettingsField::EditorAutoClose => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_auto_close = enabled)
+            .map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
+        SettingsField::EditorTabWidth => value
+            .parse::<u16>()
+            .ok()
+            .filter(|width| (1..=16).contains(width))
+            .map(|width| next.editor_tab_width = width)
+            .ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -6797,7 +6942,10 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel, git_binding::Binding)>>, String>,
+        result: Result<
+            Option<Box<(RepositorySnapshot, SourceControlModel, git_binding::Binding)>>,
+            String,
+        >,
     },
     SourceControlGroupSelection {
         key: ActiveWorktreeKey,
@@ -7708,7 +7856,11 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
 
 impl WorkspaceDestination {
     fn from_action(action: &SidebarAction) -> Option<Self> {
-        if let SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. } = action { return Self::from_action(action); }
+        if let SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. } =
+            action
+        {
+            return Self::from_action(action);
+        }
         match action {
             SidebarAction::OpenRepository { project_id, .. } => Some(Self::Folder(*project_id)),
             SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
@@ -7753,7 +7905,9 @@ impl QueuedGitMutation {
             Self::Stage(_) | Self::StageApproved { .. } => MutationKind::Stage,
             Self::Unstage(_) => MutationKind::Unstage,
             Self::Discard(_) => MutationKind::Discard,
-            Self::Operation(_) | Self::UndoDiscard(_) | Self::PreparedDiff(_) => MutationKind::Other,
+            Self::Operation(_) | Self::UndoDiscard(_) | Self::PreparedDiff(_) => {
+                MutationKind::Other
+            }
             Self::Area { command, .. } => match command {
                 sidebar::ChangeGroupCommand::Stage => MutationKind::Stage,
                 sidebar::ChangeGroupCommand::Unstage => MutationKind::Unstage,
@@ -7826,7 +7980,13 @@ pub struct Cagents {
     terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
-    terminal_clipboard: Option<(CardId, terminal_ui::ClipboardTarget, bool, String, crate::model::OperationId)>,
+    terminal_clipboard: Option<(
+        CardId,
+        terminal_ui::ClipboardTarget,
+        bool,
+        String,
+        crate::model::OperationId,
+    )>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
     navigation_cache: sidebar::NavigationCache,
@@ -13735,7 +13895,9 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
-        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim()).map(|(_, line, column)| (line, column));
+        let location =
+            crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim())
+                .map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
@@ -13771,7 +13933,7 @@ impl Cagents {
                         card,
                         path,
                         ignored,
-                    location,
+                        location,
                     });
                 }
                 task
@@ -13841,8 +14003,12 @@ impl Cagents {
                     // completion range or a hover span that predates a
                     // keystroke describes characters the buffer no longer has.
                     match text {
-                        repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
-                        repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                        repository_widget::LspChangeText::Text(text) => {
+                            self.lsp.change(doc, version, &edits, &text)
+                        }
+                        repository_widget::LspChangeText::Snapshot(source) => {
+                            self.lsp.change_snapshot(doc, version, &edits, source)
+                        }
                     }
                     let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
@@ -13916,8 +14082,13 @@ impl Cagents {
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = match text {
-            repository_widget::LspChangeText::Text(text) => self.lsp.open(doc,path,worktree,language,version,text),
-            repository_widget::LspChangeText::Snapshot(source) => self.lsp.open_snapshot(doc,path,worktree,language,version,source.clone()),
+            repository_widget::LspChangeText::Text(text) => {
+                self.lsp.open(doc, path, worktree, language, version, text)
+            }
+            repository_widget::LspChangeText::Snapshot(source) => {
+                self.lsp
+                    .open_snapshot(doc, path, worktree, language, version, source.clone())
+            }
         };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
@@ -13969,10 +14140,16 @@ impl Cagents {
             // manager can place it against the text it actually indexes.
             LspCoordinates::Utf16 => {
                 let converted = if let Some(doc) = self.lsp_document(card) {
-                    self.lsp.scalar_position(doc, jump.at).map_err(|error| error.to_string())
+                    self.lsp
+                        .scalar_position(doc, jump.at)
+                        .map_err(|error| error.to_string())
                 } else {
                     match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => runtime.scalar_position_for_utf16(jump.at).ok_or_else(|| "the target position is outside the source text".to_owned()),
+                        Some(CardRuntime::Repository(runtime)) => {
+                            runtime.scalar_position_for_utf16(jump.at).ok_or_else(|| {
+                                "the target position is outside the source text".to_owned()
+                            })
+                        }
                         _ => Err("the source buffer was closed".into()),
                     }
                 };
@@ -13990,7 +14167,11 @@ impl Cagents {
         };
         let focus = self.move_lsp_caret(card, at);
         self.complete_cross_card_jump(card);
-        if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() } else { focus }
+        if self.modal_is_open() || self.workspace.focused() != Some(card) {
+            Task::none()
+        } else {
+            focus
+        }
     }
 
     /// Places the caret and gives the editor the keyboard.
@@ -14016,7 +14197,8 @@ impl Cagents {
     }
 
     fn definition_request_current(&self, card: CardId, origin: &EditorDefinitionRequest) -> bool {
-        !self.modal_is_open() && self.workspace.focused() == Some(card)
+        !self.modal_is_open()
+            && self.workspace.focused() == Some(card)
             && self.workspace.focus_revision() == origin.focus_revision
             && self.lsp_document(card) == Some(origin.doc)
             && self.lsp.document_version(origin.doc) == origin.version
@@ -14025,13 +14207,28 @@ impl Cagents {
     }
 
     fn retire_stale_definition_requests(&mut self) {
-        let stale = self.lsp_contexts.iter().filter_map(|(card, state)| state.editor_navigation.as_ref()
-            .filter(|origin| !self.definition_request_current(*card, origin)).map(|_| *card)).collect::<Vec<_>>();
-        for card in stale { if let Some(state) = self.lsp_contexts.get_mut(&card) { state.editor_navigation = None; } }
+        let stale = self
+            .lsp_contexts
+            .iter()
+            .filter_map(|(card, state)| {
+                state
+                    .editor_navigation
+                    .as_ref()
+                    .filter(|origin| !self.definition_request_current(*card, origin))
+                    .map(|_| *card)
+            })
+            .collect::<Vec<_>>();
+        for card in stale {
+            if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                state.editor_navigation = None;
+            }
+        }
     }
 
     fn update_lsp_message(&mut self, event: LspEvent) -> Task<Message> {
-        if let Some(task) = self.editor_feature_event(&event) { return task; }
+        if let Some(task) = self.editor_feature_event(&event) {
+            return task;
+        }
         let navigation = if let LspEvent::Locations {
             doc,
             kind: crate::lsp::LocationKind::Definition,
@@ -14042,9 +14239,17 @@ impl Cagents {
         {
             self.lsp_documents.get(doc).copied().and_then(|card| {
                 let state = self.lsp_contexts.get_mut(&card)?;
-                if !state.editor_navigation.as_ref().is_some_and(|origin| origin.request == *request && origin.doc == *doc) { return None; }
+                if !state
+                    .editor_navigation
+                    .as_ref()
+                    .is_some_and(|origin| origin.request == *request && origin.doc == *doc)
+                {
+                    return None;
+                }
                 let origin = state.editor_navigation.take()?;
-                if !self.definition_request_current(card, &origin) { return None; }
+                if !self.definition_request_current(card, &origin) {
+                    return None;
+                }
                 Some((card, items.clone()))
             })
         } else {
@@ -14053,7 +14258,8 @@ impl Cagents {
         self.apply_lsp_event(event);
         if let Some((card, locations)) = navigation {
             if locations.len() == 1
-                && let (crate::lsp::LspTarget::Workspace { path } | crate::lsp::LspTarget::External { path }) = &locations[0].target
+                && let (crate::lsp::LspTarget::Workspace { path }
+                | crate::lsp::LspTarget::External { path }) = &locations[0].target
             {
                 return self.jump_to_lsp_location(
                     card,
@@ -14096,7 +14302,7 @@ impl Cagents {
             | LspEvent::Status { doc, .. }
             | LspEvent::Progress { doc, .. }
             | LspEvent::RequestFailed { doc, .. }
-                        | LspEvent::PrepareRename { doc, .. }
+            | LspEvent::PrepareRename { doc, .. }
             | LspEvent::WorkspaceEdit { doc, .. }
             | LspEvent::CodeActions { doc, .. }
             | LspEvent::CodeActionResolved { doc, .. }
@@ -14123,14 +14329,14 @@ impl Cagents {
                 // status here instead of leaving a stale Ready indicator.
                 state.context.status = Some(self.lsp.status(doc));
             }
-            LspEvent::PrepareRename {..} |
-            LspEvent::WorkspaceEdit {..} |
-            LspEvent::CodeActions {..} |
-            LspEvent::CodeActionResolved {..} |
-            LspEvent::SignatureHelp {..} |
-            LspEvent::ServerMessage {..} |
-            LspEvent::CommandExecuted {..} |
-            LspEvent::ApplyWorkspaceEdit {..} => {},
+            LspEvent::PrepareRename { .. }
+            | LspEvent::WorkspaceEdit { .. }
+            | LspEvent::CodeActions { .. }
+            | LspEvent::CodeActionResolved { .. }
+            | LspEvent::SignatureHelp { .. }
+            | LspEvent::ServerMessage { .. }
+            | LspEvent::CommandExecuted { .. }
+            | LspEvent::ApplyWorkspaceEdit { .. } => {}
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
@@ -14172,8 +14378,10 @@ impl Cagents {
             }
             LspEvent::Status { status, .. } => {
                 state.context.status = Some(status);
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions); }
-            },
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions);
+                }
+            }
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -14297,28 +14505,57 @@ impl Cagents {
     }
 
     fn capture_editor_location(&self, card: CardId) -> Option<crate::editor_locations::Location> {
-        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else { return None; };
-        Some(crate::editor_locations::Location { card, source: runtime.source_tab_path()?, anchor: runtime.editor_navigation_anchor()? })
+        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
+            return None;
+        };
+        Some(crate::editor_locations::Location {
+            card,
+            source: runtime.source_tab_path()?,
+            anchor: runtime.editor_navigation_anchor()?,
+        })
     }
 
     fn collect_editor_location_jump(&mut self, card: CardId) {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-            && let Some(origin) = runtime.take_location_jump_origin(card) {
-            self.editor_features.jump_origins.entry(card).or_insert(origin);
+            && let Some(origin) = runtime.take_location_jump_origin(card)
+        {
+            self.editor_features
+                .jump_origins
+                .entry(card)
+                .or_insert(origin);
         }
         self.complete_cross_card_jump(card);
     }
 
     fn complete_cross_card_jump(&mut self, card: CardId) {
-        if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) || self.editor_features.history_restores.contains_key(&card) { return; }
-        let Some(target) = self.capture_editor_location(card) else { return; };
-        let Some(origin) = self.editor_features.jump_origins.remove(&card) else { return; };
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.take_location_jump_origin(card); }
-        self.editor_features.location_history.record_jump(origin, target);
+        if self.workspace.focused() != Some(card)
+            || self.lsp_pending_jumps.contains_key(&card)
+            || self.editor_features.history_restores.contains_key(&card)
+        {
+            return;
+        }
+        let Some(target) = self.capture_editor_location(card) else {
+            return;
+        };
+        let Some(origin) = self.editor_features.jump_origins.remove(&card) else {
+            return;
+        };
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.take_location_jump_origin(card);
+        }
+        self.editor_features
+            .location_history
+            .record_jump(origin, target);
     }
 
-    fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
-        if self.workspace.focused() != Some(card) { return None; }
+    fn navigate_cross_card_location(
+        &mut self,
+        card: CardId,
+        forward: bool,
+    ) -> Option<Task<Message>> {
+        if self.workspace.focused() != Some(card) {
+            return None;
+        }
         self.collect_editor_location_jump(card);
         let from = self.capture_editor_location(card)?;
         self.editor_features.location_history.observe_origin(&from);
@@ -14330,57 +14567,119 @@ impl Cagents {
         let same_source = matches!(self.cards.get(&target.location.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source) && runtime.editor_navigation_anchor().is_some());
         if !same_source {
             let (view, external) = match self.cards.get(&target.location.card)? {
-                CardRuntime::Repository(runtime) => (runtime.descriptor.clone(), !target.location.source.starts_with(&runtime.descriptor.worktree)),
+                CardRuntime::Repository(runtime) => (
+                    runtime.descriptor.clone(),
+                    !target
+                        .location
+                        .source
+                        .starts_with(&runtime.descriptor.worktree),
+                ),
                 _ => return None,
             };
             // Reopen as a dedicated source tab: an unrelated dirty buffer in
             // the old card is never replaced in order to satisfy history.
-            let task = self.open_lsp_source_tab(view, target.location.source.clone(), LspPosition::new(0, 0), LspCoordinates::Scalar, external, None);
+            let task = self.open_lsp_source_tab(
+                view,
+                target.location.source.clone(),
+                LspPosition::new(0, 0),
+                LspCoordinates::Scalar,
+                external,
+                None,
+            );
             let opened = self.workspace.focused()?;
-            if !matches!(self.cards.get(&opened), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
+            if !matches!(self.cards.get(&opened), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&target.location.source))
+            {
+                return Some(task);
+            }
             self.editor_features.jump_origins.remove(&opened);
-            self.editor_features.history_restores.insert(opened, (from, target));
+            self.editor_features
+                .history_restores
+                .insert(opened, (from, target));
             self.finish_editor_history_restore(opened);
             return Some(task);
         }
         let previous = match self.cards.get_mut(&target.location.card)? {
             CardRuntime::Repository(runtime) => {
                 let previous = runtime.editor_navigation_anchor()?;
-                if !runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+                if !runtime.restore_editor_navigation_anchor(target.location.anchor) {
+                    return None;
+                }
                 previous
             }
             _ => return None,
         };
         let Ok(update) = self.workspace.focus(target.location.card) else {
-            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
+            if let Some(CardRuntime::Repository(runtime)) =
+                self.cards.get_mut(&target.location.card)
+            {
+                runtime.restore_editor_navigation_anchor(previous);
+            }
             return None;
         };
         let from_card = from.card;
-        if !self.editor_features.location_history.navigate(from, &target) {
-            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
-            let rollback = self.workspace.focus(from_card).unwrap_or_else(|_| ViewportUpdate::unchanged());
+        if !self
+            .editor_features
+            .location_history
+            .navigate(from, &target)
+        {
+            if let Some(CardRuntime::Repository(runtime)) =
+                self.cards.get_mut(&target.location.card)
+            {
+                runtime.restore_editor_navigation_anchor(previous);
+            }
+            let rollback = self
+                .workspace
+                .focus(from_card)
+                .unwrap_or_else(|_| ViewportUpdate::unchanged());
             return Some(self.apply_viewport(rollback, true, false));
         }
-        let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else { return None; };
+        let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else {
+            return None;
+        };
         let focus = repository_task(runtime.focus_editor(target.location.card));
-        Some(Task::batch([focus, self.apply_viewport(update, true, false)]))
+        Some(Task::batch([
+            focus,
+            self.apply_viewport(update, true, false),
+        ]))
     }
 
     fn finish_editor_history_restore(&mut self, card: CardId) {
-        let Some((_, target)) = self.editor_features.history_restores.get(&card) else { return; };
-        if self.workspace.focused() != Some(card) || !self.editor_features.location_history.is_current_target(target) {
-            self.editor_features.history_restores.remove(&card); return;
+        let Some((_, target)) = self.editor_features.history_restores.get(&card) else {
+            return;
+        };
+        if self.workspace.focused() != Some(card)
+            || !self
+                .editor_features
+                .location_history
+                .is_current_target(target)
+        {
+            self.editor_features.history_restores.remove(&card);
+            return;
         }
-        if self.lsp_pending_jumps.contains_key(&card) { return; }
-        let Some(loaded) = self.capture_editor_location(card) else { return; };
-        if loaded.source != target.location.source { self.editor_features.history_restores.remove(&card); return; }
+        if self.lsp_pending_jumps.contains_key(&card) {
+            return;
+        }
+        let Some(loaded) = self.capture_editor_location(card) else {
+            return;
+        };
+        if loaded.source != target.location.source {
+            self.editor_features.history_restores.remove(&card);
+            return;
+        }
         let (from, target) = self.editor_features.history_restores.remove(&card).unwrap();
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-            && runtime.restore_editor_navigation_anchor(target.location.anchor) {
+            && runtime.restore_editor_navigation_anchor(target.location.anchor)
+        {
             runtime.take_location_jump_origin(card);
-            if self.editor_features.location_history.navigate(from, &target)
-                && let Some(current) = self.capture_editor_location(card) {
-                self.editor_features.location_history.replace_current(current);
+            if self
+                .editor_features
+                .location_history
+                .navigate(from, &target)
+                && let Some(current) = self.capture_editor_location(card)
+            {
+                self.editor_features
+                    .location_history
+                    .replace_current(current);
             }
         }
         self.editor_features.jump_origins.remove(&card);
@@ -14393,34 +14692,73 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
-        let open_path = self.capture_editor_location(card).map(|location| location.source);
+        let open_path = self
+            .capture_editor_location(card)
+            .map(|location| location.source);
         if open_path.as_ref() == Some(&path) {
             let moved = match self.cards.get_mut(&card) {
-                Some(CardRuntime::Repository(runtime)) => runtime.move_cursor_to_coordinates(at, coordinates),
+                Some(CardRuntime::Repository(runtime)) => {
+                    runtime.move_cursor_to_coordinates(at, coordinates)
+                }
                 _ => false,
             };
             if !moved {
-                self.status = Some(TransientNotice::warning("The source position is no longer valid"));
+                self.status = Some(TransientNotice::warning(
+                    "The source position is no longer valid",
+                ));
                 return Task::none();
             }
             self.collect_editor_location_jump(card);
-            return if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() }
-                else { match self.cards.get(&card) { Some(CardRuntime::Repository(runtime)) => repository_task(runtime.focus_editor(card)), _ => Task::none() } };
+            return if self.modal_is_open() || self.workspace.focused() != Some(card) {
+                Task::none()
+            } else {
+                match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        repository_task(runtime.focus_editor(card))
+                    }
+                    _ => Task::none(),
+                }
+            };
         }
         let (view, read_only, dirty) = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => (runtime.descriptor.clone(), runtime.is_read_only_source(), runtime.blocks_navigation()),
+            Some(CardRuntime::Repository(runtime)) => (
+                runtime.descriptor.clone(),
+                runtime.is_read_only_source(),
+                runtime.blocks_navigation(),
+            ),
             _ => return Task::none(),
         };
-        let relative = path.strip_prefix(&view.worktree).ok().map(Path::to_path_buf);
+        let relative = path
+            .strip_prefix(&view.worktree)
+            .ok()
+            .map(Path::to_path_buf);
         if relative.is_none() || read_only || dirty {
             let origin = self.capture_editor_location(card);
-            return self.open_lsp_source_tab(view, path, at, coordinates, relative.is_none(), origin);
+            return self.open_lsp_source_tab(
+                view,
+                path,
+                at,
+                coordinates,
+                relative.is_none(),
+                origin,
+            );
         }
         let relative = relative.unwrap();
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.remember_jump_origin(); }
-        self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.remember_jump_origin();
+        }
+        self.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path,
+                at,
+                coordinates,
+            },
+        );
         match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => repository_task(runtime.open_file_location(card, relative, at.line as usize, 0, 0)),
+            Some(CardRuntime::Repository(runtime)) => {
+                repository_task(runtime.open_file_location(card, relative, at.line as usize, 0, 0))
+            }
             _ => Task::none(),
         }
     }
@@ -14495,11 +14833,15 @@ impl Cagents {
         card: CardId,
         action: repository_widget::EditorLspAction,
     ) -> Task<Message> {
-        use repository_widget::EditorLspAction as Action;
         use editor_features::Action as Feature;
+        use repository_widget::EditorLspAction as Action;
         if let Action::CodeActionsAt(at) = &action {
             return match at {
-                Some(at) => { let focus = self.move_lsp_caret(card, *at); let request = self.update_editor_features(Feature::CodeActions(card)); Task::batch([focus, request]) },
+                Some(at) => {
+                    let focus = self.move_lsp_caret(card, *at);
+                    let request = self.update_editor_features(Feature::CodeActions(card));
+                    Task::batch([focus, request])
+                }
                 None => Task::none(),
             };
         }
@@ -14508,14 +14850,20 @@ impl Cagents {
             Action::RenameDraft(draft) => Some(Feature::RenameDraft(card, draft.clone())),
             Action::SubmitRename(value) => Some(Feature::SubmitRename(card, value.clone())),
             Action::CancelRename => Some(Feature::CancelRename(card)),
-            Action::Format { selection } => Some(Feature::Format { card, selection: *selection, save_after: false }),
+            Action::Format { selection } => Some(Feature::Format {
+                card,
+                selection: *selection,
+                save_after: false,
+            }),
             Action::CodeActions => Some(Feature::CodeActions(card)),
             Action::ChooseCodeAction(index) => Some(Feature::ChooseCodeAction(card, *index)),
             Action::Signature => Some(Feature::Signature(card, None)),
             Action::Dismiss => Some(Feature::Dismiss(card)),
             _ => None,
         };
-        if let Some(feature) = feature { return self.update_editor_features(feature); }
+        if let Some(feature) = feature {
+            return self.update_editor_features(feature);
+        }
         match action {
             Action::Complete => self.request_lsp(card, LspRequestKind::Completion),
             Action::CompleteAt { doc, version, at }
@@ -14554,15 +14902,25 @@ impl Cagents {
                     _ => None,
                 });
                 if let Some(at) = at {
-                    if self.modal_is_open() || self.workspace.focused() != Some(card) { return Task::none(); }
+                    if self.modal_is_open() || self.workspace.focused() != Some(card) {
+                        return Task::none();
+                    }
                     let (caret, selection) = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => (runtime.cursor_position(), runtime.editor_selection_range()),
+                        Some(CardRuntime::Repository(runtime)) => {
+                            (runtime.cursor_position(), runtime.editor_selection_range())
+                        }
                         _ => return Task::none(),
                     };
                     let request = self.lsp.request_definition(doc, at);
-                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(EditorDefinitionRequest {
-                        request, doc, version: self.lsp.document_version(doc), caret, selection, focus_revision: self.workspace.focus_revision(),
-                    });
+                    self.lsp_contexts.entry(card).or_default().editor_navigation =
+                        Some(EditorDefinitionRequest {
+                            request,
+                            doc,
+                            version: self.lsp.document_version(doc),
+                            caret,
+                            selection,
+                            focus_revision: self.workspace.focus_revision(),
+                        });
                 }
                 Task::none()
             }
@@ -14583,7 +14941,10 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::CodeActionNext(_) | Action::Diagnostic(_) | Action::Dismiss => {
+            Action::Next(_)
+            | Action::CodeActionNext(_)
+            | Action::Diagnostic(_)
+            | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
@@ -14598,7 +14959,16 @@ impl Cagents {
                 self.collect_editor_location_jump(card);
                 task
             }
-            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::CodeActionsAt(_) | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
+            Action::CompleteAt { .. }
+            | Action::Rename
+            | Action::RenameDraft(_)
+            | Action::SubmitRename(_)
+            | Action::CancelRename
+            | Action::Format { .. }
+            | Action::CodeActions
+            | Action::CodeActionsAt(_)
+            | Action::ChooseCodeAction(_)
+            | Action::Signature => Task::none(),
         }
     }
 
@@ -14611,7 +14981,12 @@ impl Cagents {
             .take()
             .expect("the pending open was just matched");
         if let Some((line, column)) = open.location {
-            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation { card, path: open.path, line: line - 1, column: column - 1 }));
+            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation {
+                card,
+                path: open.path,
+                line: line - 1,
+                column: column - 1,
+            }));
         }
         let action = if open.ignored {
             let Ok(path) = RepoPath::parse(&open.path) else {
@@ -14779,14 +15154,29 @@ impl Cagents {
         }
         let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
         let invalidated = self.refresh_ui.source_invalidated.clone();
-        let retained = self.source_control_mutations.get(&key.canonical_path)
-            .filter(|active| active.binding.key == key).map(|active| active.binding.clone());
-        let binding = self.refresh_ui.source_binding.get_or_insert_with(|| retained.unwrap_or_else(|| git_binding::Binding::new(key.clone()))).clone();
-        if binding.key != key { return Task::none(); }
+        let retained = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|active| active.binding.key == key)
+            .map(|active| active.binding.clone());
+        let binding = self
+            .refresh_ui
+            .source_binding
+            .get_or_insert_with(|| {
+                retained.unwrap_or_else(|| git_binding::Binding::new(key.clone()))
+            })
+            .clone();
+        if binding.key != key {
+            return Task::none();
+        }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_command_binding_id(binding.id);
-            source.set_mutation(self.source_control_mutations.get(&key.canonical_path)
-                .filter(|active| active.binding.id == binding.id).map(|active| active.kind));
+            source.set_mutation(
+                self.source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|active| active.binding.id == binding.id)
+                    .map(|active| active.kind),
+            );
         }
         let model_key = key.clone();
         let reveal_demand = self.sidebar_state.files_reveal_demand().cloned();
@@ -14796,18 +15186,39 @@ impl Cagents {
                 let was_initialized = binding.initialized;
                 binding.initialize()?;
                 if !was_initialized {
-                    *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = crate::repository::SnapshotCache::default();
+                    *cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        crate::repository::SnapshotCache::default();
                 }
-                let input = git_binding::SnapshotInput { worktree, options, cancellation, cache, invalidated, browse_files, previous_errors, expanded, model_key, reveal_demand };
+                let input = git_binding::SnapshotInput {
+                    worktree,
+                    options,
+                    cancellation,
+                    cache,
+                    invalidated,
+                    browse_files,
+                    previous_errors,
+                    expanded,
+                    model_key,
+                    reveal_demand,
+                };
                 let service = RepositoryService::system("git");
                 let loaded = if let Some(authority) = binding.authority.as_ref() {
-                    input.read(&service.with_worktree_authority(authority.clone()).map_err(|error| error.to_string())?)
+                    input.read(
+                        &service
+                            .with_worktree_authority(authority.clone())
+                            .map_err(|error| error.to_string())?,
+                    )
                 } else if !crate::repository::WorktreeAuthority::supported() {
                     input.read(&service)
-                } else { Err("The original Git worktree binding is unavailable.".into()) }?;
+                } else {
+                    Err("The original Git worktree binding is unavailable.".into())
+                }?;
                 binding.validate()?;
                 Ok(loaded.map(|(snapshot, mut model)| {
-                    if let Some(reason) = crate::repository::WorktreeAuthority::unsupported_reason() {
+                    if let Some(reason) = crate::repository::WorktreeAuthority::unsupported_reason()
+                    {
                         model.set_mutation_unavailable_reason(Some(Arc::from(reason)));
                     }
                     Box::new((snapshot, model, binding))
@@ -14847,7 +15258,9 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                binding.as_ref().filter(|binding| binding.key.canonical_path == request.worktree)
+                binding
+                    .as_ref()
+                    .filter(|binding| binding.key.canonical_path == request.worktree)
                     .ok_or_else(|| "The original Git history binding is unavailable.".to_owned())?
                     .history(&request, &query, &cancellation)
             })
@@ -14871,14 +15284,19 @@ impl Cagents {
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
     fn git_mutation_unavailable(&mut self, key: &ActiveWorktreeKey) -> bool {
-        let reason = self.sidebar_model.source_control.as_ref()
+        let reason = self
+            .sidebar_model
+            .source_control
+            .as_ref()
             .filter(|source| &source.key == key)
             .and_then(|source| source.mutation_unavailable_reason())
             .map(str::to_owned);
         if let Some(reason) = reason {
             self.status = Some(TransientNotice::warning(reason));
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     fn begin_mutation(
@@ -14887,7 +15305,9 @@ impl Cagents {
         kind: MutationKind,
         commit_revision: Option<u64>,
     ) -> Option<uuid::Uuid> {
-        if self.git_mutation_unavailable(key) { return None; }
+        if self.git_mutation_unavailable(key) {
+            return None;
+        }
         if !self.source_control_is_bound(key)
             || self.folder_scope(key)
             || self
@@ -14896,9 +15316,20 @@ impl Cagents {
         {
             return None;
         }
-        let binding = self.refresh_ui.source_binding.as_ref()
-            .filter(|binding| binding.key == *key && binding.authority.is_some()
-                && self.sidebar_model.source_control.as_ref().is_some_and(|source| source.command_binding_id() == binding.id))?.clone();
+        let binding = self
+            .refresh_ui
+            .source_binding
+            .as_ref()
+            .filter(|binding| {
+                binding.key == *key
+                    && binding.authority.is_some()
+                    && self
+                        .sidebar_model
+                        .source_control
+                        .as_ref()
+                        .is_some_and(|source| source.command_binding_id() == binding.id)
+            })?
+            .clone();
         let source = self.sidebar_model.source_control.as_mut()?;
         if source.busy() {
             return None;
@@ -14931,14 +15362,27 @@ impl Cagents {
         key: ActiveWorktreeKey,
         request: QueuedGitMutation,
     ) -> Task<Message> {
-        if self.git_mutation_unavailable(&key) { return Task::none(); }
+        if self.git_mutation_unavailable(&key) {
+            return Task::none();
+        }
         if !self.source_control_is_bound(&key) || self.folder_scope(&key) {
             return Task::none();
         }
         let kind = request.kind();
         if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
-            if self.refresh_ui.source_binding.as_ref().is_none_or(|binding| binding.id != active.binding.id)
-                || self.sidebar_model.source_control.as_ref().is_none_or(|source| source.command_binding_id() != active.binding.id) { return Task::none(); }
+            if self
+                .refresh_ui
+                .source_binding
+                .as_ref()
+                .is_none_or(|binding| binding.id != active.binding.id)
+                || self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .is_none_or(|source| source.command_binding_id() != active.binding.id)
+            {
+                return Task::none();
+            }
             QueuedGitMutation::append(&mut active.pending, request.clone());
             if let Some(source) = self.sidebar_model.source_control.as_mut() {
                 if let Some(selection) = request.optimistic_selection() {
@@ -15013,10 +15457,18 @@ impl Cagents {
         operation: uuid::Uuid,
         request: QueuedGitMutation,
     ) -> Task<Message> {
-        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
-            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
+        let Some(binding) = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|active| active.id == operation)
+            .map(|active| active.binding.clone())
+        else {
+            return Task::none();
+        };
         let request = match request {
-            QueuedGitMutation::PreparedDiff(pending) => return self.apply_prepared_diff_at_turn(key, operation, pending),
+            QueuedGitMutation::PreparedDiff(pending) => {
+                return self.apply_prepared_diff_at_turn(key, operation, pending);
+            }
             QueuedGitMutation::Area { area, command, .. } => {
                 return self.queued_group_task(key, operation, area, command);
             }
@@ -15094,7 +15546,8 @@ impl Cagents {
                     .unwrap_or_default();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        binding.mutation_service()?
+                        binding
+                            .mutation_service()?
                             .discard_recoverable(&request, &cancellation)
                             .map_err(|error| error.to_string())
                     })
@@ -15124,7 +15577,8 @@ impl Cagents {
                 let worktree = key.canonical_path.clone();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        binding.mutation_service()?
+                        binding
+                            .mutation_service()?
                             .apply_patch_recoverable(
                                 &worktree,
                                 &patch,
@@ -15175,7 +15629,9 @@ impl Cagents {
                     ("Discard", service.discard(&request, cancellation))
                 }
                 QueuedGitMutation::Area { .. } | QueuedGitMutation::PreparedDiff(_) => {
-                    unreachable!("group and prepared tasks are dispatched before ordinary mutations")
+                    unreachable!(
+                        "group and prepared tasks are dispatched before ordinary mutations"
+                    )
                 }
                 QueuedGitMutation::UndoDiscard(recovery) => (
                     "Undo discard",
@@ -15207,14 +15663,18 @@ impl Cagents {
             .filter(|mutation| mutation.id == operation)
             .map(|mutation| mutation.cancellation.clone())
             .unwrap_or_default();
-        let Some(binding) = self.source_control_mutations.get(&key.canonical_path)
-            .filter(|active| active.id == operation).map(|active| active.binding.clone()) else { return Task::none(); };
+        let Some(binding) = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|active| active.id == operation)
+            .map(|active| active.binding.clone())
+        else {
+            return Task::none();
+        };
         cosmic::task::future(async move {
-            let joined = tokio::task::spawn_blocking(move || {
-                match binding.mutation_service() {
-                    Ok(service) => run(&service, &cancellation),
-                    Err(error) => (Some(error), false),
-                }
+            let joined = tokio::task::spawn_blocking(move || match binding.mutation_service() {
+                Ok(service) => run(&service, &cancellation),
+                Err(error) => (Some(error), false),
             })
             .await;
             let (report, committed) = match joined {
@@ -15912,7 +16372,11 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
-        if self.editor_features.publishing() { return Some("Wait for the workspace edit to finish applying before closing the window."); }
+        if self.editor_features.publishing() {
+            return Some(
+                "Wait for the workspace edit to finish applying before closing the window.",
+            );
+        }
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
@@ -16072,7 +16536,10 @@ impl Cagents {
     }
 
     fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
-        let observed = self.modal_stack.focus_snapshot(modal_ui::Modal::DirtyClose).get();
+        let observed = self
+            .modal_stack
+            .focus_snapshot(modal_ui::Modal::DirtyClose)
+            .get();
         let Some(close) = self.dirty_repository_close.as_mut() else {
             return Task::none();
         };
@@ -16088,8 +16555,13 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
         );
         if let Some(id) = observed
-            && let Some(control) = [DirtyCloseControl::Cancel, DirtyCloseControl::Discard, DirtyCloseControl::Save]
-                .into_iter().find(|control| dirty_close_control_id(close.card, *control) == id)
+            && let Some(control) = [
+                DirtyCloseControl::Cancel,
+                DirtyCloseControl::Discard,
+                DirtyCloseControl::Save,
+            ]
+            .into_iter()
+            .find(|control| dirty_close_control_id(close.card, *control) == id)
         {
             close.focused = control;
         }
@@ -16781,7 +17253,10 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_auto_close != self.settings.editor_auto_close || previous.editor_tab_width != self.settings.editor_tab_width || previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_auto_close != self.settings.editor_auto_close
+            || previous.editor_tab_width != self.settings.editor_tab_width
+            || previous.editor_wrap_lines != wrap_lines
+            || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
@@ -16793,8 +17268,10 @@ impl Cagents {
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_editor_tab_width(self.settings.editor_tab_width);
-                        pane.runtime.set_editor_auto_close(self.settings.editor_auto_close);
+                        pane.runtime
+                            .set_editor_tab_width(self.settings.editor_tab_width);
+                        pane.runtime
+                            .set_editor_auto_close(self.settings.editor_auto_close);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -16872,11 +17349,13 @@ impl Cagents {
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
         // so it survives if no new document is opened. New launches wait
         // for the same reap instead of overlapping a second admission cap.
-        let predecessor=self.lsp.begin_shutdown();
-        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-            self.settings.lsp_idle_timeout_seconds,
-            self.settings.lsp_max_sessions,
-        ).after_shutdown(predecessor);
+        let predecessor = self.lsp.begin_shutdown();
+        self.lsp = LspManager::new(self.settings.language_servers.clone())
+            .with_lifecycle(
+                self.settings.lsp_idle_timeout_seconds,
+                self.settings.lsp_max_sessions,
+            )
+            .after_shutdown(predecessor);
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();
@@ -22583,12 +23062,12 @@ impl Application for Cagents {
             };
             let target = self.modal_surface_target(top);
             let dialog = crate::interaction::owned_surface(dialog, target);
-            let dialog = crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top)).map(
-                move |message| Message::ModalSurface {
-                    target,
-                    message: Box::new(message),
-                },
-            );
+            let dialog =
+                crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
+                    .map(move |message| Message::ModalSurface {
+                        target,
+                        message: Box::new(message),
+                    });
             // Global Popover captures bypass the background view observer.
             // Preserve child transport isolation and bind held keys to the
             // same visible instance as every other widget decision.
@@ -22597,7 +23076,12 @@ impl Application for Cagents {
                 &self.input_trace,
                 move |event, captured, region, widget| Message::ModalSurface {
                     target,
-                    message: Box::new(Message::RoutedKeyEvent { event, captured, region, widget }),
+                    message: Box::new(Message::RoutedKeyEvent {
+                        event,
+                        captured,
+                        region,
+                        widget,
+                    }),
                 },
             )
         })
@@ -22858,7 +23342,8 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
+        self.input_trace
+            .bind_terminal_keys(self.terminal_review_input.clone());
         let mut focus_regions = Vec::new();
         for row in sidebar::visible_selection_rows(
             &self.sidebar_model,
@@ -22879,8 +23364,14 @@ impl Application for Cagents {
             workspace_widget::FocusedPane::SidebarChanges.into(),
         ));
         if self.sidebar_state.changes_tab() == sidebar::ChangesTab::History
-            && let Some(source) = &self.sidebar_model.source_control {
-            focus_regions.extend(source.history.iter().map(|row| (sidebar::history_row_focus_id(row), workspace_widget::FocusedPane::SidebarChanges.into())));
+            && let Some(source) = &self.sidebar_model.source_control
+        {
+            focus_regions.extend(source.history.iter().map(|row| {
+                (
+                    sidebar::history_row_focus_id(row),
+                    workspace_widget::FocusedPane::SidebarChanges.into(),
+                )
+            }));
         }
         let projection = self.workspace.projection(self.workspace.viewport_width());
         for mounted in &projection.mounted {
@@ -25861,26 +26352,44 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let mut app = context_inspector_test_app(false);
-        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
-        app.settings.editor_tab_width = 8; app.settings.editor_auto_close = false;
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.editor_tab_width = 8;
+        app.settings.editor_auto_close = false;
         app.settings.terminal_padding = 12.0;
         app.save_settings_now().unwrap();
         app.settings_draft.terminal_font_size = "unfinished".into();
-        app.settings_invalid.insert(SettingsField::TerminalFontSize, "Enter a number".into());
+        app.settings_invalid
+            .insert(SettingsField::TerminalFontSize, "Enter a number".into());
         app.settings_draft.terminal_font_family = "Pending font".into();
-        app.settings_pending.insert(SettingsField::TerminalFontFamily, (9, "Pending font".into()));
+        app.settings_pending.insert(
+            SettingsField::TerminalFontFamily,
+            (9, "Pending font".into()),
+        );
         let reset = app.reset_settings_category(SettingsCategory::Editor);
         settle_settings_task(&mut app, reset);
         let saved = settings::load_live(&path).unwrap();
         for actual in [&app.settings, &saved] {
-            assert_eq!(actual.editor_tab_width, 4); assert!(actual.editor_auto_close);
+            assert_eq!(actual.editor_tab_width, 4);
+            assert!(actual.editor_auto_close);
             assert_eq!(actual.terminal_padding, 12.0);
         }
         assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
         assert_eq!(app.settings_draft.terminal_font_family, "Pending font");
-        assert!(app.settings_invalid.contains_key(&SettingsField::TerminalFontSize));
-        assert!(app.settings_pending.contains_key(&SettingsField::TerminalFontFamily));
-        for field in [SettingsField::EditorTabWidth, SettingsField::EditorAutoClose] { assert!(SettingsField::PREFERENCES.contains(&field)); }
+        assert!(
+            app.settings_invalid
+                .contains_key(&SettingsField::TerminalFontSize)
+        );
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::TerminalFontFamily)
+        );
+        for field in [
+            SettingsField::EditorTabWidth,
+            SettingsField::EditorAutoClose,
+        ] {
+            assert!(SettingsField::PREFERENCES.contains(&field));
+        }
     }
 
     #[test]
@@ -25888,17 +26397,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let mut app = context_inspector_test_app(false);
-        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
         app.save_settings_now().unwrap();
         drop(app.queue_setting_input(SettingsField::EditorTabWidth, "unfinished".into()));
         drop(app.queue_setting_input(SettingsField::EditorAutoClose, "false".into()));
-        let mut external = settings::load_live(&path).unwrap(); external.show_status_bar = !external.show_status_bar;
+        let mut external = settings::load_live(&path).unwrap();
+        external.show_status_bar = !external.show_status_bar;
         settings::save(&path, &external).unwrap();
         drop(app.reload_settings(settings::load_live_observed(&path)));
         assert_eq!(app.settings_draft.editor_tab_width, "unfinished");
         assert!(!app.settings_draft.editor_auto_close);
-        assert!(app.settings_pending.contains_key(&SettingsField::EditorTabWidth));
-        assert!(app.settings_pending.contains_key(&SettingsField::EditorAutoClose));
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::EditorTabWidth)
+        );
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::EditorAutoClose)
+        );
         assert_eq!(app.settings.show_status_bar, external.show_status_bar);
     }
 
@@ -28292,25 +28809,34 @@ mod tests {
     #[test]
     fn review_actions_and_owner_are_scoped_to_the_original_same_id_attachment() {
         let (mut app, card, _directory) = live_agent_app("review-before-handshake");
-        let CardRuntime::Terminal(original) = app.cards.get(&card).unwrap() else { unreachable!() };
+        let CardRuntime::Terminal(original) = app.cards.get(&card).unwrap() else {
+            unreachable!()
+        };
         let original = original.clone();
         let old_attachment = original.attachment_id();
         // Accessibility is usable before the first handshake. A transient
         // unknown live proof must not disable or clear Review on this actor.
         assert!(original.execution_instance().is_none());
         assert!(original.host_proof().is_none());
-        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: true }));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: old_attachment,
+            active: true,
+        }));
         app.reconcile_terminal_review_owner();
         assert_eq!(app.terminal_review_card, Some(card));
         assert_eq!(app.terminal_review_identity, Some(old_attachment));
         assert_eq!(original.clone().attachment_id(), old_attachment);
 
         let peer = crate::terminal::TerminalTestPeer::with_generation(
-            original.terminal_id(), uuid::Uuid::new_v4(),
+            original.terminal_id(),
+            uuid::Uuid::new_v4(),
             crate::model::HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new("review-successor-host"),
                 boot_id: crate::model::BootId::new("review-successor-boot"),
-                host_incarnation: crate::model::HostIncarnation::new("review-successor-incarnation"),
+                host_incarnation: crate::model::HostIncarnation::new(
+                    "review-successor-incarnation",
+                ),
             },
         );
         let replacement = peer.surface();
@@ -28321,17 +28847,33 @@ mod tests {
         app.reconcile_terminal_review_owner();
         assert_eq!(app.terminal_review_card, None);
         let revision = app.terminal_review_revision;
-        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: true }));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: old_attachment,
+            active: true,
+        }));
         assert_eq!(app.terminal_review_revision, revision);
         assert_eq!(app.terminal_review_card, None);
-        drop(app.update(Message::TerminalReviewMode { card, terminal: current_attachment, active: true }));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: current_attachment,
+            active: true,
+        }));
         let revision = app.terminal_review_revision;
-        drop(app.update(Message::TerminalReviewMode { card, terminal: old_attachment, active: false }));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: old_attachment,
+            active: false,
+        }));
         app.reconcile_terminal_review_owner();
         assert_eq!(app.terminal_review_identity, Some(current_attachment));
         assert_eq!(app.terminal_review_card, Some(card));
         assert_eq!(app.terminal_review_revision, revision);
-        drop(app.update(Message::TerminalReviewMode { card, terminal: current_attachment, active: false }));
+        drop(app.update(Message::TerminalReviewMode {
+            card,
+            terminal: current_attachment,
+            active: false,
+        }));
         assert_eq!(app.terminal_review_card, None);
     }
 
@@ -28340,8 +28882,10 @@ mod tests {
         for prepared in [false, true] {
             let (mut app, card, _directory) = live_agent_app("review-focus-exit");
             let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
-            app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
-            let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+            app.cards
+                .insert(card, CardRuntime::Terminal(surface.clone()));
+            let mut mounted =
+                crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
             peer.next(crate::terminal::KeyAction::Press);
             peer.ack(true);
             mounted.wait_for_press_admission();
@@ -28351,7 +28895,11 @@ mod tests {
             app.update_prepared = prepared;
             app.settings_reset_confirm = !prepared;
             for active in callbacks {
-                let message = Message::TerminalReviewMode { card, terminal: surface.attachment_id(), active };
+                let message = Message::TerminalReviewMode {
+                    card,
+                    terminal: surface.attachment_id(),
+                    active,
+                };
                 assert!(!user_workspace_message_blocked_while_modal(&message));
                 assert!(!user_message_blocked_during_update(&message));
                 assert!(!workspace_navigation_blocked_during_save(&message));
@@ -28363,10 +28911,17 @@ mod tests {
             mounted.wait_key_pairs((0, 1));
             peer.ack(true);
             mounted.wait_key_pairs((0, 0));
-            let on = Message::TerminalReviewMode { card, terminal: surface.attachment_id(), active: true };
+            let on = Message::TerminalReviewMode {
+                card,
+                terminal: surface.attachment_id(),
+                active: true,
+            };
             assert!(user_workspace_message_blocked_while_modal(&on));
             drop(app.update(on));
-            assert_eq!(app.terminal_review_card, None, "blocked workspace cannot re-enter Review");
+            assert_eq!(
+                app.terminal_review_card, None,
+                "blocked workspace cannot re-enter Review"
+            );
         }
     }
 
@@ -28374,8 +28929,10 @@ mod tests {
     fn terminal_review_main_window_blur_releases_evicted_owner_but_foreign_blur_does_not() {
         let (mut app, card, _directory) = live_agent_app("review-evicted-blur");
         let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
-        app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
-        let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+        app.cards
+            .insert(card, CardRuntime::Terminal(surface.clone()));
+        let mut mounted =
+            crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
         peer.next(crate::terminal::KeyAction::Press);
         peer.ack(true);
         mounted.wait_for_press_admission();
@@ -28384,7 +28941,10 @@ mod tests {
         drop(mounted); // No widget remains to publish its local blur exit.
         let main = window::Id::unique();
         app.core.set_main_window_id(Some(main));
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::unique(), false))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::unique(),
+            false,
+        ))));
         assert_eq!(app.terminal_review_card, Some(card));
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))));
         assert_eq!(app.terminal_review_card, None);
@@ -28392,7 +28952,10 @@ mod tests {
         peer.ack(true);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while app.terminal_review_input.pending_counts() != (0, 0) {
-            assert!(std::time::Instant::now() < deadline, "original worker release was not accepted");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "original worker release was not accepted"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(app.terminal_review_input.take_failures().is_empty());
@@ -30547,7 +31110,7 @@ mod tests {
             message: message.into(),
             source: None,
             code: None,
-            protocol:None,
+            protocol: None,
         }
     }
 
@@ -30602,12 +31165,25 @@ mod tests {
     #[test]
     fn cross_card_source_history_restores_dirty_origin_and_readonly_target_native_anchors() {
         let (mut app, origin) = editing_repository_app();
-        let (mut origin_runtime, _) = RepositoryRuntime::open_fixture(origin, "origin.rs", "origin α\nsecond\n");
+        let (mut origin_runtime, _) =
+            RepositoryRuntime::open_fixture(origin, "origin.rs", "origin α\nsecond\n");
         origin_runtime.set_auto_save(false);
-        drop(origin_runtime.update(RepositoryAction::EditorAction { card: origin, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('!')) }));
-        let origin_anchor = crate::model::EditorNavigation { caret: crate::model::EditorPosition { line: 1, column: 3 }, selection: Some(crate::model::EditorPosition { line: 0, column: 2 }), scroll_line: 1, scroll_vertical: 3.0, scroll_horizontal: 4.0 };
+        drop(origin_runtime.update(RepositoryAction::EditorAction {
+            card: origin,
+            action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(
+                '!',
+            )),
+        }));
+        let origin_anchor = crate::model::EditorNavigation {
+            caret: crate::model::EditorPosition { line: 1, column: 3 },
+            selection: Some(crate::model::EditorPosition { line: 0, column: 2 }),
+            scroll_line: 1,
+            scroll_vertical: 3.0,
+            scroll_horizontal: 4.0,
+        };
         assert!(origin_runtime.restore_editor_navigation_anchor(origin_anchor));
-        app.cards.insert(origin, CardRuntime::Repository(Box::new(origin_runtime)));
+        app.cards
+            .insert(origin, CardRuntime::Repository(Box::new(origin_runtime)));
         let from = app.capture_editor_location(origin).unwrap();
         let target = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(target, "stdlib.rs", "a😀éX\n");
@@ -30615,72 +31191,186 @@ mod tests {
         assert!(runtime.move_cursor_to_coordinates(LspPosition::new(0, 4), LspCoordinates::Utf16));
         let target_anchor = runtime.editor_navigation_anchor().unwrap();
         let view = runtime.descriptor.clone();
-        app.cards.insert(target, CardRuntime::Repository(Box::new(runtime)));
-        Arc::make_mut(&mut app.durable).cards.push(CardState { id: target, generation: 0, title: "Std source".into(), width_fraction: 0.7, existence: Existence::Open, exposure: Exposure::Visible, residency: Residency::Hot, kind: CardKind::Repository(view) });
-        app.workspace.add_card(WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(), 1, true).unwrap();
+        app.cards
+            .insert(target, CardRuntime::Repository(Box::new(runtime)));
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: target,
+            generation: 0,
+            title: "Std source".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Repository(view),
+        });
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(),
+                1,
+                true,
+            )
+            .unwrap();
         app.editor_features.jump_origins.insert(target, from);
         app.complete_cross_card_jump(target);
         // A more recent ordinary jump is in the same window sequence: Back
         // restores its local origin before crossing back to the dirty card.
-        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card: target })));
-        drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card: target, value: "1:1".into() })));
-        drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card: target })));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor.caret.column, 0);
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::OpenGoToLine {
+                card: target,
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::GoToLineChanged {
+                card: target,
+                value: "1:1".into(),
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::SubmitGoToLine {
+                card: target,
+            })),
+        );
+        assert_eq!(
+            app.capture_editor_location(target)
+                .unwrap()
+                .anchor
+                .caret
+                .column,
+            0
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: target,
+                forward: false,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
+        assert_eq!(
+            app.capture_editor_location(target).unwrap().anchor,
+            target_anchor
+        );
         // A pending transaction makes the target unavailable, without
         // consuming the history position. Cancelling it permits the same Back.
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
             let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
-            let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "origin.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, protocol_incarnation: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+            let plan = crate::editor_workspace_edit::DocumentPlan {
+                path,
+                relative: "origin.rs".into(),
+                before_hash: blake3::hash(snapshot.text.as_bytes()),
+                before: snapshot.text.clone(),
+                after: snapshot.text,
+                version: Some(snapshot.version),
+                protocol_version: None,
+                protocol_incarnation: None,
+                open: true,
+                open_paths: Vec::new(),
+                edits: Vec::new(),
+            };
             runtime.begin_workspace_edit(313, &plan).unwrap();
             assert!(runtime.is_saving());
         }
         assert!(app.navigate_cross_card_location(target, false).is_none());
         assert_eq!(app.workspace.focused(), Some(target));
-        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) { runtime.cancel_workspace_edit(313); }
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
+            runtime.cancel_workspace_edit(313);
+        }
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: target,
+                forward: false,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(origin));
-        assert_eq!(app.capture_editor_location(origin).unwrap().anchor, origin_anchor);
-        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()));
-        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: origin, forward: true })));
+        assert_eq!(
+            app.capture_editor_location(origin).unwrap().anchor,
+            origin_anchor
+        );
+        assert!(
+            matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty())
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card: origin,
+                forward: true,
+            })),
+        );
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
-        assert!(matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n")));
+        assert_eq!(
+            app.capture_editor_location(target).unwrap().anchor,
+            target_anchor
+        );
+        assert!(
+            matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n"))
+        );
         // A retained runtime in another strip/channel is not a focus target.
         app.workspace.request_close(origin).unwrap();
         app.workspace.commit_close(origin).unwrap();
         assert!(app.cards.contains_key(&origin));
         assert!(app.navigate_cross_card_location(target, false).is_none());
         assert_eq!(app.workspace.focused(), Some(target));
-        assert_eq!(app.editor_features.location_history.peek(false, |_| true).unwrap().location.card, origin);
-        app.workspace.add_card(WorkspaceCard::new(origin, "Origin", CardWidth::Fraction(0.7)).unwrap(), 0, false).unwrap();
+        assert_eq!(
+            app.editor_features
+                .location_history
+                .peek(false, |_| true)
+                .unwrap()
+                .location
+                .card,
+            origin
+        );
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(origin, "Origin", CardWidth::Fraction(0.7)).unwrap(),
+                0,
+                false,
+            )
+            .unwrap();
         // Reusing the old card for another file never authorizes history to
         // replace its current buffer or restore an anchor from another source.
-        let (other, _) = RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
-        app.cards.insert(origin, CardRuntime::Repository(Box::new(other)));
+        let (other, _) =
+            RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
+        app.cards
+            .insert(origin, CardRuntime::Repository(Box::new(other)));
         assert!(app.navigate_cross_card_location(target, false).is_some());
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, origin);
         assert_ne!(reopened, target);
-        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer")));
+        assert!(
+            matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer"))
+        );
     }
 
     #[test]
     fn window_history_exhaustion_never_reenters_the_runtime_stack() {
         let (mut app, card) = editing_repository_app();
         let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "zero\none\ntwo\n");
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         for line in ["2", "3"] {
             drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
-            drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card, value: line.into() })));
-            drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::GoToLineChanged {
+                    card,
+                    value: line.into(),
+                })),
+            );
+            drop(
+                app.update(Message::Repository(RepositoryAction::SubmitGoToLine {
+                    card,
+                })),
+            );
         }
         for (forward, lines) in [(false, [1, 0, 0]), (true, [1, 2, 2])] {
             for line in lines {
-                drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card, forward })));
-                assert_eq!(app.capture_editor_location(card).unwrap().anchor.caret.line, line);
+                drop(
+                    app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                        card,
+                        forward,
+                    })),
+                );
+                assert_eq!(
+                    app.capture_editor_location(card).unwrap().anchor.caret.line,
+                    line
+                );
             }
         }
     }
@@ -30730,14 +31420,24 @@ mod tests {
         let path = PathBuf::from("/dependencies/std.rs");
         runtime.set_external_source(path.clone());
         let view = runtime.descriptor.clone();
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.lsp_contexts.remove(&card);
         let count = app.cards.len();
-        drop(app.open_lsp_source_tab(view, path, LspPosition::new(0, 4), LspCoordinates::Utf16, true, None));
+        drop(app.open_lsp_source_tab(
+            view,
+            path,
+            LspPosition::new(0, 4),
+            LspCoordinates::Utf16,
+            true,
+            None,
+        ));
         assert_eq!(app.cards.len(), count);
         assert_eq!(app.workspace.focused(), Some(card));
         assert!(!app.lsp_pending_jumps.contains_key(&card));
-        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source()));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source())
+        );
     }
 
     #[test]
@@ -30750,38 +31450,86 @@ mod tests {
             std::fs::write(&path, "fn main() {}\n").unwrap();
             std::fs::write(&target, "fn target() {}\n").unwrap();
             let (mut app, card) = editing_repository_app();
-            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "fn main() {}\n");
-            runtime.descriptor.worktree = root.path().into(); runtime.descriptor.repository = root.path().into();
+            let (mut runtime, _) =
+                RepositoryRuntime::open_fixture(card, "main.rs", "fn main() {}\n");
+            runtime.descriptor.worktree = root.path().into();
+            runtime.descriptor.repository = root.path().into();
             runtime.set_lsp_document(Some(LspDocumentId(1)));
             drop(runtime.take_lsp_intents());
-            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
             app.lsp = LspManager::new(AppSettings::default().language_servers);
             let language = app.lsp.language_for(&path).unwrap();
             // Discovery is not delivered: this is actual application request
             // admission and queue-delay fencing, with no server process.
-            app.lsp.open(LspDocumentId(1), &path, root.path(), language, 1, "fn main() {}\n");
-            drop(app.update(Message::Repository(RepositoryAction::Language { card, action: repository_widget::EditorLspAction::Definition(None) })));
-            let request = app.lsp_contexts[&card].editor_navigation.as_ref().unwrap().request;
+            app.lsp.open(
+                LspDocumentId(1),
+                &path,
+                root.path(),
+                language,
+                1,
+                "fn main() {}\n",
+            );
+            drop(app.update(Message::Repository(RepositoryAction::Language {
+                card,
+                action: repository_widget::EditorLspAction::Definition(None),
+            })));
+            let request = app.lsp_contexts[&card]
+                .editor_navigation
+                .as_ref()
+                .unwrap()
+                .request;
             let other = CardId::new();
-            let (runtime, _) = RepositoryRuntime::open_fixture(other, "other.rs", "keep focus here");
-            app.cards.insert(other, CardRuntime::Repository(Box::new(runtime)));
-            app.workspace.add_card(WorkspaceCard::new(other, "Other", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), false).unwrap();
+            let (runtime, _) =
+                RepositoryRuntime::open_fixture(other, "other.rs", "keep focus here");
+            app.cards
+                .insert(other, CardRuntime::Repository(Box::new(runtime)));
+            app.workspace
+                .add_card(
+                    WorkspaceCard::new(other, "Other", CardWidth::Fraction(0.7)).unwrap(),
+                    app.workspace.cards().len(),
+                    false,
+                )
+                .unwrap();
             match change {
                 "focus" | "away-back" => {
                     drop(app.update(Message::FocusCard(other)));
-                    if change == "away-back" { drop(app.update(Message::FocusCard(card))); }
+                    if change == "away-back" {
+                        drop(app.update(Message::FocusCard(card)));
+                    }
                 }
                 "caret-back" => {
-                    for motion in [repository_widget::text_editor::Motion::Right, repository_widget::text_editor::Motion::Left] {
-                        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Move(motion) })));
+                    for motion in [
+                        repository_widget::text_editor::Motion::Right,
+                        repository_widget::text_editor::Motion::Left,
+                    ] {
+                        drop(
+                            app.update(Message::Repository(RepositoryAction::EditorAction {
+                                card,
+                                action: repository_widget::EditorAction::Move(motion),
+                            })),
+                        );
                     }
                 }
                 "modal" => app.resume_ui.open = true,
                 _ => unreachable!(),
             }
-            let expected = app.workspace.focused(); let count = app.cards.len();
+            let expected = app.workspace.focused();
+            let count = app.cards.len();
             app.context_inspector_open = false;
-            drop(app.update(Message::Lsp(LspEvent::Locations { doc: LspDocumentId(1), request, kind: crate::lsp::LocationKind::Definition, items: vec![crate::lsp::LspLocation { target: crate::lsp::LspTarget::External { path: target }, range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)), coordinates: LspCoordinates::Utf16 }] })));
+            drop(app.update(Message::Lsp(LspEvent::Locations {
+                doc: LspDocumentId(1),
+                request,
+                kind: crate::lsp::LocationKind::Definition,
+                items: vec![crate::lsp::LspLocation {
+                    target: crate::lsp::LspTarget::External { path: target },
+                    range: crate::lsp::LspRange::new(
+                        LspPosition::new(0, 0),
+                        LspPosition::new(0, 1),
+                    ),
+                    coordinates: LspCoordinates::Utf16,
+                }],
+            })));
             assert_eq!(app.workspace.focused(), expected, "{change}");
             assert_eq!(app.cards.len(), count, "{change}");
             assert!(!app.context_inspector_open, "{change}");
@@ -30813,9 +31561,24 @@ mod tests {
         let doc = LspDocumentId(1);
         let request = crate::lsp::LspRequestId(1);
         app.lsp_documents.insert(doc, card);
-        app.workspace.add_card(WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), true).unwrap();
-        let origin = EditorDefinitionRequest { request, doc, version: None, caret: None, selection: None, focus_revision: app.workspace.focus_revision() };
-        let state = lsp_state(&mut app, card); state.document = Some(doc); state.editor_navigation = Some(origin);
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(),
+                app.workspace.cards().len(),
+                true,
+            )
+            .unwrap();
+        let origin = EditorDefinitionRequest {
+            request,
+            doc,
+            version: None,
+            caret: None,
+            selection: None,
+            focus_revision: app.workspace.focus_revision(),
+        };
+        let state = lsp_state(&mut app, card);
+        state.document = Some(doc);
+        state.editor_navigation = Some(origin);
         app.context_tab = ContextTab::Files;
         app.context_inspector_open = false;
         let _ = app.update(Message::Lsp(LspEvent::Locations {
@@ -31171,7 +31934,12 @@ mod tests {
         assert_eq!(notice(&app), None);
     }
 
-    fn source_control_test_app() -> (tempfile::TempDir, Cagents, ActiveWorktreeKey, ActiveWorktreeKey) {
+    fn source_control_test_app() -> (
+        tempfile::TempDir,
+        Cagents,
+        ActiveWorktreeKey,
+        ActiveWorktreeKey,
+    ) {
         let temporary = tempfile::tempdir().unwrap();
         let main = temporary.path().join("main");
         let other = temporary.path().join("fix-sidebar");
@@ -31183,16 +31951,34 @@ mod tests {
         let original = app.sidebar_state.active_worktree().unwrap().clone();
         for project in &mut app.sidebar_model.projects {
             for worktree in &mut project.worktrees {
-                worktree.path = if worktree.id == original.worktree_id { main.clone() } else { other.clone() };
+                worktree.path = if worktree.id == original.worktree_id {
+                    main.clone()
+                } else {
+                    other.clone()
+                };
             }
         }
-        app.sidebar_model.source_control.as_mut().unwrap().key.canonical_path = main.clone();
-        app.sidebar_state.sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree: main.clone() });
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .key
+            .canonical_path = main.clone();
+        app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &SidebarFocus::Repository {
+                worktree: main.clone(),
+            },
+        );
         let key = app.sidebar_state.active_worktree().unwrap().clone();
         let sibling = app.sidebar_model.worktree_at(&other).unwrap();
         let mut binding = super::git_binding::Binding::new(key.clone());
         binding.initialize().unwrap();
-        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(binding.id);
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_command_binding_id(binding.id);
         app.refresh_ui.source_binding = Some(binding);
         app.active_workspace = Some(main);
         (temporary, app, key, sibling)
@@ -31200,7 +31986,9 @@ mod tests {
 
     #[test]
     fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let first = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
@@ -31209,7 +31997,11 @@ mod tests {
         assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
         let mut sibling_binding = super::git_binding::Binding::new(sibling.clone());
         sibling_binding.initialize().unwrap();
-        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(sibling_binding.id);
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_command_binding_id(sibling_binding.id);
         app.refresh_ui.source_binding = Some(sibling_binding);
         let other = app
             .begin_mutation(&sibling, MutationKind::Push, None)
@@ -31371,7 +32163,9 @@ mod tests {
 
     #[test]
     fn git_commit_completion_preserves_later_edits_and_settles_parked_drafts() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         drop(
@@ -34367,31 +35161,92 @@ mod tests {
 
     #[test]
     fn read_only_git_refuses_actual_mutation_dispatch_and_queue_admission() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         let source = app.sidebar_model.source_control.as_ref().unwrap();
         let branch = source.branch.clone().unwrap();
         let target = source.upstream.clone().unwrap();
-        let selected = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
-        let reason: Arc<str> = "This host provides repository reads without strong Git mutation authority.".into();
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+        let selected = source
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        let reason: Arc<str> =
+            "This host provides repository reads without strong Git mutation authority.".into();
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(reason.clone()));
         for action in [
-            SidebarAction::Stage { key: key.clone(), selection: vec![selected.clone()] },
-            SidebarAction::Commit { key: key.clone(), message: "Do not commit".into(), amend: true },
-            SidebarAction::Push { key: key.clone(), branch, target },
-            SidebarAction::GitOperation { key: key.clone(), operation: crate::repository::GitOperation::Fetch { remote: "origin".into(), prune: true } },
+            SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![selected.clone()],
+            },
+            SidebarAction::Commit {
+                key: key.clone(),
+                message: "Do not commit".into(),
+                amend: true,
+            },
+            SidebarAction::Push {
+                key: key.clone(),
+                branch,
+                target,
+            },
+            SidebarAction::GitOperation {
+                key: key.clone(),
+                operation: crate::repository::GitOperation::Fetch {
+                    remote: "origin".into(),
+                    prune: true,
+                },
+            },
         ] {
             drop(app.update(Message::Sidebar(action)));
-            assert!(app.source_control_mutations.is_empty(), "actual host dispatch must refuse, not only hide a button");
+            assert!(
+                app.source_control_mutations.is_empty(),
+                "actual host dispatch must refuse, not only hide a button"
+            );
         }
-        assert!(app.notices.recent().any(|entry| entry.notice.message == reason.as_ref()));
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(None);
-        assert!(app.begin_mutation(&key, MutationKind::Stage, None).is_some());
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason));
-        let before = app.sidebar_model.source_control.as_ref().unwrap().groups().to_vec();
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message == reason.as_ref())
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(None);
+        assert!(
+            app.begin_mutation(&key, MutationKind::Stage, None)
+                .is_some()
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(reason));
+        let before = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .groups()
+            .to_vec();
         drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![selected])));
-        assert!(app.source_control_mutations[&key.canonical_path].pending.is_empty(), "a capability change cannot append another queued mutation");
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().groups(), before.as_slice(), "refused queue admission must not project a stage");
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty(),
+            "a capability change cannot append another queued mutation"
+        );
+        assert_eq!(
+            app.sidebar_model.source_control.as_ref().unwrap().groups(),
+            before.as_slice(),
+            "refused queue admission must not project a stage"
+        );
     }
 
     #[test]
@@ -35167,10 +36022,11 @@ mod tests {
             app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             app.active_workspace = Some(key.canonical_path.clone());
-            app.sidebar_state.apply(&SidebarAction::CommitMessageChanged {
-                key: key.clone(),
-                message: "Kept draft".into(),
-            });
+            app.sidebar_state
+                .apply(&SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: "Kept draft".into(),
+                });
             app.sidebar_state.apply(&SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: true,
@@ -35186,22 +36042,39 @@ mod tests {
                 message: "Kept draft".into(),
                 amend: true,
             })));
-            assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
-            assert!(app.sidebar_model.source_control.as_ref().unwrap().error
-                .as_deref().unwrap().contains("Finish or abort"));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Finish or abort")
+            );
             assert_eq!(app.sidebar_state.commit_message(), "Kept draft");
             app.sidebar_model.source_control.as_mut().unwrap().head_oid = None;
             drop(app.update(Message::Sidebar(SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: false,
             })));
-            assert!(app.sidebar_state.submitted_commit_revision(&key, "Kept draft", false).is_some());
+            assert!(
+                app.sidebar_state
+                    .submitted_commit_revision(&key, "Kept draft", false)
+                    .is_some()
+            );
         }
     }
 
     #[test]
     fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let generation = app.refresh_ui.source_generation;
@@ -35249,43 +36122,95 @@ mod tests {
 
     #[test]
     fn mutation_completion_preserves_host_refusal_and_retires_queued_projections() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         for failed in [false, true] {
             for queued in [false, true] {
                 let (_temporary, mut app, key, sibling) = source_control_test_app();
                 app.active_workspace = Some(key.canonical_path.clone());
                 let source = app.sidebar_model.source_control.as_ref().unwrap();
-                let first = source.group(crate::repository::ChangeArea::Unstaged).unwrap().rows()[0].selection();
-                let pending = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
-                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![first.clone()])));
+                let first = source
+                    .group(crate::repository::ChangeArea::Unstaged)
+                    .unwrap()
+                    .rows()[0]
+                    .selection();
+                let pending = source
+                    .group(crate::repository::ChangeArea::Untracked)
+                    .unwrap()
+                    .rows()[0]
+                    .selection();
+                drop(app.enqueue_git_mutation(
+                    key.clone(),
+                    QueuedGitMutation::Stage(vec![first.clone()]),
+                ));
                 let operation = app.source_control_mutations[&key.canonical_path].id;
-                if queued { drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending.clone()]))); }
-                let reason: Arc<str> = "Host mutation authority is no longer available; reads remain available.".into();
-                app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+                if queued {
+                    drop(app.enqueue_git_mutation(
+                        key.clone(),
+                        QueuedGitMutation::Stage(vec![pending.clone()]),
+                    ));
+                }
+                let reason: Arc<str> =
+                    "Host mutation authority is no longer available; reads remain available."
+                        .into();
+                app.sidebar_model
+                    .source_control
+                    .as_mut()
+                    .unwrap()
+                    .set_mutation_unavailable_reason(Some(reason.clone()));
                 // This owns a real admitted turn, but no fake Git process runs:
                 // deliver the exact completion through the application handler.
                 drop(app.update(Message::SourceControlMutated {
-                    key: key.clone(), operation,
-                    report: failed.then(|| "First stage failed".to_owned()), committed: false,
+                    key: key.clone(),
+                    operation,
+                    report: failed.then(|| "First stage failed".to_owned()),
+                    committed: false,
                 }));
-                assert!(app.source_control_mutations.is_empty(), "no queued work is promoted after capability refusal");
+                assert!(
+                    app.source_control_mutations.is_empty(),
+                    "no queued work is promoted after capability refusal"
+                );
                 let source = app.sidebar_model.source_control.as_ref().unwrap();
                 assert_eq!(source.mutation_unavailable_reason(), Some(reason.as_ref()));
                 assert!(!source.busy());
                 let staged = source.group(crate::repository::ChangeArea::Staged).unwrap();
-                assert_eq!(staged.rows().iter().any(|row| row.entry.path == first.path), !failed,
-                    "a completed first stage survives success; a failed stage rolls back");
-                assert!(!staged.rows().iter().any(|row| row.entry.path == pending.path), "unsupported pending work cannot remain optimistically staged");
-                assert!(source.group(crate::repository::ChangeArea::Untracked).unwrap().rows().iter().any(|row| row.entry.path == pending.path));
-                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending])));
-                assert!(app.source_control_mutations.is_empty(), "later admission still observes the host refusal");
+                assert_eq!(
+                    staged.rows().iter().any(|row| row.entry.path == first.path),
+                    !failed,
+                    "a completed first stage survives success; a failed stage rolls back"
+                );
+                assert!(
+                    !staged
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == pending.path),
+                    "unsupported pending work cannot remain optimistically staged"
+                );
+                assert!(
+                    source
+                        .group(crate::repository::ChangeArea::Untracked)
+                        .unwrap()
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == pending.path)
+                );
+                drop(
+                    app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending])),
+                );
+                assert!(
+                    app.source_control_mutations.is_empty(),
+                    "later admission still observes the host refusal"
+                );
             }
         }
     }
 
     #[test]
     fn git_mutation_failure_rolls_back_only_failed_intent_and_keeps_pending_rows() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let source = app.sidebar_model.source_control.as_ref().unwrap();
@@ -35352,7 +36277,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         for index in 0..2 {
@@ -35376,7 +36303,9 @@ mod tests {
     }
     #[test]
     fn partial_discard_keeps_undo_after_rollback_and_rebinding() {
-        if !crate::repository::WorktreeAuthority::supported() { return; }
+        if !crate::repository::WorktreeAuthority::supported() {
+            return;
+        }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let path = crate::repository::RepoPath::parse("discarded.txt").unwrap();
@@ -35450,7 +36379,11 @@ mod tests {
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: app.refresh_ui.source_generation,
-            result: Ok(Some(Box::new((snapshot, model, app.refresh_ui.source_binding.clone().unwrap())))),
+            result: Ok(Some(Box::new((
+                snapshot,
+                model,
+                app.refresh_ui.source_binding.clone().unwrap(),
+            )))),
         }));
         assert_eq!(
             app.sidebar_model
