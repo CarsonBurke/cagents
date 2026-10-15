@@ -1,8 +1,10 @@
 //! Accepted-input ownership is independent of optional original settings.
-//! Lifecycle completion is NOT success: the native engine also uses it for
-//! error_max_turns. No terminal cause or foreground tool ownership is guessed.
+//! Native SDK input receipts prove message membership and terminal causes.
+//! Lifecycle completion remains acceptance-only; it never implies success.
 use super::*;
 use crate::chat::{protocol::input_proof::ClaudeProofs,turn_outcomes::{TurnIdentity,TurnIdentityKind,TurnUpdate}};
+
+mod receipts;
 
 const PENDING:usize=64;
 const RECENT:usize=128;
@@ -13,6 +15,7 @@ pub(super) struct Inputs {
     pending:VecDeque<(String,Vec<String>)>,
     recent:VecDeque<(String,TurnIdentity)>,
     confirmed:Option<String>,
+    receipts: receipts::Receipts,
 }
 fn user_aliases(events:&[Event])->Vec<String>{
     events.iter().filter_map(|event|match event{Event::Item(item) if item.role==Role::User=>Some(item.id.clone()),_=>None}).collect()
@@ -48,8 +51,9 @@ impl Inputs {
     /// Only local proof of never writing, never a generic interruption result.
     pub(super) fn discard_undispatched(&mut self,uuid:&str){
         self.proofs.cancel(uuid);self.pending.retain(|(id,_)|id!=uuid);
+        self.receipts.discard(uuid);
     }
-    pub(super) fn observe(&mut self,frame:&Value,step:&mut Step,native_session:Option<&str>) {
+    pub(super) fn observe(&mut self,frame:&Value,step:&mut Step,native_session:Option<&str>,stream_message:Option<&str>) {
         if frame["type"]=="conversation_reset"{*self=Self::default();return;}
         if frame["type"]=="prompt_suggestion" || !frame["parent_tool_use_id"].is_null(){return;}
         // Only the main decoder can establish native session authority. An
@@ -72,6 +76,7 @@ impl Inputs {
             // its native display rows are deferred or outside this window.
             if !ids.contains(&identity.id){ids.push(identity.id.clone());}
             emit_bind(&identity,ids,step);
+            self.receipts.accepted(&proof.command_id, &identity, step);
             self.recent.push_back((proof.command_id,identity));
             while self.recent.len()>RECENT{self.recent.pop_front();}
         } else if frame["type"]=="user" && frame["isSynthetic"].as_bool()!=Some(true) && frame["message"]["role"]=="user" && !aliases.is_empty()
@@ -79,7 +84,12 @@ impl Inputs {
             // A later real replay can expose additional native parser aliases.
             emit_bind(identity,aliases,step);
         }
-        if frame["type"]=="command_lifecycle" && matches!(frame["state"].as_str(),Some("refused"|"discarded")) && let Some(uuid)=frame["command_uuid"].as_str(){self.pending.retain(|(id,_)|id!=uuid);}
+        if frame["type"]=="command_lifecycle" && matches!(frame["state"].as_str(),Some("refused"|"discarded")) && let Some(uuid)=frame["command_uuid"].as_str(){self.pending.retain(|(id,_)|id!=uuid);self.receipts.discard(uuid);}
+        let pending = &self.pending;
+        let recent = &self.recent;
+        self.receipts.observe(frame, step, stream_message, self.confirmed.as_deref(),
+            |input| pending.iter().any(|(id, _)| id == input) || recent.iter().any(|(id, _)| id == input),
+            |input, session| recent.iter().find(|(id, identity)| id == input && identity.session_id == session).map(|(_, identity)| identity.clone()));
     }
 }
 
@@ -148,6 +158,6 @@ mod tests {
     }
     #[test]
     fn never_dispatched_input_and_local_settlement_cannot_bind_prior_input(){
-        let mut inputs=Inputs::default();inputs.submit("held",&[]);inputs.discard_undispatched("held");let mut step=Step{events:vec![Event::TurnSettled,Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],..Step::default()};inputs.observe(&fate("held","started"),&mut step,None);inputs.observe(&echo("held"),&mut step,None);assert!(bindings(&step).is_empty());
+        let mut inputs=Inputs::default();inputs.submit("held",&[]);inputs.discard_undispatched("held");let mut step=Step{events:vec![Event::TurnSettled,Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],..Step::default()};inputs.observe(&fate("held","started"),&mut step,None,None);inputs.observe(&echo("held"),&mut step,None,None);assert!(bindings(&step).is_empty());
     }
 }

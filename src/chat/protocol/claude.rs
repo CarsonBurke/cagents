@@ -2625,7 +2625,7 @@ impl Adapter for Claude {
         // A configured --session-id is a routing constraint, not provider
         // confirmation. Only an actual validated native frame can seed proof.
         let native_session=if frame["type"]!="prompt_suggestion" && frame["parent_tool_use_id"].is_null(){frame["session_id"].as_str()}else{None};
-        self.turn_inputs.observe(&frame,&mut step,native_session);
+        self.turn_inputs.observe(&frame,&mut step,native_session,self.streams.get("").map(|stream|stream.message.as_str()));
         Ok(step)
     }
 }
