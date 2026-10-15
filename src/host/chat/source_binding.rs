@@ -682,6 +682,13 @@ pub(super) fn claim_continuation(
             return Err(unavailable(reason));
         }
     };
+    // Test scheduling loses only the host-observed authenticated result. The
+    // helper already owns the real claim, and the genuine Pending phase stays.
+    #[cfg(test)]
+    if let Some(observe) = take_claim_result_loss(binding) {
+        observe(claim);
+        return Err(unavailable("Test lost the authenticated claim result before host token publication"));
+    }
     continuation.claim = Some(claim);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let entry = state
@@ -2369,4 +2376,52 @@ finally:
         assert!(state.terminals.is_empty());
         assert!(state.chat_handoffs.is_empty());
     }
+}
+
+// These drivers schedule actual ownership paths; they never install native
+// history, construct a PendingHandoff, or supply a backend/token witness.
+#[cfg(test)]
+type ClaimResultLoss = (ChatSourceBinding, Box<dyn FnOnce(uuid::Uuid) + Send>);
+#[cfg(test)]
+static CLAIM_RESULT_LOSS: std::sync::Mutex<Option<ClaimResultLoss>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn take_claim_result_loss(binding: &ChatSourceBinding) -> Option<Box<dyn FnOnce(uuid::Uuid) + Send>> {
+    let mut hook = CLAIM_RESULT_LOSS.lock().unwrap();
+    if hook.as_ref().is_some_and(|(expected, _)| expected == binding) {
+        hook.take().map(|(_, callback)| callback)
+    } else { None }
+}
+#[cfg(test)]
+pub(in crate::host) fn owning_binding_for_test(host: &SharedHost, id: TerminalId) -> Result<ChatSourceBinding, ProtocolError> {
+    let transition = restart::transition_gate(host, id);
+    let _guard = transition.lock().unwrap();
+    // Unlike legacy fixture_binding, this requires the production installation.
+    refresh(host, id, false)
+}
+#[cfg(test)]
+pub(in crate::host) fn owning_claim_for_test(host: &SharedHost, binding: &ChatSourceBinding,
+    lose_result: Option<Box<dyn FnOnce(uuid::Uuid) + Send>>) -> Result<(), ProtocolError> {
+    let transition = restart::transition_gate(host, binding.source.id);
+    let _guard = transition.lock().unwrap();
+    if let Some(callback) = lose_result {
+        let mut hook = CLAIM_RESULT_LOSS.lock().unwrap();
+        assert!(hook.is_none());
+        *hook = Some((binding.clone(), callback));
+    }
+    let result = (|| {
+        let mut original = continuation(host, binding)?;
+        claim_continuation(host, binding, binding, &mut original)
+    })();
+    // Clear an unused hook on pre-effect refusal; no other test can inherit it.
+    let _ = take_claim_result_loss(binding);
+    result
+}
+#[cfg(test)]
+pub(in crate::host) fn pending_claim_for_test(host: &SharedHost, binding: &ChatSourceBinding)
+    -> Option<(Option<uuid::Uuid>, bool)> {
+    host.lock().unwrap().native_sources.entries.get(&binding.source.id)
+        .filter(|entry| entry.instance == binding.execution_instance)
+        .and_then(|entry| entry.pending_handoff.as_ref())
+        .filter(|pending| pending.admitted == *binding)
+        .map(|pending| (pending.token, pending.backend_closed))
 }

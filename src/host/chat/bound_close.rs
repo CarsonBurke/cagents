@@ -74,6 +74,10 @@ pub(super) fn close_unattempted(host: &SharedHost, source: &Session)
     // predicate. Generic close_for_resume would lose this original-owner scope.
     pending.close_original(host).map_err(|error| error.message)?;
     native_cleanup::close_retained_inner_then(host, pending.admitted(), false, None, || {
+        #[cfg(test)]
+        if let Some(callback) = take_final_verification_hook(pending.binding()) {
+            callback()?;
+        }
     let receipt = chat::native_holder::closed_source(pending.admitted(), &proof)?
         .filter(|(record, paired_closed)| record == &expected && *paired_closed)
         .ok_or("The original owner lacks its exact complete native cleanup receipt; the pending phase was retained")?;
@@ -94,4 +98,24 @@ pub(super) fn close_unattempted(host: &SharedHost, source: &Session)
         .map_err(|error| error.message)
     })?;
     Ok(Some(()))
+}
+
+#[cfg(test)]
+type VerificationHook = (crate::terminal_ipc::ChatSourceBinding, Box<dyn FnOnce() -> Result<(), String> + Send>);
+#[cfg(test)]
+static FINAL_VERIFICATION: std::sync::Mutex<Option<VerificationHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn take_final_verification_hook(binding: &crate::terminal_ipc::ChatSourceBinding)
+    -> Option<Box<dyn FnOnce() -> Result<(), String> + Send>> {
+    let mut hook = FINAL_VERIFICATION.lock().unwrap();
+    if hook.as_ref().is_some_and(|(expected, _)| expected == binding) {
+        hook.take().map(|(_, callback)| callback)
+    } else { None }
+}
+#[cfg(test)]
+pub(in crate::host) fn fail_verification_for_test(binding: crate::terminal_ipc::ChatSourceBinding,
+    callback: impl FnOnce() -> Result<(), String> + Send + 'static) {
+    let mut hook = FINAL_VERIFICATION.lock().unwrap();
+    assert!(hook.is_none());
+    *hook = Some((binding, Box::new(callback)));
 }

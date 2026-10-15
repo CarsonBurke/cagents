@@ -2,6 +2,9 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod bound_close;
+#[cfg(test)]
+pub(in crate::host) use bound_close::fail_verification_for_test;
+
 mod execution_directory;
 mod handoff_budget;
 mod native_cleanup;
