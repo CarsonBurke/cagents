@@ -448,3 +448,40 @@ fn unavailable_keyring_helper_reports_the_install_and_unlock_action() {
     assert!(error["message"].as_str().unwrap().contains("unlock"));
     assert_eq!(f.calls(), 0);
 }
+
+#[test]
+fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostics() {
+    let f = Fixture::new();
+    let helper = f.path().join("bin/secret-tool");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s' 'private-fixture-diagnostic' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(error["message"].as_str().unwrap().contains("unlock"));
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(!diagnostics.contains("private-fixture-diagnostic"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(f.calls(), 0);
+
+    // Genuine absence retains the normal credential fallback rather than
+    // reporting the private service as unavailable.
+    fs::write(&helper, "#!/bin/sh\nexit 1\n").unwrap();
+    let missing = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let error = serde_json::from_slice::<Value>(&missing.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_auth_required");
+    assert_eq!(f.calls(), 0);
+}

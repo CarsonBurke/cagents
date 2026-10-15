@@ -2,7 +2,7 @@
 //! secret values only over stdin; settings, recipes and command arguments never
 //! contain them. Keep the CLI lane independent of the desktop dependency graph.
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -51,10 +51,15 @@ fn helper(
         .args(["application", APPLICATION, "account", &account])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| keyring_error())?;
     let stdout = child.stdout.take().expect("piped output");
+    let mut stderr = child.stderr.take().expect("piped errors");
+    // libsecret reports both a missing entry and service errors with exit 1.
+    // Only errors emit stderr. Drain it without retaining or logging content:
+    // helper diagnostics are not trusted to keep credential values private.
+    let errors = thread::spawn(move || io::copy(&mut stderr, &mut io::sink()));
     let reader = thread::spawn(move || {
         let mut output = Vec::new();
         stdout
@@ -86,9 +91,13 @@ fn helper(
         .join()
         .map_err(|_| keyring_error())?
         .map_err(|_| keyring_error())?;
+    let error_bytes = errors
+        .join()
+        .map_err(|_| keyring_error())?
+        .map_err(|_| keyring_error())?;
     let status = status.ok_or_else(keyring_error)?;
-    // A missing entry is the helper's documented exit 1 and has no output.
-    if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() {
+    // A missing entry exits 1 with neither a value nor error diagnostics.
+    if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() && error_bytes == 0 {
         return Ok(None);
     }
     if !status.success() || written.is_err() || output.len() > MAX_KEY_BYTES {
