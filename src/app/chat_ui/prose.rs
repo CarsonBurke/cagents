@@ -620,6 +620,7 @@ impl Renderer {
             columns: columns.len(), rows: rows.len() + 1,
         }))
             .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path)))
             .spacing(settings.spacing.0 / 2.0), self.reader_memory.clone(), self.reader_context.clone(),
             selection::logical_identity(&self.item, &self.path), false)
     }
@@ -662,7 +663,7 @@ impl Renderer {
             )
             .direction(iced::widget::scrollable::Direction::Horizontal(
                 design::scrollbar(),
-            )), self.reader_memory.clone(), self.reader_context.clone(),
+            )).id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path))), self.reader_memory.clone(), self.reader_context.clone(),
                 selection::logical_identity(&self.item, &self.path), false),
             Some(
                 language

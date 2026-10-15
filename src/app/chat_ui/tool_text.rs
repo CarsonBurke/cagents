@@ -296,11 +296,12 @@ impl ToolText {
         let Some((height, follows)) = limit else {
             return body;
         };
-        let scrolled = widget::scrollable(body)
+        let mut scrolled = widget::scrollable(body)
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
             .height(Length::Shrink);
+        if let Some((_, context, identity)) = &reader { scrolled = scrolled.id(scroll::block_id(target, context.as_deref(), *identity)); }
         let scrolled: Element<'static, Message> = if follows {
             scroll::tool_output(scrolled.anchor_bottom())
         } else { scrolled.into() };
