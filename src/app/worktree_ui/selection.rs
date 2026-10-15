@@ -7,6 +7,8 @@ pub(in crate::app) struct State {
     generation: u64,
     pub(in crate::app) pending: bool,
     pub(in crate::app) initialize_runtimes: bool,
+    /// Superseded workers can still own a not-yet-delivered directory lease.
+    pub(super) inflight: HashSet<u64>,
 }
 impl State {
     pub(in crate::app) fn cancel(&mut self) {
@@ -113,9 +115,10 @@ impl Cagents {
     }
 
     fn prepare_worktree_selection(
-        &self, generation: u64, path: PathBuf, create: bool, intent: Intent, epoch: u64,
+        &mut self, generation: u64, path: PathBuf, create: bool, intent: Intent, epoch: u64,
         prepare: impl FnOnce(PathBuf) -> Result<(PathBuf, Vec<(PathBuf,PathBuf)>, Option<crate::worktree_cleanup::Protection>),String> + Send + 'static,
     ) -> Task<Message> {
+        self.worktree_selection.inflight.insert(generation);
         let roots = self.known_worktree_roots.clone();
         cosmic::task::future(async move {
             let requested = path.clone();
@@ -128,6 +131,15 @@ impl Cagents {
     }
 
     pub(in crate::app) fn worktree_selection_prepared(&mut self, generation: u64, create: bool, receipt: Receipt) -> Task<Message> {
+        let task = self.apply_worktree_selection_prepared(generation, create, receipt);
+        // The consumed receipt and every uninstalled guard have dropped before
+        // a deletion continuation can attempt its exclusive directory lease.
+        self.worktree_selection.inflight.remove(&generation);
+        let releases = self.finish_worktree_protection_releases(None);
+        Task::batch([task, releases])
+    }
+
+    fn apply_worktree_selection_prepared(&mut self, generation: u64, create: bool, receipt: Receipt) -> Task<Message> {
         let Some((requested,epoch,roots,intent,result)) = receipt.0.lock().unwrap().take() else { return Task::none(); };
         if generation != self.worktree_selection.generation || !self.worktree_selection.pending {
             // Dropping an obsolete receipt releases its unexposed lease.

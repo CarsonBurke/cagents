@@ -486,6 +486,18 @@ impl WindowProtections {
 
     pub(crate) fn needs_retry(&self) -> bool { self.retry_after.is_some() }
 
+    /// In-memory inspection only: no path resolution runs on the UI thread.
+    pub(crate) fn holds_within(&self, directory: &Path) -> bool {
+        self.directories.keys().any(|held| held.starts_with(directory))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_release_all(&mut self) {
+        self.directories.clear();
+        self.resolved.clear();
+        self.requested.clear();
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
         if let Some(protection) = protect(directory)? {
             self.resolved
