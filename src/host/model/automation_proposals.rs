@@ -947,4 +947,45 @@ mod tests {
         assert_eq!(registry.pending_automation_proposal_count().unwrap(), 1);
         assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
     }
+    #[test]
+    fn automation_checkpoint_refuses_a_future_schema_committed_after_the_outer_read() {
+        let (root, registry, proposal) = fixture();
+        let database = root.path().join("registry.sqlite3");
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        // This is the opener's admitted version before its writer reservation.
+        let observed: u32 = registry.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(observed, 12);
+        let competing = Connection::open(&database).unwrap();
+        let future = super::super::SCHEMA_VERSION + 1;
+        competing.execute_batch(&format!("BEGIN IMMEDIATE; CREATE TABLE future_checkpoint_owned (value TEXT NOT NULL) STRICT; INSERT INTO future_checkpoint_owned VALUES ('preserve future intent'); PRAGMA user_version={future}; COMMIT;")).unwrap();
+        let before: Vec<(String, Option<String>)> = competing.prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        // The stale outer branch still tries its old checkpoint. Its real
+        // production helper must re-admit under BEGIN IMMEDIATE, not stamp13.
+        let error = super::super::migrate_automation_extensions(&registry.db).unwrap_err();
+        assert!(error.contains("newer than supported"), "{error}");
+        assert_eq!(registry.db.pragma_query_value::<u32,_>(None, "user_version", |row| row.get(0)).unwrap(), future);
+        let after: Vec<(String, Option<String>)> = registry.db.prepare("SELECT name,sql FROM sqlite_master ORDER BY type,name").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(after, before, "no extension DDL may run on a future schema");
+        assert_eq!(registry.db.query_row("SELECT value FROM future_checkpoint_owned", [], |row| row.get::<_,String>(0)).unwrap(), "preserve future intent");
+        assert_eq!(registry.automation_proposal(proposal.id,None).unwrap(),Some(proposal));
+        assert!(!registry.db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')", [], |row| row.get::<_,bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn automation_checkpoint_accepts_an_already_committed_compatible_upgrade() {
+        let (root, registry, proposal) = fixture();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        let observed: u32 = registry.db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(observed, 12);
+        let competing = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        super::super::migrate_automation_extensions(&competing).unwrap();
+        competing.execute("UPDATE metadata SET automation_proposal_sequence=41 WHERE key=0", []).unwrap();
+        // The first opener's old12 branch resumes after the other writer has
+        // completed the atomic checkpoint and made a subsequent consent edit.
+        super::super::migrate_automation_extensions(&registry.db).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(),41);
+        assert_eq!(registry.db.pragma_query_value::<u32,_>(None,"user_version",|row|row.get(0)).unwrap(),13);
+        assert_eq!(registry.automation_proposal(proposal.id,None).unwrap(),Some(proposal));
+    }
+
 }
