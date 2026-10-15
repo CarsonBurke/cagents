@@ -313,6 +313,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             sections.push(group(app, provider, &layout, project));
         }
     }
+    sections.push(linear::view(&state.linear));
     widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
