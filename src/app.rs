@@ -26091,6 +26091,82 @@ mod tests {
     }
 
     #[test]
+    fn retained_background_spinner_reconciles_visibility_after_a_modal() {
+        use crate::ui_controls::activity_spinner;
+        use cosmic::Application as _;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, window};
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let mut modal: Element<'_, ()> = crate::inspector::ModalOverlay::new(
+            activity_spinner(24.0, crate::design::accent_color),
+            iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .into();
+        let mut tree = Tree::new(modal.as_widget());
+        let node = modal.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        for event in [window::Event::Unfocused, window::Event::Occluded(true)] {
+            match event {
+                window::Event::Unfocused => {
+                    drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))))
+                }
+                window::Event::Occluded(occluded) => drop(app.update(Message::WindowOccluded {
+                    window: main,
+                    occluded,
+                })),
+                _ => unreachable!(),
+            }
+            // The real modal wrapper forwards these only to its foreground.
+            modal.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(event),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        let mut retained = tree.children.remove(0);
+        let mut exposed: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
+        let node = layout::Node::new(Size::new(24.0, 24.0));
+        let mut redraw = || {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            exposed.as_widget_mut().update(
+                &mut retained,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            shell.redraw_request()
+        };
+        assert_eq!(redraw(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_eq!(redraw(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        assert_ne!(redraw(), window::RedrawRequest::Wait);
+    }
+
+    #[test]
     fn a_spinner_mounted_after_main_window_visibility_changes_stays_paused() {
         use crate::ui_controls::activity_spinner;
         use cosmic::Application as _;

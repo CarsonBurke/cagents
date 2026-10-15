@@ -213,6 +213,17 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         viewport: &cosmic::iced::Rectangle,
     ) {
         let state = tree.state.downcast_mut::<SpinnerState>();
+        if matches!(
+            event,
+            cosmic::iced::Event::Window(cosmic::iced::window::Event::RedrawRequested(_))
+        ) {
+            // Modal and parked subtrees can miss native visibility events.
+            // Reconcile retained state before it schedules another frame.
+            let visibility = ACTIVITY_VISIBILITY.with(std::cell::Cell::get);
+            state.active = visibility.focused;
+            state.occluded = visibility.occluded;
+            state.minimized = visibility.minimized;
+        }
         state.observe(event);
         if !state.active || state.occluded || state.minimized {
             return;
@@ -630,6 +641,12 @@ mod tests {
         ));
 
         let requested = |origin: Point, focus_event: Option<Event>| {
+            observe_activity_window_event(&window::Event::Focused);
+            observe_activity_window_event(&window::Event::Occluded(false));
+            observe_activity_window_event(&window::Event::Resized(viewport.size()));
+            if let Some(Event::Window(event)) = &focus_event {
+                observe_activity_window_event(event);
+            }
             let mut element: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
             let mut tree = Tree::new(element.as_widget());
             tree.state.downcast_mut::<SpinnerState>().active = true;
