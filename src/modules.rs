@@ -124,6 +124,7 @@ pub mod worktree_cleanup;
 pub mod worktree_basis;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_setup;
+pub mod worktree_branch;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;
