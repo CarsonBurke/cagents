@@ -302,6 +302,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::app::tests::{editor, run_tasks};
+    use cosmic::iced::futures::StreamExt;
 
     fn open_file(app: &mut Editor, root: &Path, path: &str) -> CardId {
         let task = app.add(Opened { root: root.to_path_buf(), file: Some(path.into()), snapshot: None }, true);
