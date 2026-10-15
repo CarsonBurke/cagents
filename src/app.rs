@@ -560,7 +560,8 @@ fn notice_surface<'a>(
 /// foreground and the detail lines in the ambient one.
 fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .size(design::interface_size())
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
@@ -571,7 +572,8 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
 /// `notice_surface_detail`.
 fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -588,7 +590,8 @@ fn notice_surface_detail<'a>(
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))

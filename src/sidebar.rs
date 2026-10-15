@@ -8442,10 +8442,10 @@ fn changes_footer<'a>(
         crate::ui_controls::field::editor("Commit subject", &state.commit_draft.subject_composer.0)
             .placeholder("Commit subject")
             .id(chrome.commit_input_id.clone())
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
-            .size(design::TEXT_BODY)
+            .height(Length::Fixed(design::interface_size() * 1.3 + 16.0))
+            .size(design::interface_size())
             .padding([space::S, 10.0])
             .style(commit_description_style)
             .key_binding(move |press| {
@@ -8494,13 +8494,13 @@ fn changes_footer<'a>(
             .id(chrome.commit_description_id.clone())
             .height(Length::Fixed(
                 (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
-                    * design::TEXT_BODY
+                    * design::interface_size()
                     * 1.3
                     + 16.0,
             ))
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .style(commit_description_style)
-            .size(design::TEXT_BODY)
+            .size(design::interface_size())
             .padding([space::XS, space::S])
             .key_binding(move |press| {
                 if !matches!(
@@ -9846,13 +9846,15 @@ fn search_label(
     heading: bool,
 ) -> Element<'static, SidebarAction> {
     use cosmic::iced::widget::text::Span;
+    let size = design::scaled_interface_size(size);
+    let line_height = cosmic::iced::widget::text::LineHeight::Absolute((size + 5.0).into());
     let font = cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
-        ..cosmic::font::default()
+        ..design::interface_font()
     };
     let emphasis = cosmic::font::Font {
         weight: cosmic::iced::font::Weight::Bold,
@@ -9862,6 +9864,7 @@ fn search_label(
     if highlights.is_empty() {
         return widget::text::body(label.to_owned())
             .size(size)
+            .line_height(line_height)
             .font(font)
             .class(class)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -9889,6 +9892,7 @@ fn search_label(
     }
     let label = cosmic::iced::widget::rich_text(spans)
         .size(size)
+        .line_height(line_height)
         .font(font)
         .class(class)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -11069,6 +11073,32 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn settings_interface_typography_reaches_plain_and_highlighted_sidebar_identity_labels() {
+        use super::*;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let renderer = headless_renderer();
+        let height = |query| {
+            let mut label = search_label("Project fixture", query, CHILD_ROW_TEXT_SIZE, theme::Text::Default, false);
+            let mut tree = Tree::new(label.as_widget());
+            label.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+            ).size().height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = [height(""), height("fixture")];
+        design::configure_typography("", 24.0, "", 14.0);
+        let large = [height(""), height("fixture")];
+        for (small, large) in small.into_iter().zip(large) {
+            assert!(large > small, "sidebar identity must follow interface size");
+            assert!(large <= WORKTREE_ROW_HEIGHT, "largest line box must fit its row");
+            assert_eq!(large, 29.0, "plain and highlighted labels use the same absolute line box");
+        }
+        design::configure_typography("", 13.0, "", 14.0);
+    }
+
     #[test]
     fn required_review_policy_does_not_claim_the_viewer_was_requested() {
         let mut pull_request = crate::pull_request_review::tests::pull_request(51);

@@ -126,6 +126,10 @@ pub fn interface_font() -> Font {
 pub fn interface_size() -> f32 {
     TYPOGRAPHY.with(|active| active.get().interface_size)
 }
+/// Retain a text role's proportion within the selected interface type scale.
+pub fn scaled_interface_size(base_size: f32) -> f32 {
+    interface_size() * base_size / TEXT_BODY
+}
 pub fn chat_font() -> Font {
     TYPOGRAPHY.with(|active| active.get().chat_font)
 }
@@ -184,7 +188,8 @@ pub fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
 pub fn caption<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::caption(text)
         .font(interface_font())
-        .size(interface_size() * TEXT_CAPTION / TEXT_BODY)
+        .size(scaled_interface_size(TEXT_CAPTION))
+        .line_height(LineHeight::Absolute(scaled_interface_size(17.0).into()))
         .class(cosmic::theme::Text::Custom(muted_text))
 }
 
@@ -201,9 +206,9 @@ pub fn heading_font() -> Font {
 /// The name of a dialog, a form or a section of a page.
 pub fn title<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
-        .size(interface_size() * TEXT_TITLE / TEXT_BODY)
+        .size(scaled_interface_size(TEXT_TITLE))
         .line_height(LineHeight::Absolute(
-            (interface_size() * LINE_TITLE / TEXT_BODY).into(),
+            scaled_interface_size(LINE_TITLE).into(),
         ))
         .font(title_font())
 }
@@ -219,9 +224,9 @@ pub fn title_font() -> Font {
 /// The name of a whole page or an otherwise empty pane.
 pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
-        .size(interface_size() * TEXT_DISPLAY / TEXT_BODY)
+        .size(scaled_interface_size(TEXT_DISPLAY))
         .line_height(LineHeight::Absolute(
-            (interface_size() * 26.0 / TEXT_BODY).into(),
+            scaled_interface_size(26.0).into(),
         ))
         .font(weighted(Weight::Bold))
 }
@@ -339,6 +344,7 @@ mod settings_typography_tests {
         let small_checkbox = text_height(crate::ui_controls::field::checkbox(false).label("Choice").into());
         let small_toggle = text_height(crate::ui_controls::field::toggle(false).label("Choice").into());
         let small_button = text_height(crate::ui_controls::button::secondary("Action").into());
+        let small_caption = text_height(caption("Caption").into());
         let toolkit_label_height = || {
             use cosmic::iced::advanced::widget::Operation;
             struct Label(Option<f32>);
@@ -370,6 +376,9 @@ mod settings_typography_tests {
         let large_button = text_height(crate::ui_controls::button::secondary("Action").into());
         assert!(large_button > small_button && large_button >= interface_size() + 5.0);
         assert!(toolkit_label_height() > small_toolkit_label * 1.5, "toolkit buttons inherit interface size");
+        let large_caption = text_height(caption("Caption").into());
+        assert!(large_caption > small_caption);
+        assert!((large_caption - scaled_interface_size(17.0)).abs() < 0.01, "caption line box follows its type size");
         assert_eq!(text_height(widget::text("Fixed caption").size(12.0).into()), explicit);
         configure_typography("", 13.0, "", 14.0);
     }
