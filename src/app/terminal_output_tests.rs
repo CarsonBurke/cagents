@@ -418,3 +418,55 @@ fn stable_activity_and_unread_move_on_structural_ownership_changes() {
     apply(&mut app, card, &mut peer, None);
     assert_eq!(counts(), (0, 0));
 }
+
+#[test]
+fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing() {
+    use crate::{agent::{Activity, ActivityState, Provider}, model::{ProjectKind, WorktreeId},
+        repository::RepositoryId, sidebar::{SidebarProject, SidebarWorktree}};
+    let mut app = super::tests::context_inspector_test_app(true);
+    let card = app.workspace.focused().unwrap();
+    let root = card_directory(app.card_state(card).unwrap()).unwrap().to_path_buf();
+    let nested = root.join("nested-owner");
+    let first = ProjectId::new();
+    let second = ProjectId::new();
+    let first_row = WorktreeId::new();
+    let second_row = WorktreeId::new();
+    let nested_row = WorktreeId::new();
+    let row = |id, path: PathBuf| SidebarWorktree::new(id, path, None, false, false, None, None, None);
+    app.sidebar_model.projects = vec![
+        SidebarProject::new(first, RepositoryId::new(), "Folder".into(), root.clone(),
+            vec![row(first_row, root.clone())], vec![]).with_kind(ProjectKind::Folder),
+        SidebarProject::new(second, RepositoryId::new(), "Repository".into(), root.clone(),
+            vec![row(second_row, root.clone()), row(nested_row, nested.clone())], vec![]),
+    ];
+    let folder = app.sidebar_model.projects[0].folder_key().unwrap();
+    let working = Activity { provider: Provider::Claude, state: ActivityState::Working };
+    app.sidebar_state.set_card_activity(card, working);
+    app.sidebar_state.observe_card_update(card);
+    app.refresh_sidebar_worktree_panes();
+    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), Some(ActivityState::Working));
+    assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
+    assert_eq!(app.sidebar_state.agent_activity(second, second_row), None);
+    assert!(app.sidebar_state.worktree_has_panes(first, first_row));
+    assert!(app.sidebar_state.worktree_has_panes(second, second_row));
+    app.worktree_owners.insert(card, nested.clone());
+    Arc::make_mut(&mut app.durable).card_scopes.insert(card, root.clone());
+    app.refresh_sidebar_worktree_panes();
+    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), None);
+    assert_eq!(app.sidebar_state.agent_activity(second, nested_row), Some(ActivityState::Working));
+    assert!(app.sidebar_state.has_agent_update(second, nested_row));
+    assert!(!app.sidebar_state.worktree_has_panes(first, first_row));
+    assert!(app.sidebar_state.worktree_has_panes(second, nested_row));
+    app.worktree_owners.remove(&card);
+    Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
+    app.known_worktree_roots.clear();
+    for project in &mut app.sidebar_model.projects { project.worktrees.clear(); }
+    if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
+        session.launch.working_directory = root.join("unregistered-child");
+    }
+    app.refresh_sidebar_worktree_panes();
+    assert_eq!(app.sidebar_state.agent_activity(first, folder.worktree_id), None,
+        "an exact folder key is not a newly discovered ancestor root");
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+}
