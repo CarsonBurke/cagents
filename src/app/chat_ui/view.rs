@@ -1161,9 +1161,11 @@ impl Runtime {
         self.selected_subagent.hash(&mut fingerprint);
         let selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
         let items = selected.map_or(self.snapshot.items.as_slice(), |agent| agent.items.as_slice());
-        // Snapshot generation covers transcript edits. Avoid walking every
-        // loaded item during pointer/selection/timer-only view rebuilds.
-        self.snapshot.generation.hash(&mut fingerprint);
+        // Cache preparation advances this epoch only for presented text or
+        // ordering edits. Metadata-only heartbeats and hidden-child streams
+        // must not rebuild the entire logical catalog.
+        self.presentation_revision.hash(&mut fingerprint);
+        selected.map_or(self.snapshot.busy, |agent| agent.status == chat::ToolStatus::Running).hash(&mut fingerprint);
         let mut expanded: Vec<_> = self.expanded.iter().collect(); expanded.sort_unstable(); expanded.hash(&mut fingerprint);
         let mut opened: Vec<_> = self.opened.iter().collect(); opened.sort_unstable(); opened.hash(&mut fingerprint);
         self.tool_groups_expanded.hash(&mut fingerprint);
@@ -1200,7 +1202,12 @@ impl Runtime {
             builder.plain(&item.id, &[2], text.into()); return;
         }
         let Some(cached) = self.cache.get(&item.id) else { return; };
-        if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) { return; }
+        if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) {
+            let selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+            let (items, busy) = selected.map_or((self.snapshot.items.as_slice(), self.snapshot.busy),
+                |agent| (agent.items.as_slice(), agent.status == chat::ToolStatus::Running));
+            if reasoning_finished(items, busy, &item.id) { return; }
+        }
         if matches!(item.content, ItemContent::Text { .. } | ItemContent::Delivery { .. }) {
             if let ItemContent::Delivery { kind: chat::DeliveryKind::Notice, body, .. } = &item.content {
                 let body = if !self.expanded.contains(&item.id) { body.lines().take(NOTICE_LINES).collect::<Vec<_>>().join("\n") } else { body.clone() };
