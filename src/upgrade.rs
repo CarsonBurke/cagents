@@ -109,6 +109,13 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
         })
 }
 
+/// Setup recipes are retained for an explicit reviewed run, never automatic
+/// upgrade replay. The marker is classification, not execution authority.
+#[cfg(any(feature = "host", test))]
+pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
+    recipe.environment.get("CAGENTS_WORKTREE_SETUP").is_some_and(|value| value == "1")
+}
+
 #[cfg(any(feature = "host", test))]
 pub(crate) fn checkpoint_recipe(
     session: &TerminalSession,
@@ -687,8 +694,16 @@ pub(crate) mod handoff {
                 Ok(())
             };
             for terminal in &self.terminals {
-                if !ids.insert(terminal.source.id)
-                    || checkpoint_recipe(&terminal.source, &terminal.relaunches)? != terminal.recipe
+                // An interrupted setup may be present in legacy checkpoint
+                // evidence even though its command is deliberately not safe
+                // to replay. Accept only its unchanged recipe; restore retains
+                // it for review without ever executing it.
+                let recipe_matches = if is_worktree_setup_recipe(&terminal.source.launch) {
+                    terminal.source.launch == terminal.recipe
+                } else {
+                    checkpoint_recipe(&terminal.source, &terminal.relaunches)? == terminal.recipe
+                };
+                if !ids.insert(terminal.source.id) || !recipe_matches
                 {
                     return Err("Upgrade terminal source or safe recipe is inconsistent".into());
                 }
@@ -1240,7 +1255,17 @@ pub(crate) mod handoff {
         }
 
         pub fn archive(&self) -> Result<PathBuf, String> {
-            const ARCHIVE: &str = "daemon-upgrade.abandoned.json";
+            self.archive_as("daemon-upgrade.abandoned.json")
+        }
+
+        /// Preserve deferred setup evidence without leaving a replayable
+        /// checkpoint in the daemon's boot path or replacing older evidence.
+        #[cfg(feature = "host")]
+        pub fn archive_interrupted_setup(&self) -> Result<PathBuf, String> {
+            self.archive_as(&format!("daemon-upgrade.interrupted-setup.{}.json", uuid::Uuid::new_v4()))
+        }
+
+        fn archive_as(&self, archive: &str) -> Result<PathBuf, String> {
             let file = fs_safety::open_beneath(&self.root, Path::new(FILE))
                 .map_err(|error| error.to_string())?;
             let metadata = file.metadata().map_err(|error| error.to_string())?;
@@ -1255,10 +1280,10 @@ pub(crate) mod handoff {
                     self.path.display()
                 ));
             }
-            fs_safety::rename_new_within(&self.root, OsStr::new(FILE), OsStr::new(ARCHIVE))
-                .map_err(|error| format!("Cannot archive checkpoint without replacing prior evidence: {error}. Preserve and explicitly move any existing {} first", self.path.with_file_name(ARCHIVE).display()))?;
+            fs_safety::rename_new_within(&self.root, OsStr::new(FILE), OsStr::new(archive))
+                .map_err(|error| format!("Cannot archive checkpoint without replacing prior evidence: {error}. Preserve and explicitly move any existing {} first", self.path.with_file_name(archive).display()))?;
             fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())?;
-            Ok(self.path.with_file_name(ARCHIVE))
+            Ok(self.path.with_file_name(archive))
         }
 
         /// Host-only: the daemon removes a checkpoint it has finished
