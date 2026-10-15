@@ -225,40 +225,38 @@ pub fn find_all(
     })
 }
 
-/// The names Codex keeps for its conversations apart from their
-/// transcripts, by conversation ID, the latest for each.
-pub fn names(seeds: &[chat::Session]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let mut roots = HashSet::new();
-    for seed in seeds {
+/// Codex names by the seed's actual account root and conversation ID. A
+/// copied session ID in another account is a different resume choice. Shared
+/// roots are read once and share their immutable result across seed recipes.
+pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
+    let mut roots = HashMap::<PathBuf, Arc<HashMap<String, String>>>::new();
+    let empty = Arc::new(HashMap::new());
+    seeds.iter().map(|seed| {
         if seed.launch.provider != Provider::Codex {
-            continue;
+            return empty.clone();
         }
         let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
-            continue;
+            return empty.clone();
         };
         let path = root.join("session_index.jsonl");
-        if !roots.insert(path.clone()) {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if let (Some(id), Some(name)) = (
-                value["id"].as_str(),
-                value["thread_name"]
-                    .as_str()
-                    .and_then(crate::account::clean_label),
-            ) {
-                names.insert(id.to_owned(), name);
+        roots.entry(path.clone()).or_insert_with(|| {
+            let mut names = HashMap::new();
+            if let Ok(file) = std::fs::File::open(&path) {
+                for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if let (Some(id), Some(name)) = (
+                        value["id"].as_str(),
+                        value["thread_name"].as_str().and_then(crate::workspace_model::channel_title),
+                    ) {
+                        names.insert(id.to_owned(), name);
+                    }
+                }
             }
-        }
-    }
-    names
+            Arc::new(names)
+        }).clone()
+    }).collect()
 }
 
 /// Reads a transcript's identity and title, or `None` for a file that is not
@@ -358,7 +356,7 @@ struct Titles {
 
 impl Titles {
     fn note(&mut self, value: &Value) {
-        let label = |key: &str| value[key].as_str().and_then(crate::account::clean_label);
+        let label = |key: &str| value[key].as_str().and_then(crate::workspace_model::channel_title);
         match value["type"].as_str() {
             Some("custom-title") => self.named = label("customTitle").or(self.named.take()),
             Some("ai-title") => self.generated = label("aiTitle").or(self.generated.take()),
@@ -789,7 +787,51 @@ mod tests {
             .concat(),
         )
         .unwrap();
-        assert_eq!(names(&[seed]).get(id).map(String::as_str), Some("Renamed"));
+        assert_eq!(names(&[seed.clone()])[0].get(id).map(String::as_str), Some("Renamed"));
+        for title in ["A".repeat(70), "🔐".repeat(90), "\u{202e}Bundle\nreview\u{2066}".into()] {
+            std::fs::write(root.join("session_index.jsonl"), format!("{}\n", json!({"id":id,"thread_name":title}))).unwrap();
+            assert_eq!(names(&[seed.clone()])[0].get(id).cloned(), crate::workspace_model::channel_title(&title));
+        }
+    }
+
+    #[test]
+    fn codex_names_stay_with_the_original_account_and_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut seeds = Vec::new();
+        let id = "01a0743a-ccb3-7990-b840-3a0779cca5dd";
+        for (slot, provider) in [Provider::Codex, Provider::Codex, Provider::Claude].into_iter().enumerate() {
+            let home = directory.path().join(slot.to_string());
+            std::fs::create_dir_all(&home).unwrap();
+            let account = crate::account::Account {provider, home: crate::account::AccountHome::Linked {key: uuid::Uuid::new_v4(), path: home}};
+            let seed = chat::fresh_session(provider, TerminalId::new(), directory.path().into(), &account).unwrap();
+            if provider == Provider::Codex {
+                let root = provider.session_root(&seed.launch.recipe).unwrap();
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join("session_index.jsonl"), format!("{}\n", json!({"id":id,"thread_name":format!("Account {slot} title")}))).unwrap();
+            }
+            seeds.push(seed);
+        }
+        seeds.push(seeds[0].clone());
+        let names = names(&seeds);
+        assert_eq!(names[0].get(id).map(String::as_str), Some("Account 0 title"));
+        assert_eq!(names[1].get(id).map(String::as_str), Some("Account 1 title"));
+        assert!(names[2].is_empty(), "Claude cannot borrow a same-ID Codex name");
+        assert!(Arc::ptr_eq(&names[0], &names[3]), "one account root is read only once");
+    }
+
+    #[test]
+    fn provider_resume_names_share_live_label_sanitization_and_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"Review encryption performance"}});
+        for title in ["A".repeat(70), "🧑‍💻".repeat(40), "\u{202e}Bundle\nreview\u{2066}".into()] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title, crate::workspace_model::channel_title(&title));
+            assert!(found.named);
+        }
     }
 
     /// The cache answers for a file until it changes.
