@@ -333,6 +333,24 @@ mod tests {
         assert_eq!(app.tabs.len(), count);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_open_reuses_its_canonical_source_for_definition_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.rs"), "head\na😀éX\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", root.path().join("alias.rs")).unwrap();
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "alias.rs");
+        assert_eq!(app.tab(card).unwrap().runtime.source_tab_path(), Some(root.path().join("real.rs")));
+        let task = app.open_navigation_target(card, Resolved { path: root.path().join("real.rs"), external: false, at: LspPosition::new(1, 4), coordinates: LspCoordinates::Utf16 });
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(card));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(LspPosition::new(1, 3)));
+        assert!(!app.lsp_navigation.jumps.contains_key(&card));
+        assert_eq!(app.capture_editor_location(card).unwrap().source, root.path().join("real.rs"));
+    }
+
     #[test]
     fn native_navigation_messages_round_trip_dirty_and_readonly_source_tabs() {
         let root = tempfile::tempdir().unwrap();
