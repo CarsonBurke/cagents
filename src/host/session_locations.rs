@@ -65,7 +65,7 @@ pub(super) fn verified_chat_directory(
     use crate::chat::protocol::ExecutionContext;
     use std::sync::Arc;
     let current = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get(&source.id)
@@ -75,6 +75,10 @@ pub(super) fn verified_chat_directory(
                 "The native provider changed before its directory could be captured".into(),
             );
         }
+        let instance = record.execution_instance;
+        state.observe_chat_directory_thread(source.id, instance)
+            .map_err(|error| format!("Cannot retain this provider's confirmed conversation. Check available storage and retry: {error}"))?;
+        let record = &state.chats[&source.id];
         let mut current = record.session.clone();
         current.launch.session_id = record
             .handle
@@ -147,7 +151,7 @@ pub(super) fn relocate(
     };
     let registry = super::agent_execution::registry(host).map_err(error)?;
     let sources = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let model = state.read_model()?;
         let mut sources = BTreeMap::<TerminalId, HostedSession>::new();
         for view in &model.views {
@@ -183,6 +187,22 @@ pub(super) fn relocate(
             {
                 sources.insert(source.id(), source.clone());
             }
+        }
+        // Explicit verification must also recover a metadata write that
+        // failed on the last provider event while the actor remained idle.
+        let instances = sources
+            .iter()
+            .filter_map(|(id, source)| match source {
+                HostedSession::Chat(_) => state
+                    .chats
+                    .get(id)
+                    .map(|record| (*id, record.execution_instance)),
+                HostedSession::Terminal(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, instance) in instances {
+            state.observe_chat_directory_thread(id, instance)
+                .map_err(|reason| error(format!("Cannot retain the provider's confirmed conversation. Check available storage and retry: {reason}")))?;
         }
         // A numeric ID locates a possible owner; exact source or authenticated
         // retained lineage must still prove the association outside this lock.
@@ -944,13 +964,28 @@ mod tests {
             fixture.host.lock().unwrap().chats[&fixture.source.id].session,
             fixture.source
         );
-        fixture.host.lock().unwrap().directory_thread_retry = None;
-        super::super::chat::changed_owned(
-            &Arc::downgrade(&fixture.host),
-            fixture.source.id,
-            instance,
-            runtime::Update::Presentation,
-        );
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.directory_thread_retry = None;
+            let view = state.read_model().unwrap().views[0].clone();
+            let before = view.panes[0].clone();
+            let mut pane = before.clone();
+            pane.kind = CardKind::Chat(current.clone());
+            state
+                .edit_model(
+                    1,
+                    ModelEdit::ChangeView {
+                        scope: view.scope,
+                        expected_revision: view.revision,
+                        operation: uuid::Uuid::new_v4(),
+                        change: crate::workspace_model::views::Change::Update { before, pane },
+                    },
+                )
+                .unwrap();
+        }
+        // No producer callback follows storage repair: the explicit request
+        // must refresh metadata and prove the moved directory on its own.
+        assert!(locate(&fixture).session_location_refusals.is_empty());
         assert_eq!(
             fixture.host.lock().unwrap().chats[&fixture.source.id].session,
             current
