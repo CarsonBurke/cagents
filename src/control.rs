@@ -1738,14 +1738,22 @@ impl HandshakeClient {
         }
         let timeout = self.stream.read_timeout().ok().flatten();
         let envelope: ServerEnvelope = match deadline {
-            Some(deadline) => read_frame(&mut DeadlineReader {
-                stream: &mut self.stream,
-                deadline,
-            }),
-            None => read_frame(&mut self.stream),
-        }
-        .map_err(|error| reply_error(error, timeout))?
-        .ok_or(ControlError::ConnectionClosed)?;
+            Some(deadline) => {
+                let payload = crate::terminal::ipc::read_frame_payload(
+                    &mut DeadlineReader {
+                        stream: &mut self.stream,
+                        deadline,
+                    },
+                    crate::terminal::ipc::MAX_FRAME_BYTES,
+                )
+                .map_err(|error| reply_error(error, timeout))?
+                .ok_or(ControlError::ConnectionClosed)?;
+                decode_upgrade_handshake(&payload)?
+            }
+            None => read_frame(&mut self.stream)
+                .map_err(|error| reply_error(error, timeout))?
+                .ok_or(ControlError::ConnectionClosed)?,
+        };
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
@@ -1782,6 +1790,23 @@ impl HandshakeClient {
         }
     }
 }
+
+/// Upgrade discovery must choose a payload schema before deserializing it.
+/// Postcard cannot default fields appended to an older error payload. A
+/// version here is only a routing hint: the source adapter reconnects and
+/// authenticates the complete version-pinned handshake before any operation.
+fn decode_upgrade_handshake<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, ControlError> {
+    let (version, _) = postcard::take_from_bytes::<u16>(payload).map_err(FrameError::from)?;
+    if version != PROTOCOL_VERSION {
+        return Err(ControlError::UnsupportedVersion { actual: version });
+    }
+    postcard::from_bytes(payload)
+        .map_err(FrameError::from)
+        .map_err(ControlError::from)
+}
+
 fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
     if let Some(timeout) = timeout
         && matches!(&error, FrameError::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
@@ -4773,6 +4798,78 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn upgrade_source_selects_v77_before_decoding_the_old_error_payload() {
+        // Frozen protocol-77 wire layout. In particular, Error is message tag
+        // six and has only three fields. Do not use the current error DTO here.
+        #[derive(Serialize)]
+        struct LegacyError {
+            code: u32,
+            message: String,
+            retryable: bool,
+        }
+        #[derive(Serialize)]
+        struct LegacyEnvelope {
+            version: u16,
+            request_id: Option<u64>,
+            proof: HostSessionProof,
+            message_tag: u32,
+            error: LegacyError,
+        }
+        // Models the appended details field independently of whether this
+        // source checkout has consumed that separate protocol change yet.
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        struct ExtendedError {
+            code: u32,
+            message: String,
+            retryable: bool,
+            #[serde(default)]
+            details: Option<String>,
+        }
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        struct ExtendedEnvelope {
+            version: u16,
+            request_id: Option<u64>,
+            proof: HostSessionProof,
+            message_tag: u32,
+            error: ExtendedError,
+        }
+        let payload = postcard::to_stdvec(&LegacyEnvelope {
+            version: 77,
+            request_id: Some(1),
+            proof: proof("session", "boot", "incarnation"),
+            message_tag: 6,
+            error: LegacyError {
+                code: 1, // UnsupportedVersion in protocol 77.
+                message: "Unsupported protocol version".into(),
+                retryable: false,
+            },
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<ExtendedEnvelope>(&payload).is_err());
+        assert!(matches!(
+            decode_upgrade_handshake::<ExtendedEnvelope>(&payload),
+            Err(ControlError::UnsupportedVersion { actual: 77 })
+        ));
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+            server.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+            server.write_all(&payload).unwrap();
+        });
+        assert!(matches!(
+            ControlClient::from_stream_with_deadline(
+                client,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(ControlError::UnsupportedVersion { actual: 77 })
+        ));
+        worker.join().unwrap();
     }
 
     #[test]

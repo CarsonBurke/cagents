@@ -1680,6 +1680,16 @@ pub(crate) fn read_frame_with_limit<T: DeserializeOwned>(
     reader: &mut impl Read,
     maximum: usize,
 ) -> Result<Option<T>, FrameError> {
+    read_frame_payload(reader, maximum)?
+        .map(|payload| postcard::from_bytes(&payload).map_err(FrameError::from))
+        .transpose()
+}
+
+/// Read a bounded frame before selecting its version-specific payload schema.
+pub(crate) fn read_frame_payload(
+    reader: &mut impl Read,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, FrameError> {
     let Some(length) = read_frame_length(reader)? else {
         return Ok(None);
     };
@@ -1690,7 +1700,7 @@ pub(crate) fn read_frame_with_limit<T: DeserializeOwned>(
         .map_err(|_| FrameError::Allocation { requested: length })?;
     payload.resize(length, 0);
     reader.read_exact(&mut payload)?;
-    Ok(Some(postcard::from_bytes(&payload)?))
+    Ok(Some(payload))
 }
 
 /// Reads the big-endian length prefix, returning `None` only for a clean
