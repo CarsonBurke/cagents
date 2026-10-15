@@ -381,6 +381,8 @@ impl Handle {
                     adapter,
                     state,
                     close_state,
+                    close_input_fd:None,
+                    close_input_drained:true,
                     confirmed_session,
                     store,
                     visible,
@@ -1674,6 +1676,8 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     close_state: Arc<Mutex<CloseState>>,
+    close_input_fd: Option<std::os::fd::RawFd>,
+    close_input_drained: bool,
     confirmed_session: Arc<Mutex<Option<String>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
@@ -1771,6 +1775,14 @@ impl TurnAttention {
     }
 }
 impl Actor {
+    fn close_input_is_clear(&self)->bool {
+        if !self.close_input_drained || !self.output.is_empty() {return false;}
+        let Some(fd)=self.close_input_fd else {return true;};
+        let mut input=libc::pollfd {fd,events:libc::POLLIN,revents:0};
+        // The transport owns this descriptor throughout command dispatch.
+        // No read is consumed here; the transport must observe it first.
+        (unsafe {libc::poll(&mut input,1,0)})==0
+    }
     /// Called only after a validated actor relocation succeeds. The resident
     /// census follows the operational directory and old consent becomes stale.
     fn record_execution_directory(&mut self,directory:&std::path::Path) {
@@ -1853,6 +1865,8 @@ impl Actor {
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
+        self.close_input_fd=Some(stdout.as_raw_fd());
+        self.close_input_drained=false;
         let result = (|| {
         self.step(initial)?;
         let mut stdout_eof = false;
@@ -1894,7 +1908,6 @@ impl Actor {
                     ));
                 }
             }
-            self.drain_commands(closing.is_some())?;
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -1945,6 +1958,8 @@ impl Actor {
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
             }
+            self.close_input_drained=self.output.is_empty();
+            self.drain_commands(closing.is_some())?;
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
             }
@@ -2203,6 +2218,10 @@ impl Actor {
                     continue;
                 }
                 ActorCommand::CloseIfRevision {revision} => {
+                    if !self.close_input_is_clear() {
+                        let _=reply.send(Err("Provider input is still arriving; refresh close confirmation or stop the agent before closing".into()));
+                        continue;
+                    }
                     let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                     let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                     let unchanged=close.revision==revision;
@@ -2549,6 +2568,11 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        // Clear terminal admission markers before attention reducers that may
+        // consume terminal events without retaining them in presentation.
+        if matches!(&event,Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
+            self.close_state.lock().unwrap_or_else(|p|p.into_inner()).admitted_work=false;
+        }
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -3717,7 +3741,8 @@ mod tests {
                     Command::Prompt{..}=>Vec::new(),
                     Command::SetFastMode{..}=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
                     Command::SetModel{..}=>vec![Event::TurnStarted],
-                    Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],
+                    Command::Compact=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Succeeded},Event::Status{busy:false,detail:String::new()}],
+                    Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status{busy:false,detail:String::new()}],
                     _=>return Err("Unexpected consent fixture command".into()),
                 };
                 Ok(Step{events,..Default::default()})
@@ -3744,6 +3769,8 @@ mod tests {
         assert!(!handle.close_observation().closing);
         handle.command(Command::SetFastMode{enabled:true}).unwrap();
         assert_eq!(handle.close_observation().close_revision,admitted.close_revision,"ordinary stream updates preserve consent for the same work");
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"a terminal result clears an admitted prompt even without TurnStarted");
         handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
         let autonomous=handle.close_observation();
         assert!(autonomous.close_revision>admitted.close_revision);
@@ -3752,6 +3779,53 @@ mod tests {
         assert!(!handle.close_observation().closing);
         handle.close_if_revision(autonomous.close_revision).unwrap();
         assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn conditional_close_does_not_skip_already_arrived_provider_turns() {
+        struct Incoming {
+            entered:crossbeam_channel::Sender<()>,
+            resume:crossbeam_channel::Receiver<()>,
+        }
+        impl Adapter for Incoming {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                match command {
+                    Command::SetModel{..}=> {
+                        self.entered.send(()).unwrap();
+                        self.resume.recv_timeout(Duration::from_secs(5)).map_err(|_|"Fixture command barrier timed out".to_owned())?;
+                        Ok(Step::default())
+                    }
+                    Command::Interrupt=>Ok(Step{events:vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status{busy:false,detail:String::new()}],..Default::default()}),
+                    _=>Err("Unexpected incoming fixture command".into()),
+                }
+            }
+            fn receive(&mut self,value:Value)->Result<Step,String> {
+                Ok(Step{events:if value["turn"]==true {vec![Event::TurnStarted]} else {Vec::new()},..Default::default()})
+            }
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let (entered,observed)=crossbeam_channel::bounded(1);let (resume,resumed)=crossbeam_channel::bounded(1);
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Incoming{entered,resume:resumed}),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let consent=handle.close_observation();
+        let command=handle.enqueue_command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::fs::write(directory.path().join("release"),b"").unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while !directory.path().join("emitted").exists() {assert!(Instant::now()<deadline,"provider never wrote the new turn");thread::sleep(Duration::from_millis(5));}
+        // Queue the close while the actor is blocked, after the provider has
+        // completed its write. This must not overtake the unread TurnStarted.
+        let (reply,response)=crossbeam_channel::bounded(1);
+        handle.0.commands.send((ActorCommand::CloseIfRevision{revision:consent.close_revision},reply)).unwrap();handle.wake();
+        resume.send(()).unwrap();command.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        let refusal=response.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert!(refusal.contains("input") || refusal.contains("changed"));
+        assert!(!handle.close_observation().closing);
+        until(&handle,|state|state.turn_generation>consent.turn_generation);
+        assert!(handle.close_if_revision(consent.close_revision).is_err());
+        handle.close_if_revision(handle.close_observation().close_revision).unwrap();
     }
 
     #[test]
