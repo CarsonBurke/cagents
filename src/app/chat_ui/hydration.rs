@@ -256,22 +256,8 @@ impl State {
 
 pub(super) fn live_source_bytes()->usize {chat::source_owners::usage().admitted_bytes}
 
-static READER_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Allocated String capacity in the two readers, including a completed body
-/// awaiting admission. Shared `known` items remain counted only by Owners.
-#[derive(Default)]
-struct ReaderCapacity(std::sync::atomic::AtomicUsize);
-impl ReaderCapacity {
-    fn set(&self, bytes: usize) {
-        let old = self.0.swap(bytes, Ordering::Relaxed);
-        if bytes >= old { READER_CAPACITY.fetch_add(bytes-old, Ordering::Relaxed); }
-        else { READER_CAPACITY.fetch_sub(old-bytes, Ordering::Relaxed); }
-    }
-}
-impl Drop for ReaderCapacity {
-    fn drop(&mut self) { self.set(0); }
-}
-pub(super) fn reader_source_capacity()->usize { READER_CAPACITY.load(Ordering::Relaxed) }
+use chat::source_owners::ReaderCapacity;
+pub(super) fn reader_source_capacity()->usize {chat::source_owners::reader_capacity()}
 fn admit(item:&Arc<chat::Item>,key:&Key,epoch:u64,replaced:Option<&Arc<chat::Item>>)->Admission {
     chat::source_owners::admit(item,key,epoch,replaced)
 }
