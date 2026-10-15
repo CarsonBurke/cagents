@@ -908,6 +908,7 @@ mod tests {
         let notice = crate::notifications::Notice {
             id,
             event: crate::notifications::Event {
+                content: None,
                 target: crate::notifications::Target::Session(session),
                 source_session: Some(session),
                 provider: Some(Provider::Claude),
@@ -953,6 +954,7 @@ mod tests {
             notices: vec![crate::notifications::Notice {
                 id,
                 event: crate::notifications::Event {
+                    content: None,
                     target: crate::notifications::Target::Session(session),
                     source_session: Some(session),
                     provider: Some(Provider::Claude),
