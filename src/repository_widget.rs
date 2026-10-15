@@ -5962,7 +5962,7 @@ impl RepositoryRuntime {
                 let mut protocols=protocols.into_iter();
                 let Some(first)=protocols.next() else{return Task::none();};
                 self.push_lsp_change(first);
-                for protocol in protocols {self.append_lsp_edit(protocol);}
+                if self.pending_lsp_change.is_some(){for protocol in protocols {self.append_lsp_edit(protocol);}}
                 self.markdown_task(card)
             }
             RepositoryAction::ToggleToolbarOverflow { .. } => {
