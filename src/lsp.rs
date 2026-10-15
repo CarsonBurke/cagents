@@ -39,6 +39,7 @@ use std::future::Future;
 use std::io;
 use std::ops::{ControlFlow, Range};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1579,6 +1580,33 @@ struct LaunchSpec {
 }
 
 type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + Send + Sync>;
+
+/// Keep the original directory inode allocated while a server owns its root.
+/// A path can be renamed and replaced between watchdog polls; existence alone
+/// would then keep a server for the previous checkout alive indefinitely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl RootIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self { device: metadata.dev(), inode: metadata.ino() }
+    }
+}
+
+async fn pin_session_root(root: &Path) -> io::Result<(tokio::fs::File, RootIdentity)> {
+    // O_PATH pins identity without requiring directory read permissions. This
+    // happens on the async launch path, never on the application update thread.
+    let directory = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+        .await?;
+    let identity = RootIdentity::from_metadata(&directory.metadata().await?);
+    Ok((directory, identity))
+}
 
 /// Anchors `path` to `working_directory` without consulting the filesystem.
 fn absolute_in(working_directory: &Path, path: &Path) -> PathBuf {
@@ -4572,6 +4600,8 @@ impl LspManager {
         };
         let process_slots = Arc::clone(&self.process_slots);
         let launch_barrier = self.launch_barrier.clone();
+        let root_identity = Arc::new(Mutex::new(None));
+        let launched_root_identity = Arc::clone(&root_identity);
         *handle
             .task
             .lock()
@@ -4585,7 +4615,20 @@ impl LspManager {
                 return;
             };
             if !context.retired.load(Ordering::Acquire) {
+                let (directory_pin, identity) = match pin_session_root(&context.launch.root).await {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        context.set_status(LspStatus::Unavailable {
+                            reason: format!("cannot retain language server root: {error}"),
+                        }).await;
+                        return;
+                    }
+                };
+                *launched_root_identity.lock().unwrap_or_else(|error| error.into_inner()) = Some(identity);
                 run_session(context, rx).await;
+                // Prevent inode reuse until protocol teardown has reaped the
+                // process; the watchdog's identity comparison stays exact.
+                drop(directory_pin);
             }
         }));
         let watched = handle.clone();
@@ -4622,11 +4665,16 @@ impl LspManager {
                 if watched.retired.load(Ordering::Acquire) || watched.commands.is_closed() {
                     break;
                 }
-                // Also catches removal by git/another window outside our UI.
-                if tokio::fs::metadata(&watched_root)
-                    .await
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                {
+                // Also catches external rename/remove followed by recreation
+                // at the same spelling before this poll. The original inode
+                // remains pinned until the server finishes teardown.
+                let root_metadata = tokio::fs::metadata(&watched_root).await;
+                let original = *root_identity.lock().unwrap_or_else(|error| error.into_inner());
+                let root_changed = match root_metadata {
+                    Ok(metadata) => original.is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                };
+                if root_changed {
                     let doc = watched
                         .activity
                         .lock()
@@ -8968,6 +9016,72 @@ mod tests {
             assert!(handle.methods().iter().any(|method| method == "shutdown"));
             assert!(handle.methods().iter().any(|method| method == "exit"));
             manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn replaced_root_reaps_original_server_before_reopening_the_same_path() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let worktree = parent.path().join("workspace");
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            let file = worktree.join("main.rs");
+            std::fs::write(&file, "fn old() {}\n").unwrap();
+            let child = spawn_test_child(
+                &["--exact", CHILD_HELPER_TEST, "--test-threads=1"],
+                Helper::Sleeps,
+                true,
+            );
+            let pid = child.process_group;
+            let mut manager = rust_manager().with_lifecycle(1, 1);
+            let slot = install_fake_with_child(
+                &mut manager,
+                incremental_capabilities(),
+                |_| Vec::new(),
+                Arc::new(Mutex::new(Some(child))),
+            );
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn old() {}\n");
+            let old = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+
+            // There is never a watchdog observation where this spelling is
+            // missing. The old open document also prevents idle expiration.
+            std::fs::rename(&worktree, parent.path().join("previous-workspace")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(&file, "fn replacement() {}\n").unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc: at } if *at == doc => Some(()),
+                _ => None,
+            }).await;
+            assert!(manager.live_servers().is_empty());
+            assert!(old.methods().iter().any(|method| method == "shutdown"));
+            assert!(old.methods().iter().any(|method| method == "exit"));
+            assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
+
+            manager.open_for_test(LspDocumentId(2), &file, &worktree, rust_language(), 1, "fn replacement() {}\n");
+            await_ready(&events, LspDocumentId(2)).await;
+            let replacement = handle_of(&slot).await;
+            assert_eq!(replacement.entries("initialize").len(), 1);
+            assert!(replacement.entries("shutdown").is_empty());
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn root_pin_retains_original_directory_identity_after_path_replacement() {
+        block_on(async {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("workspace");
+            std::fs::create_dir(&root).unwrap();
+            let (pin, identity) = pin_session_root(&root).await.unwrap();
+            std::fs::rename(&root, parent.path().join("original")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            assert!(identity == RootIdentity::from_metadata(&pin.metadata().await.unwrap()));
+            assert!(identity != RootIdentity::from_metadata(&std::fs::metadata(&root).unwrap()));
         });
     }
 }
