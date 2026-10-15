@@ -6,12 +6,27 @@ struct BoundCloseCleanup {
     attempted: bool,
     notifications: Option<crate::host::notifications::Broker>,
     lease: Option<crate::daemon::HostLease>,
+    // Keep the exact proxy/identity through teardown even after Return removes
+    // its Host record. Presence/absence never substitutes for retirement proof.
+    remote: Option<(chat::runtime::Handle,chat::runtime::ActorIdentity,HostSessionProof)>,
 }
 impl BoundCloseCleanup {
     fn finish(&mut self) {
         if self.attempted { return; }
         self.attempted = true;
+        let mut failures=Vec::new();
         if let Err(error) = super::super::finish_chat_shutdown(&self.host) {
+            failures.push(error);
+        }
+        if let Some((_owner,identity,proof))=&self.remote {
+            match chat::runtime::Handle::retained_retirement_proved(&identity.record,proof) {
+                Ok(true)=>{},
+                Ok(false)=>failures.push("Exact retained helper retirement is unconfirmed".into()),
+                Err(error)=>failures.push(error),
+            }
+        }
+        if !failures.is_empty() {
+            let error=failures.join("; ");
             eprintln!("Exact bound-close fixture cleanup is unconfirmed: {error}");
             // No timeout/Err is settlement. The bounded original Child and
             // outer common guardian retain the remaining cleanup obligation.
@@ -37,7 +52,7 @@ impl BoundCloseFixture {
         // Armed BEFORE lease/notification/dispatch or a fallible assertion.
         // Keep both resources alive through every constructor panic/close.
         let mut cleanup = BoundCloseCleanup {host: host.clone(), attempted:false,
-            notifications:None, lease:None};
+            notifications:None, lease:None,remote:None};
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         cleanup.lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
@@ -52,6 +67,7 @@ impl BoundCloseFixture {
         let id = agent.session.as_ref().unwrap().id();
         let handle = host.lock().unwrap().chats[&id].handle.clone();
         let identity = handle.actor_identity().expect("genuine retained Remote owner");
+        cleanup.remote=Some((handle.clone(),identity.clone(),proof.clone()));
         let binding = super::super::chat::source_binding::owning_binding_for_test(&host, id).unwrap();
         let inspection = chat::runtime::Handle::inspect_remote(&identity.record, proof.clone()).unwrap();
         assert_eq!(inspection.identity, identity);
@@ -203,6 +219,10 @@ fn combined_close_retained_lifecycle_attempted_return_stays_unknown_until_exact_
     assert_ne!(Some(receipt.terminal.execution_instance),attempt.worker_instance());
     assert!(f.phase().is_none());
     f.host.lock().unwrap().validate_terminal_handoff_receipt(&receipt).unwrap();
+    // The actual Return caller finishes semantic retirement BEFORE spawning
+    // its replacement. Do not issue another retire RPC to manufacture this.
+    assert!(chat::runtime::Handle::retained_retirement_proved(&f.identity.record,&f.proof).unwrap());
+    assert!(!f.identity.record.root.is_current()&&!f.identity.record.holder.is_current());
     returned.shutdown().unwrap();
 }
 
@@ -210,7 +230,7 @@ fn combined_close_retained_lifecycle_attempted_return_stays_unknown_until_exact_
 fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_console_retry() {
     if owning_close_isolated("combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_console_retry").is_some() {return;}
     let (host,mut request,path)=fixture();
-    let mut cleanup=BoundCloseCleanup {host:host.clone(),attempted:false,notifications:None,lease:None};
+    let mut cleanup=BoundCloseCleanup {host:host.clone(),attempted:false,notifications:None,lease:None,remote:None};
     let root=path.parent().unwrap();
     {
         use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
