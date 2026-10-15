@@ -18452,7 +18452,12 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .status_projection(
+                            &worktree.path,
+                            true,
+                            git_ui::SIDEBAR_STATUS_LIMIT,
+                            &cancellation,
+                        )
                         .ok()
                 })
                 .flatten();

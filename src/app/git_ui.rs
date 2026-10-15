@@ -8,6 +8,8 @@ fn local_workers() -> usize {
     std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8))
 }
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
+/// Sidebar counts are projections; mutation safety reads remain uncapped.
+pub(super) const SIDEBAR_STATUS_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -700,7 +702,17 @@ fn read_local_with_plan(
         if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
             continue;
         }
-        let current = match git.status_with_untracked(&record.path, false, &cancellation) {
+        // A membership edge replaces the cached full count in this same
+        // coalesced status process. Tracked-only writes do not rescan untracked
+        // trees; the bounded topology fallback repairs incomplete watch coverage.
+        let include_untracked =
+            change.topology || change.membership || change.metadata || change.untracked;
+        let current = match git.status_projection(
+            &record.path,
+            include_untracked,
+            SIDEBAR_STATUS_LIMIT,
+            &cancellation,
+        ) {
             Ok(current) => current,
             // Its own removal is often the event being read, and one absent
             // checkout must not fail its siblings.

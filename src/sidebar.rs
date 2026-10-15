@@ -847,16 +847,25 @@ impl SidebarWorktree {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        if self.untracked_omitted == status.untracked_omitted
+        // A -uno watcher read has no authority over the last complete untracked
+        // count. Only a previously complete count may be reused: a capped
+        // full listing has no authority over untracked paths it omitted.
+        let mut dirty = status.dirty.clone();
+        let untracked_omitted = status.untracked_omitted
+            && (self.dirty.is_none() || self.untracked_omitted || self.listing_truncated);
+        if status.untracked_omitted && !untracked_omitted {
+            dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
+        }
+        if self.untracked_omitted == untracked_omitted
             && self.listing_truncated == status.listing_truncated
-            && self.dirty.as_ref() == Some(&status.dirty)
+            && self.dirty.as_ref() == Some(&dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
-        self.dirty = Some(status.dirty.clone());
-        self.untracked_omitted = status.untracked_omitted;
+        self.dirty = Some(dirty);
+        self.untracked_omitted = untracked_omitted;
         self.listing_truncated = status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
@@ -11826,6 +11835,72 @@ pub(crate) mod tests {
                 .iter()
                 .any(|row| row.entry.path == selected.path && row.status_label() == "Pending…")
         );
+    }
+
+    #[test]
+    fn tracked_only_refresh_preserves_complete_untracked_count_until_next_full_read() {
+        let mut row = worktree(11, "feature/changes", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        full.dirty.unstaged = 2;
+        row.apply_status(&full);
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        tracked.dirty.unstaged = 3;
+        row.apply_status(&tracked);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15 changes"));
+        assert!(!row.chrome.tooltip.contains("tracked changes"));
+        row.apply_status(&StatusSnapshot::default());
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("No changes"));
+        assert!(row.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn tracked_only_refresh_never_promotes_partial_untracked_counts_to_complete() {
+        let mut row = worktree(11, "feature/changes", false);
+        let mut partial = StatusSnapshot {
+            listing_truncated: true,
+            ..StatusSnapshot::default()
+        };
+        partial.dirty.untracked = 12;
+        row.apply_status(&partial);
+        assert!(row.listing_truncated);
+        row.apply_status(&StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        });
+        assert!(row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("no tracked changes"));
+        assert!(!row.chrome.tooltip.contains("No changes"));
+
+        row.apply_status(&StatusSnapshot::default());
+        assert!(!row.untracked_omitted);
+        assert!(!row.listing_truncated);
+        assert!(row.chrome.tooltip.contains("No changes"));
+    }
+
+    #[test]
+    fn partial_tracked_refresh_keeps_complete_untracked_cache_as_a_lower_bound() {
+        let mut row = worktree(11, "feature/changes", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        row.apply_status(&full);
+        let mut partial = StatusSnapshot {
+            listing_truncated: true,
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        partial.dirty.unstaged = 3;
+        row.apply_status(&partial);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(!row.untracked_omitted);
+        assert!(row.listing_truncated);
+        assert!(row.chrome.tooltip.contains("15+ changes"));
     }
 
     #[test]
