@@ -1096,7 +1096,7 @@ mod tests {
         let external=Arc::new(find::External {item:Arc::from(id),revision:777,blocks:vec![find::Block {identity,text:body}].into()});
         runtime.find_external.insert(id.into(),external.clone());
         let mut paint=find::Paint::new(1,&[find::Match {turn:Arc::from(id),item:Arc::from(id),identity,range:1..17}],None);
-        paint.sources=Arc::new(HashMap::from([(id.into(),find::SourceProof {item:Arc::downgrade(&child),growing:false,external:Some(Arc::downgrade(&external))})]));
+        paint.sources=Arc::new(HashMap::from([(id.into(),find::SourceProof {item:Arc::downgrade(&child),growing:false,external:Some(Arc::downgrade(&external)),supplemental:None})]));
         paint.signatures=Arc::new(HashMap::from([(Arc::<str>::from(id),1)]));runtime.find_paint=Some(Arc::new(paint));
         assert!(std::ptr::eq(current_item(&runtime,id).unwrap(),child.as_ref()));
         assert!(runtime.find_paint_for(current_item(&runtime,id).unwrap()).is_some(),"actual detail lookup preserves accepted child paint");
