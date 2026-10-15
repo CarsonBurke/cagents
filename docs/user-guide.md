@@ -97,7 +97,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
 | Next unviewed review file | `Alt+Shift+Down` |
-| Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
+| Next / previous changed hunk in a diff | `Alt+J` or `F7` / `Alt+K` or `Shift+F7` |
 | Stage / unstage the open file | `Ctrl+Shift+S` |
 
 Workspace, native chat, and review shortcuts are configurable; see
@@ -625,19 +625,44 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   logical pixels; a terminal font size you already saved is kept.
 - Editor settings can override the terminal font family and size. **Ctrl+=**,
   **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
-- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
-  **Shift+Enter** move forward and backward; replacement controls offer one
-  match or all matches.
+- **Ctrl+F** opens Find and focuses its query. Click the buffer to keep editing,
+  undoing and redoing with Find open; the match count updates without moving
+  your caret. **Enter** / **Shift+Enter** in the query and **F3** / **Shift+F3**
+  in the buffer move between matches. **Escape** closes Find and focuses the buffer.
+- Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
+  expressions). Invalid expressions show an inline error. **Selection** searches
+  only the selection captured when enabled. Matching preferences persist for
+  the user; the selection scope lasts only for this open strip.
+- Replace or Replace all uses the same matching options. Regular expressions
+  expand captures such as `$1`; plain replacements can **Preserve case** for
+  upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
   the affected text. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
-- Working-tree diffs edit the real file buffer with the same selection, IME,
-  and safe-save behavior; removed content is selectable read-only context.
-  Staged and historical content are read-only. Syntax highlighting is kept in
-  file and diff views.
+- Diffs are read-only comparisons. Working diffs follow unsaved edits in the
+  real file buffer; use **Edit** to change that buffer. Diff and Edit keep the
+  same source line at the top and share editor font settings and zoom.
+- The diff toolbar shows labelled **Stage**, **Unstage**, **Revert**, comparison
+  basis, **Unified** / **Split**, and previous/next hunk controls. Narrow panes
+  collect these under **Diff actions**. **Ignore whitespace** hides reindents
+  across comparisons and is remembered when you restart. Reverting unsaved
+  edits returns to Edit so **Ctrl+Z** can restore them; reverting saved file
+  changes asks for confirmation.
+- Click, Shift-click, or drag to select diff rows; Up/Down moves the selection
+  and Shift extends it. In Split, selection stays on the chosen side. **Ctrl+C**
+  copies original source text. Right-click for **Copy**, **Copy line reference**
+  (`path:line`), and **Open in editor at line**. Historical and PR snapshots
+  offer **Open working file in editor at line**: it opens the current file at a
+  clamped location, which can differ from the snapshot. PR review stays open.
+  Unified also offers **Copy old side**, **Copy new side**, and **Copy as patch**
+  for selected changes.
+- **Ctrl+F** searches working, staged, branch, history, and pull request diffs.
+  The same case, whole-word, and regex controls apply. Enter / Shift+Enter
+  navigate highlighted results and reveal matches inside folded context.
+  Replacement is available in the editable source only.
 - Comparisons load on demand and cancelled jobs stop. Switching files or modes
   keeps bounded in-memory viewport positions without duplicating buffers or
   writing every scroll to disk.
