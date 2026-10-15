@@ -27,6 +27,7 @@ mod markdown_source;
 mod monospace;
 mod permissions;
 mod prose;
+mod provider_exit;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -200,6 +201,8 @@ pub enum Action {
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
     Toggle(Target, String),
+    ToggleProviderExit(Target),
+    CopyProviderExit(Target),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
@@ -1536,6 +1539,7 @@ pub(super) struct Runtime {
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
+    provider_exit_expanded: bool,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
@@ -2104,6 +2108,7 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
+            provider_exit_expanded: false,
             unfolded: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
@@ -2534,6 +2539,11 @@ impl Runtime {
         // A cancel armed for one turn must not carry over to the next.
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
+        }
+        if snapshot.provider_exit.is_none()
+            || snapshot.turn_generation != self.snapshot.turn_generation
+        {
+            self.provider_exit_expanded = false;
         }
         self.snapshot = snapshot;
         images::sync(self);
@@ -7537,6 +7547,23 @@ impl Cagents {
                     self.resume_history_navigation(target),
                 ]);
             }
+            Action::ToggleProviderExit(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.snapshot.provider_exit.is_some()
+                {
+                    runtime.provider_exit_expanded = !runtime.provider_exit_expanded;
+                }
+            }
+            Action::CopyProviderExit(target) => {
+                if let Some(diagnostic) = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.snapshot.provider_exit.as_ref())
+                {
+                    let text = provider_exit::copy_text(diagnostic);
+                    self.status = Some(TransientNotice::success("Copied provider output"));
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
+                }
+            }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.find_disclosure.manual_item(&id);
@@ -11141,6 +11168,95 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn provider_output_disclosure_ignores_replaced_targets_and_absent_diagnostics() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+        let diagnostic = chat::ProviderExitDiagnostic {
+            summary: "Provider exited with status 3".into(),
+            output: "start\nlast meaningful failure".into(),
+        };
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).provider_exit =
+            Some(diagnostic.clone());
+        let stale = Target {
+            generation: target.generation.wrapping_add(1),
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(stale)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(chat_runtime(&app, card).provider_exit_expanded);
+        assert!(chat_runtime(&app, card).provider_exit_notice(&diagnostic.summary));
+        assert!(!chat_runtime(&app, card).provider_exit_notice("Another failure"));
+        app.chat_runtime_mut(target).unwrap().failures = vec![
+            (Some("previous-turn".into()), diagnostic.summary.clone()),
+            (None, diagnostic.summary.clone()),
+        ];
+        assert_eq!(chat_runtime(&app, card).provider_exit_failure_index(), Some(1));
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+    }
+
+    #[test]
+    fn provider_output_is_absent_until_expanded_and_keeps_the_complete_retained_tail() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct TextProbe(Vec<String>);
+        impl Operation for TextProbe {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                _: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push(text.to_owned());
+            }
+        }
+        fn rendered_text(runtime: &Runtime) -> Vec<String> {
+            let mut element = runtime.provider_exit_view().expect("provider diagnostic");
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0)),
+            );
+            assert!(
+                node.size().height < 600.0,
+                "output remains in a bounded viewport"
+            );
+            let mut probe = TextProbe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            probe.0
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let output = format!(
+            "first line\n{}\nlast line",
+            "retained stderr ".repeat(2_000)
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).provider_exit =
+            Some(chat::ProviderExitDiagnostic {
+                summary: "Provider exited with status 3".into(),
+                output: output.clone(),
+            });
+        assert!(!rendered_text(chat_runtime(&app, card)).contains(&output));
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(rendered_text(chat_runtime(&app, card)).contains(&output));
     }
 
     #[test]
