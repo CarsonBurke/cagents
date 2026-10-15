@@ -490,6 +490,7 @@ pub(super) struct State {
     drafts: HashMap<CardId, String>,
     recovery_drafts: HashMap<CardId, turn_actions::Prompt>,
     original_epoch: u64,
+    copy_intents: plain_copy::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -519,6 +520,7 @@ impl Default for State {
             drafts: HashMap::new(),
             recovery_drafts: HashMap::new(),
             original_epoch: 0,
+            copy_intents: plain_copy::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -7751,13 +7753,14 @@ impl Cagents {
                 }
             }
             Action::Copy(target, id, part) => {
+                let intent=self.chat_ui.copy_intents.next();
                 let epoch=self.chat_ui.original_epoch;
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 if matches!(part,CopyPart::PlainText)
                     && runtime.active_item(&id).is_some_and(|item|matches!(item.content,ItemContent::Text {..})) {
-                    return plain_copy::begin(runtime,&id,epoch);
+                    return plain_copy::begin(runtime,&id,epoch,intent);
                 }
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
@@ -7885,6 +7888,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }

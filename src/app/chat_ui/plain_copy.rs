@@ -7,6 +7,30 @@ const LIMIT: usize = 32 * 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// One application-wide intent orders explicit chat copies across cards.
+/// Only weak slot headers are registered; withdrawing a queued request moves
+/// its actual source owner to the reclaimer without waiting for admission.
+#[derive(Default)]
+struct Hub { generation: AtomicU64, queued: Mutex<Vec<std::sync::Weak<InputSlot>>> }
+#[derive(Clone, Default)]
+pub(super) struct Intents(Arc<Hub>);
+#[derive(Clone)]
+pub(super) struct Intent { hub: Arc<Hub>, generation: u64 }
+impl Intents {
+    pub(super) fn next(&self)->Intent {
+        let generation=self.0.generation.fetch_add(1,Ordering::AcqRel).wrapping_add(1);
+        let previous=std::mem::take(&mut *self.0.queued.lock().unwrap_or_else(|error|error.into_inner()));
+        for slot in previous {if let Some(slot)=slot.upgrade() {slot.cancel();}}
+        Intent {hub:self.0.clone(),generation}
+    }
+}
+impl Intent {
+    pub(super) fn current(&self)->bool {self.hub.generation.load(Ordering::Acquire)==self.generation}
+    fn register(&self,input:&Arc<InputSlot>) {
+        self.hub.queued.lock().unwrap_or_else(|error|error.into_inner()).push(Arc::downgrade(input));
+    }
+}
+
 #[derive(Clone)]
 struct Proof {
     source: std::sync::Weak<chat::Item>,
@@ -14,10 +38,11 @@ struct Proof {
     session: Option<String>,
     selected: Option<String>,
     account_epoch: u64,
+    intent: Intent,
 }
 impl Proof {
     fn current(&self, runtime: &Runtime, account_epoch: u64) -> bool {
-        self.account_epoch == account_epoch
+        self.intent.current() && self.account_epoch == account_epoch
             && self.session == runtime.snapshot.session_id
             && self.selected == runtime.selected_subagent
             && (match (&self.actor, runtime.handle()) {
@@ -29,25 +54,32 @@ impl Proof {
                 runtime.active_item(&source.id).is_some_and(|item| Arc::ptr_eq(item, &source)))
     }
 }
-struct Attempt { id: u64, proof: Proof, cancelled: Arc<AtomicBool> }
+struct Attempt { id: u64, proof: Proof, cancelled: Arc<AtomicBool>, input: std::sync::Weak<InputSlot> }
 #[derive(Default)]
 pub(super) struct State { attempt: Option<Attempt> }
 impl State {
     pub(super) fn clear(&mut self) {
-        if let Some(attempt) = self.attempt.take() { attempt.cancelled.store(true, Ordering::Release); }
+        if let Some(attempt) = self.attempt.take() {
+            attempt.cancelled.store(true, Ordering::Release);
+            if let Some(input)=attempt.input.upgrade() {input.cancel();}
+        }
     }
 }
 impl Drop for State { fn drop(&mut self) { self.clear(); } }
 
-struct InputSlot(Mutex<Option<Arc<chat::Item>>>);
+struct InputSlot {source:Mutex<Option<Arc<chat::Item>>>,cancelled:Arc<AtomicBool>}
 impl InputSlot {
     fn take(&self) -> Option<Arc<chat::Item>> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner()).take()
+        self.source.lock().unwrap_or_else(|error| error.into_inner()).take()
+    }
+    fn cancel(&self) {
+        self.cancelled.store(true,Ordering::Release);
+        if let Some(source)=self.take() {retire(source);}
     }
 }
 impl Drop for InputSlot {
     fn drop(&mut self) {
-        if let Some(source) = self.0.get_mut().unwrap_or_else(|error| error.into_inner()).take() { retire(source); }
+        if let Some(source) = self.source.get_mut().unwrap_or_else(|error| error.into_inner()).take() { retire(source); }
     }
 }
 struct OutputBytes(usize);
@@ -85,16 +117,18 @@ fn format(source: &chat::Item) -> Result<String, String> {
     Ok(text)
 }
 
-pub(super) fn begin(runtime: &mut Runtime, item: &str, account_epoch: u64) -> Task<Message> {
+pub(super) fn begin(runtime: &mut Runtime, item: &str, account_epoch: u64, intent:Intent) -> Task<Message> {
+    if !intent.current() {return Task::none();}
     let Some(source) = runtime.active_item(item).cloned() else { return Task::none(); };
     if !matches!(source.content, ItemContent::Text { .. }) || !runtime.visible.load(Ordering::Relaxed) { return Task::none(); }
     runtime.recovery.plain_copy.clear();
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let proof = Proof { source: Arc::downgrade(&source), actor: runtime.handle().map(Arc::downgrade),
-        session: runtime.snapshot.session_id.clone(), selected: runtime.selected_subagent.clone(), account_epoch };
+        session: runtime.snapshot.session_id.clone(), selected: runtime.selected_subagent.clone(), account_epoch, intent:intent.clone() };
     let cancelled = Arc::new(AtomicBool::new(false));
-    runtime.recovery.plain_copy.attempt = Some(Attempt { id, proof, cancelled: cancelled.clone() });
-    let input = Arc::new(InputSlot(Mutex::new(Some(source))));
+    let input = Arc::new(InputSlot {source:Mutex::new(Some(source)),cancelled:cancelled.clone()});
+    intent.register(&input);
+    runtime.recovery.plain_copy.attempt = Some(Attempt { id, proof, cancelled: cancelled.clone(),input:Arc::downgrade(&input) });
     let target = runtime.target;
     Task::perform(async move {
         let value = tokio::time::timeout(Duration::from_secs(40), async move {
@@ -196,6 +230,56 @@ mod tests {
                 "only exact current selected source accepts copy; unrelated generation alone is valid");
         }
     }
+    #[tokio::test]
+    async fn saturated_readers_do_not_pin_cancelled_queued_message_generations() {
+        let first=originals::readers().clone().acquire_owned().await.unwrap();
+        let second=originals::readers().clone().acquire_owned().await.unwrap();
+        let mut app=crate::app::tests::context_inspector_test_app(false);let runtime=runtime();let target=runtime.target;
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let mut streams=Vec::new();let mut owners=Vec::new();
+        for generation in 0..20 {
+            let source=item(chat::Role::Assistant,&format!("generation {generation}: {}","large source ".repeat(20_000)));
+            owners.push(Arc::downgrade(&source));
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).items=vec![source];
+            let task=app.handle_chat_ui(Action::Copy(target,"same-opaque-message".into(),CopyPart::PlainText));
+            let mut stream=iced::runtime::task::into_stream(task).unwrap();
+            assert!(matches!(iced::futures::poll!(stream.next()),std::task::Poll::Pending));
+            streams.push(stream);
+        }
+        let runtime=app.chat_runtime_mut(target).unwrap();runtime.recovery.plain_copy.clear();
+        Arc::make_mut(&mut runtime.snapshot).items.clear();
+        struct Signal(std::sync::mpsc::Sender<()>);impl Drop for Signal {fn drop(&mut self) {let _=self.0.send(());}}
+        let(sent,received)=std::sync::mpsc::channel();retire(Signal(sent));
+        tokio::task::spawn_blocking(move||received.recv_timeout(Duration::from_secs(5)).unwrap()).await.unwrap();
+        assert!(owners.iter().all(|owner|owner.upgrade().is_none()),"all withdrawn source owners retire before semaphore admission or 40s timeout");
+        assert_eq!(originals::readers().available_permits(),0,"the readers stayed saturated throughout withdrawal");
+        drop(streams);drop(first);drop(second);
+    }
+
+    #[tokio::test]
+    async fn newer_markdown_literal_or_other_card_copy_supersedes_ready_plain_text() {
+        for newer in 0..3 {
+            let mut app=crate::app::tests::context_inspector_test_app(false);let mut current=runtime();let target=current.target;
+            Arc::make_mut(&mut current.snapshot).items=vec![item(chat::Role::Assistant,"**original formatting**")];
+            app.cards.insert(target.card,CardRuntime::Chat(Box::new(current)));
+            let (_,id,reply)=ready(app.handle_chat_ui(Action::Copy(target,"same-opaque-message".into(),CopyPart::PlainText))).await;
+            let next=match newer {
+                0=>Action::Copy(target,"same-opaque-message".into(),CopyPart::Text),
+                1=>Action::CopyLiteral("the newer literal code copy".into()),
+                _=>{
+                    let mut other=runtime();let other_target=other.target;
+                    Arc::make_mut(&mut other.snapshot).items=vec![item(chat::Role::Assistant,"newer other-card Markdown")];
+                    app.cards.insert(other_target.card,CardRuntime::Chat(Box::new(other)));
+                    Action::Copy(other_target,"same-opaque-message".into(),CopyPart::Text)
+                }
+            };
+            drop(app.handle_chat_ui(next));
+            let copied=app.chat_runtime_mut(target).unwrap().copied.clone();
+            drop(app.handle_chat_ui(Action::PlainCopyReady(target,id,reply)));
+            assert_eq!(app.chat_runtime_mut(target).unwrap().copied,copied,"older ready output must not initiate a clipboard write after newer intent");
+        }
+    }
+
     #[test]
     fn literal_user_copy_and_oversized_input_have_explicit_semantics() {
         assert_eq!(format(&item(chat::Role::User,"**literal user syntax**")).unwrap(),"**literal user syntax**");
@@ -210,7 +294,7 @@ mod tests {
         let ui=std::thread::current().id();let(entered,seen)=std::sync::mpsc::channel();let(release,resume)=std::sync::mpsc::channel();
         retire(Block {entered,release:resume});assert_ne!(seen.recv_timeout(Duration::from_secs(5)).unwrap(),ui);
         let source=item(chat::Role::Assistant,"last source owner");let weak=Arc::downgrade(&source);
-        let input=InputSlot(Mutex::new(Some(source)));drop(input);
+        let input=InputSlot {source:Mutex::new(Some(source)),cancelled:Arc::new(AtomicBool::new(false))};drop(input);
         let permits=Arc::new(tokio::sync::Semaphore::new(1));let permit=permits.clone().try_acquire_owned().unwrap();
         let text="queued completed output".to_owned();let bytes=OutputBytes::new(text.capacity());
         let reply=Reply::new(Ok(Output {text,_permit:permit,_bytes:bytes}));let last=reply.clone();drop(reply);drop(last);
