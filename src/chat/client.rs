@@ -390,11 +390,10 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
-                if session.launch.session_id.is_some()
-                    && (session.launch.session_id != restored.launch.session_id
-                        || session.launch.recipe != restored.launch.recipe)
-                {
-                    if !super::is_upgrade_recovery(&session, &restored) {
+                if session != restored {
+                    if !(super::is_upgrade_recovery(&session, &restored)
+                        || super::is_upgrade_identity_learning(&session, &restored))
+                    {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
                     *upgrade_recovery = Some((session, restored.clone()));
@@ -505,6 +504,23 @@ impl ClientHandle {
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
         handle
+    }
+
+    /// Drives the production connect/lineage/attach path for UI writer tests.
+    #[cfg(test)]
+    pub(crate) fn fixture_upgrade_handshake(
+        source: Session,
+        session: Session,
+        snapshot: Snapshot,
+    ) -> Result<Self, StartFailure> {
+        tests::restore_with_lineage(source, Some(session), move |request| {
+            let ClientRequest::ChatAttach { session } = request else {
+                panic!("expected exact upgrade attach");
+            };
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached { session, snapshot },
+            }
+        })
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -1170,6 +1186,10 @@ impl ClientHandle {
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner.upgrade_recovery.as_ref()
     }
+    pub(crate) fn is_connected(&self) -> bool {
+        self.inner.alive.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
             .snapshot
@@ -2506,13 +2526,16 @@ mod tests {
         restore_with_lineage(session, None, answer)
     }
 
-    fn restore_with_lineage(
+    pub(super) fn restore_with_lineage(
         session: Session,
         resolved: Option<Session>,
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = host_proof("live");
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
         let (client, mut server) = UnixStream::pair().unwrap();
         let proof = live.clone();
         let worker = thread::spawn(move || {

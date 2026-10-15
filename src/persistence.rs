@@ -1275,7 +1275,9 @@ impl StateStore {
         source: &crate::chat::Session,
         replacement: &crate::chat::Session,
     ) -> Result<()> {
-        if !crate::chat::is_upgrade_recovery(source, replacement) {
+        if !(crate::chat::is_upgrade_recovery(source, replacement)
+            || crate::chat::is_upgrade_identity_learning(source, replacement))
+        {
             return Err(StoreError::InvalidState(
                 "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs".into(),
             ));
@@ -2314,9 +2316,12 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
             "terminal" => CardKind::Terminal(load_terminal_record(&transaction, card)?),
             "chat" => CardKind::Chat(from_json(
                 "migration chat",
-                content.as_deref().ok_or_else(|| StoreError::corrupt_row(
-                    format!("migration chat card {card}"), "missing session descriptor",
-                ))?,
+                content.as_deref().ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing session descriptor",
+                    )
+                })?,
             )?),
             _ => unreachable!("query restricts session kinds"),
         };
@@ -6317,18 +6322,28 @@ mod tests {
             let path = directory.path().join("migration-source.sqlite3");
             let store = StateStore::open(&path, boot("chat-boot")).unwrap();
             let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
-            if chat { workspace.cards[0].kind = CardKind::Chat(source); }
+            if chat {
+                workspace.cards[0].kind = CardKind::Chat(source);
+            }
             let expected = (workspace.cards[0].id, workspace.cards[0].kind.clone());
             let mut lane = SaveLane::default();
             lane.save(&store, &workspace).unwrap();
             drop(store);
             let before = std::fs::read(&path).unwrap();
             assert_eq!(read_open_migration_sessions(&path).unwrap(), vec![expected]);
-            assert_eq!(std::fs::read(&path).unwrap(), before, "inspection cannot migrate or update the database");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "inspection cannot migrate or update the database"
+            );
             let store = StateStore::open(&path, boot("chat-boot")).unwrap();
-            workspace.cards[0].existence = Existence::Closed { tombstone: Tombstone {
-                operation_id: None, closed_at_unix_ms: 1, reason: Some("fixture closed".into()),
-            }};
+            workspace.cards[0].existence = Existence::Closed {
+                tombstone: Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("fixture closed".into()),
+                },
+            };
             workspace.focused = None;
             lane.save(&store, &workspace).unwrap();
             assert!(read_open_migration_sessions(&path).unwrap().is_empty());
@@ -6849,6 +6864,194 @@ mod tests {
         drop(store);
         let reopened =
             StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
+    #[test]
+    fn legacy_and_durable_codex_hundred_panes_save_reopen_across_three_generations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite3");
+        let boot_id = boot("chat-boot");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let (mut workspace, template) = agent_workspace(crate::agent::Provider::Codex);
+        let card_template = workspace.cards[0].clone();
+        let proof = template
+            .terminal
+            .as_ref()
+            .unwrap()
+            .continuity
+            .live_proof()
+            .unwrap();
+        workspace.cards.clear();
+        for index in 0..100 {
+            let mut source = template.clone();
+            source.id = TerminalId::new();
+            source.proof = Some(proof.clone());
+            source.terminal = None;
+            source.launch.session_id = None;
+            source.launch.recipe.arguments = vec![
+                "--remote".into(),
+                "unix://".into(),
+                "--model".into(),
+                "fixture-luna".into(),
+            ];
+            source.launch.recipe.environment.insert(
+                "CODEX_HOME".into(),
+                format!(
+                    "/fixture/{}/account-{index}",
+                    if index % 2 == 0 { "system" } else { "managed" }
+                ),
+            );
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .insert("OPENAI_API_KEY".into());
+            assert!(source.claim_owned_codex_listener(Path::new("/fixture/listeners"), &proof));
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            if index % 3 == 0 {
+                source.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.162.0".into(),
+                };
+            }
+            if index % 5 == 0 {
+                let mut terminal = template.terminal.clone().unwrap();
+                terminal.id = source.id;
+                terminal.launch = source.launch.terminal_recipe().unwrap();
+                source.terminal = Some(terminal);
+            }
+            let mut card = card_template.clone();
+            card.id = CardId::new();
+            card.exposure = if index == 0 {
+                Exposure::Visible
+            } else {
+                Exposure::Offscreen
+            };
+            card.kind = CardKind::Chat(source);
+            workspace
+                .chat_drafts
+                .insert(card.id, format!("Unsent draft for pane {index}"));
+            workspace.cards.push(card);
+        }
+        workspace.focused = Some(workspace.cards[0].id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        for generation in 1..=3 {
+            for card in &mut workspace.cards {
+                let CardKind::Chat(source) = &card.kind else {
+                    unreachable!()
+                };
+                let mut replacement = source.clone();
+                replacement.proof.as_mut().unwrap().host_incarnation =
+                    format!("migration-{generation}").into();
+                if let Some(terminal) = replacement.terminal.as_mut() {
+                    terminal.continuity = TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id.clone(),
+                        boot_id: proof.boot_id.clone(),
+                        host_incarnation: format!("migration-{generation}").into(),
+                    };
+                }
+                assert!(crate::chat::is_upgrade_recovery(source, &replacement));
+                store
+                    .rebind_chat_upgrade(card.id, source, &replacement)
+                    .unwrap();
+                card.kind = CardKind::Chat(replacement);
+            }
+            lane.save(&store, &workspace).unwrap();
+            let reopened = StateStore::open(&path, boot_id.clone()).unwrap();
+            let restored = reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.cards.len(), 100);
+            assert_eq!(restored.chat_drafts, workspace.chat_drafts);
+            for (expected, actual) in workspace.cards.iter().zip(&restored.cards) {
+                assert_eq!(actual.kind, expected.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_upgrade_identity_learning_is_transactional_and_keeps_pair_and_account_exact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("identity-learning.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Codex);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        let conversation = source.launch.session_id.take().unwrap();
+        let mut replacement = source.clone();
+        replacement.launch.session_id = Some(conversation);
+        replacement.proof.as_mut().unwrap().host_incarnation = "learned-daemon".into();
+        let proof = replacement.proof.as_ref().unwrap();
+        replacement.terminal.as_mut().unwrap().continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        assert!(!crate::chat::is_upgrade_recovery(&source, &replacement));
+        assert!(crate::chat::is_upgrade_identity_learning(
+            &source,
+            &replacement
+        ));
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        for mutation in 0..9 {
+            let mut changed = replacement.clone();
+            match mutation {
+                0 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/different-account".into());
+                }
+                1 => {
+                    changed
+                        .launch
+                        .recipe
+                        .unset_environment
+                        .insert("CHANGED_SETTING".into());
+                }
+                2 => changed
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-options".into()),
+                3 => changed.launch.recipe.working_directory = "/different-project".into(),
+                4 => changed.proof = source.proof.clone(),
+                5 => changed.proof.as_mut().unwrap().boot_id = boot("another-boot"),
+                6 => changed.terminal.as_mut().unwrap().resume_hint = Some("another-thread".into()),
+                7 => changed
+                    .terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("--different-listener".into()),
+                _ => changed.terminal.as_mut().unwrap().id = TerminalId::new(),
+            }
+            assert!(
+                !crate::chat::is_upgrade_identity_learning(&source, &changed),
+                "mutation {mutation}"
+            );
+            assert!(store.rebind_chat_upgrade(card, &source, &changed).is_err());
+        }
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(
+            lane.save(&store, &workspace).is_err(),
+            "ordinary save cannot learn a paired upgrade identity"
+        );
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let reopened = StateStore::open(path, boot("chat-boot")).unwrap();
         assert_eq!(
             reopened.load_card(card, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
