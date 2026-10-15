@@ -950,6 +950,10 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Daemon source-clock time at the observed turn boundary. Kept in resident
+    /// metadata so a first attachment can time work whose prompt is paged out.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
 }
 
 /// When a provider takes a message it is holding.

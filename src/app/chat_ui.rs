@@ -959,6 +959,8 @@ struct CachedItem {
     tool_input: Option<tool_text::ToolText>,
     tool_output: Option<tool_text::ToolText>,
     patches: Vec<tool_text::ToolText>,
+    /// Diff counts are formed on source changes, never by the frame renderer.
+    change_stat: Option<(usize, usize)>,
     token: ChangeToken,
     item: Option<Arc<chat::Item>>,
     /// Unique presentation identity for retained turns, including tail collisions.
@@ -1109,6 +1111,10 @@ impl CachedItem {
             tool_input,
             tool_output,
             patches,
+            change_stat: match content {
+                ItemContent::Changes { changes, .. } => Some(step::diff_stat(changes)),
+                _ => None,
+            },
             token: ChangeToken::of(content),
             item,
             revision: Self::next_revision(),
@@ -4563,7 +4569,7 @@ impl Cagents {
         }
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
-            if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
+            if runtime.snapshot.is_working() && !runtime.snapshot.exited && runtime.visible.load(Ordering::Relaxed))
         }) {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
