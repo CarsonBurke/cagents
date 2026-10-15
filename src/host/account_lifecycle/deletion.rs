@@ -782,6 +782,12 @@ mod tests {
         }
         host.lock().unwrap().terminals.get_mut(&issued_terminal.id).unwrap().execution_environment.as_mut().unwrap().0.insert("CLAUDE_CONFIG_DIR".into(),"relative-home".into());
         assert!(permit.verify().is_err(),"relative effective home cannot be resolved through immutable old cwd");
+        for variable in ["CODEX_HOME","HOME"] {
+            let mut mixed=effective.clone();
+            mixed.0.insert(variable.into(),"relative-other-provider-home".into());
+            host.lock().unwrap().terminals.get_mut(&issued_terminal.id).unwrap().execution_environment=Some(mixed);
+            assert!(permit.verify().is_err(),"an absolute selected-provider home cannot hide a relative home for another provider");
+        }
         host.lock().unwrap().terminals.get_mut(&issued_terminal.id).unwrap().execution_environment=Some(effective);
         permit.authorize_scope(&scope).unwrap();
         let removed=host.lock().unwrap().terminals.remove(&issued_terminal.id).unwrap();

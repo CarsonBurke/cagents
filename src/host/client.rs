@@ -432,18 +432,24 @@ fn ensure_account_homes_unused_inner(
                         .filter(|value| !value.is_empty())
                         .or_else(|| environment.0.get("HOME").filter(|value| !value.is_empty()))
                 });
-                if !conservative_pending && captured_home.is_some_and(|value| !std::path::Path::new(value).is_absolute()) {
-                    // The operational directory may have moved independently
-                    // of immutable launch.cwd. Joining a relative account home
-                    // against that old recipe would invent physical scope.
-                    return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
-                        "A terminal has relative account-home metadata without captured physical scope; close it before deleting account files", false));
-                }
                 for provider in crate::account::Account::PROVIDERS {
                     if conservative_pending || record.execution_environment.is_none() {
                         paths.extend(selected_recipe(provider, &record.session.launch));
                     }
                     if let Some(environment) = &record.execution_environment {
+                        if !conservative_pending
+                            && crate::account::home_variable(provider).and_then(|name| environment.0.get(name))
+                                .filter(|value| !value.is_empty())
+                                .or_else(|| environment.0.get("HOME").filter(|value| !value.is_empty()))
+                                .is_some_and(|value| !std::path::Path::new(value).is_absolute())
+                        {
+                            // Physical account directories may overlap across
+                            // providers. No relative provider root can be
+                            // resolved through immutable issued cwd when the
+                            // actual operational FD may have moved.
+                            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                                "A terminal has relative account-home metadata without captured physical scope; close it before deleting account files", false));
+                        }
                         paths.extend(selected_home(
                             provider,
                             &environment.0,
@@ -476,7 +482,7 @@ fn ensure_account_homes_unused_inner(
                         {
                             environment.remove(&name);
                         }
-                        if !conservative_pending && provider == account.provider
+                        if !conservative_pending
                             && crate::account::home_variable(provider).and_then(|name| environment.get(name))
                                 .filter(|value| !value.is_empty())
                                 .or_else(|| environment.get("HOME").filter(|value| !value.is_empty()))
