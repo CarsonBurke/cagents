@@ -142,6 +142,38 @@ mod tests {
         drop(app.sync_chrome());
         let (_, width) = app.tab_strip_geometry();
         assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == "WWWWWWWWWWWWWWWWWWWW" {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut header = app.column_header(id, true, width);
+        let mut tree = Tree::new(header.as_widget());
+        let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+        let node =
+            header
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut title = TitleBounds(None);
+        header
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+        assert!(
+            title.0.expect("actual mounted title text").width
+                >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
+            "the real title allocation must fit, after its icon, padding and controls"
+        );
     }
 
     #[test]
