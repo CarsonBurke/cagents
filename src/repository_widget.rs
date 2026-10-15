@@ -1894,6 +1894,7 @@ pub struct RepositoryRuntime {
     pending_jump_origin: Option<crate::editor_navigation::Location>,
     go_to_line: Option<String>,
     pending_scalar_location: Option<(PathBuf, usize, usize)>,
+    pending_source_location: Option<(PathBuf, usize)>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2124,6 +2125,7 @@ impl RepositoryRuntime {
             pending_jump_origin: None,
             go_to_line: None,
             pending_scalar_location: None,
+            pending_source_location: None,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -5026,6 +5028,15 @@ impl RepositoryRuntime {
                 };
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.content.set_auto_close(self.editor_auto_close);
+                    if let Some((path, source_line)) = self.pending_source_location.take()
+                        && document.path == path
+                        && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
+                        && *pending_path == path {
+                        let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+                        navigation.caret.line = line;
+                        navigation.caret.column = 0;
+                        navigation.scroll_line = line.saturating_sub(10);
+                    }
                     if let Some((path, line, column)) = self.pending_scalar_location.take()
                         && document.path == path
                         && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
@@ -6271,6 +6282,29 @@ impl RepositoryRuntime {
         task
     }
 
+    /// Opens a Git/diff source line counted by LF separators. Native editor
+    /// lines also split bare CR, so defer mapping until the actual file loads.
+    pub fn open_source_file_location(&mut self, card: CardId, path: PathBuf, source_line: usize) -> Task<RepositoryAction> {
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &self.document {
+            let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+            return self.open_file_location(card, path, line, 0, 0);
+        }
+        let task = self.open_file_location(card, path.clone(), 0, 0, 0);
+        if self.selected_path() == Some(path.as_path()) {
+            match &mut self.document {
+                DocumentState::Loading => self.pending_source_location = Some((path, source_line)),
+                DocumentState::Editable(document) => {
+                    let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+                    document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line, column: 0 }, selection: None });
+                    document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+                }
+                _ => {},
+            }
+        }
+        task
+    }
+
     /// Open a repository-relative location, even before the directory listing
     /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
     /// The requested range is clamped when the asynchronous file read finishes.
@@ -6278,6 +6312,7 @@ impl RepositoryRuntime {
         if crate::repository::RepoPath::parse(&path).is_err() { return Task::none(); }
         let caret = text_editor::Position { line, column };
         if self.blocks_navigation() && self.selected_path() != Some(path.as_path()) { return Task::none(); }
+        self.pending_source_location = None;
         self.record_location_jump(crate::editor_navigation::Location { path: path.clone(), cursor: text_editor::Cursor { position: caret, selection: None }, scroll: text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 } });
         let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
         if self.selected_path() == Some(path.as_path())
@@ -6335,6 +6370,7 @@ impl RepositoryRuntime {
         }
         self.pending_fragment = None;
         self.pending_scalar_location = None;
+        self.pending_source_location = None;
         self.pending_editor_navigation = None;
         self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
@@ -12186,6 +12222,27 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn async_diff_source_locations_map_lf_lines_across_bare_cr_and_crlf() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mixed.rs"), "first\rcontinued\nsecond\r\nthird\n").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 1);
+        assert!(matches!(&runtime.document, DocumentState::Loading));
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
+        assert_eq!(document.content.cursor().position, text_editor::Position { line: 2, column: 0 });
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 2);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
+        assert_eq!(document.content.cursor().position, text_editor::Position { line: 3, column: 0 });
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), usize::MAX);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
+        assert_eq!(document.content.cursor().position.line, document.content.line_count() - 1);
+    }
 
     #[tokio::test]
     async fn file_switches_retain_undo_until_the_disk_hash_changes() {
