@@ -1947,6 +1947,28 @@ fn confirm_account_conversation(
     }
 }
 
+/// A cached descriptor may predate the exact live actor's verified native
+/// promotion. Only that same Handle can supply the new typed continuity; a
+/// caller-provided Durable/actor version never authorizes learning it.
+fn reserved_automation_descriptor_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &Session,
+    actual: &chat::NativeContinuity,
+) -> bool {
+    let Some(crate::agent_execution::HostedSession::Chat(canonical)) = &agent.session else {
+        return false;
+    };
+    let issued = |value: &chat::NativeContinuity| {
+        matches!(value, chat::NativeContinuity::ReconnectOnly) || value == actual
+    };
+    if !issued(&canonical.native_continuity) || !issued(&current.native_continuity) {
+        return false;
+    }
+    let mut current = current.clone();
+    current.native_continuity = canonical.native_continuity.clone();
+    crate::automations::archive::native_descriptor_matches(agent, &current)
+}
+
 /// The caller holds this agent's owner gate and has proved an OPEN pending
 /// archive reservation. Resolve only its exact existing actor, never a launcher.
 pub(in crate::host) fn reserved_automation_actor(
@@ -1965,7 +1987,7 @@ pub(in crate::host) fn reserved_automation_actor(
     validate_proof(issued.proof.as_ref(), state.proof())?;
     let record = state.chats.get(&issued.id)
         .filter(|record| !record.handle.is_completed())
-        .filter(|record| crate::automations::archive::native_descriptor_matches(agent, &record.session))
+        .filter(|record| reserved_automation_descriptor_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id)
         .filter(|record| !require_attached || record.subscribers.contains_key(&client))
         .ok_or_else(|| unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"))?;
@@ -1990,9 +2012,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     };
     issued.launch.session_id = handle.confirmed_session_id();
     issued.native_continuity = handle.native_continuity();
-    let mut current_owner = agent.clone();
-    current_owner.session = Some(crate::agent_execution::HostedSession::Chat(issued.clone()));
-    if !crate::automations::archive::native_descriptor_matches(&current_owner, requested) {
+    if !reserved_automation_descriptor_matches(agent, requested, &issued.native_continuity) {
         return Err(error("The pending archive attachment changed its exact native descriptor"));
     }
     let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
@@ -2003,7 +2023,7 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     validate_proof(requested.proof.as_ref(), state.proof())?;
     let record = state.chats.get_mut(&requested.id)
         .filter(|record| record.handle.same_actor(&handle) && !record.handle.is_completed())
-        .filter(|record| crate::automations::archive::native_descriptor_matches(agent, &record.session))
+        .filter(|record| reserved_automation_descriptor_matches(agent, &record.session, &record.handle.native_continuity()))
         .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
     if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
@@ -3122,6 +3142,67 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn pending_automation_archive_attachment_learns_only_the_exact_actors_native_promotion() {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target};
+        let (_directory, _host, saved) = upgrade_fixture();
+        let source = saved.source;
+        let placement = Placement::Channel(crate::model::ChannelId::new());
+        let mut agent = Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::Automation { id: uuid::Uuid::new_v4() },
+            spec: Spec {
+                provider: source.launch.provider,
+                account: None,
+                target: Target {
+                    repository: source.launch.recipe.working_directory.clone(),
+                    directory: source.launch.recipe.working_directory.clone(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Chat(source.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let actual = chat::NativeContinuity::Durable { provider_version: "verified-1".into() };
+        assert!(reserved_automation_descriptor_matches(&agent, &source, &actual));
+        let mut promoted = source.clone();
+        promoted.native_continuity = actual.clone();
+        assert!(reserved_automation_descriptor_matches(&agent, &promoted, &actual));
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else { unreachable!() };
+        canonical.native_continuity = actual.clone();
+        assert!(reserved_automation_descriptor_matches(&agent, &source, &actual));
+        assert!(!crate::automations::archive::native_descriptor_matches(&agent, &source), "closed archive readiness remains strict");
+        let mut unrelated = promoted.clone();
+        unrelated.native_continuity = chat::NativeContinuity::Durable { provider_version: "unrelated-version".into() };
+        assert!(!reserved_automation_descriptor_matches(&agent, &unrelated, &actual));
+        assert!(!reserved_automation_descriptor_matches(&agent, &promoted, &chat::NativeContinuity::ReconnectOnly));
+        let mut unknown_thread = source.clone();
+        unknown_thread.launch.session_id = None;
+        assert!(reserved_automation_descriptor_matches(&agent, &unknown_thread, &actual), "only the canonical already-confirmed thread may be learned");
+        for field in 0..5 {
+            let mut changed = source.clone();
+            match field {
+                0 => changed.launch.session_id = Some("unrelated-native-thread".into()),
+                1 => changed.id = TerminalId::new(),
+                2 => changed.proof = None,
+                3 => changed.owned_codex_listener = Some(chat::OwnedCodexListener {
+                    socket: "/unrelated/control.sock".into(),
+                    allocator: source.proof.clone().unwrap(),
+                }),
+                _ => { changed.launch.recipe.environment.insert("DIFFERENT_ACCOUNT".into(), "other-home".into()); }
+            }
+            assert!(!reserved_automation_descriptor_matches(&agent, &changed, &actual), "different authority field {field}");
+        }
+    }
 
     #[test]
     fn removed_claude_account_is_reported_before_missing_resume_history() {
