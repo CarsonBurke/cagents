@@ -257,19 +257,19 @@ pub enum Action {
         command: ProjectCommand,
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
-    ConfirmDelete,
+    ConfirmDelete(u64),
     DeleteOptionsRead {
         request: u64,
         result: Result<DeleteOptions, String>,
     },
-    DeleteBranchChanged(bool),
+    DeleteBranchChanged(u64, bool),
     BranchDeleted {
         request: BranchDeletion,
         result: Result<(), crate::worktree_branch::BranchDeleteFailure>,
     },
     ForceDeleteBranch(crate::model::OperationId),
     KeepBranch(crate::model::OperationId),
-    BusyAgentsConfirmed(bool),
+    BusyAgentsConfirmed(u64, bool),
     StaleUnlocked {
         request: u64,
         result: Result<(), String>,
@@ -284,8 +284,8 @@ pub enum Action {
         request: u64,
         result: Result<Vec<String>, String>,
     },
-    CleanupPolicyChanged(String),
-    SaveCleanupPolicy,
+    CleanupPolicyChanged(u64, String),
+    SaveCleanupPolicy(u64),
     CleanupPolicySaved {
         request: u64,
         result: Result<(), String>,
@@ -335,14 +335,14 @@ impl Action {
         matches!(
             self,
             Self::Command { .. }
-                | Self::ConfirmDelete
-                | Self::DeleteBranchChanged(_)
+                | Self::ConfirmDelete(_)
+                | Self::DeleteBranchChanged(..)
                 | Self::ForceDeleteBranch(_)
                 | Self::KeepBranch(_)
-                | Self::BusyAgentsConfirmed(_)
+                | Self::BusyAgentsConfirmed(..)
                 | Self::OpenCleanupPolicy(_)
-                | Self::CleanupPolicyChanged(_)
-                | Self::SaveCleanupPolicy
+                | Self::CleanupPolicyChanged(..)
+                | Self::SaveCleanupPolicy(_)
                 | Self::ConfirmRemove
                 | Self::RetryDelete(_)
                 | Self::Dismiss
@@ -1221,13 +1221,13 @@ impl Cagents {
             Action::ForceDeleteBranch(_) | Action::KeepBranch(_) => {
                 self.project_ui.force_branches.is_empty()
             }
-            Action::CleanupPolicyChanged(_) | Action::SaveCleanupPolicy => {
+            Action::CleanupPolicyChanged(..) | Action::SaveCleanupPolicy(_) => {
                 !self.project_ui.force_branches.is_empty()
                     || self.project_ui.cleanup_dialog.is_none()
             }
-            Action::ConfirmDelete
-            | Action::DeleteBranchChanged(_)
-            | Action::BusyAgentsConfirmed(_) => !self.worktree_delete_dialog_on_top(),
+            Action::ConfirmDelete(_)
+            | Action::DeleteBranchChanged(..)
+            | Action::BusyAgentsConfirmed(..) => !self.worktree_delete_dialog_on_top(),
             Action::ConfirmRemove => {
                 !self.project_ui.force_branches.is_empty()
                     || self.project_ui.cleanup_dialog.is_some()
@@ -1304,23 +1304,23 @@ impl Cagents {
                 return iced::widget::operation::focus(self.project_ui.focus_target())
                     .map(cosmic::Action::App);
             }
-            Action::CleanupPolicyChanged(value) => {
+            Action::CleanupPolicyChanged(request, value) => {
                 if let Some(dialog) = self
                     .project_ui
                     .cleanup_dialog
                     .as_mut()
-                    .filter(|dialog| !dialog.loading)
+                    .filter(|dialog| dialog.request == request && !dialog.loading)
                 {
                     dialog.directories = value;
                     dialog.error = None;
                 }
             }
-            Action::SaveCleanupPolicy => {
+            Action::SaveCleanupPolicy(request) => {
                 let Some(dialog) = self
                     .project_ui
                     .cleanup_dialog
                     .as_mut()
-                    .filter(|dialog| !dialog.loading)
+                    .filter(|dialog| dialog.request == request && !dialog.loading)
                 else {
                     return Task::none();
                 };
@@ -1836,20 +1836,20 @@ impl Cagents {
                     }
                 }
             }
-            Action::DeleteBranchChanged(value) => {
+            Action::DeleteBranchChanged(request, value) => {
                 if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| {
-                    !dialog.branch_elsewhere && !dialog.options_loading && !dialog.loading
+                    dialog.request == request && !dialog.branch_elsewhere && !dialog.options_loading && !dialog.loading
                 }) {
                     dialog.delete_branch = value;
                     dialog.branch_choice_edited = true;
                 }
             }
-            Action::BusyAgentsConfirmed(value) => {
+            Action::BusyAgentsConfirmed(request, value) => {
                 if let Some(dialog) = self
                     .project_ui
                     .dialog
                     .as_mut()
-                    .filter(|dialog| !dialog.loading && !dialog.options_loading)
+                    .filter(|dialog| dialog.request == request && !dialog.loading && !dialog.options_loading)
                 {
                     dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone());
                 }
@@ -1884,8 +1884,8 @@ impl Cagents {
                     }
                 }
             }
-            Action::ConfirmDelete => {
-                let Some(dialog) = &self.project_ui.dialog else {
+            Action::ConfirmDelete(request) => {
+                let Some(dialog) = self.project_ui.dialog.as_ref().filter(|dialog| dialog.request == request) else {
                     return Task::none();
                 };
                 let target = dialog.target.clone();
@@ -2703,6 +2703,7 @@ impl Cagents {
             ]).spacing(space::M), 500.0));
         }
         if let Some(dialog) = &self.project_ui.cleanup_dialog {
+            let request = dialog.request;
             let mut input = crate::ui_controls::field::text(
                 "Directory names, separated by commas",
                 &dialog.directories,
@@ -2711,7 +2712,7 @@ impl Cagents {
             .width(Length::Fill);
             if !dialog.loading {
                 input =
-                    input.on_input(|value| Message::ProjectUi(Action::CleanupPolicyChanged(value)));
+                    input.on_input(move |value| Message::ProjectUi(Action::CleanupPolicyChanged(request, value)));
             }
             let mut rows = vec![
                 design::title("Project cleanup policy").into(),
@@ -2736,7 +2737,7 @@ impl Cagents {
                     .id(widget::Id::new("dialog.project.cleanup.cancel"))
                     .on_press(Message::ProjectUi(Action::Dismiss)),
                 crate::ui_controls::button::primary("Save policy").on_press_maybe(
-                    (!dialog.loading).then_some(Message::ProjectUi(Action::SaveCleanupPolicy)),
+                    (!dialog.loading).then_some(Message::ProjectUi(Action::SaveCleanupPolicy(request))),
                 ),
             ));
             return Some(super::dialog_ui::surface(
@@ -2778,6 +2779,7 @@ impl Cagents {
             ));
         }
         let dialog = self.project_ui.dialog.as_ref()?;
+        let request = dialog.request;
         let target = &dialog.target;
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Delete worktree?").into(),
@@ -2825,7 +2827,7 @@ impl Cagents {
                         crate::settings_widgets::toggle(
                             "Delete branch too",
                             dialog.delete_branch,
-                            |value| Message::ProjectUi(Action::DeleteBranchChanged(value)),
+                            move |value| Message::ProjectUi(Action::DeleteBranchChanged(request, value)),
                         )
                         .into(),
                     );
@@ -2859,7 +2861,7 @@ impl Cagents {
                 crate::settings_widgets::toggle(
                     "Interrupt these agents and delete",
                     dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents),
-                    |value| Message::ProjectUi(Action::BusyAgentsConfirmed(value)),
+                    move |value| Message::ProjectUi(Action::BusyAgentsConfirmed(request, value)),
                 )
                 .into(),
             );
@@ -2889,7 +2891,7 @@ impl Cagents {
             && !dialog.options_loading
             && dialog.safety.is_some()
             && (busy == 0 || dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents)))
-        .then_some(Message::ProjectUi(Action::ConfirmDelete));
+        .then_some(Message::ProjectUi(Action::ConfirmDelete(request)));
         let label = match dialog.safety.as_ref() {
             Some(snapshot) if snapshot.detached_only_commits > 0 => {
                 if snapshot.files_to_discard() > 0 {
@@ -3936,7 +3938,7 @@ mod tests {
             confirming: false,
             result: Ok((snapshot.clone(), agents.clone())),
         }));
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
@@ -4138,7 +4140,8 @@ mod tests {
         app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent];
         confirm_deletion_fixture(&mut app);
         assert!(!app.project_ui.is_deleting(linked.id));
-        drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::BusyAgentsConfirmed(request, true)));
         confirm_deletion_fixture(&mut app);
         assert!(app.project_ui.is_deleting(linked.id));
     }
@@ -4170,8 +4173,8 @@ mod tests {
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
             app.project_ui.dialog.as_mut().unwrap().session_census = vec![original.clone()];
             confirm_deletion_fixture(&mut app);
-            drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
-            drop(app.handle_project_action(Action::ConfirmDelete));
+            drop(app.handle_project_action(Action::BusyAgentsConfirmed(request, true)));
+            drop(app.handle_project_action(Action::ConfirmDelete(request)));
             let mut changed = original.clone();
             match change {
                 0 => changed.session = TerminalId::new(),
@@ -4244,7 +4247,7 @@ mod tests {
                 },
             )),
         }));
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         actor.close_revision = Some(2);
         drop(app.handle_project_action(Action::SafetyRead {
             request,
@@ -4333,9 +4336,9 @@ mod tests {
             }));
             app.update_prepared = update;
             app.settings_reset_confirm = !update;
-            drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
+            drop(app.handle_project_action(Action::DeleteBranchChanged(request, true)));
             assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
-            drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
+            drop(app.handle_project_action(Action::BusyAgentsConfirmed(request, true)));
             assert!(
                 app.project_ui
                     .dialog
@@ -4344,7 +4347,7 @@ mod tests {
                     .busy_confirmed
                     .is_none()
             );
-            drop(app.handle_project_action(Action::ConfirmDelete));
+            drop(app.handle_project_action(Action::ConfirmDelete(request)));
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
                 confirming: true,
@@ -4357,8 +4360,48 @@ mod tests {
             Action::ForceDeleteBranch(crate::model::OperationId::new())
         )));
         assert!(user_message_blocked_during_update(&Message::ProjectUi(
-            Action::BusyAgentsConfirmed(true)
+            Action::BusyAgentsConfirmed(0, true)
         )));
+    }
+
+    #[test]
+    fn stale_same_role_delete_controls_cannot_authorize_replacement_dialog() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        drop(app.open_worktree_delete_dialog(target.clone()));
+        let stale = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.open_worktree_delete_dialog(target));
+        let current = app.project_ui.dialog.as_ref().unwrap().request;
+        assert_ne!(stale, current);
+        drop(app.handle_project_action(Action::DeleteOptionsRead { request: current, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+        drop(app.handle_project_action(Action::SafetyRead { request: current, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+        drop(app.handle_project_action(Action::DeleteBranchChanged(stale, true)));
+        assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
+        let confirm = app.handle_project_action(Action::ConfirmDelete(stale));
+        assert!(cosmic::iced::runtime::task::into_stream(confirm).is_none());
+        assert!(!app.project_ui.dialog.as_ref().unwrap().loading);
+        assert!(!app.project_ui.is_deleting(linked.id));
+        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) }];
+        drop(app.handle_project_action(Action::BusyAgentsConfirmed(stale, true)));
+        assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
+        drop(app.handle_project_action(Action::BusyAgentsConfirmed(current, true)));
+        assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_some());
+    }
+
+    #[test]
+    fn stale_policy_edit_or_save_cannot_mutate_another_project_dialog() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.project_ui.cleanup_dialog = Some(CleanupPolicyDialog { repository: "/project-b".into(), name: "Project B".into(), directories: "target".into(), loading: false, error: None, request: 18 });
+        drop(app.handle_project_action(Action::CleanupPolicyChanged(17, "private-data".into())));
+        assert_eq!(app.project_ui.cleanup_dialog.as_ref().unwrap().directories, "target");
+        let save = app.handle_project_action(Action::SaveCleanupPolicy(17));
+        assert!(cosmic::iced::runtime::task::into_stream(save).is_none());
+        assert!(!app.project_ui.cleanup_dialog.as_ref().unwrap().loading);
+        drop(app.handle_project_action(Action::CleanupPolicyChanged(18, "node_modules".into())));
+        assert_eq!(app.project_ui.cleanup_dialog.as_ref().unwrap().directories, "node_modules");
     }
 
     #[test]
@@ -4401,9 +4444,9 @@ mod tests {
         app.project_ui
             .force_branches
             .push_back((force, "Unmerged".into()));
-        drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
+        drop(app.handle_project_action(Action::DeleteBranchChanged(request, true)));
         assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
@@ -5694,7 +5737,7 @@ mod tests {
                 lock_error: None,
             }),
         }));
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         assert!(!app.project_ui.is_deleting(linked.id));
         let mut observed = clean_snapshot();
         observed.untracked = 3;
@@ -5707,7 +5750,7 @@ mod tests {
             app.project_ui.focus_target(),
             widget::Id::new("dialog.project.close")
         );
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         assert!(app.project_ui.dialog.as_ref().unwrap().loading);
         let mut current = observed;
         current.untracked = 4;
@@ -5721,7 +5764,7 @@ mod tests {
         let dialog = app.project_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.safety.as_ref().unwrap().untracked, 4);
         assert!(dialog.failure.as_deref().unwrap().contains("changed"));
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
