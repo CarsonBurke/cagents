@@ -1225,6 +1225,11 @@ pub struct WorkspaceState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub conversation_channels: HashMap<String, ChannelId>,
 
+    /// Full host-issued return receipts awaiting an exact metadata-only ACK.
+    /// Saved with the conversion so a crash never reduces authority to an ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::terminal::ipc::TerminalHandoffReceipt>,
+
     /// Most recently visited workspace identities, newest first. Missing
     /// identities are pruned when navigation opens; this grants no ownership.
     #[serde(default)]
@@ -1267,6 +1272,7 @@ impl Default for WorkspaceState {
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),
+            terminal_handoff_receipts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,

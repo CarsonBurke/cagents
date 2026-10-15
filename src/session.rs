@@ -2888,6 +2888,7 @@ mod tests {
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),
+            terminal_handoff_receipts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,

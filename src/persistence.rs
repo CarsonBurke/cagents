@@ -264,6 +264,7 @@ pub struct WorkspaceManifest {
     pub conversation_drafts: HashMap<String, String>,
     pub conversation_models: HashMap<String, String>,
     pub conversation_channels: HashMap<String, ChannelId>,
+    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::terminal::ipc::TerminalHandoffReceipt>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -1749,6 +1750,7 @@ impl StateStore {
             conversation_drafts: manifest.conversation_drafts,
             conversation_models: manifest.conversation_models,
             conversation_channels: manifest.conversation_channels,
+            terminal_handoff_receipts: manifest.terminal_handoff_receipts,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
@@ -3316,6 +3318,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:terminal_handoff_receipts"),
+        &to_json(&state.terminal_handoff_receipts)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &to_json(&state.repository_navigation)?,
     )?;
@@ -4685,6 +4692,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace conversation channels", &value))
         .transpose()?
         .unwrap_or_default(),
+        terminal_handoff_receipts: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:terminal_handoff_receipts"),
+        )?
+        .map(|value| from_json("workspace terminal handoff receipts", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -5309,6 +5323,7 @@ mod tests {
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),
+            terminal_handoff_receipts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6234,6 +6249,51 @@ mod tests {
                 .workspace_history
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn full_terminal_handoff_receipts_survive_conversion_restart_and_exact_ack() {
+        use crate::terminal::ipc::{ChatSourceBinding, TerminalDescriptor, TerminalHandoffReceipt};
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("handoff-receipts.sqlite3");
+        let boot_id = boot("handoff-receipts");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(terminal) = workspace.cards[0].kind.clone() else { panic!("terminal"); };
+        let mut source = crate::chat::fresh_session(crate::agent::Provider::Claude, TerminalId::new(),
+            terminal.launch.working_directory.clone(), &crate::account::Account::system(crate::agent::Provider::Claude)).unwrap();
+        source.proof = terminal.continuity.live_proof().cloned();
+        let binding = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let mut descriptor = TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), terminal.transcript_path.clone());
+        descriptor.session = terminal;
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let mut learned = binding.clone();
+        learned.source.launch.session_id = Some("confirmed-return-thread".into());
+        let first = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
+            source_execution_instance: binding.execution_instance, source_binding: binding,
+            retained_binding: Some(learned), terminal: descriptor };
+        let mut next = first.clone();
+        next.operation = uuid::Uuid::new_v4();
+        next.terminal.execution_instance = uuid::Uuid::new_v4();
+        workspace.terminal_handoff_receipts.insert(first.operation, first.clone());
+        workspace.terminal_handoff_receipts.insert(next.operation, next.clone());
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot("after-ui-crash")).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.terminal_handoff_receipts, workspace.terminal_handoff_receipts);
+        assert_eq!(restored.terminal_handoff_receipts[&first.operation], first);
+        assert_eq!(restored.terminal_handoff_receipts[&next.operation], next);
+        // Acknowledging one immutable operation cannot erase another return of
+        // the same terminal ID. No current inventory or recipe reconstructs it.
+        workspace.terminal_handoff_receipts.remove(&first.operation);
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.terminal_handoff_receipts, HashMap::from([(next.operation, next)]));
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy.as_object_mut().unwrap().remove("terminal_handoff_receipts");
+        assert!(serde_json::from_value::<WorkspaceState>(legacy).unwrap().terminal_handoff_receipts.is_empty());
     }
 
     #[test]

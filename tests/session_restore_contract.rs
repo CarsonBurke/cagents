@@ -98,6 +98,7 @@ impl RestoreFixture {
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),
+            terminal_handoff_receipts: HashMap::new(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
             pending_terminal_creations: Default::default(),
