@@ -317,7 +317,7 @@ pub enum Action {
     CompletionDismiss(Target),
     /// Where the completion list has been scrolled to.
     CompletionScrolled(Target, f32),
-    HandoffFinished(Target, Result<crate::terminal::ipc::TerminalHandoffReceipt, String>),
+    HandoffFinished(Target, uuid::Uuid, Result<crate::terminal::ipc::TerminalHandoffReceipt, String>),
     HandoffAttached(CardId, uuid::Uuid, Arc<crate::terminal::ipc::TerminalHandoffReceipt>, Result<StartedTerminal, String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
@@ -561,6 +561,23 @@ pub(super) struct State {
 pub(super) struct CapturedHandoffBinding {
     binding: crate::terminal::ipc::ChatSourceBinding,
     handle: Option<Arc<ClientHandle>>,
+    registry: uuid::Uuid,
+    issued: chat::Session,
+    operation: uuid::Uuid,
+}
+impl CapturedHandoffBinding {
+    fn current(&self, app: &Cagents, target: Target, handle: &Arc<ClientHandle>, observed: &chat::Session) -> bool {
+        self.registry == app.workspace_model.identity
+            && self.handle.as_ref().is_some_and(|original| Arc::ptr_eq(original, handle))
+            && matches!(app.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+            && matches!(app.card_state(target.card), Some(state) if state.existence.is_open()
+                && matches!(&state.kind, CardKind::Chat(current)
+                    if crate::workspace_model::views::handoff_chat_source_matches(&self.issued, current)))
+            && crate::workspace_model::views::handoff_chat_source_matches(&self.binding.source, observed)
+            && handle.source_binding().is_none_or(|current| current.execution_instance == self.binding.execution_instance
+                && current.backend == self.binding.backend
+                && crate::workspace_model::views::handoff_chat_source_matches(&self.binding.source, &current.source))
+    }
 }
 struct HandoffClose {
     attachment_operation: uuid::Uuid,
@@ -7143,6 +7160,14 @@ impl Cagents {
                     );
                     return Task::none();
                 }
+                if let Some((target, captured)) = self.chat_ui.handoff_bindings.iter().find(|(target, _)| target.card == card) {
+                    let current = matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                        if runtime.handle().is_some_and(|handle| captured.current(self, *target, handle, &runtime.session)));
+                    if !current {
+                        self.status = Some(TransientNotice::warning("An earlier Return still owns this pane's recovery. Its original backend must settle before another conversion."));
+                        return Task::none();
+                    }
+                }
                 if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
                     runtime.show(true);
                     runtime.refresh();
@@ -7279,16 +7304,40 @@ impl Cagents {
                         };
                         let target = runtime.target;
                         let _ = terminal;
-                        let Some(expected) = handle.source_binding() else {
-                            self.status = Some(TransientNotice::warning("The original native backend is not confirmed. Reconnect before returning it to a terminal."));
-                            return Task::none();
+                        // An ambiguous failed Return retains its original binding and
+                        // budget. Retirement may withdraw the live cache; that is not
+                        // permission to recapture another actor on an explicit retry.
+                        let retained = self.chat_ui.handoff_bindings.get(&target).cloned();
+                        let mut captured = if let Some(retained) = retained {
+                            if !retained.current(self, target, &handle, &session) {
+                                self.status = Some(TransientNotice::warning("The original Return no longer owns this conversation. Its captured recovery intent was kept."));
+                                return Task::none();
+                            }
+                            retained
+                        } else {
+                            // A stale intent for this card cannot be replaced by a
+                            // fresh getter after its presentation generation changed.
+                            if self.chat_ui.handoff_bindings.keys().any(|old| old.card == card) {
+                                self.status = Some(TransientNotice::warning("An earlier Return still owns this pane's recovery. Reconnect its original conversation."));
+                                return Task::none();
+                            }
+                            let Some(expected) = handle.source_binding() else {
+                                self.status = Some(TransientNotice::warning("The original native backend is not confirmed. Reconnect before returning it to a terminal."));
+                                return Task::none();
+                            };
+                            if !crate::workspace_model::views::handoff_chat_source_matches(&expected.source, &session)
+                                || crate::terminal::ipc::bounded_json_bytes(&expected, crate::terminal::ipc::MAX_HANDOFF_RECEIPT_JSON_BYTES).is_err()
+                                || !self.terminal_handoff_capacity_available() {
+                                self.status = Some(TransientNotice::warning("This return cannot be retained safely yet. Save or acknowledge pending returns, then retry the original conversation."));
+                                return Task::none();
+                            }
+                            let Some(CardKind::Chat(issued)) = self.card_state(card).map(|state| state.kind.clone()) else { return Task::none(); };
+                            CapturedHandoffBinding { binding: expected, handle: Some(handle.clone()), registry: self.workspace_model.identity, issued, operation: uuid::Uuid::new_v4() }
                         };
-                        if !crate::workspace_model::views::handoff_chat_source_matches(&expected.source, &session)
-                            || !self.terminal_handoff_capacity_available() {
-                            self.status = Some(TransientNotice::warning("This return cannot be retained safely yet. Save or acknowledge pending returns, then retry the original conversation."));
-                            return Task::none();
-                        }
-                        self.chat_ui.handoff_bindings.insert(target, CapturedHandoffBinding { binding: expected.clone(), handle: Some(handle.clone()) });
+                        captured.operation = uuid::Uuid::new_v4();
+                        let operation = captured.operation;
+                        let expected = captured.binding.clone();
+                        self.chat_ui.handoff_bindings.insert(target, captured);
                         self.chat_ui.phases.insert(
                             target.card,
                             Phase::Returning {
@@ -7303,7 +7352,7 @@ impl Cagents {
                                     .await
                                     .map_err(|error| error.to_string())
                                     .and_then(|result| result);
-                            Message::ChatUi(Action::HandoffFinished(target, result))
+                            Message::ChatUi(Action::HandoffFinished(target, operation, result))
                         });
                     }
                     _ => return Task::none(),
@@ -9585,9 +9634,13 @@ impl Cagents {
                     runtime.completion.offset = offset;
                 }
             }
-            Action::HandoffFinished(target, result) => {
+            Action::HandoffFinished(target, operation, result) => {
+                if self.chat_ui.handoff_bindings.get(&target).is_none_or(|captured| captured.operation != operation)
+                    || (result.is_err() && !matches!(self.chat_ui.phases.get(&target.card), Some(Phase::Returning { target: current, local: None, .. }) if *current == target)) {
+                    return Task::none();
+                }
                 let Some(captured) = self.chat_ui.handoff_bindings.remove(&target) else { return Task::none(); };
-                let expected = captured.binding;
+                let expected = captured.binding.clone();
                 let same_handle = captured.handle.as_ref().is_some_and(|original| {
                     matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
                         if runtime.handle().is_some_and(|current| Arc::ptr_eq(original, current)))
@@ -9605,6 +9658,12 @@ impl Cagents {
                     }
                     Err(_) => true,
                 };
+                // String errors do not attest that Return had no effects. Keep
+                // the bounded original intent even if its UI owner has since
+                // changed; only a matching positive receipt retires it here.
+                if result.is_err() || !retained {
+                    self.chat_ui.handoff_bindings.insert(target, captured.clone());
+                }
                 let phase_current = self.chat_runtime_mut(target).is_some();
                 let phase = self.chat_ui.finish(target, |phase| matches!(phase, Phase::Returning { local: None, .. }));
                 let request = self.chat_ui.end_requests.remove(&target);
@@ -16078,7 +16137,7 @@ mod tests {
         assert!(handle.observe_activity_for_test(ActivityState::Working));
         let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Activity)));
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(
-            target,
+            target, app.chat_ui.handoff_bindings[&target].operation,
             Err("fixture: the terminal could not start".into()),
         )));
         assert!(matches!(
@@ -16095,6 +16154,36 @@ mod tests {
             handle.observe_activity_for_test(ActivityState::Idle),
             "the next edge wakes the surface again"
         );
+    }
+
+    #[test]
+    fn ambiguous_return_retry_keeps_original_binding_and_rejects_old_attempt_results() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let first = app.chat_ui.handoff_bindings[&target].clone();
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, first.operation, Err("ambiguous start disposition".into())))));
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        assert_eq!(app.chat_ui.handoff_bindings[&target].binding, first.binding);
+        handle.clear_source_binding_for_test();
+        // This cached None is the SAME original Handle, not a fresh authority.
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let second = app.chat_ui.handoff_bindings[&target].clone();
+        assert_ne!(first.operation, second.operation);
+        assert_eq!(first.binding, second.binding);
+        assert_eq!(app.chat_ui.handoff_bindings.len(), 1, "retry reuses its reservation");
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, first.operation, Err("duplicate earlier completion".into())))));
+        assert_eq!(app.chat_ui.handoff_bindings[&target].operation, second.operation);
+        assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Returning { target: current, .. }) if *current == target));
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, second.operation, Err("still ambiguous".into())))));
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert!(!app.chat_ui.phases.contains_key(&card), "registry replacement cannot refresh the old intent");
+        assert_eq!(app.chat_ui.handoff_bindings[&target].binding, first.binding);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
@@ -16565,7 +16654,7 @@ mod tests {
         let (card, target) = unresumable_chat(&mut app);
         let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(
-            target,
+            target, uuid::Uuid::new_v4(),
             Err("old handoff".into()),
         )));
         assert!(matches!(

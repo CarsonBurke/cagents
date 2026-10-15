@@ -1205,6 +1205,7 @@ mod tests {
                     source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
                 },
                 handle: None, // Error-only simulated outstanding return; no receipt authority.
+                registry: app.workspace_model.identity, issued: source.clone(), operation: uuid::Uuid::new_v4(),
             });
         }
         let _original_delivery = queued(app.close_cards_in_order(vec![card]));
@@ -1216,7 +1217,7 @@ mod tests {
             repository: directory.path().into(), path: directory.path().join("new-owner"),
         };
         let completion = match local_error {
-            None => super::super::Action::HandoffFinished(target, Err("original return failed".into())),
+            None => super::super::Action::HandoffFinished(target, app.chat_ui.handoff_bindings[&target].operation, Err("original return failed".into())),
             Some(false) => super::super::Action::ReturnedLocally(target, Err(ReturnRefused::SourceLive)),
             Some(true) => super::super::Action::ReturnedLocally(target, Err(ReturnRefused::Unconfirmed("original return failed".into()))),
         };
