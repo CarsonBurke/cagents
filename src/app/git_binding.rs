@@ -159,6 +159,14 @@ pub(super) mod tests {
     pub(crate) fn init(root: &Path, content: &str) {
         std::fs::create_dir_all(root).unwrap();
         assert!(git(root, &["init", "-b", "main"]).status.success());
+        // Real UI workers inherit their ordinary environment. Make this
+        // repository self-contained instead of depending on a user's identity,
+        // signing agent or globally configured executable hooks.
+        let hooks = root.join(".git").join("fixture-empty-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        for (name, value) in [("user.name", "Fixture"), ("user.email", "fixture@example.invalid"), ("commit.gpgsign", "false"), ("core.hooksPath", hooks.to_str().unwrap())] {
+            assert!(git(root, &["config", "--local", name, value]).status.success());
+        }
         std::fs::write(root.join("file.txt"), content).unwrap();
         assert!(git(root, &["add", "file.txt"]).status.success());
     }
