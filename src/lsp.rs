@@ -5022,6 +5022,18 @@ impl LspManager {
         )
     }
 
+    /// Controller tests use the real framed initialize/capability reducer and
+    /// configured format-on-save setting without launching a provider process.
+    #[cfg(test)]
+    pub(crate) async fn fixture_ready_format_on_save(doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) -> Self {
+        tests::ready_format_on_save(doc, path, worktree, text).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fixture_open_format_on_save_document(&mut self, doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) {
+        tests::open_ready_format_on_save(self, doc, path, worktree, text).await;
+    }
+
     /// Replaces the process launcher. Tests inject in-process duplex
     /// transports so no language server has to be installed.
     #[cfg(test)]
@@ -5420,6 +5432,31 @@ mod tests {
 
     fn rust_manager() -> LspManager {
         LspManager::new(vec![server("rust-analyzer", &["rs"], &["Cargo.toml"])])
+    }
+
+    pub(super) async fn ready_format_on_save(doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) -> LspManager {
+        let mut manager = rust_manager();
+        manager.servers[0].format_on_save = true;
+        let slot = install_fake(&mut manager, json!({"textDocumentSync": 2, "documentFormattingProvider": true}), |incoming| {
+            if incoming.method == "textDocument/formatting" {
+                vec![json!({"jsonrpc": "2.0", "id": incoming.id, "result": []})]
+            } else { vec![] }
+        });
+        let events = manager.events();
+        manager.open_for_test(doc, path, worktree, rust_language(), 1, text);
+        let _handle = handle_of(&slot).await;
+        await_ready(&events, doc).await;
+        assert!(manager.capabilities(doc).ready && manager.capabilities(doc).format_document);
+        assert_eq!(manager.formatting_settings(doc).map(|(enabled, _)| enabled), Some(true));
+        manager
+    }
+
+    pub(super) async fn open_ready_format_on_save(manager: &mut LspManager, doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) {
+        let events = manager.events();
+        manager.open_for_test(doc, path, worktree, rust_language(), 1, text);
+        if manager.status(doc) != LspStatus::Ready { await_ready(&events, doc).await; }
+        assert!(manager.capabilities(doc).ready && manager.capabilities(doc).format_document);
+        assert_eq!(manager.formatting_settings(doc).map(|(enabled, _)| enabled), Some(true));
     }
 
     fn rust_language() -> LspLanguage {
