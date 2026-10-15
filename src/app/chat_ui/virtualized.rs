@@ -70,11 +70,28 @@ impl<'a> Row<'a> {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Axis { #[default] Vertical, Horizontal }
+impl Axis {
+    fn point(self, main: f32) -> Point { match self { Self::Vertical => Point::new(0.0, main), Self::Horizontal => Point::new(main, 0.0) } }
+    fn main(self, size: Size) -> f32 { match self { Self::Vertical => size.height, Self::Horizontal => size.width } }
+    fn cross(self, size: Size) -> f32 { match self { Self::Vertical => size.width, Self::Horizontal => size.height } }
+    fn size(self, main: f32, cross: f32) -> Size { match self { Self::Vertical => Size::new(cross, main), Self::Horizontal => Size::new(main, cross) } }
+}
+
 pub(super) fn column<'a>(rows: Vec<Row<'a>>, window: Window) -> Element<'a, Message> {
-    Element::new(Column { rows, window, revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed) })
+    Element::new(Column { rows, window, revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed), axis: Axis::Vertical, cross_estimate: 0.0 })
+}
+
+/// Horizontal virtualization preserves a physical code line/table row while
+/// only instantiating cells near its horizontal native scroll viewport.
+pub(super) fn row<'a>(rows: Vec<Row<'a>>, height: f32, window: Window) -> Element<'a, Message> {
+    Element::new(Column { rows, window, revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed), axis: Axis::Horizontal, cross_estimate: height })
 }
 
 struct Column<'a> {
+    axis: Axis,
+    cross_estimate: f32,
     revision: u64,
     rows: Vec<Row<'a>>,
     window: Window,
@@ -93,6 +110,7 @@ impl Height {
 }
 #[derive(Default)]
 struct State {
+    axis: Axis,
     width: f32,
     heights: HashMap<u64, Height>,
     mounted: Vec<(usize, u64)>,
@@ -152,11 +170,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<State>() }
     fn state(&self) -> tree::State { tree::State::new(State::default()) }
     fn diff(&mut self, _: &mut Tree) {}
-    fn size(&self) -> Size<Length> { Size::new(Length::Fill, Length::Shrink) }
+    fn size(&self) -> Size<Length> { match self.axis { Axis::Vertical => Size::new(Length::Fill, Length::Shrink), Axis::Horizontal => Size::new(Length::Shrink, Length::Shrink) } }
     fn layout(&mut self, tree: &mut Tree, renderer: &cosmic::Renderer, limits: &layout::Limits) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
-        let width = if limits.max().width.is_finite() { limits.max().width } else { design::READABLE_MEASURE };
-        let width_changed = state.width != width;
+        let width = match self.axis {
+            Axis::Vertical => if limits.max().width.is_finite() { limits.max().width } else { design::READABLE_MEASURE },
+            Axis::Horizontal => self.cross_estimate,
+        };
+        let width_changed = state.width != width || state.axis != self.axis;
+        state.axis = self.axis;
         if width_changed {
             state.heights.clear();
             state.width = width;
@@ -183,7 +205,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         for _ in 0..3 {
             let total = state.offsets.total();
             let viewport = state.observed.or(self.window.get()).unwrap_or(Viewport {
-                top: 0.0, height: 800.0, bottom: true,
+                top: 0.0, height: 800.0, bottom: self.axis == Axis::Vertical,
             });
             let top = if viewport.bottom { (total - viewport.height).max(0.0) } else { viewport.top };
             let range = visible(&state.offsets, top, viewport.height);
@@ -199,13 +221,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 let element = row.element();
                 let mut child = previous.remove(&key).unwrap_or_else(|| Tree::new(&*element));
                 child.diff(element.as_widget_mut());
+                let child_max = match self.axis { Axis::Vertical => Size::new(width, f32::INFINITY),
+                    Axis::Horizontal => Size::new(f32::INFINITY, f32::INFINITY) };
                 let mut node = element.as_widget_mut().layout(&mut child, renderer,
-                    &layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY)));
-                let height = node.size().height;
+                    &layout::Limits::new(Size::ZERO, child_max));
+                let height = self.axis.main(node.size());
                 changed |= (height - state.offsets.values[index]).abs() > 0.5;
                 state.heights.insert(key, Height { revision, height, estimate });
                 state.offsets.set(index, height);
-                node.move_to_mut(Point::new(0.0, state.offsets.prefix(index)));
+                node.move_to_mut(self.axis.point(state.offsets.prefix(index)));
                 nodes.push(node);
                 tree.children.push(child);
                 state.mounted.push((index, key));
@@ -224,9 +248,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // through the outer transcript's layout-time anchoring operation.
         let total = state.offsets.total();
         for ((index, _), node) in state.mounted.iter().zip(&mut nodes) {
-            node.move_to_mut(Point::new(0.0, state.offsets.prefix(*index)));
+            node.move_to_mut(self.axis.point(state.offsets.prefix(*index)));
         }
-        layout::Node::with_children(Size::new(width, total), nodes)
+        let cross = match self.axis {
+            Axis::Vertical if limits.max().width.is_finite() => width,
+            _ => nodes.iter().map(|node| self.axis.cross(node.size())).fold(width, f32::max),
+        };
+        layout::Node::with_children(self.axis.size(total, cross), nodes)
     }
     fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &cosmic::Renderer, operation: &mut dyn Operation) {
         let state = tree.state.downcast_mut::<State>();
@@ -238,10 +266,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         if placeholders.visit { for &index in &state.aliased {
             let row = &self.rows[index];
             for id in &row.aliases {
-                operation.container(Some(id), Rectangle {
-                    x: layout.bounds().x, y: layout.bounds().y + state.offsets.prefix(index),
-                    width: layout.bounds().width, height: state.offsets.prefix(index + 1) - state.offsets.prefix(index),
-                });
+                let start = state.offsets.prefix(index);
+                let size = self.axis.size(state.offsets.values[index], self.axis.cross(layout.bounds().size()));
+                operation.container(Some(id), Rectangle::new(layout.bounds().position() + match self.axis { Axis::Vertical => Vector::new(0.0, start), Axis::Horizontal => Vector::new(start, 0.0) }, size));
             }
         }
         }
@@ -319,8 +346,11 @@ pub(super) fn logical_bounds(state: &dyn std::any::Any, bounds: Rectangle, ident
     let top = state.offsets.prefix(*index);
     let height = state.offsets.prefix(*index + 1) - top;
     let fraction = byte.saturating_sub(range.start) as f32 / range.len().max(1) as f32;
-    Some((Rectangle { x: bounds.x, y: bounds.y + top + height * fraction,
-        width: bounds.width, height: 1.0 }, if *chunk { 2 } else { 1 }))
+    let rectangle = match state.axis {
+        Axis::Vertical => Rectangle { x: bounds.x, y: bounds.y + top + height * fraction, width: bounds.width, height: 1.0 },
+        Axis::Horizontal => Rectangle { x: bounds.x + top + height * fraction, y: bounds.y, width: 1.0, height: bounds.height },
+    };
+    Some((rectangle, if *chunk { 2 } else { 1 }))
 }
 
 /// Fine-grained anchors include the visible window and previously anchored
@@ -332,8 +362,12 @@ pub(super) fn anchor_points(state: &mut dyn std::any::Any, bounds: Rectangle, wa
     keys.extend(wanted.iter().filter(|key| state.anchors.contains(key)).copied());
     keys.into_iter().filter_map(|key| {
         let index = *state.positions.get(&key)?;
-        Some((key, Rectangle { x: bounds.x, y: bounds.y + state.offsets.prefix(index), width: bounds.width,
-            height: state.offsets.prefix(index + 1) - state.offsets.prefix(index) }))
+        let top = state.offsets.prefix(index);
+        let rectangle = match state.axis {
+            Axis::Vertical => Rectangle { x: bounds.x, y: bounds.y + top, width: bounds.width, height: state.offsets.values[index] },
+            Axis::Horizontal => Rectangle { x: bounds.x + top, y: bounds.y, width: state.offsets.values[index], height: bounds.height },
+        };
+        Some((key, rectangle))
     }).collect()
 }
 
@@ -376,12 +410,15 @@ impl Operation for UpdateViewport {
             return;
         }
         if let (Some(state), Some(viewport)) = (state.downcast_mut::<State>(), self.clip) {
-            let top = (viewport.y + self.translation.y - bounds.y).max(0.0);
-            let wanted = visible(&state.offsets, top, viewport.height);
+            let (top, height) = match state.axis {
+                Axis::Vertical => ((viewport.y + self.translation.y - bounds.y).max(0.0), viewport.height),
+                Axis::Horizontal => ((viewport.x + self.translation.x - bounds.x).max(0.0), viewport.width),
+            };
+            let wanted = visible(&state.offsets, top, height);
             let mounted = state.mounted.first().map_or(0, |(index, _)| *index)
                 ..state.mounted.last().map_or(0, |(index, _)| *index + 1);
             if wanted != mounted { self.changed = true; self.touches += 1; }
-            state.observed = Some(Viewport { top, height: viewport.height, bottom: false });
+            state.observed = Some(Viewport { top, height, bottom: false });
         }
     }
 }
