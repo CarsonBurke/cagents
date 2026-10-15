@@ -747,6 +747,47 @@ impl Cagents {
         )));
     }
 
+    pub(super) fn publish_new_managed_pane(&mut self, scope: Scope, card: CardId) {
+        if !self.shared_views.initialized.contains(&scope)
+            || self.shared_views.blocked.contains(&scope)
+            || self.workspace_model.views.iter().any(|view| {
+                view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
+            })
+        {
+            return;
+        }
+        let Some(pane) = self
+            .local_view_panes(&scope)
+            .into_iter()
+            .find(|pane| pane.id == card)
+        else {
+            return;
+        };
+        let baseline = self.shared_views.baseline.entry(scope.clone()).or_default();
+        if baseline.iter().any(|existing| existing.id == card) {
+            return;
+        }
+        baseline.push(pane.clone());
+        let revision = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .map(|view| view.revision)
+            .unwrap_or(0);
+        let operation = uuid::Uuid::new_v4();
+        let change = Change::Insert { pane, before: None };
+        self.shared_views
+            .pending
+            .push((operation, scope.clone(), change.clone()));
+        self.publish_model_edit(ModelEdit::ChangeView {
+            scope,
+            expected_revision: revision,
+            operation,
+            change,
+        });
+    }
+
     pub(super) fn publish_view_changes(&mut self) {
         if self.shared_views.applying
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY

@@ -799,6 +799,7 @@ impl Cagents {
             self.publish_shared_channel(id);
         }
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        let mut new_managed_panes = Vec::new();
         for agent in &model.agents {
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
@@ -808,14 +809,27 @@ impl Cagents {
             ) {
                 continue;
             }
-            if let Some(display) = display_index.resolve(agent)
-                && let Some(task) = self.adopt_execution_agent_display(agent, display)
-            {
-                changed = true;
-                tasks.push(task);
+            if let Some(display) = display_index.resolve(agent) {
+                let card = CardId::from_uuid(agent.id.as_uuid());
+                let unpublished = display.pane.is_none()
+                    && !self.durable.cards.iter().any(|entry| entry.id == card);
+                let scope = display.scope.clone();
+                if let Some(task) = self.adopt_execution_agent_display(agent, display) {
+                    if unpublished {
+                        new_managed_panes.push((scope, card));
+                    }
+                    changed = true;
+                    tasks.push(task);
+                }
             }
         }
         self.workspace_model = model;
+        // First adoption has no authoritative pane to project yet. Publish only
+        // these exact new descriptors and overlay their pending Inserts before
+        // passive projection; existing panes still project before persistence.
+        for (scope, card) in new_managed_panes {
+            self.publish_new_managed_pane(scope, card);
+        }
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
@@ -1922,6 +1936,191 @@ mod tests {
             Some(active),
             "history opens the actual moved pane, not the stale launch channel"
         );
+    }
+
+    #[test]
+    fn model_read_publishes_new_managed_chat_before_initialized_view_projection() {
+        use crate::agent::Provider;
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        use crate::workspace_model::views::{Change, Scope, View};
+        for (active_target, retired) in [(true, false), (false, false), (true, true)] {
+            let (mut app, project, repository) = app_with_project();
+            let active = ChannelId::new();
+            let target = if active_target {
+                active
+            } else {
+                ChannelId::new()
+            };
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.push(local(active, project, "Active", 0));
+            if target != active {
+                durable
+                    .channels
+                    .push(local(target, project, "Execution", 1));
+            }
+            durable.active_channel = Some(active);
+            let session = crate::chat::Session {
+                native_continuity: Default::default(),
+                id: TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("execution-host"),
+                    boot_id: crate::model::BootId::new("execution-boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("execution-incarnation"),
+                }),
+                terminal: None,
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: Provider::Claude,
+                    session_id: None,
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        working_directory: PathBuf::from("/repo/worktree"),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            let agent = Agent {
+                name: None,
+                id: crate::model::AgentId::new(),
+                origin: Origin::User,
+                spec: Spec {
+                    provider: Provider::Claude,
+                    account: None,
+                    target: Target {
+                        repository,
+                        directory: PathBuf::from("/repo/worktree"),
+                        placement: Some(crate::agent_execution::Placement::Channel(target)),
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                },
+                placement: crate::agent_execution::Placement::Channel(target),
+                session: Some(HostedSession::Chat(session.clone())),
+                console: None,
+                created_ms: 0,
+                closed: false,
+            };
+            let card = CardId::from_uuid(agent.id.as_uuid());
+            let scope = Scope::Channel(target);
+            let mut channels = vec![shared(active, &agent.spec.target.repository, "Active", 0)];
+            if target != active {
+                channels.push(shared(
+                    target,
+                    &agent.spec.target.repository,
+                    "Execution",
+                    1,
+                ));
+            }
+            let mut model = registry(channels);
+            let mut view = View::empty(scope.clone());
+            view.revision = 17;
+            if retired {
+                view.retired.push(card);
+            }
+            model.views.push(view);
+            app.workspace_model = model.clone();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            // This view already exists and its real seed acknowledgement has
+            // completed before the daemon announces the new live Agent.
+            app.acknowledge_view_edit(scope.clone(), None);
+            while rx.try_recv().is_ok() {}
+            model.sequence += 1;
+            model.agents.push(agent.clone());
+            let focus = app.workspace.focused();
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            let inserts = edits
+                .iter()
+                .filter_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        scope: actual,
+                        operation,
+                        expected_revision,
+                        change: Change::Insert { pane, before },
+                    } if pane.id == card => {
+                        Some((actual, operation, expected_revision, pane, before))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if retired {
+                assert!(
+                    inserts.is_empty(),
+                    "authoritative retirement grants no new publication"
+                );
+                assert!(app.card_state(card).is_none());
+                continue;
+            }
+            assert_eq!(
+                inserts.len(),
+                1,
+                "exact first adoption must publish once before passive removal"
+            );
+            let (actual, operation, revision, pane, before) = inserts[0];
+            assert_eq!(actual, &scope);
+            assert_eq!(*revision, 17);
+            assert_eq!(*before, None);
+            assert!(matches!(&pane.kind, CardKind::Chat(actual) if actual == &session));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == target)
+                    .unwrap()
+                    .cards
+                    .contains(&card)
+            );
+            assert!(
+                app.chat_start_pending(card),
+                "unpolled real attachment Task remains Starting, not detached"
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+            assert_eq!(app.workspace_model.agents[0], agent);
+            if !active_target {
+                assert_eq!(app.workspace.focused(), focus);
+            }
+            // Repeated daemon snapshots preserve the exact pending Insert,
+            // rather than re-issuing it or treating the old empty view as close.
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+                matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+            let change = Change::Insert {
+                pane: pane.clone(),
+                before: None,
+            };
+            model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .apply(&change)
+                .unwrap();
+            model.sequence += 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: scope.clone(),
+                operation: Some(*operation),
+                model,
+            }));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.chat_start_pending(card));
+            assert!(
+                app.workspace_model
+                    .views
+                    .iter()
+                    .find(|view| view.scope == scope)
+                    .unwrap()
+                    .panes
+                    .iter()
+                    .any(|pane| pane.id == card)
+            );
+        }
     }
 
     #[test]
