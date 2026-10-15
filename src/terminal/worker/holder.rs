@@ -2510,7 +2510,14 @@ mod tests {
 
     #[test]
     fn a_holder_can_be_detached_again_by_its_successor() {
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let (socket, root) = detached("echo ready; read line; exit 2", directory.path());
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = adopt(&socket, exits).unwrap().held;
