@@ -1480,23 +1480,19 @@ impl State {
             } else {
                 "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
             }));
-            content = content.push(
-                crate::app::dialog_ui::confirmation_controls(vec![
-                    crate::ui_controls::button::secondary("Cancel")
-                        .id(widget::Id::new("automation.confirmation.cancel"))
-                        .on_press_maybe((!busy).then_some(Action::CancelConfirmation))
-                        .into(),
-                    if matches!(confirmation.request, Request::Remove { .. }) {
-                        crate::ui_controls::button::destructive("Remove automation")
-                            .on_press_maybe(
-                                (!busy).then_some(Action::Confirm(confirmation.generation)),
-                            )
-                            .into()
-                    } else {
-                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
-                    },
-                ]),
-            );
+            content = content.push(crate::app::dialog_ui::confirmation_controls(vec![
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(widget::Id::new("automation.confirmation.cancel"))
+                    .on_press_maybe((!busy).then_some(Action::CancelConfirmation))
+                    .into(),
+                if matches!(confirmation.request, Request::Remove { .. }) {
+                    crate::ui_controls::button::destructive("Remove automation")
+                        .on_press_maybe((!busy).then_some(Action::Confirm(confirmation.generation)))
+                        .into()
+                } else {
+                    button("Confirm", Action::Confirm(confirmation.generation), !busy)
+                },
+            ]));
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {

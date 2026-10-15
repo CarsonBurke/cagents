@@ -25,12 +25,15 @@ pub(super) fn confirmation_actions<'a, M: 'a>(
     confirmation_controls(vec![dismiss.into(), confirm.into()])
 }
 
-pub(crate) fn confirmation_controls<'a, M: 'a>(
-    controls: Vec<Element<'a, M>>,
-) -> Element<'a, M> {
-    widget::container(widget::row::with_children(controls).spacing(space::S).wrap().align_x(iced::alignment::Horizontal::Right))
-        .align_right(Length::Fill)
-        .into()
+pub(crate) fn confirmation_controls<'a, M: 'a>(controls: Vec<Element<'a, M>>) -> Element<'a, M> {
+    widget::container(
+        widget::row::with_children(controls)
+            .spacing(space::S)
+            .wrap()
+            .align_x(iced::alignment::Horizontal::Right),
+    )
+    .align_right(Length::Fill)
+    .into()
 }
 
 pub(super) fn overlay<'a>(

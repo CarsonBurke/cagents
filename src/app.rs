@@ -1,8 +1,8 @@
 mod account_ui;
 mod agent_ui;
 mod automation_approval;
-mod automation_ui;
 mod automation_archives;
+mod automation_ui;
 mod branch_ui;
 #[cfg(feature = "integrated-browser")]
 mod browser_import_ui;
@@ -5434,7 +5434,12 @@ impl Cagents {
         // Before an archive/model push arrives it may still look live locally;
         // discovering a dead daemon never authorizes rerunning its launcher.
         // This is only a no-execution fence, never archive/readiness authority.
-        let managed_console = session.launch.arguments == ["agent".to_owned(),"console".to_owned(),crate::model::AgentId::from_uuid(card.as_uuid()).to_string()];
+        let managed_console = session.launch.arguments
+            == [
+                "agent".to_owned(),
+                "console".to_owned(),
+                crate::model::AgentId::from_uuid(card.as_uuid()).to_string(),
+            ];
         let reserved = self
             .workspace_model
             .views
@@ -7018,11 +7023,21 @@ impl Cagents {
     fn persist(&mut self) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.automation_archives.is_empty() {
-            let closed=self.durable.cards.iter().filter(|card|!card.existence.is_open()
-                && self.durable.automation_archives.contains_key(&card.id)).map(|card|card.id).collect::<Vec<_>>();
+            let closed = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    !card.existence.is_open()
+                        && self.durable.automation_archives.contains_key(&card.id)
+                })
+                .map(|card| card.id)
+                .collect::<Vec<_>>();
             if !closed.is_empty() {
-                let archives=&mut Arc::make_mut(&mut self.durable).automation_archives;
-                for card in closed {archives.remove(&card);}
+                let archives = &mut Arc::make_mut(&mut self.durable).automation_archives;
+                for card in closed {
+                    archives.remove(&card);
+                }
             }
         }
         if !self.durable.pending_terminal_creations.is_empty() {

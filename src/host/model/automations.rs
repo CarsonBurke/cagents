@@ -100,12 +100,21 @@ impl Registry {
         limit: usize,
         proof: crate::model::HostSessionProof,
     ) -> Result<crate::automations::ArchiveAgentPage, String> {
-        let (current_identity,current_sequence):(String,u64)=self.db.query_row(
-            "SELECT identity,sequence FROM metadata WHERE key=0",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|error|error.to_string())?;
-        if current_identity!=identity.to_string() || current_sequence!=sequence {
-            return Err("The workspace changed during saved-result discovery; retry its current model".into());
+        let (current_identity, current_sequence): (String, u64) = self
+            .db
+            .query_row(
+                "SELECT identity,sequence FROM metadata WHERE key=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if current_identity != identity.to_string() || current_sequence != sequence {
+            return Err(
+                "The workspace changed during saved-result discovery; retry its current model"
+                    .into(),
+            );
         }
-        let limit=limit.clamp(1,64);
+        let limit = limit.clamp(1, 64);
         let mut query=self.db.prepare(
             "SELECT g.id,g.record FROM agents g JOIN automations a ON a.id=json_extract(g.record,'$.origin.Automation.id')
              LEFT JOIN shared_view_panes p ON p.id=g.id
@@ -113,39 +122,87 @@ impl Registry {
                AND (json_extract(a.record,'$.definition.visibility') IS NOT 'headless' OR p.id IS NOT NULL)
                AND coalesce(p.scope,json_extract(g.record,'$.placement'))=?1 AND g.id>?2
              ORDER BY g.id LIMIT ?3").map_err(|error|error.to_string())?;
-        let rows=query.query_map(params![encode(&scope)?,after.map(|id|id.to_string()).unwrap_or_default(),limit+1],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))
-            .map_err(|error|error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
-        let model=crate::workspace_model::WorkspaceModel {views:super::views::all(&self.db)?,..Default::default()};
-        let index=crate::workspace_model::views::ManagedDisplayIndex::new(&model);
-        let mut agents=Vec::new();let mut bytes=0usize;let mut last=None;let mut more=rows.len()>limit;
-        for (id,record) in rows.into_iter().take(limit) {
+        let rows = query
+            .query_map(
+                params![
+                    encode(&scope)?,
+                    after.map(|id| id.to_string()).unwrap_or_default(),
+                    limit + 1
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let model = crate::workspace_model::WorkspaceModel {
+            views: super::views::all(&self.db)?,
+            ..Default::default()
+        };
+        let index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        let mut agents = Vec::new();
+        let mut bytes = 0usize;
+        let mut last = None;
+        let mut more = rows.len() > limit;
+        for (id, record) in rows.into_iter().take(limit) {
             // Keep each IPC page below the ordinary archive payload limit.
-            if bytes.saturating_add(record.len())>3*1024*1024 {
-                if last.is_none() {return Err("A saved agent descriptor exceeds the discovery page limit".into());}
-                more=true;break;
+            if bytes.saturating_add(record.len()) > 3 * 1024 * 1024 {
+                if last.is_none() {
+                    return Err("A saved agent descriptor exceeds the discovery page limit".into());
+                }
+                more = true;
+                break;
             }
-            last=Some(id.parse::<crate::model::AgentId>().map_err(|error|error.to_string())?);
-            bytes+=record.len();
-            let agent:crate::agent_execution::Agent=decode(&record)?;
-            if matches!(agent.origin,crate::agent_execution::Origin::Automation {..})
-                && matches!(&agent.session,Some(crate::agent_execution::HostedSession::Chat(session)) if session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete))
-                && index.resolve(&agent).is_some_and(|display|display.scope==scope) {
+            last = Some(
+                id.parse::<crate::model::AgentId>()
+                    .map_err(|error| error.to_string())?,
+            );
+            bytes += record.len();
+            let agent: crate::agent_execution::Agent = decode(&record)?;
+            if matches!(
+                agent.origin,
+                crate::agent_execution::Origin::Automation { .. }
+            ) && matches!(&agent.session,Some(crate::agent_execution::HostedSession::Chat(session)) if session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete))
+                && index
+                    .resolve(&agent)
+                    .is_some_and(|display| display.scope == scope)
+            {
                 agents.push(agent);
             }
         }
-        Ok(crate::automations::ArchiveAgentPage {scope,identity,sequence,proof,agents,next:more.then_some(last).flatten()})
+        Ok(crate::automations::ArchiveAgentPage {
+            scope,
+            identity,
+            sequence,
+            proof,
+            agents,
+            next: more.then_some(last).flatten(),
+        })
     }
 
     /// Saving final history reserves that provider identity before close and
     /// before any asynchronous window learns about the read-only result.
-    pub(crate) fn is_archived_automation_session(&self,id:crate::model::TerminalId)->Result<bool,String> {
+    pub(crate) fn is_archived_automation_session(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
         let record:Option<String>=self.db.query_row(
             "SELECT g.record FROM agents g LEFT JOIN agent_policies p ON p.agent=g.id WHERE g.session_id=?1 AND (g.closed=1 OR (coalesce(p.interactive,0)=0 AND EXISTS(SELECT 1 FROM automation_snapshots s WHERE s.agent=g.id)))",
             [id.to_string()],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
-        let Some(record)=record else {return Ok(false)};
-        let agent:crate::agent_execution::Agent=decode(&record)?;
-        if !matches!(agent.origin,crate::agent_execution::Origin::Automation {..}) {return Ok(false);}
-        if !agent.session.as_ref().is_some_and(|session|session.id()==id) {
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        let agent: crate::agent_execution::Agent = decode(&record)?;
+        if !matches!(
+            agent.origin,
+            crate::agent_execution::Origin::Automation { .. }
+        ) {
+            return Ok(false);
+        }
+        if !agent
+            .session
+            .as_ref()
+            .is_some_and(|session| session.id() == id)
+        {
             return Err("The saved automation session owner is invalid".into());
         }
         // Closing this owner remains authoritative after its bounded history
@@ -189,25 +246,49 @@ impl Registry {
         {
             return Err("The archived conversation does not belong to this firing".into());
         }
-        let record:String=tx.query_row("SELECT record FROM agents WHERE id=?1",[expected.id.to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
-        let mut current:crate::agent_execution::Agent=decode(&record)?;
-        if current.origin!=expected.origin || current.session!=expected.session {
-            return Err("The exact automation conversation changed before saving its result".into());
+        let record: String = tx
+            .query_row(
+                "SELECT record FROM agents WHERE id=?1",
+                [expected.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut current: crate::agent_execution::Agent = decode(&record)?;
+        if current.origin != expected.origin || current.session != expected.session {
+            return Err(
+                "The exact automation conversation changed before saving its result".into(),
+            );
         }
-        let confirmed=snapshot.session_id.as_deref().filter(|thread|!thread.trim().is_empty())
+        let confirmed = snapshot
+            .session_id
+            .as_deref()
+            .filter(|thread| !thread.trim().is_empty())
             .ok_or("The provider has not confirmed an exact conversation for its saved result")?;
-        let Some(crate::agent_execution::HostedSession::Chat(session))=&mut current.session else {
+        let Some(crate::agent_execution::HostedSession::Chat(session)) = &mut current.session
+        else {
             return Err("The automation has no original native conversation to save".into());
         };
-        if session.launch.session_id.as_deref().is_some_and(|thread|thread!=confirmed) {
-            return Err("The provider confirmed a different conversation; its saved result was refused".into());
+        if session
+            .launch
+            .session_id
+            .as_deref()
+            .is_some_and(|thread| thread != confirmed)
+        {
+            return Err(
+                "The provider confirmed a different conversation; its saved result was refused"
+                    .into(),
+            );
         }
         if session.launch.session_id.is_none() {
             // The broker read this snapshot from the exact proved handle.
             // Learn only its confirmed thread; preserve current display moves
             // and every other authority field in the durable agent record.
-            session.launch.session_id=Some(confirmed.to_owned());
-            tx.execute("UPDATE agents SET record=?2 WHERE id=?1",params![current.id.to_string(),encode(&current)?]).map_err(|error|error.to_string())?;
+            session.launch.session_id = Some(confirmed.to_owned());
+            tx.execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![current.id.to_string(), encode(&current)?],
+            )
+            .map_err(|error| error.to_string())?;
         }
         if snapshot
             .title
@@ -402,41 +483,99 @@ impl Registry {
         Ok((!firing.state.is_active() && !firing.release_pending).then_some(firing.revision))
     }
 
-    pub(crate) fn pending_automation_precheck_retirements(&self,after:Option<Uuid>)->Result<Vec<(Uuid,u64)>,String> {
+    pub(crate) fn pending_automation_precheck_retirements(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<Vec<(Uuid, u64)>, String> {
         let mut query=self.db.prepare("SELECT f.id,p.revision FROM automation_precheck_retirements p JOIN automation_firings f ON f.id=p.firing JOIN automations a ON a.id=f.automation WHERE p.retired=0 AND f.id>?1 AND (a.active_firing IS NULL OR a.active_firing<>f.id) AND json_extract(f.record,'$.state') NOT IN ('prechecking','accepted','running','waiting') AND coalesce(json_extract(f.record,'$.release_pending'),0)=0 ORDER BY f.id LIMIT 32").map_err(|error|error.to_string())?;
-        query.query_map([after.map(|id|id.to_string()).unwrap_or_default()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u64>(1)?))).map_err(|error|error.to_string())?
-            .map(|row|{let (id,revision)=row.map_err(|error|error.to_string())?;Ok((id.parse::<Uuid>().map_err(|error|error.to_string())?,revision))}).collect()
+        query
+            .query_map(
+                [after.map(|id| id.to_string()).unwrap_or_default()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let (id, revision) = row.map_err(|error| error.to_string())?;
+                Ok((
+                    id.parse::<Uuid>().map_err(|error| error.to_string())?,
+                    revision,
+                ))
+            })
+            .collect()
     }
 
     /// The broker calls this only after the exact helper's files are retired.
     /// Until then its original firing ID remains the cleanup authority.
-    pub(crate) fn coalesce_retired_automation_precheck(&mut self,id:Uuid,revision:u64)->Result<(),String> {
-        let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
-        let record:Option<String>=tx.query_row("SELECT record FROM automation_firings WHERE id=?1",[id.to_string()],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
-        let Some(record)=record else {return Ok(());};
-        let mut firing:Firing=decode(&record)?;
-        if firing.revision!=revision {return Err("The retired precheck revision changed".into());}
-        let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM automations WHERE active_firing=?1)",[id.to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
-        if active || firing.state.is_active() || firing.release_pending {return Err("The precheck still owns its automation slot".into());}
-        let notify:Option<bool>=tx.query_row("SELECT notify FROM automation_precheck_retirements WHERE firing=?1",[id.to_string()],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
-        tx.execute("UPDATE automation_precheck_retirements SET retired=1,notify=0 WHERE firing=?1 AND revision=?2",params![id.to_string(),revision]).map_err(|error|error.to_string())?;
-        if firing.state!=FiringState::Skipped || firing.agent.is_some() || firing.run.is_some() {
-            tx.commit().map_err(|error|error.to_string())?;return Ok(());
+    pub(crate) fn coalesce_retired_automation_precheck(
+        &mut self,
+        id: Uuid,
+        revision: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let record: Option<String> = tx
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            return Ok(());
+        };
+        let mut firing: Firing = decode(&record)?;
+        if firing.revision != revision {
+            return Err("The retired precheck revision changed".into());
         }
-        coalesce_existing_skipped_firing(&tx,&mut firing)?;
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automations WHERE active_firing=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if active || firing.state.is_active() || firing.release_pending {
+            return Err("The precheck still owns its automation slot".into());
+        }
+        let notify: Option<bool> = tx
+            .query_row(
+                "SELECT notify FROM automation_precheck_retirements WHERE firing=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        tx.execute("UPDATE automation_precheck_retirements SET retired=1,notify=0 WHERE firing=?1 AND revision=?2",params![id.to_string(),revision]).map_err(|error|error.to_string())?;
+        if firing.state != FiringState::Skipped || firing.agent.is_some() || firing.run.is_some() {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        coalesce_existing_skipped_firing(&tx, &mut firing)?;
         tx.execute("INSERT INTO automation_precheck_retirements(firing,revision,retired,notify) VALUES(?1,?2,1,0) ON CONFLICT(firing) DO UPDATE SET retired=1,notify=0",params![firing.id.to_string(),firing.revision]).map_err(|error|error.to_string())?;
-        coalesce_retired_following_skips(&tx,&mut firing)?;
-        let automation=read_automation(&tx,firing.automation).ok();
-        if notify==Some(true) && let Some(automation)=automation {
+        coalesce_retired_following_skips(&tx, &mut firing)?;
+        let automation = read_automation(&tx, firing.automation).ok();
+        if notify == Some(true)
+            && let Some(automation) = automation
+        {
             // Legacy settled history is a baseline, not new attention. The
             // exact new helper's notice intent survives interrupted cleanup.
             // The surviving group ID is the durable notification evidence key.
             // Reordered helper retirement can publish its first receipt late;
             // journal idempotency still delivers only one semantic skip notice.
-            queue_automation_notice(&tx,&automation,crate::notifications::Kind::AutomationSkipped,skipped_reason(&firing),&format!("skip:{}",skip_notification_group(&tx,&firing)?))?;
+            queue_automation_notice(
+                &tx,
+                &automation,
+                crate::notifications::Kind::AutomationSkipped,
+                skipped_reason(&firing),
+                &format!("skip:{}", skip_notification_group(&tx, &firing)?),
+            )?;
         }
-        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0",[]).map_err(|error|error.to_string())?;
-        tx.commit().map_err(|error|error.to_string())
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// A confirmed retry reads its original receipt even after removal of the
@@ -630,8 +769,12 @@ impl Registry {
                 }
             }
         }
-        if firing.run.is_none() && firing.state==FiringState::Prechecking {
-            tx.execute("UPDATE automation_precheck_retirements SET retired=1,notify=0 WHERE firing=?1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
+        if firing.run.is_none() && firing.state == FiringState::Prechecking {
+            tx.execute(
+                "UPDATE automation_precheck_retirements SET retired=1,notify=0 WHERE firing=?1",
+                [firing.id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
         }
         firing.state = FiringState::Failed;
         firing.finished_ms = Some(now_ms);
@@ -1033,7 +1176,7 @@ impl Registry {
                 &automation,
                 crate::notifications::Kind::AutomationSkipped,
                 "Scheduled occurrences were missed while the scheduler was unavailable",
-                &format!("skip:{}", skip_notification_group(&tx,&firing)?),
+                &format!("skip:{}", skip_notification_group(&tx, &firing)?),
             )?;
         }
         automation.next = Some(next);
@@ -1441,8 +1584,11 @@ fn write_automation(tx: &Transaction<'_>, automation: &Automation) -> Result<(),
                 tx,
                 automation,
                 crate::notifications::Kind::AutomationBlocked,
-                if automation.active_firing.and_then(|id| read_firing(tx,id).ok())
-                    .is_some_and(|firing| firing.state==FiringState::Interrupted) {
+                if automation
+                    .active_firing
+                    .and_then(|id| read_firing(tx, id).ok())
+                    .is_some_and(|firing| firing.state == FiringState::Interrupted)
+                {
                     "A run or precheck was interrupted; inspect and close the blocking run before resuming"
                 } else {
                     "Run cleanup or its saved result needs attention; inspect and close the blocking run before resuming"
@@ -1714,8 +1860,11 @@ impl Registry {
         };
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
-        if definition.precheck.is_none() && firing.state==FiringState::Skipped && firing.skipped_occurrences.is_none() {
-            coalesce_existing_skipped_firing(&tx,&mut firing)?;
+        if definition.precheck.is_none()
+            && firing.state == FiringState::Skipped
+            && firing.skipped_occurrences.is_none()
+        {
+            coalesce_existing_skipped_firing(&tx, &mut firing)?;
         }
         if firing.state == FiringState::Skipped
             && firing
@@ -1728,7 +1877,7 @@ impl Registry {
                 &automation,
                 crate::notifications::Kind::AutomationSkipped,
                 skipped_reason(&firing),
-                &format!("skip:{}", skip_notification_group(&tx,&firing)?),
+                &format!("skip:{}", skip_notification_group(&tx, &firing)?),
             )?;
         }
         write_automation(&tx, &automation)?;
@@ -2023,8 +2172,15 @@ const HISTORY_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Notification identity belongs to the earliest adjacent same-reason skip,
 /// even while that row still retains an earlier helper's cleanup authority.
 /// Merely selecting its ID never retires, rewrites or deletes that owner.
-fn skip_notification_group(tx:&Transaction<'_>,firing:&Firing)->Result<Uuid,String> {
-    if firing.missed_interval.is_some() || !matches!(firing.trigger,crate::automations::Trigger::Scheduled {..}) {return Ok(firing.id);}
+fn skip_notification_group(tx: &Transaction<'_>, firing: &Firing) -> Result<Uuid, String> {
+    if firing.missed_interval.is_some()
+        || !matches!(
+            firing.trigger,
+            crate::automations::Trigger::Scheduled { .. }
+        )
+    {
+        return Ok(firing.id);
+    }
     let id:Option<String>=tx.query_row(
         "WITH prior AS (
             SELECT rowid AS position,id,revision,record FROM automation_firings
@@ -2039,55 +2195,144 @@ fn skip_notification_group(tx:&Transaction<'_>,firing:&Firing)->Result<Uuid,Stri
                 AND json_extract(record,'$.missed_interval') IS NULL,0)=0
         ) SELECT id FROM prior WHERE position>(SELECT position FROM boundary) ORDER BY position LIMIT 1",
         params![firing.automation.to_string(),firing.id.to_string(),firing.revision,encode(&firing.skip)?],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
-    id.map(|id|id.parse::<Uuid>().map_err(|error|error.to_string())).transpose().map(|id|id.unwrap_or(firing.id))
+    id.map(|id| id.parse::<Uuid>().map_err(|error| error.to_string()))
+        .transpose()
+        .map(|id| id.unwrap_or(firing.id))
 }
 
-fn skipped_reason(firing:&Firing)->&'static str {
+fn skipped_reason(firing: &Firing) -> &'static str {
     use crate::automations::SkipReason;
     match firing.skip {
-        Some(SkipReason::PrecheckExit)=>"The precheck declined this scheduled occurrence",
-        Some(SkipReason::MissedDeadline)=>"Scheduled occurrences were missed while the scheduler was unavailable",
-        Some(SkipReason::Overlap)=>"An earlier run is still active or waiting for input",
-        Some(SkipReason::Capacity)=>"Execution or precheck capacity is occupied by another run",
-        Some(SkipReason::DefinitionChanged)=>"The automation changed before this occurrence could start",
-        Some(SkipReason::Disabled)=>"The automation was disabled before this occurrence could start",
-        None=>"This scheduled occurrence could not run; inspect its history",
+        Some(SkipReason::PrecheckExit) => "The precheck declined this scheduled occurrence",
+        Some(SkipReason::MissedDeadline) => {
+            "Scheduled occurrences were missed while the scheduler was unavailable"
+        }
+        Some(SkipReason::Overlap) => "An earlier run is still active or waiting for input",
+        Some(SkipReason::Capacity) => "Execution or precheck capacity is occupied by another run",
+        Some(SkipReason::DefinitionChanged) => {
+            "The automation changed before this occurrence could start"
+        }
+        Some(SkipReason::Disabled) => {
+            "The automation was disabled before this occurrence could start"
+        }
+        None => "This scheduled occurrence could not run; inspect its history",
     }
 }
 
-fn coalesce_existing_skipped_firing(tx:&Transaction<'_>,firing:&mut Firing)->Result<(),String> {
-    if firing.state!=FiringState::Skipped || firing.run.is_some() || firing.agent.is_some() || firing.release_pending
-        || firing.skipped_occurrences.is_some() || !matches!(firing.trigger,crate::automations::Trigger::Scheduled {..}) {return Ok(());}
-    let latest:Option<String>=tx.query_row("SELECT id FROM automation_firings WHERE automation=?1 ORDER BY rowid DESC LIMIT 1",[firing.automation.to_string()],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
+fn coalesce_existing_skipped_firing(
+    tx: &Transaction<'_>,
+    firing: &mut Firing,
+) -> Result<(), String> {
+    if firing.state != FiringState::Skipped
+        || firing.run.is_some()
+        || firing.agent.is_some()
+        || firing.release_pending
+        || firing.skipped_occurrences.is_some()
+        || !matches!(
+            firing.trigger,
+            crate::automations::Trigger::Scheduled { .. }
+        )
+    {
+        return Ok(());
+    }
+    let latest: Option<String> = tx
+        .query_row(
+            "SELECT id FROM automation_firings WHERE automation=?1 ORDER BY rowid DESC LIMIT 1",
+            [firing.automation.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
     // A precheck may finish after later overlap rows. Preserve their ordering
     // and reason boundary instead of reinserting an older occurrence last.
-    if latest.as_deref()!=Some(firing.id.to_string().as_str()) {return Ok(());}
-    let key:String=tx.query_row("SELECT occurrence_key FROM automation_firings WHERE id=?1",[firing.id.to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
-    tx.execute("DELETE FROM automation_precheck_retirements WHERE firing=?1 AND retired=1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
-    tx.execute("DELETE FROM automation_firings WHERE id=?1",[firing.id.to_string()]).map_err(|error|error.to_string())?;
-    insert_or_coalesce_firing(tx,firing,&key)
+    if latest.as_deref() != Some(firing.id.to_string().as_str()) {
+        return Ok(());
+    }
+    let key: String = tx
+        .query_row(
+            "SELECT occurrence_key FROM automation_firings WHERE id=?1",
+            [firing.id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM automation_precheck_retirements WHERE firing=?1 AND retired=1",
+        [firing.id.to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM automation_firings WHERE id=?1",
+        [firing.id.to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    insert_or_coalesce_firing(tx, firing, &key)
 }
 
 /// Helper controllers can retire out of order. Once both adjacent owners have
 /// proved cleanup, fold forward without erasing any still-pending helper ID or
 /// crossing a reason, revision, manual occurrence or successful-run boundary.
-fn coalesce_retired_following_skips(tx:&Transaction<'_>,firing:&mut Firing)->Result<(),String> {
-    use crate::automations::{SkippedOccurrences,Trigger};
+fn coalesce_retired_following_skips(
+    tx: &Transaction<'_>,
+    firing: &mut Firing,
+) -> Result<(), String> {
+    use crate::automations::{SkippedOccurrences, Trigger};
     for _ in 0..HISTORY_ROWS {
         let record:Option<(String,String)>=tx.query_row("SELECT id,record FROM automation_firings WHERE automation=?1 AND rowid>(SELECT rowid FROM automation_firings WHERE id=?2) ORDER BY rowid LIMIT 1",params![firing.automation.to_string(),firing.id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
-        let Some((next_id,record))=record else {break;};let next:Firing=decode(&record)?;
+        let Some((next_id, record)) = record else {
+            break;
+        };
+        let next: Firing = decode(&record)?;
         if next.state!=FiringState::Skipped || next.agent.is_some() || next.run.is_some() || next.release_pending || next.skip!=firing.skip || next.revision!=firing.revision || firing.missed_interval.is_some() || next.missed_interval.is_some()
             || tx.query_row("SELECT EXISTS(SELECT 1 FROM automation_precheck_retirements WHERE firing=?1 AND retired=0)",[&next_id],|row|row.get::<_,bool>(0)).map_err(|error|error.to_string())? {break;}
-        let (Trigger::Scheduled {occurrence:first},Trigger::Scheduled {occurrence:last})=(&firing.trigger,&next.trigger) else {break;};
-        let old=firing.skipped_occurrences.clone().unwrap_or(SkippedOccurrences {count:1,first_occurrence_ms:first.due_ms,last_occurrence_ms:first.due_ms});
-        let added=next.skipped_occurrences.clone().unwrap_or(SkippedOccurrences {count:1,first_occurrence_ms:last.due_ms,last_occurrence_ms:last.due_ms});
-        let key:String=tx.query_row("SELECT occurrence_key FROM automation_firings WHERE id=?1",[&next_id],|row|row.get(0)).map_err(|error|error.to_string())?;
-        tx.execute("DELETE FROM automation_precheck_retirements WHERE firing=?1 AND retired=1",[&next_id]).map_err(|error|error.to_string())?;
-        tx.execute("DELETE FROM automation_firings WHERE id=?1",[&next_id]).map_err(|error|error.to_string())?;
-        firing.skipped_occurrences=Some(SkippedOccurrences {count:old.count.saturating_add(added.count),first_occurrence_ms:old.first_occurrence_ms,last_occurrence_ms:added.last_occurrence_ms});
-        firing.trigger=next.trigger;firing.finished_ms=next.finished_ms;firing.diagnostic=next.diagnostic;
-        tx.execute("UPDATE automation_firings SET occurrence_key=?2 WHERE id=?1",params![firing.id.to_string(),key]).map_err(|error|error.to_string())?;
-        write_firing(tx,firing)?;
+        let (Trigger::Scheduled { occurrence: first }, Trigger::Scheduled { occurrence: last }) =
+            (&firing.trigger, &next.trigger)
+        else {
+            break;
+        };
+        let old = firing
+            .skipped_occurrences
+            .clone()
+            .unwrap_or(SkippedOccurrences {
+                count: 1,
+                first_occurrence_ms: first.due_ms,
+                last_occurrence_ms: first.due_ms,
+            });
+        let added = next
+            .skipped_occurrences
+            .clone()
+            .unwrap_or(SkippedOccurrences {
+                count: 1,
+                first_occurrence_ms: last.due_ms,
+                last_occurrence_ms: last.due_ms,
+            });
+        let key: String = tx
+            .query_row(
+                "SELECT occurrence_key FROM automation_firings WHERE id=?1",
+                [&next_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM automation_precheck_retirements WHERE firing=?1 AND retired=1",
+            [&next_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM automation_firings WHERE id=?1", [&next_id])
+            .map_err(|error| error.to_string())?;
+        firing.skipped_occurrences = Some(SkippedOccurrences {
+            count: old.count.saturating_add(added.count),
+            first_occurrence_ms: old.first_occurrence_ms,
+            last_occurrence_ms: added.last_occurrence_ms,
+        });
+        firing.trigger = next.trigger;
+        firing.finished_ms = next.finished_ms;
+        firing.diagnostic = next.diagnostic;
+        tx.execute(
+            "UPDATE automation_firings SET occurrence_key=?2 WHERE id=?1",
+            params![firing.id.to_string(), key],
+        )
+        .map_err(|error| error.to_string())?;
+        write_firing(tx, firing)?;
     }
     Ok(())
 }
@@ -3663,7 +3908,11 @@ mod tests {
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
-        session.proof=Some(crate::model::HostSessionProof {host_session_id:crate::model::HostSessionId::new("archive-test"),boot_id:crate::model::BootId::new("archive-boot"),host_incarnation:crate::model::HostIncarnation::new("archive-incarnation")});
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("archive-test"),
+            boot_id: crate::model::BootId::new("archive-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("archive-incarnation"),
+        });
         let agent = registry
             .bind_agent(accepted.agent.id, None, HostedSession::Chat(session))
             .unwrap();
@@ -4219,7 +4468,7 @@ mod tests {
                 firing.id,
                 &agent,
                 crate::chat::Snapshot {
-                    session_id:Some("bounded-archive-thread".into()),
+                    session_id: Some("bounded-archive-thread".into()),
                     items: vec![
                         item("oversized", "x".repeat(4 * 1024 * 1024)),
                         item("latest", "Latest result".into()),
@@ -4264,8 +4513,12 @@ mod tests {
                 .contains("expired"),
             "history retention must also retire its archived transcript"
         );
-        assert!(registry.is_archived_automation_session(agent.session.as_ref().unwrap().id()).unwrap(),
-            "expiring saved history never authorizes the closed automation provider to restart");
+        assert!(
+            registry
+                .is_archived_automation_session(agent.session.as_ref().unwrap().id())
+                .unwrap(),
+            "expiring saved history never authorizes the closed automation provider to restart"
+        );
     }
     #[test]
     fn changing_visibility_preserves_active_run_and_execution_consent() {
@@ -4317,14 +4570,17 @@ mod tests {
     #[test]
     fn archive_storage_failure_preserves_owner_and_emits_a_named_blocker() {
         let (mut registry, _directory, definition) = fixture();
-        let (automation,done,agent)=completed_reusable_run(&mut registry,definition);
+        let (automation, done, agent) = completed_reusable_run(&mut registry, definition);
         registry.db.execute_batch("CREATE TRIGGER reject_saved_view BEFORE INSERT ON automation_snapshots BEGIN SELECT RAISE(ABORT,'fixture storage refusal'); END;").unwrap();
         assert!(
             !registry
                 .preserve_automation_conversation(
                     done.id,
                     &agent,
-                    crate::chat::Snapshot {session_id:Some("storage-fixture-thread".into()),..Default::default()},
+                    crate::chat::Snapshot {
+                        session_id: Some("storage-fixture-thread".into()),
+                        ..Default::default()
+                    },
                     240
                 )
                 .unwrap()
@@ -4370,178 +4626,635 @@ mod tests {
     }
     #[test]
     fn proved_closed_interrupted_history_expires_but_unresolved_owner_survives() {
-        use crate::agent_execution::{State,Update};
-        let (mut registry,_directory,definition)=fixture();
-        let automation=registry.create_automation(definition,100,test_identity()).unwrap();
-        let interrupt=|registry:&mut Registry,at:u64| {
-            let claim=registry.claim_automation(automation.id,1,None,crate::automations::Trigger::Manual {request:Uuid::new_v4()},None,true,at).unwrap();
-            let accepted=claim.accepted.unwrap();
-            registry.update_agent_run(accepted.run.id,accepted.run.revision,Update::Finished {state:State::Interrupted,result:Default::default()},at+1).unwrap();
-            let firing=registry.reconcile_automation_run(accepted.run.id,at+2).unwrap().unwrap();
-            (firing,accepted.agent)
+        use crate::agent_execution::{State, Update};
+        let (mut registry, _directory, definition) = fixture();
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let interrupt = |registry: &mut Registry, at: u64| {
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    at,
+                )
+                .unwrap();
+            let accepted = claim.accepted.unwrap();
+            registry
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Finished {
+                        state: State::Interrupted,
+                        result: Default::default(),
+                    },
+                    at + 1,
+                )
+                .unwrap();
+            let firing = registry
+                .reconcile_automation_run(accepted.run.id, at + 2)
+                .unwrap()
+                .unwrap();
+            (firing, accepted.agent)
         };
-        let (closed,agent)=interrupt(&mut registry,200);
-        let agent=registry.close_agent(&agent.origin,agent.id).unwrap();
-        registry.finish_automation_release(closed.id,&agent,210).unwrap();
-        let (blocked,_agent)=interrupt(&mut registry,300);
-        registry.prune_automation_history(HISTORY_TTL_MS+1000).unwrap();
-        assert!(registry.automation_firing(closed.id).is_err(),"proved cleanup retires an interrupted row under normal history TTL");
-        assert!(registry.automation_firing(blocked.id).is_ok(),"an unresolved interrupted owner remains protected");
+        let (closed, agent) = interrupt(&mut registry, 200);
+        let agent = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry
+            .finish_automation_release(closed.id, &agent, 210)
+            .unwrap();
+        let (blocked, _agent) = interrupt(&mut registry, 300);
+        registry
+            .prune_automation_history(HISTORY_TTL_MS + 1000)
+            .unwrap();
+        assert!(
+            registry.automation_firing(closed.id).is_err(),
+            "proved cleanup retires an interrupted row under normal history TTL"
+        );
+        assert!(
+            registry.automation_firing(blocked.id).is_ok(),
+            "an unresolved interrupted owner remains protected"
+        );
     }
 
     #[test]
     fn scoped_discovery_keeps_old_offline_destinations_beyond_the_global_push_window() {
         use crate::agent_execution::Placement;
-        let (mut registry,directory,mut definition)=fixture();definition.session_mode=SessionMode::Fresh;
-        let worktree=Placement::Worktree {repository:directory.path().into(),path:directory.path().into()};
-        let proof=crate::model::HostSessionProof {host_session_id:crate::model::HostSessionId::new("archive-test"),boot_id:crate::model::BootId::new("archive-boot"),host_incarnation:crate::model::HostIncarnation::new("archive-incarnation")};
-        let mut first=None;
+        let (mut registry, directory, mut definition) = fixture();
+        definition.session_mode = SessionMode::Fresh;
+        let worktree = Placement::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("archive-test"),
+            boot_id: crate::model::BootId::new("archive-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("archive-incarnation"),
+        };
+        let mut first = None;
         for index in 0..1025 {
-            let mut saved=definition.clone();
-            if index>0 {saved.agent.target.placement=Some(worktree.clone());}
-            let (_,firing,agent)=completed_reusable_run(&mut registry,saved);
-            let agent=registry.close_agent(&agent.origin,agent.id).unwrap();
-            registry.finish_automation_release(firing.id,&agent,230).unwrap();
-            registry.archive_automation_conversation(firing.id,&agent,crate::chat::Snapshot {session_id:Some(format!("paged-thread-{index}")),..Default::default()}).unwrap();
+            let mut saved = definition.clone();
+            if index > 0 {
+                saved.agent.target.placement = Some(worktree.clone());
+            }
+            let (_, firing, agent) = completed_reusable_run(&mut registry, saved);
+            let agent = registry.close_agent(&agent.origin, agent.id).unwrap();
+            registry
+                .finish_automation_release(firing.id, &agent, 230)
+                .unwrap();
+            registry
+                .archive_automation_conversation(
+                    firing.id,
+                    &agent,
+                    crate::chat::Snapshot {
+                        session_id: Some(format!("paged-thread-{index}")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             registry.db.execute("UPDATE automation_firings SET created_ms=?2,record=json_set(record,'$.created_ms',?2) WHERE id=?1",params![firing.id.to_string(),1000+index as u64]).unwrap();
-            if first.is_none() {first=Some(registry.agent(agent.id).unwrap());}
+            if first.is_none() {
+                first = Some(registry.agent(agent.id).unwrap());
+            }
         }
-        let first=first.unwrap();let model=registry.model().unwrap();
-        assert_eq!(model.archived_automation_agents.len(),1024);
-        assert!(!model.archived_automation_agents.iter().any(|agent|agent.id==first.id));
-        let oldest=registry.archived_automation_agents_page(first.placement.clone(),model.identity,model.sequence,None,64,proof.clone()).unwrap();
-        assert_eq!(oldest.agents,vec![first.clone()]);assert!(oldest.next.is_none());
-        let mut after=None;let mut seen=std::collections::HashSet::new();
+        let first = first.unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(model.archived_automation_agents.len(), 1024);
+        assert!(
+            !model
+                .archived_automation_agents
+                .iter()
+                .any(|agent| agent.id == first.id)
+        );
+        let oldest = registry
+            .archived_automation_agents_page(
+                first.placement.clone(),
+                model.identity,
+                model.sequence,
+                None,
+                64,
+                proof.clone(),
+            )
+            .unwrap();
+        assert_eq!(oldest.agents, vec![first.clone()]);
+        assert!(oldest.next.is_none());
+        let mut after = None;
+        let mut seen = std::collections::HashSet::new();
         loop {
-            let page=registry.archived_automation_agents_page(worktree.clone(),model.identity,model.sequence,after,64,proof.clone()).unwrap();
-            assert!(page.agents.len()<=64);
-            for agent in page.agents {assert!(seen.insert(agent.id));}
-            match page.next {Some(next)=>{assert!(after.is_none_or(|previous|previous<next));after=Some(next);},None=>break,}
+            let page = registry
+                .archived_automation_agents_page(
+                    worktree.clone(),
+                    model.identity,
+                    model.sequence,
+                    after,
+                    64,
+                    proof.clone(),
+                )
+                .unwrap();
+            assert!(page.agents.len() <= 64);
+            for agent in page.agents {
+                assert!(seen.insert(agent.id));
+            }
+            match page.next {
+                Some(next) => {
+                    assert!(after.is_none_or(|previous| previous < next));
+                    after = Some(next);
+                }
+                None => break,
+            }
         }
-        assert_eq!(seen.len(),1024);
-        let archive=registry.archived_automation_conversation(first.id).unwrap();
-        let crate::agent_execution::HostedSession::Chat(session)=first.session.as_ref().unwrap() else {unreachable!()};
-        assert!(crate::automations::archive::ArchivedPaneReadiness::qualify(first.id,session,&archive).is_ok());
-        registry.db.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0",[]).unwrap();
-        assert!(registry.archived_automation_agents_page(first.placement,model.identity,model.sequence,None,64,proof).is_err(),"a changed view/model must restart discovery before using its old cursor");
+        assert_eq!(seen.len(), 1024);
+        let archive = registry.archived_automation_conversation(first.id).unwrap();
+        let crate::agent_execution::HostedSession::Chat(session) = first.session.as_ref().unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            crate::automations::archive::ArchivedPaneReadiness::qualify(
+                first.id, session, &archive
+            )
+            .is_ok()
+        );
+        registry
+            .db
+            .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .unwrap();
+        assert!(
+            registry
+                .archived_automation_agents_page(
+                    first.placement,
+                    model.identity,
+                    model.sequence,
+                    None,
+                    64,
+                    proof
+                )
+                .is_err(),
+            "a changed view/model must restart discovery before using its old cursor"
+        );
     }
 
     #[test]
     fn headless_completion_preserves_an_explicitly_published_exact_pane() {
-        let (mut registry,_directory,mut definition)=fixture();
-        definition.visibility=crate::automations::Visibility::Headless;
-        let (_,firing,agent)=completed_reusable_run(&mut registry,definition);
-        let agent=registry.close_agent(&agent.origin,agent.id).unwrap();
-        registry.finish_automation_release(firing.id,&agent,230).unwrap();
-        registry.archive_automation_conversation(firing.id,&agent,crate::chat::Snapshot {session_id:Some("headless-manually-shown".into()),..Default::default()}).unwrap();
-        assert!(registry.model().unwrap().archived_automation_agents.is_empty(),"headless completion creates no automatic pane");
-        let agent=registry.agent(agent.id).unwrap();
-        let Some(crate::agent_execution::HostedSession::Chat(session))=&agent.session else {unreachable!()};
-        registry.apply(&ModelEdit::SeedView {scope:agent.placement.clone(),panes:vec![crate::workspace_model::views::Pane {id:crate::model::CardId::from_uuid(agent.id.as_uuid()),title:"Explicit saved view".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,kind:crate::model::CardKind::Chat(session.clone()),scope:None}],closed:vec![]}).unwrap();
-        let model=registry.model().unwrap();
-        assert_eq!(model.archived_automation_agents,vec![agent.clone()],"headless prevents automatic creation; a pane explicitly opened before completion still becomes its exact read-only result");
-        let proof=session.proof.clone().unwrap();
-        let page=registry.archived_automation_agents_page(agent.placement.clone(),model.identity,model.sequence,None,64,proof).unwrap();
-        assert_eq!(page.agents,vec![agent]);
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.visibility = crate::automations::Visibility::Headless;
+        let (_, firing, agent) = completed_reusable_run(&mut registry, definition);
+        let agent = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry
+            .finish_automation_release(firing.id, &agent, 230)
+            .unwrap();
+        registry
+            .archive_automation_conversation(
+                firing.id,
+                &agent,
+                crate::chat::Snapshot {
+                    session_id: Some("headless-manually-shown".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            registry
+                .model()
+                .unwrap()
+                .archived_automation_agents
+                .is_empty(),
+            "headless completion creates no automatic pane"
+        );
+        let agent = registry.agent(agent.id).unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
+            unreachable!()
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: agent.placement.clone(),
+                panes: vec![crate::workspace_model::views::Pane {
+                    id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+                    title: "Explicit saved view".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    kind: crate::model::CardKind::Chat(session.clone()),
+                    scope: None,
+                }],
+                closed: vec![],
+            })
+            .unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(
+            model.archived_automation_agents,
+            vec![agent.clone()],
+            "headless prevents automatic creation; a pane explicitly opened before completion still becomes its exact read-only result"
+        );
+        let proof = session.proof.clone().unwrap();
+        let page = registry
+            .archived_automation_agents_page(
+                agent.placement.clone(),
+                model.identity,
+                model.sequence,
+                None,
+                64,
+                proof,
+            )
+            .unwrap();
+        assert_eq!(page.agents, vec![agent]);
     }
 
     #[test]
     fn one_hundred_precheck_skips_merge_only_after_durable_outcome_and_retirement() {
-        use crate::automations::{Precheck,SkipReason,Trigger};
+        use crate::automations::{Precheck, SkipReason, Trigger};
         use crate::host::automations::precheck::Outcome;
-        let (mut registry,_directory,mut definition)=fixture();
-        definition.precheck=Some(Precheck {command:"exit 3".into(),timeout_seconds:1});
-        let created=registry.create_automation(definition,100,test_identity()).unwrap();
-        let enabled=registry.set_automation_enabled(created.id,1,Some(Occurrence {due_ms:60_000,local:"minute-0".into()}),true,200).unwrap();
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(Precheck {
+            command: "exit 3".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                1,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "minute-0".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
         for index in 0..100 {
-            let due=registry.automation(created.id).unwrap().next.unwrap();
-            let next=Occurrence {due_ms:due.due_ms+60_000,local:format!("minute-{}",index+1)};
-            let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(next),false,due.due_ms).unwrap();
-            assert!(registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).is_err());
-            assert_eq!(registry.automation(created.id).unwrap().active_firing,Some(claim.firing.id),"an unresolved helper's original owner row cannot be merged");
-            registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"predicate declined".into()},due.due_ms+1).unwrap();
-            assert!(registry.automation_firing(claim.firing.id).is_ok(),"durable completion alone does not erase the helper's cleanup key");
-            registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
+            let due = registry.automation(created.id).unwrap().next.unwrap();
+            let next = Occurrence {
+                due_ms: due.due_ms + 60_000,
+                local: format!("minute-{}", index + 1),
+            };
+            let claim = registry
+                .claim_automation(
+                    created.id,
+                    enabled.execution_revision,
+                    Some(&due),
+                    Trigger::Scheduled {
+                        occurrence: due.clone(),
+                    },
+                    Some(next),
+                    false,
+                    due.due_ms,
+                )
+                .unwrap();
+            assert!(
+                registry
+                    .coalesce_retired_automation_precheck(claim.firing.id, claim.firing.revision)
+                    .is_err()
+            );
+            assert_eq!(
+                registry.automation(created.id).unwrap().active_firing,
+                Some(claim.firing.id),
+                "an unresolved helper's original owner row cannot be merged"
+            );
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Skipped,
+                        skip: Some(SkipReason::PrecheckExit),
+                        diagnostic: "predicate declined".into(),
+                    },
+                    due.due_ms + 1,
+                )
+                .unwrap();
+            assert!(
+                registry.automation_firing(claim.firing.id).is_ok(),
+                "durable completion alone does not erase the helper's cleanup key"
+            );
+            registry
+                .coalesce_retired_automation_precheck(claim.firing.id, claim.firing.revision)
+                .unwrap();
         }
-        let history=registry.automation_history(Some(created.id),None,100).unwrap();
-        assert_eq!(history.firings.len(),1);let summary=history.firings[0].skipped_occurrences.as_ref().unwrap();
-        assert_eq!((summary.count,summary.first_occurrence_ms,summary.last_occurrence_ms),(100,60_000,6_000_000));
-        assert_eq!(registry.automation_notifications().unwrap().len(),1);
-        let due=registry.automation(created.id).unwrap().next.unwrap();
-        let next=Occurrence {due_ms:due.due_ms+60_000,local:"after interruption".into()};
-        let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(next),false,due.due_ms).unwrap();
-        registry.interrupt_automation_precheck(claim.firing.id,"cleanup receipt unavailable".into(),due.due_ms+1).unwrap();
-        assert!(registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).is_err());
-        assert_eq!(registry.automation(created.id).unwrap().active_firing,Some(claim.firing.id));
-        assert_eq!(registry.automation_firing(claim.firing.id).unwrap().state,FiringState::Interrupted);
-        assert!(registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"late proved cleanup".into()},due.due_ms+2).unwrap().is_none());
-        registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
-        assert_eq!(registry.automation_firing(claim.firing.id).unwrap().state,FiringState::Interrupted,"late cleanup never turns uncertain work into a fresh skip or new provider dispatch");
-        assert_eq!(registry.automation_history(Some(created.id),None,100).unwrap().firings.len(),2);
+        let history = registry
+            .automation_history(Some(created.id), None, 100)
+            .unwrap();
+        assert_eq!(history.firings.len(), 1);
+        let summary = history.firings[0].skipped_occurrences.as_ref().unwrap();
+        assert_eq!(
+            (
+                summary.count,
+                summary.first_occurrence_ms,
+                summary.last_occurrence_ms
+            ),
+            (100, 60_000, 6_000_000)
+        );
+        assert_eq!(registry.automation_notifications().unwrap().len(), 1);
+        let due = registry.automation(created.id).unwrap().next.unwrap();
+        let next = Occurrence {
+            due_ms: due.due_ms + 60_000,
+            local: "after interruption".into(),
+        };
+        let claim = registry
+            .claim_automation(
+                created.id,
+                enabled.execution_revision,
+                Some(&due),
+                Trigger::Scheduled {
+                    occurrence: due.clone(),
+                },
+                Some(next),
+                false,
+                due.due_ms,
+            )
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(
+                claim.firing.id,
+                "cleanup receipt unavailable".into(),
+                due.due_ms + 1,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .coalesce_retired_automation_precheck(claim.firing.id, claim.firing.revision)
+                .is_err()
+        );
+        assert_eq!(
+            registry.automation(created.id).unwrap().active_firing,
+            Some(claim.firing.id)
+        );
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap().state,
+            FiringState::Interrupted
+        );
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Skipped,
+                        skip: Some(SkipReason::PrecheckExit),
+                        diagnostic: "late proved cleanup".into()
+                    },
+                    due.due_ms + 2
+                )
+                .unwrap()
+                .is_none()
+        );
+        registry
+            .coalesce_retired_automation_precheck(claim.firing.id, claim.firing.revision)
+            .unwrap();
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap().state,
+            FiringState::Interrupted,
+            "late cleanup never turns uncertain work into a fresh skip or new provider dispatch"
+        );
+        assert_eq!(
+            registry
+                .automation_history(Some(created.id), None, 100)
+                .unwrap()
+                .firings
+                .len(),
+            2
+        );
     }
 
     #[test]
     fn retention_keeps_settled_precheck_proof_until_helper_retirement_survives_restart() {
-        use crate::automations::{Precheck,SkipReason,Trigger};
+        use crate::automations::{Precheck, SkipReason, Trigger};
         use crate::host::automations::precheck::Outcome;
-        let (mut registry,directory,mut definition)=fixture();
-        definition.precheck=Some(Precheck {command:"exit 3".into(),timeout_seconds:1});
-        let created=registry.create_automation(definition,100,test_identity()).unwrap();
-        let claim=registry.claim_automation(created.id,1,None,Trigger::Manual {request:Uuid::new_v4()},None,true,200).unwrap();
-        registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"declined".into()},210).unwrap();
-        let late=HISTORY_TTL_MS+1000;
+        let (mut registry, directory, mut definition) = fixture();
+        definition.precheck = Some(Precheck {
+            command: "exit 3".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                1,
+                None,
+                Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .finish_automation_precheck(
+                claim.firing.id,
+                Outcome::Stopped {
+                    state: FiringState::Skipped,
+                    skip: Some(SkipReason::PrecheckExit),
+                    diagnostic: "declined".into(),
+                },
+                210,
+            )
+            .unwrap();
+        let late = HISTORY_TTL_MS + 1000;
         registry.prune_automation_history(late).unwrap();
-        assert!(registry.automation_firing(claim.firing.id).is_ok(),"durable outcome alone does not prove the helper process and inherited lease retired");
+        assert!(
+            registry.automation_firing(claim.firing.id).is_ok(),
+            "durable outcome alone does not prove the helper process and inherited lease retired"
+        );
         // Simulate an older store lacking the new cleanup authority table.
-        registry.db.execute("DROP TABLE automation_precheck_retirements",[]).unwrap();
+        registry
+            .db
+            .execute("DROP TABLE automation_precheck_retirements", [])
+            .unwrap();
         drop(registry);
-        let mut registry=Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry.prune_automation_history(late).unwrap();
         assert!(registry.automation_firing(claim.firing.id).is_ok());
-        assert_eq!(registry.pending_automation_precheck_retirements(None).unwrap(),vec![(claim.firing.id,claim.firing.revision)]);
-        registry.coalesce_retired_automation_precheck(claim.firing.id,claim.firing.revision).unwrap();
-        assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty());
-        assert!(registry.automation_notifications().unwrap().is_empty(),"cleanup of legacy settled history never resurrects an old skip alert");
+        assert_eq!(
+            registry
+                .pending_automation_precheck_retirements(None)
+                .unwrap(),
+            vec![(claim.firing.id, claim.firing.revision)]
+        );
+        registry
+            .coalesce_retired_automation_precheck(claim.firing.id, claim.firing.revision)
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_precheck_retirements(None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry.automation_notifications().unwrap().is_empty(),
+            "cleanup of legacy settled history never resurrects an old skip alert"
+        );
         drop(registry);
-        let mut registry=Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty(),"backfill never forgets a committed retirement receipt");
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert!(
+            registry
+                .pending_automation_precheck_retirements(None)
+                .unwrap()
+                .is_empty(),
+            "backfill never forgets a committed retirement receipt"
+        );
         registry.prune_automation_history(late).unwrap();
         assert!(registry.automation_firing(claim.firing.id).is_err());
-        let markers:u64=registry.db.query_row("SELECT count(*) FROM automation_precheck_retirements",[],|row|row.get(0)).unwrap();
-        assert_eq!(markers,0,"retired marker metadata expires atomically with its history");
+        let markers: u64 = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM automation_precheck_retirements",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            markers, 0,
+            "retired marker metadata expires atomically with its history"
+        );
     }
 
     #[test]
     fn reordered_helper_retirement_never_retires_an_unproved_neighbor_and_then_coalesces() {
-        use crate::automations::{Precheck,SkipReason,Trigger};
+        use crate::automations::{Precheck, SkipReason, Trigger};
         use crate::host::automations::precheck::Outcome;
-        let (mut registry,_directory,mut definition)=fixture();definition.precheck=Some(Precheck {command:"exit 3".into(),timeout_seconds:1});
-        let created=registry.create_automation(definition,100,test_identity()).unwrap();
-        let enabled=registry.set_automation_enabled(created.id,1,Some(Occurrence {due_ms:60_000,local:"first".into()}),true,200).unwrap();
-        let mut owners=vec![];
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(Precheck {
+            command: "exit 3".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                1,
+                Some(Occurrence {
+                    due_ms: 60_000,
+                    local: "first".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let mut owners = vec![];
         for index in 0..2 {
-            let due=registry.automation(created.id).unwrap().next.unwrap();
-            let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(Occurrence {due_ms:due.due_ms+60_000,local:format!("next{index}")}),false,due.due_ms).unwrap();
-            registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"declined".into()},due.due_ms+1).unwrap();owners.push(claim.firing);
+            let due = registry.automation(created.id).unwrap().next.unwrap();
+            let claim = registry
+                .claim_automation(
+                    created.id,
+                    enabled.execution_revision,
+                    Some(&due),
+                    Trigger::Scheduled {
+                        occurrence: due.clone(),
+                    },
+                    Some(Occurrence {
+                        due_ms: due.due_ms + 60_000,
+                        local: format!("next{index}"),
+                    }),
+                    false,
+                    due.due_ms,
+                )
+                .unwrap();
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Skipped,
+                        skip: Some(SkipReason::PrecheckExit),
+                        diagnostic: "declined".into(),
+                    },
+                    due.due_ms + 1,
+                )
+                .unwrap();
+            owners.push(claim.firing);
         }
-        let shared_registry=std::sync::Arc::new(std::sync::Mutex::new(registry));
-        shared_registry.lock().unwrap().coalesce_retired_automation_precheck(owners[1].id,owners[1].revision).unwrap();
-        let journal_directory=tempfile::tempdir().unwrap();let journal=journal_directory.path().join("notifications.sqlite3");
-        let (delivered,first_notice)=crate::host::notifications::transfer_scheduler_events_for_test(&shared_registry,&journal).unwrap();
-        assert_eq!(delivered,1);assert!(first_notice[0].delivered);
-        assert!(shared_registry.lock().unwrap().automation_notifications().unwrap().is_empty());
-        let mut registry=shared_registry.lock().unwrap();
-        assert_eq!(registry.automation_history(Some(created.id),None,100).unwrap().firings.len(),2);
-        assert_eq!(registry.pending_automation_precheck_retirements(None).unwrap(),vec![(owners[0].id,owners[0].revision)],"retiring the later controller never grants a receipt to the earlier one");
-        registry.coalesce_retired_automation_precheck(owners[0].id,owners[0].revision).unwrap();
-        let history=registry.automation_history(Some(created.id),None,100).unwrap();assert_eq!(history.firings.len(),1);
-        assert_eq!(history.firings[0].id,owners[0].id);assert_eq!(history.firings[0].skipped_occurrences.as_ref().unwrap().count,2);
-        assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty());
+        let shared_registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+        shared_registry
+            .lock()
+            .unwrap()
+            .coalesce_retired_automation_precheck(owners[1].id, owners[1].revision)
+            .unwrap();
+        let journal_directory = tempfile::tempdir().unwrap();
+        let journal = journal_directory.path().join("notifications.sqlite3");
+        let (delivered, first_notice) =
+            crate::host::notifications::transfer_scheduler_events_for_test(
+                &shared_registry,
+                &journal,
+            )
+            .unwrap();
+        assert_eq!(delivered, 1);
+        assert!(first_notice[0].delivered);
+        assert!(
+            shared_registry
+                .lock()
+                .unwrap()
+                .automation_notifications()
+                .unwrap()
+                .is_empty()
+        );
+        let mut registry = shared_registry.lock().unwrap();
+        assert_eq!(
+            registry
+                .automation_history(Some(created.id), None, 100)
+                .unwrap()
+                .firings
+                .len(),
+            2
+        );
+        assert_eq!(
+            registry
+                .pending_automation_precheck_retirements(None)
+                .unwrap(),
+            vec![(owners[0].id, owners[0].revision)],
+            "retiring the later controller never grants a receipt to the earlier one"
+        );
+        registry
+            .coalesce_retired_automation_precheck(owners[0].id, owners[0].revision)
+            .unwrap();
+        let history = registry
+            .automation_history(Some(created.id), None, 100)
+            .unwrap();
+        assert_eq!(history.firings.len(), 1);
+        assert_eq!(history.firings[0].id, owners[0].id);
+        assert_eq!(
+            history.firings[0]
+                .skipped_occurrences
+                .as_ref()
+                .unwrap()
+                .count,
+            2
+        );
+        assert!(
+            registry
+                .pending_automation_precheck_retirements(None)
+                .unwrap()
+                .is_empty()
+        );
         drop(registry);
-        let (redelivered,after)=crate::host::notifications::transfer_scheduler_events_for_test(&shared_registry,&journal).unwrap();
-        assert_eq!(redelivered,0,"out-of-order retirement never republishes the same consecutive skip group");
-        assert_eq!(after,first_notice,"the original journal UUID and delivered state survive the earlier helper's later receipt");
-        assert!(shared_registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        let (redelivered, after) = crate::host::notifications::transfer_scheduler_events_for_test(
+            &shared_registry,
+            &journal,
+        )
+        .unwrap();
+        assert_eq!(
+            redelivered, 0,
+            "out-of-order retirement never republishes the same consecutive skip group"
+        );
+        assert_eq!(
+            after, first_notice,
+            "the original journal UUID and delivered state survive the earlier helper's later receipt"
+        );
+        assert!(
+            shared_registry
+                .lock()
+                .unwrap()
+                .automation_notifications()
+                .unwrap()
+                .is_empty()
+        );
     }
-
 }

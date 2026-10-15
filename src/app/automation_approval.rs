@@ -8,7 +8,7 @@ pub(super) struct State {
     proposal: Option<Proposal>,
     available: Option<Proposal>,
     pending: Vec<ProposalSummary>,
-    reading: Option<(uuid::Uuid,u64)>,
+    reading: Option<(uuid::Uuid, u64)>,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -167,7 +167,9 @@ impl Cagents {
                 revision,
                 result,
             } => {
-                if self.automation_approval.reading!=Some((id,revision)) {return Task::none();}
+                if self.automation_approval.reading != Some((id, revision)) {
+                    return Task::none();
+                }
                 self.automation_approval.reading = None;
                 let proposal = match result.as_ref() {
                     Ok(proposal)
@@ -186,8 +188,15 @@ impl Cagents {
                 // An explicit notification activation can precede its model
                 // push. The exact user-authorized Pending reply is sufficient
                 // to review it; this never approves or enables any schedule.
-                if !self.automation_approval.pending.iter().any(|summary|summary.id==id) {
-                    self.automation_approval.pending.push(ProposalSummary::from(&proposal));
+                if !self
+                    .automation_approval
+                    .pending
+                    .iter()
+                    .any(|summary| summary.id == id)
+                {
+                    self.automation_approval
+                        .pending
+                        .push(ProposalSummary::from(&proposal));
                 }
                 self.automation_approval.available = Some(proposal);
                 self.update_automation_approval(Action::Open { id, revision })
@@ -223,7 +232,7 @@ impl Cagents {
                     if self.automation_approval.reading.is_some() {
                         return Task::none();
                     }
-                    self.automation_approval.reading = Some((id,revision));
+                    self.automation_approval.reading = Some((id, revision));
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let socket = crate::terminal::ensure_daemon_ready()
@@ -630,31 +639,53 @@ mod tests {
         let proposal = proposal();
         let mut unrelated = proposal.clone();
         unrelated.definition.agent.target.repository = "/other-project".into();
-        drop(app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&unrelated)])));
+        drop(
+            app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(
+                &unrelated,
+            )])),
+        );
         assert!(app.automation_approval.available.is_none());
         assert_eq!(
             app.automation_approval.pending.len(),
             1,
             "another project's request updates global attention"
         );
-        let task = app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&proposal)]));
+        let task =
+            app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&proposal)]));
         assert!(
             iced::runtime::task::into_stream(task).is_none(),
             "background attention must not move keyboard focus"
         );
         assert!(!app.modal_is_open());
         assert!(app.core.keyboard_nav());
-        assert!(app.automation_approval.available.is_none(),"model pushes carry bounded summaries; full consent is fetched only for explicit review");
-        let absent=uuid::Uuid::new_v4();
-        drop(app.update_automation_approval(Action::Open {id:absent,revision:1}));
+        assert!(
+            app.automation_approval.available.is_none(),
+            "model pushes carry bounded summaries; full consent is fetched only for explicit review"
+        );
+        let absent = uuid::Uuid::new_v4();
+        drop(app.update_automation_approval(Action::Open {
+            id: absent,
+            revision: 1,
+        }));
         assert!(!app.automation_approval_open());
-        drop(app.update_automation_approval(Action::Loaded {id:absent,revision:1,result:Arc::new(Err("The request no longer exists".into()))}));
+        drop(app.update_automation_approval(Action::Loaded {
+            id: absent,
+            revision: 1,
+            result: Arc::new(Err("The request no longer exists".into())),
+        }));
         drop(app.update_automation_approval(Action::Open {
             id: proposal.id,
             revision: proposal.revision,
         }));
-        assert!(!app.modal_is_open(),"the exact private proposal must arrive before displaying consent");
-        let task=app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal.clone()))});
+        assert!(
+            !app.modal_is_open(),
+            "the exact private proposal must arrive before displaying consent"
+        );
+        let task = app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal.clone())),
+        });
         assert!(app.modal_is_open());
         assert!(!app.core.keyboard_nav());
         assert_eq!(
@@ -670,27 +701,45 @@ mod tests {
         }));
         assert!(!app.automation_approval_open());
         assert!(app.core.keyboard_nav());
-        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal))}));
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal)),
+        }));
         assert!(!app.automation_approval_open());
         assert!(app.automation_approval.available.is_none());
     }
 
     #[test]
     fn explicit_notification_review_can_arrive_before_the_proposal_model_push() {
-        let mut app=super::super::tests::context_inspector_test_app(false);
-        let proposal=proposal();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
         assert!(app.automation_approval.pending.is_empty());
-        drop(app.update_automation_approval(Action::Open {id:proposal.id,revision:proposal.revision}));
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
         assert!(!app.automation_approval_open());
-        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal.clone()))}));
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal.clone())),
+        }));
         assert!(app.automation_approval_open());
-        assert_eq!(app.automation_approval.pending,vec![ProposalSummary::from(&proposal)]);
+        assert_eq!(
+            app.automation_approval.pending,
+            vec![ProposalSummary::from(&proposal)]
+        );
         assert!(!app.automation_approval.deciding);
         drop(app.update_automation_approval(Action::Dismiss));
         assert!(!app.automation_approval_open());
-        assert_eq!(app.automation_approval.pending.len(),1);
+        assert_eq!(app.automation_approval.pending.len(), 1);
         // An old/unsolicited load cannot reopen a dismissed dialog.
-        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal))}));
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal)),
+        }));
         assert!(!app.automation_approval_open());
     }
 

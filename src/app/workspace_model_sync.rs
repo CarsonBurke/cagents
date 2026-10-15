@@ -700,11 +700,18 @@ impl Cagents {
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         for agent in &model.archived_automation_agents {
             let card = CardId::from_uuid(agent.id.as_uuid());
-            if !self.can_present_automation_archive(card,agent) {continue;}
-            if self.card_state(card).is_some_and(|state|!state.existence.is_open()) {
+            if !self.can_present_automation_archive(card, agent) {
                 continue;
             }
-            let Some(display)=display_index.resolve(agent) else {continue;};
+            if self
+                .card_state(card)
+                .is_some_and(|state| !state.existence.is_open())
+            {
+                continue;
+            }
+            let Some(display) = display_index.resolve(agent) else {
+                continue;
+            };
             if self.durable.automation_archives.get(&card) != Some(&agent.id) {
                 Arc::make_mut(&mut self.durable)
                     .automation_archives
@@ -722,8 +729,11 @@ impl Cagents {
             // Completion changes runtime ownership even when the pane's
             // geometry and persisted map were already current. Hydrate on
             // that model edge, without waiting for an unrelated viewport move.
-            let visible=self.workspace.mounted_visibility().filter_map(|(card,class)|
-                (class==VisibilityClass::Visible).then_some(card)).collect();
+            let visible = self
+                .workspace
+                .mounted_visibility()
+                .filter_map(|(card, class)| (class == VisibilityClass::Visible).then_some(card))
+                .collect();
             tasks.push(self.hydrate_visible_automation_archives(&visible));
         }
         for agent in &model.agents {
@@ -774,23 +784,38 @@ impl Cagents {
         display: crate::workspace_model::views::ManagedDisplay,
     ) -> Option<Task<Message>> {
         let placement = &display.scope;
-        let archived=agent.closed && self.durable.automation_archives.get(&CardId::from_uuid(agent.id.as_uuid()))==Some(&agent.id);
+        let archived = agent.closed
+            && self
+                .durable
+                .automation_archives
+                .get(&CardId::from_uuid(agent.id.as_uuid()))
+                == Some(&agent.id);
         if (agent.closed && !archived)
             || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
         {
             return None;
         }
         let session = if archived {
-            let mut session=agent.session.clone()?;
-            if let crate::agent_execution::HostedSession::Chat(saved)=&mut session {saved.terminal=agent.console.clone();}
+            let mut session = agent.session.clone()?;
+            if let crate::agent_execution::HostedSession::Chat(saved) = &mut session {
+                saved.terminal = agent.console.clone();
+            }
             session
-        } else {match display.pane.as_ref().map(|pane| &pane.kind) {
-            Some(CardKind::Chat(session)) => crate::agent_execution::HostedSession::Chat(session.clone()),
-            Some(CardKind::Terminal(session)) => crate::agent_execution::HostedSession::Terminal(session.clone()),
-            Some(_) => return None,
-            None if agent.spec.surface == crate::agent_execution::Surface::Terminal => crate::agent_execution::HostedSession::Terminal(agent.console.clone()?),
-            None => agent.session.clone()?,
-        }};
+        } else {
+            match display.pane.as_ref().map(|pane| &pane.kind) {
+                Some(CardKind::Chat(session)) => {
+                    crate::agent_execution::HostedSession::Chat(session.clone())
+                }
+                Some(CardKind::Terminal(session)) => {
+                    crate::agent_execution::HostedSession::Terminal(session.clone())
+                }
+                Some(_) => return None,
+                None if agent.spec.surface == crate::agent_execution::Surface::Terminal => {
+                    crate::agent_execution::HostedSession::Terminal(agent.console.clone()?)
+                }
+                None => agent.session.clone()?,
+            }
+        };
         let channel_index = match placement {
             crate::agent_execution::Placement::Channel(id) => Some(
                 self.durable
@@ -820,33 +845,68 @@ impl Cagents {
         // Includes tombstones: an explicit local close is never undone by an
         // old model read, a reconnect, or another window observing this agent.
         if let Some(existing) = self.durable.cards.iter().find(|card| card.id == card_id) {
-            if !existing.existence.is_open() { return None; }
+            if !existing.existence.is_open() {
+                return None;
+            }
             let current = match &existing.kind {
-                CardKind::Chat(session) => crate::agent_execution::HostedSession::Chat(session.clone()),
-                CardKind::Terminal(session) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+                CardKind::Chat(session) => {
+                    crate::agent_execution::HostedSession::Chat(session.clone())
+                }
+                CardKind::Terminal(session) => {
+                    crate::agent_execution::HostedSession::Terminal(session.clone())
+                }
                 _ => return None,
             };
-            if !session.same_process(&current) { return None; }
+            if !session.same_process(&current) {
+                return None;
+            }
             let saved = display.pane.as_ref()?;
             let in_place = match placement {
-                crate::agent_execution::Placement::Channel(channel) => self.durable.channels.iter().any(|owner| owner.id == *channel && owner.cards.contains(&card_id)),
-                crate::agent_execution::Placement::Worktree { path, .. } => !self.durable.channels.iter().any(|owner| owner.cards.contains(&card_id)) && self.durable.card_scopes.get(&card_id) == Some(path),
+                crate::agent_execution::Placement::Channel(channel) => self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|owner| owner.id == *channel && owner.cards.contains(&card_id)),
+                crate::agent_execution::Placement::Worktree { path, .. } => {
+                    !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|owner| owner.cards.contains(&card_id))
+                        && self.durable.card_scopes.get(&card_id) == Some(path)
+                }
             };
-            if in_place { return None; }
+            if in_place {
+                return None;
+            }
             let durable = Arc::make_mut(&mut self.durable);
-            durable.worktree_focus.retain(|_, focused| *focused != card_id);
+            durable
+                .worktree_focus
+                .retain(|_, focused| *focused != card_id);
             for channel in &mut durable.channels {
                 channel.cards.retain(|id| *id != card_id);
-                if channel.focused == Some(card_id) { channel.focused = channel.cards.first().copied(); }
+                if channel.focused == Some(card_id) {
+                    channel.focused = channel.cards.first().copied();
+                }
             }
             if let Some(index) = channel_index {
                 durable.channels[index].cards.push(card_id);
                 durable.channels[index].focused.get_or_insert(card_id);
                 self.worktree_owners.remove(&card_id);
-                match &saved.scope { Some(scope) => { durable.card_scopes.insert(card_id, scope.clone()); }, None => { durable.card_scopes.remove(&card_id); } }
+                match &saved.scope {
+                    Some(scope) => {
+                        durable.card_scopes.insert(card_id, scope.clone());
+                    }
+                    None => {
+                        durable.card_scopes.remove(&card_id);
+                    }
+                }
             } else if let crate::agent_execution::Placement::Worktree { path, .. } = placement {
                 durable.card_scopes.insert(card_id, path.clone());
-                durable.worktree_focus.entry(path.clone()).or_insert(card_id);
+                durable
+                    .worktree_focus
+                    .entry(path.clone())
+                    .or_insert(card_id);
                 self.worktree_owners.insert(card_id, path.clone());
             }
             return Some(self.refresh_managed_display_strip());
@@ -860,8 +920,14 @@ impl Cagents {
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: display.pane.as_ref().map(|pane| pane.title.clone()).unwrap_or_else(|| format!("{} agent", agent.spec.provider.label())),
-            width_fraction: if let Some(pane) = &display.pane { pane.width_fraction } else if matches!(kind, CardKind::Chat(_)) {
+            title: display
+                .pane
+                .as_ref()
+                .map(|pane| pane.title.clone())
+                .unwrap_or_else(|| format!("{} agent", agent.spec.provider.label())),
+            width_fraction: if let Some(pane) = &display.pane {
+                pane.width_fraction
+            } else if matches!(kind, CardKind::Chat(_)) {
                 self.settings.default_native_pane_fraction
             } else {
                 self.settings.default_column_fraction
@@ -875,7 +941,11 @@ impl Cagents {
         durable.cards.push(card.clone());
         let scope_path = match placement {
             crate::agent_execution::Placement::Worktree { path, .. } => path.clone(),
-            crate::agent_execution::Placement::Channel(_) => display.pane.as_ref().and_then(|pane| pane.scope.clone()).unwrap_or_else(|| agent.spec.target.directory.clone()),
+            crate::agent_execution::Placement::Channel(_) => display
+                .pane
+                .as_ref()
+                .and_then(|pane| pane.scope.clone())
+                .unwrap_or_else(|| agent.spec.target.directory.clone()),
         };
         durable.card_scopes.insert(card_id, scope_path.clone());
         if let Some(index) = channel_index {
@@ -890,7 +960,14 @@ impl Cagents {
             self.worktree_owners.insert(card_id, scope_path);
         }
         if let Some(pane) = &display.pane {
-            match &pane.user_title { Some(title) => { self.chrome_ui.user_titles.insert(card_id, title.clone()); }, None => { self.chrome_ui.user_titles.remove(&card_id); } }
+            match &pane.user_title {
+                Some(title) => {
+                    self.chrome_ui.user_titles.insert(card_id, title.clone());
+                }
+                None => {
+                    self.chrome_ui.user_titles.remove(&card_id);
+                }
+            }
         }
         self.cards.insert(card_id, CardRuntime::Loading);
         self.lifecycle.register(
@@ -1789,27 +1866,83 @@ mod tests {
         );
     }
 
-    fn managed_display_fixture() -> (Cagents, crate::agent_execution::Agent, crate::workspace_model::views::Pane, ChannelId) {
-        use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target};
+    fn managed_display_fixture() -> (
+        Cagents,
+        crate::agent_execution::Agent,
+        crate::workspace_model::views::Pane,
+        ChannelId,
+    ) {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
         let (mut app, project, repository) = app_with_project();
         let original = ChannelId::new();
         let destination = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
-        durable.channels.push(local(original, project, "Original", 0));
-        durable.channels.push(local(destination, project, "Current", 1));
-        let CardKind::Terminal(mut console) = super::super::tests::terminal_card_state().kind else { unreachable!() };
-        console.launch.working_directory = "/repo".into();
-        console.continuity = TerminalContinuity::Live { host_session_id: crate::model::HostSessionId::new("managed-display"), boot_id: crate::model::BootId::new("managed-display"), host_incarnation: crate::model::HostIncarnation::new("managed-display") };
-        let placement = Placement::Channel(original);
-        let agent = Agent { id: crate::model::AgentId::new(), name: None, origin: Origin::User,
-            spec: Spec { provider: crate::agent::Provider::Claude, account: None, target: Target { repository: repository.clone(), directory: "/repo".into(), placement: Some(placement.clone()) }, surface: Surface::Terminal, model: None, permission_mode: None, reasoning_effort: None },
-            placement, session: Some(HostedSession::Terminal(console.clone())), console: Some(console.clone()), created_ms: 0, closed: false,
+        durable
+            .channels
+            .push(local(original, project, "Original", 0));
+        durable
+            .channels
+            .push(local(destination, project, "Current", 1));
+        let CardKind::Terminal(mut console) = super::super::tests::terminal_card_state().kind
+        else {
+            unreachable!()
         };
-        let pane = crate::workspace_model::views::Pane { id: CardId::from_uuid(agent.id.as_uuid()), title: "Current managed title".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.6, kind: CardKind::Terminal(console), scope: Some("/repo".into()) };
-        app.workspace_model = registry(vec![shared(original, &repository, "Original", 0), shared(destination, &repository, "Current", 1)]);
+        console.launch.working_directory = "/repo".into();
+        console.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("managed-display"),
+            boot_id: crate::model::BootId::new("managed-display"),
+            host_incarnation: crate::model::HostIncarnation::new("managed-display"),
+        };
+        let placement = Placement::Channel(original);
+        let agent = Agent {
+            id: crate::model::AgentId::new(),
+            name: None,
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: repository.clone(),
+                    directory: "/repo".into(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Terminal(console.clone())),
+            console: Some(console.clone()),
+            created_ms: 0,
+            closed: false,
+        };
+        let pane = crate::workspace_model::views::Pane {
+            id: CardId::from_uuid(agent.id.as_uuid()),
+            title: "Current managed title".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.6,
+            kind: CardKind::Terminal(console),
+            scope: Some("/repo".into()),
+        };
+        app.workspace_model = registry(vec![
+            shared(original, &repository, "Original", 0),
+            shared(destination, &repository, "Current", 1),
+        ]);
         let mut source = crate::workspace_model::views::View::empty(original);
         source.retired.push(pane.id);
-        app.workspace_model.views = vec![source, crate::workspace_model::views::View { scope: Placement::Channel(destination), revision: 9, panes: vec![pane.clone()], retired: vec![] }];
+        app.workspace_model.views = vec![
+            source,
+            crate::workspace_model::views::View {
+                scope: Placement::Channel(destination),
+                revision: 9,
+                panes: vec![pane.clone()],
+                retired: vec![],
+            },
+        ];
         app.workspace_model.agents.push(agent.clone());
         (app, agent, pane, destination)
     }
@@ -1819,18 +1952,54 @@ mod tests {
         for worktree in [false, true] {
             let (mut app, agent, pane, destination) = managed_display_fixture();
             let original = agent.channel().unwrap();
-            if worktree { app.workspace_model.views[1].scope = crate::agent_execution::Placement::Worktree { repository: agent.spec.target.repository.clone(), path: "/repo".into() }; }
+            if worktree {
+                app.workspace_model.views[1].scope = crate::agent_execution::Placement::Worktree {
+                    repository: agent.spec.target.repository.clone(),
+                    path: "/repo".into(),
+                };
+            }
             let incoming = std::mem::take(&mut app.workspace_model);
             drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
-            let target = app.card_state(pane.id).expect("first incoming snapshot adopted its exact managed pane");
+            let target = app
+                .card_state(pane.id)
+                .expect("first incoming snapshot adopted its exact managed pane");
             assert_eq!(target.kind, pane.kind);
             assert_eq!(target.title, pane.title);
-            assert!(app.durable.channels.iter().find(|channel| channel.id == original).unwrap().cards.is_empty());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == original)
+                    .unwrap()
+                    .cards
+                    .is_empty()
+            );
             if worktree {
-                assert!(!app.durable.channels.iter().any(|channel| channel.cards.contains(&pane.id)));
-                assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&PathBuf::from("/repo")));
-            } else { assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id)); }
-            assert_eq!(app.workspace_model.agents[0], agent, "display adoption preserves immutable launch and execution ownership");
+                assert!(
+                    !app.durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&pane.id))
+                );
+                assert_eq!(
+                    app.durable.card_scopes.get(&pane.id),
+                    Some(&PathBuf::from("/repo"))
+                );
+            } else {
+                assert!(
+                    app.durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == destination)
+                        .unwrap()
+                        .cards
+                        .contains(&pane.id)
+                );
+            }
+            assert_eq!(
+                app.workspace_model.agents[0], agent,
+                "display adoption preserves immutable launch and execution ownership"
+            );
         }
     }
 
@@ -1839,32 +2008,77 @@ mod tests {
         let (mut app, agent, pane, destination) = managed_display_fixture();
         let mut original_only = app.workspace_model.clone();
         original_only.views.clear();
-        let display = crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         let runtime = app.cards.remove(&pane.id).unwrap();
         app.cards.insert(pane.id, runtime);
         let actor = app.card_state(pane.id).unwrap().kind.clone();
         drop(app.reconcile_workspace_model());
         assert_eq!(app.card_state(pane.id).unwrap().kind, actor);
-        assert!(matches!(app.cards.get(&pane.id), Some(CardRuntime::Loading)));
-        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id));
-        assert!(!app.durable.channels.iter().find(|channel| channel.id == agent.channel().unwrap()).unwrap().cards.contains(&pane.id));
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == agent.channel().unwrap())
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
     }
 
     #[test]
-    fn attention_model_sync_never_recreates_removed_replaced_or_ambiguous_managed_panes_at_old_target() {
+    fn attention_model_sync_never_recreates_removed_replaced_or_ambiguous_managed_panes_at_old_target()
+     {
         for state in ["removed", "replaced", "ambiguous"] {
             let (mut app, _, pane, _) = managed_display_fixture();
             match state {
                 "removed" => app.workspace_model.views[1].panes.clear(),
-                "replaced" => { let CardKind::Terminal(session) = &mut app.workspace_model.views[1].panes[0].kind else { unreachable!() }; session.id = TerminalId::new(); },
-                _ => { let mut duplicate = app.workspace_model.views[1].clone(); duplicate.scope = crate::agent_execution::Placement::Channel(ChannelId::new()); app.workspace_model.views.push(duplicate); },
+                "replaced" => {
+                    let CardKind::Terminal(session) =
+                        &mut app.workspace_model.views[1].panes[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    session.id = TerminalId::new();
+                }
+                _ => {
+                    let mut duplicate = app.workspace_model.views[1].clone();
+                    duplicate.scope = crate::agent_execution::Placement::Channel(ChannelId::new());
+                    app.workspace_model.views.push(duplicate);
+                }
             }
             let incoming = std::mem::take(&mut app.workspace_model);
             drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
-            assert!(app.card_state(pane.id).is_none(), "{state} canonical evidence cannot fall back to the original placement");
-            assert!(!app.durable.channels.iter().any(|channel| channel.cards.contains(&pane.id)));
-            if state != "removed" { assert!(!app.shared_views.blocked.is_empty(), "ordinary projection must not bypass the managed replacement/ambiguity fence"); }
+            assert!(
+                app.card_state(pane.id).is_none(),
+                "{state} canonical evidence cannot fall back to the original placement"
+            );
+            assert!(
+                !app.durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&pane.id))
+            );
+            if state != "removed" {
+                assert!(
+                    !app.shared_views.blocked.is_empty(),
+                    "ordinary projection must not bypass the managed replacement/ambiguity fence"
+                );
+            }
         }
     }
 

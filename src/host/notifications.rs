@@ -1217,12 +1217,23 @@ mod tests {
         let registry = Arc::new(Mutex::new(crate::host::model::Registry::at(&path).unwrap()));
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
-        let mut journal = journal::Journal::open(&directory.path().join("notices.sqlite3")).unwrap();
+        let mut journal =
+            journal::Journal::open(&directory.path().join("notices.sqlite3")).unwrap();
         let id = Uuid::new_v4();
         let event = |reason: &str, key: &str| Event {
-            target: Target::Automation { id, name: "Fixture".into(), reason: reason.into() },
-            source_session: None, provider: None, directory: None, destination: None,
-            evidence: crate::notifications::Evidence { key: key.into(), kind: crate::notifications::Kind::AutomationSkipped },
+            target: Target::Automation {
+                id,
+                name: "Fixture".into(),
+                reason: reason.into(),
+            },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: key.into(),
+                kind: crate::notifications::Kind::AutomationSkipped,
+            },
         };
         // Exercise committed scheduler rows, the actual transfer, pending queue,
         // journal and receipt ACK. The newer reason sorts before the old reason.
@@ -1230,9 +1241,13 @@ mod tests {
             let _writer = registry.lock().unwrap();
             let mut connection = rusqlite::Connection::open(&path).unwrap();
             let tx = connection.transaction().unwrap();
-            tx.execute("DELETE FROM automation_notifications", []).unwrap();
-            tx.execute("INSERT INTO automation_notifications(key,event) VALUES(?1,?2)",
-                rusqlite::params![event.evidence.key, serde_json::to_string(event).unwrap()]).unwrap();
+            tx.execute("DELETE FROM automation_notifications", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO automation_notifications(key,event) VALUES(?1,?2)",
+                rusqlite::params![event.evidence.key, serde_json::to_string(event).unwrap()],
+            )
+            .unwrap();
             tx.commit().unwrap();
         };
         let old = event("Z earlier", "earlier");
@@ -1245,13 +1260,27 @@ mod tests {
         super::super::automations::transfer_notifications(&registry, &handle).unwrap();
         let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
         assert!(pending.events.is_empty());
-        assert_eq!(pending.automation_events.iter().map(|event| event.evidence.key.as_str()).collect::<Vec<_>>(), ["earlier", "newest"]);
+        assert_eq!(
+            pending
+                .automation_events
+                .iter()
+                .map(|event| event.evidence.key.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier", "newest"]
+        );
         for event in pending.automation_events {
             journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap();
         }
         assert_eq!(journal.list().unwrap()[0].event, newer);
         super::super::automations::transfer_notifications(&registry, &handle).unwrap();
-        assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_notifications()
+                .unwrap()
+                .is_empty()
+        );
         assert!(shared.pending.lock().unwrap().automation_events.is_empty());
 
         // Interrupted-after-journal replay emits the missing receipt without
@@ -1260,37 +1289,61 @@ mod tests {
         super::super::automations::transfer_notifications(&registry, &handle).unwrap();
         let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
         for event in pending.automation_events {
-            assert!(journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap().is_none());
+            assert!(
+                journal_event(&mut journal, &Arc::downgrade(&shared), event, false)
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert_eq!(journal.list().unwrap()[0].event, newer);
         super::super::automations::transfer_notifications(&registry, &handle).unwrap();
-        assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_notifications()
+                .unwrap()
+                .is_empty()
+        );
 
         // Competing service/scheduler flushes must not publish an older row
         // after its replacement committed. Either the first transfer wins the
         // writer lock and journals old→new, or both read the new committed row.
         for round in 0..16 {
-            let old=event("Z concurrent earlier",&format!("concurrent-old-{round}"));
-            let newest=event("A concurrent newest",&format!("concurrent-new-{round}"));
+            let old = event("Z concurrent earlier", &format!("concurrent-old-{round}"));
+            let newest = event("A concurrent newest", &format!("concurrent-new-{round}"));
             commit(&old);
-            let barrier=Arc::new(std::sync::Barrier::new(2));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
             std::thread::scope(|scope| {
-                let worker_barrier=barrier.clone();let worker_registry=registry.clone();let worker_handle=handle.clone();
+                let worker_barrier = barrier.clone();
+                let worker_registry = registry.clone();
+                let worker_handle = handle.clone();
                 scope.spawn(move || {
                     worker_barrier.wait();
-                    super::super::automations::transfer_notifications(&worker_registry,&worker_handle).unwrap();
+                    super::super::automations::transfer_notifications(
+                        &worker_registry,
+                        &worker_handle,
+                    )
+                    .unwrap();
                 });
                 barrier.wait();
                 commit(&newest);
-                super::super::automations::transfer_notifications(&registry,&handle).unwrap();
+                super::super::automations::transfer_notifications(&registry, &handle).unwrap();
             });
-            let pending=std::mem::take(&mut *shared.pending.lock().unwrap());
+            let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
             for event in pending.automation_events {
-                journal_event(&mut journal,&Arc::downgrade(&shared),event,false).unwrap();
+                journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap();
             }
-            assert_eq!(journal.list().unwrap()[0].event,newest);
-            super::super::automations::transfer_notifications(&registry,&handle).unwrap();
-            assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+            assert_eq!(journal.list().unwrap()[0].event, newest);
+            super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .automation_notifications()
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         // Identical presentation targets still journal and ACK both distinct
@@ -1306,7 +1359,10 @@ mod tests {
         for event in pending.automation_events {
             journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap();
         }
-        assert_eq!(handle.take_automation_receipts(), BTreeSet::from(["same-first".into(), "same-last".into()]));
+        assert_eq!(
+            handle.take_automation_receipts(),
+            BTreeSet::from(["same-first".into(), "same-last".into()])
+        );
         assert_eq!(journal.list().unwrap()[0].event, last);
     }
 
@@ -1363,13 +1419,17 @@ fn journal_event(
     let receipt = matches!(
         &event.target,
         Target::Automation { .. } | Target::AutomationProposal { .. }
-    ).then(|| event.evidence.key.clone());
+    )
+    .then(|| event.evidence.key.clone());
     let result = journal.record(event, suppressed);
     if result.is_ok()
         && let Some(key) = receipt
         && let Some(core) = shared.upgrade()
     {
-        let mut receipts = core.automation_receipts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut receipts = core
+            .automation_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if receipts.len() < MAX_PENDING {
             receipts.insert(key);
         }
@@ -1379,22 +1439,30 @@ fn journal_event(
 
 #[cfg(test)]
 pub(in crate::host) fn transfer_scheduler_events_for_test(
-    registry:&super::agent_execution::SharedRegistry,
-    path:&std::path::Path,
-)->Result<(usize,Vec<Notice>),String> {
-    let (wake,_receiver)=mpsc::channel(1);
-    let shared=Arc::new(Shared {pending:Mutex::default(),presence:Mutex::default(),snapshot:Mutex::default(),automation_receipts:Mutex::default(),wake});
-    let handle=Handle(shared.clone());
-    super::automations::transfer_notifications(registry,&handle)?;
-    let pending=std::mem::take(&mut *shared.pending.lock().unwrap());
-    let mut journal=journal::Journal::open(path)?;let mut delivered=0;
+    registry: &super::agent_execution::SharedRegistry,
+    path: &std::path::Path,
+) -> Result<(usize, Vec<Notice>), String> {
+    let (wake, _receiver) = mpsc::channel(1);
+    let shared = Arc::new(Shared {
+        pending: Mutex::default(),
+        presence: Mutex::default(),
+        snapshot: Mutex::default(),
+        automation_receipts: Mutex::default(),
+        wake,
+    });
+    let handle = Handle(shared.clone());
+    super::automations::transfer_notifications(registry, &handle)?;
+    let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
+    let mut journal = journal::Journal::open(path)?;
+    let mut delivered = 0;
     for event in pending.automation_events {
-        if let Some(notice)=journal_event(&mut journal,&Arc::downgrade(&shared),event,false)? {
-            journal.delivered(notice.id)?;delivered+=1;
+        if let Some(notice) = journal_event(&mut journal, &Arc::downgrade(&shared), event, false)? {
+            journal.delivered(notice.id)?;
+            delivered += 1;
         }
     }
-    super::automations::transfer_notifications(registry,&handle)?;
-    Ok((delivered,journal.list()?))
+    super::automations::transfer_notifications(registry, &handle)?;
+    Ok((delivered, journal.list()?))
 }
 
 async fn run(
@@ -1565,7 +1633,11 @@ async fn run(
             }
             queue_withdrawal(&mut withdrawals, id);
         }
-        for event in pending.events.into_values().chain(pending.automation_events) {
+        for event in pending
+            .events
+            .into_values()
+            .chain(pending.automation_events)
+        {
             if stopped(&shared) {
                 return;
             }
@@ -1576,7 +1648,10 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            let automation = matches!(&event.target, Target::Automation { .. } | Target::AutomationProposal { .. });
+            let automation = matches!(
+                &event.target,
+                Target::Automation { .. } | Target::AutomationProposal { .. }
+            );
             let recorded = journal_event(journal, &shared, event, suppressed);
             if recorded.is_ok()
                 && automation

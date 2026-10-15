@@ -2881,68 +2881,195 @@ fn automation_proposals_and_decisions_are_delivered_over_the_existing_model_watc
 
 #[test]
 fn archived_automation_reservation_refuses_stale_executable_controls_before_and_after_close() {
-    const NAME:&str="archived_automation_reservation_refuses_stale_executable_controls_before_and_after_close";
-    if isolated(NAME).is_some() {return;}
-    let (host,request,path)=fixture();
-    let mut definition=automation_fixture(&host,&request).definition;
-    definition.name="Fresh saved-view reservation".into();definition.session_mode=crate::automations::SessionMode::Fresh;
-    let automation=crate::host::automations::service::create(&host,definition).unwrap();
-    let accepted=claim_fixture(&host,&automation);dispatch_accepted(&host,accepted.clone()).unwrap();
-    let done=settled(&host,accepted.run.id);assert_eq!(done.state,State::Succeeded);
-    let store=registry(&host).unwrap();let agent=store.lock().unwrap().agent(accepted.agent.id).unwrap();
-    let Some(HostedSession::Chat(session))=agent.session.clone() else {panic!("hosted provider")};
-    let handle=host.lock().unwrap().chats.get(&session.id).unwrap().handle.clone();
-    let snapshot=handle.snapshot(None).unwrap();
-    let firing=store.lock().unwrap().reconcile_automation_run(done.id,now()).unwrap().unwrap();
+    const NAME: &str =
+        "archived_automation_reservation_refuses_stale_executable_controls_before_and_after_close";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let mut definition = automation_fixture(&host, &request).definition;
+    definition.name = "Fresh saved-view reservation".into();
+    definition.session_mode = crate::automations::SessionMode::Fresh;
+    let automation = crate::host::automations::service::create(&host, definition).unwrap();
+    let accepted = claim_fixture(&host, &automation);
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    let done = settled(&host, accepted.run.id);
+    assert_eq!(done.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    let Some(HostedSession::Chat(session)) = agent.session.clone() else {
+        panic!("hosted provider")
+    };
+    let handle = host
+        .lock()
+        .unwrap()
+        .chats
+        .get(&session.id)
+        .unwrap()
+        .handle
+        .clone();
+    let snapshot = handle.snapshot(None).unwrap();
+    let firing = store
+        .lock()
+        .unwrap()
+        .reconcile_automation_run(done.id, now())
+        .unwrap()
+        .unwrap();
     {
         // A recovery's source can be unregistered while its chosen replacement
         // belongs to this automation. Hold the replacement gate as cleanup
         // would, reserve its archive, then release the competing request.
-        let gate=agent_gate(&host,agent.id);let dispatch=gate.lock().unwrap();
-        let mut source=session.clone();source.id=TerminalId::new();
-        let request=ClientRequest::ChatRecoverAccount {source,replacement:session.clone(),idle_generation:None,execution_environment:Default::default()};
-        let (started,ready)=std::sync::mpsc::channel();let (finished,result)=std::sync::mpsc::channel();
-        let competing_host=host.clone();let applied=Arc::new(std::sync::atomic::AtomicBool::new(false));let worker_applied=applied.clone();
-        let worker=std::thread::spawn(move || {
+        let gate = agent_gate(&host, agent.id);
+        let dispatch = gate.lock().unwrap();
+        let mut source = session.clone();
+        source.id = TerminalId::new();
+        let request = ClientRequest::ChatRecoverAccount {
+            source,
+            replacement: session.clone(),
+            idle_generation: None,
+            execution_environment: Default::default(),
+        };
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let competing_host = host.clone();
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_applied = applied.clone();
+        let worker = std::thread::spawn(move || {
             started.send(()).unwrap();
-            let response=interactive(&competing_host,17,request,|_| {
-                worker_applied.store(true,std::sync::atomic::Ordering::SeqCst);
-                Err(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,"unexpected executable recovery",false))
+            let response = interactive(&competing_host, 17, request, |_| {
+                worker_applied.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::terminal_ipc::ProtocolError::new(
+                    crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                    "unexpected executable recovery",
+                    false,
+                ))
             });
             finished.send(response).unwrap();
         });
         ready.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(matches!(result.recv_timeout(Duration::from_millis(50)),Err(std::sync::mpsc::RecvTimeoutError::Timeout)),"recovery must serialize against its replacement owner, even with an unregistered source");
-        store.lock().unwrap().archive_automation_conversation(firing.id,&agent,snapshot).unwrap();
+        assert!(
+            matches!(
+                result.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "recovery must serialize against its replacement owner, even with an unregistered source"
+        );
+        store
+            .lock()
+            .unwrap()
+            .archive_automation_conversation(firing.id, &agent, snapshot)
+            .unwrap();
         drop(dispatch);
-        let refused=result.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err();
+        let refused = result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
         assert!(refused.message.contains("saved read-only"));
-        assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));worker.join().unwrap();
+        assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
+        worker.join().unwrap();
     }
-    let spawn_path=path.parent().unwrap().join("spawns");let before=std::fs::read_to_string(&spawn_path).unwrap();
-    for closed in [false,true] {
+    let spawn_path = path.parent().unwrap().join("spawns");
+    let before = std::fs::read_to_string(&spawn_path).unwrap();
+    for closed in [false, true] {
         if closed {
-            store.lock().unwrap().claim_agent_interaction(agent.id,None).unwrap();
-            assert!(!store.lock().unwrap().is_archived_automation_session(session.id).unwrap(),"an open user-owned takeover remains interactive");
-            assert_eq!(reconcile_agent_run(&host,&done,true).unwrap(),Reconciliation::UserOwned);
-            crate::host::chat::process(&host,EXECUTION_CLIENT,ClientRequest::ChatClose {chat_id:session.id}).unwrap();
-            let current=store.lock().unwrap().agent(agent.id).unwrap();store.lock().unwrap().finish_automation_release(firing.id,&current,now()).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .claim_agent_interaction(agent.id, None)
+                .unwrap();
+            assert!(
+                !store
+                    .lock()
+                    .unwrap()
+                    .is_archived_automation_session(session.id)
+                    .unwrap(),
+                "an open user-owned takeover remains interactive"
+            );
+            assert_eq!(
+                reconcile_agent_run(&host, &done, true).unwrap(),
+                Reconciliation::UserOwned
+            );
+            crate::host::chat::process(
+                &host,
+                EXECUTION_CLIENT,
+                ClientRequest::ChatClose {
+                    chat_id: session.id,
+                },
+            )
+            .unwrap();
+            let current = store.lock().unwrap().agent(agent.id).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .finish_automation_release(firing.id, &current, now())
+                .unwrap();
         }
-        let proof=host.lock().unwrap().proof().clone();
-        let requests=vec![
-            ClientRequest::ChatStart {session:session.clone(),source:None,terminate_source:false,execution_environment:Default::default()},
-            ClientRequest::ChatStartSelected {session:session.clone(),source:proof,token:"stale-preview".into()},
-            ClientRequest::ChatPrepareResume {source:session.clone()},
-            ClientRequest::ChatRecoverAccount {source:session.clone(),replacement:session.clone(),idle_generation:None,execution_environment:Default::default()},
-            ClientRequest::ChatReturnTerminal {chat_id:session.id},
+        let proof = host.lock().unwrap().proof().clone();
+        let requests = vec![
+            ClientRequest::ChatStart {
+                session: session.clone(),
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+            ClientRequest::ChatStartSelected {
+                session: session.clone(),
+                source: proof,
+                token: "stale-preview".into(),
+            },
+            ClientRequest::ChatPrepareResume {
+                source: session.clone(),
+            },
+            ClientRequest::ChatRecoverAccount {
+                source: session.clone(),
+                replacement: session.clone(),
+                idle_generation: None,
+                execution_environment: Default::default(),
+            },
+            ClientRequest::ChatReturnTerminal {
+                chat_id: session.id,
+            },
         ];
-        for request in requests {let refused=crate::host::chat::process(&host,17,request).unwrap_err();assert!(refused.message.contains("saved read-only"),"{refused:?}");}
-        assert_eq!(std::fs::read_to_string(&spawn_path).unwrap(),before);
-        assert_eq!(store.lock().unwrap().agent_is_interactive(agent.id).unwrap(),closed);
+        for request in requests {
+            let refused = crate::host::chat::process(&host, 17, request).unwrap_err();
+            assert!(refused.message.contains("saved read-only"), "{refused:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&spawn_path).unwrap(), before);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .agent_is_interactive(agent.id)
+                .unwrap(),
+            closed
+        );
     }
     assert!(host.lock().unwrap().chats.is_empty());
-    let new=crate::chat::fresh_session(Provider::Claude,TerminalId::new(),path.parent().unwrap().join("project"),&crate::account::Account::system(Provider::Claude)).unwrap();
-    crate::host::chat::process(&host,17,ClientRequest::ChatStart {session:new.clone(),source:None,terminate_source:false,execution_environment:Default::default()}).unwrap();
-    crate::host::chat::process(&host,17,ClientRequest::ChatClose {chat_id:new.id}).unwrap();
-    assert_eq!(std::fs::read_to_string(&spawn_path).unwrap().lines().count(),before.lines().count()+1,"distinct new conversations remain executable");
+    let new = crate::chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        path.parent().unwrap().join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    crate::host::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatStart {
+            session: new.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    crate::host::chat::process(&host, 17, ClientRequest::ChatClose { chat_id: new.id }).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&spawn_path)
+            .unwrap()
+            .lines()
+            .count(),
+        before.lines().count() + 1,
+        "distinct new conversations remain executable"
+    );
 }
