@@ -144,6 +144,11 @@ use crate::{
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 // Version 78 adds explicit account-switch intent and safe archive/move operations.
+/// Version 78 adds AwaitingApproval to tool states delivered to existing native
+/// chat subscribers. Older postcard peers must be rejected before receiving it.
+/// This unreleased branch additionally appends immutable original-query
+/// commands/replies. The campaign integration must assign a distinct final wire
+/// version before release; other intermediate version-78 peers are incompatible.
 pub const PROTOCOL_VERSION: u16 = 78;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -793,6 +798,11 @@ pub enum ServerResponse {
     },
     ChatAccountSwitchGeneration {
         generation: Option<u64>,
+    },
+    ChatOriginal {
+        chat_id: TerminalId,
+        result:
+            Result<crate::chat::annotations::OriginalPage, crate::chat::annotations::OriginalError>,
     },
 }
 
@@ -2234,6 +2244,36 @@ mod tests {
         assert!(restored.fast_mode.is_none());
         assert!(!restored.capabilities.fast_mode);
         assert!(restored.usage.cost_estimate.is_none());
+    }
+
+    #[test]
+    fn chat_approval_state_round_trips_at_the_matched_protocol_boundary() {
+        assert!(
+            PROTOCOL_VERSION > 77,
+            "existing subscribers cannot decode AwaitingApproval at version 77"
+        );
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                items: vec![std::sync::Arc::new(crate::chat::Item {
+                    id: "approval".into(),
+                    role: crate::chat::Role::Assistant,
+                    started_at: Some(1),
+                    at: Some(2),
+                    content: crate::chat::ItemContent::Tool {
+                        name: "Bash".into(),
+                        input: "{}".into(),
+                        output: String::new(),
+                        status: crate::chat::ToolStatus::AwaitingApproval,
+                    },
+                })],
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

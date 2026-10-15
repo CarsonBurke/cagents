@@ -857,15 +857,16 @@ mod tests {
         let mut annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
         let image = root.join("picked-image.png");
         std::fs::write(&image, b"original fixture image").unwrap();
-        let attachment = annotations.retain_attachment(&image).unwrap();
-        let retained_image = attachment.path.clone();
+        let mut captures = vec![annotations.retain_attachment(&image).unwrap()];
+        let retained_image = captures[0].attachment.path.clone();
         let original = OriginalPrompt {
             user_id: "confirmed-user".into(), turn_id: "confirmed-turn".into(),
-            text_bytes: 16, attachments: vec![attachment],
-            settings: OriginalSettings { model: Setting::Default, reasoning: Setting::Default,
-                fast: Setting::Unsupported, permission: Setting::Default },
+            text_bytes: 16, attachments: vec![captures[0].attachment.clone()],
+            settings: OriginalSettings { model: Setting::Value("fixture-model".into()), reasoning: Setting::Unsupported,
+                fast: Setting::Unsupported, permission: Setting::Value("default".into()) },
         };
-        annotations.accept(&original, "original request", &[]).unwrap();
+        annotations.accept(&original, "original request", &[], &mut captures).unwrap();
+        drop(captures);
         drop(annotations);
         let cache = crate::account::cache::Cache::installation().unwrap();
         remove_account(Operation::Remove { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
@@ -892,8 +893,16 @@ mod tests {
             let retained = if indexed {
                 let scope = super::super::scope::LaunchAccountScope::resolve(Provider::Codex, &root,
                     |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
-                let annotations = storage::Store::installation(&scope, "confirmed-absent-session").unwrap();
-                Some(annotations.retain_attachment(&image).unwrap().path)
+                let mut annotations = storage::Store::installation(&scope, "confirmed-absent-session").unwrap();
+                let mut captures=vec![annotations.retain_attachment(&image).unwrap()];
+                let retained=captures[0].attachment.path.clone();
+                let original=OriginalPrompt {user_id:"confirmed-absent-user".into(),turn_id:"confirmed-absent-turn".into(),text_bytes:4,
+                    attachments:vec![captures[0].attachment.clone()],settings:OriginalSettings {model:Setting::Value("fixture-model".into()),
+                        reasoning:Setting::Unsupported,fast:Setting::Unsupported,permission:Setting::Value("default".into())}};
+                annotations.accept(&original,"text",&[],&mut captures).unwrap();
+                drop(captures);
+                assert!(retained.is_file());
+                Some(retained)
             } else { None };
             std::fs::remove_dir_all(&home).unwrap();
             let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id(), expected_home: None }, &store, &homes, &cache, |_| Ok(())).unwrap();

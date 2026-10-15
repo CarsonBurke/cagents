@@ -36,6 +36,27 @@ pub fn focused_escape<'a, Message: 'a>(
         kind: Kind::FocusedEscape,
         tip: None,
         on_escape: Some(Box::new(on_escape)),
+        on_enter: None,
+        decision_id: None,
+    }
+    .into()
+}
+
+/// Explicit shortcuts apply only after focus enters this decision card.
+/// Merely arriving while the user types must never approve a request.
+pub fn focused_decisions<'a, Message: 'a>(
+    id: Id,
+    content: impl Into<Element<'a, Message>>,
+    on_enter: impl Fn() -> Message + 'a,
+    on_escape: impl Fn() -> Message + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusedEscape,
+        tip: None,
+        on_enter: Some(Box::new(on_enter)),
+        decision_id: Some(id),
+        on_escape: Some(Box::new(on_escape)),
     }
     .into()
 }
@@ -67,6 +88,8 @@ pub fn keyboard_list<'a, Message: 'a>(
         kind: Kind::KeyboardList(enabled),
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -79,6 +102,8 @@ pub fn keyboard_list_row<'a, Message: 'a>(
         kind: Kind::ListRow,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -210,6 +235,8 @@ pub fn reserve_tab_history<'a, Message: 'a>(
         kind: Kind::TabHistory(enabled),
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -222,6 +249,8 @@ pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         kind: Kind::Hover,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -236,6 +265,8 @@ pub fn drive_animation<'a, Message: 'a>(
         kind: Kind::DriveAnimation(active),
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -329,6 +360,8 @@ fn reveal_width_aligned<'a, Message: 'a>(
         },
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -349,6 +382,8 @@ pub fn fade<'a, Message: 'a>(
         kind: Kind::Fade(progress.clamp(0.0, 1.0)),
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -386,6 +421,8 @@ fn tooltip_positioned<'a, Message: 'a>(
             content: None,
         }),
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -404,6 +441,8 @@ pub fn context_menu<'a, Message: Clone + 'static>(
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -419,6 +458,8 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -434,6 +475,8 @@ pub fn keyboard_modal<'a, Message: 'a>(
         kind: Kind::KeyboardModal,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -445,6 +488,8 @@ pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
         kind: Kind::Opaque,
         tip: None,
         on_escape: None,
+        on_enter: None,
+        decision_id: None,
     }
     .into()
 }
@@ -1157,6 +1202,8 @@ struct Effect<'a, Message> {
     kind: Kind,
     tip: Option<Tip<'a, Message>>,
     on_escape: Option<Box<dyn Fn() -> Message + 'a>>,
+    on_enter: Option<Box<dyn Fn() -> Message + 'a>>,
+    decision_id: Option<Id>,
 }
 
 struct Tip<'a, Message> {
@@ -1222,6 +1269,7 @@ struct State {
     focused: bool,
     now: Instant,
     faded: RefCell<Option<FadedTheme>>,
+    card_focused: bool,
 }
 
 impl Default for State {
@@ -1236,11 +1284,32 @@ impl Default for State {
             focused: true,
             now: Instant::now(),
             faded: RefCell::new(None),
+            card_focused: false,
         }
     }
 }
 
+impl operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.card_focused
+    }
+    fn focus(&mut self) {
+        self.card_focused = true;
+    }
+    fn unfocus(&mut self) {
+        self.card_focused = false;
+    }
+}
+
 impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
+    fn id(&self) -> Option<Id> {
+        self.decision_id.clone()
+    }
+    fn set_id(&mut self, id: Id) {
+        if self.decision_id.is_some() {
+            self.decision_id = Some(id);
+        }
+    }
     fn tag(&self) -> tree::Tag {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
@@ -1341,6 +1410,15 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             renderer,
             operation,
         );
+        // Keep native decision buttons first in the tab order. The card's
+        // final focus stop has its own explicit Enter/Escape shortcuts.
+        if let Some(id) = &self.decision_id {
+            operation.focusable(
+                Some(id),
+                layout.bounds() - layout.virtual_offset(),
+                tree.state.downcast_mut::<State>(),
+            );
+        }
     }
     fn update(
         &mut self,
@@ -1353,6 +1431,50 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Some(id) = &self.decision_id {
+            if let Event::A11y(
+                event_id,
+                iced_accessibility::accesskit::ActionRequest {
+                    action: iced_accessibility::accesskit::Action::Focus,
+                    ..
+                },
+            ) = event
+            {
+                let focused = iced_accessibility::IdEq::eq(event_id, id);
+                tree.state.downcast_mut::<State>().card_focused = focused;
+                if focused {
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut operation::focusable::unfocus::<()>(),
+                    );
+                    shell.request_redraw();
+                    shell.capture_event();
+                    return;
+                }
+            }
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                    | Event::Window(window::Event::Unfocused)
+            ) {
+                tree.state.downcast_mut::<State>().card_focused = false;
+            }
+        }
+        if let Some(on_enter) = &self.on_enter
+            && matches!(event, Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter),
+                modifiers, ..
+            }) if modifiers.is_empty())
+            && !shell.is_event_captured()
+        {
+            if tree.state.downcast_ref::<State>().card_focused {
+                shell.publish(on_enter());
+                shell.capture_event();
+                return;
+            }
+        }
         if let Some(on_escape) = &self.on_escape
             && matches!(
                 event,
@@ -1372,7 +1494,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 renderer,
                 &mut focus,
             );
-            if focus.0 {
+            if focus.0 || tree.state.downcast_ref::<State>().card_focused {
                 shell.publish(on_escape());
                 shell.capture_event();
                 return;
@@ -1673,6 +1795,20 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             cursor,
             viewport,
         );
+        if self.decision_id.is_some() && state.card_focused {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds() - layout.virtual_offset(),
+                    border: cosmic::iced::Border {
+                        color: crate::design::accent_color(theme),
+                        width: 2.0,
+                        radius: crate::design::RADIUS_M.into(),
+                    },
+                    ..Default::default()
+                },
+                Color::TRANSPARENT,
+            );
+        }
         if matches!(self.kind, Kind::Hover) {
             // Keep low-emphasis rows legible against neutral surfaces without
             // turning hover feedback into a selected-state fill.
@@ -1751,11 +1887,31 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content.as_widget().a11y_nodes(
+        let child = self.content.as_widget().a11y_nodes(
             effect_layout(self.kind, layout),
             &tree.children[0],
             cursor,
-        )
+        );
+        if let Some(id) = &self.decision_id {
+            let mut node = iced_accessibility::accesskit::Node::new(
+                iced_accessibility::accesskit::Role::Group,
+            );
+            node.set_label("Approval card: Enter allows once, Escape denies");
+            node.add_action(iced_accessibility::accesskit::Action::Focus);
+            let bounds = layout.bounds() - layout.virtual_offset();
+            node.set_bounds(iced_accessibility::accesskit::Rect::new(
+                bounds.x as f64,
+                bounds.y as f64,
+                (bounds.x + bounds.width) as f64,
+                (bounds.y + bounds.height) as f64,
+            ));
+            iced_accessibility::A11yTree::node_with_child_tree(
+                iced_accessibility::A11yNode::new(node, id.clone()),
+                child,
+            )
+        } else {
+            child
+        }
     }
     fn drag_destinations(
         &self,
@@ -1831,6 +1987,111 @@ mod tests {
                 Modifiers::CTRL | Modifiers::ALT
             ),
             None
+        );
+    }
+
+    #[test]
+    fn focused_decision_keys_require_card_focus() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let id = Id::from("approval.card");
+        let mut element = focused_decisions(
+            id.clone(),
+            crate::ui_controls::button::secondary("Deny (Esc)")
+                .id(Id::from("approval.deny"))
+                .on_press(3_u8),
+            || 1_u8,
+            || 2_u8,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(300.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        for (focused, key, expected) in [
+            (false, keyboard::key::Named::Enter, None),
+            (false, keyboard::key::Named::Escape, None),
+            (true, keyboard::key::Named::Enter, Some(1_u8)),
+            (true, keyboard::key::Named::Escape, Some(2_u8)),
+        ] {
+            if focused {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(id.clone()),
+                );
+            }
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(messages, expected.into_iter().collect::<Vec<_>>());
+        }
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(Id::from("approval.deny")),
+        );
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert_eq!(
+            messages,
+            vec![3_u8],
+            "a focused Deny button retains its native Enter action"
         );
     }
 

@@ -282,6 +282,7 @@ pub enum Action {
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
+    DenyInstructions(Target, String, bool),
     /// Puts a completion row's text over the word being completed. When the
     /// row is no longer offered, because the word changed under the key that
     /// chose it, the key does what it does without the list: the action
@@ -403,6 +404,7 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
+            | Self::DenyInstructions(target, _, _)
             | Self::Complete(target, _, _)
             | Self::Scrolled(target, _, _, _)
             | Self::ModelPicker(target, _)
@@ -612,6 +614,7 @@ impl ChangeToken {
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
+            chat::ToolStatus::AwaitingApproval => 5,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -844,6 +847,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::AwaitingApproval => "Awaiting approval",
     }
 }
 
@@ -1542,6 +1546,9 @@ pub(super) struct Runtime {
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
+    /// Tiny interaction metadata survives transcript window/cache eviction.
+    turn_started_at: Option<u64>,
+    turn_prompt_id: Option<String>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     presentation_revision: u64,
@@ -2133,6 +2140,8 @@ impl Runtime {
                 ..Snapshot::default()
             }),
             source_clock: None,
+            turn_started_at: None,
+            turn_prompt_id: None,
             finished_stamp: None,
             connection,
             queued: None,
@@ -2652,6 +2661,34 @@ impl Runtime {
                 grouping_dirty |= self.asked_after.insert(last.id.clone());
             }
         }
+        fn latest_user(state: &Snapshot) -> Option<&Arc<chat::Item>> {
+            state.items.iter().rev().find(|item| {
+                item.role == chat::Role::User
+                    && matches!(
+                        item.content,
+                        ItemContent::Text {
+                            thinking: false,
+                            ..
+                        }
+                    )
+            })
+        }
+        let current_user = latest_user(&snapshot);
+        let previous_user = latest_user(&self.snapshot);
+        let new_turn = snapshot.turn_generation != self.snapshot.turn_generation
+            || snapshot.session_id != self.snapshot.session_id
+            || (!self.snapshot.busy && snapshot.busy);
+        if new_turn {
+            self.turn_prompt_id = None;
+            self.turn_started_at = snapshot.turn_started_at;
+        }
+        if self.turn_prompt_id.is_none()
+            && let Some(user) = current_user
+            && previous_user.is_none_or(|previous| previous.id != user.id)
+        {
+            self.turn_started_at = user.started_at.or(user.at).or(self.turn_started_at);
+            self.turn_prompt_id = Some(user.id.clone());
+        }
         self.source_clock = source_clock;
         let cache = &self.cache;
         let turns = (grouping_dirty || !turn::same_structure(&self.snapshot.items, &snapshot.items)).then(|| {
@@ -2712,6 +2749,24 @@ impl Runtime {
             .iter()
             .filter(|agent| agent.stopped_by_interrupt(&self.snapshot.capabilities))
             .count()
+    }
+
+    fn denial_response(&self, request_id: &str) -> Option<Command> {
+        if self.session.launch.provider != Provider::Claude
+            || !self.snapshot.requests.iter().any(|request| {
+                request.id == request_id
+                    && request.kind == chat::RequestKind::Approval
+                    && request.actions.iter().any(|choice| choice.id == "deny")
+            })
+        {
+            return None;
+        }
+        let text = self.composer.text().trim_end_matches('\n').to_owned();
+        (!text.trim().is_empty()).then(|| Command::Answer {
+            request_id: request_id.to_owned(),
+            action: "deny".into(),
+            answers: vec![chat::Answer::denial_instructions(text)],
+        })
     }
 
     fn refresh_find(&mut self) {
@@ -8133,7 +8188,9 @@ impl Cagents {
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
-                            runtime.take_attachments();
+                            if pending.request.is_none() {
+                                runtime.take_attachments();
+                            }
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -8728,6 +8785,31 @@ impl Cagents {
                     }
                 }
             }
+            Action::DenyInstructions(target, request_id, send) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.session.launch.provider != Provider::Claude
+                    || !runtime.snapshot.requests.iter().any(|request| {
+                        request.id == request_id
+                            && request.kind == chat::RequestKind::Approval
+                            && request.actions.iter().any(|choice| choice.id == "deny")
+                    })
+                {
+                    return Task::none();
+                }
+                if !send {
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                let Some(command) = runtime.denial_response(&request_id) else {
+                    return Task::none();
+                };
+                return self.chat_send(target, command, true);
+            }
             Action::Answer(target, request_id, action) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -9296,6 +9378,72 @@ mod tests {
         assert!(runtime.prompt_suggestion().is_some());
         Arc::make_mut(&mut runtime.snapshot).session_id = Some("other-session".into());
         assert!(runtime.prompt_suggestion().is_none());
+    }
+
+    #[test]
+    fn denying_with_composer_instructions_clears_only_the_acknowledged_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("approval"));
+        let target = {
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                unreachable!()
+            };
+            runtime.session.launch.provider = Provider::Claude;
+            runtime.replace_draft(text_editor::Content::with_text(
+                "use git push --force-with-lease instead",
+            ));
+            runtime.attachments.push(Attachment {
+                path: "retained.png".into(),
+            });
+            Arc::make_mut(&mut runtime.snapshot)
+                .requests
+                .push(chat::Request {
+                    kind: chat::RequestKind::Approval,
+                    id: "approval".into(),
+                    title: "Allow Bash?".into(),
+                    description: String::new(),
+                    fields: vec![],
+                    actions: vec![chat::Choice {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: String::new(),
+                    }],
+                });
+            runtime.target
+        };
+        assert_eq!(
+            chat_runtime(&app, card).denial_response("approval"),
+            Some(Command::Answer {
+                request_id: "approval".into(),
+                action: "deny".into(),
+                answers: vec![chat::Answer::denial_instructions(
+                    "use git push --force-with-lease instead".into()
+                )],
+            })
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        let runtime = chat_runtime(&app, card);
+        let pending = runtime
+            .pending
+            .as_ref()
+            .expect("the approval is dispatched");
+        assert_eq!(pending.request.as_deref(), Some("approval"));
+        let command_id = pending.id;
+        let next = runtime.next_command;
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "use git push --force-with-lease instead"
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        assert_eq!(
+            chat_runtime(&app, card).next_command,
+            next,
+            "duplicate clicks cannot dispatch twice"
+        );
+        drop(app.handle_chat_ui(Action::CommandFinished(target, command_id, Ok(()))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.text().trim().is_empty());
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
     }
 
     #[test]

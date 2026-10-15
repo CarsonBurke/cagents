@@ -121,6 +121,30 @@ type Pending = Arc<
 >;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
+type OriginalPending = Arc<
+    Mutex<
+        BTreeMap<
+            u64,
+            tokio::sync::oneshot::Sender<
+                Result<super::annotations::OriginalPage, super::annotations::OriginalError>,
+            >,
+        >,
+    >,
+>;
+
+struct OriginalRequest<'a> {
+    pending: &'a OriginalPending,
+    id: u64,
+}
+
+impl Drop for OriginalRequest<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
@@ -190,6 +214,7 @@ struct Inner {
     reader: Mutex<Option<JoinHandle<()>>>,
     pending: Pending,
     file_pending: FilePending,
+    original_pending: OriginalPending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -297,6 +322,86 @@ fn transmit(
         codec.release_spare();
     }
     Ok(())
+}
+
+// Keep admission and socket backpressure asynchronous. Callers include this
+// future in the same deadline as the reply; dropping it never leaves a sender
+// task waiting to transmit a stale request later.
+async fn transmit_async(
+    wire: &Mutex<Wire>,
+    alive: &AtomicBool,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<(), String> {
+    let mut frame = Vec::new();
+    FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES)
+        .write(
+            &mut frame,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: id,
+                proof: Some(proof.clone()),
+                request,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    loop {
+        if try_transmit_frame(wire, alive, &frame)? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn try_transmit_frame(
+    wire: &Mutex<Wire>,
+    alive: &AtomicBool,
+    frame: &[u8],
+) -> Result<bool, String> {
+    use std::{os::fd::AsRawFd, sync::TryLockError};
+    if !alive.load(Ordering::Acquire) {
+        return Err("Chat is disconnected".into());
+    }
+    let wire = match wire.try_lock() {
+        Ok(wire) => wire,
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    if !alive.load(Ordering::Acquire) {
+        return Err("Chat is disconnected".into());
+    }
+    // MSG_DONTWAIT affects only this call. Setting O_NONBLOCK would also alter
+    // the cloned descriptor used by the blocking response reader.
+    // SAFETY: the wire guard owns a live socket; frame remains valid for send.
+    let sent = unsafe {
+        libc::send(
+            wire.stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent == frame.len() as isize {
+        return Ok(true);
+    }
+    if sent < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Ok(false);
+        }
+        alive.store(false, Ordering::Release);
+        let _ = wire.stream.shutdown(Shutdown::Both);
+        return Err(error.to_string());
+    }
+    // A cancelled partial frame must never be followed by another writer's
+    // frame. Close this connection; the daemon's actor remains independent.
+    alive.store(false, Ordering::Release);
+    let _ = wire.stream.shutdown(Shutdown::Both);
+    Err("The daemon connection closed after an incomplete request write".into())
 }
 fn receive(
     stream: &mut UnixStream,
@@ -572,6 +677,7 @@ impl ClientHandle {
                 reader: Mutex::new(None),
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
                 file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                original_pending: Arc::default(),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             });
@@ -1065,6 +1171,7 @@ impl ClientHandle {
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
+        let original_pending: OriginalPending = Arc::default();
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -1091,6 +1198,7 @@ impl ClientHandle {
             reader: Mutex::new(None),
             pending: pending.clone(),
             file_pending: file_pending.clone(),
+            original_pending: original_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1206,8 +1314,20 @@ impl ClientHandle {
                         let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
+                    for (_, reply) in std::mem::take(&mut *original_pending.lock().unwrap_or_else(|p| p.into_inner())) {
+                        let _ = reply.send(Err(super::annotations::OriginalError::Transport("Chat was explicitly closed".into())));
+                    }
                     wake(Wake::Changed);
                     return;
+                }
+                if let Some(reply) = envelope.request_id.and_then(|request| original_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&request)) {
+                    let result = match envelope.message {
+                        ServerMessage::Response { response: ServerResponse::ChatOriginal { chat_id, result } } if chat_id == id => result,
+                        ServerMessage::Error(error) => Err(super::annotations::OriginalError::Transport(error.message)),
+                        _ => Err(super::annotations::OriginalError::Transport("Unexpected original-command reply".into())),
+                    };
+                    let _ = reply.send(result);
+                    continue;
                 }
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
@@ -1361,6 +1481,9 @@ impl ClientHandle {
             }
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
+            }
+            for (_, reply) in std::mem::take(&mut *original_pending.lock().unwrap_or_else(|p| p.into_inner())) {
+                let _ = reply.send(Err(super::annotations::OriginalError::Transport(failure.clone())));
             }
             wake(Wake::Disconnected(failure));
             offline.request(body_requested.load(Ordering::Acquire) && !transcript_resident.load(Ordering::Acquire));
@@ -1624,6 +1747,111 @@ impl ClientHandle {
             .remove(&id);
         result
     }
+    /// Query immutable operator input on this connection's correlated reply
+    /// channel. The daemon neither hydrates a transcript nor dispatches work.
+    pub async fn original_prompt(
+        &self,
+        user: Option<&str>,
+        expected_session: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<super::annotations::OriginalPage, super::annotations::OriginalError> {
+        self.original_prompt_with_timeout(
+            user,
+            expected_session,
+            offset,
+            limit,
+            Duration::from_secs(40),
+        )
+        .await
+    }
+
+    async fn original_prompt_with_timeout(
+        &self,
+        user: Option<&str>,
+        expected_session: Option<&str>,
+        offset: usize,
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<super::annotations::OriginalPage, super::annotations::OriginalError> {
+        use super::annotations::OriginalError;
+        super::original::validate_query(user, expected_session, offset, limit)?;
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err(OriginalError::Transport("Chat is disconnected".into()));
+        }
+        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self
+                .inner
+                .original_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !self.inner.alive.load(Ordering::Acquire) {
+                return Err(OriginalError::Transport("Chat is disconnected".into()));
+            }
+            if pending.len() >= 64 {
+                return Err(OriginalError::Transport(
+                    "Original-command request capacity reached".into(),
+                ));
+            }
+            pending.insert(id, reply);
+        }
+        let _request = OriginalRequest {
+            pending: &self.inner.original_pending,
+            id,
+        };
+        let page = tokio::time::timeout(timeout, async {
+            transmit_async(
+                &self.inner.wire,
+                &self.inner.alive,
+                &self.inner.proof,
+                id,
+                ClientRequest::ChatCommand {
+                    chat_id: self.inner.id,
+                    command: Command::LoadOriginal {
+                        user_id: user.map(str::to_owned),
+                        expected_session: expected_session.map(str::to_owned),
+                        offset,
+                        limit,
+                    },
+                },
+            )
+            .await
+            .map_err(OriginalError::Transport)?;
+            response.await.map_err(|_| {
+                OriginalError::Transport("Original-command request disconnected".into())
+            })?
+        })
+        .await
+        .map_err(|_| OriginalError::Transport("Original-command request timed out".into()))??;
+        super::original::validate_page(user, expected_session, offset, limit, &page)?;
+        Ok(page)
+    }
+
+    /// Read at most 32 MiB, pinning the native identity and all metadata from
+    /// page one. A changed or incomplete read returns no partial prompt.
+    pub async fn original_text(
+        &self,
+        user: Option<&str>,
+        expected_session: Option<&str>,
+    ) -> Result<super::original::OriginalText, super::annotations::OriginalError> {
+        let mut original = super::original::Assembly::new(user, expected_session)?;
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let (user, session, offset, limit) = original.query();
+                let page = self.original_prompt(user, session, offset, limit).await?;
+                if original.push(page)? {
+                    return original.finish();
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            super::annotations::OriginalError::Transport("Original-command read timed out".into())
+        })?
+    }
+
     pub fn send(&self, command: Command) -> Result<(), String> {
         if matches!(&command, Command::Slash { command } if matches!(command.split_whitespace().next(), Some("/clear" | "/new" | "/reset" | "clear" | "new" | "reset"))) {
             self.inner.offline.clear();
@@ -1933,6 +2161,31 @@ mod tests {
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         assert_eq!(handle.offline_view_metrics().3, 0);
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn pre_approval_protocol_peer_is_rejected_before_chat_publications() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let proof = handoff_proof();
+        let response = ServerEnvelope {
+            version: 77,
+            request_id: Some(1),
+            proof: proof.clone(),
+            message: ServerMessage::Response {
+                response: ServerResponse::ShutdownAccepted,
+            },
+        };
+        FrameCodec::new(ipc::MAX_FRAME_BYTES)
+            .write(&mut server, &response)
+            .unwrap();
+        let error = receive(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            1,
+            Some(&proof),
+        )
+        .unwrap_err();
+        assert!(error.contains("version mismatch"), "{error}");
     }
 
     #[test]
@@ -4008,5 +4261,442 @@ mod tests {
         for server in servers {
             server.join().unwrap();
         }
+    }
+
+    fn original_test_page(
+        user: &str,
+        offset: usize,
+        text: &str,
+        total: usize,
+    ) -> super::super::annotations::OriginalPage {
+        use super::super::annotations::{OriginalPage, OriginalPrompt, OriginalSettings, Setting};
+        OriginalPage {
+            session_id: "native-session".into(),
+            original: OriginalPrompt {
+                user_id: user.into(),
+                turn_id: format!("turn-{user}"),
+                text_bytes: total,
+                attachments: vec![],
+                settings: OriginalSettings {
+                    model: Setting::Value("accepted-model".into()),
+                    reasoning: Setting::Value("low".into()),
+                    fast: Setting::Unsupported,
+                    permission: Setting::Value("ask".into()),
+                },
+            },
+            offset,
+            next_offset: offset + text.len(),
+            text: text.into(),
+            complete: offset + text.len() == total,
+        }
+    }
+
+    fn original_test_response(
+        codec: &mut FrameCodec,
+        server: &mut UnixStream,
+        proof: &HostSessionProof,
+        request: u64,
+        response: ServerResponse,
+    ) {
+        codec
+            .write(
+                server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response { response },
+                },
+            )
+            .unwrap();
+    }
+
+    fn original_test_connection(
+        script: impl FnOnce(&mut UnixStream, &mut FrameCodec, &HostSessionProof, TerminalId)
+        + Send
+        + 'static,
+    ) -> (
+        ClientHandle,
+        std::sync::mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("original-query");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            original_test_response(
+                &mut codec,
+                &mut server,
+                &proof,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected")
+            };
+            let id = session.id;
+            original_test_response(
+                &mut codec,
+                &mut server,
+                &proof,
+                start.request_id,
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 7,
+                        ..Default::default()
+                    },
+                },
+            );
+            script(&mut server, &mut codec, &proof, id);
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        (handle, done, worker)
+    }
+
+    #[test]
+    fn original_replies_are_request_correlated_without_snapshot_hydration() {
+        let (handle, done, worker) = original_test_connection(|server, codec, proof, chat_id| {
+            let first: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            let second: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            for request in [second, first] {
+                let ClientRequest::ChatCommand {
+                    command:
+                        Command::LoadOriginal {
+                            user_id: Some(user),
+                            expected_session,
+                            offset,
+                            limit,
+                        },
+                    ..
+                } = request.request
+                else {
+                    panic!("original query expected")
+                };
+                assert_eq!(expected_session.as_deref(), Some("native-session"));
+                assert_eq!(offset, 0);
+                assert_eq!(limit, 256);
+                let page = original_test_page(&user, 0, &user, user.len());
+                original_test_response(
+                    codec,
+                    server,
+                    proof,
+                    request.request_id,
+                    ServerResponse::ChatOriginal {
+                        chat_id,
+                        result: Ok(page),
+                    },
+                );
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (first, second) = futures_util::future::join(
+                handle.original_prompt(Some("one"), Some("native-session"), 0, 256),
+                handle.original_prompt(Some("two"), Some("native-session"), 0, 256),
+            )
+            .await;
+            assert_eq!(first.unwrap().text, "one");
+            assert_eq!(second.unwrap().text, "two");
+        });
+        assert_eq!(handle.snapshot().generation, 7);
+        assert!(handle.snapshot().items.is_empty());
+        assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn original_complete_read_pins_latest_session_user_and_metadata() {
+        let (handle, done, worker) = original_test_connection(|server, codec, proof, chat_id| {
+            let first: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            assert!(matches!(
+                first.request,
+                ClientRequest::ChatCommand {
+                    command: Command::LoadOriginal {
+                        user_id: None,
+                        expected_session: None,
+                        offset: 0,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            original_test_response(
+                codec,
+                server,
+                proof,
+                first.request_id,
+                ServerResponse::ChatOriginal {
+                    chat_id,
+                    result: Ok(original_test_page("native-user", 0, "first", 9)),
+                },
+            );
+            let next: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            let ClientRequest::ChatCommand {
+                command:
+                    Command::LoadOriginal {
+                        user_id,
+                        expected_session,
+                        offset,
+                        ..
+                    },
+                ..
+            } = next.request
+            else {
+                panic!("original continuation expected")
+            };
+            assert_eq!(user_id.as_deref(), Some("native-user"));
+            assert_eq!(expected_session.as_deref(), Some("native-session"));
+            assert_eq!(offset, 5);
+            original_test_response(
+                codec,
+                server,
+                proof,
+                next.request_id,
+                ServerResponse::ChatOriginal {
+                    chat_id,
+                    result: Ok(original_test_page("native-user", 5, "last", 9)),
+                },
+            );
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let original = runtime.block_on(handle.original_text(None, None)).unwrap();
+        assert_eq!(original.text, "firstlast");
+        assert_eq!(original.original.user_id, "native-user");
+        assert_eq!(original.session_id, "native-session");
+        assert_eq!(handle.snapshot().generation, 7);
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn original_replies_reject_another_chat_and_preserve_typed_authority_errors() {
+        use super::super::annotations::OriginalError;
+        let (handle, done, worker) = original_test_connection(|server, codec, proof, chat_id| {
+            let first: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            original_test_response(
+                codec,
+                server,
+                proof,
+                first.request_id,
+                ServerResponse::ChatOriginal {
+                    chat_id: TerminalId::new(),
+                    result: Ok(original_test_page("user", 0, "secret", 6)),
+                },
+            );
+            let next: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            original_test_response(
+                codec,
+                server,
+                proof,
+                next.request_id,
+                ServerResponse::ChatOriginal {
+                    chat_id,
+                    result: Err(OriginalError::Unavailable(
+                        "Account scope was revoked".into(),
+                    )),
+                },
+            );
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(matches!(
+                handle
+                    .original_prompt(Some("user"), Some("native-session"), 0, 256)
+                    .await,
+                Err(OriginalError::Transport(_))
+            ));
+            assert_eq!(
+                handle
+                    .original_prompt(Some("user"), Some("native-session"), 0, 256)
+                    .await,
+                Err(OriginalError::Unavailable(
+                    "Account scope was revoked".into()
+                ))
+            );
+        });
+        assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn original_query_disconnects_when_the_reply_comes_from_another_daemon() {
+        use super::super::annotations::OriginalError;
+        let (handle, done, worker) = original_test_connection(|server, codec, _, chat_id| {
+            let request: ClientEnvelope = codec.read(server).unwrap().unwrap();
+            original_test_response(
+                codec,
+                server,
+                &host_proof("replacement-daemon"),
+                request.request_id,
+                ServerResponse::ChatOriginal {
+                    chat_id,
+                    result: Ok(original_test_page("user", 0, "secret", 6)),
+                },
+            );
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            runtime.block_on(handle.original_prompt(Some("user"), Some("native-session"), 0, 256)),
+            Err(OriginalError::Transport(_))
+        ));
+        assert!(!handle.inner.alive.load(Ordering::Acquire));
+        assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn original_query_capacity_and_cancellation_leave_no_pending_receipts() {
+        use super::super::annotations::OriginalError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..64 {
+                let requester = handle.clone();
+                tasks.push(tokio::spawn(async move { requester.original_prompt(None, None, 0, 256).await }));
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while handle.inner.original_pending.lock().unwrap().len() < 64 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert!(matches!(handle.original_prompt(None, None, 0, 256).await, Err(OriginalError::Transport(message)) if message.contains("capacity")));
+            for task in tasks { task.abort(); assert!(task.await.unwrap_err().is_cancelled()); }
+            assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn original_query_deadline_includes_shared_wire_admission() {
+        use super::super::annotations::OriginalError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let holder = handle.clone();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _wire = holder.inner.wire.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(2));
+        });
+        acquired.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let result = runtime.block_on(handle.original_prompt_with_timeout(
+            None,
+            None,
+            0,
+            256,
+            Duration::from_millis(50),
+        ));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            matches!(result, Err(OriginalError::Transport(message)) if message.contains("timed out"))
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wire admission blocked for {elapsed:?}"
+        );
+        assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn original_query_deadline_and_cancellation_cover_socket_backpressure() {
+        use super::super::annotations::OriginalError;
+        use std::os::fd::AsRawFd;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        {
+            let wire = handle.inner.wire.lock().unwrap();
+            // Fill the socket without changing descriptor flags shared with
+            // the response reader. The fixture peer never consumes writes.
+            let byte = [0u8];
+            loop {
+                // SAFETY: the wire owns the socket and byte is a live buffer.
+                let sent = unsafe {
+                    libc::send(
+                        wire.stream.as_raw_fd(),
+                        byte.as_ptr().cast(),
+                        byte.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if sent < 0 {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert_eq!(sent, 1);
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(handle.original_prompt_with_timeout(
+            None,
+            None,
+            0,
+            256,
+            Duration::from_millis(50),
+        ));
+        assert!(
+            matches!(result, Err(OriginalError::Transport(message)) if message.contains("timed out"))
+        );
+        assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        runtime.block_on(async {
+            let requester = handle.clone();
+            let request =
+                tokio::spawn(async move { requester.original_prompt(None, None, 0, 256).await });
+            while handle.inner.original_pending.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(handle.inner.original_pending.lock().unwrap().is_empty());
+        });
     }
 }

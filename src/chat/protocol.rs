@@ -8,6 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
+pub(crate) mod original_proof;
 mod terminal_output;
 
 #[derive(Debug, Clone)]
@@ -308,6 +309,37 @@ pub trait Adapter: Send {
     fn account_switch_ready(&self) -> bool {
         true
     }
+    /// The actor captures immutable operator input only for adapters that
+    /// implement exact provider acceptance and settings evidence.
+    fn supports_original_commands(&self, _command: &Command) -> bool {
+        false
+    }
+    fn retry_original(
+        &mut self,
+        _settings: &crate::chat::annotations::OriginalSettings,
+        _command: Command,
+    ) -> Result<Step, String> {
+        Err("This provider cannot restore exact original settings atomically".into())
+    }
+    fn original_command(&mut self, _command_id: Option<String>) {}
+    fn discard_undispatched(&mut self) -> Result<Option<Step>, String> {
+        Ok(None)
+    }
+    fn maintenance(&mut self) -> Result<Step, String> {
+        Ok(Step::default())
+    }
+    fn maintenance_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn take_original_updates(&mut self) -> Vec<crate::chat::annotations::OriginalUpdate> {
+        Vec::new()
+    }
+    /// Explicit live provider requests and user answers, separate from replayed
+    /// transcript item states. Drained synchronously after each adapter step.
+    fn take_approval_updates(&mut self) -> Vec<crate::chat::annotations::ApprovalUpdate> {
+        Vec::new()
+    }
+
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

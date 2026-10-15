@@ -3,8 +3,10 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod annotations;
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod original;
 pub mod presentation;
 pub mod annotations;
 pub mod pricing;
@@ -395,6 +397,14 @@ impl From<&str> for StartFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
+}
+
+/// File bytes to dispatch, with an optional non-authoritative display label.
+/// The display path is never opened, resolved, or used for account authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedAttachment {
+    pub path: std::path::PathBuf,
+    pub display_path: Option<std::path::PathBuf>,
 }
 
 /// The file extensions every provider's image input recognises.
@@ -904,6 +914,10 @@ pub struct Snapshot {
     /// and autonomous turns, even when publications coalesce the idle state.
     #[serde(default)]
     pub turn_generation: u64,
+    /// Daemon source-clock time at the observed turn boundary. Kept in resident
+    /// metadata so a first attachment can time work whose prompt is paged out.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
     /// Daemon wall-clock time when a provider-confirmed turn and its delegated
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
@@ -978,6 +992,10 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Actor-local eligibility revision for exact originals. It changes when
+    /// authority/acceptance/latest changes, independently of presentation noise.
+    #[serde(default)]
+    pub original_revision: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1268,11 +1286,45 @@ pub enum Command {
         cursor: Option<FilePatchCursor>,
         revision: u64,
     },
+    /// Read only an immutable, provider-confirmed original command.
+    LoadOriginal {
+        user_id: Option<String>,
+        expected_session: Option<String>,
+        offset: usize,
+        limit: usize,
+    },
+    /// Retry only the exact current original. The actor reloads private input
+    /// and verifies its identity; caller-provided text is never dispatched.
+    PromptOriginal {
+        session_id: String,
+        original: annotations::OriginalPrompt,
+        turn_generation: u64,
+    },
+    /// Send new intent while preserving attachment display names from Edit.
+    /// Only `path` supplies bytes; `display_path` is presentation metadata.
+    PromptNamed {
+        text: String,
+        attachments: Vec<NamedAttachment>,
+        mode: PromptMode,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     pub field: String,
     pub values: Vec<String>,
+}
+
+impl Answer {
+    /// An optional denial redirect, carried through the existing structured
+    /// answer transport. This field is not a provider question answer.
+    pub const DENIAL_INSTRUCTIONS: &str = "__cagents_denial_instructions";
+
+    pub fn denial_instructions(text: String) -> Self {
+        Self {
+            field: Self::DENIAL_INSTRUCTIONS.into(),
+            values: vec![text],
+        }
+    }
 }
 
 /// Permission metadata supplied by the provider, without unrelated settings
@@ -1366,6 +1418,8 @@ pub enum ToolStatus {
     /// Ended before it finished because it was asked to stop: cancelled by
     /// the user, or interrupted with the work that started it.
     Stopped,
+    /// The tool has been proposed and cannot run until the user answers.
+    AwaitingApproval,
 }
 
 /// What a shell command was actually for.
@@ -1688,6 +1742,15 @@ impl ItemContent {
         }
     }
 
+    pub fn set_status(&mut self, value: ToolStatus) {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => *status = value,
+            _ => {}
+        }
+    }
+
     pub fn status(&self) -> Option<ToolStatus> {
         match self {
             Self::Command { status, .. }
@@ -1734,7 +1797,8 @@ pub struct Field {
 /// What the provider is asking the reader to do, independent of its RPC envelope.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
-    /// Authorize a tool action or additional permissions. Never submit on Enter.
+    /// Authorize a tool action or additional permissions. Requires an explicit
+    /// decision; card shortcuts are active only after the user focuses it.
     #[default]
     Approval,
     /// Answer an ordinary question, including a yes/no confirmation.
@@ -1849,6 +1913,9 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Backend can restore exact original settings as part of guarded Retry.
+    #[serde(default)]
+    pub original_retry: bool,
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

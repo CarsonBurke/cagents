@@ -263,6 +263,7 @@ mod tests {
             base_generation: 1,
             metadata: Snapshot {
                 generation: 2,
+                turn_started_at: Some(1_000),
                 ..Default::default()
             },
             order: installed.items.iter().map(|item| item.id.clone()).collect(),
@@ -277,6 +278,11 @@ mod tests {
         assert!(full_bytes > 2 * 1024 * 1024);
         assert!(delta_bytes < 4096);
         installed = std::sync::Arc::new(update.apply(&installed).unwrap());
+        assert_eq!(
+            installed.turn_started_at,
+            Some(1_000),
+            "delta metadata preserves the source turn clock"
+        );
         for (old, new) in retained_ui.items.iter().zip(&installed.items).take(127) {
             assert!(
                 std::sync::Arc::ptr_eq(old, new),
