@@ -17,6 +17,21 @@ struct AutomaticAttempt {
     local: bool,
 }
 
+/// Original UI owners only; a path receipt cannot retire later same-path intent.
+#[derive(Debug, Clone)]
+struct AutomaticCleanup {
+    request: crate::model::OperationId,
+    target: Target,
+    owners: Vec<AutomaticCardOwner>,
+}
+
+#[derive(Debug, Clone)]
+struct AutomaticCardOwner {
+    card: CardState,
+    scope: Option<PathBuf>,
+    user_title: Option<String>,
+}
+
 impl AutomaticAttempt {
     fn retry_due(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.at) >= Duration::from_secs(30)
@@ -68,7 +83,7 @@ pub struct State {
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,
     automatic_attempts: HashMap<WorktreeId, AutomaticAttempt>,
-    automatic_in_flight: HashMap<WorktreeId, Target>,
+    automatic_in_flight: HashMap<WorktreeId, AutomaticCleanup>,
     editors: Vec<crate::external_editor::Editor>,
 }
 
@@ -373,6 +388,7 @@ pub enum Action {
     },
     AutomaticallyDeleted {
         target: Target,
+        request: crate::model::OperationId,
         result: Result<RemovedWorktree, String>,
     },
     Deleted {
@@ -609,9 +625,11 @@ impl Cagents {
             });
         // Checking with the daemon is not a deletion. Keep the last quiet
         // refusal on the row while it checks; accepted removals disappear.
+        let custody = self.capture_automatic_cleanup(target.clone());
+        let request_id = custody.request;
         self.project_ui
             .automatic_in_flight
-            .insert(id, target.clone());
+            .insert(id, custody);
         self.sync_worktree_deletion_rows();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
@@ -624,8 +642,80 @@ impl Cagents {
                 }
                 Ok(removed)
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
-            Message::ProjectUi(Action::AutomaticallyDeleted { target, result })
+            Message::ProjectUi(Action::AutomaticallyDeleted { target, request: request_id, result })
         })
+    }
+
+    fn capture_automatic_cleanup(&self, target: Target) -> AutomaticCleanup {
+        let owners = self.durable.cards.iter()
+            .filter(|card| card.existence.is_open() && (card_belongs_to(card, &target.path)
+                || self.durable.card_scopes.get(&card.id).is_some_and(|scope| scope.starts_with(&target.path))))
+            .map(|card| AutomaticCardOwner {card: card.clone(),
+                scope: self.durable.card_scopes.get(&card.id).cloned(),
+                user_title: self.chrome_ui.user_titles.get(&card.id).cloned()})
+            .collect();
+        AutomaticCleanup {request: crate::model::OperationId::new(), target, owners}
+    }
+
+    fn complete_automatic_cleanup(&mut self, completed: AutomaticCleanup) -> Task<Message> {
+        let target = completed.target;
+        let current = completed.owners.into_iter().filter(|owner| {
+            self.card_state(owner.card.id) == Some(&owner.card)
+                && self.durable.card_scopes.get(&owner.card.id) == owner.scope.as_ref()
+                && self.chrome_ui.user_titles.get(&owner.card.id) == owner.user_title.as_ref()
+                && !matches!(self.cards.get(&owner.card.id), Some(CardRuntime::Repository(runtime))
+                    if runtime.selected_path().is_some() || runtime.blocks_navigation())
+        }).collect::<Vec<_>>();
+        let mut updates = Vec::new();
+        for owner in current {
+            let id = owner.card.id;
+            if card_belongs_to(&owner.card, &target.path) {
+                // Another close owns its own handoff. Preserve this projection
+                // rather than steal or cancel that operation's native focus.
+                if self.workspace.card(id).is_some() {
+                    if self.workspace.pending_close().is_some() { continue; }
+                    if self.workspace.request_close(id).is_err() { continue; }
+                    match self.workspace.commit_close(id) {
+                        Ok(update) => updates.push(update),
+                        Err(_) => { let _ = self.workspace.cancel_close(id); continue; }
+                    }
+                }
+                self.retire_lsp_card(id);
+                self.sidebar_state.clear_agent_activity(id);
+                self.sidebar_state.acknowledge_agent_update(id);
+                self.chat_discard(id);
+                self.cards.remove(&id);
+                self.lifecycle.remove(id);
+                if let Some(card) = self.card_state_mut(id) {
+                    card.existence = removed_existence("worktree removed");
+                }
+                let durable = Arc::make_mut(&mut self.durable);
+                durable.card_scopes.remove(&id);
+                for channel in &mut durable.channels {
+                    channel.cards.retain(|card| *card != id);
+                    if channel.focused == Some(id) { channel.focused = channel.cards.first().copied(); }
+                }
+                if durable.focused == Some(id) { durable.focused = self.workspace.focused(); }
+            } else if owner.scope.as_ref().is_some_and(|scope| scope.starts_with(&target.path)) {
+                Arc::make_mut(&mut self.durable).card_scopes.insert(id, target.repository.clone());
+            }
+        }
+        // No path-wide row/tombstone, creation, filing, camera or focus cleanup:
+        // the original removal is not authority over a newer same-path checkout.
+        self.refresh_sidebar_channels();
+        self.refresh_sidebar_worktree_panes();
+        self.persist();
+        self.status = Some(TransientNotice::success("Worktree removed automatically. Refreshing its repository inventory."));
+        let mut tasks = updates.into_iter().map(|update| self.apply_viewport(update, true, false)).collect::<Vec<_>>();
+        if self.sidebar_model.project(target.project).is_some_and(|project| project.repository == target.repository)
+            && !self.project_ui.closing.contains_key(&target.project)
+            && !self.project_ui.closed.contains(&target.repository)
+        {
+            tasks.push(self.repository_load_task(target.repository, Some(target.project), false));
+        }
+        tasks.push(self.lifecycle_sweep());
+        tasks.push(self.sync_chrome());
+        Task::batch(tasks)
     }
 
     fn automatic_worktree_keep_reason(
@@ -2316,23 +2406,21 @@ impl Cagents {
                 }
                 return self.remove_worktree_after_sessions(target);
             }
-            Action::AutomaticallyDeleted { target, result } => {
+            Action::AutomaticallyDeleted { target, request, result } => {
                 let Some(id) = target.worktree else {
                     return Task::none();
                 };
-                let Some(in_flight) = self.project_ui.automatic_in_flight.remove(&id) else {
-                    return Task::none();
-                };
-                if in_flight.path != target.path {
+                if !self.project_ui.automatic_in_flight.get(&id).is_some_and(|pending|
+                    pending.request == request && pending.target.project == target.project
+                        && pending.target.repository == target.repository && pending.target.path == target.path)
+                {
                     return Task::none();
                 }
+                let in_flight = self.project_ui.automatic_in_flight.remove(&id).unwrap();
                 match result {
                     Ok(receipt) if receipt.path == target.path => {
                         self.project_ui.automatic_attempts.remove(&id);
-                        return self.handle_project_action(Action::Deleted {
-                            target,
-                            result: Ok(()),
-                        });
+                        return self.complete_automatic_cleanup(in_flight);
                     }
                     result => {
                         let reason = match result {
@@ -5719,6 +5807,111 @@ mod tests {
     }
 
     #[test]
+    fn delayed_automatic_success_preserves_new_terminal_intent_and_refreshed_same_path_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("repository");
+        let linked = root.join("linked");
+        git(&root, &["init", "-b", "main", "repository"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "base"]);
+        git(&repository, &["worktree", "add", "-b", "original", linked.to_str().unwrap()]);
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        let receipt = crate::worktree_cleanup::RemovedWorktree {
+            common_dir: service.common_dir(&repository, &cancellation).unwrap(),
+            admin_dir: service.git_dir(&linked, &cancellation).unwrap(),
+            path: linked.clone(), branch: Some("refs/heads/original".into()),
+        };
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let (session, _) = SessionRuntime::open(root.join("window.sqlite3"), crate::model::BootId::new("automatic-window")).unwrap();
+        app.session = Some(session);
+        let first = super::super::load_repository(&repository, None, cancellation.clone()).unwrap();
+        let project = first.project.id;
+        drop(app.repository_load_task(repository.clone(), Some(project), false));
+        let first_generation = app.repository_generations[&project];
+        drop(app.update(Message::RepositoryLoaded { project_id: project, generation: first_generation, open_cards: false, result: Ok(Box::new(first)) }));
+        let id = app.sidebar_model.project(project).unwrap().worktrees.iter().find(|row| row.path == linked).unwrap().id;
+        let target = app.project_target(project, Some(id)).unwrap();
+        let custody = app.capture_automatic_cleanup(target.clone());
+        let request = custody.request;
+        assert!(custody.owners.is_empty());
+        app.project_ui.automatic_in_flight.insert(id, custody);
+        // Actual Git changes and the actual completed repository-read reducer
+        // put a successor row at the same path before the old reply arrives.
+        git(&repository, &["worktree", "remove", linked.to_str().unwrap()]);
+        git(&repository, &["worktree", "add", "-b", "successor", linked.to_str().unwrap()]);
+        let newer = super::super::load_repository(&repository, Some(project), cancellation).unwrap();
+        drop(app.repository_load_task(repository.clone(), Some(project), false));
+        let newer_generation = app.repository_generations[&project];
+        drop(app.update(Message::RepositoryLoaded { project_id: project, generation: newer_generation, open_cards: false, result: Ok(Box::new(newer)) }));
+        assert_eq!(row(&app, id).unwrap().branch.as_deref(), Some("successor"));
+        let before = app.durable.cards.iter().map(|card| card.id).collect::<HashSet<_>>();
+        // This real menu control inserts its Loading descriptor synchronously;
+        // no provider/native start task is polled by this reducer fixture.
+        drop(app.handle_project_action(Action::Command {project_id: project, worktree_id: Some(id), command: ProjectCommand::NewTerminal}));
+        let fresh = app.durable.cards.iter().find(|card| !before.contains(&card.id) && matches!(card.kind, CardKind::Terminal(_))).unwrap().clone();
+        assert!(matches!(fresh.kind, CardKind::Terminal(_)));
+        Arc::make_mut(&mut app.durable).card_scopes.insert(fresh.id, linked.clone());
+        app.worktree_offsets.insert(linked.clone(), 37.0);
+        app.worktree_focus.insert(linked.clone(), fresh.id);
+        let active = app.active_workspace.clone();
+        let focused = app.workspace.focused();
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {target: target.clone(), request, result: Ok(receipt.clone())}));
+        assert_eq!(app.card_state(fresh.id).unwrap().kind, fresh.kind);
+        assert!(app.card_state(fresh.id).unwrap().existence.is_open());
+        assert_eq!(app.durable.card_scopes.get(&fresh.id), Some(&linked));
+        assert_eq!(app.active_workspace, active);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.worktree_offsets.get(&linked), Some(&37.0));
+        assert_eq!(app.worktree_focus.get(&linked), Some(&fresh.id));
+        assert_eq!(row(&app, id).unwrap().branch.as_deref(), Some("successor"));
+        assert!(app.repository_generations[&project] > newer_generation, "completion requests actual inventory");
+        let session = app.session.as_ref().unwrap();
+        session.flush(Duration::from_secs(5)).unwrap();
+        assert!(session.operation_store().load_worktree(id).unwrap().unwrap().existence.is_open());
+        // A repeated old message cannot consume a later cleanup's custody.
+        let next = app.capture_automatic_cleanup(target.clone());
+        let next_request = next.request;
+        app.project_ui.automatic_in_flight.insert(id, next);
+        drop(app.handle_project_action(Action::AutomaticallyDeleted {target, request, result: Ok(receipt)}));
+        assert_eq!(app.project_ui.automatic_in_flight[&id].request, next_request);
+    }
+
+    #[test]
+    fn automatic_success_retires_only_unchanged_captured_card_owners() {
+        for replaced in [false, true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+            let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            drop(app.add_repository_card(project, repository.clone(), linked.path.clone()));
+            let original = app.durable.cards.last().unwrap().clone();
+            let target = app.project_target(project, Some(linked.id)).unwrap();
+            let custody = app.capture_automatic_cleanup(target.clone());
+            let request = custody.request;
+            assert_eq!(custody.owners.len(), 1);
+            app.project_ui.automatic_in_flight.insert(linked.id, custody);
+            if replaced {
+                // An authoritative same-CardId descriptor replacement must not
+                // be mistaken for the old repository owner merely by its ID.
+                app.card_state_mut(original.id).unwrap().kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell(linked.path.clone()).unwrap()));
+                app.cards.insert(original.id, CardRuntime::Loading);
+            }
+            let current = app.card_state(original.id).unwrap().clone();
+            drop(app.handle_project_action(Action::AutomaticallyDeleted {target, request, result: Ok(crate::worktree_cleanup::RemovedWorktree {
+                common_dir: repository.join(".git"), admin_dir: repository.join(".git/worktrees/feature"), path: linked.path.clone(), branch: Some("refs/heads/feature".into()),
+            })}));
+            if replaced {
+                assert_eq!(app.card_state(original.id).unwrap().kind, current.kind);
+                assert!(app.card_state(original.id).unwrap().existence.is_open());
+            } else {
+                assert!(!app.card_state(original.id).unwrap().existence.is_open());
+            }
+            assert!(row(&app, linked.id).is_some(), "only the new inventory may remove a row");
+        }
+    }
+
+    #[test]
     fn automatic_cleanup_refusals_are_quiet_and_backed_off() {
         let repository = PathBuf::from("/repo");
         let primary = SidebarWorktree::from_durable(
@@ -5743,11 +5936,11 @@ mod tests {
             "daemon upgrading",
             "cleanup protection unavailable",
         ] {
-            app.project_ui
-                .automatic_in_flight
-                .insert(linked.id, target.clone());
+            let custody = app.capture_automatic_cleanup(target.clone());
+            let request = custody.request;
+            app.project_ui.automatic_in_flight.insert(linked.id, custody);
             drop(app.handle_project_action(Action::AutomaticallyDeleted {
-                target: target.clone(),
+                target: target.clone(), request,
                 result: Err(reason.into()),
             }));
             let attempt = &app.project_ui.automatic_attempts[&linked.id];
@@ -5782,7 +5975,7 @@ mod tests {
         let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
         let target = app.project_target(project, Some(linked.id)).unwrap();
         drop(app.handle_project_action(Action::AutomaticallyDeleted {
-            target,
+            target, request: crate::model::OperationId::new(),
             result: Err("obsolete refusal".into()),
         }));
         assert!(app.project_ui.automatic_attempts.is_empty());
