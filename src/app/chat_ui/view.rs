@@ -1067,7 +1067,7 @@ impl Runtime {
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
-            (Some(Icon::Close), if self.unsent_text().is_empty() && self.attachments.is_empty() { "Closed" } else { "Closed · draft retained" })
+            (Some(Icon::Close), if !self.has_unsent_text() && self.attachments.is_empty() { "Closed" } else { "Closed · draft retained" })
         } else if self.queued.is_some() {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {

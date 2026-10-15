@@ -4585,7 +4585,7 @@ impl Cagents {
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
         runtime.is_some_and(|runtime| {
-            runtime.closed_elsewhere || !runtime.unsent_text().is_empty() || runtime.transition_blocker().is_some()
+            runtime.closed_elsewhere || runtime.has_unsent_text() || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts

@@ -53,6 +53,12 @@ impl Cagents {
 }
 
 impl Runtime {
+    pub(super) fn has_unsent_text(&self) -> bool {
+        let content = self.history_stash.as_ref().filter(|_| self.history_cursor.is_some()).unwrap_or(&self.composer);
+        let mut lines = content.lines();
+        lines.next().is_some_and(|line| !line.text.is_empty()) || lines.next().is_some()
+    }
+
     pub(super) fn expected_remote_close_error(&self, error: &str) -> bool {
         self.closed_elsewhere && error == "Exact native chat is not hosted; explicit recovery is required"
     }
@@ -66,7 +72,7 @@ impl Runtime {
     pub(super) fn closed_draft_controls(&self, transitioning: bool) -> Element<'_, Message> {
         let target = self.target;
         let revision = self.revision;
-        let has_text = !self.unsent_text().is_empty();
+        let has_text = self.has_unsent_text();
         widget::column::with_children(vec![
             design::body("Closed in another window. Your conversation and unsent draft are kept here. Copy the draft into another conversation, or discard its text. Attachments remain until you remove them.").into(),
             widget::row::with_children(vec![
@@ -247,18 +253,27 @@ mod tests {
         assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(target, revision))).is_empty());
         assert_eq!(runtime(&app, target).unsent_text(), "still mine");
         app.chat_runtime_mut(target).unwrap().pastes_pending = 0;
-        // Ready may replace the native actor before its descriptor update is
-        // acknowledged, even while retaining the old session's numeric ID.
-        let mut replacement = runtime(&app, target).session.clone();
+        // Exercise the original ordering through actual start/Ready handlers:
+        // the replacement is installed before the old canonical tombstone,
+        // while its descriptor update has not been acknowledged.
+        let (mut app, old_target, channel, _) = fixture("replacement's draft");
+        let mut replacement = runtime(&app, old_target).session.clone();
         replacement.launch.session_id = Some("new-native-thread-before-ack".into());
-        app.chat_runtime_mut(target).unwrap().session = replacement.clone();
-        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(replacement);
-        let new_target = Target { generation: target.generation + 1, ..target };
-        app.chat_runtime_mut(target).unwrap().target = new_target;
-        app.sync_closed_chat_draft(target.card);
-        assert!(!app.chat_closed_elsewhere(target.card));
+        drop(app.start_chat(old_target.card, replacement.clone(), chat::Intent::Restore, None, false));
+        let new_target = app.chat_ui.attempt(old_target.card).unwrap().target;
+        let handle = Arc::new(ClientHandle::fixture(replacement.clone(), Snapshot {
+            ready: true, session_id: replacement.launch.session_id.clone(), ..Snapshot::default()
+        }));
+        drop(app.handle_chat_ui(Action::Ready(new_target, Ready(Arc::new(Mutex::new(Some(Ok(handle))))))));
+        assert!(!app.chat_start_pending(new_target.card));
+        assert_eq!(runtime(&app, new_target).session.launch.session_id, replacement.launch.session_id);
+        assert!(matches!(&app.workspace_model.views[0].panes[0].kind, CardKind::Chat(old) if old.launch.session_id.as_deref() == Some("closed-draft-thread")));
+        let revision = runtime(&app, new_target).revision;
+        retire(&mut app, channel, new_target.card);
+        assert!(!app.chat_closed_elsewhere(new_target.card));
         assert!(!runtime(&app, new_target).closed_elsewhere);
-        assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(target, revision))).is_empty());
-        assert_eq!(runtime(&app, new_target).unsent_text(), "still mine");
+        assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(new_target, revision))).is_empty());
+        assert!(actions(app.handle_chat_ui(Action::DiscardClosedDraft(old_target, revision))).is_empty());
+        assert_eq!(runtime(&app, new_target).unsent_text(), "replacement's draft");
     }
 }
