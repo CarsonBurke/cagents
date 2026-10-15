@@ -25662,6 +25662,24 @@ mod tests {
     }
 
     #[test]
+    fn late_root_reconciliation_preserves_folder_ownership_and_explicit_filing() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(terminal) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else { unreachable!() };
+        terminal.launch.working_directory = "/folder/src".into();
+        let project = SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Folder".into(), "/folder".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder);
+        let key = project.folder_key().unwrap();
+        app.sidebar_model.projects.push(project);
+        app.sidebar_state.set_card_activity(card, crate::agent::Activity { provider: Provider::Omp, state: crate::agent::ActivityState::Working });
+        assert!(app.reconcile_agent_attention_owners());
+        assert_eq!(app.sidebar_state.agent_activity(key.project_id, key.worktree_id), Some(crate::agent::ActivityState::Working));
+        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/elsewhere".into());
+        assert!(app.reconcile_agent_attention_owners());
+        assert_eq!(app.sidebar_state.agent_activity(key.project_id, key.worktree_id), None);
+    }
+
+    #[test]
     fn channel_attention_rolls_into_launch_worktree_and_bulk_reads_keep_other_worktrees_unread() {
         use crate::agent::{Activity, ActivityState};
         use crate::model::{ChannelId, ProjectChannel};
