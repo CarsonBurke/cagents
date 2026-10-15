@@ -1020,7 +1020,8 @@ mod tests {
         assert!(!root.join(".worktrees/dev").exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
-        let linked = directory.path().join("external-linked");
+        let linked_directory = tempfile::tempdir().unwrap();
+        let linked = linked_directory.path().join("checkout");
         run(&[
             "worktree",
             "add",
