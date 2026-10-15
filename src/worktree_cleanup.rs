@@ -530,6 +530,21 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    #[test]
+    fn background_snapshot_keeps_old_directory_leases_until_it_retires() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let guard = acquire(runtime.path(),directory.path(),false).unwrap();
+        let mut window = WindowProtections::default();
+        window.install_prepared(Some(guard));
+        let snapshot = window.synchronization_snapshot();
+        drop(window);
+        assert!(matches!(acquire(runtime.path(),directory.path(),true),
+            Err(error) if error.kind()==io::ErrorKind::WouldBlock));
+        drop(snapshot);
+        acquire(runtime.path(),directory.path(),true).unwrap();
+    }
+
     fn fixture_git(root: &Path) -> std::process::Command {
         let mut command = std::process::Command::new("git");
         command

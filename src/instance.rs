@@ -1918,6 +1918,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_lock_publishes_no_lease_until_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readiness");
+        let prepared = prepare_owned_lock(&path).unwrap();
+        // Opening and verifying the descriptor does not advertise readiness.
+        let competing = owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB).unwrap();
+        drop(competing);
+        let committed = prepared.lock(libc::LOCK_EX|libc::LOCK_NB).unwrap();
+        assert!(matches!(owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB),
+            Err(error) if error.kind()==io::ErrorKind::WouldBlock));
+        drop(committed);
+        owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB).unwrap();
+    }
+
+    #[test]
     fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
         let runtime = tempfile::tempdir().unwrap();
         let path = runtime.path().join(slot_lock_name(PRIMARY_WINDOW));
