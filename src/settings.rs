@@ -867,6 +867,8 @@ pub struct AppSettings {
     pub chat_enter_sends: bool,
     #[serde(default)]
     pub chat_expand_tool_groups: bool,
+    /// Legacy preference retained for settings-file compatibility. Native chat
+    /// columns now fit their pane up to the shared readable measure.
     #[serde(default = "default_native_fraction")]
     pub chat_content_fraction: f32,
     #[serde(default = "default_native_fraction")]
