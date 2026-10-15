@@ -1061,6 +1061,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unqualified_unpublished_archive_never_falls_through_to_provider_retirement() {
+        let (mut app, card, _directory) = fixture();
+        let source = attach_durable_owner(&mut app, card);
+        Arc::make_mut(&mut app.durable).automation_archives.insert(card, crate::model::AgentId::from_uuid(card.as_uuid()));
+        assert!(!matches!(app.archived_pane_readiness(card), Ok(None)));
+        drop(app.begin_chat_close(card));
+        assert!(app.chat_ui.phases.is_empty());
+        assert!(app.chat_ui.retiring.is_empty());
+        assert!(app.chat_ui.end_requests.is_empty());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.chat_return_session(card), Some(source));
+        assert!(app.recently_closed.is_empty());
+    }
+
+    #[test]
     fn an_unpublished_hidden_chat_end_cannot_cross_a_registry_join() {
         let (mut app, card, directory) = fixture();
         let source = attach_durable_owner(&mut app, card);

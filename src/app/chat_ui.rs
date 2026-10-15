@@ -4947,8 +4947,9 @@ impl Cagents {
         // This capability was captured only from a fully qualified read-only
         // report and its exact canonical shared source. Ending that saved view
         // never asks a provider or terminal to stop and never deletes a report.
-        if request.archived_metadata_only() {
-            if self.chat_start_pending(card) || !matches!(self.archived_pane_readiness(card), Ok(Some(true))) {
+        let archive_readiness = self.archived_pane_readiness(card);
+        if request.archived_metadata_only() || !matches!(&archive_readiness, Ok(None)) {
+            if !request.archived_metadata_only() || self.chat_start_pending(card) || !matches!(archive_readiness, Ok(Some(true))) {
                 self.stop_pane_close_batch(batch);
                 self.status = Some(TransientNotice::warning("The saved run report is no longer ready. Its pane was kept."));
                 return Task::none();
