@@ -7,7 +7,7 @@ mod list;
 pub enum AccountCommand {
     /// List active accounts and any retained caller account from the selected daemon.
     List {
-        /// Limit account rows to this provider; never probe its CLI.
+        /// Limit rows to claude, codex, or omp; never probe its CLI.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
     },
