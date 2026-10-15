@@ -4310,6 +4310,7 @@ mod tests {
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
+            relocated_directory: false,
             expected_home: std::fs::canonicalize("/tmp").unwrap(),
             next_id: 0,
             pending: BTreeMap::new(),
@@ -4334,6 +4335,9 @@ mod tests {
             turn_pricing: Default::default(),
             turn: None,
             busy: false,
+            compaction_pending: false,
+            compaction_revision: 0,
+            compaction_acknowledged: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -6365,6 +6369,66 @@ mod tests {
         assert!(
             methods.contains(&"thread/turns/list".to_owned()),
             "the rewritten history is never asked for: {methods:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_acknowledgement_waits_for_matching_post_ack_idle_metadata() {
+        let mut adapter = adapter();
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert!(
+            requested
+                .events
+                .contains(&Event::Compaction { active: true })
+        );
+        let unrelated=adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+        assert!(
+            !unrelated
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(adapter.command(Command::Compact).is_err());
+        let acknowledged = adapter
+            .receive(json!({"id":requested.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let probe = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/read")
+            .unwrap();
+        let completed=adapter.receive(json!({"id":probe["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true}}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        adapter.command(Command::Compact).unwrap();
+        let wrong_thread = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"unrelated"}}))
+            .unwrap();
+        assert!(
+            !wrong_thread
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let completed = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
         );
     }
 
