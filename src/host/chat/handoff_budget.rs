@@ -12,8 +12,13 @@ use crate::terminal_ipc::{
 // before their metadata-only receipt is issued.
 const COMPONENT_BYTES: usize = 64 * 1024;
 // Independently count escaping rather than deriving JSON bytes from postcard.
-// The receipt embeds fewer than seven such complete input components plus its
-// bounded hint/path/scalars; the shared 8 MiB promise retains ample headroom.
+// Conservatively allow twelve copies of complete source/recipe components:
+// original+canonical source, post-source and its pair, returned session's live
+// proof/owned listener, and completed-continuity recipe duplication. This is
+// <=6 MiB; two <=16 KiB recovery hints (including JSON escaping), filesystem-
+// bounded paths and fixed field/scalar overhead stay below the shared 8 MiB.
+// Fresh spawns have no upgrade aliases; existing views are checked exactly
+// before any metadata-only receipt is issued.
 const COMPONENT_JSON_BYTES: usize = 512 * 1024;
 fn component(value: &impl serde::Serialize) -> Result<(), ProtocolError> {
     FrameCodec::new(COMPONENT_BYTES).write(&mut std::io::sink(), value)
