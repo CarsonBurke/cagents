@@ -6263,6 +6263,7 @@ impl Cagents {
                                 self.retire_switched_terminal(terminal, &session);
                             }
                         }
+                        self.notices.resolve(&format!("chat-resume:{}", target.card));
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
@@ -6380,7 +6381,8 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.error = Some(failure.message);
+                            runtime.error = Some(failure.message.clone());
+                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
@@ -6388,12 +6390,12 @@ impl Cagents {
                             Some(CardKind::Chat(_))
                         ) {
                             self.fail_runtime(target.card, failure.message.clone());
-                            self.status = Some(TransientNotice::error(failure.message));
+                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error(failure.message));
+                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -15734,7 +15736,9 @@ mod tests {
             app.chat_switch_ready(id),
             "a failed attachment can be retried"
         );
-        assert_eq!(errors(&app), [reason]);
+        assert_eq!(errors(&app), ["Couldn’t reopen this conversation"]);
+        let notice = app.notices.recent().find(|entry| entry.notice.key.as_deref() == Some(format!("chat-resume:{id}").as_str())).unwrap();
+        assert_eq!(notice.notice.details.as_deref(), Some(reason));
         assert!(
             matches!(
                 crate::app::tests::task_app_message(task),

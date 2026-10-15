@@ -2555,7 +2555,7 @@ impl Cagents {
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
                         self.status =
-                            Some(TransientNotice::success("Existing account home added."));
+                            Some(TransientNotice::success("Existing account home added.").key(format!("account-added:{key:?}")));
                         let id = self
                             .account_ui
                             .accounts
@@ -3929,7 +3929,7 @@ impl Cagents {
                     }
                     state.identity = identity;
                 }
-                self.status = Some(TransientNotice::success(format!("{name} was added.")));
+                self.status = Some(TransientNotice::success(format!("{name} was added.")).key(format!("account-added:{id:?}")));
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Duplicate { existing, registry }) => {
