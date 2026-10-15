@@ -311,21 +311,21 @@ enum LabelCommand {
     Add {
         #[command(flatten)]
         target: Target,
-        #[arg(help = "Label names or IDs; comma-separate option values.")]
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
     /// Remove the named labels from an issue.
     Remove {
         #[command(flatten)]
         target: Target,
-        #[arg(help = "Label names or IDs; comma-separate option values.")]
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
     /// Replace the complete issue label set.
     Set {
         #[command(flatten)]
         target: Target,
-        #[arg(help = "Label names or IDs; comma-separate option values.")]
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
 }

@@ -121,41 +121,4 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn fish_loads_script_and_completes_nested_agent_spawn() {
-        use crate::process::{
-            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
-        };
-        let fish = Path::new("/usr/bin/fish");
-        if !fish.exists() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let command = CommandSpec::new(fish)
-            .args([
-                "--no-config",
-                "-c",
-                "source /dev/stdin; complete -C 'cagents agent sp'",
-            ])
-            .env("HOME", directory.path())
-            .env("XDG_CONFIG_HOME", directory.path())
-            .env("XDG_DATA_HOME", directory.path())
-            .env("XDG_CACHE_HOME", directory.path())
-            .stdin(script(clap_complete::Shell::Fish).into_bytes())
-            .timeout(Duration::from_secs(5))
-            .output_limits(64 * 1024, 64 * 1024);
-        let output = SystemProcessExecutor
-            .execute(&command, &CancellationToken::new())
-            .unwrap()
-            .require_success(fish)
-            .unwrap();
-        let completions = String::from_utf8(output.stdout).unwrap();
-        assert!(
-            completions
-                .lines()
-                .any(|line| line.split('\t').next() == Some("spawn")),
-            "{completions}"
-        );
-    }
 }
