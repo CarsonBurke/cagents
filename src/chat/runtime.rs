@@ -700,8 +700,9 @@ impl Handle {
         CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone(),directory_identity:close.directory_identity}
     }
 
-    /// The actor compares consent with all earlier admitted commands before
-    /// fencing further work. Call outside HostLock; joining may take time.
+    /// Compare resident consent without treating it as a backend turn fence.
+    /// Live providers currently refuse; positively observed completed owners
+    /// can finish cleanup. Call outside HostLock because cleanup may join.
     pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
         if self.close_observation().directory_identity.is_none() {
             return Err("The provider execution scope is not authoritatively observed; reattach before confirming close".into());
