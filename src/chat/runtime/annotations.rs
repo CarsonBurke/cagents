@@ -968,18 +968,12 @@ mod tests {
                     turn_id: "actual-second-turn".into(),
                     aliases: vec![]
                 }])
-                .is_some()
+                .is_none()
         );
-        assert_eq!(
-            authority
-                .pending_store()
-                .unwrap()
-                .prepared(&id)
-                .unwrap()
-                .expected_session
-                .as_deref(),
-            Some("confirmed-session")
-        );
+        assert!(authority.pending_store().unwrap().prepared(&id).is_err());
+        let accepted = authority.original(Some("actual-second-user"), 0, 1024).unwrap();
+        assert_eq!(accepted.text, "accepted but settings unavailable");
+        assert!(!accepted.original.settings.is_exact());
         authority.store.as_mut().unwrap().purge_for_test().unwrap();
         assert!(!path.exists());
         assert!(!pending_path.exists());
@@ -1119,6 +1113,10 @@ mod tests {
         assert!(
             authority
                 .originals(vec![
+                    OriginalUpdate::Settings {
+                        command_id: newer.clone(),
+                        settings: OriginalSettings::unknown(),
+                    },
                     OriginalUpdate::Accepted {
                         command_id: newer,
                         session_id: "session".into(),
@@ -1136,10 +1134,10 @@ mod tests {
                 ])
                 .is_some()
         );
-        assert!(matches!(
-            authority.original(None, 0, 32),
-            Err(OriginalError::Unavailable(_))
-        ));
+        let captured = authority.original(None, 0, 32).unwrap();
+        assert_eq!(captured.original.user_id, "newer-user");
+        assert!(!captured.original.settings.is_exact());
+        assert!(matches!(authority.prepare_retry("session", &captured.original), Err(OriginalError::Unavailable(_))));
         assert_eq!(authority.latest_proven.as_deref(), Some("newer-user"));
         assert!(!rejected_path.exists());
         assert!(
