@@ -89,11 +89,18 @@ fn creates_lists_and_removes_in_configured_location_and_retains_branch_by_defaul
     let mut observer=cagents::control::ControlClient::connect(&socket).unwrap();
     observer.watch_workspace_model().unwrap();
     let (send,receive)=std::sync::mpsc::channel();
-    let watcher=thread::spawn(move || {let _=send.send(observer.next_workspace_model_update());});
+    let watcher=thread::spawn(move || {
+        loop {
+            let event=observer.next_workspace_model_update();
+            if matches!(&event,Ok(cagents::control::WorkspaceModelEvent::Edited {..})) {continue;}
+            let _=send.send(event);break;
+        }
+    });
     let path=fixture.create("feat-one");
     let event=receive.recv_timeout(Duration::from_secs(5)).expect("create must publish a sidebar refresh immediately").unwrap();
     assert!(matches!(event,cagents::control::WorkspaceModelEvent::WorktreesChanged {repository} if repository==fixture.root.path().join("project/.git")));
     watcher.join().unwrap();
+    assert_eq!(fixture.cli(&["project","list"])["projects"].as_array().unwrap().len(),1);
     assert_eq!(path,fixture.root.path().join("project/managed/feat-one"));
     assert!(path.join("tracked").is_file());
     let list=fixture.cli(&["worktree","list"]);

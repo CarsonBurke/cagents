@@ -480,10 +480,19 @@ pub(super) fn process_request(
                 Some(host.lock().unwrap_or_else(|poison|poison.into_inner()).worktree_removal_scope()
                     .map_err(|error|ProtocolError::new(ProtocolErrorCode::InvalidRequest,error.to_string(),false))?)
             } else {None};
-            let result=crate::worktree_control::service::execute(operation, |path| {
+            let mut result=crate::worktree_control::service::execute(operation, |path| {
                 if let Some(scope)=scope.take() {scope.check(path).map_err(|error|error.to_string())?;}
                 Ok(host.lock().unwrap_or_else(|p|p.into_inner()).worktree_live_sessions(path))
             });
+            if let Ok(crate::worktree_control::Reply::Created {warnings,..})=&mut result {
+                if let Some(repository)=&repository {
+                    if let Err(error)=host.lock().unwrap_or_else(|poison|poison.into_inner()).edit_model(0,crate::workspace_model::ModelEdit::ReopenProject {
+                        repository:repository.clone(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git,
+                    }) {warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {error}"));}
+                }
+            }
+            // Publish the project before its inventory edge, so a window can
+            // refresh a repository that this command opened for the first time.
             // A later setup/branch failure can follow a committed Git mutation.
             // Refresh on either outcome so a retained worktree is never hidden.
             if mutates&&let Some(repository)=&repository { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(repository); }
