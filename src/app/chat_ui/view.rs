@@ -2337,12 +2337,9 @@ impl Runtime {
             secondary.push(spend);
             footer.push(widget::Space::new().width(Length::Fill).into());
             footer.push(crate::ui_controls::popover(
-                icon(
-                    Icon::More,
-                    "Conversation details and settings",
-                    true,
-                    Action::FooterPicker(target, !details_open),
-                ),
+                crate::ui_controls::icon_button(Icon::More, "Conversation details and settings")
+                    .id(card_control_id(target.card, "chat-footer-details"))
+                    .on_press(action(Action::FooterPicker(target, !details_open))),
                 details_open.then(|| {
                     widget::container(
                         widget::flex_row(secondary)
@@ -2689,6 +2686,7 @@ impl Runtime {
                     selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
                 ))
                 .name("Choose reasoning effort")
+                .id(card_control_id(target.card, "chat-reasoning-picker"))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
                 .on_press(action(Action::ReasoningPicker(target, !open)));
@@ -2701,6 +2699,10 @@ impl Runtime {
                             .map(|(index, reasoning)| {
                                 widget::button::custom(design::body(reasoning.as_str()))
                                     .name(reasoning.as_str())
+                                    .id(card_control_id(
+                                        target.card,
+                                        &format!("chat-reasoning-choice-{index}"),
+                                    ))
                                     .class(crate::ui_controls::control_style(
                                         Some(index) == selected,
                                         None,
@@ -2960,6 +2962,7 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .name("Choose a model")
+        .id(card_control_id(target.card, "chat-model-picker"))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
@@ -4656,6 +4659,13 @@ fn model_list<'a>(
                     .align_y(Alignment::Center),
                 )
                 .name(name)
+                .id(card_control_id(
+                    target.card,
+                    &match id {
+                        Some(id) => format!("chat-model-choice-{provider:?}-named-{id}"),
+                        None => format!("chat-model-choice-{provider:?}-default"),
+                    },
+                ))
                 .class(crate::ui_controls::control_style(selected, None))
                 .selected(selected)
                 .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
@@ -5889,7 +5899,10 @@ mod tests {
 
     #[test]
     fn compact_footer_keeps_nested_model_and_reasoning_pickers_interactive() {
-        use iced::advanced::clipboard;
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation::Focusable},
+        };
         use iced::runtime::{UserInterface, user_interface::Cache};
 
         fn click(
@@ -5897,7 +5910,7 @@ mod tests {
             target: Target,
             cache: Cache,
             renderer: &mut cosmic::Renderer,
-            label: &str,
+            role: &str,
         ) -> (Cache, Vec<Message>) {
             let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
                 panic!("chat");
@@ -5918,21 +5931,36 @@ mod tests {
                 Vec::new(),
             );
             let mut ui = UserInterface::build(view, iced::Size::new(450.0, 700.0), cache, renderer);
-            let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
-            let bounds = accessible
-                .root()
-                .iter()
-                .chain(accessible.children())
-                .find(|node| {
-                    node.node().role() == iced_accessibility::accesskit::Role::Button
-                        && node.node().label() == Some(label)
-                })
-                .and_then(|node| node.node().bounds())
-                .unwrap_or_else(|| panic!("missing visible button {label}"));
-            let pointer = iced::Point::new(
-                (bounds.x0 + bounds.x1) as f32 / 2.0,
-                (bounds.y0 + bounds.y1) as f32 / 2.0,
-            );
+            struct Bounds {
+                id: widget::Id,
+                rect: Option<iced::Rectangle>,
+            }
+            impl Operation for Bounds {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn Focusable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.rect = Some(bounds);
+                    }
+                }
+            }
+            let mut bounds = Bounds {
+                id: card_control_id(target.card, role),
+                rect: None,
+            };
+            // Unlike a11y_nodes in pinned COSMIC, operate also traverses the
+            // actual nested overlay layouts and their live focusable controls.
+            ui.operate(renderer, &mut bounds);
+            let rect = bounds
+                .rect
+                .unwrap_or_else(|| panic!("missing mounted control {role}"));
+            let pointer = iced::Point::new(rect.center_x(), rect.center_y());
             let mut messages = Vec::new();
             ui.update(
                 &[
@@ -5980,23 +6008,17 @@ mod tests {
             .insert(target.card, CardRuntime::Chat(Box::new(live)));
         let mut renderer = crate::app::tests::headless_renderer();
         let mut cache = Cache::new();
-        for picker in ["Choose a model", "Choose reasoning effort"] {
-            let (next, messages) = click(
-                &app,
-                target,
-                cache,
-                &mut renderer,
-                "Conversation details and settings",
-            );
+        for picker in ["chat-model-picker", "chat-reasoning-picker"] {
+            let (next, messages) = click(&app, target, cache, &mut renderer, "chat-footer-details");
             cache = next;
             apply(&mut app, messages);
             let (next, messages) = click(&app, target, cache, &mut renderer, picker);
             cache = next;
             apply(&mut app, messages);
-            let label = if picker == "Choose a model" {
-                "Fixture model B"
+            let label = if picker == "chat-model-picker" {
+                "chat-model-choice-Claude-named-model-b"
             } else {
-                "high"
+                "chat-reasoning-choice-1"
             };
             let (next, messages) = click(&app, target, cache, &mut renderer, label);
             cache = next;
@@ -6015,7 +6037,13 @@ mod tests {
         // The keyboard command must mount More's anchor and the model popup
         // even though the overflow has not been opened with the pointer.
         drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
-        let (_, messages) = click(&app, target, cache, &mut renderer, "Fixture model B");
+        let (_, messages) = click(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            "chat-model-choice-Claude-named-model-b",
+        );
         assert!(messages.iter().any(|message| matches!(message,
             Message::ChatUi(Action::Model(actual, id)) if *actual == target && id == "model-b")));
     }
