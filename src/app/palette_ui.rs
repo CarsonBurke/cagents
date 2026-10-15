@@ -51,13 +51,19 @@ impl Cagents {
                 let Some((field, chord, owner)) = self.palette.reassign.take() else { return Task::none(); };
                 let binding = settings::parse_shortcut(&chord).expect("recorded chord");
                 let mut next = self.settings.clone();
-                let mut remaining = next.keyboard_shortcuts.actions()[owner].clone();
+                let drafts = self.settings_draft.keyboard_shortcuts.shortcut_values();
+                let owner_action = SettingsField::SHORTCUTS[owner].shortcut_action().expect("shortcut action");
+                let remaining = drafts.iter().find(|(action, _)| *action == owner_action).expect("owner draft").1;
+                let mut remaining = settings::parse_chords(remaining);
                 remaining.retain(|chord| settings::parse_shortcut(chord).ok() != Some(binding));
                 next.keyboard_shortcuts.set_action(owner, remaining.clone());
                 let index = SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).expect("shortcut");
-                let mut mine = next.keyboard_shortcuts.actions()[index].clone();
-                mine.push(chord);
+                let action = field.shortcut_action().expect("shortcut action");
+                let mine = drafts.iter().find(|(candidate, _)| *candidate == action).expect("edited draft").1;
+                let mut mine = settings::parse_chords(mine);
+                if !mine.iter().any(|chord| settings::parse_shortcut(chord).ok() == Some(binding)) { mine.push(chord); }
                 next.keyboard_shortcuts.set_action(index, mine.clone());
+                let attempted = next.clone();
                 match next.validate() {
                     Ok(next) => {
                         let previous = std::mem::replace(&mut self.settings, next);
@@ -74,7 +80,11 @@ impl Cagents {
                         Task::batch([self.save_settings_task(false), self.synchronize_settings(&previous)])
                     }
                     Err(_) => {
-                        self.palette.recording_error = Some(format!("{} requires at least one shortcut. Record another shortcut there before reassigning this one.", SettingsField::SHORTCUTS[owner].label()));
+                        self.palette.recording_error = if remaining.is_empty() && settings::shortcut_required(owner) {
+                            Some(format!("{} requires at least one shortcut. Record another shortcut there before reassigning this one.", SettingsField::SHORTCUTS[owner].label()))
+                        } else {
+                            refusal(field, &attempted).or_else(|| refusal(SettingsField::SHORTCUTS[owner], &attempted)).or_else(|| Some("Reassignment could not be saved. Check the other settings.".into()))
+                        };
                         Task::none()
                     }
                 }
@@ -1200,6 +1210,22 @@ mod settings_recorder_tests {
             assert_eq!(app.palette.recording, Some(field));
             assert_eq!(app.settings_draft.keyboard_shortcuts.toggle_projects, original);
         }
+    }
+
+    #[test]
+    fn reassign_preserves_chord_drafts_still_waiting_for_autosave() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.queue_setting_input(field, String::new()));
+        drop(app.queue_setting_input(SettingsField::ShortcutCommandPalette, format!("{chord}, Ctrl+Alt+Shift+P")));
+        drop(app.update_palette(Action::Record(field)));
+        drop(app.record_shortcut(field, chord.clone()));
+        drop(app.update_palette(Action::Reassign));
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert_eq!(app.settings.keyboard_shortcuts.command_palette, ["Ctrl+Alt+Shift+P"]);
+        assert!(app.settings_pending.is_empty());
+        assert!(app.settings_invalid.is_empty());
     }
 
     #[test]
