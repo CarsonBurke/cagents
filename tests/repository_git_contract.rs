@@ -4925,7 +4925,7 @@ fn git_operation_explicit_merge_parent_and_patch_application() {
             .git_operation(
                 &fixture.work(),
                 &GitOperation::ApplyPatch {
-                    patch: patch.clone(),
+                    patch: patch.clone().into(),
                     cached: true,
                     reverse: false,
                     expected_head: None
@@ -4941,7 +4941,7 @@ fn git_operation_explicit_merge_parent_and_patch_application() {
             .git_operation(
                 &fixture.work(),
                 &GitOperation::ApplyPatch {
-                    patch,
+                    patch: patch.into(),
                     cached: true,
                     reverse: true,
                     expected_head: None
@@ -5081,7 +5081,7 @@ fn deleted_file_unstage_patch_refuses_a_head_that_moved_after_render() {
         .git_operation(
             &fixture.work(),
             &GitOperation::ApplyPatch {
-                patch,
+                patch: patch.into(),
                 cached: true,
                 reverse: true,
                 expected_head: Some(cagents::repository::GitHeadGuard::Commit(rendered_head)),
@@ -5112,7 +5112,7 @@ fn unborn_unstage_patch_refuses_a_commit_created_after_render() {
         .git_operation(
             &fixture.work(),
             &GitOperation::ApplyPatch {
-                patch,
+                patch: patch.into(),
                 cached: true,
                 reverse: true,
                 expected_head: Some(GitHeadGuard::Unborn),

@@ -1181,7 +1181,7 @@ pub enum GitOperation {
         kind: GitOperationKind,
     },
     ApplyPatch {
-        patch: Vec<u8>,
+        patch: Arc<[u8]>,
         cached: bool,
         reverse: bool,
         expected_head: Option<GitHeadGuard>,
@@ -4761,7 +4761,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if *reverse {
                     command = command.arg("--reverse");
                 }
-                command.arg("-").stdin(patch.clone())
+                command.arg("-").stdin(patch.to_vec())
             }
             GitOperation::RevertCommit { oid, mainline }
             | GitOperation::CherryPick { oid, mainline } => {
