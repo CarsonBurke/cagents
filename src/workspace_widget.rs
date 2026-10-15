@@ -790,7 +790,11 @@ fn shortcut_matches(
         }
 }
 
-fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
+/// Character normalization shared by shortcut dispatch and the settings recorder.
+pub(crate) fn latin_key(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+) -> Option<char> {
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
         if let (Some(character), None) = (characters.next(), characters.next())

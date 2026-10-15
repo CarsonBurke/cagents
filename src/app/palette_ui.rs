@@ -193,10 +193,17 @@ impl Cagents {
                 self.palette.recording_error = None;
                 return Some(Task::none());
             }
-            if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
+            if let keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            } = event
+            {
                 let name = match key {
                     keyboard::Key::Character(value) if value.chars().count() == 1 => {
-                        Some(value.to_uppercase())
+                        workspace_widget::latin_key(key, *physical_key)
+                            .map(|character| character.to_ascii_uppercase().to_string())
                     }
                     keyboard::Key::Named(name) => match name {
                         keyboard::key::Named::ArrowLeft => Some("Left".into()),
@@ -1311,6 +1318,69 @@ mod settings_recorder_tests {
             drop(app.update(tab()));
             assert_eq!(app.workspace.focused(), Some(ids[2]));
         }
+    }
+
+    #[test]
+    fn settings_recorder_and_key_filter_share_dispatch_character_normalization() {
+        let event = |value: &str, physical, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(value.into()),
+            physical_key: keyboard::key::Physical::Code(physical),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let modifiers =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
+        for (value, physical, chord) in [
+            ("л", keyboard::key::Code::KeyK, "Ctrl+Alt+Shift+K"),
+            (",", keyboard::key::Code::Comma, "Ctrl+Alt+Shift+Comma"),
+            ("+", keyboard::key::Code::Equal, "Ctrl+Alt+Shift+Plus"),
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let field = SettingsField::ShortcutToggleProjects;
+            let pressed = event(value, physical, modifiers);
+            let binding = settings::parse_shortcut(chord).unwrap();
+            assert!(workspace_widget::shortcut_event_matches(binding, &pressed));
+            drop(app.update_palette(Action::Record(field)));
+            drop(
+                app.palette_key_event(&pressed)
+                    .expect("recorder owns the key"),
+            );
+            assert!(app.palette.recording_error.is_none());
+            assert!(
+                app.settings
+                    .keyboard_shortcuts
+                    .toggle_projects
+                    .iter()
+                    .any(|chord| settings::parse_shortcut(chord).ok() == Some(binding))
+            );
+            drop(app.update_palette(Action::FilterKey));
+            drop(
+                app.palette_key_event(&pressed)
+                    .expect("pressed-key filter owns the key"),
+            );
+            assert_eq!(app.settings_search, chord);
+            assert!(!app.palette.filtering_key);
+        }
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let before = app.settings.keyboard_shortcuts.clone();
+        drop(app.update_palette(Action::Record(field)));
+        let interrupt = event("с", keyboard::key::Code::KeyC, keyboard::Modifiers::CTRL);
+        drop(
+            app.palette_key_event(&interrupt)
+                .expect("recorder owns the key"),
+        );
+        assert!(
+            app.palette
+                .recording_error
+                .as_ref()
+                .is_some_and(|reason| reason.contains("interrupts"))
+        );
+        assert_eq!(app.settings.keyboard_shortcuts, before);
+        assert_eq!(app.palette.recording, Some(field));
     }
 
     #[test]
