@@ -57,6 +57,33 @@ fn identity(root: &Root) -> io::Result<(u64, u64)> {
     let metadata = root.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
 }
+#[cfg(target_os = "linux")]
+fn mount_identity(root: &Root) -> io::Result<u64> {
+    // Device/inode alone cannot terminate an ancestor walk: a self bind mount
+    // can expose the same inode through a different mount before the real
+    // checkout ancestor. statx's retained-FD mount ID distinguishes that edge.
+    let mut metadata = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe { libc::statx(root.descriptor(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT, libc::STATX_MNT_ID, metadata.as_mut_ptr()) };
+    if result < 0 { return Err(io::Error::last_os_error()); }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(unsupported("Recovery ancestry requires a supported retained-directory mount identity."));
+    }
+    Ok(metadata.stx_mnt_id)
+}
+#[cfg(target_os = "linux")]
+fn parent_of(root: &Root) -> io::Result<Root> {
+    let directory = open_at(root.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
+    Ok(Root { directory, path: root.path().join("..") })
+}
+#[cfg(not(target_os = "linux"))]
+fn mount_identity(_root: &Root) -> io::Result<u64> {
+    Err(unsupported("Strong recovery placement is unavailable without qualified native mount-identity ancestry inspection."))
+}
+#[cfg(not(target_os = "linux"))]
+fn parent_of(_root: &Root) -> io::Result<Root> {
+    Err(unsupported("Strong recovery placement is unavailable on this platform."))
+}
 impl RecoveryPlacement {
     /// Captures an already-held candidate, never reconstructing an effect path.
     /// Candidate selection is domain-owned: prefer authenticated outside Git
@@ -97,6 +124,7 @@ impl RecoveryPlacement {
         let mut cursor = self.parent.try_clone()?;
         for _ in 0..MAX_ANCESTORS {
             let current = identity(&cursor)?;
+            let current_mount = mount_identity(&cursor)?;
             if excluded.contains(&current) {
                 return Err(unsupported("Recovery payloads would be inside a known edited or registered checkout root; this step was refused and existing recovery was retained."));
             }
@@ -107,15 +135,22 @@ impl RecoveryPlacement {
                 Ok(_) => return Err(unsupported("Recovery placement has an enclosing Git checkout locator; this step was refused and existing recovery was retained.")),
                 Err(error) => return Err(unsupported(&format!("Recovery checkout ancestry could not be established: {error}"))),
             }
-            let directory = open_at(cursor.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
-            let parent = Root { directory, path: cursor.path().join("..") };
-            if identity(&parent)? == current {
+            let parent = parent_of(&cursor)?;
+            if identity(&parent)? == current && mount_identity(&parent)? == current_mount {
                 (self.registry.check)()?;
                 return Ok(());
             }
             cursor = parent;
         }
         Err(unsupported("Recovery placement exceeds the bounded ancestor inspection; this step was refused and existing recovery was retained."))
+    }
+    /// The consumer's original effect Root must match the captured source;
+    /// borrowing a safe placement for another source does not transfer consent.
+    pub fn validate_for_source(&self, source: &Root) -> io::Result<()> {
+        if identity(source)? != self.source_identity {
+            return Err(unsupported("Recovery placement belongs to a different source directory."));
+        }
+        self.validate()
     }
     pub fn directory(&self) -> &Root { &self.parent }
     pub fn namespace(&self) -> &DirectoryNamespace { &self.namespace }
@@ -125,7 +160,7 @@ impl RecoveryPlacement {
     pub fn retained_descriptor_count(&self) -> usize { self.retained_descriptors }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::{fs, sync::atomic::{AtomicBool, Ordering}};
