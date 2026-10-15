@@ -61,13 +61,13 @@ pub(super) struct State {
 }
 
 impl RepositoryRuntime {
-    /// Uses the same capabilities as the diff toolbar; file staging also works
-    /// in the repository editor, matching the repository shortcut. Availability is
+    /// Uses the same capabilities as the diff toolbar. Basis selection and
+    /// file staging also work from the repository editor toolbar. Availability is
     /// checked again at dispatch; the existing actions also retain their normal
     /// save, mutation and asynchronous-result fences.
     pub fn diff_presentation_available(&self, command: DiffPresentationCommand) -> bool {
         use DiffPresentationCommand::*;
-        if !matches!(command, StageFile | UnstageFile | StageOrUnstageFile)
+        if !matches!(command, Working | Staged | Branch | History | StageFile | UnstageFile | StageOrUnstageFile)
             && !self.shows_diff() { return false; }
         match command {
             Unified | Split => self.can_change_diff_layout(),

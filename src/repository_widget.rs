@@ -12636,6 +12636,54 @@ mod tests {
     }
 
     #[test]
+    fn editor_toolbar_basis_buttons_dispatch_and_reveal_the_requested_diff() {
+        use cosmic::iced::advanced::{Layout, Shell, layout, mouse, widget::Tree};
+        for (label, command) in [
+            ("Working", DiffPresentationCommand::Working),
+            ("Staged", DiffPresentationCommand::Staged),
+            ("Branch", DiffPresentationCommand::Branch),
+            ("History", DiffPresentationCommand::History),
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "line\n");
+            runtime.selected.as_mut().unwrap().staged = true;
+            runtime.selected.as_mut().unwrap().unstaged = true;
+            assert_eq!(runtime.source_surface, SourceSurface::Editor);
+            let renderer = headless_renderer();
+            let mut toolbar = selected_file_toolbar(card, &runtime).unwrap();
+            let mut tree = Tree::new(toolbar.as_widget());
+            let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 160.0));
+            let node = toolbar.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+            let point = {
+                let accessible = toolbar.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+                let button = accessible.root().iter().chain(accessible.children())
+                    .find(|entry| entry.node().label()==Some(label)).expect("editor basis button is mounted");
+                assert!(!button.node().is_disabled(), "{label} must be enabled while editing");
+                let bounds = button.node().bounds().unwrap();
+                iced::Point::new(((bounds.x0+bounds.x1)/2.0) as f32, ((bounds.y0+bounds.y1)/2.0) as f32)
+            };
+            let mut messages = Vec::new();
+            for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+                toolbar.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), mouse::Cursor::Available(point),
+                    &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            }
+            drop(toolbar);
+            let action = messages.pop().expect("actual toolbar click emits its basis action");
+            assert!(messages.is_empty());
+            match (&action, command) {
+                (RepositoryAction::ApplyDiffBasis { basis: DiffBasis::IndexToWorktree,.. }, DiffPresentationCommand::Working)
+                | (RepositoryAction::ApplyDiffBasis { basis: DiffBasis::HeadToIndex,.. }, DiffPresentationCommand::Staged)
+                | (RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::Branch,.. }, DiffPresentationCommand::Branch)
+                | (RepositoryAction::SelectCommittedBasis { choice: CommittedChoice::LastCommit,.. }, DiffPresentationCommand::History) => {}
+                _ => panic!("toolbar action must retain requested basis"),
+            }
+            drop(runtime.update(action));
+            assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        }
+    }
+
+    #[test]
     fn shell_toolbar_actions_stay_in_the_header_when_find_is_open() {
         use cosmic::iced::Size;
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
