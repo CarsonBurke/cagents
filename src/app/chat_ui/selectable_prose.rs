@@ -98,6 +98,8 @@ impl Shape {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(super) fn flow_readiness(&self) -> Option<bool> {self.flow.as_ref().map(|_|self.flow_ready.is_some())}
     fn paragraph(&self) -> &ParagraphBuffer {
         debug_assert!(self.flow.is_none(), "flow text must never shape synchronously");
         self.paragraph
