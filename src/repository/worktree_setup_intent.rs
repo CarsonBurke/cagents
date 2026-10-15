@@ -232,7 +232,11 @@ mod tests {
     fn setup_progress_survives_reopen_without_executing_or_recreating_the_worktree() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let path = root.path().join("state.sqlite");
-        let request = request(root.path());
+        let mut request = request(root.path());
+        request.linear_issue = Some(crate::linear::context::LinkedIssue {
+            issue_id: "2b498c52-7dc7-4c76-ad59-dfc488c40111".into(),
+            workspace: Some("fixtureA".into()),
+        });
         let first = intent(&request);
         let mut journal = journal(request.clone());
         // Reconciliation can settle a checkout after the creating process
@@ -251,6 +255,10 @@ mod tests {
                 copied.clone(),
             )
             .unwrap();
+        assert_eq!(
+            report.request.as_ref().unwrap().linear_issue,
+            request.linear_issue
+        );
         assert_eq!(report.request.unwrap().setup_intent, Some(copied.clone()));
         assert_eq!(report.state, WorktreeOperationState::Created);
         assert_eq!(report.created_at_unix_ms, 42);
@@ -263,6 +271,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let saved: WorktreeJournal = serde_json::from_value(row.payload).unwrap();
+        assert_eq!(saved.request.linear_issue, request.linear_issue);
         assert_eq!(saved.request.setup_intent, Some(copied.clone()));
         assert_eq!(row.status, PendingOperationStatus::Applied);
         let service = RepositoryService::system("must-not-execute-git");
@@ -275,6 +284,10 @@ mod tests {
             .worktree_setup_creation(&reopened, request.operation_id)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            read.request.as_ref().unwrap().linear_issue,
+            request.linear_issue
+        );
         assert_eq!(read.request.unwrap().setup_intent, Some(copied));
         assert_eq!(read.state, WorktreeOperationState::Created);
         assert_eq!(read.created_at_unix_ms, 42);
