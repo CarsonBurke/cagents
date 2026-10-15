@@ -149,6 +149,8 @@ pub enum GlobalShortcut {
     GitAbort,
     GitContinue,
     GitOutput,
+    GitAcceptOurs,
+    GitAcceptTheirs,
 
 
     CommandPalette,
@@ -250,6 +252,8 @@ impl GlobalShortcut {
             Self::OpenFile => Some(1 << 27),
             Self::RevealInFiles => Some(1 << 28),
             Self::IgnoreChangePath => Some(1 << 29),
+            Self::GitAcceptOurs => Some(1 << 30),
+            Self::GitAcceptTheirs => Some(1 << 31),
             _ => None,
         }
     }
@@ -373,6 +377,8 @@ impl GlobalShortcut {
             Self::GitAbort => "git_abort",
             Self::GitContinue => "git_continue",
             Self::GitOutput => "git_output",
+            Self::GitAcceptOurs => "git_accept_ours",
+            Self::GitAcceptTheirs => "git_accept_theirs",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -544,7 +550,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
-        if git_command_bit(self.action).is_some() { return "Git"; }
+        if self.id().starts_with("git_") { return "Git"; }
         if self.scope == ShortcutScope::Sidebar { return "Navigation"; }
         let id = self.id();
         if id.starts_with("settings_")
@@ -1290,6 +1296,8 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::GitAbort, label: "Abort Git operation", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::GitContinue, label: "Continue Git operation", repeatable: false, scope: ShortcutScope::Workspace },
     ShortcutDescriptor { action: GlobalShortcut::GitOutput, label: "Show or hide Git output", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitAcceptOurs, label: "Accept ours and stage", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::GitAcceptTheirs, label: "Accept theirs and stage", repeatable: false, scope: ShortcutScope::Sidebar },
 
 ];
 
@@ -1411,6 +1419,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitAbort => &shortcuts.git_abort,
         GlobalShortcut::GitContinue => &shortcuts.git_continue,
         GlobalShortcut::GitOutput => &shortcuts.git_output,
+        GlobalShortcut::GitAcceptOurs => &shortcuts.git_accept_ours,
+        GlobalShortcut::GitAcceptTheirs => &shortcuts.git_accept_theirs,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,

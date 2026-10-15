@@ -9580,6 +9580,11 @@ fn change_row_view<'a>(
     let identity = RowInteraction::change_row(identity, &source.key, ChangeSelectionRow { area, path: row.entry.path.clone() }, state, !modal_open);
     let identity = change_context_controls(identity, &source.key, row, state.change_selection_revision(), modal_open, shortcuts);
     let commands = row_commands(source, area, row, modal_open).into_iter().map(|mut control| {
+        if let Some(SidebarAction::GitOperation { operation: GitOperation::ResolveConflict { ours, .. }, .. }) = control.action.as_ref() {
+            let command = if *ours { crate::workspace_widget::GlobalShortcut::GitAcceptOurs } else { crate::workspace_widget::GlobalShortcut::GitAcceptTheirs };
+            control.action = Some(SidebarAction::RunChangeCommand { key: source.key.clone(), row: ChangeSelectionRow { area, path: row.entry.path.clone() }, selection_revision: state.change_selection_revision(), command });
+            control.name = commands::label(command);
+        }
         let command = match control.action.as_ref() {
             Some(SidebarAction::Stage { .. }) => Some(ChangeGroupCommand::Stage),
             Some(SidebarAction::Unstage { .. }) => Some(ChangeGroupCommand::Unstage),

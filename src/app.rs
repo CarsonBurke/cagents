@@ -2947,12 +2947,14 @@ pub enum SettingsField {
     ShortcutGitAbort,
     ShortcutGitContinue,
     ShortcutGitOutput,
+    ShortcutGitAcceptOurs,
+    ShortcutGitAcceptTheirs,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 136] = [
+    const SHORTCUTS: [Self; 138] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3094,6 +3096,8 @@ impl SettingsField {
         Self::ShortcutGitAbort,
         Self::ShortcutGitContinue,
         Self::ShortcutGitOutput,
+        Self::ShortcutGitAcceptOurs,
+        Self::ShortcutGitAcceptTheirs,
 
     ];
 
@@ -3240,6 +3244,8 @@ impl SettingsField {
             Self::ShortcutGitAbort => "Abort Git operation",
             Self::ShortcutGitContinue => "Continue Git operation",
             Self::ShortcutGitOutput => "Show or hide Git output",
+            Self::ShortcutGitAcceptOurs => "Accept ours and stage",
+            Self::ShortcutGitAcceptTheirs => "Accept theirs and stage",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3440,6 +3446,8 @@ impl SettingsField {
             | Self::ShortcutGitAbort
             | Self::ShortcutGitContinue
             | Self::ShortcutGitOutput
+            | Self::ShortcutGitAcceptOurs
+            | Self::ShortcutGitAcceptTheirs
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3603,6 +3611,8 @@ struct ShortcutDraft {
     git_abort: String,
     git_continue: String,
     git_output: String,
+    git_accept_ours: String,
+    git_accept_theirs: String,
 
 
     command_palette: String,
@@ -3754,6 +3764,8 @@ impl ShortcutDraft {
             git_abort: settings::format_chords(&shortcuts.git_abort),
             git_continue: settings::format_chords(&shortcuts.git_continue),
             git_output: settings::format_chords(&shortcuts.git_output),
+            git_accept_ours: settings::format_chords(&shortcuts.git_accept_ours),
+            git_accept_theirs: settings::format_chords(&shortcuts.git_accept_theirs),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4120,6 +4132,8 @@ impl SettingsDraft {
             SettingsField::ShortcutGitAbort => self.keyboard_shortcuts.git_abort = value,
             SettingsField::ShortcutGitContinue => self.keyboard_shortcuts.git_continue = value,
             SettingsField::ShortcutGitOutput => self.keyboard_shortcuts.git_output = value,
+            SettingsField::ShortcutGitAcceptOurs => self.keyboard_shortcuts.git_accept_ours = value,
+            SettingsField::ShortcutGitAcceptTheirs => self.keyboard_shortcuts.git_accept_theirs = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4479,6 +4493,8 @@ fn settings_update(
         SettingsField::ShortcutGitAbort => { next.keyboard_shortcuts.git_abort = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitContinue => { next.keyboard_shortcuts.git_continue = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitOutput => { next.keyboard_shortcuts.git_output = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitAcceptOurs => { next.keyboard_shortcuts.git_accept_ours = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitAcceptTheirs => { next.keyboard_shortcuts.git_accept_theirs = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

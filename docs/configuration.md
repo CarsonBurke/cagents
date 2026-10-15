@@ -480,3 +480,8 @@ The unbound Git command settings are `git_fetch`, `git_push`, `git_publish`,
 `[keyboard_shortcuts]`. They use the active worktree's existing Git controls;
 commit uses that worktree's subject, description and amend choice. Stash
 commands open a target picker and retain its exact stash object identity.
+
+`git_accept_ours` and `git_accept_theirs` are unbound commands for the focused
+conflict row. They accept the chosen side and stage that exact path, using the
+same operation as the row buttons; a changed worktree or selection retires the
+captured command.

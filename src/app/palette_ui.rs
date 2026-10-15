@@ -1535,6 +1535,8 @@ impl Cagents {
             | Command::GitAbort
             | Command::GitContinue
             | Command::GitOutput
+            | Command::GitAcceptOurs
+            | Command::GitAcceptTheirs
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1805,6 +1807,8 @@ impl SettingsField {
             Self::ShortcutGitAbort => Some(Command::GitAbort),
             Self::ShortcutGitContinue => Some(Command::GitContinue),
             Self::ShortcutGitOutput => Some(Command::GitOutput),
+            Self::ShortcutGitAcceptOurs => Some(Command::GitAcceptOurs),
+            Self::ShortcutGitAcceptTheirs => Some(Command::GitAcceptTheirs),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1979,6 +1983,8 @@ impl ShortcutDraft {
             (Command::GitAbort, self.git_abort.as_str()),
             (Command::GitContinue, self.git_continue.as_str()),
             (Command::GitOutput, self.git_output.as_str()),
+            (Command::GitAcceptOurs, self.git_accept_ours.as_str()),
+            (Command::GitAcceptTheirs, self.git_accept_theirs.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),

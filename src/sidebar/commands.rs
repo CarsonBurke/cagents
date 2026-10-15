@@ -200,6 +200,7 @@ impl CommandTarget {
             Command::OpenFile if current.entry.kind != ChangeKind::Deleted => return Some(SidebarAction::OpenFile { key: key.clone(), path: row.path.clone() }),
             Command::RevealInFiles if current.entry.kind != ChangeKind::Deleted => return Some(SidebarAction::RevealChangeInFiles { key: key.clone(), path: row.path.clone() }),
             Command::IgnoreChangePath if row.area == ChangeArea::Untracked && !source.busy() => return Some(SidebarAction::IgnoreChangePath { key: key.clone(), path: row.path.clone() }),
+            Command::GitAcceptOurs | Command::GitAcceptTheirs if row.area == ChangeArea::Conflict && !source.busy() && current.entry.conflict.is_some() => return Some(SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::ResolveConflict { path: row.path.clone(), ours: command == Command::GitAcceptOurs } }),
             _ => {}
         }
         if source.busy() { return None; }
@@ -351,5 +352,27 @@ mod change_navigation_target_tests {
         let tracked=source.groups().iter().filter(|group| group.area!=ChangeArea::Untracked).flat_map(|group| group.rows()).next().unwrap();
         let target=CommandTarget::Changes { key:source.key.clone(),row:ChangeSelectionRow { area:tracked.entry.area,path:tracked.entry.path.clone() },selection_revision:state.change_selection_revision() };
         assert!(target.resolve_in(&model,&state,Command::IgnoreChangePath).is_none());
+    }
+}
+
+#[cfg(test)]
+mod conflict_command_tests {
+    use super::*;
+    #[test]
+    fn conflict_templates_preserve_captured_path_area_and_revision() {
+        let mut model = super::super::tests::panel_model();
+        let mut state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let entry = source.group(ChangeArea::Conflict).unwrap().rows()[0].entry.clone();
+        let target = CommandTarget::Changes { key: source.key.clone(), row: ChangeSelectionRow { area: ChangeArea::Conflict, path: entry.path.clone() }, selection_revision: state.change_selection_revision() };
+        for (command, expected) in [(Command::GitAcceptOurs, true), (Command::GitAcceptTheirs, false)] {
+            assert!(matches!(target.resolve_in(&model, &state, command), Some(SidebarAction::GitOperation { operation: GitOperation::ResolveConflict { path, ours }, .. }) if path == entry.path && ours == expected));
+        }
+        model.source_control.as_mut().unwrap().set_mutation(Some(MutationKind::Other));
+        assert!(target.resolve_in(&model, &state, Command::GitAcceptOurs).is_none());
+        model.source_control.as_mut().unwrap().set_mutation(None);
+        let order = change_selection_order(model.source_control.as_ref().unwrap(), &state);
+        state.select_change_rows(order[0].clone(), SelectionIntent::Toggle, &order);
+        assert!(target.resolve_in(&model, &state, Command::GitAcceptOurs).is_none(), "a changed selection cannot substitute another conflict");
     }
 }

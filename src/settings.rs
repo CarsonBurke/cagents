@@ -383,6 +383,8 @@ pub struct KeyboardShortcuts {
     pub git_abort: Vec<String>,
     pub git_continue: Vec<String>,
     pub git_output: Vec<String>,
+    pub git_accept_ours: Vec<String>,
+    pub git_accept_theirs: Vec<String>,
 
 
     /// Serialized action names whose configured chords pass through to terminals.
@@ -533,6 +535,8 @@ impl Default for KeyboardShortcuts {
             git_abort: Vec::new(),
             git_continue: Vec::new(),
             git_output: Vec::new(),
+            git_accept_ours: Vec::new(),
+            git_accept_theirs: Vec::new(),
 
 
             terminal_passthrough_actions: [
@@ -566,7 +570,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 136] {
+    pub fn actions(&self) -> [&Vec<String>; 138] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -709,6 +713,8 @@ impl KeyboardShortcuts {
             &self.git_abort,
             &self.git_continue,
             &self.git_output,
+            &self.git_accept_ours,
+            &self.git_accept_theirs,
 
 
         ]
@@ -716,7 +722,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 136] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 138] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -854,6 +860,8 @@ impl KeyboardShortcuts {
             &mut self.git_abort,
             &mut self.git_continue,
             &mut self.git_output,
+            &mut self.git_accept_ours,
+            &mut self.git_accept_theirs,
 
         ]
     }
@@ -904,7 +912,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 136] = [
+const SHORTCUT_ACTIONS: [&str; 138] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1046,6 +1054,8 @@ const SHORTCUT_ACTIONS: [&str; 136] = [
     "git_abort",
     "git_continue",
     "git_output",
+    "git_accept_ours",
+    "git_accept_theirs",
 
 
 ];
@@ -2229,7 +2239,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 131] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 133] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2366,6 +2376,8 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 131] = [
     "git_abort",
     "git_continue",
     "git_output",
+    "git_accept_ours",
+    "git_accept_theirs",
 
 
 ];
