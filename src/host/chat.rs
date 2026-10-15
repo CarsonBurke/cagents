@@ -762,6 +762,7 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -1048,6 +1049,14 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    // Capture before a proven source may be frozen/stopped. The same Arc
+    // retains uncertain startup cleanup; issued launch recipes stay unchanged.
+    let execution = if execution.is_none() && session.launch.provider == Provider::Claude
+        && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines)
+    {
+        Some(Arc::new(chat::protocol::ExecutionContext::capture(&spec.working_directory).map_err(unavailable)?))
+    } else { execution };
+    spec.execution = execution.clone();
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -1306,29 +1315,26 @@ fn start_with_execution(
         // If removal wins between them, startup's validation refuses the launch.
         let weak = Arc::downgrade(host);
         let id = session.id;
-        let handle = Handle::start_owned(
-            spec,
-            adapter,
-            initial,
-            store,
-            session.clone(),
-            recovery_environment,
-            move |update| {
-                if let Update::Execution { run, update } = update {
-                    if let Some(host) = weak.upgrade() {
-                        super::agent_execution::observed(
-                            &host,
-                            id,
-                            execution_instance,
-                            run,
-                            update,
-                        );
-                    }
-                } else {
-                    changed(&weak, id, update);
+        let notify = move |update| {
+            if let Update::Execution { run, update } = update {
+                if let Some(host) = weak.upgrade() {
+                    super::agent_execution::observed(&host, id, execution_instance, run, update);
                 }
-            },
-        )
+            } else { changed(&weak, id, update); }
+        };
+        let remote = session.launch.provider == Provider::Claude
+            && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines);
+        let startup_source = session.clone();
+        let handle = if remote {
+            let context = execution.as_ref().expect("Claude retained startup captured its context");
+            retained_actor::reserve_startup(host, &session, context.clone()).map_err(unavailable)?;
+            // The holder creates and retains the sole reducer/Store. Host
+            // preparation above is a reversible validation before source stop.
+            drop((adapter, initial, store));
+            Handle::start_remote_owned(spec, session.clone(), recovery_environment, notify)
+        } else {
+            Handle::start_owned(spec, adapter, initial, store, session.clone(), recovery_environment, notify)
+        }
         .map_err(|message| {
             check_launch_account(&session.launch)
                 .err()
@@ -1356,6 +1362,10 @@ fn start_with_execution(
                 return Err(failure);
             }
         }
+        // A helper commit is fallible RPC and must run outside HostState.
+        // Keep its exact context in native_actor_startups on any uncertainty.
+        handle.commit_native_installation().map_err(unavailable)?;
+        let execution_instance = handle.actor_identity().map_or(execution_instance, |identity| identity.instance);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);
@@ -1384,12 +1394,17 @@ fn start_with_execution(
             returning_terminal: false,
         };
         let response = session_snapshot(&record);
-        record.handle.commit_native_installation();
+        let installed_handle = record.handle.clone();
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
         }
         state.inventory_generation += 1;
+        drop(state);
+        if remote && let Some(context) = &execution {
+            retained_actor::forget_startup(host, &startup_source, context);
+        }
+        installed_handle.wake_retained_outcomes();
         Ok(response)
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

@@ -96,3 +96,43 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Keep the exact cleanup owner even when helper spawn/installation replies
+/// fail. A later retry must prove this owner's teardown before any new launch.
+pub(super) fn reserve_startup(host: &SharedHost, source: &Session, context: Arc<chat::protocol::ExecutionContext>) -> Result<(), String> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.native_actor_startups.contains_key(&source.id) || state.native_actor_startups.len() >= 128 {
+        return Err("An exact retained startup still owns cleanup or startup capacity is exhausted".into());
+    }
+    state.native_actor_startups.insert(source.id, (source.clone(), context));
+    Ok(())
+}
+
+pub(super) fn forget_startup(host: &SharedHost, source: &Session, context: &Arc<chat::protocol::ExecutionContext>) {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.native_actor_startups.get(&source.id).is_some_and(|(expected, current)| expected == source && Arc::ptr_eq(current, context)) {
+        state.native_actor_startups.remove(&source.id);
+    }
+}
+
+pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
+    let pending = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((expected, context)) = state.native_actor_startups.get(&source.id) else { return Ok(false); };
+        if state.chats.contains_key(&source.id) || state.chat_spawning.contains_key(&source.id)
+            || expected.launch != source.launch || expected.terminal != source.terminal
+            || expected.owned_codex_listener != source.owned_codex_listener
+            || source.proof.as_ref().is_some_and(|proof| Some(proof) != expected.proof.as_ref())
+        {
+            return Err("The retained startup belongs to another exact descriptor or is still transitioning".into());
+        }
+        (expected.clone(), context.clone())
+    };
+    match pending.1.reconcile_cleanup()? {
+        chat::protocol::LaunchOutcome::NoProvider | chat::protocol::LaunchOutcome::TeardownProved => {
+            forget_startup(host, &pending.0, &pending.1);
+            Ok(true)
+        }
+        chat::protocol::LaunchOutcome::Uncertain => Err("The exact retained startup has not proved cleanup; no second provider was started".into()),
+    }
+}
