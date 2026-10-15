@@ -1049,7 +1049,7 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
                 let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
                 if fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
                     let identity = (pid.parse::<u32>().unwrap(), fields[19].parse::<u64>().unwrap());
-                    witnessed_children.insert(identity.clone());
+                    witnessed_children.insert(identity);
                     if fields.first() == Some(&"Z") { zombies.insert(identity); }
                 }
             }
@@ -1066,8 +1066,8 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         let zombies = census();
         pending.retain(|identity, _| zombies.contains(identity));
         for identity in zombies {
-            observed.insert(identity.clone());
-            let since = pending.entry(identity.clone()).or_insert_with(Instant::now);
+            observed.insert(identity);
+            let since = pending.entry(identity).or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_millis(250) { persistent.insert(identity); }
         }
         samples += 1;
