@@ -72,6 +72,15 @@ impl ToolCache {
                 self.bytes = self.bytes.saturating_sub(cost(&key, &item));
             }
         }
+        // One native frame can contain many small calls before its canonical
+        // commit. Release that temporary container high-water mark as well as
+        // their bodies; count trimming alone leaves large hash/deque storage.
+        if self.items.capacity() > MAX_ITEMS * 2 {
+            self.items.shrink_to(MAX_ITEMS);
+        }
+        if self.order.capacity() > MAX_ITEMS * 2 {
+            self.order.shrink_to(MAX_ITEMS);
+        }
     }
     pub fn remove(&mut self, agent: Option<&str>, id: &str) {
         let key = ItemKey::new(agent, id);
@@ -84,6 +93,7 @@ impl ToolCache {
         self.items.clear();
         self.order.clear();
         self.bytes = 0;
+        self.trim();
     }
 }
 #[cfg(test)]
@@ -223,5 +233,29 @@ mod tests {
         assert!(cache.get(Some("b"), "same").is_some());
         cache.remove(Some("b"), "same");
         assert_eq!(cache.bytes, 0);
+    }
+    #[test]
+    fn one_large_native_frame_does_not_leave_unbounded_container_capacity_after_commit_or_reset() {
+        let mut cache = ToolCache::default();
+        for index in 0..8192 {
+            cache.insert(None, tool(&format!("same-frame-{index}"), 0));
+        }
+        assert!(cache.items.capacity() > MAX_ITEMS * 2);
+        assert!(cache.order.capacity() > MAX_ITEMS * 2);
+        cache.trim();
+        assert_eq!(cache.items.len(), MAX_ITEMS);
+        assert_eq!(cache.order.len(), MAX_ITEMS);
+        assert!(cache.items.capacity() <= MAX_ITEMS * 2);
+        assert!(cache.order.capacity() <= MAX_ITEMS * 2);
+        assert!(cache.get(None, "same-frame-8191").is_some());
+        for index in 0..8192 {
+            cache.insert(None, tool(&format!("uncommitted-reset-{index}"), 0));
+        }
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.items.is_empty());
+        assert!(cache.order.is_empty());
+        assert!(cache.items.capacity() <= MAX_ITEMS * 2);
+        assert!(cache.order.capacity() <= MAX_ITEMS * 2);
     }
 }
