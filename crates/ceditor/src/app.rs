@@ -3760,6 +3760,10 @@ impl Application for Editor {
                         | SidebarAction::ConfirmDiscard { key, .. }
                         | SidebarAction::CommitMessageChanged { key, .. }
                         | SidebarAction::Commit { key, .. }
+                        | SidebarAction::AmendChanged { key, .. }
+                        | SidebarAction::GitOperation { key, .. }
+                        | SidebarAction::ToggleStashes { key }
+                        | SidebarAction::RequestStashDrop { key, .. }
                         | SidebarAction::Push { key, .. }
                         | SidebarAction::OpenPublish { key, .. }
                         | SidebarAction::PublishRemoteChanged { key, .. }
@@ -3815,7 +3819,7 @@ impl Application for Editor {
                                 Message::Discarded(id, paths, result)
                             })
                         }
-                        SidebarAction::Commit { message, .. } => {
+                        SidebarAction::Commit { message, amend, .. } => {
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Commit)
                             else {
                                 return Task::none();
@@ -3823,8 +3827,9 @@ impl Application for Editor {
                             cosmic::task::future(async move {
                                 let submitted = message.clone();
                                 let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").commit(
+                                    RepositoryService::system("git").commit_with_amend(
                                         &CommitRequest { worktree, message },
+                                        amend,
                                         &CancellationToken::default(),
                                     )
                                 })
@@ -3832,6 +3837,37 @@ impl Application for Editor {
                                 .map_err(|error| error.to_string())
                                 .and_then(|result| result.map_err(|error| error.to_string()));
                                 Message::Committed(id, submitted, result)
+                            })
+                        }
+                        SidebarAction::ToggleStashes { .. } => {
+                            if let Some(source) = tab.sidebar.source_control.as_mut() {
+                                source.stashes_expanded = !source.stashes_expanded;
+                            }
+                            Task::none()
+                        }
+                        SidebarAction::RequestStashDrop { entry, .. } => {
+                            if let Some(source) = tab.sidebar.source_control.as_mut() {
+                                if entry.as_ref().is_none_or(|entry| source.stashes.contains(entry)) {
+                                    source.pending_stash_drop = entry;
+                                }
+                            }
+                            Task::none()
+                        }
+                        SidebarAction::GitOperation { operation, .. } => {
+                            let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
+                            if source.is_reloading() || source.busy() { return Task::none(); }
+                            if let cagents::repository::GitOperation::StashDrop { reference, expected_oid } = &operation {
+                                if !source.pending_stash_drop.as_ref().is_some_and(|entry| &entry.reference == reference && &entry.oid == expected_oid) {
+                                    self.notice = Some("Confirm the exact stash before dropping it.".into());
+                                    return Task::none();
+                                }
+                            }
+                            let Some(worktree) = self.begin_mutation(id, MutationKind::Other) else { return Task::none(); };
+                            if let Some(source) = self.tab_mut(id).and_then(|tab| tab.sidebar.source_control.as_mut()) { source.pending_stash_drop = None; }
+                            cosmic::task::future(async move {
+                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").git_operation(&worktree, &operation, &CancellationToken::default()))
+                                    .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::Mutation(id, result)
                             })
                         }
                         SidebarAction::Push { branch, target, .. } => {
@@ -4041,6 +4077,7 @@ impl Application for Editor {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
                                     let mut source = SourceControlModel::ready(key, &snapshot);
+                                    if let Some(previous) = tab.sidebar.source_control.as_ref() { previous.carry_mutation_into(&mut source); }
                                     source.set_mutation(tab.mutation);
                                     tab.navigation.reconcile_change_rows(&source);
                                     tab.sidebar.source_control = Some(source);
@@ -5742,6 +5779,43 @@ mod tests {
             git(remote.path(), &["rev-parse", "refs/heads/main"]),
             git(root, &["rev-parse", "HEAD"])
         );
+    }
+
+    #[test]
+    fn shared_git_controls_execute_stash_and_amend_with_exact_worktree_and_confirmation() {
+        use cagents::repository::GitOperation;
+        let directory = git_fixture();
+        let root = directory.path();
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        sidebar_action(&mut app, SidebarAction::Commit { key: key.clone(), message: "Amended through shared controls".into(), amend: true });
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Amended through shared controls");
+        assert_ne!(git(root, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(git(root, &["rev-list", "--count", "HEAD"]), "1", "amend replaces the commit");
+
+        std::fs::write(root.join("tracked.txt"), "stash me\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new file\n").unwrap();
+        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashPush { message: Some("shared control".into()), include_untracked: true } });
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert!(!root.join("new.txt").exists());
+        let stash = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().stashes[0].clone();
+        let mut stale = key.clone();
+        stale.canonical_path = directory.path().join("replacement");
+        sidebar_action(&mut app, SidebarAction::GitOperation { key: stale, operation: GitOperation::StashApply { reference: stash.reference.clone(), expected_oid: stash.oid.clone(), pop: false } });
+        assert!(!root.join("new.txt").exists(), "stale worktree cannot apply a stash");
+        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashApply { reference: stash.reference.clone(), expected_oid: stash.oid.clone(), pop: false } });
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "new file\n");
+        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashDrop { reference: stash.reference.clone(), expected_oid: stash.oid.clone() } });
+        assert!(app.notice.as_deref().unwrap().contains("Confirm the exact stash"));
+        assert_eq!(git(root, &["stash", "list", "--format=%H"]), stash.oid.to_string());
+        sidebar_action(&mut app, SidebarAction::RequestStashDrop { key: key.clone(), entry: Some(stash.clone()) });
+        sidebar_action(&mut app, SidebarAction::GitOperation { key, operation: GitOperation::StashDrop { reference: stash.reference, expected_oid: stash.oid } });
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert!(git(root, &["stash", "list"]).is_empty());
     }
 
     #[test]
