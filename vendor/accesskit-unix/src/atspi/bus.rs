@@ -63,6 +63,11 @@ impl Bus {
         Ok(bus)
     }
 
+    pub(crate) async fn check_connection(&self) -> zbus::Result<()> {
+        zbus::fdo::DBusProxy::new(&self.conn).await?.get_id().await?;
+        Ok(())
+    }
+
     fn unique_name(&self) -> &OwnedUniqueName {
         self.conn.unique_name().unwrap()
     }
