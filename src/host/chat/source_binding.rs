@@ -1102,12 +1102,25 @@ mod tests {
             let _ = release.send(());
             holder.join().unwrap();
             request.join().unwrap();
-            let reason = response.expect("binding must refuse without waiting for presentation IO")
+            let reason = response
+                .expect("binding must refuse without waiting for presentation IO")
                 .expect_err("busy presentation cannot publish or admit authority");
-            assert!(reason.message.contains("presentation metadata is busy"), "{reason:?}");
-            assert!(census_available, "binding cannot retain the global host behind actor state");
-            assert!(fixture.validates(&binding), "busy sampling cannot mint or replace history");
-            assert!(!owner.0.is_completed(), "metadata contention cannot stop the provider");
+            assert!(
+                reason.message.contains("presentation metadata is busy"),
+                "{reason:?}"
+            );
+            assert!(
+                census_available,
+                "binding cannot retain the global host behind actor state"
+            );
+            assert!(
+                fixture.validates(&binding),
+                "busy sampling cannot mint or replace history"
+            );
+            assert!(
+                !owner.0.is_completed(),
+                "metadata contention cannot stop the provider"
+            );
         }
     }
 
