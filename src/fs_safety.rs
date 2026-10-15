@@ -467,7 +467,7 @@ pub use recovery_cache::RecoveryParentCandidates;
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 pub(crate) use recovery_cache::{
     RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory,
-    prepare_recovery_directory_with_owner,
+    prepare_recovery_directory_with_owner, verify_recovery_directory_private,
 };
 
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to

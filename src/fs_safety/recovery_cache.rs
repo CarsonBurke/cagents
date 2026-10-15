@@ -9,6 +9,33 @@ use crate::{
 };
 use std::{os::unix::fs::MetadataExt, sync::Arc};
 
+/// Recheck the original holding against the factory's trusted post-setup
+/// observation. This checks the held inode only: it neither repairs permissions
+/// nor proves current placement, ACL policy or atomicity with a later effect.
+/// Directory timestamps are deliberately excluded because payload work changes them.
+pub(crate) fn verify_recovery_directory_private(
+    directory: &Root,
+    expected: &std::fs::Metadata,
+) -> io::Result<()> {
+    let current = directory.metadata()?;
+    if !expected.is_dir()
+        || expected.uid() != unsafe { libc::geteuid() }
+        || expected.mode() & 0o7777 != 0o700
+        || !current.is_dir()
+        || current.dev() != expected.dev()
+        || current.ino() != expected.ino()
+        || current.uid() != expected.uid()
+        || current.gid() != expected.gid()
+        || current.mode() & 0o7777 != expected.mode() & 0o7777
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Recovery holding identity or private permissions changed",
+        ));
+    }
+    Ok(())
+}
+
 const MAX_CANDIDATES: usize = 8;
 const MAX_PARENT_WALK: usize = 256;
 
@@ -460,6 +487,43 @@ pub(crate) fn fixture_recovery_directory_preparation_failure<T: Send + 'static>(
 mod tests {
     use super::*;
     use std::{cell::Cell, fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn private_verification_preserves_original_identity_across_name_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("holding");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let held = Root::open(&path).unwrap();
+        let expected = held.metadata().unwrap();
+        fs::rename(&path, fixture.path().join("original")).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = Root::open(&path).unwrap();
+        verify_recovery_directory_private(&held, &expected).unwrap();
+        assert!(verify_recovery_directory_private(&replacement, &expected).is_err());
+        fs::write(fixture.path().join("original/payload"), b"owned").unwrap();
+        verify_recovery_directory_private(&held, &expected).unwrap();
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_verification_refuses_mode_drift_without_repair_or_new_baseline() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let held = Root::open(fixture.path()).unwrap();
+        let expected = held.metadata().unwrap();
+        for mode in [0o711, 0o1700, 0o2700] {
+            fs::set_permissions(fixture.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let observed = held.metadata().unwrap();
+            assert_ne!(observed.mode() & 0o7777, 0o700);
+            assert!(verify_recovery_directory_private(&held, &expected).is_err());
+            assert!(verify_recovery_directory_private(&held, &observed).is_err());
+            assert_eq!(held.metadata().unwrap().mode(), observed.mode());
+        }
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        verify_recovery_directory_private(&held, &expected).unwrap();
+    }
 
     fn context() -> (tempfile::TempDir, FilesystemRecoveryContext) {
         let source = tempfile::tempdir().unwrap();
