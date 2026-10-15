@@ -2477,10 +2477,15 @@ mod tests {
             &live,
             saved.clone(),
             ServerMessage::Response {
-                response: ServerResponse::UpgradeChatResolved { session: wrong_thread },
+                response: ServerResponse::UpgradeChatResolved {
+                    session: wrong_thread,
+                },
             },
         );
-        assert!(outcome.is_err(), "a confirmed replacement cannot change a saved known thread");
+        assert!(
+            outcome.is_err(),
+            "a confirmed replacement cannot change a saved known thread"
+        );
 
         // A replacement for a different chat proves nothing about this one.
         // A known conversation identifier remains part of its exact source.

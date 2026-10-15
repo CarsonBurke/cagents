@@ -7675,8 +7675,15 @@ mod tests {
         wrong_thread.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
         workspace.cards[0].kind = CardKind::Chat(wrong_thread.clone());
         assert!(lane.save(&store, &workspace).is_err());
-        assert!(store.rebind_chat_upgrade(card, &source, &wrong_thread).is_err());
-        assert_eq!(store.load_card(card, None).unwrap().unwrap().kind, CardKind::Chat(source.clone()));
+        assert!(
+            store
+                .rebind_chat_upgrade(card, &source, &wrong_thread)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
         workspace.cards[0].kind = CardKind::Chat(replacement.clone());
         for altered in 0..8 {
             let mut refused = replacement.clone();
