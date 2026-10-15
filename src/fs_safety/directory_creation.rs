@@ -508,6 +508,13 @@ impl DirectoryStage {
         if let Err(error)=set_directory_permissions(payload,mode|0o200) {
             return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false));
         }
+        let expected=preparation.pending_mode.unwrap();
+        let checked=payload.metadata().and_then(|current| {
+            if current.mode()&0o7777!=expected.temporary || current.uid()!=expected.uid || current.gid()!=expected.gid {
+                Err(io::Error::other("kernel did not retain exact temporary mode/ownership; refusing publication"))
+            } else {Ok(())}
+        });
+        if let Err(error)=checked {return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false));}
     }
     let outer=preparation.outer.as_ref().unwrap();
     if let Err(error)=rename_exclusive(outer,OsStr::new("directory"),&parent,&name) {
