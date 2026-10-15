@@ -1,4 +1,4 @@
-use crate::ui_controls::editable::{EditorHistoryCommand, EditorHistoryOwner};
+use crate::ui_controls::field::{EditorHistoryCommand, EditorHistoryOwner};
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
