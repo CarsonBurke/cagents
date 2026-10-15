@@ -5621,6 +5621,27 @@ mod tests {
         TerminalSession,
     };
 
+    // A historical fixture uses today's writer only while populating open
+    // cards. Remove these temporary retirement fields before exercising the
+    // actual old-schema migration, rather than stamping a v12 table as old.
+    fn add_legacy_writer_retirement_fields(connection: &Connection) {
+        connection.execute_batch("ALTER TABLE cards ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1));
+            CREATE TABLE closed_cards(card_id TEXT PRIMARY KEY NOT NULL);").unwrap();
+    }
+
+    fn remove_legacy_writer_retirement_fields(connection: &Connection) {
+        let closed: i64 = connection.query_row("SELECT count(*) FROM closed_cards", [], |row| row.get(0)).unwrap();
+        assert_eq!(closed, 0, "these legacy fixture builders contain only open cards");
+        connection.execute_batch("DROP TABLE closed_cards; ALTER TABLE cards DROP COLUMN retired;").unwrap();
+    }
+
+    fn remove_v12_fixture_schema(connection: &Connection) {
+        connection.execute_batch("DROP INDEX cards_active_workspace_order_idx;
+            DROP INDEX cards_retired_age_idx; DROP TABLE closed_card_archives;
+            DROP TABLE closed_terminal_claims; DROP TABLE closed_cards;
+            ALTER TABLE cards DROP COLUMN retired;").unwrap();
+    }
+
     fn boot(value: &str) -> BootId {
         BootId::new(value)
     }
@@ -7649,6 +7670,7 @@ mod tests {
         lane.save(&store, &workspace).unwrap();
         drop(store);
         let connection = Connection::open(&database).unwrap();
+        remove_v12_fixture_schema(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
@@ -7955,6 +7977,7 @@ mod tests {
             fidelity: BrowserRestoreFidelity::HistoryAndScroll,
         });
         workspace.cards.push(browser.clone());
+        add_legacy_writer_retirement_fields(&transaction);
         let commit = save_workspace_transaction(
             &transaction,
             &workspace,
@@ -7965,6 +7988,7 @@ mod tests {
             &mut RefusedClosures::new(),
         )
         .unwrap();
+        remove_legacy_writer_retirement_fields(&transaction);
         transaction.pragma_update(None, "user_version", 3).unwrap();
         transaction
             .execute_batch(
@@ -8040,6 +8064,7 @@ mod tests {
             fidelity: BrowserRestoreFidelity::HistoryAndScroll,
         });
         workspace.cards.push(browser.clone());
+        add_legacy_writer_retirement_fields(&transaction);
         let commit = save_workspace_transaction(
             &transaction,
             &workspace,
@@ -8059,6 +8084,7 @@ mod tests {
                 )
                 .is_err()
         );
+        remove_legacy_writer_retirement_fields(&transaction);
         transaction.pragma_update(None, "user_version", 5).unwrap();
         transaction
             .execute_batch(
@@ -8194,6 +8220,7 @@ mod tests {
         store.save_project(&project).unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
+        remove_v12_fixture_schema(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE projects DROP COLUMN kind_json;
@@ -8671,9 +8698,9 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            stored,
-            Some(to_json(&restored.channels).unwrap()),
-            "saving must keep writing the durable spelling an older build reads"
+            serde_json::from_str::<serde_json::Value>(&stored.expect("legacy navigation key remains stored")).unwrap(),
+            serde_json::to_value(&restored.channels).unwrap(),
+            "saving must retain the legacy key and complete JSON fields; object key order is not schema"
         );
         let reloaded = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(reloaded.channels, restored.channels);
@@ -8992,11 +9019,11 @@ mod tests {
             restored.cards[0].kind,
             CardKind::Terminal(replacement.clone())
         );
-        assert_eq!(
-            restored.cards[1].kind,
-            CardKind::Terminal(replacement.clone())
-        );
-        assert_eq!(restored.cards[1].existence, workspace.cards[1].existence);
+        assert_eq!(restored.cards.len(), 1, "committed closed history is not active workspace ownership");
+        let archived = store.load_card(history_card, None).unwrap().unwrap();
+        assert_eq!(archived.kind, CardKind::Terminal(replacement.clone()));
+        assert_eq!(archived.existence, workspace.cards[1].existence);
+        assert!(store.card_was_closed(history_card));
         workspace.cards[0].kind = CardKind::Terminal(replacement.clone());
         lane.save(&store, &workspace).unwrap();
         // Even after active ownership is released, an old closed snapshot
@@ -9300,7 +9327,7 @@ mod tests {
         let mut old_card = original.cards[0].clone();
         old_card.generation = resurrection.generation;
         resurrection.cards.push(old_card);
-        let error = lane.save(&store, &resurrection).unwrap_err();
+        let error = card_refusal(lane.save(&store, &resurrection), card_id);
         assert!(matches!(error, StoreError::InvalidState(_)));
     }
 
