@@ -3431,8 +3431,10 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
-            SidebarAction::ChangeViewport { scope, first_row, .. } => {
-                self.change_first_rows.insert(*scope, *first_row);
+            SidebarAction::ChangeViewport { key, scope, first_row } => {
+                if self.active_worktree.as_ref() == Some(key) {
+                    self.change_first_rows.insert(*scope, *first_row);
+                }
             }
             SidebarAction::RequestDiscard { key, request } => {
                 self.discard = Some(DiscardConfirmation {
@@ -16014,7 +16016,8 @@ pub(crate) mod tests {
         let group = &source.groups[0];
         let first = group.rows.first().unwrap().chrome.stage_id.to_string();
         let last = group.rows.last().unwrap().chrome.stage_id.to_string();
-        let mut state = SidebarState::default();
+        let model = panel_model();
+        let mut state = panel_state(&model);
         let ids = control_ids(&change_group_view(&state, &source, group, false));
         assert!(ids.contains(&first));
         assert!(!ids.contains(&last));
@@ -16027,6 +16030,11 @@ pub(crate) mod tests {
         assert!(ids.contains(&last));
         assert!(ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8, "mounted {} controls", ids.len());
         assert_eq!(group.rows.len(), 40_000, "virtualization retains the complete command model");
+        assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+        state.apply(&SidebarAction::ChangeViewport {
+            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984,
+        });
+        assert!(state.change_first_rows.is_empty(), "old worktree scroll callbacks cannot move the newly bound pane");
     }
 
     #[test]

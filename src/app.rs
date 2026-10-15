@@ -14289,6 +14289,7 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if matches!(&action, SidebarAction::FilesPage { key, .. }
+                    | SidebarAction::ChangeViewport { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
                     | SidebarAction::CommitMessageChanged { key, .. }
