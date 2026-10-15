@@ -2149,6 +2149,7 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::Space => Key::Named(Named::Space),
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
+        ShortcutKey::End => Key::Named(Named::End),
         ShortcutKey::Function(number) => Key::Named(match number {
             1 => Named::F1,
             2 => Named::F2,
@@ -2871,6 +2872,7 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageDown)
             ),
+            ShortcutKey::End => matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::End)),
             ShortcutKey::Function(number) => {
                 use keyboard::key::Named;
                 let keys = [

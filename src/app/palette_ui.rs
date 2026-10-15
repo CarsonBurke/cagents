@@ -695,6 +695,7 @@ impl Cagents {
                         keyboard::key::Named::Tab => Some("Tab".into()),
                         keyboard::key::Named::PageUp => Some("PageUp".into()),
                         keyboard::key::Named::PageDown => Some("PageDown".into()),
+                        keyboard::key::Named::End => Some("End".into()),
                         keyboard::key::Named::F1
                         | keyboard::key::Named::F2
                         | keyboard::key::Named::F3

@@ -1651,6 +1651,7 @@ pub enum ShortcutKey {
     Space,
     PageUp,
     PageDown,
+    End,
     Function(u8),
 }
 
@@ -1697,6 +1698,8 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
                 Some(ShortcutKey::PageDown)
+            } else if token.eq_ignore_ascii_case("end") {
+                Some(ShortcutKey::End)
             } else if token.eq_ignore_ascii_case("comma") {
                 Some(ShortcutKey::Character(','))
             } else if token.eq_ignore_ascii_case("plus") {
@@ -1718,7 +1721,7 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
+                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, Space, PageUp, PageDown, End, or F1-F12 (use Comma and Plus for separator keys)",
                         );
                     }
                 }
@@ -1769,6 +1772,7 @@ pub fn shortcut_search_keywords(value: &str) -> String {
                 ShortcutKey::Space => "Space".into(),
                 ShortcutKey::PageUp => "PageUp".into(),
                 ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::End => "End".into(),
                 ShortcutKey::Function(number) => format!("F{number}"),
             });
             parts.join("+")
@@ -5569,6 +5573,7 @@ new_thread = "Alt+Shift+G"
             parse_shortcut("Ctrl+Shift+PageDown").unwrap().key,
             ShortcutKey::PageDown
         );
+        assert_eq!(parse_shortcut("Ctrl+End").unwrap().key, ShortcutKey::End);
         // Shift+PageUp scrolls a terminal's own scrollback.
         assert!(parse_shortcut("Shift+PageUp").is_err());
 
