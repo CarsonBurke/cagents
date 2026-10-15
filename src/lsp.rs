@@ -9018,4 +9018,16 @@ mod tests {
         next_matching(&events,|e|match e{LspEvent::WorkspaceEdit{request:r,..}if *r==request=>Some(()),_=>None}).await;
         let entries=handle.log.lock().unwrap();let change=entries.iter().position(|e|e.method=="textDocument/didChange"&&e.params["textDocument"]["uri"]==json!(other_uri)).unwrap();let rename=entries.iter().position(|e|e.method=="textDocument/rename").unwrap();assert!(change<rename);drop(entries);manager.begin_shutdown().await;
     });}
+
+    #[test]
+    fn oversized_code_action_lists_and_titles_report_terminal_failure(){block_on(async{
+        let (_guard,worktree,file)=workspace();let mut manager=rust_manager();let request_count=Arc::new(AtomicUsize::new(0));let count=Arc::clone(&request_count);
+        let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"codeActionProvider":true}),move|request|{
+            if request.method!="textDocument/codeAction"{return vec![];}
+            let result=if count.fetch_add(1,Ordering::Relaxed)==0{json!(vec![json!({"title":"Fix"});513])}else{json!([{"title":"x".repeat(4097)}])};
+            vec![json!({"jsonrpc":"2.0","id":request.id,"result":result})]
+        });let events=manager.events();let doc=LspDocumentId(1);manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo\n");let _handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        for _ in 0..2 {let request=manager.request_code_actions(doc,LspRange::default(),&[]);next_matching(&events,|e|match e{LspEvent::RequestFailed{request:r,error:LspError::Unsupported(_),..}if *r==request=>Some(()),_=>None}).await;}
+        manager.begin_shutdown().await;
+    });}
 }
