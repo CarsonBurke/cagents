@@ -7963,6 +7963,8 @@ impl Cagents {
                 .map(|chrome| chrome.focus_id.clone())
                 .unwrap_or_else(|| workspace_widget::card_focus_id(card)),
             Some(CardRuntime::Chat(runtime)) => card_control_id(card, runtime.focus_control()),
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => card_control_id(card, "browser.content"),
             Some(CardRuntime::Repository(runtime)) => match runtime.editor_focus_target(card) {
                 Some(_) if runtime.find_is_open() => repository_widget::find_focus_id(card),
                 Some(target) => target,
@@ -8083,6 +8085,13 @@ impl Cagents {
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
         let focus_changed = self.durable.focused != focused;
+        #[cfg(feature = "integrated-browser")]
+        if focus_changed {
+            // Parked trees cannot observe the native focus operation.
+            if let Some(CardRuntime::Browser(browser)) = self.durable.focused.and_then(|id| self.cards.get(&id)) {
+                let _ = browser.handle.set_focused(false);
+            }
+        }
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
             apply_durable_viewport_update(
@@ -9243,9 +9252,11 @@ impl Cagents {
             }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
+                .id(card_control_id(id, "browser.content"))
                 .obscured(self.workspace_inputs_blocked())
                 .on_shortcut(move |event| browser_shortcut(id, &event))
-                .model_focused(card_focused)
+                .model_focused(focused)
+                .window_focused(self.refresh_ui.focused)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(effective_surface_scale(
                     self.window_scale_factor,
