@@ -8721,7 +8721,8 @@ mod tests {
 
     #[test]
     fn denying_with_composer_instructions_clears_only_the_acknowledged_draft() {
-        let instructions="  use git push --force-with-lease instead\n\nKeep existing changes.  \n\n";
+        let instructions =
+            "  use git push --force-with-lease instead\n\nKeep existing changes.  \n\n";
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("approval"));
         let target = {
@@ -8754,9 +8755,7 @@ mod tests {
             Some(Command::Answer {
                 request_id: "approval".into(),
                 action: "deny".into(),
-                answers: vec![chat::Answer::denial_instructions(
-                    instructions.into()
-                )],
+                answers: vec![chat::Answer::denial_instructions(instructions.into())],
             })
         );
         drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
@@ -8768,10 +8767,7 @@ mod tests {
         assert_eq!(pending.request.as_deref(), Some("approval"));
         let command_id = pending.id;
         let next = runtime.next_command;
-        assert_eq!(
-            runtime.composer.text(),
-            instructions
-        );
+        assert_eq!(runtime.composer.text(), instructions);
         drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
         assert_eq!(
             chat_runtime(&app, card).next_command,
