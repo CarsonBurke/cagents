@@ -108,6 +108,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatProviderExitOutput { .. }
         }
     )
 }
@@ -507,6 +508,7 @@ mod tests {
                 chat_id,
                 state,
                 generation,
+                outcome: None,
             };
             queue.push(envelope.clone()).unwrap();
         }

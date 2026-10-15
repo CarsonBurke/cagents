@@ -143,7 +143,9 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
+/// Version 79 pages immutable retained provider output by opaque log identity.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -472,6 +474,12 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Read one bounded page from an opaque, immutable provider-exit log.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,6 +651,7 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// A terminal some other client created, delivered only to a connection
     /// that subscribed with [`ClientRequest::WatchTerminals`].
@@ -778,6 +787,16 @@ pub enum ServerResponse {
     ChatFileChangePatches {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
+    },
+    /// Raw pages preserve UTF-8 and ANSI sequences across frame boundaries;
+    /// the requesting client cleans the complete bounded output once.
+    ChatProviderExitOutput {
+        chat_id: TerminalId,
+        log_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+        next_offset: Option<u64>,
+        omitted: u64,
     },
 }
 
@@ -1594,6 +1613,17 @@ impl FrameCodec {
         &mut self,
         reader: &mut impl Read,
     ) -> Result<Option<T>, FrameError> {
+        self.read_with(reader, |payload| postcard::from_bytes(payload))
+    }
+
+    /// Inspect a complete frame without first allocating its owned wire type.
+    /// The callback cannot retain a borrow of the connection's scratch buffer.
+    /// Length validation and partial-read resumption are identical to `read`.
+    pub(crate) fn read_with<T>(
+        &mut self,
+        reader: &mut impl Read,
+        decode: impl FnOnce(&[u8]) -> Result<T, postcard::Error>,
+    ) -> Result<Option<T>, FrameError> {
         let length = if let Some(length) = self.payload_length {
             length
         } else {
@@ -1640,7 +1670,7 @@ impl FrameCodec {
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
-        let value = postcard::from_bytes(&self.read_buffer[..length]);
+        let value = decode(&self.read_buffer[..length]);
         self.prefix_read = 0;
         self.payload_length = None;
         self.payload_read = 0;
@@ -1852,6 +1882,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activity_ipc_preserves_failed_outcome_and_reason() {
+        let message = ServerMessage::ChatActivity {
+            chat_id: TerminalId::new(),
+            state: crate::agent::ActivityState::Idle,
+            generation: 42,
+            outcome: Some(crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            }),
+        };
+        let binary = postcard::to_stdvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
+        let json = serde_json::to_value(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
+    }
+
+    #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
         struct TimeoutReader {
             bytes: Vec<u8>,
@@ -1907,6 +1959,25 @@ mod tests {
             Some("next frame".into())
         );
         assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn raw_frame_callback_rejection_preserves_next_frame_and_eof() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &vec![255u8; 32]).unwrap();
+        write_frame(&mut bytes, &"next valid frame").unwrap();
+        let mut input = Cursor::new(bytes);
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let result: Result<Option<()>, FrameError> = codec.read_with(&mut input, |payload| {
+            assert_eq!(payload.len(), 33);
+            Err(postcard::Error::DeserializeBadEncoding)
+        });
+        assert!(matches!(result, Err(FrameError::InvalidPayload(_))));
+        assert_eq!(
+            codec.read::<String>(&mut input).unwrap(),
+            Some("next valid frame".into())
+        );
+        assert_eq!(codec.read::<String>(&mut input).unwrap(), None);
     }
 
     #[test]
