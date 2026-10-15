@@ -9427,6 +9427,7 @@ fn history_section<'a>(
             .on_submit(move |query| SidebarAction::SearchHistory { key: submit_key.clone(), query });
     }
     column = column.push(search);
+    column = column.push(design::caption("Paste a commit SHA from another branch to find it here."));
     if let Some((oid, name)) = &state.history_branch {
         let branch_key = key.clone();
         let create = ValidatedBranchName::parse(name.clone()).ok().map(|name| SidebarAction::CreateHistoryBranch { key: key.clone(), oid: oid.clone(), name });

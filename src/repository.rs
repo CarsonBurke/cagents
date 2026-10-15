@@ -4945,8 +4945,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parsed, output)
     }
 
+    /// Resolve a pasted commit SHA even when another branch owns the commit.
+    /// Restrict this extra lookup to hexadecimal prefixes; ordinary queries
+    /// remain literal message/author text and never become revision syntax.
+    fn history_sha_match(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CommitSummary>, RepositoryError> {
+        if !(4..=64).contains(&query.len()) || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)? else { return Ok(None); };
+        let pinned = HistoryRequest { revision: HistoryRevision::Object { oid }, page: 0, ..request.clone() };
+        Ok(self.history(&pinned, cancellation)?.into_iter().next().filter(|commit| history_matches(commit, query)))
+    }
+
     /// Literal, case-insensitive OR search across message, author and SHA prefix.
     /// Walk bounded pages on the reader worker so matches can occur anywhere in history.
+    /// A pasted SHA can also name a commit on a sibling branch, allowing a
+    /// selected change to be cherry-picked into the current worktree.
     pub fn filtered_history(
         &self,
         request: &HistoryRequest,
@@ -4955,16 +4974,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
         let query = query.trim().to_lowercase();
         if query.is_empty() { return self.history(request, cancellation); }
-        let Some(start) = self.history_start(request, cancellation)? else { return Ok(Vec::new()); };
+        let candidate = self.history_sha_match(request, &query, cancellation)?;
+        let candidate_oid = candidate.as_ref().map(|commit| commit.oid.clone());
+        let start = self.history_start(request, cancellation)?;
         let mut walk = request.clone();
-        walk.revision = HistoryRevision::Object { oid: start };
+        if let Some(start) = &start { walk.revision = HistoryRevision::Object { oid: start.clone() }; }
         walk.page = 0;
         let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
         let mut matches = Vec::new();
+        if let Some(candidate) = candidate {
+            if skip > 0 { skip -= 1; } else { matches.push(candidate); }
+        }
         loop {
-            let commits = self.history(&walk, cancellation)?;
+            let commits = if start.is_some() { self.history(&walk, cancellation)? } else { Vec::new() };
             let complete = commits.len() < HISTORY_PAGE_SIZE as usize;
             for commit in commits {
+                if candidate_oid.as_ref() == Some(&commit.oid) { continue; }
                 if history_matches(&commit, &query) {
                     if skip > 0 { skip -= 1; }
                     else { matches.push(commit); }
@@ -8651,6 +8676,46 @@ mod tests {
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn history_sha_search_finds_a_sibling_commit_for_cherry_pick_and_revert() {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("source");
+            let target = fixture.path().join("target");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("base.txt"), "baseline\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "baseline"]);
+            git(&root, &["branch", "target"]);
+            fs::write(root.join("agent-change.txt"), "selected agent change\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-m", "Fix from another branch", "-m", "Multiline body for the selected change"]);
+            let service = service();
+            let cancel = CancellationToken::new();
+            let source = service.resolve_head(&root, &cancel).unwrap().unwrap();
+            git(&root, &["worktree", "add", target.to_str().unwrap(), "target"]);
+            fs::write(target.join("target-only.txt"), "preserve target\n").unwrap();
+            git(&target, &["add", "."]);
+            git(&target, &["commit", "-m", "Independent target change"]);
+            let request = HistoryRequest { worktree: target.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert!(!service.history(&request, &cancel).unwrap().iter().any(|commit| commit.oid == source));
+            for query in [source.as_str(), &source.as_str()[..8]] {
+                let found = service.filtered_history(&request, query, &cancel).unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].oid, source);
+                assert!(found[0].body.contains("Multiline body"));
+            }
+            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
+            let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
+            assert_ne!(picked, source);
+            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(!target.join("agent-change.txt").exists());
+            assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
+            assert!(root.join("agent-change.txt").exists());
+            assert_eq!(service.filtered_history(&request, source.as_str(), &cancel).unwrap().len(), 1);
         }
 
         fn git(directory: &Path, arguments: &[&str]) {
