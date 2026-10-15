@@ -142,12 +142,17 @@ pub(crate) struct CloseObservation {
     pub closing: bool,
     pub owns_work: bool,
     pub working_directory: std::path::PathBuf,
+    pub directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
 }
 
 struct CloseState {
     actor_id: uuid::Uuid,
     revision: u64,
     admitted_work: bool,
+    compacting: bool,
+    unobserved_native: bool,
+    directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
+    _directory: Option<Arc<std::fs::File>>,
     working_directory: std::path::PathBuf,
 }
 
@@ -296,6 +301,28 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // A live actor's close authority follows the physical directory it
+        // entered, never a launch alias that can be retargeted afterwards.
+        // Adopted legacy providers have no actor-owned admission observation.
+        let scope_observed = !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+            && !matches!(spec.transport, TransportSpec::History | TransportSpec::UnixWebSocket { .. });
+        let directory_identity = if scope_observed {
+            spec.working_directory = std::fs::canonicalize(&spec.working_directory)
+                .map_err(|error| format!("Cannot resolve provider execution directory: {error}"))?;
+            if spec.execution.is_none() {
+                let directory = std::fs::File::open(&spec.working_directory)
+                    .map_err(|error| format!("Cannot pin provider execution directory: {error}"))?;
+                spec.execution = Some(Arc::new(super::protocol::ExecutionContext::new(Some(Arc::new(directory)))));
+            }
+            let context = spec.execution.as_ref().unwrap();
+            context.verify_directory(&spec.working_directory)?;
+            context.directory_descriptor().as_ref().map(|directory|directory.metadata()
+                .map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata)))
+                .transpose().map_err(|error|error.to_string())?
+        } else { None };
+        // Keep the admitted inode alive even after the actor completes. Numeric
+        // identities alone can be recycled after a directory is removed.
+        let close_directory=if scope_observed {spec.execution.as_ref().and_then(|context|context.directory_descriptor())} else {None};
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -359,7 +386,7 @@ impl LocalHandle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
-        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,working_directory:spec.working_directory.clone()}));
+        let close_state=Arc::new(Mutex::new(CloseState {actor_id:uuid::Uuid::new_v4(),revision:0,admitted_work:false,compacting:false,unobserved_native:false,directory_identity,_directory:close_directory,working_directory:if scope_observed {spec.working_directory.clone()} else {Default::default()}}));
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
@@ -606,6 +633,7 @@ impl LocalHandle {
                 let code = status.and_then(|status| status.code());
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
+                        actor.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=true;
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
@@ -614,6 +642,7 @@ impl LocalHandle {
                     {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
+                        actor.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=true;
                         false
                     } else {
                         true
@@ -823,14 +852,16 @@ impl LocalHandle {
         let owns_work=self.owns_work();
         let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
         let close=self.0.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        let activity=if (close.admitted_work || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
-        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready,exited:state.exited,completed:self.is_completed(),closing:self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire),owns_work,working_directory:close.working_directory.clone()}
+        let activity=if close.unobserved_native {ActivityState::Unknown} else if (close.admitted_work || close.compacting || !state.queued.is_empty()) && !state.exited {ActivityState::Working} else {state.activity()};
+        CloseObservation {actor_id:close.actor_id,close_revision:close.revision,turn_generation:state.turn_generation,activity,ready:state.ready&&!close.unobserved_native,exited:state.exited&&!close.unobserved_native,completed:self.is_completed(),closing:!close.unobserved_native&&(self.0.stop.load(Ordering::Acquire)||self.0.draining.load(Ordering::Acquire)),owns_work:owns_work||close.unobserved_native,working_directory:close.working_directory.clone(),directory_identity:close.directory_identity}
     }
 
     /// The actor compares consent with all earlier admitted commands before
     /// fencing further work. Call outside HostLock; joining may take time.
     pub(crate) fn close_if_revision(&self, revision:u64) -> Result<(),String> {
+        if self.close_observation().directory_identity.is_none() {return Err("The provider execution scope is not authoritatively observed; reattach before confirming close".into());}
         if self.is_completed() {
+            if self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {return Err("Retained provider work is not observed by this actor; reattach the session before confirming close".into());}
             if self.close_observation().close_revision!=revision {return Err("Provider work changed before conditional close".into());}
         } else {
             self.ownership_command(ActorCommand::CloseIfRevision {revision})?;
@@ -1341,6 +1372,8 @@ impl LocalHandle {
                 detached.take();
             }
         }
+        let unobserved_native=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner()).is_some() || self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner()).is_some();
+        self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=unobserved_native;
         if self.is_completed() {
             return Ok(());
         }
@@ -1868,8 +1901,12 @@ impl Actor {
     fn record_execution_directory(&mut self,directory:&std::path::Path) {
         let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        if close.working_directory!=directory {
+        let pinned=self.launch_context.as_ref().and_then(|context|context.directory_descriptor());
+        let identity=pinned.as_ref().and_then(|pinned|pinned.metadata().ok()).map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata));
+        if close.working_directory!=directory || close.directory_identity!=identity {
             close.working_directory=directory.into();
+            close.directory_identity=identity;
+            close._directory=pinned;
             close.revision=close.revision.saturating_add(1);
         }
     }
@@ -2335,7 +2372,7 @@ impl Actor {
                 ActorCommand::CloseIfRevision {revision} => {
                     let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                     let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-                    let unchanged=close.revision==revision;
+                    let unchanged=close.revision==revision && close.directory_identity.is_some();
                     if unchanged {self.stop.store(true,Ordering::Release);}
                     let _=reply.send(if unchanged {Ok(())} else {Err("Provider work changed before conditional close".into())});
                     continue;
@@ -2386,7 +2423,8 @@ impl Actor {
                 None
             };
             let starts_turn = matches!(&command, Command::Prompt { .. });
-            let starts_new_work=matches!(&command,Command::Prompt{..}|Command::Compact|Command::Slash{..}|Command::StartQueued{..}|Command::Branch{..});
+            let compacts = matches!(&command, Command::Compact);
+            let starts_new_work=matches!(&command,Command::Prompt{..}|Command::Slash{..}|Command::StartQueued{..}|Command::Branch{..});
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2428,6 +2466,7 @@ impl Actor {
                 Ok(step) => {
                     effects.possible();
                     let acknowledgement = self.adapter.command_ack();
+                    let compaction_finished=step.events.iter().any(|event|matches!(event,Event::Compaction{active:false}));
                     let observed_boundary=step.events.iter().any(|event|matches!(event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}));
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
@@ -2438,6 +2477,7 @@ impl Actor {
                         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                         close.revision=close.revision.saturating_add(1);
                         close.admitted_work |= starts_new_work && !observed_boundary;
+                        close.compacting |= compacts && !compaction_finished;
                     }
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
@@ -2472,7 +2512,8 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.control_replies.is_empty() || !self.close_input_is_clear() {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.is_working() || state.waiting || !state.requests.is_empty()
+            || {let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());close.admitted_work || close.compacting} {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle
@@ -2680,6 +2721,15 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if let Event::Compaction { active } = &event {
+            let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+            if *active && !close.compacting {close.revision=close.revision.saturating_add(1);}
+            close.compacting=*active;
+            return;
+        }
+        if matches!(&event,Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
+            self.close_state.lock().unwrap_or_else(|p|p.into_inner()).compacting=false;
+        }
         // Clear terminal admission markers before attention reducers that may
         // consume terminal events without retaining them in presentation.
         if matches!(&event,Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}|Event::Reset{..}) {
@@ -3091,7 +3141,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
         Event::HistoryError(message) => state.error = Some(message),
-        Event::HistoryRecovered => {}
+        Event::HistoryRecovered | Event::Compaction { .. } => {}
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
@@ -3912,6 +3962,34 @@ mod tests {
     }
 
     #[test]
+    fn close_scope_keeps_the_physical_admitted_directory_after_alias_retarget() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let original=root.path().join("original");
+        let replacement=root.path().join("replacement");
+        let alias=root.path().join("alias");
+        std::fs::create_dir(&original).unwrap(); std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original,&alias).unwrap();
+        let expected=crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&original).unwrap());
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:alias.clone(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Idle),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&replacement,&alias).unwrap();
+        let observed=handle.close_observation();
+        assert_eq!(observed.working_directory,original);
+        assert_eq!(observed.directory_identity,Some(expected));
+        assert_ne!(observed.working_directory,std::fs::canonicalize(&alias).unwrap());
+        handle.close_if_revision(observed.close_revision).unwrap();
+    }
+
+    #[test]
     fn conditional_close_refuses_new_admitted_or_autonomous_work_but_allows_streaming() {
         struct Consent;
         impl Adapter for Consent {
@@ -3921,7 +3999,7 @@ mod tests {
                     Command::Prompt{..}=>Vec::new(),
                     Command::SetFastMode{..}=>vec![Event::TextDelta{id:"stream".into(),role:Role::Assistant,thinking:false,delta:"more text".into()}],
                     Command::SetModel{..}=>vec![Event::TurnStarted],
-                    Command::Compact=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Succeeded},Event::Status{busy:false,detail:String::new()}],
+                    Command::Compact=>vec![Event::Compaction{active:true},Event::Compaction{active:false},Event::Status{busy:false,detail:String::new()}],
                     Command::Interrupt=>vec![Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled},Event::Status{busy:false,detail:String::new()}],
                     _=>return Err("Unexpected consent fixture command".into()),
                 };
@@ -3950,7 +4028,13 @@ mod tests {
         handle.command(Command::SetFastMode{enabled:true}).unwrap();
         assert_eq!(handle.close_observation().close_revision,admitted.close_revision,"ordinary stream updates preserve consent for the same work");
         handle.command(Command::Compact).unwrap();
-        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"a terminal result clears an admitted prompt even without TurnStarted");
+        assert_eq!(handle.close_observation().activity,ActivityState::Working,"maintenance completion and idle status cannot release a previously accepted prompt");
+        handle.command(Command::Interrupt).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"the prompt's own terminal result clears its admission marker without TurnStarted");
+        let idle_generation=handle.close_observation().turn_generation;
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Idle,"explicit maintenance completion releases only its own admission");
+        assert_eq!(handle.close_observation().turn_generation,idle_generation,"compaction creates no prompt completion");
         handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap();
         let autonomous=handle.close_observation();
         assert!(autonomous.close_revision>admitted.close_revision);
@@ -4010,6 +4094,27 @@ mod tests {
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
         handle.close_if_revision(handle.close_observation().close_revision).unwrap();
+    }
+
+    #[test]
+    fn unobserved_native_ownership_stays_visible_without_waiting_for_holder_io() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);handle.close().unwrap();
+        // Model the resident ownership marker published by retained teardown.
+        handle.0.close_state.lock().unwrap().unobserved_native=true;
+        let holder_io=handle.0.retained_native.lock().unwrap();
+        let observer=handle.clone();let (send,receive)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move||{send.send(observer.close_observation()).unwrap();});
+        let observation=receive.recv_timeout(Duration::from_secs(1));
+        drop(holder_io);worker.join().unwrap();
+        let observation=observation.expect("resident census must not acquire the holder's IO mutex");
+        assert!(observation.completed && observation.owns_work);
+        assert_eq!(observation.activity,ActivityState::Unknown);
+        assert!(!observation.ready && !observation.exited && !observation.closing);
+        assert!(handle.close_if_revision(observation.close_revision).unwrap_err().contains("reattach"));
+        handle.0.close_state.lock().unwrap().unobserved_native=false;
     }
 
     #[test]
