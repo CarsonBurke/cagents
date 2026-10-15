@@ -3,6 +3,7 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
+mod deferred;
 mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;

@@ -263,6 +263,16 @@ pub(crate) fn verified_codex_version(user_agent: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_source() -> super::Session {
+    tests::recovery().source
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_identity() -> super::protocol::ServerIdentity {
+    tests::server_identity()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -393,6 +403,9 @@ mod tests {
     fn terminal_holder(source: &super::super::Session) -> crate::terminal::holder::Record {
         crate::terminal::holder::Record {
             version: 4,
+            build: Some(crate::daemon::holder_registry::BuildIdentity::current(
+                crate::daemon::holder_registry::Kind::Terminal,
+            )),
             kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot: source.proof.as_ref().unwrap().boot_id.clone(),

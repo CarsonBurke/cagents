@@ -22,6 +22,11 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
+#[cfg(any(feature = "ui", feature = "host"))]
+#[path = "chat/protocol/terminal_output.rs"]
+pub(crate) mod terminal_output;
 
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
@@ -874,6 +879,8 @@ pub struct Snapshot {
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
     pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub outcome: Option<crate::agent::ActivityOutcome>,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
@@ -900,6 +907,8 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub provider_exit: Option<ProviderExitDiagnostic>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
     #[serde(default)]
@@ -944,6 +953,25 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+}
+
+/// Readable provider failure with a separately expandable bounded stderr tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitDiagnostic {
+    pub summary: String,
+    /// Last 64 KiB of readable stderr, independent of retained-log availability.
+    pub output: String,
+    #[serde(default)]
+    pub log: Option<ProviderExitLog>,
+}
+
+/// Opaque retained diagnostic identity. Full output is loaded only on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitLog {
+    pub id: String,
+    pub bytes: u64,
+    /// Raw bytes beyond the per-session disk cap or lost after a write failure.
+    pub omitted: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1079,6 +1107,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 item_id,
                 role,
                 thinking,
+                delta,
+            }],
+            Event::InputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentInputDelta {
+                id: id.into(),
+                item_id,
+                offset,
                 delta,
             }],
             Event::OutputDelta {
@@ -1917,6 +1955,19 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    ProviderExit(ProviderExitDiagnostic),
+    InputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
+    SubagentInputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2052,10 +2103,61 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// A delayed result for an already superseded turn: notifications only.
+    /// It must not settle current activity, requests, tools or completion time.
+    PastTurnFinished {
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
+        use crate::agent::ActivityOutcome;
+        for outcome in [
+            ActivityOutcome::Succeeded,
+            ActivityOutcome::Cancelled,
+            ActivityOutcome::Failed {
+                reason: "Provider exited with status 3: authentication failed".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "Provider exited with status 0 before its final result".into(),
+            },
+        ] {
+            let snapshot = super::Snapshot {
+                outcome: Some(outcome),
+                provider_exit: Some(super::ProviderExitDiagnostic {
+                    summary: "Provider exited with status 3. Restart session to continue.".into(),
+                    output: "First diagnostic\nAuthentication failed\n".into(),
+                    log: None,
+                }),
+                ..Default::default()
+            };
+            let binary = postcard::to_stdvec(&snapshot).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<super::Snapshot>(&binary).unwrap(),
+                snapshot
+            );
+            let json = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::Snapshot>(json).unwrap(),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_json_defaults_absent_provider_outcome_and_diagnostic() {
+        let mut legacy = serde_json::to_value(super::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("outcome");
+        legacy.as_object_mut().unwrap().remove("provider_exit");
+        let restored: super::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.outcome.is_none());
+        assert!(restored.provider_exit.is_none());
+    }
+
     #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});

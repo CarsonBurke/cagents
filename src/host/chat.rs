@@ -385,6 +385,13 @@ fn attached_mut(
     Ok(record)
 }
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    if matches!(&update, Update::PastAttention(_)) {
+        // Session notifications coalesce by the current session target. An
+        // older result cannot replace a newer actionable question, nor can it
+        // borrow rich context from the current snapshot. Managed lifecycle
+        // evidence is delivered separately with its exact accepted RunId.
+        return;
+    }
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -448,10 +455,15 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     };
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
-            &Update::Activity { state, generation } => ServerMessage::ChatActivity {
-                chat_id: id,
+            Update::Activity {
                 state,
                 generation,
+                outcome,
+            } => ServerMessage::ChatActivity {
+                chat_id: id,
+                state: *state,
+                generation: *generation,
+                outcome: outcome.clone(),
             },
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
             &Update::Observed { generation } if !visible => {
@@ -1947,6 +1959,29 @@ fn confirm_account_conversation(
     }
 }
 
+pub(super) fn enqueue_deferred(
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+) -> Result<crossbeam_channel::Receiver<Result<(), String>>, ProtocolError> {
+    let mut pending = None;
+    super::agent_execution::try_interactive(host, client, request, |request| {
+        let ClientRequest::ChatCommand { chat_id, command } = request else {
+            return Err(error("Expected a provider control command"));
+        };
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down {
+                return Err(unavailable("Daemon is shutting down"));
+            }
+            attached(&state, client, chat_id)?.handle.clone()
+        };
+        pending = Some(handle.enqueue_command(command).map_err(unavailable)?);
+        Ok(ServerResponse::Accepted)
+    })?;
+    pending.ok_or_else(|| error("Provider control was not admitted"))
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
@@ -2173,6 +2208,28 @@ fn process_inner(
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
             Ok(ServerResponse::Detached)
+        }
+        ClientRequest::ChatProviderExitOutput {
+            chat_id,
+            log_id,
+            offset,
+        } => {
+            let handle = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                attached(&state, client, chat_id)?.handle.clone()
+            };
+            // Disk reads never hold HostLock and remain available after exit.
+            let (bytes, next_offset, omitted) = handle
+                .provider_exit_output(&log_id, offset)
+                .map_err(unavailable)?;
+            Ok(ServerResponse::ChatProviderExitOutput {
+                chat_id,
+                log_id,
+                offset,
+                bytes,
+                next_offset,
+                omitted,
+            })
         }
         ClientRequest::ChatCommand { chat_id, command } => {
             let handle = {
