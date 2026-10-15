@@ -1940,13 +1940,21 @@ mod tests {
 
     #[test]
     fn raw_frame_callback_rejection_preserves_next_frame_and_eof() {
-        let mut bytes=Vec::new();write_frame(&mut bytes,&vec![255u8;32]).unwrap();write_frame(&mut bytes,&"next valid frame").unwrap();
-        let mut input=Cursor::new(bytes);let mut codec=FrameCodec::new(MAX_FRAME_BYTES);
-        let result:Result<Option<()>,FrameError>=codec.read_with(&mut input,|payload| {
-            assert_eq!(payload.len(),33);Err(postcard::Error::DeserializeBadEncoding)
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &vec![255u8; 32]).unwrap();
+        write_frame(&mut bytes, &"next valid frame").unwrap();
+        let mut input = Cursor::new(bytes);
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let result: Result<Option<()>, FrameError> = codec.read_with(&mut input, |payload| {
+            assert_eq!(payload.len(), 33);
+            Err(postcard::Error::DeserializeBadEncoding)
         });
-        assert!(matches!(result,Err(FrameError::InvalidPayload(_))));
-        assert_eq!(codec.read::<String>(&mut input).unwrap(),Some("next valid frame".into()));assert_eq!(codec.read::<String>(&mut input).unwrap(),None);
+        assert!(matches!(result, Err(FrameError::InvalidPayload(_))));
+        assert_eq!(
+            codec.read::<String>(&mut input).unwrap(),
+            Some("next valid frame".into())
+        );
+        assert_eq!(codec.read::<String>(&mut input).unwrap(), None);
     }
 
     #[test]
