@@ -1253,7 +1253,7 @@ impl Registry {
                 );
             }
         }
-        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        require_agent_placement(&tx, &agent)?;
         if agent.console.is_some() {
             agent.console = receipt.replacement().terminal.clone();
         }
@@ -3275,11 +3275,28 @@ mod tests {
 
     #[test]
     fn console_restart_preserves_acceptance_runs_and_capability_and_fences_stale_pair() {
-        let (mut registry, _directory, request) = fixture();
+        assert_console_restart_preserves_acceptance(false);
+    }
+    #[test]
+    fn located_console_restart_rebinds_current_placement_without_rewriting_issued_provenance() {
+        assert_console_restart_preserves_acceptance(true);
+    }
+    fn assert_console_restart_preserves_acceptance(locate: bool) {
+        let (mut registry, directory, mut request) = fixture();
+        let old = directory.path().join("issued-project");
+        if locate {
+            std::fs::create_dir(&old).unwrap();
+            registry.apply(&ModelEdit::OpenProject {repository:old.clone(),name:"Issued".into(),kind:ProjectKind::Folder}).unwrap();
+            let Destination::New(spec) = &mut request.destination else {unreachable!()};
+            spec.target.repository = old.clone(); spec.target.directory = old.clone();
+        }
         let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
         let HostedSession::Chat(mut original) = source() else {
             unreachable!()
         };
+        original.launch.recipe.working_directory = accepted.agent.spec.target.directory.clone();
+        let issued_recipe = original.launch.recipe.clone();
+        let issued_spec = accepted.agent.spec.clone();
         let issued = HostedSession::Chat(original.clone());
         registry
             .bind_agent(accepted.agent.id, None, issued.clone())
@@ -3309,8 +3326,22 @@ mod tests {
             .bind_agent_console(accepted.agent.id, &issued, terminal.clone())
             .unwrap();
         original.terminal = Some(terminal);
-        let before = registry.agent(accepted.agent.id).unwrap();
         let run = registry.agent_run(accepted.run.id).unwrap();
+        if locate {
+            let approved = registry.agent_directory(accepted.agent.id).unwrap();
+            let moved = directory.path().join("located-project");
+            std::fs::rename(&old, &moved).unwrap();
+            let relocation = crate::project_recovery::Relocation {repository:old.clone(),destination:moved.clone(),old_root:old,new_root:moved.clone()};
+            let evidence = registry.agent_relocation_inputs(&relocation).unwrap().into_iter().map(super::super::agent_locations::RelocationInput::verify).collect::<Vec<_>>();
+            registry.apply_with_location_moves(&ModelEdit::RelocateProject {relocation}, &[], &evidence).unwrap();
+            assert_eq!(registry.agent_location(accepted.agent.id).unwrap().repository, moved);
+            assert_eq!(registry.agent_execution_directory(accepted.agent.id).unwrap(), moved);
+            assert_eq!(registry.agent_directory(accepted.agent.id).unwrap(), approved, "Locate retained the approved physical inode");
+            let current = registry.agent(accepted.agent.id).unwrap();
+            assert_eq!(current.spec, issued_spec);
+            assert!(require_placement(&registry.db,&current.placement,&issued_spec.target.repository).is_err(), "the issued repository no longer owns the relocated channel");
+        }
+        let before = registry.agent(accepted.agent.id).unwrap();
         let mut replacement = original.clone();
         replacement.terminal.as_mut().unwrap().transcript_path =
             Some("/fixture/new-console.log".into());
@@ -3318,6 +3349,10 @@ mod tests {
         let rebound = registry.rebind_restarted_agent(&before, &receipt).unwrap();
         assert_eq!(rebound.id, before.id);
         assert_eq!(rebound.spec, before.spec);
+        assert_eq!(rebound.spec, issued_spec);
+        assert_eq!(receipt.source().launch.recipe, issued_recipe);
+        assert_eq!(receipt.replacement().launch.recipe, issued_recipe);
+        assert_eq!(receipt.replacement().terminal.as_ref().unwrap().launch, before.console.as_ref().unwrap().launch);
         assert_eq!(rebound.origin, before.origin);
         assert_eq!(rebound.console, replacement.terminal);
         assert_eq!(
