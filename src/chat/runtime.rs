@@ -4294,7 +4294,7 @@ mod tests {
         struct LateIdentity;
         impl Adapter for LateIdentity {
             fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {write:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {writes:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
             fn receive(&mut self,value:Value)->Result<Step,String> {Ok(Step {events:vec![Event::Session {id:value["identity"].as_str().unwrap().to_owned(),title:None}],..Default::default()})}
         }
         let root=tempfile::tempdir_in("/var/tmp").unwrap();
