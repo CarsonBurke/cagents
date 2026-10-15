@@ -83,8 +83,12 @@ fn parse(text: &str, path: &str, result: &mut Overrides) {
             let width = || value.parse::<u16>().ok().filter(|width| (1..=16).contains(width));
             match key.trim().to_ascii_lowercase().as_str() {
                 "indent_style" => result.tabs = match value.as_str() { "tab" => Some(true), "space" => Some(false), "unset" => None, _ => result.tabs },
-                "indent_size" => { result.size_is_tab = value == "tab"; result.size = width(); },
-                "tab_width" => result.tab_width = width(),
+                "indent_size" => match value.as_str() {
+                    "tab" => { result.size_is_tab = true; result.size = None; },
+                    "unset" => { result.size_is_tab = false; result.size = None; },
+                    _ => if let Some(size) = width() { result.size_is_tab = false; result.size = Some(size); },
+                },
+                "tab_width" => if value == "unset" { result.tab_width = None; } else if let Some(width) = width() { result.tab_width = Some(width); },
                 _ => {},
             }
         }
@@ -189,6 +193,19 @@ mod tests {
         assert_eq!(budget, 0);
         assert!(!glob_with_budget("*", "later.rs", &mut budget));
         assert!(glob("*.{rs,py}", "normal.rs"));
+    }
+
+    #[test]
+    fn invalid_indent_widths_preserve_inheritance_while_unset_explicitly_clears_it() {
+        let mut config = Overrides::default();
+        parse("[*]\nindent_size=2\ntab_width=8\n", "a.rs", &mut config);
+        parse("[*]\nindent_size=invalid\ntab_width=0\n", "a.rs", &mut config);
+        assert_eq!((config.size, config.tab_width), (Some(2), Some(8)));
+        parse("[*]\nindent_size=tab\n", "a.rs", &mut config);
+        assert_eq!(Indentation::detect("", 4, config).size, 8);
+        parse("[*]\nindent_size=unset\ntab_width=unset\n", "a.rs", &mut config);
+        assert_eq!(Indentation::detect("", 4, config).size, 4);
+        assert_eq!((config.size, config.tab_width), (None, None));
     }
 
     #[test]
