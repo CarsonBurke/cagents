@@ -9473,6 +9473,12 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
+                if !matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return text_editor::default_bindings(press);
+                }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
                     press.physical_key,
@@ -9484,12 +9490,6 @@ fn editable_document_view<'a>(
                     }));
                 }
                 if let Some(binding) = registered_editor_binding(card, runtime, &press) { return binding; }
-                if !matches!(
-                    press.status,
-                    iced::widget::text_editor::Status::Focused { .. }
-                ) {
-                    return text_editor::default_bindings(press);
-                }
                 let action = match &press.key {
                     Key::Character(character)
                         if character.as_str() == " " && press.modifiers.command() =>
@@ -17660,6 +17660,18 @@ mod tests {
             let actions: Vec<_> = messages.iter().filter_map(|message| match message { Observation::Editor(RepositoryAction::Undo { card }) => Some(*card), _ => None }).collect();
             assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
             assert!(!messages.iter().any(|message| matches!(message, Observation::Editor(action) if !matches!(action, RepositoryAction::Undo { .. }))), "unfocused editors must not publish another edit action");
+            let mut zoom = event;
+            if let Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modified_key, physical_key, .. }) = &mut zoom {
+                *key = Key::Character("=".into());
+                *modified_key = key.clone();
+                *physical_key = Physical::Code(Code::Equal);
+            }
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree, &zoom, Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut shell, &viewport);
+            let zooms: Vec<_> = messages.iter().filter_map(|message| match message { Observation::Editor(RepositoryAction::ZoomFont { card, delta: 1 }) => Some(*card), _ => None }).collect();
+            assert_eq!(zooms, expected.into_iter().collect::<Vec<_>>());
+            assert!(!messages.iter().any(|message| matches!(message, Observation::Editor(action) if !matches!(action, RepositoryAction::ZoomFont { .. }))));
         }
         assert_eq!(first_runtime.editor_text(), Some("first".into()));
         assert_eq!(second_runtime.editor_text(), Some("second".into()));
