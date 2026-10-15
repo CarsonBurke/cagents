@@ -6510,7 +6510,9 @@ mod tests {
 
     #[test]
     fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
-        let items = frame_cost::transcript(2);
+        let items: Vec<_> = frame_cost::transcript(2).into_iter()
+            .filter(|item| item.role == chat::Role::User || item.id.ends_with("-answer"))
+            .collect();
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         assert_eq!(runtime.turns.len(), 2);
         let first = runtime.turns[0].key.clone();
