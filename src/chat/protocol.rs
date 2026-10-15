@@ -337,6 +337,10 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Deterministically exercise provider work after the last local input poll.
+    #[cfg(test)]
+    fn after_close_input_drained(&mut self) {}
+
     /// Refresh cached operational paths after the caller verified the same
     /// approved directory inode. This never changes provider launch provenance.
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
