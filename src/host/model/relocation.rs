@@ -9,10 +9,16 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, mov
     let new = repository_key(&relocation.destination)?;
     let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [old], |row| row.get(0)).map_err(|error| error.to_string())?;
     if !existing { return Ok(false); }
-    if old == new { return relocate_agents(tx, relocation, moves); }
-    let destination_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [new], |row| row.get(0)).map_err(|error| error.to_string())?;
-    if destination_exists { return Err("The located folder is already open as another project".into()); }
-    tx.execute("INSERT INTO projects(repository,name,ordinal,kind) SELECT ?2,name,ordinal,kind FROM projects WHERE repository=?1", params![old,new]).map_err(|error| error.to_string())?;
+    if relocation.verification_only() { return relocate_agents(tx, relocation, moves); }
+    let (checkout, primary): (Option<String>,Option<String>) = tx.query_row("SELECT checkout,primary_checkout FROM projects WHERE repository=?1", [old], |row| Ok((row.get(0)?,row.get(1)?))).map_err(|error| error.to_string())?;
+    let checkout = checkout.map(PathBuf::from).map(|path| relocation.mapped(&path));
+    let primary = primary.map(PathBuf::from).map(|path| relocation.mapped(&path));
+    if old != new {
+        let destination_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [new], |row| row.get(0)).map_err(|error| error.to_string())?;
+        if destination_exists { return Err("The located folder is already open as another project".into()); }
+        tx.execute("INSERT INTO projects(repository,name,ordinal,kind) SELECT ?2,name,ordinal,kind FROM projects WHERE repository=?1", params![old,new]).map_err(|error| error.to_string())?;
+    }
+    tx.execute("UPDATE projects SET checkout=?2,primary_checkout=?3 WHERE repository=?1", params![new,checkout.as_deref().map(repository_key).transpose()?,primary.as_deref().map(repository_key).transpose()?]).map_err(|error| error.to_string())?;
     views::relocate(tx, relocation)?;
     tx.execute("UPDATE channels SET repository=?2 WHERE repository=?1", params![old,new]).map_err(|error| error.to_string())?;
     let navigation: Option<String> = tx.query_row("SELECT items FROM navigation_orders WHERE repository=?1", [old], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
@@ -26,9 +32,11 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, mov
     // changed path needs a fresh user-approved revision, so pause their existing
     // definitions while retaining their history rather than executing old paths.
     automations::close_project(tx, old, crate::chat::now_ms().unwrap_or(0))?;
-    tx.execute("DELETE FROM projects WHERE repository=?1", [old]).map_err(|error| error.to_string())?;
-    tx.execute("INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)", [old]).map_err(|error| error.to_string())?;
-    tx.execute("DELETE FROM closed_projects WHERE repository=?1", [new]).map_err(|error| error.to_string())?;
+    if old != new {
+        tx.execute("DELETE FROM projects WHERE repository=?1", [old]).map_err(|error| error.to_string())?;
+        tx.execute("INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)", [old]).map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM closed_projects WHERE repository=?1", [new]).map_err(|error| error.to_string())?;
+    }
     Ok(true)
 }
 
@@ -54,11 +62,32 @@ mod tests {
     use crate::{model::{CardId, CardKind, ProjectId, RepositoryView}, workspace_model::views::{Scope, Pane}};
 
     #[test]
+    fn external_metadata_identity_survives_primary_checkout_move() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
+        let relocation = Relocation { repository: "/metadata/project.git".into(), destination: "/metadata/project.git".into(), old_root: "/old/checkout".into(), new_root: "/moved/checkout".into() };
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: relocation.repository.clone(), name: "Project".into(), kind: ProjectKind::Git }).unwrap();
+        registry.db.execute("UPDATE projects SET checkout=?1,primary_checkout=?1", [relocation.old_root.to_str().unwrap()]).unwrap();
+        let channel = ChannelId::new();
+        registry.apply(&ModelEdit::CreateChannel { id: channel, repository: relocation.repository.clone(), title: "Work".into(), title_source: Default::default() }).unwrap();
+        registry.apply(&ModelEdit::ReorderNavigation { repository: relocation.repository.clone(), source: crate::workspace_model::NavigationItem::Worktree(relocation.old_root.clone()), before: None, fallback: vec![] }).unwrap();
+        let before = registry.model().unwrap();
+        let after = registry.apply(&ModelEdit::RelocateProject { relocation: relocation.clone() }).unwrap().model;
+        assert_eq!(after.projects[0].repository, before.projects[0].repository);
+        assert_eq!(after.projects[0].ordinal, before.projects[0].ordinal);
+        assert_eq!(after.projects[0].checkout.as_ref(), Some(&relocation.new_root));
+        assert_eq!(after.projects[0].primary_checkout.as_ref(), Some(&relocation.new_root));
+        assert_eq!(after.channels[0].id, channel);
+        assert!(!after.closed_projects.contains(&relocation.repository));
+        assert_eq!(after.navigation_orders[0].items, vec![crate::workspace_model::NavigationItem::Worktree(relocation.new_root)]);
+    }
+
+    #[test]
     fn locate_preserves_channels_and_shared_panes_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&directory.path().join("registry.sqlite3")).unwrap();
         let relocation = Relocation { repository: "/old/repo/.git".into(), destination: "/new/repo/.git".into(), old_root: "/old/repo".into(), new_root: "/new/repo".into() };
-        registry.apply(&ModelEdit::OpenProject { repository: relocation.repository.clone(), name: "Repo".into(), kind: ProjectKind::Git }).unwrap();
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: relocation.repository.clone(), name: "Repo".into(), kind: ProjectKind::Git }).unwrap();
         let channel = ChannelId::new();
         registry.apply(&ModelEdit::CreateChannel { id: channel, repository: relocation.repository.clone(), title: "Review".into(), title_source: Default::default() }).unwrap();
         let card = CardId::new();

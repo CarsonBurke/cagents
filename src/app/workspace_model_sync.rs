@@ -597,7 +597,7 @@ impl Cagents {
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
-        durable.shared_project_ordinals.clear();
+        durable.shared_project_bindings.clear();
         for channel in durable.channels.iter_mut() {
             channel.shared = false;
         }
@@ -944,10 +944,7 @@ impl Cagents {
                 != Some(checkout)
         });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
-            if shared.ordinal != PENDING_ORDINAL && self.durable.shared_project_ordinals.get(&project_id) != Some(&shared.ordinal) {
-                Arc::make_mut(&mut self.durable).shared_project_ordinals.insert(project_id, shared.ordinal);
-                self.persist();
-            }
+            self.remember_project_binding(project_id, shared);
             let needs_checkout_read = primary_changed
                 || (checkout_changed
                     && self
@@ -1015,7 +1012,7 @@ impl Cagents {
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
         self.sidebar_model.data_state = SidebarDataState::Ready;
-        if shared.ordinal != PENDING_ORDINAL { Arc::make_mut(&mut self.durable).shared_project_ordinals.insert(project.id, shared.ordinal); self.persist(); }
+        self.remember_project_binding(project.id, shared);
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
             Some(project.id),

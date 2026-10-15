@@ -230,7 +230,7 @@ mod tests {
         let old = fixture.path().join("old"); let moved = fixture.path().join("moved");
         std::fs::create_dir(&old).unwrap(); std::fs::create_dir(&moved).unwrap();
         let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
-        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
         let source = source(&old);
         let identity = DirectoryIdentity::from_metadata(&std::fs::metadata(&old).unwrap());
         registry.bind_session_location(&source, None, &old, identity).unwrap();
@@ -300,7 +300,7 @@ mod tests {
         let old = fixture.path().join("old"); let moved = fixture.path().join("moved");
         std::fs::create_dir(&old).unwrap();
         let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
-        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Legacy".into(), kind: ProjectKind::Folder }).unwrap();
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: old.clone(), name: "Legacy".into(), kind: ProjectKind::Folder }).unwrap();
         let placement = crate::workspace_model::views::Scope::Worktree { repository: old.clone(), path: old.clone() };
         registry.apply(&ModelEdit::SeedView { scope: placement.clone(), panes: Vec::new(), closed: Vec::new() }).unwrap();
         let accepted = registry.submit_agent(&Origin::User, &Submit { name: None, destination: Destination::New(Spec { provider: Provider::Omp, account: None, target: Target { repository: old.clone(), directory: old.clone(), placement: Some(placement) }, surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None }), prompt: "fixture, no real provider".into(), idempotency_key: "legacy-locate".into() }, 1).unwrap();

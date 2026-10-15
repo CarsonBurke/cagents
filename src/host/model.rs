@@ -696,6 +696,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_thirteen_checkout_only_registry_gains_all_location_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
+        registry.apply(&open("/metadata/project.git")).unwrap();
+        registry.db.execute("UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'", []).unwrap();
+        registry.db.execute_batch("DROP TABLE agent_locations; DROP TABLE session_locations; PRAGMA user_version=13;").unwrap();
+        drop(registry);
+        let registry = Registry::at(&path).unwrap();
+        for table in ["agent_locations", "session_locations"] {
+            let exists: bool = registry.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0)).unwrap();
+            assert!(exists, "{table}");
+        }
+        let model = registry.model().unwrap();
+        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkout/project")));
+        assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/checkout/primary")));
+    }
+
+    #[test]
     fn navigation_rejects_cross_project_channels_and_relative_paths_without_writing() {
         use crate::workspace_model::NavigationItem;
         let directory = tempfile::tempdir().unwrap();

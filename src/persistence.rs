@@ -264,7 +264,7 @@ pub struct WorkspaceManifest {
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
-    pub shared_project_ordinals: HashMap<ProjectId, u32>,
+    pub shared_project_bindings: HashMap<ProjectId, crate::model::SharedProjectBinding>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_terminal_creations: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
@@ -1747,7 +1747,7 @@ impl StateStore {
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
-            shared_project_ordinals: manifest.shared_project_ordinals,
+            shared_project_bindings: manifest.shared_project_bindings,
             local_only_cards: manifest.local_only_cards,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
@@ -3305,7 +3305,7 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:workspace_model_identity"),
         &to_json(&state.workspace_model_identity)?,
     )?;
-    set_metadata(transaction, &format!("workspace:{workspace_id}:navigation:shared_project_ordinals"), &to_json(&state.shared_project_ordinals)?)?;
+    set_metadata(transaction, &format!("workspace:{workspace_id}:navigation:shared_project_bindings"), &to_json(&state.shared_project_bindings)?)?;
 
     set_metadata(
         transaction,
@@ -4660,7 +4660,7 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("pending terminal creation identities", &value))
         .transpose()?
         .unwrap_or_default(),
-        shared_project_ordinals: metadata(connection, &format!("workspace:{id}:navigation:shared_project_ordinals"))?.map(|value| from_json("shared project identities", &value)).transpose()?.unwrap_or_default(),
+        shared_project_bindings: metadata(connection, &format!("workspace:{id}:navigation:shared_project_bindings"))?.map(|value| from_json("shared project identities", &value)).transpose()?.unwrap_or_default(),
         workspace_model_identity: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_model_identity"),
@@ -5271,7 +5271,7 @@ mod tests {
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
-            shared_project_ordinals: HashMap::new(),
+            shared_project_bindings: HashMap::new(),
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
         }
@@ -6602,7 +6602,7 @@ mod tests {
         workspace.active_worktree = Some("/tmp".into());
         let identity = uuid::Uuid::new_v4();
         workspace.workspace_model_identity = Some(identity);
-        workspace.shared_project_ordinals.insert(project_id, 17);
+        workspace.shared_project_bindings.insert(project_id, crate::model::SharedProjectBinding { ordinal: 17, root: Some("/tmp".into()) });
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let manifest = store
@@ -6615,7 +6615,7 @@ mod tests {
         assert_eq!(restored.channels, workspace.channels);
         assert_eq!(restored.active_channel, Some(id));
         assert_eq!(restored.workspace_model_identity, Some(identity));
-        assert_eq!(restored.shared_project_ordinals, workspace.shared_project_ordinals);
+        assert_eq!(restored.shared_project_bindings, workspace.shared_project_bindings);
         assert_eq!(
             restored
                 .cards

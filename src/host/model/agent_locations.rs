@@ -150,7 +150,7 @@ mod tests {
     use crate::{agent::Provider, agent_execution::{Accepted, Destination, Origin, Spec, Submit, Surface, Target}, model::ProjectKind, workspace_model::{ModelEdit, views::Scope}};
 
     fn accepted(registry: &mut Registry, repository: &Path, key: &str) -> Accepted {
-        registry.apply(&ModelEdit::OpenProject { repository: repository.into(), name: key.into(), kind: ProjectKind::Folder }).unwrap();
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: repository.into(), name: key.into(), kind: ProjectKind::Folder }).unwrap();
         let placement = Scope::Worktree { repository: repository.into(), path: repository.into() };
         registry.apply(&ModelEdit::SeedView { scope: placement.clone(), panes: Vec::new(), closed: Vec::new() }).unwrap();
         registry.submit_agent(&Origin::User, &Submit { name: None, destination: Destination::New(Spec { provider: Provider::Claude, account: None, target: Target { repository: repository.into(), directory: repository.into(), placement: Some(placement) }, surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None }), prompt: "fixture only, no provider starts".into(), idempotency_key: key.into() }, 1).unwrap()

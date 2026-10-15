@@ -1183,6 +1183,16 @@ pub struct EditorNavigation {
     pub scroll_horizontal: f32,
 }
 
+/// A local project bound to one non-reused rank in the recorded registry.
+/// The optional known checkout preserves Missing detection for external Git
+/// metadata layouts across a window restart. It confers no process authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedProjectBinding {
+    pub ordinal: u32,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -1234,7 +1244,7 @@ pub struct WorkspaceState {
     /// identity above. Lets a window follow explicit Locate across reconnects
     /// without interpreting a reused old path as the original project.
     #[serde(default)]
-    pub shared_project_ordinals: HashMap<ProjectId, u32>,
+    pub shared_project_bindings: HashMap<ProjectId, SharedProjectBinding>,
     #[serde(default)]
     pub local_only_cards: HashSet<CardId>,
     /// Explicit terminal creations awaiting the daemon's accepted view. Their
@@ -1262,7 +1272,7 @@ impl Default for WorkspaceState {
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
-            shared_project_ordinals: HashMap::new(),
+            shared_project_bindings: HashMap::new(),
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
         }

@@ -289,9 +289,13 @@ impl WorkspaceModel {
                 }
             }
             ModelEdit::RelocateProject { relocation } => {
-                if self.projects.iter().any(|project| project.repository == relocation.destination) { return; }
+                if relocation.verification_only() || (relocation.repository != relocation.destination && self.projects.iter().any(|project| project.repository == relocation.destination)) { return; }
                 for project in &mut self.projects {
-                    if project.repository == relocation.repository { project.repository = relocation.destination.clone(); }
+                    if project.repository == relocation.repository {
+                        project.repository = relocation.destination.clone();
+                        if let Some(checkout) = &mut project.checkout { relocation.path(checkout); }
+                        if let Some(primary) = &mut project.primary_checkout { relocation.path(primary); }
+                    }
                 }
                 let channels = self.channels.iter().filter(|channel| channel.repository == relocation.repository).map(|channel| channel.id).collect::<std::collections::HashSet<_>>();
                 for channel in &mut self.channels {
@@ -319,8 +323,10 @@ impl WorkspaceModel {
                 for agent in &mut self.agents {
                     if owned_agents.contains(&agent.id) || agent.spec.target.repository == relocation.repository { relocation.agent(agent); }
                 }
-                self.closed_projects.retain(|path| *path != relocation.destination);
-                if !self.closed_projects.contains(&relocation.repository) { self.closed_projects.push(relocation.repository.clone()); }
+                if relocation.repository != relocation.destination {
+                    self.closed_projects.retain(|path| *path != relocation.destination);
+                    if !self.closed_projects.contains(&relocation.repository) { self.closed_projects.push(relocation.repository.clone()); }
+                }
             }
             ModelEdit::CloseProject { repository } => {
                 self.navigation_orders

@@ -770,7 +770,7 @@ impl Cagents {
             .as_deref()
             .is_some_and(|active| scope.contains(active));
         self.sidebar_model.projects.remove(index);
-        Arc::make_mut(&mut self.durable).shared_project_ordinals.remove(&id);
+        Arc::make_mut(&mut self.durable).shared_project_bindings.remove(&id);
         self.refresh_ui.git.forget(id);
         self.github_availability.remove(&id);
         self.review_repositories.remove(&id);

@@ -156,7 +156,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handle = Handle::start(spec, Box::new(PathAware { directory: old.clone(), calls: calls.clone() }), initial, store, None, |_| {}).unwrap();
         let mut registry = Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
-        registry.apply(&ModelEdit::OpenProject { repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
+        registry.apply(&ModelEdit::OpenProject { checkout: None, primary_checkout: None, repository: old.clone(), name: "Original".into(), kind: ProjectKind::Folder }).unwrap();
         registry.apply(&ModelEdit::SeedView { scope: Scope::Worktree { repository: old.clone(), path: old.clone() }, panes: vec![Pane { id: CardId::new(), title: "Owned native fixture".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: CardKind::Chat(source.clone()), scope: Some(old.clone()) }], closed: Vec::new() }).unwrap();
         if let Some(identity) = identity { registry.bind_session_location(&HostedSession::Chat(source.clone()), None, &old, identity).unwrap(); }
         let mut state = HostState::new(proof);

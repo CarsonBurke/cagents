@@ -19,11 +19,13 @@ impl Relocation {
                 return Err("project locations must be absolute normalized paths".into());
             }
         }
-        if !self.repository.starts_with(&self.old_root) || !self.destination.starts_with(&self.new_root) {
-            return Err("the project identity must belong to the located folder".into());
-        }
+        // Git metadata can live outside its checkout. Logical ownership comes
+        // from the exact persisted project; operational authority is verified
+        // separately against pinned directory/process identities.
         Ok(())
     }
+
+    pub fn verification_only(&self) -> bool { self.repository == self.destination && self.old_root == self.new_root }
 
     pub fn path(&self, path: &mut PathBuf) {
         if *path == self.repository { *path = self.destination.clone(); }
