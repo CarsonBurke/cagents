@@ -144,3 +144,51 @@ fn routed_owner_is_immutable_across_a_newer_sample_and_a_closed_owner_is_refused
     assert_eq!(app.recently_closed.len(), 1, "an already-closed native owner cannot target the currently selected pane");
     drop(current);
 }
+
+
+#[test]
+fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_operations() {
+    use iced::futures::StreamExt;
+    use keyboard::key::Code;
+    let (mut app, owner) = super::tests::editing_repository_app();
+    let mut other = app.card_state(owner).unwrap().clone();
+    other.id = CardId::new();
+    other.kind = CardKind::Settings;
+    let selected = other.id;
+    Arc::make_mut(&mut app.durable).cards.push(other);
+    app.cards.insert(selected, CardRuntime::Settings);
+    app.workspace.add_card(
+        crate::workspace::WorkspaceCard::new(selected, "Other pane", crate::workspace::CardWidth::Fraction(0.4)).unwrap(),
+        1, true,
+    ).unwrap();
+    prepare(&mut app);
+    let header = app.card_header_widget_id(owner);
+    assert_ne!(header, app.card_keyboard_focus(owner), "the retained native owner must differ from the pane's default editor target");
+    assert_eq!(app.workspace.focused(), Some(selected));
+    let mut renderer = super::tests::headless_renderer();
+    let (cache, messages) = native(&app, &mut renderer, Cache::new(), Some(header.clone()), &[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)]);
+    let routed = messages.into_iter().find(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))).expect("actual mounted nonselected header owns the event");
+    let task = app.update(routed);
+    assert_eq!(app.workspace.focused(), Some(owner));
+    let mut ui = UserInterface::build(app.view(), Size::new(1600.0, 1000.0), cache, &mut renderer);
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    executor.block_on(async {
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            // Exercise the actual ready effects, including any erroneous
+            // default-focus operation. Maintenance timers are unrelated.
+            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+                if let iced::runtime::Action::Widget(operation) = action {
+                    let mut next = Some(operation);
+                    while let Some(mut operation) = next.take() {
+                        ui.operate(&renderer, operation.as_mut());
+                        if let iced::advanced::widget::operation::Outcome::Chain(chained) = operation.finish() { next = Some(chained); }
+                    }
+                }
+            }
+        }
+    });
+    executor.shutdown_background();
+    let mut messages = Vec::new();
+    let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+    assert!(messages.iter().any(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))), "logical reconciliation and its actual widget operations must preserve the nondefault native owner");
+}

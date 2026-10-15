@@ -13228,7 +13228,13 @@ impl Application for Cagents {
                 {
                     if self.focused_repository_is_saving() { return Task::none(); }
                     match self.workspace.focus(card) {
-                        Ok(update) => self.apply_viewport(update, false, false),
+                        Ok(update) => {
+                            // The event's native child already owns focus.
+                            // Match PointerFocused: selecting its pane must
+                            // not redirect focus to that pane's default field.
+                            self.workspace.take_widget_focus_request();
+                            self.apply_viewport(update, false, false)
+                        }
                         Err(_) => return Task::none(),
                     }
                 } else { Task::none() };
