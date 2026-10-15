@@ -115,6 +115,7 @@ pub fn observe<'a, Message: 'a>(
         trace: trace.clone(),
         focus_regions: None,
         keyboard_callback: None,
+        modal_keyboard: false,
     })
 }
 
@@ -143,6 +144,7 @@ pub fn observe_keyboard_focus<'a, Message: 'a>(
         trace: trace.clone(),
         focus_regions: Some(regions),
         keyboard_callback: None,
+        modal_keyboard: false,
     })
 }
 
@@ -162,6 +164,7 @@ pub fn observe_keyboard_events<'a, Message: 'a>(
         trace: trace.clone(),
         focus_regions: Some(regions),
         keyboard_callback: Some(on_key),
+        modal_keyboard: false,
     })
 }
 
@@ -174,12 +177,13 @@ pub fn observe_dialog_keyboard_events<'a, Message: 'a>(
     on_key: KeyboardCallback<Message>,
 ) -> Element<'a, Message> {
     let id = cosmic::iced::widget::Id::new("dialog.keyboard-region");
-    observe_keyboard_events(
-        cosmic::widget::container(content).id(id.clone()),
-        trace,
-        vec![(id, FocusedPane::OutsideWorkspace.into())],
-        on_key,
-    )
+    Element::new(Observed {
+        content: cosmic::widget::container(content).id(id.clone()).into(),
+        trace: trace.clone(),
+        focus_regions: Some(vec![(id, FocusedPane::OutsideWorkspace.into())]),
+        keyboard_callback: Some(on_key),
+        modal_keyboard: true,
+    })
 }
 
 pub(crate) struct ScopedKeyboardRegion {
@@ -359,6 +363,7 @@ struct Observed<'a, Message> {
     trace: InputTrace,
     focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
     keyboard_callback: Option<KeyboardCallback<Message>>,
+    modal_keyboard: bool,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
@@ -449,9 +454,20 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             shell,
             viewport,
         );
+        if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
+            shell.capture_event();
+        }
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
+            if self.modal_keyboard {
+                if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
+                    return; // Modifiers still update widgets below the dialog.
+                }
+                // Claim ignored keys too: otherwise the global Popover would
+                // also update the base observer and publish the chord twice.
+                shell.capture_event();
+            }
             shell.publish(callback(event.clone(), shell.is_event_captured(), region));
         }
     }
@@ -517,6 +533,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                     &self.trace,
                     self.focus_regions.clone(),
                     self.keyboard_callback,
+                    self.modal_keyboard,
                 )
             })
     }
@@ -556,6 +573,7 @@ struct ObservedOverlay<'a, Message> {
     trace: InputTrace,
     focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
     keyboard_callback: Option<KeyboardCallback<Message>>,
+    modal_keyboard: bool,
 }
 
 impl<'a, Message: 'a> ObservedOverlay<'a, Message> {
@@ -564,12 +582,14 @@ impl<'a, Message: 'a> ObservedOverlay<'a, Message> {
         trace: &InputTrace,
         focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
         keyboard_callback: Option<KeyboardCallback<Message>>,
+        modal_keyboard: bool,
     ) -> overlay::Element<'a, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Self {
             content,
             trace: trace.clone(),
             focus_regions,
             keyboard_callback,
+            modal_keyboard,
         }))
     }
 }
@@ -630,9 +650,18 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         self.content
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, clipboard, shell);
+        if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
+            shell.capture_event();
+        }
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
+            if self.modal_keyboard {
+                if !matches!(event, keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }) {
+                    return;
+                }
+                shell.capture_event();
+            }
             // A focused overlay owns ignored editing chords too. Capturing
             // those prevents both background input and duplicate root routing.
             if owns_keyboard {
@@ -663,10 +692,11 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         let trace = self.trace.clone();
         let regions = self.focus_regions.clone();
         let keyboard_callback = self.keyboard_callback;
+        let modal_keyboard = self.modal_keyboard;
         self.content
             .as_overlay_mut()
             .overlay(layout, renderer)
-            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions, keyboard_callback))
+            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions, keyboard_callback, modal_keyboard))
     }
 
     fn index(&self) -> f32 {
