@@ -52,6 +52,10 @@ impl Drop for State {
 }
 
 impl State {
+    fn has_authorized_run(&self, session: &TerminalSession) -> bool {
+        session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").and_then(|value| value.parse().ok())
+            .is_some_and(|run| self.authorized_runs.lock().expect("setup launch authorization lock").contains(&run))
+    }
     pub(super) fn authorized_run(&self, session: &TerminalSession) -> Option<OperationId> {
         let run = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")?.parse().ok()?;
         self.authorized_runs.lock().expect("setup launch authorization lock").remove(&run).then_some(run)
@@ -200,7 +204,10 @@ impl Cagents {
             let started_at = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_STARTED_AT").and_then(|value| value.parse::<u64>().ok()).unwrap_or_default();
             if self.setup_ui.terminals.get(path).is_some_and(|(known_at, known)| *known_at > started_at || (*known_at == started_at && *known != session.id)) { continue; }
             self.setup_ui.terminals.insert(path.clone(), (started_at, session.id));
-            let starting = self.terminal_start_in_flight(card.id);
+            // A new deliberate start first waits for its durable pane
+            // reservation. Restored pending panes have no in-memory permit.
+            let starting = self.terminal_start_in_flight(card.id)
+                || (matches!(self.cards.get(&card.id), Some(CardRuntime::Loading)) && self.setup_ui.has_authorized_run(session));
             let status = if !starting && session.continuity.live_proof().is_some() && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_))) {
                 WorktreeSetupStatus::Interrupted("Setup terminal status is unavailable. Review its existing session before resuming.".into())
             } else { terminal_status(session, card.existence.is_open(), starting) };
@@ -583,7 +590,9 @@ mod tests {
         session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
         assert!(state.authorized_run(&session).is_none());
         state.authorized_runs.lock().unwrap().insert(run);
+        assert!(state.has_authorized_run(&session));
         assert_eq!(state.authorized_run(&session), Some(run));
+        assert!(!state.has_authorized_run(&session));
         assert!(state.authorized_run(&session).is_none());
     }
 
