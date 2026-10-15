@@ -179,6 +179,7 @@ fn apply_reports(
             continue;
         };
         let entry = entries.entry(key.clone()).or_insert_with(|| Entry {
+            verification: None,
             identity: None,
             snapshot: UsageSnapshot::state(
                 UsageStatus::Unavailable,
@@ -239,7 +240,8 @@ fn apply_reports(
 fn invalidate_identity(cache: &Cache, key: &str, now: u64, detail: &str) -> crate::account::cache::Entry {
     cache.invalidate_identity(key, now, detail).unwrap_or_else(|error| {
         tracing::warn!(%error, "Cannot persist account identity invalidation");
-        crate::account::cache::Entry { identity: None,
+        crate::account::cache::Entry {
+            verification: None, identity: None,
             snapshot: crate::account::UsageSnapshot::state(crate::account::UsageStatus::NeedsLogin, detail, now) }
     })
 }
@@ -473,6 +475,7 @@ mod tests {
             .store(
                 &account.cache_key().unwrap(),
                 Entry {
+                    verification: None,
                     identity: None,
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "", 1),
                 },
@@ -571,6 +574,7 @@ mod tests {
             .store(
                 &account.cache_key().unwrap(),
                 Entry {
+                    verification: None,
                     identity: None,
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "replacement login", now),
                 },
@@ -628,6 +632,7 @@ mod tests {
                 .store(
                     &account.cache_key().unwrap(),
                     Entry {
+                        verification: None,
                         identity: Some(Identity {
                             email: Some("old@fixture.invalid".into()),
                             plan: Some("pro".into()),
@@ -738,6 +743,7 @@ mod tests {
                 .store(
                     &account.cache_key().unwrap(),
                     Entry {
+                        verification: None,
                         identity: None,
                         snapshot: UsageSnapshot::state(UsageStatus::Ok, "verified login", 1),
                     },
@@ -837,7 +843,7 @@ mod tests {
             let cache_key = account.cache_key().unwrap();
             let positive = |at, source| { let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", at);
                 snapshot.source = source;
-                Entry { identity: Some(crate::account::Identity { email: Some("old@fixture.invalid".into()), plan: Some("pro".into()), organization: None }), snapshot }
+                Entry { verification: None, identity: Some(crate::account::Identity { email: Some("old@fixture.invalid".into()), plan: Some("pro".into()), organization: None }), snapshot }
             };
             cache.store(&cache_key, positive(if mode == "older-than-quota" { 50 } else { 1 },
                 if mode == "older-than-quota" { UsageSource::Live } else { UsageSource::Probe })).unwrap();
@@ -896,7 +902,8 @@ mod tests {
         };
         let cache = Cache::at(root.path().join("cache"));
         let now = crate::chat::now_ms().unwrap();
-        cache.store(&first.cache_key().unwrap(), Entry { identity: None,
+        cache.store(&first.cache_key().unwrap(), Entry {
+            verification: None, identity: None,
             snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now.saturating_sub(1)) }).unwrap();
         let signal = Arc::new(Signal::new(Arc::new((Mutex::new(false), Condvar::new()))));
         let events = Arc::new(Mutex::new(Vec::new()));

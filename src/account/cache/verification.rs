@@ -4,10 +4,12 @@ use std::os::unix::fs::MetadataExt;
 
 const FILE: &str = "account-identity-verification.json";
 const LIMIT: usize = 4096;
+const VERIFICATION_VERSION: u32 = 2;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Pending {
     version: u32,
+    epoch: uuid::Uuid,
     #[serde(default)]
     blocked: bool,
     entries: BTreeMap<String, Barrier>,
@@ -15,6 +17,7 @@ struct Pending {
 #[derive(Serialize, Deserialize)]
 struct Barrier {
     nonce: uuid::Uuid,
+    revision: u64,
     observed_at: u64,
     detail: String,
     /// Retain the generation after successful verification so a pre-change
@@ -24,11 +27,14 @@ struct Barrier {
 /// Captured before provider authentication, not inferred from usage time.
 pub(in crate::account) struct Token {
     key: String,
-    nonce: Option<uuid::Uuid>,
+    nonce: Option<(uuid::Uuid, u64)>,
     pending: bool,
 }
 impl Token {
     pub(in crate::account) fn pending(&self) -> bool { self.pending }
+}
+impl Default for Pending {
+    fn default() -> Self { Self { version: VERIFICATION_VERSION, epoch: uuid::Uuid::new_v4(), blocked: false, entries: BTreeMap::new() } }
 }
 impl Pending {
     fn read(cache: &Cache) -> io::Result<Self> {
@@ -36,7 +42,7 @@ impl Pending {
         let file = match OpenOptions::new().read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self { version: 1, ..Self::default() }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error),
         };
         let metadata = file.metadata()?;
@@ -48,7 +54,7 @@ impl Pending {
         file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_BYTES { return Err(io::Error::other("Account identity verification metadata exceeds its size limit")); }
         let state: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        if state.version != 1 || state.entries.len() > LIMIT || state.blocked
+        if state.version != VERIFICATION_VERSION || state.entries.len() > LIMIT || state.blocked
             || state.entries.iter().any(|(key,value)| key.len() > 16384 || value.detail.len() > 1024) {
             return Err(io::Error::other("Account identity verification metadata is unavailable; repair the private account cache before routing"));
         }
@@ -64,7 +70,12 @@ impl Pending {
         temporary.persist(cache.directory.join(FILE)).map_err(|error|error.error)?;
         cache.sync_directory()
     }
+    fn stamp(&self, key: &str) -> Option<IdentityVerification> {
+        self.entries.get(key).map(|barrier| IdentityVerification { epoch: self.epoch,
+            revision: barrier.revision, pending: barrier.pending })
+    }
     fn overlay(&self, key: &str, entry: &mut Entry) {
+        entry.verification = self.stamp(key);
         if let Some(barrier) = self.entries.get(key).filter(|barrier|barrier.pending) {
             let observed_at = entry.snapshot.observed_at.max(barrier.observed_at);
             entry.identity = None;
@@ -80,19 +91,28 @@ impl Cache {
     pub(in crate::account) fn begin_verification(&self, key: &str) -> io::Result<Token> {
         let _lock = self.lock(libc::LOCK_SH)?;
         let state = Pending::read(self)?;
-        Ok(Token { key: key.into(), nonce: state.entries.get(key).map(|barrier|barrier.nonce), pending: state.entries.get(key).is_some_and(|barrier|barrier.pending) })
+        Ok(Token { key: key.into(), nonce: state.entries.get(key).map(|barrier|(barrier.nonce,barrier.revision)), pending: state.entries.get(key).is_some_and(|barrier|barrier.pending) })
     }
     /// Only the real provider-probe path calls this with its pre-auth token.
     /// Commit the entry durably before clearing the matching invalidation.
     pub(in crate::account) fn finish_verification(&self, token: Token, entry: Entry, persist: bool) -> io::Result<Entry> {
         let _lock = self.lock(libc::LOCK_EX)?;
         let mut state = Pending::read(self)?;
-        if state.entries.get(&token.key).map(|barrier|barrier.nonce) != token.nonce {
+        if state.entries.get(&token.key).map(|barrier|(barrier.nonce,barrier.revision)) != token.nonce {
             return Err(io::Error::other("The account sign-in changed during verification; retry checking this account"));
         }
         let confirmed = entry.identity.is_some() && entry.snapshot.status != super::super::UsageStatus::NeedsLogin;
         let mut visible = entry;
-        if !confirmed { state.overlay(&token.key, &mut visible); }
+        let clear = persist && confirmed && state.entries.get(&token.key).is_some_and(|barrier|barrier.pending);
+        if clear {
+            let barrier = state.entries.get_mut(&token.key).unwrap();
+            barrier.revision = barrier.revision.checked_add(1)
+                .ok_or_else(||io::Error::other("Account identity verification revision exhausted"))?;
+            barrier.pending = false;
+        }
+        // The sidecar on disk still holds pending until AFTER the verified
+        // quota entry commits. Its overlay wins across any intervening crash.
+        state.overlay(&token.key, &mut visible);
         if persist {
             let mut document = read_document(&self.path()).unwrap_or_default();
             document.version = VERSION;
@@ -105,10 +125,7 @@ impl Cache {
                 // barrier cleared by this older completed probe.
                 return Err(io::Error::other("A newer account observation arrived during verification; retry checking this account"));
             }
-            if confirmed && let Some(barrier) = state.entries.get_mut(&token.key).filter(|barrier|barrier.pending) {
-                barrier.pending = false;
-                state.write(self)?;
-            }
+            if clear { state.write(self)?; }
         }
         Ok(visible)
     }
@@ -133,12 +150,21 @@ impl Cache {
             self.save_invalidation(lock, state, save)?;
             return Err(io::Error::other("Account identity verification capacity exceeded; repair the private account cache before routing"));
         }
-        state.entries.insert(key.into(), Barrier { nonce: uuid::Uuid::new_v4(), observed_at, detail: detail.into(), pending: true });
+        let revision = match state.entries.get(key).map_or(Some(1), |old|old.revision.checked_add(1)) {
+            Some(revision) => revision,
+            None => {
+                state.blocked = true;
+                state.entries.clear();
+                self.save_invalidation(lock, state, save)?;
+                return Err(io::Error::other("Account identity verification revision exhausted; repair the private account cache before routing"));
+            }
+        };
+        state.entries.insert(key.into(), Barrier { nonce: uuid::Uuid::new_v4(), revision, observed_at, detail: detail.into(), pending: true });
         // Persist the invalidation first. A crash before quota replacement
         // must leave every reader blocked, including after a process restart.
         self.save_invalidation(lock, state, save)?;
         let mut entry = read_document(&self.path()).and_then(|mut document|document.entries.remove(key))
-            .unwrap_or_else(||Entry { identity: None, snapshot: UsageSnapshot::state(super::super::UsageStatus::NeedsLogin, detail, observed_at) });
+            .unwrap_or_else(||Entry { verification: None, identity: None, snapshot: UsageSnapshot::state(super::super::UsageStatus::NeedsLogin, detail, observed_at) });
         state.overlay(key, &mut entry);
         Ok(entry)
     }
@@ -195,7 +221,7 @@ mod tests {
     fn reading(at: u64, source: UsageSource, email: &str) -> Entry {
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", at);
         snapshot.source = source;
-        Entry { identity: Some(Identity { email: Some(email.into()), plan: Some("pro".into()), organization: None }), snapshot }
+        Entry { verification: None, identity: Some(Identity { email: Some(email.into()), plan: Some("pro".into()), organization: None }), snapshot }
     }
     fn assert_pending(cache: &Cache, now: u64) {
         let entry = cache.load(now).remove(KEY).unwrap();
@@ -273,7 +299,7 @@ mod tests {
             let path = root.path().join(FILE);
             match kind {
                 "malformed" => std::fs::write(&path, b"bad json").unwrap(),
-                "future" => std::fs::write(&path, br#"{"version":2,"entries":{}}"#).unwrap(),
+                "future" => std::fs::write(&path, br#"{"version":999,"entries":{}}"#).unwrap(),
                 "oversize" => std::fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap(),
                 "symlink" => { let other = root.path().join("outside.json"); std::fs::write(&other, b"{}").unwrap(); symlink(other, &path).unwrap(); },
                 "fifo" => { use std::os::unix::ffi::OsStrExt; let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap(); assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0); },
@@ -312,9 +338,9 @@ mod tests {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let cache = Cache::at(root.path());
         cache.store(KEY, reading(1, UsageSource::Probe, "old@fixture.invalid")).unwrap();
-        let mut pending = Pending { version: 1, ..Pending::default() };
+        let mut pending = Pending::default();
         for index in 0..LIMIT {
-            pending.entries.insert(index.to_string(), Barrier { nonce: uuid::Uuid::new_v4(), observed_at: 1, detail: "Verify".into(), pending: true });
+            pending.entries.insert(index.to_string(), Barrier { nonce: uuid::Uuid::new_v4(), revision: 1, observed_at: 1, detail: "Verify".into(), pending: true });
         }
         pending.write(&cache).unwrap();
         assert!(cache.invalidate_identity(KEY, 10, "Login changed").is_err());
@@ -348,6 +374,47 @@ mod tests {
         assert!(cache.store(KEY, reading(30, UsageSource::Live, "old@fixture.invalid")).is_err());
         assert!(cache.store(KEY, reading(30, UsageSource::Probe, "unproved@fixture.invalid")).is_err());
         assert_eq!(cache.load(30)[KEY].identity.as_ref().unwrap().email.as_deref(), Some("new@fixture.invalid"));
+    }
+
+    #[test]
+    fn identity_revision_exhaustion_never_wraps_to_old_ui_authority() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cache = Cache::at(root.path());
+        cache.store(KEY,reading(1,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+        let mut state = Pending::default();
+        state.entries.insert(KEY.into(),Barrier { nonce: uuid::Uuid::new_v4(), revision: u64::MAX,
+            observed_at: 1,detail: "Verify".into(),pending: false });
+        state.write(&cache).unwrap();
+        assert!(cache.invalidate_identity(KEY,10,"Login changed").is_err());
+        assert!(cache.load(20).is_empty());
+        assert!(cache.begin_verification(KEY).is_err());
+    }
+    #[test]
+    fn generic_writer_stamp_is_always_replaced_by_private_sidecar_verdict() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cache = Cache::at(root.path());
+        cache.store(KEY,reading(1,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+        cache.invalidate_identity(KEY,10,"Login changed").unwrap();
+        let pending = cache.load(10).remove(KEY).unwrap();
+        let mut generic = reading(20,UsageSource::Live,"old@fixture.invalid");
+        generic.verification = Some(IdentityVerification { epoch: uuid::Uuid::new_v4(),revision: u64::MAX,pending: false });
+        cache.store(KEY,generic).unwrap();
+        let stored = cache.load(20).remove(KEY).unwrap();
+        assert_eq!(stored.verification,pending.verification);
+        assert_eq!(stored.snapshot.status,UsageStatus::NeedsLogin);
+    }
+
+    #[test]
+    fn verified_revision_exhaustion_keeps_pending_identity_blocked() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cache = Cache::at(root.path());
+        cache.store(KEY,reading(1,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+        let mut state = Pending::default();
+        state.entries.insert(KEY.into(),Barrier { nonce: uuid::Uuid::new_v4(), revision: u64::MAX,
+            observed_at: 1,detail: "Verify".into(),pending: true });
+        state.write(&cache).unwrap();
+        assert!(cache.fixture_verify_identity(KEY,reading(20,UsageSource::Probe,"new@fixture.invalid")).is_err());
+        assert_pending(&cache,20);
     }
 
 }

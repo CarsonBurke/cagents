@@ -105,6 +105,8 @@ const SHELL_SCRUBBED_ENVIRONMENT: &[&str] = &[
 pub enum Outcome {
     /// The account's state, which may be "signed out" or "not installed".
     Answered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<super::cache::IdentityVerification>,
         identity: Option<Identity>,
         snapshot: UsageSnapshot,
         /// The models the CLI listed while it was asked, which a cached
@@ -226,6 +228,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
             snapshot,
             models,
         })) => Outcome::Answered {
+            verification: None,
             catalog: (!models.is_empty()).then(|| Catalog {
                 models,
                 observed_at: snapshot.observed_at,
@@ -241,10 +244,10 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         )),
     };
     let (identity, snapshot, catalog) = match outcome {
-        Outcome::Answered { identity, snapshot, catalog } => (identity, snapshot, catalog),
+        Outcome::Answered { identity, snapshot, catalog, .. } => (identity, snapshot, catalog),
         other => { drop(lock); return other; }
     };
-    let entry = Entry { identity, snapshot };
+    let entry = Entry { verification: None, identity, snapshot };
     let saved_catalog = catalog.clone();
     let provider = account.provider;
     // Keep the provider lock until the causal identity verdict and durable
@@ -264,7 +267,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         Ok::<_, std::io::Error>(entry)
     }).await;
     match committed {
-        Ok(Ok(entry)) => Outcome::Answered { identity: entry.identity, snapshot: entry.snapshot, catalog },
+        Ok(Ok(entry)) => Outcome::Answered { verification: entry.verification, identity: entry.identity, snapshot: entry.snapshot, catalog },
         Ok(Err(error)) => Outcome::Failed(format!("The account verification could not be committed: {error}")),
         Err(_) => Outcome::Failed("The account verification could not be committed".into()),
     }
@@ -341,13 +344,15 @@ fn prepare(
     {
         let mut snapshot = entry.snapshot;
         snapshot.source = UsageSource::Cache;
-        return Prepared::Done(answered(entry.identity, snapshot));
+        return Prepared::Done(Outcome::Answered { verification: entry.verification,
+            identity: entry.identity, snapshot, catalog: None });
     }
     Prepared::Probe { cli, key, lock, verification }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
     Outcome::Answered {
+        verification: None,
         identity,
         snapshot,
         catalog: None,

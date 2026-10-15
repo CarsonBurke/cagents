@@ -68,7 +68,7 @@ async fn refresh_with<F, Fut>(
                     // by an unqualified duplicate write of this old answer.
                     let entry = match &cache {
                         Some(cache) => cache.load(crate::chat::now_ms().unwrap_or(now)).remove(&key),
-                        None => Some(Entry { identity, snapshot }),
+                        None => Some(Entry { verification: None, identity, snapshot }),
                     };
                     if let Some(entry) = entry { entries.insert(key.clone(), entry); }
                     else { entries.remove(&key); }
@@ -133,6 +133,7 @@ mod tests {
             (
                 source.cache_key().unwrap(),
                 Entry {
+                    verification: None,
                     identity: None,
                     snapshot: crate::account::UsageSnapshot::state(
                         crate::account::UsageStatus::Ok,
@@ -144,6 +145,7 @@ mod tests {
             (
                 target.cache_key().unwrap(),
                 Entry {
+                    verification: None,
                     identity: None,
                     snapshot: crate::account::UsageSnapshot::state(
                         crate::account::UsageStatus::Ok,
@@ -186,6 +188,7 @@ mod tests {
                     return std::future::ready(probe::Outcome::Busy);
                 }
                 std::future::ready(probe::Outcome::Answered {
+                    verification: None,
                     identity: Some(crate::account::Identity {
                         email: Some("fixture@example.invalid".into()),
                         ..Default::default()

@@ -603,16 +603,16 @@ impl State {
             // Daemon and other windows share this cache. Adopt newer evidence
             // before scheduling a focus probe, preserving any newer live report.
             if let Some(entry) = restored.entry.filter(|entry| {
-                restored.present
-                    && state
-                        .snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| entry.snapshot.observed_at > snapshot.observed_at)
+                restored.present && account::cache::adopt_identity_verdict(
+                    entry.verification.as_ref(), state.verification.as_ref(),
+                    &entry.snapshot, state.snapshot.as_ref(), false,
+                )
             }) {
                 let mut snapshot = entry.snapshot;
                 snapshot.source = UsageSource::Cache;
                 state.schedule.observe(snapshot.observed_at);
                 state.identity = entry.identity;
+                if entry.verification.is_some() { state.verification = entry.verification; }
                 state.snapshot = Some(snapshot);
                 state.failure = None;
             }
@@ -702,6 +702,7 @@ impl State {
                 Some((
                     state.account.clone(),
                     Entry {
+                        verification: None,
                         identity: state.identity.clone(),
                         snapshot: state.snapshot.clone()?,
                     },
@@ -791,6 +792,7 @@ struct AccountState {
     /// people use one of the two CLIs rather than both.
     present: bool,
     identity: Option<Identity>,
+    verification: Option<account::cache::IdentityVerification>,
     snapshot: Option<UsageSnapshot>,
     schedule: Schedule,
     /// Why the latest probe produced nothing, while the figures on screen
@@ -824,6 +826,7 @@ impl AccountState {
             account,
             present: false,
             identity: None,
+            verification: None,
             snapshot: None,
             schedule: Schedule::default(),
             failure: None,
@@ -2296,7 +2299,8 @@ impl Cagents {
             }
             if let LiveReport::CodexLogin(login) = &report {
                 login_changed |= !login.describes(state.snapshot.as_ref(), state.identity.as_ref());
-            } else if let Some(snapshot) = state.snapshot.as_mut()
+            } else if !state.verification.as_ref().is_some_and(|proof|proof.pending())
+                && let Some(snapshot) = state.snapshot.as_mut()
                 && report.apply(snapshot, observed_at, now)
             {
                 state.schedule.observe(snapshot.observed_at);
@@ -3206,20 +3210,21 @@ impl Cagents {
         let provider = state.account.provider;
         let mut learned = None;
         match outcome {
-            // A delayed probe can finish after a newer daemon/live answer
-            // was adopted. Its origin cannot make older evidence current.
-            Outcome::Answered { snapshot, .. }
-                if state
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|current| snapshot.observed_at < current.observed_at) =>
+            // Causal identity verdicts precede usage wall-clock ordering.
+            // A stale probe without a newer verdict cannot rewind the state.
+            Outcome::Answered { ref snapshot, ref verification, .. }
+                if !account::cache::adopt_identity_verdict(
+                    verification.as_ref(), state.verification.as_ref(),
+                    snapshot, state.snapshot.as_ref(), true,
+                ) =>
             {
                 state.schedule.abandon();
             }
             // Current provider evidence settles this probe.
             Outcome::Answered {
-                identity, snapshot, ..
+                identity, snapshot, verification, ..
             } => {
+                if verification.is_some() { state.verification = verification; }
                 // A changed identity confirms that the login attempt ended,
                 // but accepting that identity for this account is separate.
                 // The attempt ends once the home reports
@@ -3252,7 +3257,8 @@ impl Cagents {
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.
-                if identity.is_some() || snapshot.status == UsageStatus::Unavailable {
+                if identity.is_some() || snapshot.status == UsageStatus::Unavailable
+                    || state.verification.as_ref().is_some_and(|proof|proof.pending()) {
                     state.identity = identity;
                 }
                 if let (Some(key), Some(identity)) =
@@ -5627,6 +5633,7 @@ mod tests {
                 id: id.clone(),
                 present,
                 entry: Some(Entry {
+                    verification: None,
                     identity: None,
                     snapshot: UsageSnapshot::state(status, "", observed_at),
                 }),
@@ -5667,6 +5674,7 @@ mod tests {
                 id: id.clone(),
                 present: true,
                 entry: Some(Entry {
+                    verification: None,
                     identity: None,
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now),
                 }),
@@ -5750,6 +5758,7 @@ mod tests {
         ready.entries.insert(
             "codex:remote-fixture".into(),
             Entry {
+                verification: None,
                 identity: Some(Identity::default()),
                 snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()),
             },
@@ -5836,6 +5845,7 @@ mod tests {
             entries: BTreeMap::from([(
                 key.clone(),
                 Entry {
+                    verification: None,
                     identity: Some(Identity::default()),
                     snapshot: UsageSnapshot::state(
                         UsageStatus::Limited,
@@ -7202,6 +7212,7 @@ mod app_tests {
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: Some(Identity {
                     email: Some(email.into()),
@@ -7543,6 +7554,7 @@ mod app_tests {
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW),
@@ -7751,6 +7763,7 @@ mod app_tests {
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: snapshot.clone(),
@@ -7776,6 +7789,7 @@ mod app_tests {
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: Some(account::Identity {
                     email: Some("someone@example.com".into()),
@@ -7862,6 +7876,7 @@ mod app_tests {
             owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 identity: None,
                 snapshot: snapshot.clone(),
                 catalog: Some(catalog(now - 5_000, "probed")),
@@ -7958,6 +7973,7 @@ mod app_tests {
             owner: app.account_ui.account(&managed).unwrap().owner,
             id: managed.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: probed,
@@ -8028,6 +8044,7 @@ mod app_tests {
         let codex = Account::system(Provider::Codex).id();
         let now = now_ms();
         let cached = |used| Entry {
+            verification: None,
             identity: None,
             snapshot: UsageSnapshot {
                 windows: vec![UsageWindow {
@@ -8081,6 +8098,7 @@ mod app_tests {
             owner: app.account_ui.account(&codex).unwrap().owner,
             id: codex.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: probed.clone(),
@@ -8134,6 +8152,76 @@ mod app_tests {
         assert_eq!(app.account_ui.popover, None);
     }
 
+    #[test]
+    fn identity_verdicts_cross_quota_timestamps_in_restore_and_actual_probe_dispatch() {
+        for delivered_by_probe in [false, true] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let home = root.path().join("home"); std::fs::create_dir(&home).unwrap();
+            let account = Account::managed(Provider::Codex,uuid::Uuid::new_v4(),home);
+            let id = account.id(); let key = account.cache_key().unwrap();
+            let cache = Cache::at(root.path().join("cache"));
+            let reading = |at, email: &str| Entry {
+                verification: None,
+                identity: Some(Identity { email: Some(email.into()), plan: Some("pro".into()), organization: None }),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok,"",at),
+            };
+            let old = reading(100,"old@fixture.invalid");
+            cache.store(&key,old.clone()).unwrap();
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.accounts = vec![AccountState::new(account)];
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true; state.identity = old.identity; state.snapshot = Some(old.snapshot);
+            cache.invalidate_identity(&key,100,"Verify the changed login").unwrap();
+            let pending = cache.load(100).remove(&key).unwrap();
+            app.account_ui.restore(vec![Restored { id: id.clone(), present: true, entry: Some(pending.clone()) }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin,
+                "pending authority must replace equal-time positive quota");
+            assert!(state.identity.is_none());
+            // A real UI live-report dispatch must not turn the pending identity
+            // back into positive display evidence, even at a newer time.
+            let recipe = recipe_on(&app,&id);
+            drop(app.account_reported(Provider::Codex,&recipe,vec![(LiveReport::CodexLimits(account::codex::LimitsUpdate {
+                windows: vec![UsageWindow { key: "codex:session".into(),kind: account::WindowKind::Session,
+                    label: "Session".into(),used: 0.2,resets_at: None,span_secs: None,binding: true }],
+                credits: None,plan: Some("pro".into()),limited: false,
+            }),101)]));
+            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
+            let mut newer_quota = pending.clone(); newer_quota.snapshot.observed_at = 101;
+            cache.store(&key,newer_quota).unwrap();
+            let old_pending = cache.load(101).remove(&key).unwrap();
+            app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(old_pending.clone()) }]);
+            // This is the real pre-auth-token commit API, called through its
+            // test-only fixture. No provider process or native ABI is claimed.
+            let verified = cache.fixture_verify_identity(&key,reading(100,"new@fixture.invalid")).unwrap();
+            assert_eq!(verified.snapshot.observed_at,100,"never fabricate a newer quota timestamp");
+            if delivered_by_probe {
+                drop(app.update(Message::AccountUi(Action::Probed {
+                    owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
+                    outcome: Outcome::Answered { verification: verified.verification.clone(),
+                        identity: verified.identity.clone(),snapshot: verified.snapshot.clone(),catalog: None },
+                })));
+            } else {
+                app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(verified.clone()) }]);
+            }
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
+            assert_eq!(state.snapshot.as_ref().unwrap().observed_at,100);
+            assert!(!state.verification.as_ref().unwrap().pending());
+            // Late negative and unqualified newer positive replies cannot
+            // reverse the retained causal verdict in either adoption path.
+            app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(old_pending.clone()) }]);
+            for entry in [old_pending,reading(200,"unproved@fixture.invalid")] {
+                drop(app.update(Message::AccountUi(Action::Probed {
+                    owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
+                    outcome: Outcome::Answered { verification: entry.verification,
+                        identity: entry.identity,snapshot: entry.snapshot,catalog: None },
+                })));
+            }
+            assert_eq!(app.account_ui.account(&id).unwrap().identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
+        }
+    }
+
     /// A conversation says its account's login changed: the figures shown
     /// no longer describe it, so the account is asked again at once.
     #[test]
@@ -8146,6 +8234,7 @@ mod app_tests {
             owner: app.account_ui.account(&id).unwrap().owner,
             id: id.clone(),
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
@@ -8202,6 +8291,7 @@ mod app_tests {
                 id: id.clone(),
                 present: true,
                 entry: Some(Entry {
+                    verification: None,
                     identity: None,
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now),
                 }),
@@ -8216,6 +8306,7 @@ mod app_tests {
             id: id.clone(),
             owner,
             outcome: Outcome::Answered {
+                verification: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::Limited, "delayed", now - 1),
                 catalog: None,
@@ -8700,6 +8791,7 @@ mod app_tests {
             let _ = app.login_verified(
                 key,
                 Outcome::Answered {
+                    verification: None,
                     catalog: None,
                     identity: Some(Identity {
                         email: Some("cached@example.com".into()),
@@ -8732,6 +8824,7 @@ mod app_tests {
 
     fn answered(identity: Option<&str>, status: UsageStatus) -> Outcome {
         Outcome::Answered {
+            verification: None,
             catalog: None,
             identity: identity.map(|email| Identity {
                 email: Some(email.into()),
@@ -8825,6 +8918,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key: old,
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
@@ -8844,6 +8938,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key,
             outcome: Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW),

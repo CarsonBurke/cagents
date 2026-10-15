@@ -12165,6 +12165,7 @@ mod tests {
                 owner: app.account_ui.probe_owner(&id).unwrap(),
                 id,
                 outcome: account::probe::Outcome::Answered {
+                    verification: None,
                     identity: None,
                     catalog: None,
                     snapshot: account::UsageSnapshot::state(status, "", now),
@@ -14585,6 +14586,7 @@ mod tests {
             owner: app.account_ui.probe_owner(&account).unwrap(),
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
+                verification: None,
                 catalog: None,
                 identity: None,
                 snapshot: crate::account::UsageSnapshot::state(
@@ -18480,6 +18482,7 @@ mod tests {
                 owner: app.account_ui.probe_owner(&id).unwrap(),
                 id: id.clone(),
                 outcome: account::probe::Outcome::Answered {
+                    verification: None,
                     identity: Some(account::Identity {
                         email: Some(email),
                         organization: None,

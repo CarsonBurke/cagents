@@ -44,9 +44,46 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// milliseconds.
 const ORPHAN_AFTER: u64 = 7 * 24 * 3_600_000;
 
+/// Causal ordering for identity verdicts, separate from quota wall-clock time.
+/// This metadata is an observation order, never provider/read authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityVerification {
+    epoch: uuid::Uuid,
+    revision: u64,
+    pending: bool,
+}
+impl IdentityVerification {
+    pub(crate) fn pending(&self) -> bool { self.pending }
+}
+
+/// Compare causal verdicts before usage timestamps. A known later revision
+/// wins even when its provider quota was observed earlier. An older/unproved
+/// positive reply cannot overwrite a retained identity verdict.
+pub(crate) fn adopt_identity_verdict(
+    incoming: Option<&IdentityVerification>,
+    current: Option<&IdentityVerification>,
+    snapshot: &UsageSnapshot,
+    previous: Option<&UsageSnapshot>,
+    allow_equal: bool,
+) -> bool {
+    match (incoming, current) {
+        (Some(new), Some(old)) if new != old => {
+            return new.epoch == old.epoch && new.revision > old.revision;
+        }
+        (Some(_), None) => return true,
+        (None, Some(_)) if !matches!(snapshot.status,
+            super::UsageStatus::NeedsLogin | super::UsageStatus::Unavailable) => return false,
+        _ => {}
+    }
+    previous.is_none_or(|old| snapshot.observed_at > old.observed_at
+        || (allow_equal && snapshot.observed_at == old.observed_at))
+}
+
 /// What is remembered about one account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<IdentityVerification>,
     pub identity: Option<Identity>,
     pub snapshot: UsageSnapshot,
 }
@@ -308,6 +345,7 @@ mod tests {
         let mut snapshot = UsageSnapshot::state(UsageStatus::NeedsLogin, detail, observed_at);
         snapshot.source = UsageSource::Probe;
         Entry {
+            verification: None,
             identity: Some(Identity {
                 email: Some("user@example.com".into()),
                 organization: None,

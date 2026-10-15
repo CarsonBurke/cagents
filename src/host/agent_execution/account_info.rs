@@ -107,6 +107,7 @@ pub(super) fn read(
                     brokered.insert(
                         row.account.id(),
                         Entry {
+                            verification: None,
                             identity: Some(row.identity),
                             snapshot: row.snapshot,
                         },
@@ -199,7 +200,7 @@ pub(super) fn read(
                     identity, snapshot, ..
                 } => apply(
                     &mut info,
-                    Entry { identity, snapshot },
+                    Entry { verification: None, identity, snapshot },
                     crate::chat::now_ms().unwrap_or(now),
                 ),
                 probe::Outcome::Failed(error) => {
