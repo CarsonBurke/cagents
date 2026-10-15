@@ -50,7 +50,7 @@ pub(super) struct State {
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
     activation_generation: u64,
-    activation_attempt: Option<(Weak<WorkspaceState>, bool)>,
+    activation_attempt: Option<(Weak<WorkspaceState>, bool, uuid::Uuid, u64)>,
     #[cfg(test)]
     activation_attempts: usize,
 }
@@ -482,6 +482,7 @@ impl Cagents {
             } => {
                 if self.notification_ui.session_activation == Some(session)
                     && self.notification_ui.activation_generation == generation
+                    && self.activated_automation_agent(session).is_none()
                     && !self
                         .durable
                         .cards
@@ -551,13 +552,19 @@ impl Cagents {
             .notification_ui
             .activation_attempt
             .as_ref()
-            .is_some_and(|(workspace, was_blocked)| {
-                workspace.as_ptr() == Arc::as_ptr(&self.durable) && *was_blocked == blocked
+            .is_some_and(|(workspace, was_blocked, identity, sequence)| {
+                workspace.as_ptr() == Arc::as_ptr(&self.durable)
+                    && *was_blocked == blocked
+                    && *identity == self.workspace_model.identity
+                    && *sequence == self.workspace_model.sequence
             })
         {
             return Task::none();
         }
-        self.notification_ui.activation_attempt = Some((Arc::downgrade(&self.durable), blocked));
+        self.notification_ui.activation_attempt = Some((
+            Arc::downgrade(&self.durable), blocked,
+            self.workspace_model.identity, self.workspace_model.sequence,
+        ));
         if blocked {
             return Task::none();
         }
@@ -565,22 +572,34 @@ impl Cagents {
         {
             self.notification_ui.activation_attempts += 1;
         }
-        let card = self
-            .durable
-            .cards
-            .iter()
-            .find(|card| card.existence.is_open() && card_session(card) == Some(session));
-        let Some(id) = card.map(|card| card.id) else {
-            if self
-                .durable
-                .cards
-                .iter()
-                .any(|card| card_session(card) == Some(session))
-            {
-                self.notification_ui.session_activation = None;
-                self.notification_ui.activation_attempt = None;
-            }
+        // A scheduled agent can remain headless in this window. Only this
+        // explicit user activation may mount its exact authenticated descriptor.
+        let automation = self.activated_automation_agent(session);
+        let existing = self.durable.cards.iter().find(|card| card_session(card) == Some(session));
+        if existing.is_some_and(|card| !card.existence.is_open()) {
+            self.notification_ui.session_activation = None;
+            self.notification_ui.activation_attempt = None;
             return Task::none();
+        }
+        let mut adopted = Task::none();
+        let id = if let Some(card) = existing {
+            if let Some(agent) = &automation {
+                let expected = activation_session(agent).expect("validated activation session");
+                let current = match &card.kind {
+                    CardKind::Chat(session) => crate::agent_execution::HostedSession::Chat(session.clone()),
+                    CardKind::Terminal(session) => crate::agent_execution::HostedSession::Terminal(session.clone()),
+                    _ => unreachable!("session card"),
+                };
+                if !expected.same_process(&current) { return Task::none(); }
+            }
+            card.id
+        } else {
+            let Some(agent) = automation else { return Task::none(); };
+            let Some(task) = self.adopt_execution_agent(&agent) else { return Task::none(); };
+            adopted = task;
+            self.refresh_sidebar_channels();
+            self.persist();
+            CardId::from_uuid(agent.id.as_uuid())
         };
         if self.durable.channels.iter().find(|channel| channel.cards.contains(&id))
             .is_some_and(|channel| self.sidebar_model.project(channel.project_id).is_none())
@@ -590,13 +609,55 @@ impl Cagents {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
         }
-        focus
+        Task::batch([adopted, focus])
+    }
+
+    /// The model comes from the authenticated daemon watch. A session ID alone
+    /// never grants launch authority: require one live owner, its proof, and a
+    /// currently open exact placement. Model ambiguity is deferred, not guessed.
+    fn activated_automation_agent(&self, session: TerminalId) -> Option<crate::agent_execution::Agent> {
+        use crate::agent_execution::{Origin, Placement};
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY { return None; }
+        let mut owners = self.workspace_model.agents.iter().filter(|agent| {
+            !agent.closed && activation_session(agent).is_some_and(|owner| owner.id() == session)
+        });
+        let agent = owners.next()?;
+        if owners.next().is_some() || !matches!(agent.origin, Origin::Automation { .. })
+            || self.project_ui.closed.contains(&agent.spec.target.repository)
+            || self.workspace_model.closed_projects.contains(&agent.spec.target.repository)
+        { return None; }
+        let owner = activation_session(agent)?;
+        let proven = match &owner {
+            crate::agent_execution::HostedSession::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
+            crate::agent_execution::HostedSession::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
+        };
+        if !proven || agent.spec.target.placement.as_ref().is_some_and(|placement| placement != &agent.placement) { return None; }
+        match &agent.placement {
+            Placement::Channel(id) => {
+                let shared = self.workspace_model.channel(*id)?;
+                let local = self.durable.channels.iter().find(|channel| channel.id == *id)?;
+                let project = self.sidebar_model.project(local.project_id)?;
+                if shared.repository != agent.spec.target.repository || project.repository != shared.repository { return None; }
+            }
+            Placement::Worktree { repository, path } => {
+                if repository != &agent.spec.target.repository || self.worktree_view_scope(path).as_ref() != Some(&agent.placement) { return None; }
+            }
+        }
+        Some(agent.clone())
     }
 
     pub(super) fn notification_subscription(&self) -> Subscription<Message> {
         Subscription::run_with(Source(self.notification_ui.receiver.clone()), stream)
             .map(Message::NotificationUi)
     }
+}
+
+/// Match the surface actually shown for this existing actor; never manufacture
+/// a console descriptor or substitute a different session from the same run.
+fn activation_session(agent: &crate::agent_execution::Agent) -> Option<crate::agent_execution::HostedSession> {
+    if agent.spec.surface == crate::agent_execution::Surface::Terminal {
+        agent.console.clone().map(crate::agent_execution::HostedSession::Terminal)
+    } else { agent.session.clone() }
 }
 
 fn test_notice(outcome: Result<TestOutcome, String>) -> TransientNotice {
@@ -1023,6 +1084,134 @@ mod tests {
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
         );
+    }
+
+    fn scheduled_attention_fixture() -> (Cagents, crate::agent_execution::Agent) {
+        use crate::agent_execution::{Agent, Origin, Placement, Spec, Surface, Target as AgentTarget};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/tmp");
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Scheduled".into(), repository.clone(), Vec::new(), Vec::new()));
+        Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
+            id: channel, project_id: project, title: "Scheduled".into(), title_source: Default::default(), ordinal: 0, shared: true, cards: vec![], focused: None,
+        });
+        let CardKind::Terminal(mut console) = super::super::tests::terminal_card_state().kind else { unreachable!() };
+        console.launch.working_directory = repository.clone();
+        console.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("scheduled-host"),
+            boot_id: crate::model::BootId::new("scheduled-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("scheduled-incarnation"),
+        };
+        let placement = Placement::Channel(channel);
+        let agent = Agent {
+            id: crate::model::AgentId::new(), name: None,
+            origin: Origin::Automation { id: uuid::Uuid::new_v4() },
+            spec: Spec { provider: crate::agent::Provider::Claude, account: None,
+                target: AgentTarget { repository: repository.clone(), directory: repository.clone(), placement: Some(placement.clone()) },
+                surface: Surface::Terminal, model: None, permission_mode: None, reasoning_effort: None,
+            }, placement, session: None, console: Some(console), created_ms: 0, closed: false,
+        };
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.sequence = 1;
+        app.workspace_model.channels.push(crate::workspace_model::ModelChannel {
+            id: channel, repository, title: "Scheduled".into(), title_source: Default::default(), ordinal: 0,
+        });
+        (app, agent)
+    }
+
+    #[test]
+    fn attention_activation_adopts_only_the_exact_existing_scheduled_actor_after_watch_arrival() {
+        let (mut app, agent) = scheduled_attention_fixture();
+        let descriptor = activation_session(&agent).unwrap();
+        let session = descriptor.id();
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.durable.cards.is_empty());
+        let unchanged = Arc::as_ptr(&app.durable);
+        app.workspace_model.agents.push(agent.clone());
+        app.workspace_model.sequence += 1;
+        assert_eq!(Arc::as_ptr(&app.durable), unchanged);
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.durable.active_channel, agent.channel());
+        assert!(app.notification_ui.session_activation.is_none());
+        let adopted = app.card_state(card).unwrap();
+        assert!(matches!(&adopted.kind, CardKind::Terminal(actual) if crate::agent_execution::HostedSession::Terminal(actual.clone()).same_process(&descriptor)));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(!app.chat_start_pending(card), "terminal activation cannot start a chat or replay a provider prompt");
+        let cards = app.durable.cards.len();
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert_eq!(app.durable.cards.len(), cards);
+    }
+
+    #[test]
+    fn scheduled_attention_chat_activation_attaches_to_the_existing_native_proof_without_a_prompt() {
+        let (mut app, mut agent) = scheduled_attention_fixture();
+        let console = agent.console.take().unwrap();
+        let session = crate::chat::Session {
+            native_continuity: Default::default(), id: TerminalId::new(), proof: console.continuity.live_proof(),
+            terminal: None, owned_codex_listener: None,
+            launch: crate::chat::Launch { provider: agent.spec.provider, session_id: None, recipe: console.launch },
+        };
+        agent.spec.surface = crate::agent_execution::Surface::Chat;
+        agent.session = Some(crate::agent_execution::HostedSession::Chat(session.clone()));
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.update_notifications(Action::Activated(Target::Session(session.id))));
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(app.chat_start_pending(card), "existing native descriptor is attached, never synthesized");
+        assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(actual) if actual == &session));
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn scheduled_attention_activation_waits_for_modal_and_preserves_local_close() {
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = activation_session(&agent).unwrap().id();
+        app.workspace_model.agents.push(agent.clone());
+        app.settings_reset_confirm = true;
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        let generation = app.notification_ui.activation_generation;
+        drop(app.update_notifications(Action::SessionActivationExpired { session, generation }));
+        assert_eq!(app.notification_ui.session_activation, Some(session));
+        assert!(app.durable.cards.is_empty());
+        app.settings_reset_confirm = false;
+        drop(app.retry_notification_activation());
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        assert_eq!(app.workspace.focused(), Some(card));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.iter_mut().find(|entry| entry.id == card).unwrap().existence = Existence::Closed { tombstone: crate::model::Tombstone {
+            operation_id: None, closed_at_unix_ms: 1, reason: Some("closed locally".into()),
+        }};
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.durable.cards.len(), 1);
+        assert!(app.notification_ui.session_activation.is_none());
+    }
+
+    #[test]
+    fn scheduled_attention_activation_rejects_missing_proof_ambiguous_owner_and_wrong_scope() {
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = activation_session(&agent).unwrap().id();
+        let mut missing = agent.clone();
+        missing.console.as_mut().unwrap().continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: missing.console.as_ref().unwrap().launch.clone(), last_exit: None,
+        };
+        app.workspace_model.agents = vec![missing];
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.durable.cards.is_empty());
+        let mut duplicate = agent.clone();
+        duplicate.id = crate::model::AgentId::new();
+        app.workspace_model.agents = vec![agent.clone(), duplicate];
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.durable.cards.is_empty());
+        let mut wrong_scope = agent;
+        wrong_scope.spec.target.repository = "/other".into();
+        app.workspace_model.agents = vec![wrong_scope];
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.durable.cards.is_empty());
     }
 
     #[test]
