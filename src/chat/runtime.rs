@@ -2197,6 +2197,7 @@ impl Actor {
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        let suppress_current_notification = step.suppress_current_notification;
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -2238,7 +2239,11 @@ impl Actor {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             super::notification::FrameContext::capture(&state)
         };
-        let mut frame_contents = frame_context.project(&step.events);
+        let mut frame_contents = if suppress_current_notification {
+            Default::default()
+        } else {
+            frame_context.project(&step.events)
+        };
         // Preserve decoded outcomes even when the transcript cache fails.
         // Stop further Store writes, then report the original error after
         // this bounded frame's semantic proof has been published.
@@ -2273,7 +2278,7 @@ impl Actor {
             // The disk-backed transcript store consumes text/tool items. Keep
             // their bounded live excerpt before that boundary, without ever
             // hydrating the page a window happens to be reading.
-            if matches!(
+            if !suppress_current_notification && matches!(
                 &event,
                 Event::Item(_) | Event::TextDelta { .. } | Event::TurnStarted | Event::Reset { .. }
             ) {
@@ -2311,12 +2316,18 @@ impl Actor {
                     self.touch();
                 }
                 for event in events {
+                    if suppress_current_notification && matches!(event,
+                        Event::Error { .. } | Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. })
+                    {
+                        continue;
+                    }
                     let content = matches!(&event, Event::TurnFinished { .. })
                         .then(|| frame_contents.pop_front())
                         .flatten();
                     self.apply_with_attention(event, content);
                 }
             } else if let Some(event) = authority {
+                if suppress_current_notification { continue; }
                 let content = matches!(&event, Event::TurnFinished { .. })
                     .then(|| frame_contents.pop_front())
                     .flatten();
@@ -3142,6 +3153,15 @@ pub(crate) fn notification_frames_for_test(
     crate::notifications::Evidence,
     crate::notifications::Content,
 )> {
+    notification_frames_with_snapshot_for_test(adapter, frames, fail_store).0
+}
+
+#[cfg(test)]
+pub(crate) fn notification_frames_with_snapshot_for_test(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+) -> (Vec<(crate::notifications::Evidence, crate::notifications::Content)>, Snapshot) {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
@@ -3199,6 +3219,7 @@ pub(crate) fn notification_frames_for_test(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
+    let snapshot = handle.0.state.lock().unwrap().clone();
     // Retire the actual process before asserting any result, including the
     // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();
@@ -3220,7 +3241,7 @@ pub(crate) fn notification_frames_for_test(
     );
     let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
     receipts.extend(later);
-    receipts
+    (receipts, snapshot)
 }
 
 #[cfg(test)]
@@ -3247,6 +3268,7 @@ mod tests {
             ) -> Result<Step, String> {
                 self.run = Some(run);
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: vec![serde_json::json!({"final":true})],
                     events: vec![
                         Event::Execution {
@@ -3263,6 +3285,7 @@ mod tests {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: Vec::new(),
                     events: vec![
                         Event::Execution {
@@ -4756,6 +4779,7 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
                 writes: vec![json!({"text": "hello"})],
                 events: Vec::new(),
             })
@@ -4765,12 +4789,14 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                suppress_current_notification: false,
                 writes: vec![json!({"text": " world"})],
                 events: Vec::new(),
             })
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
                 writes: Vec::new(),
                 events: vec![Event::TextDelta {
                     id: "echo".into(),
@@ -5394,6 +5420,7 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -5403,6 +5430,7 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: Vec::new(),
                     events: vec![Event::AccountUsage(report())],
                 })
@@ -5466,6 +5494,7 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -5476,6 +5505,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: Vec::new(),
                     events: vec![
                         Event::Session {
@@ -5635,6 +5665,7 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    suppress_current_notification: false,
                     writes: vec![json!({"interrupt": true})],
                     events: Vec::new(),
                 })

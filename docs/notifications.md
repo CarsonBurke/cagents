@@ -19,9 +19,8 @@ Disabling delivery or a category withdraws its current desktop notices without
 marking the journal attention read.
 
 This preference controls notification presentation and the attention journal. It
-does not delete ordinary conversation history or private, bounded semantic replay
-history retained for a native session while its daemon is unavailable. Replay
-records retire after the daemon durably acknowledges them.
+does not delete ordinary conversation history, transcript files or saved run
+results.
 
 Native conversation previews use semantic provider events, independently of the
 transcript page a window is viewing. When the provider supplies no conversation

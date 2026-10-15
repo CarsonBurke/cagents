@@ -192,6 +192,11 @@ impl ProcessSpec {
 }
 #[derive(Debug, Default)]
 pub struct Step {
+    /// The decoder has not qualified this frame as the current turn. Its
+    /// transcript and exact managed execution evidence remain valid, but it
+    /// cannot replace the current conversation's notification context/error.
+    /// This transport-local flag never enters the shared wire codec.
+    pub suppress_current_notification: bool,
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
