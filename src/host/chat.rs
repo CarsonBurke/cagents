@@ -384,7 +384,13 @@ fn attached_mut(
     }
     Ok(record)
 }
+pub(super) fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+    changed_from(host, id, Some(instance), update);
+}
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    changed_from(host, id, None, update);
+}
+fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uuid>, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -416,6 +422,13 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(instance) = instance {
+        if !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance) { return; }
+        if let Err(error) = state.observe_chat_directory_thread(id, instance) {
+            tracing::warn!(%error, "cannot retain the owned provider's confirmed thread");
+            return;
+        }
+    }
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
@@ -1391,7 +1404,7 @@ fn start_with_execution(
                         );
                     }
                 } else {
-                    changed(&weak, id, update);
+                    changed_owned(&weak, id, execution_instance, update);
                 }
             },
         )
