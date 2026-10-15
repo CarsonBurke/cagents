@@ -1675,6 +1675,7 @@ struct Transport {
 /// What to launch, resolved before the session task starts.
 #[derive(Debug, Clone)]
 struct LaunchSpec {
+    initialization_options: Option<serde_json::Value>,
     command: Vec<String>,
     root: PathBuf,
 }
@@ -2363,7 +2364,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
     // `a_superseded_request_is_cancelled_on_the_wire` locks the coupling.
     let mut next_wire_id: i32 = 0;
 
-    let params = match initialize_params(&context.launch.root) {
+    let mut params = match initialize_params(&context.launch.root) {
         Ok(params) => params,
         Err(reason) => {
             teardown(protocol, child, stderr_drain, &context.process_group).await;
@@ -2371,6 +2372,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             return;
         }
     };
+    params.initialization_options = context.launch.initialization_options.clone();
     let initialize = server.request::<request::Initialize>(params);
     next_wire_id += 1;
     let initialized = tokio::select! {
@@ -4734,6 +4736,7 @@ impl LspManager {
         let context = SessionContext {
             key: key.clone(),
             launch: LaunchSpec {
+                initialization_options: server.initialization_options.clone(),
                 command: server.command.clone(),
                 root: key.root.to_path_buf(),
             },
@@ -5038,6 +5041,7 @@ mod tests {
 
     fn server(id: &str, extensions: &[&str], markers: &[&str]) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: vec![crate::settings::LanguageServerLanguage {
                 language_id: id.to_owned(),
@@ -7655,11 +7659,38 @@ mod tests {
     }
 
     #[test]
+    fn initialization_options_reach_the_server_before_document_open() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let options = json!({
+                "checkOnSave": false,
+                "cargo": {"buildScripts": {"enable": false}, "extraArgs": ["--locked", "--offline"]},
+                "procMacro": {"enable": false}
+            });
+            manager.servers[0].initialization_options = Some(options.clone());
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "fn f() {}\n");
+            await_ready(&events, doc).await;
+            let fake = handle_of(&slot).await;
+            fake.wait_for("textDocument/didOpen").await;
+            assert_eq!(fake.entries("initialize")[0].params["initializationOptions"], options);
+            let methods = fake.methods();
+            assert!(methods.iter().position(|method| method == "initialize")
+                < methods.iter().position(|method| method == "textDocument/didOpen"));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
     fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
         block_on(async {
             let (_guard, worktree, file) = workspace();
             // The real launcher runs here: nothing with this name can exist.
             let mut manager = LspManager::new(vec![LanguageServerSettings {
+                initialization_options: None,
                 id: "rust-analyzer".to_owned(),
                 languages: vec![crate::settings::LanguageServerLanguage {
                     language_id: "rust".to_owned(),

@@ -1032,6 +1032,9 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    /// Sent in initialize before the server begins loading its workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1044,6 +1047,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
         root_markers: &[&str],
     ) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: languages
                 .iter()
@@ -1770,6 +1774,13 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
 
     for server in servers {
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} initialization_options exceed 1 MiB", server.id
+            )));
+        }
         let id = server.id.as_str();
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -2852,6 +2863,23 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_server_initialization_options_round_trip_and_are_bounded() {
+        let mut settings = AppSettings::default();
+        let options = serde_json::json!({
+            "checkOnSave": false,
+            "cargo": {"extraArgs": ["--locked", "--offline"]}
+        });
+        settings.language_servers[0].initialization_options = Some(options.clone());
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers[0].initialization_options, Some(options));
+        assert!(decoded.validate().is_ok());
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"oversized": "x".repeat(1024 * 1024)}));
+        assert!(settings.validate().is_err());
+    }
+
     #[test]
     fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
         for cap in [0, 65, usize::MAX] {

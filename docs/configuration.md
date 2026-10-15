@@ -308,10 +308,16 @@ A server entry has these fields:
   matter.
 - `root_markers` (optional): relative paths that mark a project root, such as
   `Cargo.toml`. They cannot contain empty, `.`, or `..` path components. To
-  find a file's project root, cagents checks the file's folder and then each
-  parent folder, and stops at the worktree root. The first folder that contains
-  a marker is the project root. If no folder has a marker, the worktree root is
-  used.
+  find a file's project root, cagents checks its ancestors up to the worktree
+  root on a background worker. Rust files prefer the topmost Cargo workspace;
+  JavaScript and TypeScript files prefer an npm/pnpm workspace or TypeScript
+  project-reference root. Otherwise the nearest marker wins. With no marker,
+  the worktree root is used. Documents can also join an existing ancestor
+  server in the same worktree.
+- `initialization_options` (optional): server-specific JSON-compatible TOML data,
+  sent in the first `initialize` request before workspace loading. It is limited
+  to 1 MiB of encoded JSON. For example, `initialization_options = { checkOnSave = false }`
+  configures rust-analyzer startup; supported keys depend on the server.
 
 An extension can belong to only one server.
 
