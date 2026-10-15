@@ -125,7 +125,7 @@ pub enum AgentCommand {
         #[arg(long)]
         interrupted: bool,
         /// Include other callers; available only to the user, never session agents.
-        #[arg(long, requires = "interrupted")]
+        #[arg(long, requires = "interrupted", conflicts_with = "agent")]
         all: bool,
     },
 }
@@ -1616,7 +1616,7 @@ mod tests {
             vec!["cagents", "agent", "close", "1234", "--interrupted"],
             vec!["cagents", "agent", "close", "1234", "--all"],
         ] {
-            assert!(Cli::try_parse_from(args).is_err());
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "unexpectedly accepted {args:?}");
         }
     }
     use super::*;
