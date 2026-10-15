@@ -287,8 +287,14 @@ impl HostedSession {
     /// requires a complete issued proof before comparing current descriptors.
     pub(crate) fn has_complete_proof(&self) -> bool {
         match self {
-            Self::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
-            Self::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
+            Self::Chat(session) => session
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete),
+            Self::Terminal(session) => session
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete()),
         }
     }
 

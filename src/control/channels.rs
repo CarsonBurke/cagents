@@ -23,8 +23,13 @@ fn current_agent_pane(agent: &crate::agent_execution::Agent, pane: &Pane) -> boo
         _ => return false,
     };
     source.has_complete_proof()
-        && (agent.session.as_ref().is_some_and(|current| current.same_process(&source))
-            || agent.console.as_ref().is_some_and(|console| HostedSession::Terminal(console.clone()).same_process(&source)))
+        && (agent
+            .session
+            .as_ref()
+            .is_some_and(|current| current.same_process(&source))
+            || agent.console.as_ref().is_some_and(|console| {
+                HostedSession::Terminal(console.clone()).same_process(&source)
+            }))
 }
 
 fn find_pane<'a>(
@@ -78,8 +83,10 @@ fn find_pane<'a>(
         view.panes.iter().filter_map(move |pane| {
             let matches = match requested_agent {
                 Some(agent) => current_agent_pane(agent, pane),
-                None => pane.id.to_string() == target
-                    || session_id(pane).is_some_and(|id| id.to_string() == target),
+                None => {
+                    pane.id.to_string() == target
+                        || session_id(pane).is_some_and(|id| id.to_string() == target)
+                }
             };
             matches.then_some((view, pane))
         })
@@ -402,13 +409,25 @@ mod tests {
         let mut alias_only = model.clone();
         alias_only.views[0].panes[0].id = CardId::new();
         let alias = alias_only.views[0].panes[0].clone();
-        assert_eq!(find_pane(&alias_only, &alias.id.to_string()).unwrap().1, &alias);
-        assert_eq!(find_pane(&alias_only, &session_id(&alias).unwrap().to_string()).unwrap().1, &alias);
+        assert_eq!(
+            find_pane(&alias_only, &alias.id.to_string()).unwrap().1,
+            &alias
+        );
+        assert_eq!(
+            find_pane(&alias_only, &session_id(&alias).unwrap().to_string())
+                .unwrap()
+                .1,
+            &alias
+        );
         let mut replaced = model.clone();
-        let CardKind::Terminal(session) = &mut replaced.views[0].panes[0].kind else { unreachable!() };
+        let CardKind::Terminal(session) = &mut replaced.views[0].panes[0].kind else {
+            unreachable!()
+        };
         session.id = TerminalId::new();
         let mut unproved = model.clone();
-        let CardKind::Terminal(session) = &mut unproved.views[0].panes[0].kind else { unreachable!() };
+        let CardKind::Terminal(session) = &mut unproved.views[0].panes[0].kind else {
+            unreachable!()
+        };
         session.continuity = TerminalContinuity::Live {
             host_session_id: HostSessionId::new(""),
             boot_id: BootId::new("boot"),
@@ -416,7 +435,11 @@ mod tests {
         };
         unproved.agents[0].session = Some(HostedSession::Terminal(session.clone()));
         for invalid in [alias_only, replaced, unproved] {
-            for handle in ["worker".into(), model.agents[0].id.to_string(), model.agents[0].id.to_string()[..8].to_owned()] {
+            for handle in [
+                "worker".into(),
+                model.agents[0].id.to_string(),
+                model.agents[0].id.to_string()[..8].to_owned(),
+            ] {
                 assert_eq!(find_pane(&invalid, &handle).unwrap_err().kind, "not_found");
             }
         }
