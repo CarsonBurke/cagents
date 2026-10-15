@@ -88,9 +88,10 @@ impl Content {
         if !markdown.contains(['\r', '\0'])
             && let Some(mut fence) = self.open_fence.take()
             && !fence.advance(markdown)
-            && let Some(Item::CodeBlock { code, .. }) = self.items.last_mut()
+            && let Some(Item::CodeBlock { code, reader_source, .. }) = self.items.last_mut()
         {
             self.state.leftover.push_str(markdown);
+            reader_source.append(code, markdown);
             code.push_str(markdown);
             self.open_fence = Some(fence);
             return;
@@ -176,6 +177,10 @@ impl Content {
             match (previous, current) {
                 (Item::Paragraph(previous), Item::Paragraph(current)) => current.record_prefix(previous),
                 (Item::Heading(old_level, previous), Item::Heading(level, current)) if old_level == level => current.record_prefix(previous),
+                (Item::CodeBlock { language: old_language, code: old, reader_source: previous, .. },
+                 Item::CodeBlock { language, code, reader_source, .. }) if old_language == language => {
+                    *reader_source = super::reader_source::Source::updated(previous, old, code);
+                }
                 _ => {},
             }
         }
@@ -252,6 +257,8 @@ pub enum Item {
         code: String,
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
+        /// Stable source digest and bounded append proof for nested reader geometry.
+        reader_source: super::reader_source::Source,
     },
     /// A list.
     List {
@@ -834,6 +841,7 @@ fn parse_with<'a>(
                     &mut stack,
                     Item::CodeBlock {
                         language: code_language.take(),
+                        reader_source: super::reader_source::Source::new(&code),
                         code: mem::take(&mut code),
                         lines: code_lines.drain(..).collect(),
                     },

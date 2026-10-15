@@ -421,8 +421,8 @@ impl Renderer {
                 heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)))
             }
             Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0))),
-            Item::CodeBlock { language, code, .. } => {
-                self.code_block(settings, language.as_deref(), code)
+            Item::CodeBlock { language, code, reader_source, .. } => {
+                self.code_block(settings, language.as_deref(), code, reader_source)
             }
             Item::List { start, bullets } => self.list(settings, *start, bullets),
             Item::Quote(items) => {
@@ -592,6 +592,7 @@ impl Renderer {
         settings: markdown::Settings,
         language: Option<&str>,
         code: &str,
+        reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
         let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT).then(|| self.blocks.get(&fence_key(language.unwrap_or_default(), code))).flatten()
             .cloned()
@@ -606,15 +607,15 @@ impl Renderer {
             Some(self.logical(Arc::from(""), 0)),
         );
         step::code_frame(
-            scroll::block(widget::scrollable(
+            scroll::block_source(widget::scrollable(
                 widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16])
-                    .min_width(self.reader_memory.reader_width(self.reader_context.as_deref(),
-                        selection::logical_identity(&self.item, &self.path))),
+                    .min_width(self.reader_memory.reader_width_for(self.reader_context.as_deref(),
+                        selection::logical_identity(&self.item, &self.path), reader_source)),
             )
             .direction(iced::widget::scrollable::Direction::Horizontal(
                 design::scrollbar(),
             )).id(scroll::block_id(self.target, self.reader_context.as_deref(), selection::logical_identity(&self.item, &self.path))), self.reader_memory.clone(), self.reader_context.clone(),
-                selection::logical_identity(&self.item, &self.path), false),
+                selection::logical_identity(&self.item, &self.path), false, Some(reader_source.clone())),
             Some(
                 language
                     .and_then(fence_language)

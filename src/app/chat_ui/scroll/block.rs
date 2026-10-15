@@ -5,17 +5,22 @@ use iced::advanced::clipboard::DndDestinationRectangles;
 
 pub(super) type Key = (Option<String>, u64);
 #[derive(Clone, Copy)]
-pub(super) struct Saved { position: Point, at_end: bool, used: u64, pub(super) content_width: f32 }
+pub(super) struct Saved { position: Point, at_end: bool, used: u64, pub(super) content_width: f32, pub(super) source: Option<blake3::Hash> }
 #[derive(Default)]
 pub(super) struct Positions { pub(super) entries: HashMap<Key, Saved>, clock: u64 }
 
 
 pub(in crate::app::chat_ui) fn block<'a>(content: impl Into<Element<'a, Message>>,
     memory: Memory, context: Option<String>, identity: u64, bottom: bool) -> Element<'a, Message> {
-    Element::new(Block { content: content.into(), memory, key: (context, identity), bottom })
+    block_source(content, memory, context, identity, bottom, None)
 }
-struct Block<'a> { content: Element<'a, Message>, memory: Memory, key: Key, bottom: bool }
-struct Mounted(Option<Key>);
+pub(in crate::app::chat_ui) fn block_source<'a>(content: impl Into<Element<'a, Message>>,
+    memory: Memory, context: Option<String>, identity: u64, bottom: bool,
+    source: Option<super::super::reader_source::Source>) -> Element<'a, Message> {
+    Element::new(Block { content: content.into(), memory, key: (context, identity), bottom, source })
+}
+struct Block<'a> { content: Element<'a, Message>, memory: Memory, key: Key, bottom: bool, source: Option<super::super::reader_source::Source> }
+struct Mounted(Option<(Key, Option<blake3::Hash>)>);
 struct Position { restore: Option<Saved>, bottom: bool, saved: Option<Saved>, changed: bool }
 impl Operation for Position {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -36,10 +41,17 @@ impl Operation for Position {
             }
         }
         self.saved = Some(Saved { position: Point::new(translation.x, translation.y),
-            at_end: travel - translation.y <= 0.5, used: 0, content_width: content.width });
+            at_end: travel - translation.y <= 0.5, used: 0, content_width: content.width, source: None });
     }
 }
 impl Block<'_> {
+    fn accepts(&self, previous: Option<blake3::Hash>) -> bool {
+        match (&self.source, previous) {
+            (None, None) => true,
+            (Some(source), Some(previous)) => source.accepts(previous),
+            _ => false,
+        }
+    }
     fn observe(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &cosmic::Renderer) {
         let mut read = Position { restore: None, bottom: self.bottom, saved: None, changed: false };
         self.content.as_widget_mut().operate(tree, layout, renderer, &mut read);
@@ -47,6 +59,7 @@ impl Block<'_> {
             let mut memory = self.memory.1.borrow_mut();
             memory.clock = memory.clock.wrapping_add(1);
             saved.used = memory.clock;
+            saved.source = self.source.as_ref().map(|source| source.digest());
             if !memory.entries.contains_key(&self.key) && memory.entries.len() >= 1024 {
                 if let Some(key) = memory.entries.iter().min_by_key(|(_, saved)| saved.used).map(|(key, _)| key.clone()) {
                     memory.entries.remove(&key);
@@ -62,7 +75,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Block<'_> {
     fn children(&self) -> Vec<Tree> { vec![Tree::new(&self.content)] }
     fn diff(&mut self, tree: &mut Tree) {
         let mounted = tree.state.downcast_mut::<Mounted>();
-        if mounted.0.as_ref().is_some_and(|key| key != &self.key) {
+        if mounted.0.as_ref().is_some_and(|(key, source)| key != &self.key || !self.accepts(*source)) {
             // A reused tree belongs to another logical reader. Its default
             // is native top-left/bottom-follow, never the preceding key's offset.
             tree.children = vec![Tree::new(&self.content)];
@@ -74,9 +87,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Block<'_> {
     fn layout(&mut self, tree: &mut Tree, renderer: &cosmic::Renderer, limits: &layout::Limits) -> layout::Node {
         let mut node = self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits);
         let mounted = tree.state.downcast_mut::<Mounted>();
-        if mounted.0.as_ref() != Some(&self.key) {
-            mounted.0 = Some(self.key.clone());
-            let saved = self.memory.1.borrow().entries.get(&self.key).copied();
+        if mounted.0.as_ref() != Some(&(self.key.clone(), self.source.as_ref().map(|source| source.digest()))) {
+            mounted.0 = Some((self.key.clone(), self.source.as_ref().map(|source| source.digest())));
+            let saved = self.memory.1.borrow().entries.get(&self.key).copied().filter(|saved| self.accepts(saved.source));
             let mut restore = Position { restore: saved, bottom: self.bottom, saved: None, changed: false };
             self.content.as_widget_mut().operate(&mut tree.children[0], Layout::new(&node), renderer, &mut restore);
             if restore.changed { node = self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits); }
@@ -123,6 +136,43 @@ mod tests {
             _: Vector, state: &mut dyn operation::Scrollable) {
             state.scroll_to(iced::widget::scrollable::AbsoluteOffset { x: Some(100.0), y: Some(300.0) });
         }
+    }
+    #[test]
+    fn replaced_source_resets_same_tree_width_and_offsets_but_append_and_reload_preserve_them() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 200.0));
+        let memory = Memory::default();
+        let original = super::super::super::reader_source::Source::new("wide");
+        let make = |source: super::super::super::reader_source::Source, width: f32| {
+            let remembered = memory.reader_width_for(None, 7, &source);
+            block_source(widget::scrollable(widget::container(widget::Space::new().width(width).height(2000))
+                .min_width(remembered)).direction(iced::widget::scrollable::Direction::Both {
+                    vertical: design::scrollbar(), horizontal: design::scrollbar(),
+                }).width(Length::Fill).height(Length::Fill), memory.clone(), None, 7, false, Some(source))
+        };
+        let mut element = make(original.clone(), 2000.0);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut Move);
+        let mut grown = original.clone(); grown.append("wide", " append");
+        let mut next = make(grown.clone(), 100.0);
+        next.as_widget_mut().diff(&mut tree);
+        next.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let saved = memory.1.borrow().entries[&(None, 7)];
+        assert_eq!(saved.position.x, 100.0);
+        assert!(saved.content_width >= 2000.0);
+        drop(tree); drop(element); drop(next);
+        let mut reloaded = make(super::super::super::reader_source::Source::new("wide append"), 100.0);
+        let mut tree = Tree::new(&reloaded);
+        reloaded.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!(memory.1.borrow().entries[&(None, 7)].position.x, 100.0);
+        let mut replaced = make(super::super::super::reader_source::Source::new("short"), 100.0);
+        replaced.as_widget_mut().diff(&mut tree);
+        replaced.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let saved = memory.1.borrow().entries[&(None, 7)];
+        assert_eq!(saved.position.x, 0.0, "replacement must not inherit old native x");
+        assert!(saved.content_width <= 400.0, "removed wide row must not leave a phantom range");
+        assert_eq!(saved.position.y, 0.0, "replacement restores native top anchoring");
     }
     #[test]
     fn nested_positions_survive_tree_eviction_without_retaining_widget_state() {
