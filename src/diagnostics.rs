@@ -673,12 +673,25 @@ pub struct Report {
     pub products: Vec<ProductReport>,
     pub holders_readable: bool,
     pub holders: Vec<HolderReport>,
+    pub transcript_caches: Option<crate::transcript_cache::Usage>,
 }
 impl Report {
     pub fn human(&self) -> String {
-        let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
+        let mut lines = vec![
+            format!(
+                "cagents {} (protocol {})",
+                self.cli_version, self.cli_protocol
+            ),
             format!("Private diagnostics: {}", self.path.display()),
-            "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
+            "Sibling versions and health are last observed, not a live check.".into(),
+        ];
+        match &self.transcript_caches {
+            Some(usage) => lines.push(format!(
+                "Transcript caches: {} ({} bytes)",
+                usage.count, usage.bytes
+            )),
+            None => lines.push("Transcript caches: unavailable".into()),
+        }
         for product in &self.products {
             match &product.last_observed {
                 Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
@@ -728,9 +741,9 @@ impl Report {
     }
 }
 
-/// Reads recorded lifecycle evidence and a read-only procfs snapshot of live
-/// holders. It never starts services or connects to runtime sockets. Absence
-/// of recorded evidence is not proof of a clean shutdown.
+/// Reads recorded lifecycle evidence, current transcript-cache file metadata
+/// and a read-only procfs snapshot of holders. Never starts services or opens
+/// runtime sockets or databases. Absence does not prove clean shutdown.
 pub fn inspect() -> io::Result<Report> {
     let mut report = inspect_at(state_path()?)?;
     (report.holders_readable, report.holders) = observe_holders();
@@ -760,6 +773,14 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         products,
         holders_readable: true,
         holders: Vec::new(),
+        transcript_caches: crate::daemon::RuntimePaths::discover()
+            .ok()
+            .and_then(|paths| {
+                paths
+                    .socket
+                    .parent()
+                    .and_then(|root| crate::transcript_cache::usage(root).ok())
+            }),
     })
 }
 
