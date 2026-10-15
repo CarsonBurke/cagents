@@ -1718,7 +1718,8 @@ impl State {
             .map_or(0, |index| index + 1);
         let next = (0..files.len())
             .map(|offset| files[(start + offset) % files.len()])
-            .find(|index| !self.files[*index].viewed);
+            .find(|index| !self.files[*index].viewed
+                && (!self.only_changed_since_viewed || self.files[*index].changed_since_viewed));
         if let Some(index) = next {
             if self.files[index].sync == ViewedSync::Unknown {
                 self.pages.wanted = Some(self.files[index].entry.path.clone());
@@ -1801,7 +1802,8 @@ impl State {
             .as_ref()
             .and_then(|path| self.file_index(path))
             .and_then(|index| files.iter().position(|file| *file == index));
-        let visible = |index: &&usize| !self.hide_viewed || !self.files[**index].viewed;
+        let visible = |index: &&usize| (!self.hide_viewed || !self.files[**index].viewed)
+            && (!self.only_changed_since_viewed || self.files[**index].changed_since_viewed);
         let next = if direction > 0 {
             files
                 .iter()
@@ -2232,7 +2234,8 @@ impl State {
                 .into(),
             icon_button(Icon::ChevronRight, "Next unviewed file")
                 .on_press_maybe(
-                    (!modal_open && self.files.iter().any(|file| !file.viewed))
+                    (!modal_open && self.files.iter().any(|file| !file.viewed
+                        && (!self.only_changed_since_viewed || file.changed_since_viewed)))
                         .then_some(Action::NextUnviewed),
                 )
                 .into(),

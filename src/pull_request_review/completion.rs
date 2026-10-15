@@ -306,6 +306,38 @@ mod tests {
         assert!(!state.files[0].changed_since_viewed);
     }
     #[test]
+    fn changed_since_viewed_navigation_stays_inside_the_filtered_files() {
+        for mode in [FileListMode::Tree, FileListMode::Flat] {
+            let (mut state, _) = state();
+            state.target = Some(target(1));
+            state.adopt(&loaded(
+                vec![entry("a.rs", ChangeKind::Modified), entry("b.rs", ChangeKind::Modified), entry("c.rs", ChangeKind::Modified)],
+                vec![remote_file("a.rs", false), remote_file("b.rs", false), remote_file("c.rs", false)],
+            ));
+            state.files[0].changed_since_viewed = true;
+            state.files[2].changed_since_viewed = true;
+            drop(state.update(super::super::Action::SetFileListMode(mode)));
+            drop(state.update(super::super::Action::ToggleChangedSinceViewed));
+            state.select_file(RepoPath::parse("a.rs").unwrap());
+            drop(state.update(super::super::Action::NextFile));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "c.rs");
+            drop(state.update(super::super::Action::PreviousFile));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "a.rs");
+            drop(state.update(super::super::Action::NextUnviewed));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "c.rs");
+            drop(state.update(super::super::Action::NextUnviewed));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "a.rs");
+            state.files.iter_mut().for_each(|file| file.changed_since_viewed = false);
+            drop(state.update(super::super::Action::NextFile));
+            drop(state.update(super::super::Action::NextUnviewed));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "a.rs");
+            drop(state.update(super::super::Action::ToggleChangedSinceViewed));
+            drop(state.update(super::super::Action::NextFile));
+            assert_eq!(state.selected.as_ref().unwrap().display(), "b.rs");
+        }
+    }
+
+    #[test]
     fn uncertain_control_write_blocks_navigation_until_successful_reconciliation() {
         let (mut state,_)=state();state.target=Some(target(1));state.completion.uncertain=true;
         assert!(state.completion.blocker().is_some());
