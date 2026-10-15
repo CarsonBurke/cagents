@@ -172,6 +172,8 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
             Ok(Reply::DisposableIgnoredDirectories {directories:service.disposable_ignored_directories(&path,&cancellation).map_err(|error|error.to_string())?})
         }
         Operation::SetupIntent {repository,path}=>setup::read(&service,&store,&repository,&path,&cancellation),
+        Operation::SetupIntents {repository}=>setup::list(&service,&store,&repository,&cancellation),
+        Operation::BusySessions {..}|Operation::CloseSessions {..}=>Err("Session census and guarded close require the owning daemon".into()),
         Operation::ResumeSetup {repository,path,expected_run_id,expected_plan_fingerprint,trust,skip}=> {
             let (report,primary)=setup::report(&service,&store,&repository,&path,&cancellation)?;
             let request=report.request.as_ref().expect("validated request");
