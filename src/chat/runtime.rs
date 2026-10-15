@@ -8153,7 +8153,7 @@ mod tests {
         }
     }
 
-    fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
+    pub(super) fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
         struct TlsCleanup {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>,finished:crossbeam_channel::Sender<()>}
         impl Drop for TlsCleanup {
             fn drop(&mut self) {let _=self.entered.send(());let _=self.release.recv_timeout(Duration::from_secs(5));let _=self.finished.send(());}
