@@ -39,23 +39,67 @@ fn eligible(part:&RawSourcePart)->Result<(),String> {
     if part.source_len>chat::source_owners::SOURCE_BYTES {return Err("This original call exceeds the 32 MiB display limit.".into());}
     Ok(())
 }
+/// One attempt shares its input slot with every recipe/future clone. Cancel
+/// withdraws an unstarted restored body immediately, before reader admission.
+/// The real allocation remains ledger-charged through background destruction.
+struct ReadInput {
+    cancelled:tokio::sync::watch::Sender<bool>,offline:Mutex<Option<Arc<str>>>,
+    #[cfg(test)] preparation_probe:Mutex<Option<(std::sync::mpsc::Sender<std::thread::ThreadId>,std::sync::mpsc::Receiver<()>)>>,
+}
+impl ReadInput {
+    fn new(offline:Option<Arc<str>>)->Arc<Self> {
+        let(cancelled,_)=tokio::sync::watch::channel(false);
+        Arc::new(Self {cancelled,offline:Mutex::new(offline),#[cfg(test)] preparation_probe:Mutex::new(None)})
+    }
+    fn is_cancelled(&self)->bool {*self.cancelled.borrow()}
+    fn take(&self)->Option<Arc<str>> {self.offline.lock().unwrap_or_else(|error|error.into_inner()).take()}
+    fn cancel(&self) {self.cancelled.send_replace(true);if let Some(text)=self.take() {retire(text);}}
+    async fn cancelled(&self) {
+        let mut changes=self.cancelled.subscribe();if *changes.borrow() {return;}
+        while changes.changed().await.is_ok() {if *changes.borrow() {return;}}
+    }
+    #[cfg(test)]
+    fn before_preparation(&self) {
+        if let Some((started,release))=self.preparation_probe.lock().unwrap_or_else(|error|error.into_inner()).take() {
+            let _=started.send(std::thread::current().id());let _=release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+impl Drop for ReadInput {fn drop(&mut self) {if let Some(text)=self.offline.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(text);}}}
+async fn interruptible<T>(input:Option<&ReadInput>,work:impl std::future::Future<Output=T>)->Result<T,String> {
+    match input {Some(input)=>tokio::select! {biased; _=input.cancelled()=>Err("Original loading was cancelled.".into()),value=work=>Ok(value)},None=>Ok(work.await)}
+}
+fn prepare(part:RawSourcePart,text:Arc<str>,input:Option<Arc<ReadInput>>,deadline:Instant,
+    reader:tokio::sync::OwnedSemaphorePermit,capacity:chat::source_owners::ReaderCapacity)->Result<Pending,String> {
+    #[cfg(test)] if let Some(input)=&input {input.before_preparation();}
+    if input.as_ref().is_some_and(|input|input.is_cancelled()) {return Err("Original loading was cancelled.".into());}
+    let key=tail_digest(0,&text);let prefixes=prefixes(&text);
+    if input.as_ref().is_some_and(|input|input.is_cancelled()) {return Err("Original loading was cancelled.".into());}
+    Ok(Pending {part,text,key,prefixes,deadline,_reader:reader,_capacity:capacity})
+}
 struct Pending {
     part:RawSourcePart,text:Arc<str>,key:u64,prefixes:Arc<Vec<[u8;32]>>,deadline:Instant,
     _reader:tokio::sync::OwnedSemaphorePermit,_capacity:chat::source_owners::ReaderCapacity,
 }
 /// The same two readers bound prose, patches and original calls, including
 /// their admission waits and queued completed outputs.
-async fn read<F,Fut>(part:RawSourcePart,mut fetch:F)->Result<Pending,String>
+#[cfg(test)]
+async fn read<F,Fut>(part:RawSourcePart,fetch:F)->Result<Pending,String>
+where F:FnMut(RawSourceQuery)->Fut,Fut:std::future::Future<Output=Result<RawSourcePage,SourceError>> {
+    read_with_input(part,None,fetch).await
+}
+async fn read_with_input<F,Fut>(part:RawSourcePart,input:Option<Arc<ReadInput>>,mut fetch:F)->Result<Pending,String>
 where F:FnMut(RawSourceQuery)->Fut,Fut:std::future::Future<Output=Result<RawSourcePage,SourceError>> {
     eligible(&part)?;
     let deadline=Instant::now()+Duration::from_secs(40);
     tokio::time::timeout(Duration::from_secs(40),async move {
-        let reader=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Original loading stopped.".to_owned())?;
+        let reader=interruptible(input.as_deref(),chat::source_owners::readers().clone().acquire_owned()).await?
+            .map_err(|_|"Original loading stopped.".to_owned())?;
         let capacity=chat::source_owners::ReaderCapacity::default();let mut text=String::with_capacity(part.source_len);capacity.set(text.capacity());
         let mut offset=0;
         loop {
-            let page=fetch(RawSourceQuery {source:part.source.clone(),field:part.field,offset,limit:chat::cache::PAGE_BYTES,
-                expected_epoch:Some(part.epoch),until:Some(part.source_len)}).await
+            let page=interruptible(input.as_deref(),fetch(RawSourceQuery {source:part.source.clone(),field:part.field,offset,limit:chat::cache::PAGE_BYTES,
+                expected_epoch:Some(part.epoch),until:Some(part.source_len)})).await?
                 .map_err(|_|"The original call changed or is unavailable. Reconnect and retry.".to_owned())?;
             if page.source!=part.source || page.field!=part.field || page.epoch!=part.epoch || page.metadata!=part.metadata
                 || page.source_len!=part.source_len || page.offset!=offset || page.text.len()>chat::cache::PAGE_BYTES
@@ -66,12 +110,8 @@ where F:FnMut(RawSourceQuery)->Fut,Fut:std::future::Future<Output=Result<RawSour
             text.push_str(&page.text);offset=page.next_offset;if page.complete {break;}
         }
         capacity.set(text.capacity().saturating_add(text.len()));let text:Arc<str>=Arc::from(text);capacity.set(text.len());
-        tokio::task::spawn_blocking(move || {
-            // All source hashing is performed on the reader worker. The final
-            // canonical reader port adopts this immutable allocation directly.
-            let key=tail_digest(0,&text);let prefixes=prefixes(&text);
-            Pending {part,text,key,prefixes,deadline,_reader:reader,_capacity:capacity}
-        }).await.map_err(|_|"Original call preparation stopped.".to_owned())
+        tokio::task::spawn_blocking(move || prepare(part,text,input,deadline,reader,capacity))
+            .await.map_err(|_|"Original call preparation stopped.".to_owned())?
     }).await.map_err(|_|"The original call could not be read in time.".to_owned())?
 }
 static REVISIONS:AtomicU64=AtomicU64::new(1);
@@ -94,9 +134,15 @@ fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
     Arc::new(values)
 }
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
-struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,input:Option<Arc<ReadInput>>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 struct Disclosure {epoch:SourceEpoch,rehydrating:bool}
-impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,loaded:None,restored:None,error:None}}}
+impl Entry {
+    fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,input:None,loaded:None,restored:None,error:None}}
+    fn cancel_request(&mut self)->bool {
+        let pending=self.attempt.take().is_some();if let Some(input)=self.input.take() {input.cancel();}pending
+    }
+    fn arm(&mut self,attempt:u64) {self.cancel_request();self.attempt=Some(attempt);self.input=Some(ReadInput::new(self.restored.clone()));}
+}
 #[derive(Default)]
 pub(super) struct State {intents:disclosure_intent::Cache<Key,Disclosure>,entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
@@ -110,7 +156,7 @@ impl State {
     pub(super) fn evict(&mut self) {
         let mut changed=false;
         for entry in self.entries.values_mut() {
-            let mut entry_changed=entry.attempt.take().is_some();
+            let mut entry_changed=entry.cancel_request();
             if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;entry.error=None;retire_loaded(loaded);entry_changed=true;}
             if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);entry_changed=true;}
             if entry_changed {entry.revision=next_revision();}changed |=entry_changed;
@@ -164,7 +210,7 @@ impl State {
         for entry in self.entries.values_mut() {
             if entry.opened && entry.loaded.is_none() && entry.restored.is_none() && entry.attempt.is_none() && entry.error.is_none() {
                 match eligible(&entry.part) {
-                    Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);entry.revision=next_revision();},
+                    Ok(())=>{self.next=self.next.wrapping_add(1);entry.arm(self.next);entry.revision=next_revision();},
                     Err(error)=>entry.error=Some(error),
                 }
                 self.revision=self.revision.wrapping_add(1);
@@ -179,8 +225,8 @@ impl State {
         let Some(key)=self.key(item,field) else {return;};let Some(entry)=self.entries.get_mut(&key) else {return;};
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
-            match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.rehydrating=false;entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
+            match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.arm(self.next);},Err(error)=>entry.error=Some(error)}
+        } else {entry.rehydrating=false;entry.cancel_request();if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}if let Some(text)=entry.restored.take() {retire(text);}}
         entry.revision=next_revision();self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
@@ -259,14 +305,14 @@ impl State {
         if let Err(error)=validation {retire(view);return Err(error);}
         for (text,proof) in view.calls {
             let key=Key {source:proof.source,field:proof.field};let entry=self.entries.get_mut(&key).expect("validated raw source");
-            entry.opened=true;if let Some(old)=entry.restored.replace(text) {retire(old);}entry.revision=next_revision();self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);
+            entry.opened=true;if let Some(old)=entry.restored.replace(text) {retire(old);}entry.revision=next_revision();self.next=self.next.wrapping_add(1);entry.arm(self.next);
         }
         self.restore_notice(None);self.revision=self.revision.wrapping_add(1);Ok(())
     }
 }
 impl Drop for State {fn drop(&mut self) {self.clear();}}
 #[derive(Clone)]
-struct Request {target:Target,key:Key,context:u64,attempt:u64,part:RawSourcePart,handle:Option<ClientHandle>,offline:Option<Arc<str>>}
+struct Request {target:Target,key:Key,context:u64,attempt:u64,part:RawSourcePart,handle:Option<ClientHandle>,offline:bool,input:Arc<ReadInput>}
 impl PartialEq for Request {fn eq(&self,other:&Self)->bool {self.target==other.target && self.key==other.key && self.context==other.context && self.attempt==other.attempt}}
 impl Eq for Request {}
 impl std::hash::Hash for Request {fn hash<H:std::hash::Hasher>(&self,state:&mut H) {use std::hash::Hash;std::any::TypeId::of::<Self>().hash(state);self.target.hash(state);self.key.hash(state);self.context.hash(state);self.attempt.hash(state);}}
@@ -277,20 +323,26 @@ impl Drop for ReplySlot {fn drop(&mut self) {if let Some(value)=self.0.get_mut()
 fn stream(request:&Request)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Send>> {
     let request=request.clone();Box::pin(iced::futures::stream::once(async move {
         let result=tokio::time::timeout(Duration::from_secs(40),async {
-            let pending=if let Some(text)=request.offline {
-                let reader=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Original loading stopped.".to_owned())?;
-                let part=request.part.clone();tokio::task::spawn_blocking(move || Pending {key:tail_digest(0,&text),prefixes:prefixes(&text),part,text,deadline:Instant::now()+Duration::from_secs(40),_reader:reader,_capacity:Default::default()})
-                    .await.map_err(|_|"Original preparation stopped.".to_owned())?
+            let pending=if request.offline {
+                let reader=interruptible(Some(request.input.as_ref()),chat::source_owners::readers().clone().acquire_owned()).await?
+                    .map_err(|_|"Original loading stopped.".to_owned())?;
+                let text=request.input.take().ok_or("Original loading was cancelled.")?;
+                let part=request.part.clone();let input=request.input.clone();
+                tokio::task::spawn_blocking(move || prepare(part,text,Some(input),Instant::now()+Duration::from_secs(40),reader,Default::default()))
+                    .await.map_err(|_|"Original preparation stopped.".to_owned())??
             } else {
                 let handle=request.handle.ok_or("Reconnect to load the complete original call.")?;
-                read(request.part.clone(),move |query|{let handle=handle.clone();async move {handle.raw_source_page(query).await}}).await?
+                read_with_input(request.part.clone(),Some(request.input.clone()),move |query|{let handle=handle.clone();async move {handle.raw_source_page(query).await}}).await?
             };
             let proof=record(&pending.part);
-            loop {match chat::source_owners::admit_raw(&pending.text,&proof,None) {
-                chat::source_owners::Admission::Ready=>break,
-                chat::source_owners::Admission::Turnover if pending.deadline>Instant::now()=>tokio::time::sleep(Duration::from_millis(16)).await,
-                _=>return Err("Complete original calls have reached the display memory limit. Collapse another call and retry.".into()),
-            }}
+            loop {
+                if request.input.is_cancelled() {return Err("Original loading was cancelled.".into());}
+                match chat::source_owners::admit_raw(&pending.text,&proof,None) {
+                    chat::source_owners::Admission::Ready=>break,
+                    chat::source_owners::Admission::Turnover if pending.deadline>Instant::now()=>interruptible(Some(request.input.as_ref()),tokio::time::sleep(Duration::from_millis(16))).await?,
+                    _=>return Err("Complete original calls have reached the display memory limit. Collapse another call and retry.".into()),
+                }
+            }
             Ok(pending)
         }).await.unwrap_or_else(|_|Err("The complete original call could not be loaded in time.".into()));
         action(Action::RawOriginalReady(request.target,request.key.source,request.key.field,request.context,request.attempt,Reply(Arc::new(ReplySlot(Mutex::new(Some(result)))))))
@@ -300,22 +352,25 @@ pub(super) fn sync(runtime:&mut Runtime) {
     if !runtime.visible.load(Ordering::Relaxed) {runtime.raw_original.evict();return;}
     let handle=runtime.handle().cloned();runtime.raw_original.sync(&runtime.snapshot,runtime.selected_subagent.as_deref(),handle.as_ref());
 }
-pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
+fn requests(runtime:&Runtime)->Vec<Request> {
     if !runtime.visible.load(Ordering::Relaxed) {return Vec::new();}
     runtime.raw_original.entries.iter().filter_map(|(key,entry)|Some(Request {target:runtime.target,key:key.clone(),context:runtime.raw_original.context,attempt:entry.attempt?,
-        part:entry.part.clone(),handle:runtime.handle().map(|handle|(**handle).clone()),offline:entry.restored.clone()})).map(|request|Subscription::run_with(request,stream)).collect()
+        part:entry.part.clone(),handle:runtime.handle().map(|handle|(**handle).clone()),offline:entry.restored.is_some(),input:entry.input.clone()?})).collect()
+}
+pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
+    requests(runtime).into_iter().map(|request|Subscription::run_with(request,stream)).collect()
 }
 pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceField,context:u64,attempt:u64,reply:Reply) {
     let Some(result)=reply.0.0.lock().unwrap_or_else(|error|error.into_inner()).take() else {return;};
     sync(runtime);let state=&mut runtime.raw_original;let key=Key {source,field};
     let accepted=runtime.visible.load(Ordering::Relaxed) && state.context==context && state.entries.get(&key).is_some_and(|entry|entry.opened && entry.attempt==Some(attempt));
     if !accepted {retire(result);return;}
-    let entry=state.entries.get_mut(&key).expect("current raw request");entry.attempt=None;
+    let entry=state.entries.get_mut(&key).expect("current raw request");entry.cancel_request();
     match result {
         Ok(pending) if record(&pending.part)==record(&entry.part) && pending.deadline>Instant::now() && chat::source_owners::resident_raw(&pending.text).as_ref()==Some(&record(&entry.part))=>{
             let view=tool_text::ToolText::from_captured(pending.text.clone(),pending.key);
             if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view,prefixes:pending.prefixes.clone()}) {retire_loaded(old);}
-            entry.restored=None;entry.rehydrating=false;retire(pending);
+            if let Some(text)=entry.restored.take() {retire(text);}entry.rehydrating=false;retire(pending);
         }
         Ok(pending)=>{retire(pending);entry.error=Some("The original call changed before it was displayed. Retry its current source.".into());}
         Err(error)=>entry.error=Some(error),
@@ -355,6 +410,7 @@ fn retire_loaded(loaded:Loaded) {
     let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record,loaded.prefixes));
 }
 fn retire_entry(mut entry:Entry) {
+    entry.cancel_request();
     if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}
     if let Some(text)=entry.restored.take() {retire(text);}
 }
@@ -425,6 +481,58 @@ mod tests {
         let mut end=(query.offset+query.limit).min(text.len());while !text.is_char_boundary(end) {end-=1;}
         RawSourcePage {source:query.source,field:query.field,epoch:part.epoch,source_len:text.len(),offset:query.offset,next_offset:end,
             text:text[query.offset..end].into(),complete:end==text.len(),metadata:part.metadata.clone()}
+    }
+    fn restored_input_runtime()->(Runtime,RawSourcePart,std::sync::Weak<str>) {
+        let text:Arc<str>=Arc::from("private original input waiting for worker".repeat(4096));let(mut runtime,part)=runtime_fixture(&text);
+        let proof=record(&part);assert_eq!(chat::source_owners::admit_raw(&text,&proof,None),chat::source_owners::Admission::Ready);
+        runtime.raw_original.restore(ResidentRawCalls {calls:vec![(text.clone(),proof)]}).unwrap();
+        let weak=Arc::downgrade(&text);drop(text);(runtime,part,weak)
+    }
+    fn accept_read_event(runtime:&mut Runtime,event:Message) {
+        let Message::ChatUi(Action::RawOriginalReady(target,source,field,context,attempt,reply))=event else {panic!("actual original reader completion")};
+        assert_eq!(target,runtime.target);complete(runtime,source,field,context,attempt,reply);
+    }
+    #[test]
+    fn actual_unpolled_restored_recipe_releases_body_before_recipe_drop() {
+        let(mut runtime,part,weak)=restored_input_runtime();let recipe=requests(&runtime).pop().unwrap();
+        let clone=recipe.clone();assert!(recipe.offline);assert!(recipe.input.offline.lock().unwrap().is_some());
+        runtime.visible.store(false,Ordering::Relaxed);runtime.raw_original.evict();flush();
+        assert!(weak.upgrade().is_none(),"unpolled recipe clones retain empty cancellation slots, not bodies");
+        assert!(recipe.input.is_cancelled());assert!(recipe.input.offline.lock().unwrap().is_none());
+        assert_eq!(runtime.raw_original.retained_bytes(),0);assert!(runtime.raw_original.entries[&Key::of(&part)].opened);
+        drop(clone);drop(recipe);
+    }
+    #[tokio::test]
+    async fn actual_saturated_restored_reader_withdraws_before_permits_return() {
+        use iced::futures::{FutureExt,StreamExt};
+        let held=tokio::time::timeout(Duration::from_secs(5),chat::source_owners::readers().clone().acquire_many_owned(2)).await.unwrap().unwrap();
+        let(mut runtime,_,weak)=restored_input_runtime();let recipe=requests(&runtime).pop().unwrap();let mut events=stream(&recipe);
+        assert!(events.next().now_or_never().is_none(),"actual reader waits for the two shared slots");
+        runtime.visible.store(false,Ordering::Relaxed);runtime.raw_original.evict();flush();
+        assert!(weak.upgrade().is_none(),"cancellation withdraws model and queued source before permit return or another stream poll");
+        assert!(recipe.input.is_cancelled());assert_eq!(chat::source_owners::readers().available_permits(),0);
+        let event=tokio::time::timeout(Duration::from_secs(5),events.next()).await.unwrap().unwrap();
+        accept_read_event(&mut runtime,event);assert_eq!(runtime.raw_original.retained_bytes(),0);
+        assert!(runtime.raw_original.entries.values().all(|entry|entry.attempt.is_none() && entry.error.is_none()));
+        drop(held);drop(events);drop(recipe);
+    }
+    #[tokio::test]
+    async fn actual_running_restored_preparation_keeps_body_until_worker_finishes_then_refuses_late_result() {
+        use iced::futures::StreamExt;
+        let(mut runtime,_,weak)=restored_input_runtime();let recipe=requests(&runtime).pop().unwrap();
+        let(start,started)=std::sync::mpsc::channel();let(release,released)=std::sync::mpsc::channel();
+        *recipe.input.preparation_probe.lock().unwrap()=Some((start,released));
+        let owner=std::thread::current().id();let mut events=stream(&recipe);
+        let control=async {
+            let worker=tokio::task::spawn_blocking(move||started.recv_timeout(Duration::from_secs(5)).unwrap()).await.unwrap();assert_ne!(worker,owner);
+            assert!(recipe.input.offline.lock().unwrap().is_none(),"worker took input only after actual reader admission");
+            runtime.visible.store(false,Ordering::Relaxed);runtime.raw_original.evict();flush();
+            assert!(weak.upgrade().is_some(),"the admitted running worker remains a real charged owner until its preparation exits");
+            release.send(()).unwrap();
+        };
+        let(event,())=tokio::join!(tokio::time::timeout(Duration::from_secs(5),events.next()),control);
+        accept_read_event(&mut runtime,event.unwrap().unwrap());flush();assert!(weak.upgrade().is_none());
+        assert_eq!(runtime.raw_original.retained_bytes(),0);assert!(runtime.raw_original.entries.values().all(|entry|entry.error.is_none()));
     }
     #[test]
     fn contradictory_raw_aliases_deny_the_exact_field_regardless_of_publication_order() {
