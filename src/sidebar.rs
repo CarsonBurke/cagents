@@ -2235,6 +2235,8 @@ pub struct SourceControlModel {
     pub remotes: Vec<String>,
     /// The mutation currently in flight, which disables every command.
     pub mutation: Option<MutationKind>,
+    /// Host capability, independent of transient Git activity or read access.
+    mutation_unavailable_reason: Option<Arc<str>>,
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub output_expanded: bool,
@@ -2421,6 +2423,7 @@ impl SourceControlModel {
             tracking: TrackingState::NoUpstream,
             remotes: Vec::new(),
             mutation: None,
+            mutation_unavailable_reason: None,
             error: None,
             output_expanded: false,
             undo_discard_until_unix_ms: None,
@@ -2583,6 +2586,7 @@ impl SourceControlModel {
             tracking: snapshot.status.tracking.clone(),
             remotes,
             mutation: None,
+            mutation_unavailable_reason: None,
             error: None,
             output_expanded: false,
             undo_discard_until_unix_ms: None,
@@ -2775,6 +2779,19 @@ impl SourceControlModel {
         self.mutation = mutation;
     }
 
+    /// Preserve repository reads while a host cannot safely perform mutations.
+    pub fn set_mutation_unavailable_reason(&mut self, reason: Option<Arc<str>>) {
+        self.mutation_unavailable_reason = reason.filter(|reason| !reason.trim().is_empty());
+    }
+
+    pub fn mutation_unavailable_reason(&self) -> Option<&str> {
+        self.mutation_unavailable_reason.as_deref()
+    }
+
+    pub fn mutations_available(&self) -> bool {
+        self.mutation_unavailable_reason.is_none()
+    }
+
     pub fn set_error(&mut self, error: Option<String>) {
         self.output_expanded = false;
         self.error = error;
@@ -2804,6 +2821,10 @@ impl SourceControlModel {
         if self.key != next.key {
             return;
         }
+        // A freshly supplied host refusal takes precedence over older state;
+        // an ordinary snapshot with no capability metadata retains the refusal.
+        let mutation_reason = next.mutation_unavailable_reason.clone()
+            .or_else(|| self.mutation_unavailable_reason.clone());
         if matches!(self.data_state, SidebarDataState::Ready)
             && matches!(next.data_state, SidebarDataState::Loading)
         {
@@ -2811,10 +2832,12 @@ impl SourceControlModel {
             // panel over is also how the mutation, the failure and the history
             // below are carried.
             *next = self.clone();
+            next.mutation_unavailable_reason = mutation_reason;
             next.reloading = true;
             return;
         }
         next.mutation = self.mutation;
+        next.mutation_unavailable_reason = mutation_reason;
         if self.mutation.is_some() {
             // A read started before the queue cannot overwrite newer user
             // intent. The single read after drain supplies authoritative rows.
@@ -2895,7 +2918,7 @@ impl SourceControlModel {
 
     /// Commit needs a message, something staged, and no mutation in flight.
     pub fn can_commit(&self, message: &str) -> bool {
-        !message.trim().is_empty()
+        self.mutations_available() && !message.trim().is_empty()
             && (self.staged_count > 0
                 || self.operation.as_ref().is_some_and(|operation| {
                     operation.kind == crate::repository::GitOperationKind::Merge
@@ -2910,7 +2933,7 @@ impl SourceControlModel {
     /// A branch with no upstream is published instead; see
     /// [`Self::can_publish`].
     pub fn can_push(&self) -> bool {
-        self.branch.is_some()
+        self.mutations_available() && self.branch.is_some()
             && !self.detached
             && !self.busy()
             && self.upstream.is_some()
@@ -2925,7 +2948,7 @@ impl SourceControlModel {
     /// upstream and when this panel could not name the one it has, while
     /// `tracking` is what `git status` reported and knows the difference.
     pub fn can_publish(&self) -> bool {
-        self.branch.is_some()
+        self.mutations_available() && self.branch.is_some()
             && !self.detached
             && !self.busy()
             && self.upstream.is_none()
@@ -7904,6 +7927,7 @@ fn change_context_controls<'a>(
     key: &'a ActiveWorktreeKey,
     row: &'a ChangeRow,
     selection_revision: u64,
+    mutations_available: bool,
     blocked: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
@@ -7920,7 +7944,8 @@ fn change_context_controls<'a>(
     } else {
         ChangeGroupCommand::Stage
     };
-    let mut entries = vec![widget::menu::Item::Button(
+    let mutation = if mutations_available { widget::menu::Item::Button } else { widget::menu::Item::ButtonDisabled };
+    let mut entries = vec![mutation(
         commands::label(commands::change_command_id(command)).into(),
         None,
         ChangeContextCommand {
@@ -7930,7 +7955,7 @@ fn change_context_controls<'a>(
             action: ChangeContextAction::Mutate(command),
         },
     )];
-    let ignore = if row.entry.area == ChangeArea::Untracked {
+    let ignore = if mutations_available && row.entry.area == ChangeArea::Untracked {
         widget::menu::Item::Button
     } else {
         widget::menu::Item::ButtonDisabled
@@ -7979,7 +8004,7 @@ fn change_context_controls<'a>(
     ));
     if matches!(row.entry.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
         entries.push(widget::menu::Item::Divider);
-        entries.push(widget::menu::Item::Button(
+        entries.push(mutation(
             commands::label(commands::change_command_id(ChangeGroupCommand::Discard)).into(),
             None,
             ChangeContextCommand {
@@ -8001,7 +8026,7 @@ fn change_context_controls<'a>(
     );
     crate::interaction::context_menu_keyed(
         content,
-        (cached_menu_token(&row.chrome.stage_id), selection_revision),
+        (cached_menu_token(&row.chrome.stage_id), selection_revision, mutations_available),
         widget::menu::items(&bindings, entries),
     )
 }
@@ -8746,7 +8771,11 @@ fn source_control_notices<'a>(
     source: &'a SourceControlModel,
     git_controls: bool,
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
-    let mut notices = widget::column::with_capacity(3).spacing(space::XS);
+    let mut notices = widget::column::with_capacity(4).spacing(space::XS);
+    let mutation_controls_available = source.mutations_available() && !source.busy();
+    if let Some(reason) = source.mutation_unavailable_reason() {
+        notices = notices.push(design::caption(reason).wrapping(cosmic::iced::widget::text::Wrapping::Word));
+    }
     if let Some(error) = source.error.as_deref() {
         let summary = error
             .split_once("\n\nGit output:\n")
@@ -8807,7 +8836,7 @@ fn source_control_notices<'a>(
         notices = notices.push(
             widget::row::with_children(vec![
                 widget::button::text("Abort")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
                         key: source.key.clone(),
                         operation: GitOperation::Abort {
                             kind: operation.kind,
@@ -8816,7 +8845,7 @@ fn source_control_notices<'a>(
                     .into(),
                 widget::button::text("Continue")
                     .on_press_maybe(
-                        (!source.busy()
+                        (mutation_controls_available
                             && source
                                 .group(ChangeArea::Conflict)
                                 .is_none_or(ChangeGroup::is_empty))
@@ -8853,10 +8882,10 @@ fn source_control_notices<'a>(
 
         notices = notices.push(widget::row::with_children(vec![
             widget::button::text("Stage anyway")
-                .on_press(SidebarAction::ConfirmStageMarkers {
+                .on_press_maybe(source.mutations_available().then(|| SidebarAction::ConfirmStageMarkers {
                     key: source.key.clone(),
                     confirmed: true,
-                })
+                }))
                 .into(),
             widget::button::text("Cancel")
                 .on_press(SidebarAction::ConfirmStageMarkers {
@@ -8876,7 +8905,7 @@ fn source_control_notices<'a>(
             .or_else(|| source.remotes.first().map(String::as_str))
         {
             actions = actions.push(widget::button::text("Fetch").on_press_maybe(
-                (!source.busy()).then(|| SidebarAction::GitOperation {
+                mutation_controls_available.then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Fetch {
                         remote: remote.to_owned(),
@@ -8887,13 +8916,13 @@ fn source_control_notices<'a>(
         }
         if source.upstream.is_some() {
             actions = actions.push(widget::button::text("Sync").on_press_maybe(
-                (!source.busy()).then(|| SidebarAction::GitOperation {
+                mutation_controls_available.then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Sync { rebase: false },
                 }),
             ));
             actions = actions.push(widget::button::text("Sync (rebase)").on_press_maybe(
-                (!source.busy()).then(|| SidebarAction::GitOperation {
+                mutation_controls_available.then(|| SidebarAction::GitOperation {
                     key: key.clone(),
                     operation: GitOperation::Sync { rebase: true },
                 }),
@@ -8916,7 +8945,7 @@ fn source_control_notices<'a>(
                     .on_press(SidebarAction::ToggleStashes { key: key.clone() })
                     .into(),
                 widget::button::text("Stash changes")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
                         key: key.clone(),
                         operation: GitOperation::StashPush {
                             message: None,
@@ -8930,7 +8959,7 @@ fn source_control_notices<'a>(
         if source.stashes_expanded {
             notices = notices.push(
                 widget::button::text("Stash including new files").on_press_maybe(
-                    (!source.busy()).then(|| SidebarAction::GitOperation {
+                    mutation_controls_available.then(|| SidebarAction::GitOperation {
                         key: key.clone(),
                         operation: GitOperation::StashPush {
                             message: None,
@@ -8948,7 +8977,7 @@ fn source_control_notices<'a>(
                 rows = rows.push(
                     widget::row::with_children(vec![
                         widget::button::text("Apply")
-                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                            .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
                                 key: key.clone(),
                                 operation: GitOperation::StashApply {
                                     reference: stash.reference.clone(),
@@ -8958,7 +8987,7 @@ fn source_control_notices<'a>(
                             }))
                             .into(),
                         widget::button::text("Pop")
-                            .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                            .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
                                 key: key.clone(),
                                 operation: GitOperation::StashApply {
                                     reference: stash.reference.clone(),
@@ -8968,7 +8997,7 @@ fn source_control_notices<'a>(
                             }))
                             .into(),
                         widget::button::text("Drop…")
-                            .on_press_maybe((!source.busy()).then(|| {
+                            .on_press_maybe(mutation_controls_available.then(|| {
                                 SidebarAction::RequestStashDrop {
                                     key: key.clone(),
                                     entry: Some(stash.clone()),
@@ -8988,7 +9017,7 @@ fn source_control_notices<'a>(
             )));
             notices = notices.push(widget::row::with_children(vec![
                 widget::button::text("Drop stash")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
+                    .on_press_maybe(mutation_controls_available.then(|| SidebarAction::GitOperation {
                         key: key.clone(),
                         operation: GitOperation::StashDrop {
                             reference: stash.reference.clone(),
@@ -10289,6 +10318,7 @@ fn change_row_view<'a>(
         &source.key,
         row,
         state.change_selection_revision(),
+        source.mutations_available(),
         modal_open,
         shortcuts,
     );
@@ -10433,6 +10463,7 @@ fn group_commands<'a>(
     group: &'a ChangeGroup,
     modal_open: bool,
 ) -> Vec<IconCommand<'a>> {
+    let mutations_blocked = modal_open || !source.mutations_available();
     let key = &source.key;
     let chrome = &group.chrome;
     if group.is_empty() {
@@ -10449,7 +10480,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Unstage,
                 },
-                modal_open,
+                mutations_blocked,
             ),
             id: chrome.unstage_all_id.clone(),
         });
@@ -10463,7 +10494,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Stage,
                 },
-                modal_open,
+                mutations_blocked,
             ),
             id: chrome.stage_all_id.clone(),
         });
@@ -10478,7 +10509,7 @@ fn group_commands<'a>(
                     area: group.area,
                     command: ChangeGroupCommand::Discard,
                 },
-                modal_open || source.busy(),
+                mutations_blocked || source.busy(),
             ),
             id: chrome.discard_all_id.clone(),
         });
@@ -10495,7 +10526,7 @@ pub fn resolve_group_command(
     let SidebarAction::ChangeGroup { key, area, command } = action else {
         return None;
     };
-    if key != &source.key || (source.busy() && matches!(command, ChangeGroupCommand::Discard)) {
+    if !source.mutations_available() || key != &source.key || (source.busy() && matches!(command, ChangeGroupCommand::Discard)) {
         return None;
     }
     let group = source.group(*area)?;
@@ -10589,7 +10620,7 @@ pub fn whole_change_group_available(
     model.source_control.as_ref().is_some_and(|source| model.contains_worktree(&source.key) && whole_change_group_available_for(source, state, area, command, modal_open))
 }
 fn whole_change_group_available_for(source: &SourceControlModel, state: &SidebarState, area: ChangeArea, command: ChangeGroupCommand, modal_open: bool) -> bool {
-    if modal_open || state.active_worktree() != Some(&source.key)
+    if !source.mutations_available() || modal_open || state.active_worktree() != Some(&source.key)
         || !matches!(source.data_state, SidebarDataState::Ready)
         || state.change_rows.first_in_area(area).is_some()
         || source.group(area).is_none_or(ChangeGroup::is_empty)
@@ -10654,7 +10685,7 @@ pub fn change_command_available_for(
     focused: &ChangeSelectionRow,
     command: ChangeGroupCommand,
 ) -> bool {
-    if state.active_worktree() != Some(&source.key) {
+    if !source.mutations_available() || state.active_worktree() != Some(&source.key) {
         return false;
     }
     let allowed = |area| match command {
@@ -10697,7 +10728,7 @@ pub fn resolve_change_command(
     focused: &ChangeSelectionRow,
     command: ChangeGroupCommand,
 ) -> Option<SidebarAction> {
-    if &source.key != key {
+    if !source.mutations_available() || &source.key != key {
         return None;
     }
     let order = source
@@ -10767,6 +10798,7 @@ fn row_commands<'a>(
     row: &'a ChangeRow,
     modal_open: bool,
 ) -> Vec<IconCommand<'a>> {
+    let mutations_blocked = modal_open || !source.mutations_available();
     let key = &source.key;
     let chrome = &row.chrome;
     let mut commands = Vec::with_capacity(2);
@@ -10779,7 +10811,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open,
+                mutations_blocked,
             ),
             id: chrome.unstage_id.clone(),
         });
@@ -10792,7 +10824,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     selection: vec![row.selection()],
                 },
-                modal_open,
+                mutations_blocked,
             ),
             id: chrome.stage_id.clone(),
         });
@@ -10813,7 +10845,7 @@ fn row_commands<'a>(
                             ours,
                         },
                     },
-                    modal_open || source.busy(),
+                    mutations_blocked || source.busy(),
                 ),
                 id: stable_id(format!("resolve.{ours}.{}", path_key(&row.entry.path))),
             });
@@ -10828,7 +10860,7 @@ fn row_commands<'a>(
                     key: key.clone(),
                     request: single_discard_request(key, area, row),
                 },
-                modal_open || source.busy(),
+                mutations_blocked || source.busy(),
             ),
             id: chrome.discard_id.clone(),
         });
@@ -10932,7 +10964,7 @@ fn changes_footer<'a>(
     let chrome = &source.chrome;
     let message = state.commit_message();
     let input_key = key.clone();
-    let can_commit = !modal_open
+    let can_commit = source.mutations_available() && !modal_open
         && !source.busy()
         && state.commit_draft.ready()
         && !state.commit_draft.subject.trim().is_empty()
@@ -11054,7 +11086,8 @@ fn changes_footer<'a>(
     } else {
         "Commit"
     };
-    let commit_hint = if !has_subject {
+    let commit_hint = if let Some(reason) = source.mutation_unavailable_reason() { reason
+    } else if !has_subject {
         "Enter a commit summary"
     } else if source.busy() {
         "Git operation in progress"
@@ -11231,7 +11264,7 @@ fn publish_picker<'a>(
                 remote_branch,
             });
     }
-    let blocked = publish.blocked_reason(source.busy());
+    let blocked = source.mutation_unavailable_reason().or_else(|| publish.blocked_reason(source.busy()));
     let mut confirm =
         crate::ui_controls::button::secondary("Publish").id(chrome.publish_id.clone());
     if let Some(push) = publish
@@ -21006,6 +21039,82 @@ pub(crate) mod tests {
             )),
             "the folded group must keep the control that reopens it; it published {folded:?}"
         );
+    }
+
+    #[test]
+    fn read_only_git_capability_survives_refresh_and_does_not_rebind() {
+        let reason: Arc<str> = "Git mutations are unavailable on this host; repository reads remain available.".into();
+        let mut original = SourceControlModel::ready(main_key(), &snapshot());
+        original.set_mutation_unavailable_reason(Some(reason.clone()));
+        for loading in [false, true] {
+            let mut next = if loading { SourceControlModel::loading(main_key()) }
+                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            original.carry_mutation_into(&mut next);
+            assert_eq!(next.mutation_unavailable_reason(), Some(reason.as_ref()));
+            assert!(!next.mutations_available());
+            assert!(!next.groups().is_empty(), "readable change rows survive");
+        }
+        let writable = SourceControlModel::ready(main_key(), &snapshot());
+        for loading in [false, true] {
+            let mut next = if loading { SourceControlModel::loading(main_key()) }
+                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            next.set_mutation_unavailable_reason(Some(reason.clone()));
+            writable.carry_mutation_into(&mut next);
+            assert!(!next.mutations_available(), "new explicit host capability must not be overwritten by old writable state");
+        }
+        let mut other = SourceControlModel::ready(fix_key(), &snapshot());
+        original.carry_mutation_into(&mut other);
+        assert!(other.mutations_available(), "one worktree never lends its capability to another");
+    }
+
+    #[test]
+    fn read_only_git_disables_mounted_mutations_but_preserves_navigation() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let renderer = headless_renderer();
+        let mut model = panel_model();
+        let mut state = panel_state(&model);
+        state.changes_tab = ChangesTab::Changes;
+        state.apply(&SidebarAction::CommitMessageChanged { key: main_key(), message: "Retain this draft".into() });
+        let mutates = |action: &SidebarAction| matches!(action,
+            SidebarAction::Stage { .. } | SidebarAction::Unstage { .. }
+            | SidebarAction::InvokeChangeRows { .. } | SidebarAction::ChangeGroup { .. }
+            | SidebarAction::RunChangeGroup { .. } | SidebarAction::RequestDiscard { .. }
+            | SidebarAction::Commit { .. } | SidebarAction::Push { .. }
+            | SidebarAction::OpenPublish { .. } | SidebarAction::GitOperation { .. }
+            | SidebarAction::RunChangeCommand { command: Command::StageSelectedChanges | Command::UnstageSelectedChanges | Command::DiscardSelectedChanges | Command::GitAcceptOurs | Command::GitAcceptTheirs | Command::IgnoreChangePath, .. });
+        let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
+        assert!(live.iter().any(mutates), "the actual native controls start usable");
+        let reason = "Git mutations need retained worktree support; repository reads are available.";
+        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from(reason)));
+        let source = model.source_control.as_ref().unwrap();
+        assert!(!source.can_push());
+        assert!(!source.can_commit(state.commit_message()));
+        assert!(source.wants_history() && source.can_load_history(), "history remains readable");
+        let mut committable = source.clone();
+        committable.groups.retain(|group| group.area != ChangeArea::Conflict);
+        committable.set_mutation_unavailable_reason(None);
+        assert!(committable.can_commit(state.commit_message()));
+        assert!(committable.can_push());
+        committable.set_mutation_unavailable_reason(Some(Arc::from(reason)));
+        assert!(!committable.can_commit(state.commit_message()));
+        let disabled = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
+        assert!(!disabled.iter().any(mutates), "mounted native mutation controls must not emit actions");
+        assert!(disabled.iter().any(|action| matches!(action, SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. })), "read navigation remains mounted and usable");
+        assert!(disabled.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
+        let mut retained = SourceControlModel::ready(main_key(), &snapshot());
+        retained.upstream = None;
+        retained.tracking = TrackingState::NoUpstream;
+        assert!(retained.can_publish());
+        retained.set_mutation_unavailable_reason(Some(Arc::from(reason)));
+        assert!(!retained.can_publish());
+        let publish = PublishDraft::new(main_key(), retained.branch.clone().unwrap(), &retained.remotes);
+        assert!(!frame_enter_presses(&renderer, publish_picker(&retained, &publish, false)).iter().any(|action| matches!(action, SidebarAction::Push { .. })));
+        let mut notice: Element<'_, SidebarAction> = source_control_notices(source, true).into();
+        let mut tree = Tree::new(notice.as_widget());
+        let node = notice.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(380., 4000.)));
+        let nodes = notice.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+        assert!(nodes.root().iter().chain(nodes.children()).any(|node| node.node().label() == Some(reason)), "the actual panel explains why mutations are disabled");
     }
 
     #[test]
