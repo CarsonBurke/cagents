@@ -279,7 +279,7 @@ impl DaemonAdmissionGuard {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 fn upgrade_fence(file: &File) -> io::Result<()> {
     // An SH→EX conversion is NOT atomic. On failure Linux can drop the
     // parent's SH lock: return immediately, before any startup mutation.
