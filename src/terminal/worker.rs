@@ -396,6 +396,7 @@ struct PublishedState {
     completed: AtomicBool,
     /// 0 unadmitted, 1 retained by the join service, 2 joined, 3 panicked.
     worker_join: AtomicU8,
+    join_reservation: OnceLock<joins::Reservation>,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -446,6 +447,7 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             completed: AtomicBool::new(false),
             worker_join: AtomicU8::new(0),
+            join_reservation: OnceLock::new(),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -784,6 +786,7 @@ impl TerminalHandle {
         config: TerminalConfig,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        let reservation = joins::reserve().map_err(TerminalStartError::Worker)?;
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
         // are low-volume metadata; an unbounded queue avoids either dropping a
@@ -793,6 +796,7 @@ impl TerminalHandle {
             config.initially_visible,
             Arc::new(wake),
         ));
+        published.join_reservation.set(reservation).expect("a new worker has exactly one cleanup reservation");
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -7145,6 +7149,53 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(published.worker_join.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn final_drop_reserves_cleanup_capacity_before_any_terminal_child_starts() {
+        const CHILD: &str = "CAGENTS_TERMINAL_JOIN_RESERVATION_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::tests::final_drop_reserves_cleanup_capacity_before_any_terminal_child_starts", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("CAGENTS_TERMINAL_JOIN_TEST_CAPACITY", "4").output().unwrap();
+            assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        struct Releases(Vec<Sender<()>>);
+        impl Drop for Releases { fn drop(&mut self) { for release in &self.0 { let _ = release.try_send(()); } } }
+        let mut releases = Releases(Vec::new()); let mut owners = Vec::new(); let mut slots = Vec::new();
+        for _ in 0..4 {
+            let reservation = joins::reserve().unwrap();
+            let (worker, release) = latched_tls_worker(); releases.0.push(release);
+            let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+            published.join_reservation.set(reservation).unwrap();
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+            assert!(descriptor >= 0);
+            published.shutdown_pidfd.set(unsafe { File::from_raw_fd(descriptor as i32) }).unwrap();
+            let slot = Arc::new(Mutex::new(Some(worker)));
+            owners.push(Arc::downgrade(&published)); slots.push(Arc::downgrade(&slot));
+            let handle = TerminalHandle { inner: Arc::new(HandleInner {
+                commands: command_channel(1).0, events: crossbeam_channel::unbounded().1, published, worker: slot,
+            }) };
+            let started = Instant::now(); drop(handle);
+            assert!(started.elapsed() < Duration::from_millis(250));
+        }
+        assert!(slots.iter().all(|slot| slot.upgrade().is_some()), "saturated final Drop must retain every original worker slot");
+        assert!(owners.iter().all(|owner| owner.upgrade().is_some_and(|owner| owner.worker_join.load(Ordering::Acquire) == 1 && owner.shutdown_pidfd.get().is_some())), "queued and active joins retain each original pidfd owner");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap(); let marker = directory.path().join("child-started");
+        let mut source = shell_session("printf started > \"$MARKER\"; exec /bin/cat");
+        source.launch.environment.insert("MARKER".into(), marker.to_string_lossy().into_owned());
+        let error = TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap_err();
+        assert!(error.to_string().contains("cleanup capacity"));
+        assert!(!marker.exists(), "capacity refusal must precede actual child startup");
+        drop(releases);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while owners.iter().any(|owner| owner.upgrade().is_some()) { assert!(Instant::now() < deadline); thread::yield_now(); }
+        assert!(slots.iter().all(|slot| slot.upgrade().is_none()));
+        let handle = TerminalHandle::spawn(source, Default::default(), |_| {}).unwrap();
+        handle.input(b"capacity-recovered\n").unwrap(); wait_for_text(&handle, "capacity-recovered");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "started");
+        handle.shutdown().unwrap();
     }
 
     #[test]
