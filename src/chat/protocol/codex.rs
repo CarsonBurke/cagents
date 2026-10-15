@@ -4986,7 +4986,7 @@ mod tests {
         let mut adapter = adapter();
         let original_thread = adapter.thread.clone();
         adapter
-            .relocate_directory(Path::new("/verified/moved"))
+            .relocate_directory(std::path::Path::new("/verified/moved"))
             .unwrap();
         let prompt = adapter
             .command(Command::Prompt {

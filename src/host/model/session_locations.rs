@@ -121,7 +121,8 @@ fn source_key(source: &HostedSession) -> Result<Option<[u8; 32]>, String> {
         _ => return Ok(None),
     }
     .map_err(|error| error.to_string())?;
-    Ok(Some(*blake3::hash(&value).as_bytes()))
+    use sha2::Digest;
+    Ok(Some(sha2::Sha256::digest(&value).into()))
 }
 fn retain_source(location: &mut Location) -> Result<(), String> {
     let source = location.source.clone();
