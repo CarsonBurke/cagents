@@ -2990,6 +2990,8 @@ impl SettingsField {
         Self::LinkOpenDestination,
         Self::EditorAutoSave,
         Self::EditorWrapLines,
+        Self::EditorTabWidth,
+        Self::EditorAutoClose,
         Self::DiffHideUnchanged,
         Self::ChatEnterSends,
         Self::ChatExpandToolGroups,
@@ -3740,6 +3742,8 @@ impl SettingsDraft {
             }
             SettingsField::EditorAutoSave => self.editor_auto_save = previous.editor_auto_save,
             SettingsField::EditorWrapLines => self.editor_wrap_lines = previous.editor_wrap_lines,
+            SettingsField::EditorTabWidth => self.editor_tab_width = previous.editor_tab_width.clone(),
+            SettingsField::EditorAutoClose => self.editor_auto_close = previous.editor_auto_close,
             SettingsField::DiffHideUnchanged => {
                 self.diff_hide_unchanged = previous.diff_hide_unchanged
             }
@@ -21363,6 +21367,52 @@ mod tests {
             assert!(SettingsField::PREFERENCES.contains(&field));
             assert_eq!(field.config_key(), key);
         }
+    }
+
+    #[test]
+    fn editor_category_reset_persists_indentation_and_pairing_defaults_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
+        app.settings.editor_tab_width = 8; app.settings.editor_auto_close = false;
+        app.settings.terminal_padding = 12.0;
+        app.save_settings_now().unwrap();
+        app.settings_draft.terminal_font_size = "unfinished".into();
+        app.settings_invalid.insert(SettingsField::TerminalFontSize, "Enter a number".into());
+        app.settings_draft.terminal_font_family = "Pending font".into();
+        app.settings_pending.insert(SettingsField::TerminalFontFamily, (9, "Pending font".into()));
+        let reset = app.reset_settings_category(SettingsCategory::Editor);
+        settle_settings_task(&mut app, reset);
+        let saved = settings::load_live(&path).unwrap();
+        for actual in [&app.settings, &saved] {
+            assert_eq!(actual.editor_tab_width, 4); assert!(actual.editor_auto_close);
+            assert_eq!(actual.terminal_padding, 12.0);
+        }
+        assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
+        assert_eq!(app.settings_draft.terminal_font_family, "Pending font");
+        assert!(app.settings_invalid.contains_key(&SettingsField::TerminalFontSize));
+        assert!(app.settings_pending.contains_key(&SettingsField::TerminalFontFamily));
+        for field in [SettingsField::EditorTabWidth, SettingsField::EditorAutoClose] { assert!(SettingsField::PREFERENCES.contains(&field)); }
+    }
+
+    #[test]
+    fn editor_preference_drafts_survive_unrelated_live_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone()); app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        drop(app.queue_setting_input(SettingsField::EditorTabWidth, "unfinished".into()));
+        drop(app.queue_setting_input(SettingsField::EditorAutoClose, "false".into()));
+        let mut external = settings::load_live(&path).unwrap(); external.show_status_bar = !external.show_status_bar;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings_draft.editor_tab_width, "unfinished");
+        assert!(!app.settings_draft.editor_auto_close);
+        assert!(app.settings_pending.contains_key(&SettingsField::EditorTabWidth));
+        assert!(app.settings_pending.contains_key(&SettingsField::EditorAutoClose));
+        assert_eq!(app.settings.show_status_bar, external.show_status_bar);
     }
 
     #[test]

@@ -131,6 +131,11 @@ fn number_setting_current(value: &str, default: f64, min: f64, max: f64) -> f64 
         .clamp(min, max)
 }
 
+fn number_setting_serialized(field: SettingsField, number: f64) -> String {
+    if matches!(field, SettingsField::HibernationDelayMs | SettingsField::EditorTabWidth) { format!("{number:.0}") }
+    else { format!("{number:.3}") }
+}
+
 fn number_setting_reset(field: SettingsField, value: &str, default: f64) -> Option<Message> {
     if field == SettingsField::EditorFontSize {
         return (!value.is_empty()).then(|| Message::SettingsChanged {
@@ -143,11 +148,7 @@ fn number_setting_reset(field: SettingsField, value: &str, default: f64) -> Opti
         .is_ok_and(|value| value.is_finite() && (value - default).abs() < 0.000_001);
     (!unchanged).then(|| Message::SettingsChanged {
         field,
-        value: if field == SettingsField::HibernationDelayMs {
-            format!("{default:.0}")
-        } else {
-            format!("{default:.3}")
-        },
+        value: number_setting_serialized(field, default),
     })
 }
 
@@ -170,14 +171,12 @@ fn setting_stepper<'a>(
         f64::from(step),
         f64::from(default),
     );
-    let current = number_setting_current(value, default, min, max);
+    let current = if field == SettingsField::EditorTabWidth {
+        value.parse::<u16>().map(f64::from).unwrap_or(default).clamp(min, max)
+    } else { number_setting_current(value, default, min, max) };
     let change = |next: f64| Message::SettingsChanged {
         field,
-        value: if field == SettingsField::HibernationDelayMs {
-            format!("{:.0}", next.clamp(min, max))
-        } else {
-            format!("{:.3}", next.clamp(min, max))
-        },
+        value: number_setting_serialized(field, next.clamp(min, max)),
     };
     let factor = number_setting_factor(field);
     let unit = if factor == 100.0 {
@@ -213,7 +212,7 @@ fn setting_stepper<'a>(
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
-    setting_field(label, detail, control).error(invalid.get(&field).map(String::as_str))
+    setting_field(label, detail, control).error(invalid.get(&field).map(String::as_str)).keywords(field.config_key()).keywords(value)
 }
 
 fn settings_choice<'a>(
@@ -722,12 +721,10 @@ fn settings_category_controls<'a>(
                 options.push(setting_field(
                     "Auto-close brackets and quotes", "Insert matching closers and type over existing closing brackets and quotes.",
                     crate::settings_widgets::toggle("Auto-close brackets and quotes", draft.editor_auto_close, |enabled| Message::SettingsChanged { field: SettingsField::EditorAutoClose, value: enabled.to_string() }),
-                ));
-                options.push(setting_field(
+                ).keywords(SettingsField::EditorAutoClose.config_key()));
+                options.push(setting_stepper(
                     "Tab width", "Display tab stops and default space indentation (1–16). File indentation and .editorconfig take precedence.",
-                    crate::ui_controls::field::text("4", &draft.editor_tab_width)
-                        .on_input(|value| Message::SettingsChanged { field: SettingsField::EditorTabWidth, value })
-                        .width(80).into(),
+                    &draft.editor_tab_width, SettingsField::EditorTabWidth, 1.0, 16.0, 1.0, 4.0, " columns", invalid, &draft.numeric_display,
                 ));
                 options.push(setting_field(
                     "Hide unchanged diff lines",
@@ -1799,6 +1796,8 @@ mod search_tests {
             (SettingsCategory::General, "focus_follows_mouse"),
             (SettingsCategory::General, "hover"),
             (SettingsCategory::Terminal, "dracula"),
+            (SettingsCategory::Editor, "editor_tab_width"),
+            (SettingsCategory::Editor, "editor_auto_close"),
             (SettingsCategory::Keyboard, "ctrl+t"),
             (
                 SettingsCategory::Keyboard,
@@ -1849,6 +1848,22 @@ mod typography_settings_tests {
             Some(family)
         );
         assert!(missing_font_warning("Example", &["example".into()], "system monospace").is_none());
+    }
+
+    #[test]
+    fn tab_width_stepper_and_reset_emit_valid_integral_settings() {
+        let field = SettingsField::EditorTabWidth;
+        let settings = AppSettings::default();
+        for width in [1_u16, 4, 8, 16] {
+            let value = number_setting_serialized(field, f64::from(width));
+            assert_eq!(value.parse::<u16>().unwrap(), width);
+            assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+        }
+        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(field, "8", 4.0) else { panic!("tab width reset"); };
+        assert_eq!(value, "4");
+        assert!(!matches!(settings_update(&settings, field, &value), SettingsDecision::Invalid(_)));
+        assert_eq!(number_setting_value(field, "4."), "4");
+        assert!(matches!(settings_update(&settings, field, &number_setting_value(field, "4.5")), SettingsDecision::Invalid(_)));
     }
 
     #[test]
