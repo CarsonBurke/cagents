@@ -1134,7 +1134,7 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
         use crate::terminal_ipc::{ShutdownOperation,ShutdownOutcome};
         let mut state = host.lock().unwrap();
         assert!(
-            state.spawning.is_empty() && state.chat_spawning.is_empty()
+            state.execution_inventory_count_for_test() == 0 && state.chat_spawning.is_empty()
                 && state.chats.is_empty() && state.terminals.is_empty(),
             "no published record masks the startup-only guard"
         );
