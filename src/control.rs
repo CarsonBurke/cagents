@@ -1890,6 +1890,40 @@ struct CommandOutput {
     human: String,
 }
 
+/// Scriptable outcomes shared by commands that wait for work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WaitOutcome {
+    Succeeded,
+    Pending,
+    TimedOut,
+    Failed,
+    Waiting,
+}
+
+impl WaitOutcome {
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Succeeded => 0,
+            Self::Pending | Self::TimedOut => 3,
+            Self::Failed => 4,
+            Self::Waiting => 5,
+        }
+    }
+}
+
+impl CommandOutput {
+    fn exit_code(&self) -> ExitCode {
+        let code = match self.data.get("outcome").and_then(Value::as_str) {
+            Some("pending" | "timed_out") => WaitOutcome::TimedOut.exit_code(),
+            Some("failed") => WaitOutcome::Failed.exit_code(),
+            Some("waiting") => WaitOutcome::Waiting.exit_code(),
+            _ => WaitOutcome::Succeeded.exit_code(),
+        };
+        ExitCode::from(code)
+    }
+}
+
 #[derive(Debug)]
 struct AppError {
     kind: &'static str,
@@ -2018,12 +2052,13 @@ where
     }
     match execute(cli.command) {
         Ok(output) => {
+            let code = output.exit_code();
             emit_success(cli.json, output);
-            ExitCode::SUCCESS
+            code
         }
         Err(error) => {
             emit_error(cli.json, &error);
-            ExitCode::FAILURE
+            ExitCode::from(if error.kind == "timeout" { 3 } else { 1 })
         }
     }
 }
