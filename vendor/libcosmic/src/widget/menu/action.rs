@@ -38,7 +38,9 @@
 ///     }
 /// }
 /// ```
-pub trait MenuAction: Clone + Copy + Eq + PartialEq {
+// Actions may retain shared captured targets; menu construction only borrows
+// the action to compare its shortcut and to construct its message.
+pub trait MenuAction: Clone + Eq + PartialEq {
     /// The type of message that will be produced when the action is triggered.
     type Message;
 
