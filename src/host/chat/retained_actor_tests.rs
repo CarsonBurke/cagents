@@ -37,6 +37,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     let mut state = HostState::new(first.clone());
     state.install_model(registry);
     let host = Arc::new(HostLock::new(state));
+    let notifications = super::super::notifications::Broker::start(&host, crate::notifications::Application::Cagents).unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
     let source = chat::fresh_session(Provider::Claude, TerminalId::new(), root.join("project"), &crate::account::Account::system(Provider::Claude)).unwrap();
     let id = source.id;
     let context = Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
@@ -63,6 +65,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     wait_until(|| fs::read_to_string(root.join("produced")).unwrap_or_default().lines().count() >= 3, "provider never began its slow turn");
     assert_eq!(registry.lock().unwrap().agent_run(accepted.run.id).unwrap().state, State::Running);
     drop(handle);
+    drop(notifications);
     drop(host);
     drop(lease.take());
     // The actual reducer, accepted command UUID, Store and protocol pipes stay
@@ -75,6 +78,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     let mut state = HostState::new(next);
     state.install_model(super::super::model::Registry::at(&path).unwrap());
     let successor = Arc::new(HostLock::new(state));
+    let _notifications = super::super::notifications::Broker::start(&successor, crate::notifications::Application::Cagents).unwrap();
+    successor.lock().unwrap().notifications = Some(_notifications.handle());
     restore_orphaned_native(&successor, &[]).unwrap();
     let handle = successor.lock().unwrap().chats[&id].handle.clone();
     assert_eq!(handle.actor_identity(), Some(identity.clone()), "adoption must retain both helper and original provider incarnations");

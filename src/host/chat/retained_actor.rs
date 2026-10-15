@@ -308,6 +308,12 @@ pub(in crate::host) fn finish_close(host: &SharedHost, handle: &Handle, requeste
     if let Some(loss) = &loss {
         let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;
         if changed { super::super::agent_execution::announce(host, &registry); }
+        let current = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.proof() == &proof && (state.chats.get(&source.id).is_some_and(|record| record.handle.same_actor(handle))
+                || state.native_closing.get(&source.id).is_some_and(|pending| pending.owns(&identity.record, requested)))
+        };
+        if !current { return Err("Actor close ownership changed before continuity-loss acknowledgement".into()); }
         handle.ack_continuity_loss(loss.id)?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
