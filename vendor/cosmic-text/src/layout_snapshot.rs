@@ -194,4 +194,17 @@ mod tests {
         assert_eq!(projection.buffer().layout_runs().count(), 2);
         assert!(snapshot.project(0..usize::MAX).is_none());
     }
+    #[test]
+    fn configuration_changes_cannot_publish_a_stale_layout_snapshot() {
+        let mut fonts = FontSystem::new();
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(16.0, 20.0));
+        buffer.set_size(Some(720.0), None);
+        buffer.set_text("a paragraph with wraps ".repeat(100).as_str(), &Attrs::new(), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut fonts, false);
+        buffer.set_size(Some(300.0), None);
+        let mut buffer = buffer.into_layout_snapshot().expect_err("resize must be laid out first");
+        buffer.shape_until_scroll(&mut fonts, false);
+        assert!(buffer.into_layout_snapshot().is_ok());
+    }
+
 }
