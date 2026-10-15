@@ -1839,7 +1839,7 @@ impl Cagents {
         &mut self,
         change: impl FnOnce(&mut Registry) + Send + 'static,
     ) -> Task<Message> {
-        if crate::device::is_remote() {
+        if crate::device::is_remote() || self.account_ui.store.is_some() {
             let expected_revision = self.account_ui.registry.revision();
             let mut registry = self.account_ui.registry.clone();
             change(&mut registry);
@@ -1865,25 +1865,13 @@ impl Cagents {
                 Message::AccountUi(Action::Saved(result))
             });
         }
-        let Some(store) = self.account_ui.store.clone() else {
-            // A window without a configuration directory keeps its choices
-            // for as long as it runs.
-            let mut registry = self.account_ui.registry.clone();
-            change(&mut registry);
-            self.account_ui.set_registry(registry);
-            return Task::none();
-        };
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || store.update(change))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| {
-                    result
-                        .map(|(registry, ())| registry)
-                        .map_err(|error| error.to_string())
-                });
-            Message::AccountUi(Action::Saved(result))
-        })
+        // A window without a configuration directory keeps its choices
+        // for as long as it runs.
+        let mut registry = self.account_ui.registry.clone();
+        change(&mut registry);
+        self.account_ui.set_registry(registry);
+        return Task::none();
+
     }
 
     /// The status bar was shown or hidden, or the Accounts pane opened.
@@ -1962,7 +1950,6 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         self.refresh_login_watch(id, now);
         let focused = self.refresh_ui.focused;
-        let cache = self.account_ui.cache.clone();
         let account = &self.account_ui.account(id)?.account;
         // Omp's accounts are asked about together, by reading its record.
         if account.is_brokered() {
@@ -2010,7 +1997,7 @@ impl Cagents {
         let id = state.id.clone();
         let owner = state.owner;
         let probe = cosmic::task::future(async move {
-            let outcome = if crate::device::is_remote() {
+            let outcome = {
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
                         crate::device_service::Operation::AccountProbe { account, force },
@@ -2025,8 +2012,6 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result)
                 .unwrap_or_else(Outcome::Failed)
-            } else {
-                probe::run(account, cache, force).await
             };
             Message::AccountUi(Action::Probed { owner, id, outcome })
         });
@@ -3384,7 +3369,6 @@ impl Cagents {
         }
         self.account_ui.table.linking = true;
         let key = uuid::Uuid::new_v4();
-        if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle::<(Registry, uuid::Uuid)>(account::remote::Operation::Link {
@@ -3402,136 +3386,36 @@ impl Cagents {
                 };
                 Message::AccountUi(Action::LinkReady { key, result })
             });
-        }
-        let store = self.account_ui.store.clone();
-        let homes = self.account_ui.homes.clone();
-        let fallback = self.account_ui.registry.clone();
-        let system_home = Account::system(provider).resolved_home();
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let raw_path = raw_path.trim();
-                let _lifecycle = homes
-                    .as_ref()
-                    .map(Homes::lifecycle_lock)
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .ok_or("HOME is unavailable")?
-                        .join(relative)
-                } else {
-                    PathBuf::from(raw_path)
-                };
-                if !chosen.is_absolute() {
-                    return Err("Enter an absolute path or one starting with ~/".into());
-                }
-                let path = std::fs::canonicalize(&chosen)
-                    .map_err(|error| format!("{}: {error}", chosen.display()))?;
-                crate::secure_file::validate_owned_directory(&path)
-                    .map_err(|error| error.to_string())?;
-                let change = |registry: &mut Registry| {
-                    registry.link(
-                        provider,
-                        key,
-                        path,
-                        system_home.as_deref(),
-                        homes.as_ref(),
-                        now_ms(),
-                    )
-                };
-                match store {
-                    Some(store) => store
-                        .update(change)
-                        .map_err(|error| error.to_string())
-                        .and_then(|(registry, result)| result.map(|key| (registry, key))),
-                    None => {
-                        let mut registry = fallback;
-                        let key = change(&mut registry)?;
-                        Ok((registry, key))
-                    }
-                }
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            let (key, result) = match result {
-                Ok((registry, key)) => (key, Ok(registry)),
-                Err(error) => (key, Err(error)),
-            };
-            Message::AccountUi(Action::LinkReady { key, result })
-        })
     }
 
     /// Creates the new account's home off the interface thread, with the
     /// reader's shared entries linked in, and finds its CLI.
     fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
-        if crate::device::is_remote() {
-            let copy_codex_config = self.account_ui.table.own_codex_config;
-            self.account_ui.table.close_popups();
-            self.account_ui.popover = None;
-            return cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    remote_lifecycle(account::remote::Operation::Create {
-                        provider,
-                        copy_codex_config,
-                    })
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                Message::AccountUi(Action::RemoteHomeReady(provider, result))
-            });
-        }
-        let codex_config = if self.account_ui.table.own_codex_config {
-            account::home::CodexConfig::Copy
-        } else {
-            account::home::CodexConfig::Shared
-        };
+        let remote = crate::device::is_remote();
+        let copy_codex_config = self.account_ui.table.own_codex_config;
         self.account_ui.table.close_popups();
         self.account_ui.popover = None;
-        if login_arguments(provider, device).is_none() {
-            return Task::none();
-        }
-        let Some(homes) = self.account_ui.homes.clone() else {
-            self.status = Some(TransientNotice::error(
-                "Accounts cannot be added: this system offers no data directory.",
-            ));
-            return Task::none();
-        };
-        if provider == Provider::Codex && !device {
+        if !remote && login_arguments(provider, device).is_none() { return Task::none(); }
+        if !remote && provider == Provider::Codex && !device {
             if self.codex_browser_busy() {
                 self.status = Some(TransientNotice::warning(account::login::BUSY));
                 return Task::none();
             }
             self.account_ui.browser_preparing = true;
         }
-        let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
-            let search_path = probe::search_path().await;
             let result = tokio::task::spawn_blocking(move || {
-                if provider == Provider::Codex && !device {
-                    browser_login_available()?;
-                }
-                let program = probe::find_executable(provider.executable(), search_path.as_deref())
-                    .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
-                let system = Account::system(provider).resolved_home();
-                let create = || homes.create_with_config(provider, system.as_deref(), codex_config);
-                let (key, home) = match &store {
-                    Some(store) => store.create_pending(&homes, provider, now_ms(), create),
-                    None => create(),
-                }
-                .map_err(|error| format!("Its home could not be created and recorded: {error}"))?;
-                Ok((key, home, program))
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            Message::AccountUi(Action::HomeReady {
-                provider,
-                device,
-                result,
-            })
+                if !remote && provider == Provider::Codex && !device { browser_login_available()?; }
+                remote_lifecycle::<account::remote::Created>(account::remote::Operation::Create { provider, copy_codex_config })
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            if remote {
+                Message::AccountUi(Action::RemoteHomeReady(provider, result))
+            } else {
+                // Preserve the local browser/device choice after the daemon
+                // has created and durably registered the pending home.
+                Message::AccountUi(Action::HomeReady { provider, device,
+                    result: result.map(|created| (created.key, created.home, PathBuf::from(created.recipe.program))) })
+            }
         })
     }
 
@@ -3591,9 +3475,8 @@ impl Cagents {
         task
     }
 
-    /// Deletes a home that never became an account, and its pending entry.
+    /// Abandons pending metadata through the host. Files require separate proved cleanup.
     fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
-        if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle(account::remote::Operation::Abandon { provider, key })
@@ -3603,18 +3486,6 @@ impl Cagents {
                 .and_then(|result| result);
                 Message::AccountUi(Action::LoginSettled { key, result })
             });
-        }
-        let homes = self.account_ui.homes.clone();
-        let store = self.account_ui.store.clone();
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || -> Result<Settled, String> {
-                abandon_home(store.as_ref(), homes.as_ref(), provider, key).map(Settled::Abandoned)
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            Message::AccountUi(Action::LoginSettled { key, result })
-        })
     }
 
     /// Asks the home of every sign-in whose terminal has ended - or whose
@@ -3771,7 +3642,7 @@ impl Cagents {
                 }
             }
             // No cache: the answer is about a home no other window knows.
-            let outcome = if crate::device::is_remote() {
+            let outcome = {
                 tokio::task::spawn_blocking(move || {
                     match crate::device_service::request(
                         crate::device_service::Operation::AccountProbe {
@@ -3789,8 +3660,6 @@ impl Cagents {
                 .map_err(|error| error.to_string())
                 .and_then(|result| result)
                 .unwrap_or_else(Outcome::Failed)
-            } else {
-                probe::run(account, None, true).await
             };
             Message::AccountUi(Action::LoginVerified {
                 key,
@@ -3864,7 +3733,6 @@ impl Cagents {
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
-        if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     remote_lifecycle(account::remote::Operation::Register { provider, key })
@@ -3874,65 +3742,6 @@ impl Cagents {
                 .and_then(|result| result);
                 Message::AccountUi(Action::LoginSettled { key, result })
             });
-        }
-        let managed = registry::Registered {
-            key,
-            provider,
-            linked_home: None,
-            label: None,
-            email: identity
-                .as_ref()
-                .and_then(|identity| identity.email.clone()),
-            organization: identity
-                .as_ref()
-                .and_then(|identity| identity.organization.clone()),
-            added_at: now,
-        };
-        let system = self.account_ui.system_identities();
-        let store = self.account_ui.store.clone();
-        let homes = self.account_ui.homes.clone();
-        let fallback = self.account_ui.registry.clone();
-        cosmic::task::future(async move {
-            let registration_homes = homes.clone();
-            let registered = match store.clone() {
-                Some(store) => tokio::task::spawn_blocking(move || match registration_homes {
-                    Some(homes) => store.register_pending(&homes, managed, &system),
-                    None => store.update(|registry| registry.register(managed, &system)),
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string())),
-                None => {
-                    let mut registry = fallback;
-                    let result = registry.register(managed, &system);
-                    Ok((registry, result))
-                }
-            };
-            let result = match registered {
-                Ok((registry, Ok(()))) => Ok(Settled::Registered {
-                    registry,
-                    identity,
-                    snapshot: Some(snapshot),
-                }),
-                Ok((_, Err(existing))) => {
-                    // The same login twice would be one allowance counted
-                    // twice. The new home is signed out - its login is its
-                    // own, so the existing one is unaffected - and deleted.
-                    let _ = probe::logout(account).await;
-                    tokio::task::spawn_blocking(move || -> Result<Settled, String> {
-                        Ok(Settled::Duplicate {
-                            existing,
-                            registry: abandon_home(store.as_ref(), homes.as_ref(), provider, key)?,
-                        })
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result)
-                }
-                Err(error) => Err(error),
-            };
-            Message::AccountUi(Action::LoginSettled { key, result })
-        })
     }
 
     fn login_settled(&mut self, key: uuid::Uuid, result: Result<Settled, String>) -> Task<Message> {
@@ -4018,8 +3827,8 @@ impl Cagents {
         }
     }
 
-    /// Forgets a linked home without touching it. A home cagents created is
-    /// signed out and deleted after it is removed from the registry.
+    /// Forgets a linked home through host admission. Managed file removal is
+    /// refused until its complete ownership/deletion permit is available.
     fn remove_account(&mut self, id: AccountId) -> Task<Message> {
         self.account_ui.table.close_popups();
         let Some(account) = self
@@ -4029,14 +3838,12 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let Some(key) = account.registry_key() else {
+        let Some(_key) = account.registry_key() else {
             return Task::none();
         };
-        let linked = account.is_linked();
         if !self.account_ui.removing.insert(id.clone()) {
             return Task::none();
         }
-        if crate::device::is_remote() {
             return cosmic::task::future(async move {
                 let remove_id = id.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -4057,53 +3864,6 @@ impl Cagents {
                     error,
                 })
             });
-        }
-        let store = self.account_ui.store.clone();
-        let homes = self.account_ui.homes.clone();
-        let fallback = self.account_ui.registry.clone();
-        let provider = account.provider;
-        cosmic::task::future(async move {
-            if !linked {
-                let _ = probe::logout(account).await;
-            }
-            let (registry, error) = tokio::task::spawn_blocking(move || {
-                if !linked && let (Some(store), Some(homes)) = (&store, &homes) {
-                    return match store.remove_home(homes, provider, key, true) {
-                        Ok((registry, error)) => (Some(registry), error),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
-                }
-                let registry = match store {
-                    Some(store) => match store.update(|registry| {
-                        registry.unregister(key);
-                    }) {
-                        Ok((registry, ())) => registry,
-                        Err(error) => return (None, Some(error.to_string())),
-                    },
-                    None => {
-                        let mut registry = fallback;
-                        registry.unregister(key);
-                        registry
-                    }
-                };
-                // Once forgotten, the home is no account's: a deletion that
-                // fails here leaves files, never a broken account.
-                let error = (!linked).then_some(homes).flatten().and_then(|homes| {
-                    homes
-                        .remove(provider, key)
-                        .err()
-                        .map(|error| format!("its files could not be deleted: {error}"))
-                });
-                (Some(registry), error)
-            })
-            .await
-            .unwrap_or_else(|error| (None, Some(error.to_string())));
-            Message::AccountUi(Action::Removed {
-                id,
-                registry,
-                error,
-            })
-        })
     }
 
     /// The account `provider` starts new work on outside a project.
@@ -5137,6 +4897,7 @@ fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), Str
 
 /// Forgets the pending sign-in `key`, returning the registry as it now
 /// stands where there is one on disk.
+#[cfg(test)]
 fn abandon_home(
     store: Option<&Store>,
     homes: Option<&Homes>,
@@ -5160,6 +4921,7 @@ fn abandon_home(
     abandon(store, key)
 }
 
+#[cfg(test)]
 fn abandon(store: Option<&Store>, key: uuid::Uuid) -> Result<Option<Registry>, String> {
     store
         .map(|store| {

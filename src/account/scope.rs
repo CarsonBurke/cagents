@@ -24,6 +24,21 @@ pub(crate) struct LaunchAccountScope {
     pub registered_id: Option<AccountId>,
 }
 
+/// Exact physical namespace comparison only. This pure hash grants no read,
+/// export or deletion authority. Annotation storage must share this codec.
+#[cfg(feature = "host")]
+pub(crate) fn namespace_key(scope: &LaunchAccountScope) -> String {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let mut hash = Sha256::new();
+    hash.update(postcard::to_stdvec(&scope.provider).expect("provider serialization"));
+    hash.update((scope.canonical_home.as_os_str().as_bytes().len() as u64).to_le_bytes());
+    hash.update(scope.canonical_home.as_os_str().as_bytes());
+    hash.update(scope.device.to_le_bytes());
+    hash.update(scope.inode.to_le_bytes());
+    format!("{:x}", hash.finalize())
+}
+
 impl LaunchAccountScope {
     /// `environment` must describe the actual child environment after explicit
     /// removals and captured inheritance. Do not consult a later UI selection.

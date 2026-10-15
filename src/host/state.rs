@@ -330,6 +330,7 @@ pub(crate) struct HostState {
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) project_removals: super::project_removal::Reservations,
+    pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -460,6 +461,7 @@ impl HostState {
         Self {
             recover_holders: false,
             project_removals: Default::default(),
+            account_lifecycle: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             published_terminal_workers: terminal_instances::PublishedWorkers::default(),
@@ -4066,6 +4068,17 @@ fn start_terminal_view_owned_attempt(
     if let Some(environment) = &mut execution_environment {
         session.launch.remove_unset_environment(&mut environment.0);
     }
+    if adoption.is_some() {
+        super::account_lifecycle::ensure_terminal_adoption(shared,
+            execution_environment.as_ref().map(|environment| &environment.0),
+            &crate::account::launch_credential_overrides(&session.launch))?;
+    }
+    super::account_lifecycle::ensure_launch_at_directory(
+        shared, &session.launch.working_directory,
+        execution_environment.as_ref().map(|value| &value.0).unwrap_or(&session.launch.environment),
+        &crate::account::launch_credential_overrides(&session.launch),
+        execution_environment.is_none(), execution_directory.as_deref(),
+    )?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();

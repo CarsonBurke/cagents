@@ -182,6 +182,7 @@ fn restore_authenticated(
     recovery: chat::native_holder::Recovery,
     publication: &super::source_binding::Reservation,
 ) -> Result<ServerResponse, String> {
+    super::super::account_lifecycle::ensure_captured_scope(host, recovery.launch_account_scope.as_ref()).map_err(|error| error.message)?;
     super::super::session_locations::observer_registry(host)?;
     let mut retained: Vec<_> = recovery
         .previous_sources

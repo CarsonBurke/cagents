@@ -36,6 +36,10 @@
 //!
 //! # Removal
 //!
+//! The current host admission foundation retains managed files until the
+//! complete ownership/deletion permit is composed. Raw cleanup below is
+//! restricted to isolated tests; discovery never grants cleanup authority.
+//!
 //! A home is removed by renaming it aside within its provider directory and
 //! then deleting the renamed tree. Nothing is followed on the way:
 //! the path is rebuilt from the account's key rather than taken from
@@ -115,6 +119,12 @@ impl Homes {
         crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX)
     }
 
+    /// Host short admission must never wait behind another process's flock.
+    pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+        crate::secure_file::prepare_private_directory(&self.root)?;
+        crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX | libc::LOCK_NB)
+    }
+
     fn provider_directory(&self, provider: Provider) -> PathBuf {
         self.root.join(provider.executable())
     }
@@ -168,8 +178,7 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                let _ = self.remove(provider, key);
-                return Err(error);
+                return Err(io::Error::other(format!("{error}; the new home was retained at {} for recovery", path.display())));
             }
             link_shared(provider, system_home, &path);
         }
@@ -178,6 +187,7 @@ impl Homes {
 
     /// Deletes the home of account `key`. A home that is already gone is not
     /// an error: removing an account twice leaves it just as removed.
+    #[cfg(test)]
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
             remove_parked(&parked)?;
@@ -187,6 +197,7 @@ impl Homes {
 
     /// Rename under the lifecycle/registry locks; delete the parked tree only
     /// after releasing them, since provider caches can be large.
+    #[cfg(test)]
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
@@ -209,6 +220,7 @@ impl Homes {
     /// Called only with a supported, existing registry and both locks held.
     /// A grace period also protects homes being created by an older window
     /// that predates atomic creation/registration.
+    #[cfg(test)]
     pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -251,6 +263,7 @@ impl Homes {
     /// cagents, a reset configuration directory - and holds a login and its
     /// history. Sign-ins that never finished are the registry's pending
     /// entries, which the accounts view verifies before removing anything.
+    #[cfg(test)]
     pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -390,6 +403,7 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
 
 /// Deletes a home that has been renamed aside, after checking it is still a
 /// real directory of this user's.
+#[cfg(test)]
 fn remove_parked(parked: &Path) -> io::Result<()> {
     crate::secure_file::reject_symlink_components(parked)?;
     crate::secure_file::validate_owned_directory(parked)?;
@@ -567,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_seed_removes_the_unregistered_home() {
+    fn a_failed_seed_retains_the_unregistered_home_for_proved_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let system = directory.path().join("system");
         fs::create_dir_all(system.join("settings.json")).unwrap();
@@ -577,7 +591,7 @@ mod tests {
             fs::read_dir(directory.path().join("accounts/claude"))
                 .unwrap()
                 .count(),
-            0
+            1
         );
     }
 

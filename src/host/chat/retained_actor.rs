@@ -330,6 +330,7 @@ pub(super) fn restore(
     {
         return Err("The retained Claude actor identity changed during inspection".into());
     }
+    super::super::account_lifecycle::ensure_captured_scope(host, inspection.launch_account_scope.as_ref().ok()).map_err(|error| error.message)?;
     let weak = Arc::downgrade(host);
     let id = requested.id;
     let expected_instance = inspection.identity.instance;

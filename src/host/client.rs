@@ -512,6 +512,21 @@ pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
+/// A scoped mutation must never enqueue a writer behind slow admitted work:
+/// writer-preferring RwLocks would then also block unrelated Input readers.
+/// Keep global upgrade/shutdown on their intentional blocking barrier.
+pub(super) fn try_scoped_control_write(gate: &RwLock<()>) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
+    match gate.try_write() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The daemon is busy finishing another operation. Try this operation again after it settles.",
+            true,
+        )),
+    }
+}
+
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
@@ -625,6 +640,26 @@ pub(super) fn process_request(
             false,
         ));
     }
+    // The reservation outlives all provider probes. Only installing it and
+    // committing each registry change take the short control writer.
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountLifecycle { operation },
+    } = &request {
+        let reservation = {
+            let _writer = try_scoped_control_write(&gate)?;
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+            super::project_removal::admit(host, &request)?;
+            let accounts = crate::account::remote::affected_accounts(operation)
+                .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
+            super::account_lifecycle::Reservation::install(host, &accounts)?
+        };
+        let reply = crate::account::remote::execute_reserved(operation.clone(), &reservation)
+            .map_err(|message| ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false))?;
+        return Ok((ServerResponse::DeviceOperation {
+            reply: crate::device_service::Reply::AccountLifecycle(reply),
+        }, Vec::new(), false));
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(
@@ -637,9 +672,6 @@ pub(super) fn process_request(
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
-            }
-            | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
@@ -656,6 +688,7 @@ pub(super) fn process_admitted(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    super::account_lifecycle::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::ProjectCloseInventory { project } => Ok((
@@ -671,40 +704,21 @@ pub(super) fn process_admitted(
             false,
         )),
         ClientRequest::DeviceOperation { operation } => {
-            if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
-                let account =
-                    crate::account::remote::affected_account(operation).map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
-                if let Some(account) = account {
-                    let variable = crate::account::home_variable(account.provider).unwrap();
-                    let home = account.resolved_home().unwrap();
-                    let uses = |recipe: &crate::model::LaunchRecipe| {
-                        recipe
-                            .environment
-                            .get(variable)
-                            .is_some_and(|path| std::path::Path::new(path) == home)
-                    };
-                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    if state
-                        .terminals
-                        .values()
-                        .any(|record| !record.handle.is_completed() && uses(&record.session.launch))
-                        || state.chats.values().any(|record| {
-                            record.handle.owns_work() && uses(&record.session.launch.recipe)
-                        })
-                        || state
-                            .chat_spawning
-                            .values()
-                            .any(|session| uses(&session.launch.recipe))
-                    {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
-                            false,
-                        ));
-                    }
+            if matches!(&operation, crate::device_service::Operation::AccountLifecycle { .. }) {
+                return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                    "Account lifecycle requires its host reservation", false));
+            }
+            match &operation {
+                crate::device_service::Operation::AccountsUpdate { registry, .. } => {
+                    let proposed = serde_json::from_value(registry.clone()).map_err(|error|
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, format!("Invalid account preferences: {error}"), false))?;
+                    super::account_lifecycle::ensure_update(host, &proposed)?;
                 }
+                crate::device_service::Operation::AccountLogin { account }
+                | crate::device_service::Operation::AccountProbe { account, .. } => {
+                    super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
+                }
+                _ => {}
             }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1684,6 +1698,9 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
+        if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
+            continue;
+        }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
