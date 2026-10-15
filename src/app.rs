@@ -28126,10 +28126,11 @@ mod tests {
             app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             app.active_workspace = Some(key.canonical_path.clone());
-            app.sidebar_state.apply(&SidebarAction::CommitMessageChanged {
-                key: key.clone(),
-                message: "Kept draft".into(),
-            });
+            app.sidebar_state
+                .apply(&SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: "Kept draft".into(),
+                });
             app.sidebar_state.apply(&SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: true,
@@ -28145,15 +28146,30 @@ mod tests {
                 message: "Kept draft".into(),
                 amend: true,
             })));
-            assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
-            assert!(app.sidebar_model.source_control.as_ref().unwrap().error
-                .as_deref().unwrap().contains("Finish or abort"));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Finish or abort")
+            );
             assert_eq!(app.sidebar_state.commit_message(), "Kept draft");
             drop(app.update(Message::Sidebar(SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: false,
             })));
-            assert!(app.sidebar_state.submitted_commit_revision(&key, "Kept draft", false).is_some());
+            assert!(
+                app.sidebar_state
+                    .submitted_commit_revision(&key, "Kept draft", false)
+                    .is_some()
+            );
         }
     }
 
