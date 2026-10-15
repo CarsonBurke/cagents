@@ -628,6 +628,9 @@ impl HostState {
         }
         let registry = self.registry()?;
         let applied = registry.apply(&edit).map_err(|error| {
+            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
+                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+            }
             // An execution writer can close a view after the preflight read.
             // apply has rolled back; inspect authoritative membership again
             // rather than making the client retry a permanently invalid edit.
