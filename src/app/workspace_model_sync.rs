@@ -1981,14 +1981,19 @@ mod tests {
         assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
             "a retained primary absent from current rows must not fence a usable linked checkout");
         project.worktrees.push(row(&primary));
-        assert_eq!(app.project_activation_worktree(&project), Some(primary),
+        assert_eq!(app.project_activation_worktree(&project), Some(primary.clone()),
             "a verified separate-directory primary wins over a linked checkout regardless of row order");
         app.project_ui.primary_checkout_roots.clear();
         app.project_ui.checkout_roots.clear();
-        assert_eq!(app.project_activation_worktree(&project), Some(linked),
+        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
             "legacy fallback also skips the non-checkout metadata row");
         project.worktrees.truncate(1);
         assert_eq!(app.project_activation_worktree(&project), None);
+        project.repository = primary.join(".git");
+        project.worktrees = vec![row(&linked), row(&primary)];
+        app.project_ui.checkout_roots.insert(project.repository.clone(), linked);
+        assert_eq!(app.project_activation_worktree(&project), Some(primary),
+            "an ordinary primary remains selected when only a linked checkout was opened explicitly");
     }
 
     /// A channel another window created arrives as a scope, not as a

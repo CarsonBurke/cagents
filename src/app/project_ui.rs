@@ -261,21 +261,19 @@ impl Cagents {
             .get(&project.repository)
             .filter(|path| listed(path))
             .or_else(|| {
+                project.worktrees.iter()
+                    .find(|row| checkout(&row.path)
+                        && sidebar::is_primary_worktree(&project.repository, &row.path))
+                    .map(|row| &row.path)
+            })
+            .or_else(|| {
                 self.project_ui
                     .checkout_roots
                     .get(&project.repository)
                     .filter(|path| listed(path))
             })
+            .or_else(|| project.worktrees.iter().find(|row| checkout(&row.path)).map(|row| &row.path))
             .cloned()
-            .or_else(|| {
-                project
-                    .worktrees
-                    .iter()
-                    .filter(|row| checkout(&row.path))
-                    .find(|row| sidebar::is_primary_worktree(&project.repository, &row.path))
-                    .or_else(|| project.worktrees.iter().find(|row| checkout(&row.path)))
-                    .map(|row| row.path.clone())
-            })
     }
 
     pub(super) fn known_project_checkout(
