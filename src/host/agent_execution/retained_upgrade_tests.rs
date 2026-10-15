@@ -13,10 +13,29 @@ impl Drop for UpgradeProviderPins {
 }
 struct PausedUpgradeHelper(Option<crate::daemon::owned_children::FixtureProcessPin>);
 impl PausedUpgradeHelper {
+    fn stop(owner: &crate::daemon::holder_registry::Process) -> Self {
+        let pin = crate::daemon::owned_children::FixtureProcessPin::capture(owner).unwrap();
+        let paused = Self(Some(pin));
+        paused.0.as_ref().unwrap().signal(libc::SIGSTOP).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // Proc state is observation only; every signal uses the already
+            // retained pidfd. Recheck the exact incarnation around the read.
+            assert_eq!(crate::daemon::holder_registry::Process::read(owner.pid).unwrap(), *owner);
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", owner.pid)).unwrap();
+            let state = stat.as_bytes()[stat.rfind(')').unwrap() + 2];
+            assert_eq!(crate::daemon::holder_registry::Process::read(owner.pid).unwrap(), *owner);
+            if matches!(state, b'T' | b't') { break; }
+            assert!(Instant::now() < deadline, "exact fixture helper did not stop");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        paused
+    }
     fn resume(&mut self) {
-        if let Some(pin) = self.0.take() {
+        if let Some(pin) = &self.0 {
             pin.signal(libc::SIGCONT).unwrap();
         }
+        self.0.take();
     }
 }
 impl Drop for PausedUpgradeHelper {
@@ -118,9 +137,7 @@ fn retained_upgrade_checkpoint_case(pause_claude: bool) {
     successor.lock().unwrap().notifications = Some(_notifications.handle());
     let mut paused = PausedUpgradeHelper(None);
     if pause_claude {
-        let pin = crate::daemon::owned_children::FixtureProcessPin::capture(&owners[0].holder).unwrap();
-        pin.signal(libc::SIGSTOP).unwrap();
-        paused.0 = Some(pin);
+        paused = PausedUpgradeHelper::stop(&owners[0].holder);
     }
     let refused = crate::host::state::restore_upgrade(&successor).unwrap();
     assert!(store.load().unwrap().is_none(), "only the successfully processed checkpoint is consumed");
