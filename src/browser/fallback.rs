@@ -898,9 +898,9 @@ impl FallbackSurface {
     pub(crate) fn prepare_for_paint(&self) -> Result<(), BrowserError> {
         use servo::RenderingContext;
 
-        self.context
-            .make_current()
-            .map_err(|error| BrowserError::Wayland(format!("make Servo context current: {error:?}")))?;
+        self.context.make_current().map_err(|error| {
+            BrowserError::Wayland(format!("make Servo context current: {error:?}"))
+        })?;
         // SAFETY: WindowRenderingContext is an EGL Wayland context, owned by
         // this browser thread, and make_current above selected its live draw
         // surface. EGL handles are opaque; no pointer is dereferenced here.
