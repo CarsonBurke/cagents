@@ -232,3 +232,18 @@ Elvish and PowerShell scripts are available with `completions elvish` and
 Automation definition and history pages accept `--limit` from 1 through 100;
 values outside that range are refused. For definitions, pass the last returned
 UUID as `--after` to request the next page.
+
+## Terminal inventory output
+
+`cagents terminal list` shows running terminals with a header, observed native
+terminal titles and working directories. `--all` includes retained non-running
+entries; `--exited` selects entries with a recorded exit. Missing exit evidence
+is shown as “relaunch available”, not inferred to mean hibernated or successful.
+Titles stay unknown until the daemon observes a terminal title event.
+
+List JSON now uses a metadata-only `data.terminals` array with `id`, `state`,
+`title`, `attached`, `program`, `working_directory` and `exit` fields, plus the
+sampled daemon `proof` once at the top level. State names are snake_case.
+Scripts that previously read `data.terminals[].session.id` should read
+`data.terminals[].id`. Full launch environments and recovery descriptors remain
+available through `cagents terminal show ID --json`; list output omits them.

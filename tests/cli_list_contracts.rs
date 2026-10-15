@@ -29,6 +29,8 @@ enum Listing {
     Channels,
     Automations,
     History,
+    Terminals,
+    TerminalShow,
 }
 
 impl Listing {
@@ -39,6 +41,8 @@ impl Listing {
             Self::Channels => &["channel", "list"],
             Self::Automations => &["automation", "list"],
             Self::History => &["automation", "history"],
+            Self::Terminals => &["terminal", "list"],
+            Self::TerminalShow => &["terminal", "show", "00000000-0000-4000-8000-000000000001"],
         }
     }
 
@@ -194,6 +198,23 @@ impl Listing {
                     },
                 ))
             }
+            (Self::Terminals | Self::TerminalShow, ClientRequest::List) => {
+                let terminals = if populated {
+                    let mut terminal = cagents::terminal::ipc::TerminalDescriptor::relaunchable(
+                        "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+                        cagents::model::LaunchRecipe { program: "/bin/sh".into(), arguments: vec!["-l".into()],
+                            working_directory: "/fixture".into(),
+                            environment: std::collections::BTreeMap::from([("FIXTURE_VALUE".into(), "show only".into())]),
+                            unset_environment: Default::default(), }, None);
+                    terminal.title = Some("Fixture terminal".into());
+                    terminal.session.resume_hint = Some("fixture recovery metadata".into());
+                    terminal.session.continuity = cagents::model::TerminalContinuity::DetachedSameBoot {
+                        host_session_id: HostSessionId::new("list-peer"), boot_id: BootId::new("private-boot"),
+                        host_incarnation: HostIncarnation::new("private-incarnation"), };
+                    vec![terminal]
+                } else { vec![] };
+                ServerResponse::Listed { terminals }
+            }
             _ => panic!("CLI sent a request outside its expected read contract"),
         }
     }
@@ -331,6 +352,7 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
             "No automation history",
             "At capacity",
         ),
+        (Listing::Terminals, "TERMINAL", "No running terminals", "Fixture terminal"),
     ] {
         assert_eq!(output(listing, false, false).trim(), empty);
         let human = output(listing, true, false);
@@ -355,4 +377,16 @@ fn standalone_account_list_json_is_metadata_only_and_lowercase() {
     for removed in ["usage", "environment", "launch", "recipe", "detail"] {
         assert!(row.get(removed).is_none(), "unexpected field {removed}");
     }
+}
+
+#[test]
+fn standalone_terminal_list_omits_recipes_and_show_preserves_them() {
+    let listed: serde_json::Value = serde_json::from_str(&output(Listing::Terminals, true, true)).unwrap();
+    let row = &listed["data"]["terminals"][0];
+    assert_eq!(row["state"], "running");
+    assert_eq!(row["title"], "Fixture terminal");
+    for field in ["session", "launch", "environment", "recipe", "resume_hint"] { assert!(row.get(field).is_none()); }
+    let shown: serde_json::Value = serde_json::from_str(&output(Listing::TerminalShow, true, true)).unwrap();
+    assert_eq!(shown["data"]["terminal"]["session"]["launch"]["environment"]["FIXTURE_VALUE"], "show only");
+    assert_eq!(shown["data"]["terminal"]["session"]["resume_hint"], "fixture recovery metadata");
 }
