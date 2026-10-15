@@ -24,6 +24,26 @@ pub(super) struct State {
     query_focused: bool,
     requested: Option<Instant>,
 }
+impl State {
+    fn result_target(&self, index: usize) -> Option<ResultTarget> {
+        Some(ResultTarget {
+            root: self.root.clone()?,
+            generation: self.generation,
+            index,
+            matched: self.matches.get(index)?.clone(),
+        })
+    }
+}
+
+/// One rendered result belongs to one immutable query and selected worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultTarget {
+    root: ActiveWorktreeKey,
+    generation: u64,
+    index: usize,
+    matched: project_search::Match,
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         if let Some(cancel) = &self.cancel {
@@ -49,8 +69,8 @@ pub enum Action {
         progress: Progress,
     },
     Select(usize),
-    OpenResult(usize),
-    Submit,
+    OpenResult(ResultTarget),
+    Submit(u64),
 }
 
 fn query_id() -> widget::Id {
@@ -257,21 +277,25 @@ impl Cagents {
                 )
                 .map(cosmic::Action::App);
             }
-            Action::Submit => {
-                return self.update_project_search(Action::OpenResult(self.search_ui.selected));
+            Action::Submit(generation) => {
+                if generation != self.search_ui.generation {
+                    return Task::none();
+                }
+                let Some(target) = self.search_ui.result_target(self.search_ui.selected) else {
+                    return Task::none();
+                };
+                return self.update_project_search(Action::OpenResult(target));
             }
-            Action::OpenResult(index) => {
-                let Some(root) = self
-                    .search_ui
-                    .root
-                    .clone()
-                    .filter(|root| self.sidebar_state.active_worktree() == Some(root))
-                else {
+            Action::OpenResult(target) => {
+                if target.generation != self.search_ui.generation
+                    || self.search_ui.root.as_ref() != Some(&target.root)
+                    || self.sidebar_state.active_worktree() != Some(&target.root)
+                    || self.search_ui.matches.get(target.index) != Some(&target.matched)
+                {
                     return Task::none();
-                };
-                let Some(matched) = self.search_ui.matches.get(index).cloned() else {
-                    return Task::none();
-                };
+                }
+                let root = target.root;
+                let matched = target.matched;
                 let Ok(path) = RepoPath::parse(&matched.path) else {
                     return Task::none();
                 };
@@ -353,10 +377,11 @@ impl Cagents {
             .padding(space::M)
             .into();
         }
+        let generation = state.generation;
         let query = crate::ui_controls::field::search("Search file contents", &state.options.query)
             .id(query_id())
             .width(Length::Fill)
-            .on_submit(|_| Message::ProjectSearch(Action::Submit))
+            .on_submit(move |_| Message::ProjectSearch(Action::Submit(generation)))
             .on_focus(Message::ProjectSearch(Action::QueryFocus(true)))
             .on_unfocus(Message::ProjectSearch(Action::QueryFocus(false)));
         let query = if enabled {
@@ -488,7 +513,8 @@ impl Cagents {
                     .height(design::DENSE_ROW_HEIGHT)
                     .padding([space::XS, space::S])
                     .on_press_maybe(
-                        enabled.then_some(Message::ProjectSearch(Action::OpenResult(index))),
+                        enabled.then(|| state.result_target(index)).flatten()
+                            .map(|target| Message::ProjectSearch(Action::OpenResult(target))),
                     ),
             ));
         }
@@ -563,7 +589,8 @@ mod tests {
             snippet: "hit".into(),
             highlight: 0..3,
         });
-        drop(app.update_project_search(Action::OpenResult(0)));
+        let target = app.search_ui.result_target(0).unwrap();
+        drop(app.update_project_search(Action::OpenResult(target)));
         assert!(
             app.status
                 .as_ref()
@@ -576,6 +603,38 @@ mod tests {
         assert_eq!(runtime.navigation(), navigation);
         assert!(runtime.is_dirty());
         assert!(app.pending_panel_open.is_none());
+    }
+
+    #[test]
+    fn held_result_and_submit_cannot_open_a_new_queries_same_index() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let root = app.sidebar_state.active_worktree().unwrap().clone();
+        let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::dirty_fixture(card);
+        runtime.descriptor.project = root.project_id;
+        runtime.descriptor.repository = root.canonical_path.clone();
+        runtime.descriptor.worktree = root.canonical_path.clone();
+        runtime.descriptor.selected_file = None;
+        let navigation = runtime.navigation();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.search_ui.root = Some(root.clone()); app.search_ui.generation = 41;
+        app.search_ui.matches.push(project_search::Match { path: "original.rs".into(), line: 0, column: 0, length: 1, snippet: "a".into(), highlight: 0..1 });
+        let held = app.search_ui.result_target(0).unwrap();
+        app.context_tab = ContextTab::Search;
+        drop(app.update_project_search(Action::Query("replacement".into())));
+        let generation = app.search_ui.generation;
+        drop(app.update_project_search(Action::Progress { generation, root, progress: Progress::Batch(vec![project_search::Match { path: "replacement.rs".into(), ..held.matched.clone() }]) }));
+        assert_eq!(app.search_ui.matches[0].path, Path::new("replacement.rs"));
+        app.status = None;
+        drop(app.update_project_search(Action::OpenResult(held)));
+        drop(app.update_project_search(Action::Submit(41)));
+        assert!(app.status.is_none(), "a stale activation must not even reach the current editor guard");
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else { panic!("original editor"); };
+        assert_eq!(runtime.navigation(), navigation);
+        assert!(runtime.is_dirty()); assert!(app.pending_panel_open.is_none());
     }
 
     #[test]
