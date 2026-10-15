@@ -10006,7 +10006,6 @@ mod tests {
                 name: "fixture".into(),
                 input: "{}".into(),
                 output: String::new(),
-                log: None,
                 status: chat::ToolStatus::Running,
             },
             started_at: None,
