@@ -20580,7 +20580,22 @@ pub(crate) mod tests {
         let disabled = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
         assert!(!disabled.iter().any(mutates), "mounted native mutation controls must not emit actions");
         assert!(disabled.iter().any(|action| matches!(action, SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. })), "read navigation remains mounted and usable");
-        assert!(disabled.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
+        // Pinned native checkboxes activate through pointer/touch, not Enter.
+        let mut footer = changes_footer(&state, source, false);
+        let mut tree = Tree::new(footer.as_widget());
+        let viewport = cosmic::iced::Rectangle::with_size(Size::new(380., 1200.));
+        let node = footer.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()));
+        let nodes = footer.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+        let bounds = nodes.root().iter().chain(nodes.children())
+            .find(|node| node.node().label() == Some("Amend")).unwrap().node().bounds().unwrap();
+        let point = cosmic::iced::Point::new(((bounds.x0 + bounds.x1) / 2.) as f32, ((bounds.y0 + bounds.y1) / 2.) as f32);
+        let mut toggles = Vec::new();
+        footer.as_widget_mut().update(&mut tree,
+            &cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(cosmic::iced::mouse::Button::Left)),
+            Layout::new(&node), cosmic::iced::mouse::Cursor::Available(point), &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null, &mut cosmic::iced::advanced::Shell::new(&mut toggles), &viewport);
+        assert!(toggles.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
         let mut retained = SourceControlModel::ready(main_key(), &snapshot());
         retained.upstream = None;
         retained.tracking = TrackingState::NoUpstream;

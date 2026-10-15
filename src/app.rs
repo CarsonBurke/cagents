@@ -19876,7 +19876,13 @@ impl Application for Cagents {
                 {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
-                if failed
+                let mutation_refused = self.sidebar_model.source_control.as_ref()
+                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                    .is_some_and(|source| !source.mutations_available());
+                // Roll back Git rows, never a newer host capability. On a
+                // successful final supported turn, retain only its projection:
+                // pending operations are no longer allowed to run or project.
+                if (failed || mutation_refused)
                     && let Some(rollback) = mutation.rollback.as_ref()
                     && let Some(source) = self
                         .sidebar_model
@@ -19884,12 +19890,20 @@ impl Application for Cagents {
                         .as_mut()
                         .filter(|source| source.key.canonical_path == key.canonical_path)
                 {
+                    let current_capability = source.mutation_unavailable_reason().map(Arc::from);
                     *source = rollback.clone();
-                    for pending in &mutation.pending {
-                        if let Some(selection) = pending.optimistic_selection() {
-                            source.optimistic_mutation(pending.kind(), selection);
+                    source.set_mutation_unavailable_reason(current_capability);
+                    if source.mutations_available() {
+                        for pending in &mutation.pending {
+                            if let Some(selection) = pending.optimistic_selection() {
+                                source.optimistic_mutation(pending.kind(), selection);
+                            }
                         }
                     }
+                }
+                if mutation_refused {
+                    mutation.pending.clear();
+                    self.git_mutation_unavailable(&key);
                 }
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
@@ -31767,6 +31781,44 @@ mod tests {
                 .contains_key(&key.canonical_path)
         );
         assert_eq!(app.refresh_ui.source_generation, generation + 1);
+    }
+
+    #[test]
+    fn mutation_completion_preserves_host_refusal_and_retires_queued_projections() {
+        for failed in [false, true] {
+            for queued in [false, true] {
+                let mut app = context_inspector_test_app(false);
+                app.sidebar_model = sidebar::tests::panel_model();
+                app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+                let key = app.sidebar_state.active_worktree().unwrap().clone();
+                app.active_workspace = Some(key.canonical_path.clone());
+                let source = app.sidebar_model.source_control.as_ref().unwrap();
+                let first = source.group(crate::repository::ChangeArea::Unstaged).unwrap().rows()[0].selection();
+                let pending = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
+                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![first.clone()])));
+                let operation = app.source_control_mutations[&key.canonical_path].id;
+                if queued { drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending.clone()]))); }
+                let reason: Arc<str> = "Host mutation authority is no longer available; reads remain available.".into();
+                app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+                // This owns a real admitted turn, but no fake Git process runs:
+                // deliver the exact completion through the application handler.
+                drop(app.update(Message::SourceControlMutated {
+                    key: key.clone(), operation,
+                    report: failed.then(|| "First stage failed".to_owned()), committed: false,
+                }));
+                assert!(app.source_control_mutations.is_empty(), "no queued work is promoted after capability refusal");
+                let source = app.sidebar_model.source_control.as_ref().unwrap();
+                assert_eq!(source.mutation_unavailable_reason(), Some(reason.as_ref()));
+                assert!(!source.busy());
+                let staged = source.group(crate::repository::ChangeArea::Staged).unwrap();
+                assert_eq!(staged.rows().iter().any(|row| row.entry.path == first.path), !failed,
+                    "a completed first stage survives success; a failed stage rolls back");
+                assert!(!staged.rows().iter().any(|row| row.entry.path == pending.path), "unsupported pending work cannot remain optimistically staged");
+                assert!(source.group(crate::repository::ChangeArea::Untracked).unwrap().rows().iter().any(|row| row.entry.path == pending.path));
+                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending])));
+                assert!(app.source_control_mutations.is_empty(), "later admission still observes the host refusal");
+            }
+        }
     }
 
     #[test]
