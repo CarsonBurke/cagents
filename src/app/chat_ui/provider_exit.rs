@@ -1213,7 +1213,9 @@ mod tests {
             };
             assert!(request.current(app.chat_runtime_mut(target).unwrap()));
             assert!(reply.contains_text_for_test("successful saved output held before path copy"));
-            let path_copy = app.update(Message::ChromeUi(crate::app::chrome_ui::Action::CopyPath(target.card)));
+            let path_copy = app.update(Message::ChromeUi(crate::app::chrome_ui::Action::CopyPath(
+                target.card,
+            )));
             assert_recent_copy_action(path_copy, Some("/workspace/chat-fixture"));
             app.status = None;
             assert_no_actions(app.handle_chat_ui(completed));

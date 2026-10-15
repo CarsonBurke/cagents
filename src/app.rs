@@ -8532,7 +8532,10 @@ impl Cagents {
                 }
                 TerminalEvent::ClipboardText { request, text } => {
                     if let Some(find) = self.terminal_find.get_mut(&card)
-                        && find.pending_copy.as_ref().is_some_and(|pending| pending.request == request)
+                        && find
+                            .pending_copy
+                            .as_ref()
+                            .is_some_and(|pending| pending.request == request)
                     {
                         let pending = find.pending_copy.take().unwrap();
                         if pending.intent.current() && !text.trim().is_empty() {
@@ -11274,8 +11277,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13950,9 +13956,17 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                if matches!(&action, RepositoryAction::Clipboard { op: repository_widget::ClipboardOp::Copy | repository_widget::ClipboardOp::Cut, .. })
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_) | CardRuntime::PullRequests(_)))
-                {
+                if matches!(
+                    &action,
+                    RepositoryAction::Clipboard {
+                        op: repository_widget::ClipboardOp::Copy
+                            | repository_widget::ClipboardOp::Cut,
+                        ..
+                    }
+                ) && matches!(
+                    self.cards.get(&card),
+                    Some(CardRuntime::Repository(_) | CardRuntime::PullRequests(_))
+                ) {
                     self.chat_ui.begin_clipboard_copy();
                 }
                 let completion_character = match &action {
