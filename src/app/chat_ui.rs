@@ -4114,9 +4114,14 @@ impl Cagents {
     /// This opens no directory, selects no path, persists nothing and starts
     /// no actor. Original-directory authority is registered separately.
     pub(super) fn prepare_directory_start_pane(
-        &self, directory: PathBuf, pane: settings::DefaultPane, session: TerminalId,
+        &self,
+        directory: PathBuf,
+        pane: settings::DefaultPane,
+        session: TerminalId,
     ) -> Result<CardKind, String> {
-        if session.as_uuid().is_nil() { return Err("Directory-start session identity is missing".into()); }
+        if session.as_uuid().is_nil() {
+            return Err("Directory-start session identity is missing".into());
+        }
         match pane {
             settings::DefaultPane::Terminal => Ok(CardKind::Terminal(
                 fresh_terminal_session_with_id(self.terminal_launch_recipe(directory)?, session),
@@ -4125,7 +4130,8 @@ impl Cagents {
                 let provider = self.preferred_chat_provider();
                 let account = self.default_account_for_directory(provider, &directory);
                 let automatic = self.automatic_accounts_for_directory(provider, &directory);
-                fresh_chat_session(provider, session, directory, &account, automatic).map(CardKind::Chat)
+                fresh_chat_session(provider, session, directory, &account, automatic)
+                    .map(CardKind::Chat)
             }
         }
     }
@@ -5316,14 +5322,26 @@ impl Cagents {
             return Task::none();
         }
         let registry = self.workspace_model.identity;
-        let obligation = self.durable.created_start_requirements.get(&target.card).cloned()
-            .or_else(|| self.workspace_model.created_start_requirements.iter()
-                .find(|requirement| requirement.card == target.card)
-                .map(|requirement| (registry, requirement.clone())));
+        let obligation = self
+            .durable
+            .created_start_requirements
+            .get(&target.card)
+            .cloned()
+            .or_else(|| {
+                self.workspace_model
+                    .created_start_requirements
+                    .iter()
+                    .find(|requirement| requirement.card == target.card)
+                    .map(|requirement| (registry, requirement.clone()))
+            });
         let conflicting_obligation = obligation.as_ref().is_some_and(|(_, required)| {
-            self.workspace_model.created_start_requirements.iter().any(|current| {
-                (current.card == target.card || current.session == required.session) && current != required
-            })
+            self.workspace_model
+                .created_start_requirements
+                .iter()
+                .any(|current| {
+                    (current.card == target.card || current.session == required.session)
+                        && current != required
+                })
         });
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
@@ -5338,9 +5356,12 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         if let Some((original_registry, required)) = &obligation {
-            if required.validate().is_err() || conflicting_obligation
-                || original_registry.is_nil() || *original_registry != registry
-                || required.card != target.card || required.session != session.id
+            if required.validate().is_err()
+                || conflicting_obligation
+                || original_registry.is_nil()
+                || *original_registry != registry
+                || required.card != target.card
+                || required.session != session.id
                 || required.kind != crate::model::CreatedStartKind::NativeChat
             {
                 runtime.error = Some("The original directory-start target changed. Its draft was preserved; reconnect or register a new explicit directory intent.".into());
@@ -5373,8 +5394,10 @@ impl Cagents {
         runtime.reasoning_picker = false;
         runtime.session = session.clone();
         if let Some(obligation) = obligation {
-            Arc::make_mut(&mut self.durable).created_start_requirements
-                .entry(target.card).or_insert(obligation);
+            Arc::make_mut(&mut self.durable)
+                .created_start_requirements
+                .entry(target.card)
+                .or_insert(obligation);
         }
         self.replace_chat_conversation(target.card, session.clone());
         self.start_chat(target.card, session, chat::Intent::Start, None, false)
@@ -11207,8 +11230,12 @@ mod tests {
             let registry = uuid::Uuid::new_v4();
             app.workspace_model.identity = registry;
             let mut required = crate::model::CreatedStartRequirement {
-                card, session: original_session, operation: crate::model::OperationId::new(),
-                generation: 4, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::NativeChat,
+                card,
+                session: original_session,
+                operation: crate::model::OperationId::new(),
+                generation: 4,
+                attempt: uuid::Uuid::new_v4(),
+                kind: crate::model::CreatedStartKind::NativeChat,
             };
             let mut saved_registry = registry;
             match case {
@@ -11218,28 +11245,47 @@ mod tests {
                 5 => required.card = CardId::new(),
                 _ => {}
             }
-            Arc::make_mut(&mut app.durable).created_start_requirements
+            Arc::make_mut(&mut app.durable)
+                .created_start_requirements
                 .insert(card, (saved_registry, required.clone()));
             if case != 1 {
                 let mut reported = required.clone();
-                if case == 6 { reported.attempt = uuid::Uuid::new_v4(); }
-                app.workspace_model.created_start_requirements.push(reported);
+                if case == 6 {
+                    reported.attempt = uuid::Uuid::new_v4();
+                }
+                app.workspace_model
+                    .created_start_requirements
+                    .push(reported);
             }
             write(&mut app, card, "preserve this original-directory prompt");
             let original_text = chat_runtime(&app, card).composer.text();
             submit(&mut app, card);
             if case <= 1 {
-                let attempt = app.chat_ui.attempt(card).expect("the same target can request host admission");
+                let attempt = app
+                    .chat_ui
+                    .attempt(card)
+                    .expect("the same target can request host admission");
                 assert_eq!(attempt.session.id, original_session);
-                assert_eq!(chat_runtime(&app, card).queued.as_ref().unwrap().draft.id, original_session);
-                assert_eq!(app.durable.created_start_requirements[&card], (registry, required));
+                assert_eq!(
+                    chat_runtime(&app, card).queued.as_ref().unwrap().draft.id,
+                    original_session
+                );
+                assert_eq!(
+                    app.durable.created_start_requirements[&card],
+                    (registry, required)
+                );
             } else {
                 assert!(!app.chat_start_pending(card));
                 let runtime = chat_runtime(&app, card);
                 assert_eq!(runtime.session.id, original_session);
                 assert_eq!(runtime.composer.text(), original_text);
                 assert!(runtime.queued.is_none());
-                assert!(runtime.error.as_deref().is_some_and(|error| error.contains("draft was preserved")));
+                assert!(
+                    runtime
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("draft was preserved"))
+                );
             }
         }
     }
@@ -11265,14 +11311,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11291,7 +11342,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);

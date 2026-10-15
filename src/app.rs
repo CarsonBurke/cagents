@@ -1497,7 +1497,10 @@ pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
     fresh_terminal_session_with_id(launch, TerminalId::new())
 }
 
-pub(super) fn fresh_terminal_session_with_id(launch: LaunchRecipe, id: TerminalId) -> TerminalSession {
+pub(super) fn fresh_terminal_session_with_id(
+    launch: LaunchRecipe,
+    id: TerminalId,
+) -> TerminalSession {
     TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
@@ -5753,14 +5756,17 @@ impl Cagents {
         match self.terminal_launch_recipe(working_directory) {
             Ok(launch) => self.add_terminal_recipe(launch),
             Err(error) => {
-                self.status = Some(TransientNotice::error(format!("could not create terminal: {error}")));
+                self.status = Some(TransientNotice::error(format!(
+                    "could not create terminal: {error}"
+                )));
                 Task::none()
             }
         }
     }
 
     fn terminal_launch_recipe(&self, working_directory: PathBuf) -> Result<LaunchRecipe, String> {
-        let mut launch = LaunchRecipe::shell(working_directory.clone()).map_err(|error| error.to_string())?;
+        let mut launch =
+            LaunchRecipe::shell(working_directory.clone()).map_err(|error| error.to_string())?;
         if let Some(shell) = crate::device::shell() {
             launch.program = shell.to_owned();
         }

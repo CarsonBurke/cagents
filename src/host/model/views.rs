@@ -322,8 +322,11 @@ pub(super) fn apply(
                 return Err("workspace view revision conflict".into());
             }
             match change {
-                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
-                    | Change::Update { pane, .. } => super::created_start::validate_pane(transaction, pane)?,
+                Change::Insert { pane, .. }
+                | Change::InsertIfEmpty { pane }
+                | Change::Update { pane, .. } => {
+                    super::created_start::validate_pane(transaction, pane)?
+                }
                 _ => {}
             }
             changed = match change {

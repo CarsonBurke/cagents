@@ -266,7 +266,8 @@ pub struct WorkspaceManifest {
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
     pub pending_terminal_creations: HashSet<CardId>,
-    pub created_start_requirements: HashMap<CardId, (uuid::Uuid, crate::model::CreatedStartRequirement)>,
+    pub created_start_requirements:
+        HashMap<CardId, (uuid::Uuid, crate::model::CreatedStartRequirement)>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -5296,18 +5297,29 @@ mod tests {
         let mut state = workspace_with_terminal(&boot_id);
         let id = state.cards[0].id;
         state.pending_terminal_creations.insert(id);
-        let CardKind::Terminal(session) = &state.cards[0].kind else { panic!("terminal fixture") };
-        let requirement = crate::model::CreatedStartRequirement {
-            card: id, session: session.id, operation: crate::model::OperationId::new(),
-            generation: 3, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::Terminal,
+        let CardKind::Terminal(session) = &state.cards[0].kind else {
+            panic!("terminal fixture")
         };
-        state.created_start_requirements.insert(id, (uuid::Uuid::new_v4(), requirement));
+        let requirement = crate::model::CreatedStartRequirement {
+            card: id,
+            session: session.id,
+            operation: crate::model::OperationId::new(),
+            generation: 3,
+            attempt: uuid::Uuid::new_v4(),
+            kind: crate::model::CreatedStartKind::Terminal,
+        };
+        state
+            .created_start_requirements
+            .insert(id, (uuid::Uuid::new_v4(), requirement));
         state.card_scopes.insert(id, PathBuf::from("/repo"));
         let mut lane = SaveLane::default();
         lane.save(&store, &state).unwrap();
         let restored = store.load_workspace(state.id, None).unwrap().unwrap();
         assert_eq!(restored.pending_terminal_creations, HashSet::from([id]));
-        assert_eq!(restored.created_start_requirements, state.created_start_requirements);
+        assert_eq!(
+            restored.created_start_requirements,
+            state.created_start_requirements
+        );
         let (CardKind::Terminal(before), CardKind::Terminal(after)) =
             (&state.cards[0].kind, &restored.cards[0].kind)
         else {
