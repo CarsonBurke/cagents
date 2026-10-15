@@ -171,7 +171,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let agent = accepted["agent"]["id"].as_str().unwrap();
     let first_run = accepted["run"]["id"].as_str().unwrap();
     let waiting = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 5);
-    assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
+    assert_eq!(waiting["run"]["state"], "waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
     // PTY snapshots can split the heading from its following instructions.
     // Wait for the actionable line before asserting the complete request.
@@ -206,7 +206,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         "10",
     ]);
     let completed = fixture.wait(&["agent", "wait", first_run, "--timeout", "10"], 0);
-    assert_eq!(completed["run"]["state"], "Succeeded", "{completed}");
+    assert_eq!(completed["run"]["state"], "succeeded", "{completed}");
     assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
     fixture.cli(&["terminal", "write", terminal, "second prompt\n"]);
     fixture.cli(&[
@@ -221,7 +221,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let second = loop {
         let second = fixture.cli(&["agent", "status", agent]);
-        if second["run"]["id"] != first_run && second["run"]["state"] == "Succeeded" {
+        if second["run"]["id"] != first_run && second["run"]["state"] == "succeeded" {
             break second;
         }
         assert!(
@@ -231,7 +231,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         thread::sleep(Duration::from_millis(10));
     };
     assert_ne!(second["run"]["id"], first_run);
-    assert_eq!(second["run"]["state"], "Succeeded", "{second}");
+    assert_eq!(second["run"]["state"], "succeeded", "{second}");
     assert_eq!(second["run"]["result"]["usage"]["input_tokens"], 7);
     assert_eq!(
         fs::read_to_string(fixture.root.path().join("spawns")).unwrap(),
@@ -287,7 +287,7 @@ fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
     let agent = accepted["agent"]["id"].as_str().unwrap();
     let run = accepted["run"]["id"].as_str().unwrap();
     let failed = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 4);
-    assert_eq!(failed["run"]["state"], "Failed", "{failed}");
+    assert_eq!(failed["run"]["state"], "failed", "{failed}");
     assert!(
         failed["run"]["result"]["diagnostic"]
             .as_str()
@@ -368,7 +368,7 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
         let run = accepted["run"]["id"].as_str().unwrap();
         assert_eq!(
             fixture.wait(&["agent", "wait", run, "--timeout", "10"], 5)["run"]["state"],
-            "Waiting"
+            "waiting"
         );
         fixture.cli(&["agent", "close", agent]);
         if request_key == "checkout" {
@@ -408,7 +408,7 @@ fn an_owner_drives_its_agent_by_short_handles() {
     let run = &accepted["run"]["id"].as_str().unwrap()[..8];
 
     let waiting = fixture.wait(&["agent", "wait", agent, "--timeout", "10"], 5);
-    assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
+    assert_eq!(waiting["run"]["state"], "waiting", "{waiting}");
     let requests = fixture.cli(&["agent", "requests", agent]);
     assert_eq!(
         requests["requests"][0]["id"], "console-approval",
@@ -419,7 +419,7 @@ fn an_owner_drives_its_agent_by_short_handles() {
     let answered = fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
     assert_eq!(answered["requests"], serde_json::json!([]));
     let completed = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 0);
-    assert_eq!(completed["run"]["state"], "Succeeded", "{completed}");
+    assert_eq!(completed["run"]["state"], "succeeded", "{completed}");
     assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
 
     let followed = fixture.cli(&[
@@ -431,7 +431,7 @@ fn an_owner_drives_its_agent_by_short_handles() {
         "--timeout",
         "10",
     ]);
-    assert_eq!(followed["run"]["state"], "Succeeded", "{followed}");
+    assert_eq!(followed["run"]["state"], "succeeded", "{followed}");
     assert_eq!(followed["timed_out"], false);
     let idle = fixture.output(&["agent", "interrupt", agent]);
     assert!(!idle.status.success(), "nothing to interrupt: {idle:?}");
@@ -477,7 +477,7 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
     );
     fixture.cli(&["agent", "interrupt", agent]);
     let cancelled = fixture.wait(&["agent", "wait", run, "--timeout", "10"], 4);
-    assert_eq!(cancelled["run"]["state"], "Cancelled");
+    assert_eq!(cancelled["run"]["state"], "cancelled");
     let follow = fixture.output(&[
         "agent",
         "send",
@@ -525,4 +525,100 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
     let all = fixture.output(&["agent", "wait", succeeded_run, failed_run, "--timeout", "1"]);
     assert_eq!(all.status.code(), Some(4), "{all:?}");
     fixture.cli(&["agent", "close", agent]);
+}
+
+#[test]
+fn scripting_account_defaults_and_settings_use_the_shared_persistent_configuration() {
+    let fixture = Fixture::new();
+    let accounts = fixture.cli(&["account", "list"]);
+    assert!(accounts["accounts"].as_array().unwrap().iter().any(|account| account["id"] == "claude/system"));
+    let selected = fixture.cli(&["account", "default", "claude", "system"]);
+    assert_eq!(selected["account"], "claude/system");
+    let accounts = fixture.cli(&["account", "list"]);
+    assert!(accounts["accounts"].as_array().unwrap().iter().any(|account| account["id"] == "claude/system" && account["default"] == true));
+    let automatic = fixture.cli(&["account", "default", "claude", "automatic"]);
+    assert_eq!(automatic["automatic"], true);
+    let changed = fixture.cli(&["settings", "set", "terminal_font_size", "15"]);
+    assert_eq!(changed["value"], 15.0);
+    let path = changed["path"].as_str().unwrap();
+    assert_eq!(cagents::settings::load(path).unwrap().terminal_font_size, 15.0,
+        "the same loader used by running windows sees the persisted change");
+    assert_eq!(fixture.cli(&["settings", "get", "terminal_font_size"])["value"], 15.0);
+    let invalid = fixture.output(&["settings", "set", "terminal_font_size", "1"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    let mut settings = cagents::settings::AppSettings::default(); settings.terminal_font_size = 1.0;
+    assert_eq!(error["error"]["message"], settings.validate().unwrap_err().to_string());
+}
+
+struct FollowGuard(Child);
+impl Drop for FollowGuard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+
+#[test]
+fn transcript_follow_streams_appended_items_and_exits_after_agent_close() {
+    use std::io::BufRead;
+    let fixture = Fixture::new();
+    let project_path = fixture.root.path().join("project"); let project = project_path.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&["agent", "spawn", "first", "--provider", "claude", "--project", project]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    fixture.wait(&["agent", "wait", agent, "--timeout", "10"], 5);
+    let exported = fixture.cli(&["agent", "transcript", agent, "--format", "json"]);
+    assert!(!exported["parts"].as_array().unwrap().is_empty());
+    let markdown = Fixture::command(fixture.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
+        .args(["agent", "transcript", agent, "--format", "md"]).output().unwrap();
+    assert!(markdown.status.success(), "{markdown:?}");
+    assert!(String::from_utf8_lossy(&markdown.stdout).contains("## User"));
+    let child = Fixture::command(fixture.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
+        .args(["agent", "transcript", agent, "--follow", "--format", "json"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = FollowGuard(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || for line in std::io::BufReader::new(stdout).lines() {
+        if sent.send(line.unwrap()).is_err() { break; }
+    });
+    let initial = received.recv_timeout(Duration::from_secs(10)).expect("initial transcript page");
+    let initial: Value = serde_json::from_str(&initial).unwrap();
+    assert_eq!(initial["command"], "agent.transcript");
+    fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let line = received.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("appended assistant result");
+        if line.contains("CONSOLE_RESULT_1") { break; }
+    }
+    fixture.cli(&["agent", "close", agent]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success()); break; }
+        assert!(Instant::now() < deadline, "transcript follow did not exit after close");
+        thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+}
+
+#[test]
+fn terminal_lists_show_native_titles_and_exit_status_without_launch_secrets() {
+    let fixture = Fixture::new();
+    let project_path = fixture.root.path().join("project");
+    let project = project_path.to_str().unwrap();
+    let spawned = fixture.cli(&["terminal", "spawn", "--cwd", project, "--", "sh", "-c",
+        "printf '\\033]0;Fixture shell\\007'; exit 3"]);
+    let id = spawned["terminal"]["session"]["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completed = loop {
+        let listed = fixture.cli(&["terminal", "list", "--all"]);
+        let terminal = listed["terminals"].as_array().unwrap().iter().find(|terminal| terminal["id"] == id).unwrap();
+        if terminal["state"] == "exited" { break terminal.clone(); }
+        assert!(Instant::now() < deadline, "terminal did not exit: {listed}");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(completed["exit_code"], 3);
+    assert_eq!(completed["title"], "Fixture shell");
+    assert!(!completed.to_string().contains("environment"));
+    assert!(!completed.to_string().contains("resume_hint"));
+    assert!(fixture.cli(&["terminal", "list"])["terminals"].as_array().unwrap().iter().all(|terminal| terminal["id"] != id));
+    assert!(fixture.cli(&["terminal", "list", "--exited"])["terminals"].as_array().unwrap().iter().any(|terminal| terminal["id"] == id));
+    let shown = fixture.cli(&["terminal", "show", id]);
+    assert!(shown["terminal"]["session"]["launch"]["environment"].is_object());
 }

@@ -200,3 +200,51 @@ If the deadline expires before a run’s first status arrives, `agent wait` keep
 any statuses already received and reports the unread IDs in `data.unresolved_runs`.
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
+
+## Shell use and configuration
+
+`cagents completions bash`, `zsh`, `fish`, `elvish`, or `powershell` writes the
+matching completion script without starting services. For example, install fish
+completions with `cagents completions fish > ~/.config/fish/completions/cagents.fish`.
+Every command and argument is described by `--help`. Automation pages accept
+1–100 results; continue `automation list` with `--after` and the last returned ID.
+
+List commands share aligned headers and explicit empty messages. Terminal lists
+show live sessions by default; `terminal list --all` includes retained completed
+sessions and `--exited` selects completed sessions. List JSON contains only
+identity, state, title, exit status, attachment state, program, directory and
+generation; use `terminal show ID`
+for the full descriptor, including the launch environment and recovery recipe.
+Provider, surface and state values in CLI JSON use snake_case; provider arguments
+accept both `Claude` and `claude`.
+
+Pass `--no-start` (or set `CAGENTS_NO_START=1`) to connect without starting a
+daemon, including on a selected remote device. An absent daemon reports
+`daemon_not_running`. `daemon stop` on an absent daemon succeeds with
+`{"state":"already_stopped"}` in its data envelope.
+
+`cagents settings get terminal_font_size` reads a typed value;
+`settings set terminal_font_size 15` validates and saves through the app's own
+settings code. Values use TOML syntax, unquoted strings are accepted, and `null`
+clears optional settings. Dots select nested keys. `settings path` prints the
+configuration path and `settings open` creates the file if needed and opens it.
+Running windows reload valid file changes. Settings commands target `--device`
+when supplied; open the printed path on that device for remote editing.
+
+`account list` shows registered accounts and defaults. Select a default with
+`account default claude claude/UUID`, `account default claude system`, or
+`account default claude automatic`. `account sign-in claude` runs the official
+provider login in a new isolated account home and registers its verified identity
+on success. Provider login output goes to stderr so JSON stdout remains parseable.
+`account remove PROVIDER/UUID` uses the same daemon safety checks as the app and
+retains managed transcript files; it is refused under an inherited agent token.
+
+`agent transcript ID --format md` exports readable cached messages and tools.
+Use `--format json` for JSON Lines pages containing `parts`, `cursor`, `at_end`,
+`closed` and `partial_history`; large items are split into bounded parts with
+byte offsets. `--follow` streams newly appended cached text and items, then exits
+when the agent closes. Each connection retains only a read lease on the cache,
+so following never moves a window's history cursor or keeps a provider running.
+If a restored provider has older history outside the cache, `partial_history`
+reports that gap and Markdown prints a notice. Open the export before closing
+an agent; a cache already discarded by closure reports it is unavailable.
