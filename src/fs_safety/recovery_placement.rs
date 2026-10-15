@@ -40,6 +40,8 @@ pub struct RecoveryPlacement {
     registry: RecoveryRegistryCheck,
     source_identity: (u64, u64),
     parent_identity: (u64, u64),
+    source_mount: u64,
+    parent_mount: u64,
     retained_descriptors: usize,
 }
 impl fmt::Debug for RecoveryPlacement {
@@ -47,6 +49,8 @@ impl fmt::Debug for RecoveryPlacement {
         f.debug_struct("RecoveryPlacement")
             .field("source_identity", &self.source_identity)
             .field("parent_identity", &self.parent_identity)
+            .field("source_mount", &self.source_mount)
+            .field("parent_mount", &self.parent_mount)
             .field("excluded_roots", &self.excluded.len())
             .field("retained_descriptors", &self.retained_descriptors)
             .finish_non_exhaustive()
@@ -96,7 +100,9 @@ impl RecoveryPlacement {
         (registry.check)()?;
         let source_identity = identity(&source)?;
         let parent_identity = identity(&parent)?;
-        if source_identity.0 != parent_identity.0 {
+        let source_mount = mount_identity(&source)?;
+        let parent_mount = mount_identity(&parent)?;
+        if source_identity.0 != parent_identity.0 || source_mount != parent_mount {
             return Err(unsupported("Recovery requires a private outside-source directory on the same filesystem; no file was moved."));
         }
         let namespace = DirectoryNamespace::acquire(&parent)?;
@@ -106,7 +112,7 @@ impl RecoveryPlacement {
         descriptors.extend(excluded.iter().map(|root| root.descriptor()));
         let retained_descriptors = descriptors.len().checked_add(registry.retained_descriptors)
             .ok_or_else(|| unsupported("Recovery descriptor accounting overflowed."))?;
-        let placement = Arc::new(Self { parent, source, excluded, namespace, registry, source_identity, parent_identity, retained_descriptors });
+        let placement = Arc::new(Self { parent, source, excluded, namespace, registry, source_identity, parent_identity, source_mount, parent_mount, retained_descriptors });
         placement.validate()?;
         Ok(placement)
     }
@@ -116,7 +122,8 @@ impl RecoveryPlacement {
     /// root or replacement path. Callers must preserve typed creation failures.
     pub fn validate(&self) -> io::Result<()> {
         (self.registry.check)()?;
-        if identity(&self.source)? != self.source_identity || identity(&self.parent)? != self.parent_identity {
+        if identity(&self.source)? != self.source_identity || identity(&self.parent)? != self.parent_identity
+            || mount_identity(&self.source)? != self.source_mount || mount_identity(&self.parent)? != self.parent_mount {
             return Err(unsupported("The retained recovery source or placement identity changed."));
         }
         let mut excluded = HashSet::from([self.source_identity]);
@@ -147,10 +154,11 @@ impl RecoveryPlacement {
     /// The consumer's original effect Root must match the captured source;
     /// borrowing a safe placement for another source does not transfer consent.
     pub fn validate_for_source(&self, source: &Root) -> io::Result<()> {
-        if identity(source)? != self.source_identity {
+        self.validate()?;
+        if identity(source)? != self.source_identity || mount_identity(source)? != self.source_mount {
             return Err(unsupported("Recovery placement belongs to a different source directory."));
         }
-        self.validate()
+        Ok(())
     }
     pub fn directory(&self) -> &Root { &self.parent }
     pub fn namespace(&self) -> &DirectoryNamespace { &self.namespace }
