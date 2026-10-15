@@ -1085,6 +1085,8 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Read fixture".into(), "/tmp".into(), Vec::new(), Vec::new()));
         let channel = ChannelId::new();
         let already_read = super::super::tests::terminal_card_state();
         let read_id = already_read.id;
@@ -1098,7 +1100,7 @@ mod tests {
             durable.channels.push(ProjectChannel {
                 title_source: Default::default(),
                 id,
-                project_id: ProjectId::new(),
+                project_id: project,
                 title: title.into(),
                 ordinal: 0,
                 shared: false,
@@ -1120,6 +1122,13 @@ mod tests {
                 .attention_retained(sidebar::SelectionRow::Channel(read_channel)),
             "bulk read must not promote a previously hidden read channel"
         );
+        let rows = sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(rows.contains(&sidebar::SelectionRow::Channel(channel)));
+        assert!(!rows.contains(&sidebar::SelectionRow::Channel(read_channel)));
+        assert!(app.sidebar_model.projects[0].channels.iter().find(|row| row.id == channel).unwrap().acknowledged_attention);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(sidebar::SidebarFilter::All))));
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(sidebar::SidebarFilter::Attention))));
+        assert!(!sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false).contains(&sidebar::SelectionRow::Channel(channel)));
     }
 
     #[test]
