@@ -506,6 +506,7 @@ pub(super) struct State {
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
 struct HandoffClose {
+    attachment_operation: uuid::Uuid,
     receipt: Arc<crate::terminal::ipc::TerminalHandoffReceipt>,
     request: closing::EndRequest,
     attached: bool,
@@ -8414,6 +8415,7 @@ impl Cagents {
                 // Attachment owns a start slot. Even immediate actor cleanup
                 // must not deliver a queued Close into that outstanding slot.
                 self.chat_ui.handoff_closes.insert(target.card, HandoffClose {
+                    attachment_operation: self.terminal_start_operation(target.card).expect("original handoff attachment"),
                     receipt: Arc::new(receipt), request, attached: false,
                 });
                 return task;
@@ -8426,7 +8428,7 @@ impl Cagents {
                     binding.execution_instance == receipt.terminal.execution_instance
                         && crate::workspace_model::views::same_card_source(&CardKind::Terminal(receipt.terminal.session.clone()), &CardKind::Terminal(binding.source))));
                 if let Some(pending) = self.chat_ui.handoff_closes.get_mut(&card)
-                    && pending.receipt.as_ref() == receipt.as_ref() {
+                    && pending.attachment_operation == operation && pending.receipt.as_ref() == receipt.as_ref() {
                     pending.attached = current && exact;
                     if !pending.attached {
                         let pending = self.chat_ui.handoff_closes.remove(&card).unwrap();
@@ -8435,7 +8437,8 @@ impl Cagents {
                 }
                 // The ordinary installer releases this exact start slot LAST;
                 // its finish hook then resumes only a fully attached Close.
-                return self.terminal_started_for_operation(card, receipt.terminal.session.id, result, current && exact);
+                let install = current && (result.is_err() || exact);
+                return self.terminal_started_for_operation(card, receipt.terminal.session.id, result, install);
             }
             Action::RetainedCloseFinished(target, session, result) => {
                 if self

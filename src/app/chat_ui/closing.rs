@@ -162,6 +162,9 @@ impl Cagents {
     pub(in crate::app) fn terminal_confirmation_owns_pane(&self, card: CardId) -> bool {
         self.terminal_close.as_ref().is_some_and(|intent| intent.card == card)
     }
+    pub(in crate::app) fn dirty_editor_close_owns_pane(&self, card: CardId) -> bool {
+        self.dirty_repository_close.as_ref().is_some_and(|close| close.card == card || close.remaining.contains(&card))
+    }
     fn conversation_end_placement(&self, card: CardId) -> Option<(Option<crate::model::ChannelId>, Option<ProjectId>, Option<PathBuf>, Option<crate::workspace_model::views::Scope>, Option<PathBuf>, Option<PathBuf>)> {
         let mut channels = self.durable.channels.iter().filter(|channel| channel.cards.contains(&card));
         let (channel, channel_project) = channels.next().map_or((None, None), |channel| (Some(channel.id), Some(channel.project_id)));
