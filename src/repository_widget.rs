@@ -4341,6 +4341,19 @@ impl RepositoryRuntime {
         self.is_dirty() && !self.is_saving()
     }
 
+    pub fn external_editor_command_available(&self) -> bool {
+        self.can_open_external() && !self.external_editors.is_empty()
+    }
+
+    pub fn external_editor_command(&self, card: CardId, editor_id: Option<&str>) -> Option<RepositoryAction> {
+        if !self.external_editor_command_available() { return None; }
+        let editor = match editor_id {
+            Some(id) => self.external_editors.iter().find(|editor| editor.id == id)?,
+            None => self.external_editors.first()?,
+        };
+        Some(external_editor_action(card, &editor.id))
+    }
+
     pub fn can_open_external(&self) -> bool {
         !self.standalone && self.selected.is_some() && !self.is_saving()
     }
@@ -7580,15 +7593,17 @@ fn editor_context_menu(card: CardId, runtime: &RepositoryRuntime) -> Vec<widget:
     widget::menu::items(&hints, items)
 }
 
+impl ExternalEditorCommand<'_> {
+    fn command(self) -> crate::workspace_widget::GlobalShortcut { crate::workspace_widget::GlobalShortcut::OpenInExternalEditor }
+}
+
+fn external_editor_action(card: CardId, editor_id: &str) -> RepositoryAction {
+    RepositoryAction::OpenExternal { card, editor_id: editor_id.to_owned() }
+}
+
 impl widget::menu::Action for ExternalEditorCommand<'_> {
     type Message = RepositoryAction;
-
-    fn message(&self) -> RepositoryAction {
-        RepositoryAction::OpenExternal {
-            card: self.0,
-            editor_id: self.1.to_owned(),
-        }
-    }
+    fn message(&self) -> RepositoryAction { external_editor_action(self.0, self.1) }
 }
 
 fn toolbar_group<'a>(
@@ -7865,12 +7880,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             icon(editor),
             format!("Open in {} · right-click for other editors", editor.name),
         )
-        .on_press_maybe(runtime.can_open_external().then(|| {
-            RepositoryAction::OpenExternal {
-                card,
-                editor_id: editor.id.clone(),
-            }
-        }));
+        .on_press_maybe(runtime.external_editor_command(card, Some(&editor.id)));
         if runtime.is_saving() {
             secondary.push(button.into());
         } else {
@@ -7885,9 +7895,15 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                     )
                 })
                 .collect();
+            // The unparameterized binding opens the configured default editor;
+            // parameterized alternatives must not advertise that same chord.
+            let bindings = runtime.external_editors.first().and_then(|editor| {
+                let command = ExternalEditorCommand(card, editor.id.as_str());
+                crate::workspace_widget::menu_shortcut(command.command(), &runtime.keyboard_shortcuts).map(|chord| (chord, command))
+            }).into_iter().collect();
             secondary.push(crate::interaction::context_menu(
                 button,
-                widget::menu::items(&HashMap::new(), entries),
+                widget::menu::items(&bindings, entries),
             ));
         }
     }
@@ -15960,6 +15976,19 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn registry_external_editor_template_preserves_the_requested_editor() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        assert!(!runtime.external_editor_command_available());
+        runtime.set_external_editors(["first", "chosen"].into_iter().map(|id| crate::sidebar::SidebarEditor { id: id.into(), name: id.into(), icon: "editor".into() }).collect());
+        let command = ExternalEditorCommand(card, "chosen");
+        assert_eq!(crate::workspace_widget::shortcut_descriptor(command.command()).id(), "open_in_external_editor");
+        assert!(matches!(runtime.external_editor_command(card, Some("chosen")), Some(RepositoryAction::OpenExternal { card: id, editor_id }) if id == card && editor_id == "chosen"));
+        assert!(matches!(runtime.external_editor_command(card, None), Some(RepositoryAction::OpenExternal { editor_id, .. }) if editor_id == "first"));
+        assert!(runtime.external_editor_command(card, Some("removed")).is_none());
     }
 
     #[test]

@@ -397,6 +397,7 @@ pub struct CommandContext {
     pub pane_has_path: bool,
     pub pane_revealable: bool,
     pub pane_cloneable: bool,
+    pub pane_external_editor: bool,
     pub can_fork: bool,
     pub can_end_conversation: bool,
     pub chat_account: bool,
@@ -484,7 +485,7 @@ impl ShortcutDescriptor {
         }
         let pane = context.pane_index.is_some();
         match self.action {
-            GlobalShortcut::OpenInExternalEditor => false,
+            GlobalShortcut::OpenInExternalEditor => context.pane_external_editor,
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::EndConversation => context.can_end_conversation,
             GlobalShortcut::MarkAllRead => context.has_unread,

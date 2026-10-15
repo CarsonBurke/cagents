@@ -1064,6 +1064,7 @@ impl Cagents {
                     && !state.kind.is_utility()
                     && !self.project_ui.deleting_card(state)
             }),
+            pane_external_editor: state.is_some_and(|state| state.existence.is_open()) && card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.external_editor_command_available())),
             can_fork: card.and_then(|id| self.chat_fork_target(id)).is_some(),
             can_end_conversation: state.is_some_and(|state| state.existence.is_open() && matches!(state.kind, CardKind::Chat(_))),
             chat_account: card.is_some_and(|id| self.chat_control_available(id, Command::ChatAccount)),
@@ -1115,6 +1116,10 @@ impl Cagents {
             Command::EndConversation => Message::ChatClose(chat_ui::closing::Action::End(id)),
             Command::CloseOtherPanes => Message::ChromeUi(chrome_ui::Action::CloseOthers(id)),
             Command::ClosePanesToRight => Message::ChromeUi(chrome_ui::Action::CloseToRight(id)),
+            Command::OpenInExternalEditor => Message::Repository(match self.cards.get(&id) {
+                Some(CardRuntime::Repository(runtime)) => runtime.external_editor_command(id, None)?,
+                _ => return None,
+            }),
             Command::CopyPath => Message::ChromeUi(chrome_ui::Action::CopyPath(id)),
             Command::RevealInProjects => Message::ChromeUi(chrome_ui::Action::Reveal(id)),
             Command::SwitchPane => Message::ChatUi(chat_ui::Action::Switch(id)),
