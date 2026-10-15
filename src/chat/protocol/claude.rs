@@ -494,6 +494,13 @@ impl Claude {
             && self.started_generation != Some(self.attention_generation)
         {
             self.interruption = None;
+            // This idle generation will also identify the next prompt. Forget
+            // its between-turn interrupts before a late reply can be mistaken
+            // for that prompt's own interrupt or deferred result.
+            self.controls.retain(|_, request| {
+                string(request, "subtype") != "interrupt"
+                    || request["_cagents_turn"].as_u64() != Some(self.attention_generation)
+            });
             self.status(false, "Claude turn complete", step);
         }
         self.retired.push_back(id);
@@ -5760,6 +5767,94 @@ mod tests {
                 finished.events
             );
             assert!(!adapter.busy);
+        }
+    }
+
+    #[test]
+    fn a_between_turn_interrupt_ack_cannot_settle_the_next_runs_interrupt() {
+        use crate::agent_execution::ProviderEvent;
+        use crate::notifications::Kind;
+
+        for after_result in [false, true] {
+            for old_accepted in [false, true] {
+                let mut adapter = Claude {
+                    ready: true,
+                    ..Claude::default()
+                };
+                adapter
+                    .send_prompt("first".into(), vec![], PromptMode::Send)
+                    .unwrap();
+                adapter
+                    .receive(approval("background", "Bash", json!({"command":"true"})))
+                    .unwrap();
+                adapter
+                    .receive(json!({"type":"result","is_error":false}))
+                    .unwrap();
+                let old = adapter.command(Command::Interrupt).unwrap();
+                let old_id = old.writes[0]["request_id"].as_str().unwrap();
+                adapter
+                    .command(Command::Answer {
+                        request_id: "background".into(),
+                        action: "deny".into(),
+                        answers: vec![],
+                    })
+                    .unwrap();
+
+                let next = crate::model::RunId::new();
+                adapter
+                    .command_for_run(
+                        next,
+                        Command::Prompt {
+                            text: "next".into(),
+                            attachments: vec![],
+                            mode: PromptMode::Send,
+                        },
+                    )
+                    .unwrap();
+                let current = adapter.command(Command::Interrupt).unwrap();
+                let current_id = current.writes[0]["request_id"].as_str().unwrap();
+                let result = json!({"type":"result","uuid":"next-result","is_error":false});
+                let mut events = Vec::new();
+                if after_result {
+                    events.extend(adapter.receive(result.clone()).unwrap().events);
+                }
+                let old_ack = if old_accepted {
+                    reply(old_id, json!({}))
+                } else {
+                    json!({"type":"control_response","response":{"request_id":old_id,"subtype":"error","error":"already settled"}})
+                };
+                let stale = adapter.receive(old_ack).unwrap();
+                assert!(stale.events.is_empty(), "{:?}", stale.events);
+                if !after_result {
+                    events.extend(adapter.receive(result).unwrap().events);
+                }
+                assert!(
+                    !events.iter().any(|event| matches!(event,
+                        Event::Execution { run, event: ProviderEvent::Finished { .. } } if *run == next)),
+                    "the next run must await its own interrupt acknowledgement: {events:?}"
+                );
+                events.extend(
+                    adapter
+                        .receive(json!({
+                            "type":"control_response",
+                            "response":{"request_id":current_id,"subtype":"error","error":"already settled"}
+                        }))
+                        .unwrap()
+                        .events,
+                );
+                let outcomes: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Execution {
+                            run,
+                            event: ProviderEvent::Finished { outcome },
+                        } if *run == next => Some(*outcome),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(outcomes, [Kind::Succeeded], "{events:?}");
+                assert!(!adapter.busy);
+            }
         }
     }
 
