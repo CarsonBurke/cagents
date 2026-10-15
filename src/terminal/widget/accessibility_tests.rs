@@ -1917,3 +1917,59 @@ fn native_focus_batch_overrides_stale_builder_and_next_diff_retires_the_override
         key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
     assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
 }
+
+
+#[test]
+fn admitted_physical_release_precedes_new_clipboard_or_viewport_chord() {
+    use keyboard::key::{Code, Named, Physical};
+    let cases = [
+        (keyboard::Key::Character("c".into()), Code::KeyC, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+        (keyboard::Key::Character("v".into()), Code::KeyV, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+        (keyboard::Key::Named(Named::PageUp), Code::PageUp, keyboard::Modifiers::SHIFT),
+        (keyboard::Key::Named(Named::PageDown), Code::PageDown, keyboard::Modifiers::SHIFT),
+        (keyboard::Key::Named(Named::Home), Code::Home, keyboard::Modifiers::SHIFT),
+        (keyboard::Key::Named(Named::End), Code::End, keyboard::Modifiers::SHIFT),
+    ];
+    for (key, code, changed) in cases {
+        let peer = Peer::new();
+        let renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let mut widget = widget(&peer, "release-owner-first", barrier.clone(), true, false);
+        widget.on_shortcut = None;
+        Arc::make_mut(&mut widget.snapshot).scroll = super::super::ScrollSnapshot {
+            total:100, len:1, ..Default::default()
+        };
+        let mut tree = widget_tree(&widget);
+        let event = |down, modifiers| Event::Keyboard(if down {
+            keyboard::Event::KeyPressed {key:key.clone(), modified_key:key.clone(), physical_key:Physical::Code(code),
+                location:keyboard::Location::Standard, modifiers, text:None, repeat:false}
+        } else {
+            keyboard::Event::KeyReleased {key:key.clone(), modified_key:key.clone(), physical_key:Physical::Code(code),
+                location:keyboard::Location::Standard, modifiers}
+        });
+        dispatch(&mut widget, &mut tree, &renderer, event(true, keyboard::Modifiers::empty()));
+        let press = peer.fence().into_iter().filter_map(|request| match request {
+            ClientRequest::Key {input,..} => Some(input), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(press.len(), 1, "plain physical press must reach the actual hosted peer: {code:?}");
+        assert_eq!(press[0].action, KeyAction::Press);
+        dispatch(&mut widget, &mut tree, &renderer, Event::Keyboard(keyboard::Event::ModifiersChanged(changed)));
+        dispatch(&mut widget, &mut tree, &renderer, event(false, changed));
+        let releases = peer.fence().into_iter().filter_map(|request| match request {
+            ClientRequest::Key {input,..} => Some(input), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(releases.len(), 1, "changed modifiers must not swallow an admitted release: {code:?}");
+        assert_eq!(releases[0].action, KeyAction::Release);
+        assert_eq!(releases[0].key, press[0].key);
+        assert_eq!(releases[0].unshifted_codepoint, press[0].unshifted_codepoint);
+        assert_eq!(releases[0].modifiers, map_iced_modifiers(changed));
+        assert!(tree.state.downcast_ref::<WidgetState>().input_keys.is_empty());
+        assert_eq!(barrier.pending_counts(), (0,0));
+        // Duplicate release/redraw and a UI-only chord with no admitted press
+        // must not synthesize a second/phantom key-up for the terminal.
+        dispatch(&mut widget, &mut tree, &renderer, event(false, changed));
+        dispatch(&mut widget, &mut tree, &renderer, event(true, changed));
+        dispatch(&mut widget, &mut tree, &renderer, event(false, keyboard::Modifiers::empty()));
+        assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key {..})));
+    }
+}
