@@ -15,6 +15,7 @@ pub(crate) struct Store {
     session:Option<String>,
     directory: PathBuf,
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pending_text_bytes:std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 /// Owns an unaccepted attachment. Dropping/aborting removes its private bytes;
 /// the file lock protects active captures from cold orphan recovery.
@@ -24,6 +25,10 @@ pub(crate) struct PendingAttachment {
     accepted: bool,
     reserved_bytes:u64,
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+pub(crate) struct PendingText(PendingAttachment);
+impl PendingText {
+    pub(crate) fn bytes(&self)->usize{self.0.attachment.bytes as usize}
 }
 impl Drop for PendingAttachment {
     fn drop(&mut self) {
@@ -142,7 +147,7 @@ impl Store {
           CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
           CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL); PRAGMA user_version=1;")
             .map_err(|e|e.to_string())?;
-        let store=Self{db,scope:scope.clone(),session:session.map(str::to_owned),directory,pending_bytes:Default::default()};
+        let store=Self{db,scope:scope.clone(),session:session.map(str::to_owned),directory,pending_bytes:Default::default(),pending_text_bytes:Default::default()};
         store.recover_pending()?;
         Ok(store)
     }
@@ -189,15 +194,24 @@ impl Store {
     /// Snapshot BEFORE dispatch and send this owned private path to the
     /// provider. The capture is retained only by a successful accept().
     pub(crate) fn retain_attachment(&self,path:&Path)->Result<PendingAttachment,OriginalError>{
-        use std::{io::{Read,Write},os::fd::AsRawFd,sync::atomic::Ordering};
-        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
-        self.recover_pending().map_err(OriginalError::Unavailable)?;
-        let mut input=fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+        let input=fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         let metadata=input.metadata().map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         if !metadata.is_file(){return Err(OriginalError::Unavailable("The original attachment is not a regular file".into()));}
         let reserved_bytes=metadata.len();if reserved_bytes>32*1024*1024{return Err(OriginalError::TooLarge);}
-        self.pending_bytes.fetch_update(Ordering::AcqRel,Ordering::Acquire,|bytes|bytes.checked_add(reserved_bytes).filter(|total|*total<=64*1024*1024)).map_err(|_|OriginalError::TooLarge)?;
         let extension=path.extension().and_then(|value|value.to_str()).filter(|value|!value.is_empty()&&value.len()<=16&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()));
+        self.retain_reader(input,reserved_bytes,path,extension,self.pending_bytes.clone(),64*1024*1024)
+    }
+    /// Original operator text is ephemeral until a real provider acceptance;
+    /// spool it instead of retaining another unbounded command String in RAM.
+    pub(crate) fn capture_text(&self,text:&str)->Result<PendingText,OriginalError>{
+        if text.len()>ORIGINAL_TEXT_BYTES{return Err(OriginalError::TooLarge);}
+        self.retain_reader(std::io::Cursor::new(text.as_bytes()),text.len() as u64,Path::new(""),Some("txt"),self.pending_text_bytes.clone(),ORIGINAL_TEXT_BYTES as u64).map(PendingText)
+    }
+    fn retain_reader(&self,mut input:impl std::io::Read,reserved_bytes:u64,original_path:&Path,extension:Option<&str>,budget:std::sync::Arc<std::sync::atomic::AtomicU64>,budget_limit:u64)->Result<PendingAttachment,OriginalError>{
+        use std::{io::Write,os::fd::AsRawFd,sync::atomic::Ordering};
+        self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        self.recover_pending().map_err(OriginalError::Unavailable)?;
+        budget.fetch_update(Ordering::AcqRel,Ordering::Acquire,|bytes|bytes.checked_add(reserved_bytes).filter(|total|*total<=budget_limit)).map_err(|_|OriginalError::TooLarge)?;
         let name=format!("capture-{}{}",uuid::Uuid::new_v4(),extension.map(|value|format!(".{value}")).unwrap_or_default());
         let retained=self.directory.join(&name);
         let mut created=false;
@@ -218,30 +232,47 @@ impl Store {
             if bytes!=reserved_bytes{return Err(OriginalError::Changed);}
             output.sync_all().map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             fs::File::open(&self.directory).and_then(|file|file.sync_all()).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,reserved_bytes,pending_bytes:self.pending_bytes.clone()})
+            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:original_path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,reserved_bytes,pending_bytes:budget.clone()})
         })();
-        if result.is_err(){if created{let _=fs::remove_file(retained);}self.pending_bytes.fetch_sub(reserved_bytes,Ordering::AcqRel);}
+        if result.is_err(){if created{let _=fs::remove_file(retained);}budget.fetch_sub(reserved_bytes,Ordering::AcqRel);}
         result
     }
     /// Persist only after a provider acknowledgment binds this exact original
     /// command to its real user item. Conflicting rewrites are refused.
     pub(crate) fn accept(&mut self, original:&OriginalPrompt,text:&str,aliases:&[String],captures:&mut [PendingAttachment])->Result<(),OriginalError> {
+        if text.len()!=original.text_bytes{return Err(OriginalError::Changed);}
+        self.accept_reader(original,std::io::Cursor::new(text.as_bytes()),Sha256::digest(text.as_bytes()).into(),aliases,captures)
+    }
+    pub(crate) fn accept_captured(&mut self,original:&OriginalPrompt,text:&PendingText,aliases:&[String],captures:&mut[PendingAttachment])->Result<(),OriginalError>{
+        if text.bytes()!=original.text_bytes||text.0.attachment.path.parent()!=Some(self.directory.as_path()){return Err(OriginalError::Changed);}
+        let file=crate::secure_file::open_existing_private_file(&text.0.attachment.path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+        self.accept_reader(original,file,text.0.attachment.sha256,aliases,captures)
+    }
+    fn accept_reader(&mut self,original:&OriginalPrompt,mut text:impl std::io::Read,text_sha:[u8;32],aliases:&[String],captures:&mut[PendingAttachment])->Result<(),OriginalError>{
         self.scope.revalidate().map_err(OriginalError::Unavailable)?;
         let session=self.confirmed().map_err(OriginalError::Unavailable)?.to_owned();
         if !valid_id(&original.user_id)||!valid_id(&original.turn_id)||aliases.len()>128||aliases.iter().any(|id|!valid_id(id)) {return Err(OriginalError::TooLarge);}
         if !original.settings.is_exact() {return Err(OriginalError::Unavailable("The accepted provider settings are unknown".into()));}
-        if text.len()!=original.text_bytes||text.len()>ORIGINAL_TEXT_BYTES||original.attachments.len()>32||original.attachments.iter().try_fold(0u64,|sum,file|sum.checked_add(file.bytes)).is_none_or(|bytes|bytes>64*1024*1024) {return Err(OriginalError::TooLarge);}
+        if original.text_bytes>ORIGINAL_TEXT_BYTES||original.attachments.len()>32||original.attachments.iter().try_fold(0u64,|sum,file|sum.checked_add(file.bytes)).is_none_or(|bytes|bytes>64*1024*1024) {return Err(OriginalError::TooLarge);}
         if original.attachments.len()!=captures.len()||original.attachments.iter().zip(captures.iter()).any(|(expected,capture)|expected!=&capture.attachment||capture.attachment.path.parent()!=Some(self.directory.as_path())){return Err(OriginalError::Changed);}
         let metadata=postcard::to_stdvec(original).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         if metadata.len()>META_BYTES{return Err(OriginalError::TooLarge);}
-        let mut hash=Sha256::new();hash.update(&metadata);hash.update(text.as_bytes());let digest=hash.finalize();
+        let mut hash=Sha256::new();hash.update(&metadata);hash.update(text_sha);let digest=hash.finalize();
         let transaction=self.db.transaction().map_err(storage_error)?;
         let old:Option<Vec<u8>>=transaction.query_row("SELECT digest FROM prompts WHERE session=?1 AND user_id=?2",params![session,original.user_id],|r|r.get(0)).optional().map_err(storage_error)?;
         if old.as_deref().is_some_and(|old|old!=digest.as_slice()){return Err(OriginalError::Changed);}
         if old.is_none(){
             transaction.execute("INSERT INTO prompts VALUES(?1,?2,?3,?4)",params![session,original.user_id,metadata,digest.as_slice()]).map_err(storage_error)?;
-            for (index,chunk) in text.as_bytes().chunks(CHUNK).enumerate(){transaction.execute("INSERT INTO prompt_text VALUES(?1,?2,?3,?4)",params![session,original.user_id,index*CHUNK,chunk]).map_err(storage_error)?;}
         }
+        let mut buffer=[0u8;CHUNK];let mut written=0usize;let mut actual_hash=Sha256::new();
+        loop {
+            let count=text.read(&mut buffer).map_err(|error|OriginalError::Unavailable(error.to_string()))?;if count==0{break;}
+            if written.saturating_add(count)>original.text_bytes{return Err(OriginalError::Changed);}
+            actual_hash.update(&buffer[..count]);
+            if old.is_none(){transaction.execute("INSERT INTO prompt_text VALUES(?1,?2,?3,?4)",params![session,original.user_id,written,&buffer[..count]]).map_err(storage_error)?;}
+            written+=count;
+        }
+        if written!=original.text_bytes||<[u8;32]>::from(actual_hash.finalize())!=text_sha{return Err(OriginalError::Changed);}
         for alias in std::iter::once(&original.user_id).chain(aliases){
             let existing:Option<String>=transaction.query_row("SELECT user_id FROM aliases WHERE session=?1 AND alias=?2",params![session,alias],|r|r.get(0)).optional().map_err(storage_error)?;
             if existing.as_deref().is_some_and(|id|id!=original.user_id){return Err(OriginalError::Changed);}
@@ -465,10 +496,21 @@ mod tests {
         let transaction=store.db.transaction().unwrap();
         for index in 0..1100{let name=format!("capture-history-{index:04}");fs::write(store.directory.join(&name),b"").unwrap();fs::set_permissions(store.directory.join(&name),fs::Permissions::from_mode(0o600)).unwrap();transaction.execute("INSERT INTO retained_attachments VALUES(?1,1,0,'session-to-delete')",[name]).unwrap();}
         transaction.commit().unwrap();
-        let preserved=store.directory.join("capture-other-session");fs::write(&preserved,b"other").unwrap();store.db.execute("INSERT INTO retained_attachments VALUES('capture-other-session',1,5,'other-session')",[]).unwrap();
+        let preserved=store.directory.join("capture-other-session");fs::write(&preserved,b"other").unwrap();fs::set_permissions(&preserved,fs::Permissions::from_mode(0o600)).unwrap();store.db.execute("INSERT INTO retained_attachments VALUES('capture-other-session',1,5,'other-session')",[]).unwrap();
         store.purge_current_session().unwrap();
         let remaining:usize=store.db.query_row("SELECT count(*) FROM retained_attachments",[],|row|row.get(0)).unwrap();assert_eq!(remaining,1);assert_eq!(fs::read(preserved).unwrap(),b"other");
         assert_eq!(fs::read_dir(&store.directory).unwrap().filter_map(Result::ok).filter(|entry|entry.file_name().to_string_lossy().starts_with("capture-history-")).count(),0);
+    }
+
+    #[test]
+    fn pending_original_text_is_spooled_streamed_and_immutable_without_retaining_a_second_string(){
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");let pending=Store::open(&annotations,&account,None).unwrap();
+        let input="/original-operator-command 🐙\n".repeat(40000);let capture=pending.capture_text(&input).unwrap();let temporary_path=capture.0.attachment.path.clone();let mut original=prompt("provider-confirmed-user",&input);
+        let mut confirmed=Store::at(&annotations,&account,"confirmed-session").unwrap();confirmed.accept_captured(&original,&capture,&["provider-transformed-display-id".into()],&mut []).unwrap();drop(capture);assert!(!temporary_path.exists());
+        let mut result=String::new();let mut offset=0;loop{let page=confirmed.original(Some("provider-transformed-display-id"),offset,4097).unwrap();offset=page.next_offset;result.push_str(&page.text);if page.complete{break;}}
+        assert_eq!(result,input);
+        original.user_id="different-provider-user".into();let capture=pending.capture_text(&input).unwrap();fs::write(&capture.0.attachment.path,vec![b'x';input.len()]).unwrap();
+        assert_eq!(confirmed.accept_captured(&original,&capture,&[],&mut []),Err(OriginalError::Changed));assert!(matches!(confirmed.original(Some(&original.user_id),0,4),Err(OriginalError::Unavailable(_))),"changed spool must roll back the entire acceptance");
     }
 
 }
