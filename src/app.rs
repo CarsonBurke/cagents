@@ -2157,6 +2157,7 @@ pub struct SettingsSaved {
     desired: AppSettings,
     reload_error: Option<String>,
     observed_at: Instant,
+    undo: bool,
     backup: Option<PathBuf>,
     reset: Option<u64>,
 }
@@ -2191,7 +2192,7 @@ impl SettingsSave {
                 (Some(backup), settings::load_live_observed(&self.path))
             }
         } else {
-            let base = lane.as_ref().map_or(&self.base, |saved| &saved.desired);
+            let base = lane.as_ref().filter(|saved| !saved.undo).map_or(&self.base, |saved| &saved.desired);
             let saved = settings::save_merged_observed(&self.path, base, &self.desired).map_err(|error| error.to_string())?;
             (None, settings::LiveSettings { result: saved.reload_error.map_or(Ok(saved.settings), Err), observed_at: saved.observed_at })
         };
@@ -2206,6 +2207,7 @@ impl SettingsSave {
             desired: self.desired,
             reload_error,
             observed_at: observed.observed_at,
+            undo: false,
             backup,
             reset: self.reset,
         };
@@ -4576,6 +4578,7 @@ pub enum Message {
     SettingsFileOpened(Result<(), String>),
     SettingsReloaded(settings::LiveSettings),
     UndoSettingsReset,
+    SettingsResetUndone { generation: u64, backup: PathBuf, result: Result<Option<settings::LiveSettings>, String> },
     ConfirmResetSettings,
     CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
@@ -13006,7 +13009,11 @@ impl Cagents {
         let Ok(next) = next.try_into::<AppSettings>() else { return Task::none(); };
         let Ok(next) = next.validate() else { return Task::none(); };
         let previous = std::mem::replace(&mut self.settings, next);
-        self.settings_draft = SettingsDraft::from_settings(&self.settings);
+        let mut draft = SettingsDraft::from_settings(&self.settings);
+        for field in self.settings_pending.keys().chain(self.settings_invalid.keys()).copied().filter(|field| field.category() != category) {
+            draft.preserve_field(&self.settings_draft, field);
+        }
+        self.settings_draft = draft;
         self.settings_pending.retain(|field, _| field.category() != category);
         self.settings_invalid.retain(|field, _| field.category() != category);
         Task::batch([self.save_settings_task(true), self.synchronize_settings(&previous)])
@@ -16505,7 +16512,7 @@ impl Application for Cagents {
             Message::SettingsReloaded(result) => self.reload_settings(result),
             Message::ResetSettingsCategory(category) => self.reset_settings_category(category),
             Message::UndoSettingsReset => {
-                let (Some(path), Some(backup)) = (self.settings_path.clone(), self.settings_backup.take()) else { return Task::none(); };
+                let (Some(path), Some(backup)) = (self.settings_path.clone(), self.settings_backup.clone()) else { return Task::none(); };
                 let lane = self.settings_save_lane.clone();
                 self.settings_save_generation += 1;
                 let generation = self.settings_save_generation;
@@ -16516,21 +16523,49 @@ impl Application for Cagents {
                 self.settings_invalid.clear();
                 let fallback = self.settings.clone();
                 cosmic::task::future(async move {
+                    let source = backup.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         let mut saved = lane.lock().map_err(|_| "Settings save lane unavailable".to_owned())?;
-                        settings::restore_backup(&path, backup).map_err(|error| error.to_string())?;
+                        // A later UI save may have acquired the lane while this
+                        // task was waiting to run. Never roll its generation back.
+                        if saved.as_ref().is_some_and(|saved| saved.generation > generation) {
+                            return Ok(None);
+                        }
+                        settings::restore_backup(&path, source).map_err(|error| error.to_string())?;
                         let result = settings::load_live_observed(&path);
                         // Captured saves from before Undo cannot rewrite the
                         // restored bytes after this lock is released.
                         *saved = Some(SettingsSaved { generation, path,
                             settings: result.result.as_ref().unwrap_or(&fallback).clone(),
-                            desired: result.result.as_ref().unwrap_or(&fallback).clone(), reload_error: result.result.as_ref().err().cloned(), observed_at: result.observed_at,
-                            backup: None, reset: None });
-                        Ok::<_, String>(result)
-                    }).await.map_err(|error| error.to_string()).and_then(|result| result)
-                        .unwrap_or_else(|error| settings::LiveSettings::now(Err(error)));
-                    Message::SettingsReloaded(result)
+                            desired: fallback, reload_error: result.result.as_ref().err().cloned(), observed_at: result.observed_at,
+                            undo: true, backup: None, reset: None });
+                        Ok::<_, String>(Some(result))
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    Message::SettingsResetUndone { generation, backup, result }
                 })
+            }
+            Message::SettingsResetUndone { generation, backup, result } => {
+                match result {
+                    Ok(Some(observed)) => {
+                        // A newer reset can have installed a different backup
+                        // while the restore was running. Consume only this one.
+                        if self.settings_backup.as_ref() == Some(&backup) { self.settings_backup = None; }
+                        self.notices.resolve("settings-reset-undo");
+                        self.reload_settings(observed)
+                    }
+                    Ok(None) => {
+                        if generation >= self.settings_ack_generation {
+                            self.status = Some(TransientNotice::warning("Undo was skipped because newer settings were saved. You can try Undo again.").key("settings-reset-undo"));
+                        }
+                        Task::none()
+                    }
+                    Err(error) => {
+                        if generation >= self.settings_ack_generation {
+                            self.status = Some(TransientNotice::error("Could not undo the settings reset. You can try again.").key("settings-reset-undo").details(error));
+                        }
+                        Task::none()
+                    }
+                }
             }
             Message::OpenSettingsFile { reveal } => {
                 let path = self.settings_path.clone().or_else(|| settings::default_path().ok());
@@ -19774,7 +19809,7 @@ mod tests {
                 if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                     while let Some(action) = stream.next().await {
                         if let iced::runtime::Action::Output(cosmic::Action::App(
-                            message @ (Message::SettingsSaved { .. } | Message::SettingsReloaded(_)),
+                            message @ (Message::SettingsSaved { .. } | Message::SettingsReloaded(_) | Message::SettingsResetUndone { .. }),
                         )) = action
                         {
                             let _ = app.update(message);
@@ -19957,6 +19992,94 @@ mod tests {
         drop(app.acknowledge_settings_save(second_ack));
         drop(app.acknowledge_settings_save(first_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
+    }
+
+    #[test]
+    fn settings_category_reset_preserves_other_categories_unfinished_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings_draft.terminal_font_size = "unfinished".into();
+        app.settings_invalid.insert(SettingsField::TerminalFontSize, "Enter a number".into());
+        app.settings_draft.terminal_font_family = "Pending mono".into();
+        app.settings_pending.insert(SettingsField::TerminalFontFamily, (1, "Pending mono".into()));
+        drop(app.reset_settings_category(SettingsCategory::Links));
+        assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
+        assert_eq!(app.settings_draft.terminal_font_family, "Pending mono");
+        assert!(app.settings_invalid.contains_key(&SettingsField::TerminalFontSize));
+        assert!(app.settings_pending.contains_key(&SettingsField::TerminalFontFamily));
+    }
+
+    #[test]
+    fn settings_delayed_undo_cannot_overwrite_a_later_saved_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 18.0;
+        app.save_settings_now().unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let undo = app.update(Message::UndoSettingsReset);
+        app.settings.terminal_font_size = 24.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        let generation = saved.generation;
+        drop(app.acknowledge_settings_save(saved));
+        settle_settings_task(&mut app, undo);
+        assert_eq!(settings::load_live(&path).unwrap().terminal_font_size, 24.0);
+        assert_eq!(app.settings_save_lane.lock().unwrap().as_ref().unwrap().generation, generation);
+        assert!(app.settings_backup.is_some());
+    }
+
+    #[test]
+    fn settings_edit_captured_during_undo_preserves_restored_other_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_family = "Original mono".into();
+        app.save_settings_now().unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let undo = app.update(Message::UndoSettingsReset);
+        app.settings.terminal_font_size = 24.0;
+        let later = app.capture_settings_save().unwrap();
+        settle_settings_task(&mut app, undo);
+        let saved = later.run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        let persisted = settings::load_live(&path).unwrap();
+        assert_eq!(persisted.terminal_font_size, 24.0);
+        assert_eq!(persisted.terminal_font_family, "Original mono");
+    }
+
+    #[test]
+    fn settings_failed_undo_retains_its_backup_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!("# retained exact bytes\n{}", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &original).unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let backup = app.settings_backup.clone().unwrap();
+        let unavailable = backup.with_extension("temporarily-unavailable");
+        std::fs::rename(&backup, &unavailable).unwrap();
+        let undo = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, undo);
+        assert_eq!(app.settings_backup.as_ref(), Some(&backup));
+        assert!(app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reset-undo")));
+        std::fs::rename(unavailable, &backup).unwrap();
+        let retry = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, retry);
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert!(app.settings_backup.is_none());
+        assert!(!app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reset-undo")));
     }
 
     #[test]
