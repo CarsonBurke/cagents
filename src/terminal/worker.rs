@@ -6620,6 +6620,39 @@ mod tests {
     }
 
     #[test]
+    fn whole_session_stop_checks_worker_identity_and_fences_every_input_path() {
+        let handle=TerminalHandle::spawn(shell_session("echo STOP_SESSION_READY; exec sleep 600"),TerminalConfig::default(),|_|{}).unwrap();
+        wait_for_text(&handle,"STOP_SESSION_READY");
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        assert!(handle.fence_session_stop(uuid::Uuid::new_v4(),deadline).is_err());
+        assert!(!handle.inner.published.input_order.lock().unwrap().closing);
+        let stop=handle.fence_session_stop(handle.execution_instance(),deadline).unwrap();
+        assert_eq!(handle.input(b"new work".to_vec()),Err(TerminalSendError::Closed));
+        assert_eq!(handle.input(vec![3]),Err(TerminalSendError::Closed));
+        assert!(handle.preserve_for_restart().is_err(),"a stop winner must not subsequently detach the holder");
+        stop.finish(deadline).unwrap();
+        assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn preserve_admission_winner_prevents_session_stop_from_killing_successor_ownership() {
+        let (mut worker,events)=capture_worker_for(shell_session("exec cat").launch);
+        let (commands,receiver)=command_channel(4);worker.commands=receiver;
+        let handle=TerminalHandle {inner:Arc::new(HandleInner {commands,events,published:worker.published.clone(),worker:Mutex::new(None)})};
+        let preserving=handle.clone();
+        let call=thread::spawn(move||preserving.preserve_for_restart());
+        let command=worker.commands.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.published.input_order.lock().unwrap().handoff,"handoff must be fenced before enqueue");
+        assert!(handle.fence_session_stop(handle.execution_instance(),std::time::Instant::now()+Duration::from_secs(2)).is_err());
+        assert!(!worker.published.input_order.lock().unwrap().closing);
+        let Command::PreserveForRestart(reply)=command else {panic!("expected ownership-preservation command")};
+        reply.send(Err("fixture refuses preservation".into())).unwrap();
+        assert!(call.join().unwrap().is_err());
+        assert!(worker.published.priority_close.lock().unwrap().is_none());
+        drop(handle);worker.run();
+    }
+
+    #[test]
     fn worktree_close_fence_rejects_priority_interrupt_admission() {
         let handle = TerminalHandle::spawn(shell_session("echo FENCE_READY; sleep 600"), TerminalConfig::default(), |_| {}).unwrap();
         wait_for_text(&handle, "FENCE_READY");

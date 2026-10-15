@@ -3344,6 +3344,25 @@ mod tests {
         context
     }
     #[test]
+    fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true),Event::TurnStarted],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        let observed=handle.close_observation();
+        assert!(handle.fence_session_stop_until(uuid::Uuid::new_v4(),Instant::now()+Duration::from_secs(2)).is_err());
+        assert!(!handle.0.stop.load(Ordering::Acquire),"a replacement refusal must not stop the original actor");
+        handle.fence_session_stop_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
+        assert!(handle.0.stop.load(Ordering::Acquire),"the stop fence must be published before acknowledgement");
+        assert!(handle.enqueue_command(Command::Prompt{text:"must never run".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}).is_err());
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        assert!(handle.is_completed());
+        handle.stop_session_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
     fn generic_alias_launch_does_not_infer_provider_scope_from_process_canonicalization() {
         struct Idle;
         impl Adapter for Idle {

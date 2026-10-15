@@ -492,6 +492,19 @@ mod tests {
     }
 
     #[test]
+    fn session_stop_identity_ignores_work_revision_but_rejects_replacement() {
+        let first=token(TerminalId::new());
+        let actor=|token|Actor {token,busy:true,terminal:None,native:None,starting:false};
+        let consent=SessionStopConsent {sessions:session_identities(&[actor(first.clone())])};
+        let mut newer=first.clone();newer.close_revision=Some(100);newer.turn_generation=Some(10);newer.instance=uuid::Uuid::new_v4();
+        assert_eq!(session_identities(&[actor(newer.clone())]),consent.sessions,"explicit whole-session consent includes its new ongoing work");
+        newer.session_instance=uuid::Uuid::new_v4();
+        assert_ne!(session_identities(&[actor(newer)]),consent.sessions,"a replacement must require fresh consent");
+        assert!(validate_stop_consent(&consent).is_ok());
+        assert!(validate_stop_consent(&SessionStopConsent {sessions:vec![consent.sessions[0].clone(),consent.sessions[0].clone()]}).is_err());
+    }
+
+    #[test]
     fn consent_requires_the_exact_unique_roster_including_idle_actors() {
         let mut census = vec![token(TerminalId::new()), token(TerminalId::new())];
         census.sort();
