@@ -425,6 +425,11 @@ impl FileRootIdentity {
     pub(crate) fn has_active_admission(&self) -> bool {
         self.admission.as_ref().is_some_and(|admission| admission.ticket().phase() == crate::edited_root_admission::AdmissionPhase::Active)
     }
+    /// Worker-only construction for an already enrolled original Source. Both
+    /// metadata capture and lease association happen before UI publication.
+    pub fn admitted(root: std::sync::Arc<Root>, admission: crate::edited_root_admission::AdmittedRoot, deadline: std::time::Instant) -> Result<Self, FileIoError> {
+        Self::of(root)?.with_admission(admission, deadline)
+    }
     /// Worker-only attachment before Editable publication. A successful ticket
     /// from another Root cannot be rebound merely by storing it in the model.
     pub(crate) fn with_admission(mut self, admission: crate::edited_root_admission::AdmittedRoot, deadline: std::time::Instant) -> Result<Self, FileIoError> {

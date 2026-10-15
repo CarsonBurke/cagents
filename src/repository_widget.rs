@@ -2391,6 +2391,7 @@ pub struct RepositoryRuntime {
     // Captured once by the actual window before any initial file task.
     recovery_endpoint: Option<crate::recovery_domain::LocalRecoveryEndpoint>,
     edited_root_admissions: Option<crate::edited_root_admission::SharedEditedRootAdmissions>,
+    original_editor_root: Option<crate::editor::FileRootIdentity>,
     directory_only: bool,
     external_source: Option<PathBuf>,
     standalone: bool,
@@ -2655,6 +2656,7 @@ impl RepositoryRuntime {
             worktree_protection: None,
             recovery_endpoint: None,
             edited_root_admissions: None,
+            original_editor_root: None,
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             editor_tab_width: 4,
@@ -3652,6 +3654,16 @@ impl RepositoryRuntime {
         if self.edited_root_admissions.is_none() { self.edited_root_admissions = Some(admissions); }
     }
 
+    /// Install the already enrolled ORIGINAL Source before initial load. It
+    /// keeps directory-only tabs registered and lets file loads share its lease.
+    /// This is not a Git-reader or filesystem-effect grant. Retargeting cannot
+    /// overwrite it; a genuine replacement source needs a fresh runtime.
+    pub fn set_original_editor_root(&mut self, root: crate::editor::FileRootIdentity) -> Result<(), crate::editor::FileRootIdentity> {
+        if self.original_editor_root.is_some() || !root.has_active_admission() { return Err(root); }
+        self.original_editor_root = Some(root);
+        Ok(())
+    }
+
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         if let Some(path) = self.external_source.clone() {
             self.files = FileListState::Ready(Vec::new());
@@ -3802,18 +3814,22 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) => document.undo_root.as_ref(),
             _ => None,
         };
-        let mut roots = Vec::with_capacity(9);
-        for root in current.into_iter().chain(self.undo_lru.retained_root_identities()) {
+        let mut roots = Vec::with_capacity(10);
+        for root in self.original_editor_root.iter().chain(current).chain(self.undo_lru.retained_root_identities()) {
             if root.has_active_admission() && !roots.contains(root) { roots.push(root.clone()); }
         }
         roots
     }
 
-    /// Complete bounded document/history census, including cached roots while
-    /// the new document is loading or read-only. Recovery/operation leases are
+    /// Complete bounded Source/document/history census (at most ten roots),
+    /// including cached roots while loading or read-only. Recovery/operation leases are
     /// additionally enrolled with the domain issuer until their own release.
     pub fn retained_filesystem_roots(&self) -> Vec<Arc<crate::fs_safety::Root>> {
         let mut roots = self.retained_filesystem_root().into_iter().collect::<Vec<_>>();
+        if let Some(source) = &self.original_editor_root {
+            let root = source.retained_root();
+            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) { roots.push(root); }
+        }
         for root in self.undo_lru.retained_roots() {
             if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) { roots.push(root); }
         }
