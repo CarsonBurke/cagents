@@ -2827,20 +2827,10 @@ fn shortcut_applies(
     focused: FocusedPane,
     shortcuts: &KeyboardShortcuts,
 ) -> bool {
-    if focused == FocusedPane::Terminal {
-        let keys = shortcut_keys(descriptor.action, shortcuts);
-        let action = shortcuts
-            .actions()
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate.as_slice(), keys));
-        if action.is_some_and(|index| {
-            shortcuts
-                .terminal_passthrough_actions
-                .iter()
-                .any(|name| name == KeyboardShortcuts::action_names()[index])
-        }) {
-            return false;
-        }
+    if focused == FocusedPane::Terminal
+        && shortcuts.terminal_passthrough_actions.iter().any(|name| name == descriptor.id())
+    {
+        return false;
     }
     // Sidebar rows may reuse NewThread for their captured worktree. Other
     // pane commands must not act on the background selected card. The app's
