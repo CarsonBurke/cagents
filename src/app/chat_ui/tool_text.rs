@@ -430,9 +430,8 @@ mod tests {
             }
             fn custom(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, state: &mut dyn std::any::Any) {
                 let Some(state) = state.downcast_ref::<selectable_prose::State>() else { return; };
-                let Some(logical) = state.logical.as_ref().filter(|logical| logical.identity == 42) else { return; };
-                let Some(byte) = (300 * "ordinary line\n".len() + 5999).checked_sub(logical.start) else { return; };
-                if let Some(mut glyph) = state.logical_byte_bounds(byte) {
+                let byte = 300 * "ordinary line\n".len() + 5999;
+                if let Some(mut glyph) = state.logical_byte_bounds(42, byte) {
                     glyph.x += bounds.x - self.translation.x;
                     glyph.y += bounds.y - self.translation.y;
                     self.glyphs.push(glyph);
