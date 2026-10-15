@@ -1262,11 +1262,7 @@ impl Cagents {
                         {
                             return self.handle_terminal_find(terminal_ui::Action::Open(card));
                         }
-                        if self.sidebar_state.active_worktree().is_some() {
-                            self.update(Message::SelectContextTab(ContextTab::Search))
-                        } else {
-                            self.update(Message::FocusProjectSearch)
-                        }
+                        self.update(Message::FocusProjectSearch)
                     }
                 }
             }
