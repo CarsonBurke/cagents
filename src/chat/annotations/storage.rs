@@ -147,43 +147,41 @@ fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), Strin
 pub(crate) fn purge_registered(id: &crate::account::AccountId) -> Result<Option<usize>, String> {
     purge_registered_at(&installation_root()?, id)
 }
-fn purge_registered_at(
-    root: &Path,
-    id: &crate::account::AccountId,
-) -> Result<Option<usize>, String> {
-    let directory = root
-        .join("purge-index")
-        .join(format!("{:x}", Sha256::digest(id.as_str().as_bytes())));
-    crate::secure_file::reject_symlink_components(&directory).map_err(|e| e.to_string())?;
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
-    };
-    crate::secure_file::validate_owned_directory(&directory).map_err(|e| e.to_string())?;
-    let mut removed = 0;
+const MAX_REGISTERED_NAMESPACES:usize=4096;
+fn registered_index_lease(root:&Path,id:&crate::account::AccountId,operation:i32)->Result<crate::instance::OwnedLock,String>{
+    let directory=root.join("purge-index-locks");
+    crate::secure_file::prepare_private_directory(&directory).map_err(|error|error.to_string())?;
+    let path=directory.join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
+    crate::instance::owned_lock(&path,operation|libc::LOCK_NB).map_err(|error|format!("Annotation association is busy or unavailable: {error}"))
+}
+fn purge_registered_at(root:&Path,id:&crate::account::AccountId)->Result<Option<usize>,String>{
+    purge_registered_with(root,id,|_|Ok(()))
+}
+/// The index lease stabilizes the complete set through namespace reservation,
+/// census and deletion. The callback must authorize every key before mutation.
+fn purge_registered_with(root:&Path,id:&crate::account::AccountId,authorize:impl FnOnce(&[String])->Result<(),String>)->Result<Option<usize>,String>{
+    let _lease=registered_index_lease(root,id,libc::LOCK_EX)?;
+    let directory=root.join("purge-index").join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
+    crate::secure_file::reject_symlink_components(&directory).map_err(|error|error.to_string())?;
+    let entries=match fs::read_dir(&directory){Ok(entries)=>entries,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.to_string())};
+    crate::secure_file::validate_owned_directory(&directory).map_err(|error|error.to_string())?;
+    let mut keys=Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        let name = name
-            .to_str()
-            .ok_or("Invalid annotation purge association")?;
-        if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("Invalid annotation purge association".into());
-        }
-        crate::secure_file::open_existing_private_file(&entry.path()).map_err(|e| e.to_string())?;
-        revoke_account(root, name)?;
-        let path = root.join(name);
-        crate::secure_file::reject_symlink_components(&path).map_err(|e| e.to_string())?;
-        match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
-            Ok(_) => {
-                crate::secure_file::validate_owned_directory(&path).map_err(|e| e.to_string())?;
-                fs::remove_dir_all(path).map_err(|e| e.to_string())?;
-                removed += 1;
-            }
-        }
+        if keys.len()==MAX_REGISTERED_NAMESPACES{return Err("Annotation purge association exceeds the 4096 namespace limit".into());}
+        let entry=entry.map_err(|error|error.to_string())?;
+        let name=entry.file_name();let name=name.to_str().ok_or("Invalid annotation purge association")?;
+        if name.len()!=64 || !name.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)){return Err("Invalid annotation purge association".into());}
+        crate::secure_file::open_existing_private_file(&entry.path()).map_err(|error|error.to_string())?;
+        keys.push(name.to_owned());
+    }
+    keys.sort();keys.dedup();
+    authorize(&keys)?;
+    let mut removed=0;
+    for key in keys {
+        revoke_account(root,&key)?;
+        let path=root.join(key);
+        crate::secure_file::reject_symlink_components(&path).map_err(|error|error.to_string())?;
+        match fs::symlink_metadata(&path){Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(error.to_string()),Ok(_)=>{crate::secure_file::validate_owned_directory(&path).map_err(|error|error.to_string())?;fs::remove_dir_all(path).map_err(|error|error.to_string())?;removed+=1;}}
     }
     Ok(Some(removed))
 }
@@ -196,6 +194,7 @@ fn associate_for_purge(root: &Path, scope: &LaunchAccountScope) -> Result<(), St
     ids.sort();
     ids.dedup();
     for id in ids {
+        let _lease=registered_index_lease(root,id,libc::LOCK_SH)?;
         // These associations grant deletion only. Neither ID nor alias may
         // reconstruct a missing physical home or authorize metadata reads.
         let directory = root
@@ -1466,6 +1465,35 @@ mod tests {
             ),
             "changed spool must roll back the entire acceptance"
         );
+    }
+
+    #[test]
+    fn registered_index_lease_fences_association_and_refused_reservation_deletes_nothing(){
+        let root=test_directory();let mut account=scope(root.path(),crate::agent::Provider::Claude);
+        let id=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("selected")).id();
+        account.purge_ids=vec![id.clone()];let annotations=root.path().join("annotations");
+        let _store=Store::at(&annotations,&account,"session").unwrap();
+        let exclusive=registered_index_lease(&annotations,&id,libc::LOCK_EX).unwrap();
+        assert!(associate_for_purge(&annotations,&account).is_err());
+        drop(exclusive);
+        let shared=registered_index_lease(&annotations,&id,libc::LOCK_SH).unwrap();
+        assert!(purge_registered_at(&annotations,&id).is_err());drop(shared);
+        let key=account_key(&account);
+        assert!(purge_registered_with(&annotations,&id,|keys|{assert_eq!(keys,&[key.clone()]);Err("active historical namespace".into())}).is_err());
+        assert!(annotations.join(&key).exists());assert!(reject_revoked(&annotations,&key).is_ok());
+        assert_eq!(purge_registered_with(&annotations,&id,|keys|{assert_eq!(keys,&[key.clone()]);Ok(())}).unwrap(),Some(1));
+    }
+    #[test]
+    fn malformed_registered_index_refuses_before_any_namespace_is_revoked(){
+        let root=test_directory();let mut account=scope(root.path(),crate::agent::Provider::Claude);
+        let id=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("selected")).id();
+        account.purge_ids=vec![id.clone()];let annotations=root.path().join("annotations");
+        let _store=Store::at(&annotations,&account,"session").unwrap();
+        let index=annotations.join("purge-index").join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
+        fs::write(index.join("invalid-key"),b"").unwrap();
+        assert!(purge_registered_at(&annotations,&id).is_err());
+        assert!(annotations.join(account_key(&account)).exists());
+        assert!(reject_revoked(&annotations,&account_key(&account)).is_ok());
     }
 
     #[test]
