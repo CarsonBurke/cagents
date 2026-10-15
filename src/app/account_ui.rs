@@ -91,6 +91,18 @@ const POPOVER_WIDTH: f32 = 320.0;
 /// words, so the bar never pushes against the window edge.
 const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 
+/// Cached setup authority for one selected Claude/Codex account. Views never
+/// inspect executable paths, home directories, credentials or transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProviderReadiness {
+    Checking,
+    MissingCli,
+    MissingHome(AccountId),
+    NeedsLogin(AccountId),
+    LoginBusy(AccountId),
+    Ready(AccountId),
+}
+
 pub(super) struct State {
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
@@ -170,6 +182,47 @@ impl OmpRecord {
 }
 
 impl State {
+    pub(super) fn account_readiness(&self, id: &AccountId) -> ProviderReadiness {
+        let Some(account) = self.account(id) else {
+            return if self.installed.is_empty() { ProviderReadiness::Checking }
+                else { ProviderReadiness::MissingHome(id.clone()) };
+        };
+        if self.preparing_logins.contains(&account.owner)
+            || account.sign_in_terminal.is_some()
+            || self.logins.iter().any(|login| login.provider == account.account.provider
+                && Some(&login.home) == account.account.resolved_home().as_ref())
+        {
+            return ProviderReadiness::LoginBusy(id.clone());
+        }
+        match self.installed.get(&account.account.provider) {
+            None => return ProviderReadiness::Checking,
+            Some(false) => return ProviderReadiness::MissingCli,
+            Some(true) => {}
+        }
+        // Presence is populated by completed asynchronous detection. Retained
+        // identity/quota from a deleted home cannot establish launch readiness.
+        if !account.present {
+            return ProviderReadiness::MissingHome(id.clone());
+        }
+        if self.login_conflict(account).is_some()
+            || account.snapshot.as_ref().is_some_and(|snapshot|
+                matches!(snapshot.status, UsageStatus::NeedsLogin | UsageStatus::Unavailable))
+        {
+            return ProviderReadiness::NeedsLogin(id.clone());
+        }
+        if account.identity.is_some()
+            || account.snapshot.as_ref().is_some_and(|snapshot|
+                matches!(snapshot.status, UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited))
+        {
+            return ProviderReadiness::Ready(id.clone());
+        }
+        if account.snapshot.is_none() && account.failure.is_none() {
+            ProviderReadiness::Checking
+        } else {
+            ProviderReadiness::NeedsLogin(id.clone())
+        }
+    }
+
     pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
         self.account(id).map(|state| state.owner)
     }
@@ -184,7 +237,8 @@ impl State {
             Some(false) => "CLI not found on PATH",
             Some(true)
                 if self.of(provider).any(|account| {
-                    account.identity.is_some()
+                    account.present && account.identity.is_some()
+                        && self.login_conflict(account).is_none()
                         && !account
                             .snapshot
                             .as_ref()
@@ -4215,6 +4269,43 @@ impl Cagents {
             .and_then(|directory| self.project_for_directory(directory))
     }
 
+    /// Read the actual draft selection, honoring an explicit picker choice and
+    /// per-directory defaults. A missing pinned default never silently chooses
+    /// another signed-in identity.
+    pub(super) fn draft_account_readiness(
+        &self,
+        provider: Provider,
+        directory: &Path,
+        chosen: Option<&AccountId>,
+    ) -> ProviderReadiness {
+        if !self.account_ui.installed.contains_key(&provider) {
+            return ProviderReadiness::Checking;
+        }
+        let selected = chosen.cloned().unwrap_or_else(||
+            self.default_account_for_directory(provider, directory).id());
+        if self.account_ui.account(&selected).is_some_and(|state| state.account.provider != provider) {
+            return ProviderReadiness::MissingHome(selected);
+        }
+        self.account_ui.account_readiness(&selected)
+    }
+
+    pub(super) fn usable_default_account_for_directory(
+        &self,
+        provider: Provider,
+        directory: &Path,
+    ) -> Option<Account> {
+        let account = self.default_account_for_directory(provider, directory);
+        matches!(self.account_ui.account_readiness(&account.id()), ProviderReadiness::Ready(_))
+            .then_some(account)
+    }
+
+    /// Call once when opening a new draft or explicitly refreshing setup.
+    /// Discovery/home reads run on the async worker; Located then schedules
+    /// bounded probes. Calling a view or switching focus never reads a path.
+    pub(super) fn refresh_draft_accounts(&mut self) -> Task<Message> {
+        self.accounts_surface_changed()
+    }
+
     pub(super) fn default_account_for_directory(
         &self,
         provider: Provider,
@@ -5207,6 +5298,57 @@ mod tests {
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn cached_readiness_distinguishes_detection_home_login_and_retained_identity() {
+        let mut state = State::new(None, None, None);
+        let id = Account::system(Provider::Claude).id();
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::Checking);
+        state.installed.insert(Provider::Claude, false);
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingCli);
+        state.installed.insert(Provider::Claude, true);
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingHome(id.clone()));
+        let account = state.account_mut(&id).unwrap();
+        account.present = true;
+        account.identity = Some(Identity::default());
+        account.snapshot = Some(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW));
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::NeedsLogin(id.clone()));
+        let account = state.account_mut(&id).unwrap();
+        account.sign_in_terminal = Some(TerminalId::new());
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::LoginBusy(id.clone()));
+        let account = state.account_mut(&id).unwrap();
+        account.sign_in_terminal = None;
+        account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::Ready(id.clone()));
+        // Completed async detection can mark a once-valid home absent without
+        // erasing retained identity or history. Neither may imply readiness.
+        state.account_mut(&id).unwrap().present = false;
+        assert_eq!(state.account_readiness(&id), ProviderReadiness::MissingHome(id));
+        assert_ne!(state.provider_status(Provider::Claude), "Account available");
+    }
+
+    #[test]
+    fn draft_readiness_honors_the_selected_account_and_a_pinned_missing_default() {
+        let mut app = context_inspector_test_app(false);
+        let provider = Provider::Codex;
+        let selected = app.account_ui.add_managed_fixture(provider, 998);
+        app.account_ui.installed.insert(provider, true);
+        let account = app.account_ui.account_mut(&selected).unwrap();
+        account.identity = Some(Identity::default());
+        account.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+        let system = Account::system(provider);
+        app.account_ui.registry.set_default(&system);
+        let directory = Path::new("/fixture/no-filesystem-read-is-needed");
+        assert_eq!(app.draft_account_readiness(provider, directory, None),
+            ProviderReadiness::MissingHome(system.id()));
+        assert!(app.usable_default_account_for_directory(provider, directory).is_none());
+        assert_eq!(app.draft_account_readiness(provider, directory, Some(&selected)),
+            ProviderReadiness::Ready(selected.clone()));
+        let chosen = app.known_account(&selected).unwrap();
+        app.account_ui.registry.set_default(&chosen);
+        assert_eq!(app.usable_default_account_for_directory(provider, directory).unwrap().id(), selected);
+    }
+
 
     #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {
