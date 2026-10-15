@@ -8292,6 +8292,9 @@ impl EditorMenuCommand {
 /// `Some(None)` retires an original native editing chord after remapping;
 /// `None` leaves unrelated native navigation and form input unchanged.
 fn registered_editor_binding(card: CardId, runtime: &RepositoryRuntime, press: &iced::widget::text_editor::KeyPress) -> Option<Option<text_editor::Binding<RepositoryAction>>> {
+    if !matches!(press.status, iced::widget::text_editor::Status::Focused { .. }) {
+        return None;
+    }
     if let Some(command) = crate::workspace_widget::editor_shortcut(&press.key, press.physical_key, press.modifiers, &runtime.keyboard_shortcuts) {
         return Some(editor_command_action(card, command).map(text_editor::Binding::Custom));
     }
@@ -17609,6 +17612,57 @@ mod tests {
         runtime.set_search_mode(true);
         assert_eq!(runtime.editor_command_capabilities() & (1|2|4|16), 0);
         assert_ne!(runtime.editor_command_capabilities() & 8, 0);
+    }
+
+    #[test]
+    fn registered_editor_bindings_ignore_inactive_native_status() {
+        use iced::keyboard::{Key, key::{Code, Physical}};
+        let card = CardId::new();
+        let (runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "original");
+        for (key, code, modifiers) in [("z", Code::KeyZ, iced::keyboard::Modifiers::CTRL), ("c", Code::KeyC, iced::keyboard::Modifiers::CTRL), ("a", Code::KeyA, iced::keyboard::Modifiers::CTRL)] {
+            let press = iced::widget::text_editor::KeyPress { key: Key::Character(key.into()), modified_key: Key::Character(key.into()), physical_key: Physical::Code(code), modifiers, text: None, status: iced::widget::text_editor::Status::Active };
+            assert!(registered_editor_binding(card, &runtime, &press).is_none());
+        }
+        let press = iced::widget::text_editor::KeyPress { key: Key::Named(iced::keyboard::key::Named::F8), modified_key: Key::Named(iced::keyboard::key::Named::F8), physical_key: Physical::Code(Code::F8), modifiers: iced::keyboard::Modifiers::empty(), text: None, status: iced::widget::text_editor::Status::Active };
+        assert!(registered_editor_binding(card, &runtime, &press).is_none());
+    }
+
+    #[test]
+    fn mounted_editors_keep_sidebar_chords_and_dispatch_only_the_native_focus_owner() {
+        use iced::{Event, Rectangle, Size};
+        use iced::advanced::{Layout, Shell, clipboard, mouse};
+        use iced::keyboard::{Key, key::{Code, Physical}};
+        #[derive(Debug, Clone)]
+        enum Observation { Editor(RepositoryAction), Sidebar(String) }
+        let first = CardId::new();
+        let second = CardId::new();
+        let (first_runtime, _) = RepositoryRuntime::lsp_open_fixture(first, "first");
+        let (second_runtime, _) = RepositoryRuntime::lsp_open_fixture(second, "second");
+        let sidebar = widget::Id::new("registry.sidebar");
+        let first_focus = first_runtime.editor_focus_target(first).unwrap();
+        let second_focus = second_runtime.editor_focus_target(second).unwrap();
+        let mut element: Element<'_, Observation> = widget::row::with_children(vec![
+            widget::container(editor_surface(first, &first_runtime).map(Observation::Editor)).width(320).height(200).into(),
+            widget::container(editor_surface(second, &second_runtime).map(Observation::Editor)).width(320).height(200).into(),
+            widget::text_input("Sidebar", "query").id(sidebar.clone()).on_input(Observation::Sidebar).width(240).into(),
+        ]).into();
+        let renderer = headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(1000.0, 240.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+        for (target, expected) in [(sidebar, None), (first_focus, Some(first)), (second_focus, Some(second))] {
+            let mut focus = iced::advanced::widget::operation::focusable::focus::<()>(target);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            let event = Event::Keyboard(iced::keyboard::Event::KeyPressed { key: Key::Character("z".into()), modified_key: Key::Character("z".into()), physical_key: Physical::Code(Code::KeyZ), location: iced::keyboard::Location::Standard, modifiers: iced::keyboard::Modifiers::CTRL, text: None, repeat: false });
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut shell, &viewport);
+            let actions: Vec<_> = messages.iter().filter_map(|message| match message { Observation::Editor(RepositoryAction::Undo { card }) => Some(*card), _ => None }).collect();
+            assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
+            assert!(!messages.iter().any(|message| matches!(message, Observation::Editor(action) if !matches!(action, RepositoryAction::Undo { .. }))), "unfocused editors must not publish another edit action");
+        }
+        assert_eq!(first_runtime.editor_text(), Some("first".into()));
+        assert_eq!(second_runtime.editor_text(), Some("second".into()));
     }
 
     #[test]
