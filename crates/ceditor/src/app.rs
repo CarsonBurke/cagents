@@ -4018,7 +4018,9 @@ impl Application for Editor {
                             tab.navigation.reconcile_change_rows(&source);
                             let focus = tab.navigation.finish_reveal_in_files(&source);
                             tab.sidebar.source_control = Some(source);
-                            focus.map_or_else(Task::none, |id| iced::widget::operation::focus(id).map(cosmic::Action::App))
+                            let root = tab.runtime.descriptor.worktree.clone();
+                            let sourced = tab.review.set_source(review_source(&root, Some(&snapshot))).map(move |action| Message::PullRequestReview(card, action)).map(cosmic::Action::App);
+                            Task::batch([sourced, self.apply_review_effects(card), focus.map_or_else(Task::none, |id| iced::widget::operation::focus(id).map(cosmic::Action::App))])
                         }
                         Err(error) => { self.notice = Some(format!("Could not reveal the requested path: {error}")); Task::none() }
                     }
