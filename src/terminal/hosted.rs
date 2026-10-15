@@ -279,6 +279,7 @@ struct HostedPublishedState {
     delivery_changed: tokio::sync::Notify,
     attachment: Mutex<AttachmentState>,
     attachment_changed: Condvar,
+    attachment_available: tokio::sync::Notify,
     wake: Arc<WakeCallback>,
 }
 
@@ -315,6 +316,7 @@ impl HostedPublishedState {
             delivery_changed: tokio::sync::Notify::new(),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_changed: Condvar::new(),
+            attachment_available: tokio::sync::Notify::new(),
             wake,
         }
     }
@@ -771,6 +773,7 @@ impl HostedPublishedState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .confirmed = true;
         self.attachment_changed.notify_all();
+        self.attachment_available.notify_waiters();
     }
 
     fn fail_attachment(&self, message: String) {
@@ -783,6 +786,7 @@ impl HostedPublishedState {
             attachment.failure = Some(message);
         }
         self.attachment_changed.notify_all();
+        self.attachment_available.notify_waiters();
     }
 
     fn wait_until_attached(&self, timeout: Duration) -> Result<(), String> {
@@ -802,6 +806,23 @@ impl HostedPublishedState {
             Ok(())
         } else {
             Err("timed out waiting for the daemon to attach the terminal".to_owned())
+        }
+    }
+
+    async fn wait_until_attached_async(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let available = self.attachment_available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            {
+                let attachment = self.attachment.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(error) = &attachment.failure { return Err(error.clone()); }
+                if attachment.confirmed { return Ok(()); }
+            }
+            if tokio::time::timeout_at(deadline, available).await.is_err() {
+                return Err("timed out waiting for the daemon to attach the terminal".into());
+            }
         }
     }
 
@@ -1055,7 +1076,10 @@ impl HostedTerminalHandle {
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, HostedTerminalStartError> {
         Self::validate_descriptor_proof(&terminal, &proof)?;
-        let socket = ensure_daemon_ready()?;
+        // The authenticated return already came from a live daemon. Never
+        // start another daemon for this receipt or consume a blocking startup
+        // worker; its immutable proof will reject a replacement connection.
+        let socket = super::ipc::daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
         Self::connect_descriptor_proved_at(socket, terminal, proof, initially_visible, wake)
     }
     fn validate_descriptor_proof(terminal: &super::ipc::TerminalDescriptor, proof: &HostSessionProof) -> Result<(), HostedTerminalStartError> {
@@ -1207,6 +1231,12 @@ impl HostedTerminalHandle {
     /// does not confirm that it accepted this terminal.
     pub fn wait_until_attached(&self, timeout: Duration) -> Result<(), String> {
         self.inner.published.wait_until_attached(timeout)
+    }
+
+    /// Event-driven counterpart for UI tasks; no blocking-pool thread waits
+    /// for each terminal's response.
+    pub async fn wait_until_attached_async(&self, timeout: Duration) -> Result<(), String> {
+        self.inner.published.wait_until_attached_async(timeout).await
     }
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
@@ -4324,6 +4354,12 @@ mod tests {
             }
             let handle = HostedTerminalHandle::connect_descriptor_proved_at(socket, descriptor.clone(), proof.clone(), false, |_| {}).unwrap();
             assert_eq!(handle.execution_instance(), Some(descriptor.execution_instance), "binding exists before peer IO");
+            let (attached_tx, attached_rx) = std::sync::mpsc::channel();
+            let waiting_handle = handle.clone();
+            let waiting = super::super::transport::runtime().unwrap().spawn(async move {
+                let result = waiting_handle.wait_until_attached_async(Duration::from_secs(2)).await;
+                let _ = attached_tx.send(result);
+            });
             if !completed { handle.input(b"queued only for original worker".to_vec()).unwrap(); }
             let mut stream = accept_connection(&listener);
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
@@ -4338,7 +4374,8 @@ mod tests {
             // from the already seeded original descriptor on mismatch.
             write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Event { terminal_id: source.id, sequence: 1, event: super::super::ipc::WireTerminalEvent::TitleChanged { title: "before-bound-attach".into() } } }).unwrap();
             write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(attach.request_id), proof: proof.clone(), message: ServerMessage::Response { response: ServerResponse::Attached { terminal: actual } } }).unwrap();
-            let result = handle.wait_until_attached(Duration::from_secs(2));
+            let result = attached_rx.recv_timeout(Duration::from_secs(3)).expect("async attachment deadline must finish");
+            drop(waiting);
             assert_eq!(result.is_ok(), !successor);
             assert_eq!(handle.execution_instance(), Some(descriptor.execution_instance));
             if successor {

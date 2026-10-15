@@ -5426,15 +5426,14 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = descriptor.session.id;
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let session = descriptor.session.clone();
+            let session = descriptor.session.clone();
+            let result = async move {
                 let handle = HostedTerminalHandle::connect_descriptor_proved(descriptor, proof, visible, move |wake| {
                     let _ = sender.try_send(TerminalWakeup { card, generation: wake.generation });
                 }).map_err(|error| error.to_string())?;
-                handle.wait_until_attached(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10))?;
+                handle.wait_until_attached_async(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10)).await?;
                 Ok(StartedTerminal { handle: TerminalSurface::from(handle), session, spawned: false })
-            }).await.map_err(|error| format!("returned terminal attachment failed: {error}"))
-                .and_then(|result| result);
+            }.await;
             Message::TerminalStarted { card, terminal, result }
         })
     }
