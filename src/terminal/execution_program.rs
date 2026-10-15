@@ -34,6 +34,15 @@ pub(crate) struct AuthorizedCli {
     authorization:crate::host::ConsoleProgramAuthorization,
 }
 impl AuthorizedCli {
+    #[cfg(test)]
+    pub(crate) fn fixture_unexecuted(authorization:crate::host::ConsoleProgramAuthorization)->Arc<Self> {
+        // This fixture exercises the production admission path without
+        // executing a CLI or substituting for matched-product qualification.
+        let file=Arc::new(File::open("/bin/true").unwrap());
+        let identity=FileIdentity::capture(&file,true).unwrap();
+        let descriptor=Descriptor {digest:digest(&file,&identity).unwrap(),file:identity,build:crate::console_identity::Identity::current(uuid::Uuid::new_v4())};
+        Arc::new(Self {pin:Arc::new(MatchedCli {file,descriptor}),authorization})
+    }
     pub(crate) fn capture(authorization:crate::host::ConsoleProgramAuthorization)->Result<Arc<Self>,String> {
         authorization.revalidate()?;
         let pin=MatchedCli::current()?;
@@ -45,6 +54,11 @@ impl AuthorizedCli {
         self.pin.validate()
     }
     pub(super) fn pin(&self)->Arc<MatchedCli> {self.pin.clone()}
+    pub(crate) fn prepare_spawn(&self,session:&crate::model::TerminalSession,authority:&crate::agent_execution::Authority)->Result<(Arc<MatchedCli>,crate::daemon::console_transition::Lease),String> {
+        let lease=self.authorization.acquire_spawn(session.id,&session.launch,authority)?;
+        self.pin.validate()?;
+        Ok((self.pin.clone(),lease))
+    }
 }
 impl MatchedCli {
     #[cfg(test)]

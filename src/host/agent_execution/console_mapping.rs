@@ -46,6 +46,12 @@ impl ConsoleProgramAuthorization {
         }
         Ok(())
     }
+    pub(crate) fn acquire_spawn(&self,id:crate::model::TerminalId,recipe:&LaunchRecipe,authority:&Authority)->Result<crate::daemon::console_transition::Lease,String> {
+        let lease=crate::daemon::console_transition::acquire(self.source.id)?;
+        self.validate_spawn(id,recipe,authority)?;
+        self.revalidate()?;
+        Ok(lease)
+    }
 }
 fn validate(registry:&super::Registry,expected:&Agent,source:&Session,console:&TerminalSession,authority:&Authority)->Result<(),String> {
     let current=registry.agent_for_session(source.id)?.ok_or("The accepted console owner was retired")?;

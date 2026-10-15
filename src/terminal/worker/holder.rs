@@ -249,6 +249,15 @@ pub(super) fn spawn_recoverable_with_execution(
     directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
     program: Option<std::sync::Arc<super::super::execution_program::MatchedCli>>,
 ) -> Result<Held,String> {
+    spawn_recoverable_with_console_transition(command,size,exits,recovery,directory,setup_lease,program,None)
+}
+
+pub(super) fn spawn_recoverable_with_console_transition(
+    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
+    program: Option<std::sync::Arc<super::super::execution_program::MatchedCli>>,
+    console_transition:Option<crate::daemon::console_transition::Lease>,
+) -> Result<Held,String> {
     if let Some(program)=&program {program.validate()?;}
     let cleanup_source = recovery.as_ref().map(|recovery|
         registry::cleanup::SourceReceipt::capture(&recovery.source)).transpose()?;
@@ -288,7 +297,7 @@ pub(super) fn spawn_recoverable_with_execution(
     crate::host::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
-    let child_reaping = match crate::daemon::child_reaper::reserve() {
+    let mut child_reaping = match crate::daemon::child_reaper::reserve() {
         Ok(reservation) => reservation,
         Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
             // Explicit new-helper admission can retry only original children
@@ -304,9 +313,11 @@ pub(super) fn spawn_recoverable_with_execution(
         }
         Err(error) => return Err(format!("Reserve terminal holder cleanup: {error}")),
     };
+    if let Some(lease)=console_transition {child_reaping.hold_console_transition(lease);}
     let process = process
         .spawn()
         .map_err(|error| format!("start terminal holder: {error}"))?;
+    child_reaping.quarantine();
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
@@ -324,6 +335,9 @@ pub(super) fn spawn_recoverable_with_execution(
     // Typed wire order: directory first, setup lease second, matched CLI third.
     let directory_descriptors: Vec<RawFd> = directory.iter().chain(setup_lease.iter()).map(|file| file.as_raw_fd())
         .chain(program.iter().map(|program|program.file().as_raw_fd())).collect();
+    // Mark logical uncertainty in the retained guard BEFORE any Spawn
+    // bytes can be written. A short/failed write is still ambiguous.
+    if let Some(process)=holder.process.as_mut() {process.reservation.mark_console_requested();}
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -536,6 +550,10 @@ fn watched(
             })
     })();
     holder.watch = Some(watching.map_err(|error| format!("watch terminal holder: {error}"))?);
+    // Only a validated root-spawn reply and fully installed exact watcher
+    // release console authority exclusion. Every earlier error leaves it on
+    // the original child's reservation for Holder/reaper cleanup ownership.
+    if let Some(process)=holder.process.as_mut() {process.reservation.confirm_console_started();}
     Ok(Held {
         master: PtyMaster(master),
         child: HeldChild { pid, pidfd: root },
@@ -737,6 +755,9 @@ impl Holder {
 
     fn finish_cleanup(&mut self) -> Result<(),String> {
         if let Some(process) = self.process.as_mut() {
+            // Only the existing typed family-cleanup success path reaches
+            // here; an independently reaped helper cannot call this method.
+            process.reservation.confirm_console_family_closed();
             process.child.try_wait().map_err(|error| error.to_string())?;
         }
         self.detached = true;

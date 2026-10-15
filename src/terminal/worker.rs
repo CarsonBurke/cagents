@@ -1895,15 +1895,20 @@ impl Worker {
                 ) {
                     command.env("PATH", path);
                 }
+                let (program,console_transition)=match config.execution_program.as_ref() {
+                    Some(program)=>{let (pin,lease)=program.prepare_spawn(&session,&config.agent_authority)?;(Some(pin),Some(lease))}
+                    None=>(None,None),
+                };
                 (
-                    holder::spawn_recoverable_with_execution(
+                    holder::spawn_recoverable_with_console_transition(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         config.execution_directory.clone(),
                         config.setup_execution_lease.clone(),
-                        config.execution_program.as_ref().map(|program|program.pin()),
+                        program,
+                        console_transition,
                     )?,
                     Vec::new(),
                 )

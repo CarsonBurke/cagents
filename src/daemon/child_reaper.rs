@@ -20,6 +20,7 @@ pub(crate) struct Reservation {
     service: Arc<Service>,
     slot: Option<usize>,
     ticket: u64,
+    console_transition: Option<super::console_transition::Lease>,
 }
 impl std::fmt::Debug for Reservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +74,26 @@ pub(crate) fn has_retained_ownership() -> bool {
 
 pub(crate) type RetainError = (io::Error, Child, File, Reservation);
 impl Reservation {
+    /// Move private spawn exclusion with the original child until a positive
+    /// root-spawn acknowledgement or actual original-child reaping.
+    pub(crate) fn hold_console_transition(&mut self, lease:super::console_transition::Lease) {
+        debug_assert!(self.console_transition.is_none());
+        self.console_transition=Some(lease);
+    }
+    pub(crate) fn mark_console_requested(&mut self) {if let Some(lease)=&mut self.console_transition {lease.mark_requested();}}
+    pub(crate) fn confirm_console_started(&mut self) {
+        if let Some(lease)=&mut self.console_transition {lease.confirm_started();}
+        self.console_transition=None;
+        if let Some(slot)=self.slot {
+            let mut state=self.service.state.lock().unwrap_or_else(|p|p.into_inner());
+            if state.quarantined[slot]==Some(self.ticket) {state.quarantined[slot]=None;}
+        }
+        crate::daemon::wake();
+    }
+    pub(crate) fn confirm_console_family_closed(&mut self) {
+        if let Some(lease)=&mut self.console_transition {lease.confirm_family_closed();}
+        self.console_transition=None;
+    }
     /// Final cleanup may hold the original Child outside this service's map.
     /// Mark that ownership before publishing the handoff or cancelling the
     /// spawn reservation. Its preallocated slot stays fenced through rollback.
@@ -102,9 +123,10 @@ impl Reservation {
         }
         let slot = self.slot.expect("a live reservation owns one credit");
         debug_assert!(state.entries[slot].is_none());
-        state.entries[slot] = Some(Entry { child, pidfd: Some(pidfd), ticket: self.ticket, suspended: false });
+        state.entries[slot] = Some(Entry { child, pidfd: Some(pidfd), ticket: self.ticket, suspended: false, console_transition:self.console_transition.take() });
         if let Err(error) = service.wake() {
             let entry = state.entries[slot].take().expect("transfer remains private under its lock");
+            self.console_transition=entry.console_transition;
             drop(state);
             return Err((error, entry.child, entry.pidfd.expect("normal transfer retains a pidfd"), self));
         }
@@ -123,7 +145,7 @@ impl Reservation {
         let slot = self.slot.take().expect("a live reservation owns one credit");
         debug_assert!(state.entries[slot].is_none());
         let pid = child.id();
-        state.entries[slot] = Some(Entry { child, pidfd, ticket: self.ticket, suspended: true });
+        state.entries[slot] = Some(Entry { child, pidfd, ticket: self.ticket, suspended: true, console_transition:self.console_transition.take() });
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
         }
@@ -146,7 +168,7 @@ impl Drop for Reservation {
     }
 }
 
-struct Entry { child: Child, pidfd: Option<File>, ticket: u64, suspended: bool }
+struct Entry { child: Child, pidfd: Option<File>, ticket: u64, suspended: bool, console_transition:Option<super::console_transition::Lease> }
 struct State {
     entries: Vec<Option<Entry>>,
     quarantined: Vec<Option<u64>>,
@@ -209,7 +231,7 @@ impl Service {
             format!("Helper child ownership capacity is full ({capacity}/{capacity}); existing helpers were retained")))?;
         debug_assert!(state.quarantined[slot].is_none());
         state.next_ticket = next;
-        Ok(Reservation { service: self.clone(), slot: Some(slot), ticket })
+        Ok(Reservation { service: self.clone(), slot: Some(slot), ticket, console_transition:None })
     }
     fn retry_preserved(&self) -> io::Result<RetryReport> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -534,6 +556,26 @@ mod tests {
         assert!(!reaper.service.has_outstanding_ownership());
         drop(reaper.service.reserve().unwrap());
         assert_eq!(reaper.free(), 1);
+    }
+
+    #[test]
+    fn requested_console_guard_survives_rollback_suspended_transfer_and_original_reaping() {
+        let id=crate::model::TerminalId::new();
+        let reaper=TestService::new(1);
+        let mut reservation=reaper.service.reserve().unwrap();
+        reservation.hold_console_transition(crate::daemon::console_transition::acquire(id).unwrap());
+        reservation.mark_console_requested();reservation.quarantine();
+        let mut owned=Probe::spawn(&["-c","exec /bin/sleep 600"]);
+        reaper.service.fail_wake.store(true,Ordering::Release);
+        let (error,child,pidfd,reservation)=reservation.retain(owned.child.take().unwrap(),owned.pidfd.try_clone().unwrap()).unwrap_err();
+        assert!(crate::daemon::console_transition::acquire(id).is_err(),"rollback must retain logical authority with the exact reservation");
+        reservation.preserve_suspended(child,Some(pidfd),&error.to_string());
+        assert!(crate::daemon::console_transition::acquire(id).is_err());
+        reaper.service.fail_wake.store(false,Ordering::Release);
+        reaper.service.retry_preserved().unwrap();
+        unsafe {libc::syscall(libc::SYS_pidfd_send_signal,owned.pidfd.as_raw_fd(),libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0);}
+        reaper.await_free(1);
+        assert!(crate::daemon::console_transition::acquire(id).is_err(),"reaped helper alone cannot prove the historical console family was closed");
     }
 
     #[test]

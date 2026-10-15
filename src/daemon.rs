@@ -1,5 +1,7 @@
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) mod child_reaper;
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub(crate) mod console_transition;
 #[cfg(feature = "host")]
 pub(crate) mod holder_registry;
 #[cfg(feature = "host")]

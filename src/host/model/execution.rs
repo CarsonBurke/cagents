@@ -131,6 +131,7 @@ impl Registry {
         retained: &[HostedSession],
         successor: &HostedSession,
     ) -> Result<bool, String> {
+        let _console_transition=crate::daemon::console_transition::acquire(successor.id())?;
         if retained.is_empty() || retained.iter().any(|source| source.id() != successor.id()) {
             return Err("Agent adoption requires exact same-session holder lineage".into());
         }
@@ -534,6 +535,7 @@ impl Registry {
     /// Retirement is exact-source fenced: a late close from the old daemon
     /// incarnation cannot revoke the authority of its authenticated successor.
     pub(crate) fn retire_agent_authority(&mut self, source: &HostedSession) -> Result<(), String> {
+        let _console_transition=crate::daemon::console_transition::acquire(source.id())?;
         self.db
             .execute(
                 "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
@@ -551,6 +553,7 @@ impl Registry {
         source: &HostedSession,
         successor: &HostedSession,
     ) -> Result<bool, String> {
+        let _console_transition=crate::daemon::console_transition::acquire(source.id())?;
         let mut normalized = successor.clone();
         match (&mut normalized, source) {
             (HostedSession::Terminal(next), HostedSession::Terminal(old)) => {
@@ -610,6 +613,7 @@ impl Registry {
         session: &HostedSession,
         fresh: bool,
     ) -> Result<Authority, String> {
+        let _console_transition=crate::daemon::console_transition::acquire(session.id())?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1087,6 +1091,7 @@ impl Registry {
         source: &HostedSession,
         now_ms: u64,
     ) -> Result<bool, String> {
+        let _console_transition=crate::daemon::console_transition::acquire(source.id())?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1614,6 +1619,7 @@ mod tests {
         let authority = registry.register_agent_authority(&hosted).unwrap();
         let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
         let authorization = crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &source, &console).unwrap();
+        let program = crate::terminal::execution_program::AuthorizedCli::fixture_unexecuted(authorization.clone());
         authorization.validate_spawn(console.id, &console.launch, &authority).unwrap();
         let mut arbitrary = console.launch.clone();
         arbitrary.program = "/bin/sleep".into();
@@ -1623,7 +1629,12 @@ mod tests {
         let mut unrelated = source.clone();
         unrelated.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
         assert!(crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &unrelated, &console).is_err());
+        let (_, lease) = program.prepare_spawn(&console, &authority).unwrap();
+        assert!(registry.lock().unwrap().retire_agent_authority(&hosted).is_err(), "revocation cannot cross actual private-spawn admission");
+        assert!(registry.lock().unwrap().agent_for_session(source.id).unwrap().is_some());
+        drop(lease); // No helper or Spawn request existed in this fixture.
         registry.lock().unwrap().retire_agent_authority(&hosted).unwrap();
+        assert!(program.prepare_spawn(&console, &authority).is_err(), "a minted AuthorizedCli must refuse through the actual worker admission method after retirement");
         assert!(authorization.revalidate().is_err(), "retired permission cannot be used after the executable probe");
         assert_eq!(registry.lock().unwrap().agent(accepted.agent.id).unwrap().spec, accepted.agent.spec);
     }
