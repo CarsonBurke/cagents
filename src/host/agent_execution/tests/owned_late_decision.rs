@@ -2,7 +2,7 @@
 //! libtest process never changes its process-wide subreaper policy.
 use std::{
     fs, io::{self, Read},
-    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, process::CommandExt},
+    os::unix::{fs::{OpenOptionsExt, PermissionsExt}, net::UnixStream},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -40,26 +40,116 @@ fn command(name:&str,root:&Path,role:&str)->Command {
         .env("XDG_RUNTIME_DIR",root.join("run"))
         .env("PATH",format!("{}:/usr/bin:/bin",root.join("bin").display()))
         .stdin(Stdio::null());
-    // SAFETY: this child-only pre-exec callback performs only setrlimit. It
-    // bounds every private regular log, with overflow failing the child.
-    unsafe {command.pre_exec(|| {
-        let limit=libc::rlimit{rlim_cur:LOG_LIMIT,rlim_max:LOG_LIMIT};
-        if libc::setrlimit(libc::RLIMIT_FSIZE,&limit)==0 {Ok(())}else{Err(io::Error::last_os_error())}
-    });}
     command
+}
+
+struct Evidence {
+    directory:Option<tempfile::TempDir>,
+    success:bool,
+}
+impl Drop for Evidence {
+    fn drop(&mut self) {
+        if !self.success {
+            if let Some(directory)=self.directory.take() {
+                eprintln!("late-decision failure evidence retained: {}",directory.keep().display());
+            }
+        }
+    }
+}
+struct Capture(thread::JoinHandle<io::Result<()>>);
+impl Capture {
+    fn new(root:&Path,name:&str,budget:Duration)->(Stdio,Self) {
+        let mut file=log_file(root,name);
+        let (mut reader,writer)=UnixStream::pair().unwrap();
+        reader.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let deadline=Instant::now()+budget;
+        let handle=thread::spawn(move||{
+            use std::io::Write;
+            let mut bytes=[0u8;4096];let mut written=0u64;let mut overflow=false;
+            loop {
+                if Instant::now()>=deadline {return Err(io::Error::other("private log capture deadline"));}
+                let length=match reader.read(&mut bytes) {
+                    Ok(0)=>return if overflow{Err(io::Error::other("private log exceeded cap"))}else{Ok(())},
+                    Ok(length)=>length,
+                    Err(error) if matches!(error.kind(),io::ErrorKind::Interrupted|io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut)=>continue,
+                    Err(error)=>return Err(error),
+                };
+                let keep=length.min((LOG_LIMIT-written) as usize);
+                file.write_all(&bytes[..keep])?;written+=keep as u64;
+                overflow|=keep!=length;
+                // Drain excess bytes without allocating/storing them; the
+                // controller's absolute worker deadline remains authoritative.
+            }
+        });
+        (Stdio::from(std::os::fd::OwnedFd::from(writer)),Self(handle))
+    }
+    fn finish(self)->io::Result<()> {
+        self.0.join().map_err(|_|io::Error::other("private log reader panicked"))?
+    }
+}
+
+/// Reserve ownership retention before starting the controller. The normal
+/// path stops this empty waiter; an exceptional unresolved wait transfers the
+/// original Child, never a discovered PID or a detached kill capability.
+struct ReservedReaper {
+    state:std::sync::Arc<(std::sync::Mutex<(Option<Child>,bool)>,std::sync::Condvar)>,
+    worker:Option<thread::JoinHandle<()>>,
+}
+impl ReservedReaper {
+    fn new(root:&Path)->Self {
+        let state=std::sync::Arc::new((std::sync::Mutex::new((None::<Child>,false)),std::sync::Condvar::new()));
+        let owned=std::sync::Arc::clone(&state);let evidence=root.to_owned();
+        let worker=thread::Builder::new().name("late-decision-original-reaper".into()).spawn(move||{
+            let (lock,wake)=&*owned;
+            let mut slot=lock.lock().unwrap_or_else(|error|error.into_inner());
+            while slot.0.is_none()&&!slot.1 {slot=wake.wait(slot).unwrap_or_else(|error|error.into_inner());}
+            let Some(mut child)=slot.0.take() else{return;};drop(slot);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status))=>{
+                        eprintln!("retained original controller {} reaped: {status}; evidence {}",child.id(),evidence.display());
+                        break;
+                    }
+                    Ok(None)=>{},
+                    Err(error)=>eprintln!("original controller reap remains unresolved: {error}; evidence {}",evidence.display()),
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }).expect("reserve original-child retention before spawning any child");
+        Self{state,worker:Some(worker)}
+    }
+    fn retain(&mut self,child:Child) {
+        let (lock,wake)=&*self.state;
+        lock.lock().unwrap_or_else(|error|error.into_inner()).0=Some(child);
+        wake.notify_one();
+        // This already-created thread now owns the original Child. Do not
+        // block a failing test or claim that this handoff proves settlement.
+        drop(self.worker.take());
+    }
+}
+impl Drop for ReservedReaper {
+    fn drop(&mut self) {
+        if let Some(worker)=self.worker.take() {
+            let (lock,wake)=&*self.state;
+            lock.lock().unwrap_or_else(|error|error.into_inner()).1=true;
+            wake.notify_one();
+            if worker.join().is_err(){eprintln!("empty reserved child reaper panicked");}
+        }
+    }
 }
 
 /// Only this owner waits for the original controller Child; an unreaped child
 /// retains its PID, and no global waitpid consumer exists in the parent.
 struct ControllerChild {
-    child:Child,
+    child:Option<Child>,
+    retained:ReservedReaper,
     reaped:bool,
     cleanup_deadline:Option<Instant>,
 }
 impl ControllerChild {
     fn wait_until(&mut self,deadline:Instant)->io::Result<Option<ExitStatus>> {
         loop {
-            if let Some(status)=self.child.try_wait()? {self.reaped=true;return Ok(Some(status));}
+            if let Some(status)=self.child.as_mut().expect("owned original child").try_wait()? {self.reaped=true;return Ok(Some(status));}
             if Instant::now()>=deadline {return Ok(None);}
             thread::sleep(Duration::from_millis(10));
         }
@@ -67,10 +157,10 @@ impl ControllerChild {
     fn finish(&mut self)->io::Result<()> {
         if self.reaped{return Ok(());}
         let deadline=*self.cleanup_deadline.get_or_insert_with(||Instant::now()+Duration::from_secs(3));
-        if let Some(_)=self.child.try_wait()? {self.reaped=true;return Ok(());}
+        if let Some(_)=self.child.as_mut().expect("owned original child").try_wait()? {self.reaped=true;return Ok(());}
         // This is our still-unreaped original Child, not a discovered PID or
         // borrowed process group. A timeout is failure, never family proof.
-        self.child.kill()?;
+        self.child.as_mut().expect("owned original child").kill()?;
         self.wait_until(deadline)?.ok_or_else(||io::Error::other("original controller did not settle"))?;
         Ok(())
     }
@@ -78,7 +168,8 @@ impl ControllerChild {
 impl Drop for ControllerChild {
     fn drop(&mut self) {
         if let Err(error)=self.finish() {
-            eprintln!("late-decision controller cleanup FAILED: {error}");
+            if let Some(child)=self.child.take(){self.retained.retain(child);}
+            eprintln!("late-decision controller cleanup FAILED: {error}; original Child retained, settlement UNKNOWN");
             if !thread::panicking(){panic!("{error}");}
         }
     }
@@ -243,10 +334,9 @@ pub(super) fn run(name:&str,body:impl FnOnce()) {
             // SAFETY: only this exact single-test subprocess becomes a subreaper.
             assert_eq!(unsafe{libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0)},0);
             let mut family=Family{settled:false,cleanup_deadline:None};
-            let mut worker=command(name,&root,"worker")
-                .stdout(log_file(&root,"worker.stdout"))
-                .stderr(log_file(&root,"worker.stderr"))
-                .spawn().unwrap();
+            let (stdout,stdout_capture)=Capture::new(&root,"worker.stdout",Duration::from_secs(52));
+            let (stderr,stderr_capture)=Capture::new(&root,"worker.stderr",Duration::from_secs(52));
+            let mut worker=command(name,&root,"worker").stdout(stdout).stderr(stderr).spawn().unwrap();
             let deadline=Instant::now()+Duration::from_secs(45);
             let outcome=loop {
                 if let Some(status)=worker.try_wait().unwrap(){break Some(status);}
@@ -254,7 +344,9 @@ pub(super) fn run(name:&str,body:impl FnOnce()) {
                 thread::sleep(Duration::from_millis(10));
             };
             family.finish().expect("actual worker/provider family must reach ECHILD");
+            let stdout_capture=stdout_capture.finish();let stderr_capture=stderr_capture.finish();
             let stdout=read_log(&root,"worker.stdout");let stderr=read_log(&root,"worker.stderr");
+            assert!(stdout_capture.is_ok()&&stderr_capture.is_ok(),"bounded worker logs failed: {stdout_capture:?}/{stderr_capture:?}\n{stdout}\n{stderr}");
             assert!(outcome.is_some_and(|status|status.success()),"exact worker failed/timed out: {outcome:?}\n{stdout}\n{stderr}");
             assert_eq!(fs::read_to_string(root.join("worker-completed")).unwrap(),name,"the requested actual body must finish");
             assert_eq!(stdout.matches("running 1 test").count(),1,"{stdout}");
@@ -264,22 +356,25 @@ pub(super) fn run(name:&str,body:impl FnOnce()) {
             receipt(&root,"controller-settled",name);
         }
         ""=>{
-            let directory=tempfile::tempdir().unwrap();let root=directory.path();
+            let mut evidence=Evidence{directory:Some(tempfile::tempdir().unwrap()),success:false};
+            let root=evidence.directory.as_ref().unwrap().path();
+            eprintln!("late-decision private evidence directory: {}",root.display());
             fs::set_permissions(root,fs::Permissions::from_mode(0o700)).unwrap();
             for path in ["bin","home/.claude","home/.codex","data","config","cache","tmp","run","project"] {
                 fs::create_dir_all(root.join(path)).unwrap();
             }
             super::install_claude(&root.join("bin/claude"));
-            let child=command(name,root,"controller")
-                .stdout(log_file(root,"controller.stdout"))
-                .stderr(log_file(root,"controller.stderr"))
-                .spawn().unwrap();
-            let mut controller=ControllerChild{child,reaped:false,cleanup_deadline:None};
+            let retained=ReservedReaper::new(root);
+            let (stdout,stdout_capture)=Capture::new(root,"controller.stdout",Duration::from_secs(65));
+            let (stderr,stderr_capture)=Capture::new(root,"controller.stderr",Duration::from_secs(65));
+            let child=command(name,root,"controller").stdout(stdout).stderr(stderr).spawn().unwrap();
+            let mut controller=ControllerChild{child:Some(child),retained,reaped:false,cleanup_deadline:None};
             let status=controller.wait_until(Instant::now()+Duration::from_secs(60)).unwrap();
             if status.is_none() {
                 controller.finish().expect("exact original controller must settle after timeout");
                 panic!("private controller timed out; worker-family settlement is UNKNOWN, never passing evidence");
             }
+            let stdout_capture=stdout_capture.finish();let stderr_capture=stderr_capture.finish();
             let stdout=read_log(root,"controller.stdout");let stderr=read_log(root,"controller.stderr");
             // Preserve complete capped child logs in the durable Cargo receipt,
             // while escaping nested libtest text so its results are not counted
@@ -287,17 +382,19 @@ pub(super) fn run(name:&str,body:impl FnOnce()) {
             let worker_stdout=root.join("worker.stdout").exists().then(||read_log(root,"worker.stdout"));
             let worker_stderr=root.join("worker.stderr").exists().then(||read_log(root,"worker.stderr"));
             eprintln!("late-decision fixture evidence: {}",serde_json::json!({
-                "case":name,"controller_pid":controller.child.id(),"controller_status":format!("{status:?}"),
+                "case":name,"controller_pid":controller.child.as_ref().unwrap().id(),"controller_status":format!("{status:?}"),
                 "controller_stdout":stdout,"controller_stderr":stderr,
                 "worker_stdout":worker_stdout,"worker_stderr":worker_stderr,
                 "worker_status":fs::read_to_string(root.join("worker-status")).ok(),
                 "settled_receipt":fs::read_to_string(root.join("controller-settled")).ok(),
             }));
+            assert!(stdout_capture.is_ok()&&stderr_capture.is_ok(),"bounded controller logs failed: {stdout_capture:?}/{stderr_capture:?}");
             assert!(status.unwrap().success(),"private controller failed\n{stdout}\n{stderr}");
             assert_eq!(fs::read_to_string(root.join("controller-settled")).unwrap(),name,"exact ECHILD receipt required");
             assert_eq!(stdout.matches("running 1 test").count(),1,"{stdout}");
             assert_eq!(stdout.matches("test result: ok. 1 passed; 0 failed;").count(),1,"{stdout}");
             assert!(stdout.contains(&format!("test host::agent_execution::tests::{name} ...")),"{stdout}");
+            evidence.success=true;
         }
         other=>panic!("unknown late-decision fixture role {other}"),
     }
