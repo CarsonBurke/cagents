@@ -87,6 +87,7 @@ pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expect
             .as_deref()
             .ok_or_else(|| FileIoError::Io("The Undo metadata is unavailable.".into()))?;
         return replace_or_remove_document_file(
+            root,
             &parent,
             &name,
             expected_hash,
@@ -103,6 +104,7 @@ pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expect
         }
         if presence.expected_present {
             return remove_document_file(
+                root,
                 &parent,
                 &name,
                 expected_hash,
@@ -210,7 +212,57 @@ fn version(metadata: &fs::Metadata) -> (u64, u32, u32, u32, i64, i64, i64, i64) 
     )
 }
 
+/// Private metadata staging requires ownership established before its public
+/// name is published. Existing/unverified roots never authorize chmod or cleanup.
+fn create_private_holding(namespace_root: &Root, parent: &Root) -> Result<fs_safety::DirectoryPublication, FileIoError> {
+    let namespace = fs_safety::DirectoryNamespace::acquire(namespace_root).map_err(io_error)?;
+    let name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
+    let creation = fs_safety::create_directory_in_namespace(&namespace, parent, Path::new(&name), 0o700).map_err(resolve_error)?;
+    let mut publication = match creation {
+        fs_safety::DirectoryCreation::Published(publication) => publication,
+        fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor holding directory already exists; its permissions and contents were preserved.".into())),
+        fs_safety::DirectoryCreation::Unverified { reason, .. } => return Err(FileIoError::Io(format!("The editor holding directory could not be verified; its permissions and contents were preserved: {reason}"))),
+    };
+    let checked = (|| {
+        if let Some(error) = publication.publication_error() {
+            let retained = publication.pending_staging_path().map(|path| format!(" Diagnostic retained staging spelling: {}.", path.display())).unwrap_or_default();
+            return Err(FileIoError::Io(format!("Could not finish private editor staging: {error}.{retained}")));
+        }
+        // Only Published carries the prepublication inode. Repairing a
+        // restrictive umask here never chmods an Existing/Unverified target.
+        fs_safety::set_directory_permissions(publication.directory(), 0o700).map_err(io_error)?;
+        if publication.directory().metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
+            return Err(FileIoError::Io("The editor metadata directory is not private.".into()));
+        }
+        Ok(())
+    })();
+    if let Err(error) = checked { return Err(with_holding_cleanup(error, &mut publication)); }
+    Ok(publication)
+}
+
+fn cleanup_private_holding(publication: &mut fs_safety::DirectoryPublication) -> Result<(), FileIoError> {
+    publication.cleanup_empty().map_err(|error| {
+        let retained = publication.recovery_path().map(|path| format!(" Diagnostic retained recovery spelling: {}.", path.display())).unwrap_or_default();
+        FileIoError::Io(format!("{error}{retained}"))
+    })
+}
+
+fn with_holding_cleanup(error: FileIoError, publication: &mut fs_safety::DirectoryPublication) -> FileIoError {
+    match cleanup_private_holding(publication) {
+        Ok(()) => error,
+        Err(cleanup) => FileIoError::Io(format!("{error} Could not clean the editor holding directory: {cleanup}")),
+    }
+}
+
+fn put_back_acquired_file(holding: &Root, publication: &mut fs_safety::DirectoryPublication, parent: &Root, name: &std::ffi::OsStr, error: FileIoError) -> FileIoError {
+    match fs_safety::rename_new_between(holding, std::ffi::OsStr::new("file"), parent, name) {
+        Ok(()) => with_holding_cleanup(FileIoError::Io(format!("{error} The acquired file was put back without replacing newer work.")), publication),
+        Err(restore) => FileIoError::Io(format!("{error} The acquired file remains in the retained holding directory {}: {restore}; newer destination contents were left intact.", holding.path().display())),
+    }
+}
+
 fn remove_document_file(
+    namespace_root: &Root,
     parent: &Root,
     name: &std::ffi::OsStr,
     expected_hash: blake3::Hash,
@@ -218,6 +270,7 @@ fn remove_document_file(
     before_acquire: impl FnOnce() -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
     replace_or_remove_document_file(
+        namespace_root,
         parent,
         name,
         expected_hash,
@@ -228,6 +281,7 @@ fn remove_document_file(
 }
 
 fn replace_or_remove_document_file(
+    namespace_root: &Root,
     parent: &Root,
     name: &std::ffi::OsStr,
     expected_hash: blake3::Hash,
@@ -264,22 +318,16 @@ fn replace_or_remove_document_file(
             "The file changed while Revert checked its contents.".into(),
         ));
     }
-    let holding_name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-    let (holding, created) =
-        fs_safety::create_directory_beneath(parent, Path::new(&holding_name), 0o700)
-            .map_err(resolve_error)?;
-    if !created {
-        return Err(FileIoError::Io(
-            "The editor holding directory already exists; no file was removed.".into(),
-        ));
-    }
-    fs_safety::set_directory_permissions(&holding, 0o700).map_err(io_error)?;
+    let mut publication = create_private_holding(namespace_root, parent)?;
+    let holding = match publication.directory().try_clone() {
+        Ok(holding) => holding,
+        Err(error) => return Err(with_holding_cleanup(io_error(error), &mut publication)),
+    };
     let acquired_name = std::ffi::OsStr::new("file");
     if let Err(error) = before_acquire().map_err(io_error).and_then(|()| {
         fs_safety::rename_new_between(parent, name, &holding, acquired_name).map_err(resolve_error)
     }) {
-        let _ = fs_safety::remove_directory_within(parent, &holding_name);
-        return Err(error);
+        return Err(with_holding_cleanup(error, &mut publication));
     }
     let verify = (|| {
         let acquired = fs_safety::metadata_beneath(&holding, Path::new(acquired_name))
@@ -313,31 +361,18 @@ fn replace_or_remove_document_file(
         }
         immutable_metadata_template(&holding, &held, &before, &attributes)
     })();
-    let put_back = |error: FileIoError| {
-        let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
-        let location = if restored.is_ok() {
-            let _ = fs_safety::remove_directory_within(parent, &holding_name);
-            "The acquired file was put back without replacing newer work.".to_owned()
-        } else {
-            format!(
-                "The acquired file is preserved at {}; newer destination contents were left intact.",
-                holding.path().join(acquired_name).display()
-            )
-        };
-        FileIoError::Io(format!("{error} {location}"))
-    };
-    let template = verify.map_err(&put_back)?;
+    let template = verify.map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, error))?;
     if let Some((restoration, text)) = replacement {
         // Keep the acquired original until the replacement is published. A
         // racing new destination is refused and the original is put back or
         // retained explicitly; no newer path is overwritten.
-        let outcome = restore_document_file(parent, name, text, restoration).map_err(&put_back)?;
+        let outcome = restore_document_file(parent, name, text, restoration).map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, error))?;
         let cleanup = match fs_safety::unlink_within(&holding, acquired_name) {
             Err(error) => Err(format!(
                 "The previous file remains at {}: {error}",
                 holding.path().join(acquired_name).display()
             )),
-            Ok(()) => fs_safety::remove_directory_within(parent, &holding_name).map_err(|error| {
+            Ok(()) => cleanup_private_holding(&mut publication).map_err(|error| {
                 format!(
                     "The previous file was removed; the holding directory remains at {}: {error}",
                     holding.path().display()
@@ -369,8 +404,8 @@ fn replace_or_remove_document_file(
         };
     }
     fs_safety::unlink_within(&holding, acquired_name)
-        .map_err(|error| put_back(resolve_error(error)))?;
-    let cleanup = fs_safety::remove_directory_within(parent, &holding_name);
+        .map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, resolve_error(error)))?;
+    let cleanup = cleanup_private_holding(&mut publication);
     let durability = match cleanup {
         Ok(()) => sync_durability(parent),
         Err(error) => SaveDurability::Unconfirmed {
@@ -414,24 +449,13 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     // The metadata can be world-readable/writable. Until its temporary name
     // is removed, it must live behind a private directory, just as removal's
     // metadata capture does. Never expose it in the ordinary worktree parent.
-    let holding_name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-    let (holding, created) = fs_safety::create_directory_beneath(&parent, Path::new(&holding_name), 0o700).map_err(resolve_error)?;
-    if !created { return Err(FileIoError::Io("The private Undo metadata directory already exists.".into())); }
-    let capture = (|| {
-        fs_safety::set_directory_permissions(&holding, 0o700).map_err(io_error)?;
-        if holding.metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
-            return Err(FileIoError::Io("The Undo metadata directory is not private.".into()));
-        }
-        immutable_metadata_template_with_hook(&holding, &source, &before, &attributes, before_unlink)
-    })();
-    let cleanup = (|| {
-        let named = fs_safety::metadata_beneath(&parent, Path::new(&holding_name)).map_err(resolve_error)?;
-        let held = holding.metadata().map_err(io_error)?;
-        if !named.is_dir() || !held.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
-            return Err(FileIoError::Io("The private Undo metadata directory was moved or replaced; no replacement directory was removed.".into()));
-        }
-        fs_safety::remove_directory_within(&parent, &holding_name).map_err(resolve_error)
-    })();
+    let mut publication = create_private_holding(root, &parent)?;
+    let holding = match publication.directory().try_clone() {
+        Ok(holding) => holding,
+        Err(error) => return Err(with_holding_cleanup(io_error(error), &mut publication)),
+    };
+    let capture = immutable_metadata_template_with_hook(&holding, &source, &before, &attributes, before_unlink);
+    let cleanup = cleanup_private_holding(&mut publication);
     let template = match (capture, cleanup) {
         (Ok(template), Ok(())) => template,
         (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
@@ -482,6 +506,94 @@ fn immutable_metadata_template_with_hook(parent: &Root, source: &File, before: &
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn editor_file_presence_cleanup_preserves_a_replacement_holding_directory() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "original").unwrap();
+        let mut replaced = None;
+        let result = remove_document_file(&root, &root, std::ffi::OsStr::new("file"), blake3::hash(b"original"), Some(0o100644), || {
+            let holding = fs::read_dir(directory.path())?.filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with(".cagents-editor-")).unwrap().path();
+            fs::rename(&holding, directory.path().join("original-holding"))?;
+            fs::create_dir(&holding)?; fs::set_permissions(&holding, Permissions::from_mode(0o711))?;
+            fs::write(holding.join("foreign"), "preserve replacement")?;
+            replaced = Some(holding); Ok(())
+        }).unwrap();
+        assert!(matches!(result, SaveOutcome::Absent { durability: SaveDurability::Unconfirmed { .. }, .. }));
+        let replaced = replaced.unwrap();
+        assert_eq!(fs::read_to_string(replaced.join("foreign")).unwrap(), "preserve replacement");
+        assert_eq!(fs::metadata(&replaced).unwrap().mode() & 0o777, 0o711);
+        assert_eq!(fs::metadata(directory.path().join("original-holding")).unwrap().mode() & 0o777, 0o700);
+        assert!(!directory.path().join("file").exists());
+    }
+
+    #[test]
+    fn editor_file_presence_reload_cleanup_preserves_a_replacement_holding_directory() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "contents").unwrap();
+        let mut replaced = None;
+        let result = capture_restoration_with_hook(&root, Path::new("file"), blake3::hash(b"contents"), |holding, _| {
+            let path = holding.path().to_path_buf();
+            fs::rename(&path, directory.path().join("original-holding"))?;
+            fs::create_dir(&path)?; fs::set_permissions(&path, Permissions::from_mode(0o711))?;
+            fs::write(path.join("foreign"), "preserve replacement")?;
+            replaced = Some(path); Ok(())
+        });
+        assert!(result.is_err());
+        let replaced = replaced.unwrap();
+        assert_eq!(fs::read_to_string(replaced.join("foreign")).unwrap(), "preserve replacement");
+        assert_eq!(fs::metadata(replaced).unwrap().mode() & 0o777, 0o711);
+        assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");
+    }
+
+    #[test]
+    fn editor_file_presence_uses_protected_root_for_a_shared_nested_parent() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::create_dir(directory.path().join("shared")).unwrap();
+        fs::set_permissions(directory.path().join("shared"), Permissions::from_mode(0o777)).unwrap();
+        let path = Path::new("shared/file"); fs::write(directory.path().join(path), "contents").unwrap();
+        let saved = save_document_file_at(&root, path, "", blake3::hash(b"contents"), false, removal()).unwrap();
+        let SaveOutcome::Absent { restoration, .. } = saved else { panic!("removed file"); };
+        assert!(!directory.path().join(path).exists());
+        save_document_file_at(&root, path, "contents", blake3::hash(b""), false, PresenceSave { expected_present: false, external_missing_recreate: false, desired_present: true, expected_mode: None, restoration: Some(restoration) }).unwrap();
+        assert_eq!(fs::read_to_string(directory.path().join(path)).unwrap(), "contents");
+        assert_eq!(fs::read_dir(directory.path().join("shared")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn editor_file_presence_refuses_unverified_top_level_holding_before_removal() {
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "contents").unwrap();
+        fs::set_permissions(directory.path(), Permissions::from_mode(0o777)).unwrap();
+        assert!(save_document_file_at(&root, Path::new("file"), "", blake3::hash(b"contents"), false, removal()).is_err());
+        assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn editor_file_presence_private_holding_survives_restrictive_umask() {
+        const CHILD: &str = "CAGENTS_PRESENCE_HOLDING_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "editor::presence::tests::editor_file_presence_private_holding_survives_restrictive_umask", "--test-threads=1"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "the exact owning contract must run: {output:?}");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "contents").unwrap();
+        let previous = unsafe { libc::umask(0o777) };
+        let result = capture_restoration_with_hook(&root, Path::new("file"), blake3::hash(b"contents"), |holding, _| {
+            assert_eq!(holding.metadata()?.mode() & 0o777, 0o700); Ok(())
+        });
+        unsafe { libc::umask(previous) };
+        assert!(result.is_ok(), "private capture must set permissions on its retained inode: {result:?}");
+        assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn reload_metadata_is_private_while_named_and_refuses_an_outside_hard_link() {
@@ -649,6 +761,7 @@ mod tests {
         let root = Root::open(directory.path()).unwrap();
         let result = remove_document_file(
             &root,
+            &root,
             std::ffi::OsStr::new("new.txt"),
             blake3::hash(b"original"),
             Some(0o100644),
@@ -702,6 +815,7 @@ mod tests {
         fs::set_permissions(root.join("new.txt"), Permissions::from_mode(0o644)).unwrap();
         let held_root = Root::open(root).unwrap();
         let outcome = replace_or_remove_document_file(
+            &held_root,
             &held_root,
             std::ffi::OsStr::new("new.txt"),
             blake3::hash(b"synthetic beta"),
@@ -879,6 +993,7 @@ mod tests {
         .unwrap();
         let result = remove_document_file(
             &root,
+            &root,
             std::ffi::OsStr::new("new.sh"),
             blake3::hash(b"original"),
             Some(0o100755),
@@ -913,6 +1028,7 @@ mod tests {
         )
         .unwrap();
         let result = remove_document_file(
+            &root,
             &root,
             std::ffi::OsStr::new("new.sh"),
             blake3::hash(b"original"),
