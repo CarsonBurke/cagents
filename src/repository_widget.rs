@@ -8192,7 +8192,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ReplaceMatch { card, all } => {
-                if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
+                if self.shows_diff() || self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
                 if self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
                     return Task::none();
                 }
@@ -23598,6 +23598,25 @@ mod tests {
         }));
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_error.is_some());
+    }
+
+    #[test]
+    fn stale_replace_message_cannot_edit_a_mounted_diff() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "old value");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "old".into() }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "new".into() }));
+        assert_eq!(runtime.find_matches.len(), 1);
+        let before = runtime.editor_text();
+        // Retain the editor cache deliberately: admission must also check the
+        // currently mounted surface, independently of asynchronous Find state.
+        runtime.source_surface = SourceSurface::Diff;
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(runtime.editor_text(), before);
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+        assert!(!document.history.can_undo());
     }
 
     #[test]
