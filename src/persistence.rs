@@ -4435,6 +4435,7 @@ fn retarget_dropped_cards(state: &mut WorkspaceState) {
             .find(|card| card.existence.is_open())
             .map(|card| card.id);
     }
+    state.agent_updates.retain(|card, _| open.contains(card));
     normalize_project_channels(&mut state.channels, &mut state.active_channel, &open);
 }
 
@@ -9011,7 +9012,7 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_card_costs_only_that_card() {
+    fn an_undecodable_card_costs_only_that_card_and_its_unread_attention() {
         let directory = tempdir().unwrap();
         let boot_id = boot("boot-a");
         let store = StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone())
@@ -9030,6 +9031,8 @@ mod tests {
         let broken_card = broken.id;
         workspace.cards.push(broken);
         workspace.focused = Some(broken_card);
+        workspace.agent_updates.insert(survivor, None);
+        workspace.agent_updates.insert(broken_card, None);
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
 
@@ -9053,6 +9056,7 @@ mod tests {
             .expect("the workspace still exists");
         assert_eq!(restored.state.cards.len(), 1);
         assert_eq!(restored.state.cards[0].id, survivor);
+        assert_eq!(restored.state.agent_updates, BTreeMap::from([(survivor, None)]));
         assert_eq!(restored.warnings.len(), 1);
         assert!(
             restored.warnings[0].contains("launch recipe")
