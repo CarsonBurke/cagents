@@ -10962,19 +10962,7 @@ fn changes_footer<'a>(
     let chrome = &source.chrome;
     let message = state.commit_message();
     let input_key = key.clone();
-    let can_commit = source.mutations_available() && !modal_open
-        && !source.busy()
-        && state.commit_draft.ready()
-        && (!state.commit_draft.amend || source.operation.is_none())
-        && !state.commit_draft.subject.trim().is_empty()
-        && (source.staged_count > 0
-            || (state.commit_draft.amend && source.head_oid.is_some())
-            || source.operation.as_ref().is_some_and(|operation| {
-                operation.kind == crate::repository::GitOperationKind::Merge
-            }))
-        && source
-            .group(ChangeArea::Conflict)
-            .is_none_or(ChangeGroup::is_empty);
+    let can_commit = !modal_open && git_commands::commit_available(source, state);
     let commit_action = SidebarAction::Commit {
         key: key.clone(),
         message: message.to_owned(),
@@ -20872,6 +20860,35 @@ pub(crate) mod tests {
                 tab == ChangesTab::Changes,
                 "{tab:?} offered Commit: {commits}"
             );
+        }
+    }
+
+    #[test]
+    fn amend_footer_requires_the_current_pinned_head_even_with_staged_changes() {
+        let renderer = headless_renderer();
+        for basis in ["matching", "missing-head", "changed-head", "missing-pin", "normal-unborn"] {
+            let mut model = panel_model();
+            let mut state = panel_state(&model);
+            let source = model.source_control.as_mut().unwrap();
+            source.groups.retain(|group| group.area != ChangeArea::Conflict);
+            assert!(source.staged_count > 0, "staged paths must not bypass the amend basis");
+            let head = Oid::parse_object(source.head_oid.as_deref().unwrap()).unwrap();
+            let key = source.key.clone();
+            state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Retained draft".into() });
+            if basis != "normal-unborn" {
+                state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+                let revision = state.amend_request_revision().unwrap();
+                state.pin_amend_head(&key, revision, head);
+                assert!(state.load_amend_message(&key, revision, "Loaded subject\n\nLoaded body\n"));
+            }
+            match basis {
+                "missing-head" | "normal-unborn" => source.head_oid = None,
+                "changed-head" => source.head_oid = Some("b".repeat(40)),
+                "missing-pin" => state.commit_draft.amend_head = None,
+                _ => {}
+            }
+            let actions = frame_enter_presses(&renderer, changes_footer(&state, source, false));
+            assert_eq!(actions.iter().any(|action| matches!(action, SidebarAction::Commit { .. })), matches!(basis, "matching" | "normal-unborn"), "{basis}");
         }
     }
 
