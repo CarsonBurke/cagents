@@ -2277,6 +2277,54 @@ pub enum SavedSessionOwner {
     Directory(PathBuf),
 }
 
+/// Read exact open session descriptors without migrating or updating a source
+/// window's database. Upgrade preflight must fail on an unreadable session,
+/// rather than quietly omit the pane that needs recovery.
+pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let transaction = connection.transaction()?;
+    let mut statement = transaction.prepare(
+        "SELECT c.card_id, c.kind_tag, c.content_json, c.existence_json, w.existence_json
+         FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
+         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (card, kind, content, existence, workspace) = row?;
+        if !from_json::<Existence>("migration card existence", &existence)?.is_open()
+            || !from_json::<Existence>("migration workspace existence", &workspace)?.is_open()
+        {
+            continue;
+        }
+        let card = parse_id("migration card", &card)?;
+        let session = match kind.as_str() {
+            "terminal" => CardKind::Terminal(load_terminal_record(&transaction, card)?),
+            "chat" => CardKind::Chat(from_json(
+                "migration chat",
+                content.as_deref().ok_or_else(|| StoreError::corrupt_row(
+                    format!("migration chat card {card}"), "missing session descriptor",
+                ))?,
+            )?),
+            _ => unreachable!("query restricts session kinds"),
+        };
+        sessions.push((card, session));
+    }
+    Ok(sessions)
+}
+
 /// Read one consistent snapshot without migrating or writing another window's
 /// database. Only open cards with explicit navigation ownership contribute.
 pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
@@ -6260,6 +6308,31 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn migration_session_inspection_is_read_only_and_reconstructs_exact_terminal_and_chat_rows() {
+        for chat in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("migration-source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            if chat { workspace.cards[0].kind = CardKind::Chat(source); }
+            let expected = (workspace.cards[0].id, workspace.cards[0].kind.clone());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(read_open_migration_sessions(&path).unwrap(), vec![expected]);
+            assert_eq!(std::fs::read(&path).unwrap(), before, "inspection cannot migrate or update the database");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            workspace.cards[0].existence = Existence::Closed { tombstone: Tombstone {
+                operation_id: None, closed_at_unix_ms: 1, reason: Some("fixture closed".into()),
+            }};
+            workspace.focused = None;
+            lane.save(&store, &workspace).unwrap();
+            assert!(read_open_migration_sessions(&path).unwrap().is_empty());
+        }
     }
 
     #[test]
