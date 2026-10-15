@@ -373,7 +373,7 @@ impl Runtime {
                 }
             );
         code_frame_label(
-            block.view_logical(
+            block.view_logical_with_reader(
                 self.syntax_theme,
                 limit.map(|height| (height, follows)),
                 target,
@@ -389,7 +389,7 @@ impl Runtime {
                     ),
                     start: 0,
                     paint: self.find_paint.clone(),
-                },
+                }, self.scroll_memory.clone(), self.selected_subagent.clone(),
             ),
             Some(
                 if matches!(part, CopyPart::Input)
@@ -408,6 +408,7 @@ impl Runtime {
                     design::caption(caption.to_owned()).into()
                 },
             ),
+
             Some(copy),
         )
     }

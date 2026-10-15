@@ -259,14 +259,8 @@ pub(super) fn view(
             .collect::<HashMap<_, _>>()
             .into(),
         revision: cached.revision,
-        item: cached
-            .item
-            .as_ref()
-            .map_or_else(
-                || format!("unbound-{}", cached.revision),
-                |item| item.id.clone(),
-            )
-            .into(),
+        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
         path: vec![0],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
@@ -294,26 +288,9 @@ pub(super) fn content_view(
             .collect::<HashMap<_, _>>()
             .into(),
         revision: cached.revision,
-        item: cached
-            .item
-            .as_ref()
-            .map_or_else(
-                || format!("unbound-{}", cached.revision),
-                |item| item.id.clone(),
-            )
-            .into(),
-        path: vec![
-            1,
-            cached
-                .coordination
-                .as_ref()
-                .and_then(|coordinated| {
-                    coordinated
-                        .contents()
-                        .position(|candidate| std::ptr::eq(candidate, content))
-                })
-                .unwrap_or_default() as u32,
-        ],
+        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
+        path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
         paint: cached.find_paint.clone(),
@@ -336,14 +313,8 @@ pub(super) fn items_for_test(
             .collect::<HashMap<_, _>>()
             .into(),
         revision: cached.revision,
-        item: cached
-            .item
-            .as_ref()
-            .map_or_else(
-                || format!("unbound-{}", cached.revision),
-                |item| item.id.clone(),
-            )
-            .into(),
+        reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
+        item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
         path: vec![0],
         dark: true,
         find: None,
@@ -357,6 +328,8 @@ pub(super) fn items_for_test(
 
 #[derive(Clone)]
 struct Renderer {
+    reader_memory: scroll::Memory,
+    reader_context: Option<String>,
     item: Arc<str>,
     path: Vec<u32>,
     paint: Option<Arc<find::Paint>>,
@@ -405,18 +378,10 @@ impl Renderer {
         }
     }
     fn child(&self, index: u32) -> Self {
-        let mut path = self.path.clone();
-        path.push(index);
-        Self {
-            item: self.item.clone(),
-            path,
-            paint: self.paint.clone(),
-            find: self.find.clone(),
-            target: self.target,
-            blocks: self.blocks.clone(),
-            revision: self.revision,
-            dark: self.dark,
-        }
+        let mut path = self.path.clone(); path.push(index);
+        Self { item: self.item.clone(), path, paint: self.paint.clone(), find: self.find.clone(), target: self.target,
+            reader_memory: self.reader_memory.clone(), reader_context: self.reader_context.clone(),
+            blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
     }
     fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
         selectable_prose::Logical {
@@ -651,18 +616,12 @@ impl Renderer {
             }).collect();
         let table = widget::container(virtualized::column(descriptors, Default::default()))
             .width(width * columns.len().max(1) as f32);
-        iced::widget::scrollable(selection::wrap(
-            table,
-            selection::Kind::Table {
-                columns: columns.len(),
-                rows: rows.len() + 1,
-            },
-        ))
-        .direction(iced::widget::scrollable::Direction::Horizontal(
-            design::scrollbar(),
-        ))
-        .spacing(settings.spacing.0 / 2.0)
-        .into()
+        scroll::block(iced::widget::scrollable(selection::wrap(table, selection::Kind::Table {
+            columns: columns.len(), rows: rows.len() + 1,
+        }))
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .spacing(settings.spacing.0 / 2.0), self.reader_memory.clone(), self.reader_context.clone(),
+            selection::logical_identity(&self.item, &self.path), false)
     }
 
     /// A fenced block on the sunken surface commands and outputs use, drawn
@@ -698,13 +657,13 @@ impl Renderer {
             Some(self.logical(Arc::from(""), 0)),
         );
         step::code_frame(
-            widget::scrollable(
+            scroll::block(widget::scrollable(
                 widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
             )
             .direction(iced::widget::scrollable::Direction::Horizontal(
                 design::scrollbar(),
-            ))
-            .into(),
+            )), self.reader_memory.clone(), self.reader_context.clone(),
+                selection::logical_identity(&self.item, &self.path), false),
             Some(
                 language
                     .and_then(fence_language)
