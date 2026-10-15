@@ -1,6 +1,6 @@
 //! Filesystem stamps and line anchors for asynchronous open-document refresh.
 use std::{fs::Metadata, os::unix::fs::MetadataExt, path::Path};
-use crate::{editor::{FileContent, LoadedFile, PdfTone}, fs_safety::{self, Root}};
+use crate::{editor::{FileContent, LoadedFile, PdfTone}, fs_safety::{self}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp { device: u64, inode: u64, size: u64, modified: (i64, i64), changed: (i64, i64) }
@@ -13,7 +13,7 @@ impl From<Metadata> for FileStamp {
 pub struct Stamp { selected: FileStamp, source: FileStamp }
 
 pub fn stamp(worktree: &Path, selected: &Path, source: &Path) -> Result<Option<Stamp>, String> {
-    let root = Root::open(worktree).map_err(|error| error.to_string())?;
+    let root = crate::editor::worktree_root(worktree).map_err(|error| error.to_string())?;
     let selected = match fs_safety::metadata_beneath(&root, selected) {
         Ok(metadata) => metadata,
         Err(error) if error.is_not_found() => return Ok(None),
@@ -102,6 +102,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap(); let actual = directory.path().join("actual"); let alias = directory.path().join("alias");
         std::fs::create_dir(&actual).unwrap(); std::os::unix::fs::symlink(&actual, &alias).unwrap();
         std::fs::write(actual.join("file.rs"), "updated\n").unwrap();
+        assert!(stamp(&alias, Path::new("file.rs"), Path::new("file.rs")).unwrap().is_some());
         for capture in [false, true] {
             let version = load_with_restoration(&alias, Path::new("file.rs"), "old\n", PdfTone::Original, capture).unwrap();
             assert_eq!(version.text, "updated\n"); assert_eq!(version.restoration.is_some(), capture);
