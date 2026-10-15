@@ -839,7 +839,8 @@ mod tests {
                     name: "review".into(),
                     description: "Review the diff".into(),
                 },
-            ].into(),
+            ]
+            .into(),
             skills: vec![
                 Skill {
                     name: "commits".into(),
@@ -851,7 +852,8 @@ mod tests {
                     description: "Review a pull request".into(),
                     invocation: "/pr-review".into(),
                 },
-            ].into(),
+            ]
+            .into(),
             ..Snapshot::default()
         }
     }
@@ -960,7 +962,8 @@ mod tests {
                 name: "review".into(),
                 description: String::new(),
                 invocation: "/skill:review".into(),
-            }].into(),
+            }]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(insertions(&snapshot, "/skill:re|"), ["/skill:review"]);
@@ -983,7 +986,8 @@ mod tests {
                 name: "commits".into(),
                 description: String::new(),
                 invocation: "$commits".into(),
-            }].into(),
+            }]
+            .into(),
             capabilities: Capabilities {
                 compact: true,
                 ..Capabilities::default()
@@ -1032,7 +1036,8 @@ mod tests {
                     description: "repo · Lint".into(),
                     invocation: "[$lint](/repo/.codex/skills/lint/SKILL.md)".into(),
                 },
-            ].into(),
+            ]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(sigils(&snapshot), ['/', '@', '$']);
@@ -1064,7 +1069,8 @@ mod tests {
                 name: "steward-pr".into(),
                 description: "Own a pull request".into(),
                 invocation: path.into(),
-            }].into(),
+            }]
+            .into(),
             ..Snapshot::default()
         };
         assert_eq!(insertions(&snapshot, "$ste|"), ["$steward-pr"]);

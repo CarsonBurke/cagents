@@ -609,14 +609,16 @@ fn metadata() -> Snapshot {
                 label: format!("Model {index}"),
                 reasoning: ["low", "medium", "high", "max"].map(String::from).into(),
             })
-            .collect::<Vec<_>>().into(),
+            .collect::<Vec<_>>()
+            .into(),
         selected_model: Some("provider/model-7-20260101".into()),
         commands: (0..64)
             .map(|index| chat::SlashCommand {
                 name: format!("command-{index}"),
                 description: "Runs the project's command of this name with its arguments.".into(),
             })
-            .collect::<Vec<_>>().into(),
+            .collect::<Vec<_>>()
+            .into(),
         skills: (0..160)
             .map(|index| chat::Skill {
                 name: format!("skill-{index}"),
@@ -625,7 +627,8 @@ fn metadata() -> Snapshot {
                     .into(),
                 invocation: format!("/skill-{index}"),
             })
-            .collect::<Vec<_>>().into(),
+            .collect::<Vec<_>>()
+            .into(),
         plan: (0..8)
             .map(|index| chat::PlanStep {
                 text: format!("Step {index} of the plan the conversation is working to."),

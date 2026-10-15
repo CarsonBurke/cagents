@@ -3,10 +3,10 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod cache;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
-pub mod cache;
 pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
@@ -1220,7 +1220,9 @@ pub enum Command {
         revision: u64,
     },
     /// Read original prose without hydrating or changing the presentation window.
-    LoadSource { query: cache::SourceQuery },
+    LoadSource {
+        query: cache::SourceQuery,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

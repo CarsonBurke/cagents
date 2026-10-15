@@ -18,9 +18,20 @@ pub struct SourceMetadata {
     pub started_at: Option<u64>,
 }
 impl SourceMetadata {
-    pub(crate) fn from_item(item:&super::Item)->Option<Self>{
-        let super::ItemContent::Text{thinking,phase,..}=&item.content else {return None;};
-        Some(Self{role:item.role,thinking:*thinking,phase:*phase,at:item.at,started_at:item.started_at})
+    pub(crate) fn from_item(item: &super::Item) -> Option<Self> {
+        let super::ItemContent::Text {
+            thinking, phase, ..
+        } = &item.content
+        else {
+            return None;
+        };
+        Some(Self {
+            role: item.role,
+            thinking: *thinking,
+            phase: *phase,
+            at: item.at,
+            started_at: item.started_at,
+        })
     }
 }
 /// Store-authored association between one visible item and original prose.
@@ -76,7 +87,10 @@ impl std::fmt::Display for SourceError {
             Self::Unsupported => f.write_str("This cached item is not prose"),
             Self::Changed => f.write_str("Original text changed; restart the read"),
             Self::InvalidRange => f.write_str("Invalid source page boundary or limit"),
-            Self::TooLarge { source_len, limit } => write!(f, "Original text is {source_len} bytes, exceeding the {limit} byte display limit"),
+            Self::TooLarge { source_len, limit } => write!(
+                f,
+                "Original text is {source_len} bytes, exceeding the {limit} byte display limit"
+            ),
             Self::Transport(message) => f.write_str(message),
         }
     }
@@ -86,18 +100,67 @@ impl std::error::Error for SourceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{chat::Command,model::TerminalId,terminal_ipc::{ClientRequest,ServerResponse}};
+    use crate::{
+        chat::Command,
+        model::TerminalId,
+        terminal_ipc::{ClientRequest, ServerResponse},
+    };
     #[test]
     fn source_queries_and_typed_replies_round_trip_on_matched_wire() {
-        let source=SourceKey{agent_id:Some("child".into()),source_id:"original:native-part:1:text:0-8:0-0".into()};
-        let query=SourceQuery{source:source.clone(),offset:4,limit:PAGE_BYTES,expected_epoch:Some(17),until:Some(8)};
-        let chat_id=TerminalId::new();
-        let request=ClientRequest::ChatCommand{chat_id,command:Command::LoadSource{query}};
-        assert_eq!(postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),request);
-        let page=SourcePage{source,epoch:17,source_len:8,offset:4,next_offset:8,text:"text".into(),complete:true,metadata:SourceMetadata{role:crate::chat::Role::Assistant,thinking:false,phase:crate::chat::Phase::Final,at:Some(1),started_at:Some(1)}};
-        for result in [Ok(page),Err(SourceError::NotFound),Err(SourceError::Unsupported),Err(SourceError::Changed),Err(SourceError::InvalidRange),Err(SourceError::TooLarge{source_len:SOURCE_BYTES+1,limit:SOURCE_BYTES}),Err(SourceError::Transport("closed".into()))] {
-            let reply=ServerResponse::ChatSource{chat_id,result};
-            assert_eq!(postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap()).unwrap(),reply);
+        let source = SourceKey {
+            agent_id: Some("child".into()),
+            source_id: "original:native-part:1:text:0-8:0-0".into(),
+        };
+        let query = SourceQuery {
+            source: source.clone(),
+            offset: 4,
+            limit: PAGE_BYTES,
+            expected_epoch: Some(17),
+            until: Some(8),
+        };
+        let chat_id = TerminalId::new();
+        let request = ClientRequest::ChatCommand {
+            chat_id,
+            command: Command::LoadSource { query },
+        };
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),
+            request
+        );
+        let page = SourcePage {
+            source,
+            epoch: 17,
+            source_len: 8,
+            offset: 4,
+            next_offset: 8,
+            text: "text".into(),
+            complete: true,
+            metadata: SourceMetadata {
+                role: crate::chat::Role::Assistant,
+                thinking: false,
+                phase: crate::chat::Phase::Final,
+                at: Some(1),
+                started_at: Some(1),
+            },
+        };
+        for result in [
+            Ok(page),
+            Err(SourceError::NotFound),
+            Err(SourceError::Unsupported),
+            Err(SourceError::Changed),
+            Err(SourceError::InvalidRange),
+            Err(SourceError::TooLarge {
+                source_len: SOURCE_BYTES + 1,
+                limit: SOURCE_BYTES,
+            }),
+            Err(SourceError::Transport("closed".into())),
+        ] {
+            let reply = ServerResponse::ChatSource { chat_id, result };
+            assert_eq!(
+                postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap())
+                    .unwrap(),
+                reply
+            );
         }
     }
 }

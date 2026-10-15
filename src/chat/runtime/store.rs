@@ -1,7 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
-mod file_changes;
 mod append;
+mod file_changes;
 mod source;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -153,7 +153,8 @@ impl Store {
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
-            db.execute_batch(source::SCHEMA).map_err(|e| e.to_string())?;
+            db.execute_batch(source::SCHEMA)
+                .map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
@@ -392,7 +393,14 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
-        if is_text || previous.as_ref().is_some_and(|(_,metadata,_)|postcard::from_bytes::<Item>(metadata).is_ok_and(|old|matches!(old.content,ItemContent::Text{..}))) {self.source_changed()?;}
+        if is_text
+            || previous.as_ref().is_some_and(|(_, metadata, _)| {
+                postcard::from_bytes::<Item>(metadata)
+                    .is_ok_and(|old| matches!(old.content, ItemContent::Text { .. }))
+            })
+        {
+            self.source_changed()?;
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -785,7 +793,9 @@ impl Store {
                 thinking,
                 delta,
             } => {
-                if !delta.is_empty() {self.source_changed()?;}
+                if !delta.is_empty() {
+                    self.source_changed()?;
+                }
                 if self.pending_text.as_ref().is_some_and(|pending| {
                     pending.0 != id
                         || pending.1 != role
@@ -808,7 +818,9 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
-                if self.removes_text_sources(&ids)? {self.source_changed()?;}
+                if self.removes_text_sources(&ids)? {
+                    self.source_changed()?;
+                }
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
@@ -1139,21 +1151,31 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    let base_id=format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
-                    let mut candidate=base_id.clone();
-                    let mut attempt=0_u64;
+                    let base_id =
+                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                    let mut candidate = base_id.clone();
+                    let mut attempt = 0_u64;
                     // A provider's real ID may resemble any generated suffix.
                     // Escape only synthetic aliases, preserving opaque root IDs.
                     // The private cache nonce keeps aliases stable across pages.
                     while self.exists(&candidate)? {
-                        candidate=format!("{base_id}:native-alias:{}:{attempt}",self.directory.file_name().unwrap().to_string_lossy());
-                        attempt=attempt.checked_add(1).ok_or("Native alias capacity exhausted")?;
+                        candidate = format!(
+                            "{base_id}:native-alias:{}:{attempt}",
+                            self.directory.file_name().unwrap().to_string_lossy()
+                        );
+                        attempt = attempt
+                            .checked_add(1)
+                            .ok_or("Native alias capacity exhausted")?;
                     }
                     std::borrow::Cow::Owned(candidate)
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
-                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0};
+                let source_bytes = if kind == "text" {
+                    item_id.len() + id.len() + 64
+                } else {
+                    0
+                };
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
@@ -1165,12 +1187,28 @@ impl Store {
                 {
                     break 'records;
                 }
-                if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:source_epoch,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
+                if kind == "text" {
+                    source_parts.push(crate::chat::cache::SourcePart {
+                        item_id: item_id.to_string(),
+                        source: crate::chat::cache::SourceKey {
+                            agent_id: None,
+                            source_id: id.clone(),
+                        },
+                        start: start0,
+                        end: end0,
+                        source_len: len0,
+                        replacement: false,
+                        epoch: source_epoch,
+                        metadata: crate::chat::cache::SourceMetadata::from_item(&base).unwrap(),
+                    });
                 }
                 if let Some(previous) = old.get(item_id.as_ref())
-                    && (self.changed.as_ref().is_some_and(|changed| !changed.contains(&id))
-                        || (part > 0 && self.completed_text_reusable(&id, start0, end0, previous, &base)))
+                    && (self
+                        .changed
+                        .as_ref()
+                        .is_some_and(|changed| !changed.contains(&id))
+                        || (part > 0
+                            && self.completed_text_reusable(&id, start0, end0, previous, &base)))
                 {
                     reused.insert(item_id.into_owned());
                     newest = Some(
@@ -1193,7 +1231,9 @@ impl Store {
                     ItemContent::Text { .. } | ItemContent::Command { .. } => prefix0,
                     ItemContent::Tool { .. } => prefix1,
                     _ => false,
-                } { proven.insert(item.id.clone()); }
+                } {
+                    proven.insert(item.id.clone());
+                }
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -1368,7 +1408,8 @@ impl Store {
             .map(|item| {
                 crate::chat::presentation::ItemChange::between_known(
                     old.get(item.id.as_str()).map(|item| item.as_ref()),
-                    item, proven.contains(&item.id),
+                    item,
+                    proven.contains(&item.id),
                 )
             })
             .collect();
@@ -1635,54 +1676,119 @@ mod tests {
     #[test]
     fn append_publication_reads_only_new_sqlite_bytes_with_exact_rewrite_fallback() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
-        store.apply(Event::Item(history_item("live", &"x".repeat(64 * 1024)))).unwrap();
+        store
+            .apply(Event::Item(history_item("live", &"x".repeat(64 * 1024))))
+            .unwrap();
         let mut previous = store.window().unwrap().items;
         store.field_bytes.set(0);
-        store.apply(Event::TextDelta { id: "live".into(), role: Role::Assistant,
-            thinking: false, delta: "αβ".into() }).unwrap();
+        store
+            .apply(Event::TextDelta {
+                id: "live".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: "αβ".into(),
+            })
+            .unwrap();
         let appended = store.window_reusing(&mut previous).unwrap();
-        assert_eq!(store.field_bytes.get(), "αβ".len(), "resident prefix must not be reread from SQLite");
-        assert!(matches!(&appended.changes[0], crate::chat::presentation::ItemChange::Append { offset, suffix, .. }
-            if *offset == 64 * 1024 && suffix == "αβ"));
+        assert_eq!(
+            store.field_bytes.get(),
+            "αβ".len(),
+            "resident prefix must not be reread from SQLite"
+        );
+        assert!(
+            matches!(&appended.changes[0], crate::chat::presentation::ItemChange::Append { offset, suffix, .. }
+            if *offset == 64 * 1024 && suffix == "αβ")
+        );
         previous = appended.items;
         store.field_bytes.set(0);
-        store.apply(Event::Item(history_item("live", &"z".repeat(64 * 1024 + 4)))).unwrap();
-        store.apply(Event::TextDelta { id: "live".into(), role: Role::Assistant,
-            thinking: false, delta: " tail".into() }).unwrap();
+        store
+            .apply(Event::Item(history_item(
+                "live",
+                &"z".repeat(64 * 1024 + 4),
+            )))
+            .unwrap();
+        store
+            .apply(Event::TextDelta {
+                id: "live".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " tail".into(),
+            })
+            .unwrap();
         let rewritten = store.window_reusing(&mut previous).unwrap();
-        assert!(store.field_bytes.get() >= 64 * 1024 + 9,
-            "replacement followed by append cannot resurrect an invalid prefix proof");
-        assert!(matches!(&rewritten.changes[0], crate::chat::presentation::ItemChange::Replace(_)));
-        assert!(matches!(&rewritten.items[0].content, ItemContent::Text { text, .. }
-            if text.starts_with("zzzz") && text.ends_with(" tail")));
+        assert!(
+            store.field_bytes.get() >= 64 * 1024 + 9,
+            "replacement followed by append cannot resurrect an invalid prefix proof"
+        );
+        assert!(matches!(
+            &rewritten.changes[0],
+            crate::chat::presentation::ItemChange::Replace(_)
+        ));
+        assert!(
+            matches!(&rewritten.items[0].content, ItemContent::Text { text, .. }
+            if text.starts_with("zzzz") && text.ends_with(" tail"))
+        );
     }
 
     #[test]
     fn megabyte_append_does_not_reread_completed_native_parts() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let source = "x".repeat(PART_BYTES * 8 + 2000);
-        store.apply(Event::Item(history_item("large", &source))).unwrap();
+        store
+            .apply(Event::Item(history_item("large", &source)))
+            .unwrap();
         let mut previous = store.window().unwrap().items;
         assert_eq!(previous.len(), 9);
-        let completed: std::collections::HashMap<_, _> = previous.iter()
-            .skip(1).take(7).map(|item| (item.id.clone(), item.clone())).collect();
+        let completed: std::collections::HashMap<_, _> = previous
+            .iter()
+            .skip(1)
+            .take(7)
+            .map(|item| (item.id.clone(), item.clone()))
+            .collect();
         store.field_bytes.set(0);
-        store.apply(Event::TextDelta { id: "large".into(), role: Role::Assistant,
-            thinking: false, delta: "尾".into() }).unwrap();
+        store
+            .apply(Event::TextDelta {
+                id: "large".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: "尾".into(),
+            })
+            .unwrap();
         let window = store.window_reusing(&mut previous).unwrap();
-        assert!(store.field_bytes.get() < 4096, "only new canonical tail part and UTF-8 boundary probes are read: {}", store.field_bytes.get());
+        assert!(
+            store.field_bytes.get() < 4096,
+            "only new canonical tail part and UTF-8 boundary probes are read: {}",
+            store.field_bytes.get()
+        );
         for (id, previous) in completed {
             let current = window.items.iter().find(|item| item.id == id).unwrap();
-            assert!(std::sync::Arc::ptr_eq(&previous, current),
-                "completed fragments must not copy immutable body bytes on each tail append");
+            assert!(
+                std::sync::Arc::ptr_eq(&previous, current),
+                "completed fragments must not copy immutable body bytes on each tail append"
+            );
         }
-        assert!(window.changes.len() <= 2, "completed fragment bodies need no empty append patch");
-        let actual = window.items.iter().map(|item| match &item.content {
-            ItemContent::Text { text, .. } => text.as_str(), _ => unreachable!(),
-        }).collect::<String>();
+        assert!(
+            window.changes.len() <= 2,
+            "completed fragment bodies need no empty append patch"
+        );
+        let actual = window
+            .items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text.as_str(),
+                _ => unreachable!(),
+            })
+            .collect::<String>();
         assert_eq!(actual, format!("{source}尾"));
-        assert_eq!(window.changes.iter().filter(|change| matches!(change,
-            crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty())).count(), 1);
+        assert_eq!(
+            window
+                .changes
+                .iter()
+                .filter(|change| matches!(change,
+            crate::chat::presentation::ItemChange::Append { suffix, .. } if suffix.is_empty()))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1690,26 +1796,53 @@ mod tests {
         use crate::chat::cache::{SourceKey, SourceQuery};
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let source = "x".repeat(PART_BYTES * 32 + 17);
-        let item = Item { id: "clocked".into(), role: Role::Assistant,
-            at: Some(10), started_at: Some(3), content: ItemContent::Text {
-                text: source.clone(), thinking: true, phase: Phase::Commentary } };
+        let item = Item {
+            id: "clocked".into(),
+            role: Role::Assistant,
+            at: Some(10),
+            started_at: Some(3),
+            content: ItemContent::Text {
+                text: source.clone(),
+                thinking: true,
+                phase: Phase::Commentary,
+            },
+        };
         store.put(item, true).unwrap();
         let mut previous = store.window().unwrap();
         assert!(previous.has_earlier);
-        assert!(!previous.items.iter().any(|item| item.id == "clocked"),
-            "fixture must omit original root display part");
+        assert!(
+            !previous.items.iter().any(|item| item.id == "clocked"),
+            "fixture must omit original root display part"
+        );
         let epoch = previous.source_parts[0].epoch;
-        let completed: Vec<_> = previous.items.iter().filter(|item| matches!(&item.content,
-            ItemContent::Text { text, .. } if text.len() == PART_BYTES)).cloned().collect();
+        let completed: Vec<_> = previous
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(&item.content,
+            ItemContent::Text { text, .. } if text.len() == PART_BYTES)
+            })
+            .cloned()
+            .collect();
         assert!(!completed.is_empty());
-        store.apply(Event::TextDelta { id: "clocked".into(), role: Role::Assistant,
-            thinking: true, delta: " tail".into() }).unwrap();
+        store
+            .apply(Event::TextDelta {
+                id: "clocked".into(),
+                role: Role::Assistant,
+                thinking: true,
+                delta: " tail".into(),
+            })
+            .unwrap();
         let next = store.window_reusing(&mut previous.items).unwrap();
         assert!(!next.items.iter().any(|item| item.id == "clocked"));
         for old in completed {
             let current = next.items.iter().find(|item| item.id == old.id).unwrap();
             assert!(std::sync::Arc::ptr_eq(&old, current));
-            assert_eq!(current.at, Some(10), "retained display fragment keeps its own stamp");
+            assert_eq!(
+                current.at,
+                Some(10),
+                "retained display fragment keeps its own stamp"
+            );
         }
         let expected = &next.source_parts[0].metadata;
         assert!(expected.at.is_some_and(|at| at > 10));
@@ -1718,15 +1851,29 @@ mod tests {
         assert!(expected.thinking);
         assert_eq!(expected.phase, Phase::Commentary);
         for part in &next.source_parts {
-            assert_eq!(part.epoch, epoch, "append does not replace the original source");
+            assert_eq!(
+                part.epoch, epoch,
+                "append does not replace the original source"
+            );
             assert_eq!(part.source_len, source.len() + " tail".len());
             assert_eq!(&part.metadata, expected);
         }
-        let page = store.source_page(SourceQuery { source: SourceKey {
-            agent_id: None, source_id: "clocked".into() }, offset: 0, limit: 1024,
-            expected_epoch: Some(epoch), until: Some(source.len() + " tail".len()) }).unwrap();
-        assert_eq!(&page.metadata, expected,
-            "hydration/timers use authoritative root metadata independently of display Arcs");
+        let page = store
+            .source_page(SourceQuery {
+                source: SourceKey {
+                    agent_id: None,
+                    source_id: "clocked".into(),
+                },
+                offset: 0,
+                limit: 1024,
+                expected_epoch: Some(epoch),
+                until: Some(source.len() + " tail".len()),
+            })
+            .unwrap();
+        assert_eq!(
+            &page.metadata, expected,
+            "hydration/timers use authoritative root metadata independently of display Arcs"
+        );
         assert_eq!(page.text, "x".repeat(1024));
     }
 
@@ -1735,10 +1882,19 @@ mod tests {
     #[test]
     #[ignore = "run explicitly in the optimized dev-runtime host lane"]
     fn append_publication_cost_breakdown() {
-        struct Sample { micros: u128, sql: usize, prefix: usize, bodies: usize, reused: usize, wire: usize }
+        struct Sample {
+            micros: u128,
+            sql: usize,
+            prefix: usize,
+            bodies: usize,
+            reused: usize,
+            wire: usize,
+        }
         fn sample(bytes: usize, reuse: bool) -> Sample {
             let mut store = Store::at(std::env::temp_dir()).unwrap();
-            store.apply(Event::Item(history_item("measured", &"x".repeat(bytes)))).unwrap();
+            store
+                .apply(Event::Item(history_item("measured", &"x".repeat(bytes))))
+                .unwrap();
             let mut previous = store.window().unwrap().items;
             store.field_bytes.set(0);
             store.publication_work.materialized.set(0);
@@ -1746,30 +1902,53 @@ mod tests {
             let started = std::time::Instant::now();
             let mut wire = 0;
             for _ in 0..200 {
-                store.apply(Event::TextDelta { id: "measured".into(), role: Role::Assistant,
-                    thinking: false, delta: " measured stream delta ".into() }).unwrap();
+                store
+                    .apply(Event::TextDelta {
+                        id: "measured".into(),
+                        role: Role::Assistant,
+                        thinking: false,
+                        delta: " measured stream delta ".into(),
+                    })
+                    .unwrap();
                 let next = store.window_reusing(&mut previous).unwrap();
                 wire += postcard::to_stdvec(&next.changes).unwrap().len();
                 previous = next.items;
             }
-            Sample { micros: started.elapsed().as_micros(), sql: store.field_bytes.get(),
+            Sample {
+                micros: started.elapsed().as_micros(),
+                sql: store.field_bytes.get(),
                 prefix: store.publication_work.prefix_copied.get(),
                 bodies: store.publication_work.materialized.get(),
-                reused: store.publication_work.completed_reused.get(), wire }
+                reused: store.publication_work.completed_reused.get(),
+                wire,
+            }
         }
-        eprintln!("source_bytes,reuse,updates,elapsed_us,sqlite_read_bytes,prefix_copy_bytes,materialized_body_bytes,reused_completed_bytes,change_wire_bytes");
+        eprintln!(
+            "source_bytes,reuse,updates,elapsed_us,sqlite_read_bytes,prefix_copy_bytes,materialized_body_bytes,reused_completed_bytes,change_wire_bytes"
+        );
         for bytes in [64 * 1024, 300 * 1024, 1024 * 1024 + 2000] {
             let reference = sample(bytes, false);
             let optimized = sample(bytes, true);
             for (enabled, sample) in [(false, &reference), (true, &optimized)] {
-                eprintln!("{bytes},{enabled},200,{},{},{},{},{},{}", sample.micros,
-                    sample.sql, sample.prefix, sample.bodies, sample.reused, sample.wire);
+                eprintln!(
+                    "{bytes},{enabled},200,{},{},{},{},{},{}",
+                    sample.micros,
+                    sample.sql,
+                    sample.prefix,
+                    sample.bodies,
+                    sample.reused,
+                    sample.wire
+                );
             }
-            assert!(optimized.sql < reference.sql / 4,
-                "validated appends must avoid reading the resident source from SQLite");
+            assert!(
+                optimized.sql < reference.sql / 4,
+                "validated appends must avoid reading the resident source from SQLite"
+            );
             if bytes > PART_BYTES * 2 {
-                assert!(optimized.bodies < reference.bodies * 3 / 4,
-                    "completed fragments must avoid materializing immutable bodies");
+                assert!(
+                    optimized.bodies < reference.bodies * 3 / 4,
+                    "completed fragments must avoid materializing immutable bodies"
+                );
             }
         }
     }
