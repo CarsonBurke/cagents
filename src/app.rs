@@ -25045,7 +25045,11 @@ mod tests {
     async fn opening_pr_diff_working_file_preserves_review_and_uses_editor_owned_card() {
         let (mut app, _) = pull_request_test_app(&[]);
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("source.rs"), "first\rcontinued\nsecond\r\nthird\n").unwrap();
+        std::fs::write(
+            directory.path().join("source.rs"),
+            "first\rcontinued\nsecond\r\nthird\n",
+        )
+        .unwrap();
         let (origin, task) = app.add_pull_requests_card(directory.path().to_path_buf());
         drop(task);
         let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else {
@@ -25080,14 +25084,22 @@ mod tests {
         );
         let mut stream = iced::runtime::task::into_stream(load).expect("working file load");
         let mut loaded = false;
-        while let Ok(Some(action)) = tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-            if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::Repository(RepositoryAction::FileLoaded { .. }))) = action {
+        while let Ok(Some(action)) =
+            tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+        {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::Repository(RepositoryAction::FileLoaded { .. }),
+            )) = action
+            {
                 drop(app.update(message));
                 loaded = true;
                 break;
             }
         }
-        assert!(loaded, "the actual working file must load before source-line mapping is checked");
+        assert!(
+            loaded,
+            "the actual working file must load before source-line mapping is checked"
+        );
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&target) else {
             panic!("working source belongs to a repository editor")
         };

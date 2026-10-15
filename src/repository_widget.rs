@@ -15237,13 +15237,19 @@ mod tests {
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
         // Preserve the midpoint of row 3: its own annotation contributes
         // half its height, while the leading block and row 1 precede it.
-        assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 3.5 * row_height + 15.0);
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            60.0 + 90.0 + 3.5 * row_height + 15.0
+        );
         assert_eq!(runtime.diff_horizontal, 44.0);
         let unchanged = runtime.diff_viewport.offset;
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
         assert_eq!(runtime.diff_viewport.offset, unchanged);
         drop(runtime.update(RepositoryAction::NextChange { card }));
-        assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 30.0 + 7.0 * row_height);
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            60.0 + 90.0 + 30.0 + 7.0 * row_height
+        );
         drop(runtime.update(RepositoryAction::PreviousChange { card }));
         assert_eq!(runtime.diff_viewport.offset, 60.0 + 90.0 + 2.0 * row_height);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));

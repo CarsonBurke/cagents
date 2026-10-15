@@ -436,7 +436,8 @@ pub fn context_menu_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'stati
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
-    }.into()
+    }
+    .into()
 }
 
 /// Lazy menu construction with the same target lifetime as [`context_menu_keyed`].
@@ -446,11 +447,15 @@ pub fn context_menu_lazy_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + '
     builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
 ) -> Element<'a, Message> {
     Effect {
-        content: layer(content.into(), context_menu::lazy_surface_keyed(key, builder)),
+        content: layer(
+            content.into(),
+            context_menu::lazy_surface_keyed(key, builder),
+        ),
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
-    }.into()
+    }
+    .into()
 }
 
 /// Keeps every key from the layers beneath a transient surface that the

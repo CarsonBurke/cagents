@@ -407,10 +407,15 @@ impl RepositoryRuntime {
             .as_ref()
             .is_none_or(|(source, _)| source != &key.source)
         {
-            let Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) = self.displayed_diff_state() else {
+            let Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) =
+                self.displayed_diff_state()
+            else {
                 return Task::none();
             };
-            let snapshot = Arc::new(interaction::SearchSnapshot::new(Arc::clone(model), self.diff_mode));
+            let snapshot = Arc::new(interaction::SearchSnapshot::new(
+                Arc::clone(model),
+                self.diff_mode,
+            ));
             self.diff_interaction.snapshot = Some((key.source.clone(), snapshot));
         }
         let snapshot = Arc::clone(&self.diff_interaction.snapshot.as_ref().unwrap().1);

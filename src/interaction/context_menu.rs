@@ -111,7 +111,9 @@ impl<Message: Clone + 'static, Key> MenuSurface<'_, Message, Key> {
     }
 }
 
-impl<Message: Clone + 'static, Key: Clone + Eq + 'static> Widget<Message, Theme, Renderer> for MenuSurface<'_, Message, Key> {
+impl<Message: Clone + 'static, Key: Clone + Eq + 'static> Widget<Message, Theme, Renderer>
+    for MenuSurface<'_, Message, Key>
+{
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<MenuItems<Key>>()
     }
@@ -342,15 +344,27 @@ mod tests {
     #[test]
     fn diff_context_menu_identity_closes_same_count_recycled_targets() {
         let renderer = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap()
-            .block_on(Renderer::new(cosmic::iced::Font::default(), cosmic::iced::Pixels(14.0), Some("tiny-skia")))
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
             .unwrap();
         fn menu() -> Vec<widget::menu::Tree<()>> {
-            widget::menu::items(&std::collections::HashMap::new(), vec![widget::menu::Item::Button("Action", None, Action)])
+            widget::menu::items(
+                &std::collections::HashMap::new(),
+                vec![widget::menu::Item::Button("Action", None, Action)],
+            )
         }
         let make = |lazy, key| -> Element<'static, ()> {
-            if lazy { lazy_surface_keyed(key, menu) }
-            else { surface_keyed(key, menu()) }
+            if lazy {
+                lazy_surface_keyed(key, menu)
+            } else {
+                surface_keyed(key, menu())
+            }
         };
         let window = Size::new(400.0, 200.0);
         let viewport = Rectangle::with_size(window);
@@ -359,26 +373,63 @@ mod tests {
         // item counts deliberately cannot distinguish these target changes.
         let original = (1_u64, 10_usize, 2_u64);
         for lazy in [false, true] {
-            for replacement in [(2,10,2), (1,11,2), (1,10,3)] {
+            for replacement in [(2, 10, 2), (1, 11, 2), (1, 10, 3)] {
                 let mut element = make(lazy, original);
                 let widget = element.as_widget_mut();
                 let mut tree = Tree::new(&*widget);
                 widget.diff(&mut tree);
                 let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
                 let mut messages = Vec::new();
-                widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&row), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
                 {
-                    let mut popup = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).expect("menu opens for original target");
+                    let mut popup = widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .expect("menu opens for original target");
                     let popup_node = popup.as_overlay_mut().layout(&renderer, window);
-                    popup.as_overlay_mut().update(&Event::Window(window::Event::RedrawRequested(Instant::now())), Layout::new(&popup_node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+                    popup.as_overlay_mut().update(
+                        &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                        Layout::new(&popup_node),
+                        cursor,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
                 }
                 for key in [original, replacement] {
                     let mut next = make(lazy, key);
                     let widget = next.as_widget_mut();
                     widget.diff(&mut tree);
-                    let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
-                    let open = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).is_some();
-                    assert_eq!(open, key == original, "lazy={lazy}, key={key:?}: unrelated frames preserve the menu; changed targets close it");
+                    let row =
+                        widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                    let open = widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .is_some();
+                    assert_eq!(
+                        open,
+                        key == original,
+                        "lazy={lazy}, key={key:?}: unrelated frames preserve the menu; changed targets close it"
+                    );
                 }
             }
         }
