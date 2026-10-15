@@ -9000,15 +9000,26 @@ pub(super) fn show_chat_snapshot_for_test(
     snapshot: chat::Snapshot,
 ) -> usize {
     let requests = snapshot.requests.len();
+    let items = snapshot.items.len();
+    let child_items: Vec<_> = snapshot.subagents.iter()
+        .map(|agent| (agent.id.clone(), agent.items.len())).collect();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
         panic!("chat snapshot requires a chat runtime");
     };
+    // A hidden client intentionally discards incoming bodies. Establish the
+    // real presentation interest before publishing this visible fixture.
+    runtime.show(true);
     runtime
         .handle()
         .expect("a chat snapshot is shown on a live conversation")
         .replace_snapshot_for_test(snapshot);
     runtime.show(true);
     preparation::drain_fixture(runtime);
+    assert_eq!(runtime.snapshot.items.len(), items,
+        "visible fixtures must retain their published parent body");
+    assert_eq!(runtime.snapshot.subagents.iter()
+        .map(|agent| (agent.id.clone(), agent.items.len())).collect::<Vec<_>>(), child_items,
+        "visible fixtures must retain their published child bodies");
     assert_eq!(
         runtime.snapshot.requests.len(),
         requests,
@@ -10393,6 +10404,7 @@ mod tests {
                 })],
             })
             .collect();
+        app.chat_runtime_mut(target).unwrap().show(true);
         handle.publish_snapshot_for_test(Snapshot {
             generation: 20,
             ready: true,
@@ -10407,8 +10419,8 @@ mod tests {
             ..Snapshot::default()
         });
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.visible.store(true, Ordering::Relaxed);
         runtime.refresh();
+        preparation::drain_fixture(runtime);
         assert_eq!(
             runtime.cache.len(),
             1,
@@ -13164,8 +13176,8 @@ mod tests {
         card
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn flow_dispatch_prepares_cached_tools_and_recreated_temporary_contexts() {
+    #[test]
+    fn flow_dispatch_prepares_cached_tools_and_recreated_temporary_contexts() {
         use iced::advanced::{
             Layout, Shell, layout, mouse,
             widget::{Operation, Tree},
@@ -13194,6 +13206,7 @@ mod tests {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let source = "x".repeat(6000);
         let renderer = crate::app::tests::headless_renderer();
+        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0));
         for temporary in [false, true] {
             if !temporary {
@@ -13265,6 +13278,7 @@ mod tests {
                 .cache
                 .get("tool")
                 .map(|cached| cached.revision);
+            let reply = executor.block_on(async {
             let task = app.handle_chat_action(action);
             let mut outputs =
                 iced::runtime::task::into_stream(task).expect("actual dispatch starts shaping");
@@ -13280,7 +13294,8 @@ mod tests {
                 panic!("flow task produced no completion");
             })
             .await
-            .expect("bounded fixture completion");
+            .expect("bounded fixture completion")
+            });
             drop(app.handle_chat_action(reply));
             if !temporary {
                 assert_ne!(
