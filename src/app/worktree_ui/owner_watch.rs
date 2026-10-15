@@ -72,12 +72,20 @@ impl Monitor {
         // Watching each existing ancestor also observes replacement of a
         // symlink in the middle of a launch directory, and creation of a
         // directory that did not exist when canonicalization first ran.
-        let directories = {
+        let observed_paths = {
             let observed = self.observed.lock().unwrap_or_else(|error| error.into_inner());
-            observed.iter().flat_map(|(lexical, physical)| [lexical, physical])
-                .flat_map(|path| path.ancestors().skip(1))
-                .filter(|path| path.is_dir()).map(Path::to_owned).collect::<HashSet<_>>()
+            observed.iter().flat_map(|(lexical, physical)| [lexical.clone(), physical.clone()])
+                .collect::<Vec<_>>()
         };
+        // UI fallback invalidation also reads `observed`. Never hold that
+        // mutex across even metadata calls on a potentially slow filesystem.
+        let directories = observed_paths.iter().flat_map(|path| path.ancestors().skip(1))
+            .filter(|path| path.is_dir()).map(Path::to_owned).collect::<HashSet<_>>();
+        let removed = registration.paths.difference(&directories).cloned().collect::<Vec<_>>();
+        for path in removed {
+            if let Some(watcher) = &mut registration.watcher { let _ = watcher.unwatch(&path); }
+            registration.paths.remove(&path);
+        }
         let mut failed = registration.watcher.is_none() && !directories.is_empty();
         for path in directories {
             if registration.paths.contains(&path) { continue; }
@@ -90,6 +98,16 @@ impl Monitor {
         if self.failed.swap(failed, Ordering::AcqRel) != failed {
             let _ = self.sender.try_send(());
         }
+    }
+
+    /// A cheap UI operation: registration cleanup itself runs in the next
+    /// blocking task, including a task with no new canonical paths.
+    pub(super) fn retain(&self, active: &HashSet<PathBuf>) -> bool {
+        let mut observed = self.observed.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = observed.len();
+        observed.retain(|path, _| active.contains(path));
+        self.dirty.lock().unwrap_or_else(|error| error.into_inner()).retain(|path| active.contains(path));
+        observed.len() != previous
     }
 
     pub(super) fn take_invalidated(&self) -> HashSet<PathBuf> {
@@ -155,6 +173,20 @@ mod tests {
         next_change(&monitor);
         assert!(monitor.take_invalidated().contains(&alias));
         assert_eq!(alias.canonicalize().unwrap(), second);
+    }
+
+    #[test]
+    fn obsolete_paths_release_their_watch_registrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("card");
+        std::fs::create_dir(&path).unwrap();
+        let monitor = Monitor::default();
+        monitor.register(&[(path.clone(), path)]);
+        assert!(!monitor.registration.lock().unwrap().paths.is_empty());
+        assert!(monitor.retain(&HashSet::new()));
+        monitor.register(&[]);
+        assert!(monitor.registration.lock().unwrap().paths.is_empty());
+        assert!(monitor.observed.lock().unwrap().is_empty());
     }
 
     #[test]

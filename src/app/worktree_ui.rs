@@ -10,6 +10,9 @@ pub(super) struct OwnerPaths {
     cached: HashMap<PathBuf, PathBuf>,
     queued: HashSet<PathBuf>,
     inflight: HashSet<PathBuf>,
+    inflight_generation: Option<u64>,
+    active: HashSet<PathBuf>,
+    watch_dirty: bool,
     generation: u64,
     invalidated: HashSet<PathBuf>,
     watch: Arc<owner_watch::Monitor>,
@@ -17,6 +20,7 @@ pub(super) struct OwnerPaths {
 
 impl OwnerPaths {
     fn request(&mut self, path: &Path, remote: bool) {
+        self.active.insert(path.into());
         if remote {
             self.cached.entry(path.into()).or_insert_with(|| path.into());
         } else if !self.cached.contains_key(path) && !self.inflight.contains(path) {
@@ -25,27 +29,39 @@ impl OwnerPaths {
     }
 
     fn take_batch(&mut self) -> Option<(u64, Vec<PathBuf>)> {
-        if !self.inflight.is_empty() || self.queued.is_empty() { return None; }
+        if self.inflight_generation.is_some() || (self.queued.is_empty() && !self.watch_dirty) { return None; }
         self.generation = self.generation.wrapping_add(1);
+        self.inflight_generation = Some(self.generation);
+        self.watch_dirty = false;
         self.inflight = std::mem::take(&mut self.queued);
         Some((self.generation, self.inflight.iter().cloned().collect()))
     }
 
     fn finish(&mut self, generation: u64, paths: Vec<(PathBuf, PathBuf)>) -> bool {
-        if generation != self.generation || self.inflight.is_empty() { return false; }
+        if self.inflight_generation != Some(generation) { return false; }
         for (path, resolved) in paths {
-            if self.inflight.contains(&path) && !self.invalidated.contains(&path) {
+            if self.inflight.contains(&path) && self.active.contains(&path) && !self.invalidated.contains(&path) {
                 self.cached.insert(path, resolved);
             }
         }
         self.queued.extend(self.invalidated.drain());
         self.inflight.clear();
+        self.inflight_generation = None;
         true
+    }
+
+    fn retain_paths(&mut self, active: HashSet<PathBuf>) {
+        self.cached.retain(|path, _| active.contains(path));
+        self.queued.retain(|path| active.contains(path));
+        self.invalidated.retain(|path| active.contains(path));
+        self.watch_dirty |= self.watch.retain(&active);
+        self.active = active;
     }
 
     pub(super) fn invalidate_watched(&mut self) {
         self.watch.invalidate_failed();
         for path in self.watch.take_invalidated() {
+            if !self.active.contains(&path) { continue; }
             self.cached.remove(&path);
             if self.inflight.contains(&path) { self.invalidated.insert(path); }
             else { self.queued.insert(path); }
@@ -492,11 +508,13 @@ impl Cagents {
                     }),
             );
         let remote = crate::device::is_remote();
-        for path in self.known_worktree_roots.iter().map(PathBuf::as_path)
-            .chain(self.durable.cards.iter().filter_map(card_directory))
-            .chain(selected)
-        {
-            self.worktree_owner_paths.request(path, remote);
+        let paths = self.known_worktree_roots.iter().cloned()
+            .chain(self.durable.cards.iter().filter(|card| card.existence.is_open())
+                .filter_map(card_directory).map(Path::to_owned))
+            .chain(selected.map(Path::to_owned)).collect::<HashSet<_>>();
+        self.worktree_owner_paths.retain_paths(paths.clone());
+        for path in paths {
+            self.worktree_owner_paths.request(&path, remote);
         }
         let roots = self
             .known_worktree_roots
@@ -553,9 +571,17 @@ impl Cagents {
         let watch = self.worktree_owner_paths.watch.clone();
         cosmic::task::future(async move {
             let paths = tokio::task::spawn_blocking(move || {
-                let resolved = canonicalize_owner_paths(paths, resolver);
-                watch.register(&resolved);
-                resolved
+                // Install lexical ancestor watches before the first read so
+                // an alias retarget between read and registration cannot be
+                // lost. Register physical ancestors too, then validate the
+                // initial result across that registration gap.
+                watch.register(&paths.iter().map(|path| (path.clone(), path.clone())).collect::<Vec<_>>());
+                let mut resolver = resolver;
+                let first = canonicalize_owner_paths(paths.clone(), &mut resolver);
+                watch.register(&first);
+                let validated = canonicalize_owner_paths(paths, resolver);
+                watch.register(&validated);
+                validated
             }).await.unwrap_or_default();
             Message::WorktreeOwnerPathsResolved { generation, paths }
         })
@@ -2630,6 +2656,36 @@ mod owner_path_cache_tests {
         assert!(app.worktree_owner_paths.finish(generation, paths));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn initial_watch_registration_cannot_miss_a_retarget_after_the_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.worktree_owner_paths.request(&alias, false);
+        let changed = alias.clone();
+        let target = second.clone();
+        let mut initial = true;
+        let task = app.resolve_worktree_owner_paths_with(move |path| {
+            let result = path.canonicalize();
+            if initial {
+                initial = false;
+                std::fs::remove_file(&changed).unwrap();
+                std::os::unix::fs::symlink(&target, &changed).unwrap();
+            }
+            result
+        });
+        let Message::WorktreeOwnerPathsResolved { paths, .. } = super::super::tests::task_app_message(task) else {
+            panic!("owner task returned another message");
+        };
+        assert_eq!(paths, vec![(alias, second)]);
+    }
+
     #[test]
     fn a_watch_change_during_resolution_cannot_install_the_old_alias() {
         let mut cache = OwnerPaths::default();
@@ -2639,6 +2695,19 @@ mod owner_path_cache_tests {
         assert!(cache.finish(generation, vec![("/alias".into(), "/old".into())]));
         assert_eq!(cache.canonical(Path::new("/alias")), Path::new("/alias"));
         assert_eq!(cache.take_batch().unwrap().1, vec![PathBuf::from("/alias")]);
+    }
+
+    #[test]
+    fn obsolete_card_directories_leave_the_owner_cache() {
+        let mut cache = OwnerPaths::default();
+        for path in ["/root", "/old/card", "/new/card"] {
+            cache.request(Path::new(path), false);
+        }
+        let (generation, batch) = cache.take_batch().unwrap();
+        assert!(cache.finish(generation, batch.into_iter().map(|path| (path.clone(), path)).collect()));
+        cache.retain_paths([PathBuf::from("/root"), PathBuf::from("/new/card")].into());
+        assert_eq!(cache.cached.len(), 2);
+        assert!(!cache.cached.contains_key(Path::new("/old/card")));
     }
 
     #[test]
