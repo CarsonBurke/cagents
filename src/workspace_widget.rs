@@ -3204,6 +3204,9 @@ mod tests {
             global_shortcut(&redo, &shortcuts, FocusedPane::Terminal),
             Some(GlobalShortcut::ReopenPane)
         );
+        assert_eq!(global_shortcut(
+            &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
+            &shortcuts, FocusedPane::Browser), Some(GlobalShortcut::FindInPane));
         assert_eq!(
             global_shortcut(
                 &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),

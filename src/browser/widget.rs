@@ -767,6 +767,32 @@ mod tests {
     }
 
     #[test]
+    fn inactive_window_redraw_retains_logical_focus_and_explicit_return_reasserts_it() {
+        let handle = BrowserHandle::fixture();
+        let mut selected = BrowserWidget::<()>::new(&handle).model_focused(true);
+        let mut tree = Tree::new(&selected as &dyn Widget<(), Theme, Renderer>);
+        tree.state.downcast_mut::<WidgetState>().input_focused = true;
+        selected.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(true));
+        let mut inactive_window = BrowserWidget::<()>::new(&handle).model_focused(true).window_focused(false);
+        inactive_window.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(false));
+        assert!(tree.state.downcast_ref::<WidgetState>().input_focused);
+        inactive_window.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().focused, None);
+        selected.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(true));
+
+        // The application can blur a parked browser through its original
+        // handle while that tree is outside native operation traversal.
+        handle.set_focused(false).unwrap();
+        handle.mailbox.drain_coalesced();
+        operation::Focusable::focus(tree.state.downcast_mut::<WidgetState>());
+        selected.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().focused, Some(true));
+    }
+
+    #[test]
     fn evicting_the_native_tree_releases_against_its_original_browser() {
         use keyboard::key::{Code, Physical};
         let original = BrowserHandle::fixture();
