@@ -7,6 +7,8 @@ mod owned_listener;
 pub(in crate::host) mod retained_actor;
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod retained_actor_tests;
 use crate::{
     agent::Provider,
     chat::{
