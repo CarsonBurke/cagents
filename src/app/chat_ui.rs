@@ -6698,9 +6698,8 @@ impl Cagents {
                                 if let Some(channel) = self.durable.channels.iter()
                                     .find(|channel| channel.cards.contains(&target.card)).map(|channel| channel.id)
                                 {
-                                    let scope = self.select_channel(channel);
-                                    let insert = self.insert_chat_card(session, Some(target.card), None);
-                                    Task::batch([scope, insert])
+                                    self.select_channel_then(channel,
+                                        worktree_ui::selection::Intent::Chat {session,beside:Some(target.card),ephemeral:false})
                                 } else {
                                     self.select_worktree_then(session.launch.recipe.working_directory.clone(), false,
                                         worktree_ui::selection::Intent::Chat { session, beside: Some(target.card), ephemeral: false })

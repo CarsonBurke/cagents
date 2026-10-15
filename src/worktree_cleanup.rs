@@ -487,6 +487,10 @@ impl WindowProtections {
     pub(crate) fn needs_retry(&self) -> bool { self.retry_after.is_some() }
 
     /// In-memory inspection only: no path resolution runs on the UI thread.
+    pub(crate) fn protects_exact(&self, directory: &Path) -> bool {
+        self.directories.contains_key(directory)
+    }
+
     pub(crate) fn holds_within(&self, directory: &Path) -> bool {
         self.directories.keys().any(|held| held.starts_with(directory))
     }

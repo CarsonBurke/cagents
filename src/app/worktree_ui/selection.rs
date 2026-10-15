@@ -21,6 +21,8 @@ impl State {
 /// It must never run in a batch beside the asynchronous preparation task.
 pub(in crate::app) enum Intent {
     Navigate,
+    Channel { id: ChannelId, path: PathBuf, after: Box<Intent> },
+    EnsureDefaultPane,
     Terminal(TerminalSession),
     TerminalWithLifecycle { session: TerminalSession, committed: Box<Message>, rejected: Box<Message> },
     NewTerminal(PathBuf),
@@ -101,9 +103,10 @@ impl Cagents {
         // existing synchronous navigation semantics; production takes the
         // exact same commit path after off-thread preparation.
         if !crate::instance::window_is_initialized() || crate::device::is_remote() {
-            let scope = self.select_worktree_inner(path, create);
+            let scope = self.commit_worktree_selection_scope(path, create, &intent);
+            let initialization = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(intent);
-            return Task::batch([scope, after, self.resolve_worktree_owner_paths()]);
+            return Task::batch([scope, initialization, after, self.resolve_worktree_owner_paths()]);
         }
         let epoch = self.worktree_owner_paths.invalidate_watched();
         self.refresh_worktree_owners(Some(&path));
@@ -158,6 +161,15 @@ impl Cagents {
         if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested,create,intent);
         }
+        if let Intent::Channel {id,path,..} = &intent
+            && self.channel_scope_path(*id).as_ref()!=Some(path)
+        {
+            // The channel may have moved to another project while preparation
+            // was blocked. Its current directory needs its own physical guard.
+            drop(result);
+            if let Intent::Channel {id,after,..}=intent {return self.select_channel_then(id,*after);}
+            unreachable!();
+        }
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -172,7 +184,7 @@ impl Cagents {
         self.worktree_protections.install_prepared(prepared.guard);
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths.install_prepared(prepared.canonical);
-        let selected = self.select_worktree_inner(prepared.path, create);
+        let selected = self.commit_worktree_selection_scope(prepared.path, create, &intent);
         let initialization = self.initialize_prepared_scope_runtimes();
         let after = self.finish_worktree_selection(intent);
         Task::batch([selected,initialization,after,self.resolve_worktree_owner_paths()])
@@ -185,17 +197,27 @@ impl Cagents {
         Task::batch([initialize,self.ensure_default_pane()])
     }
 
-    fn abandon_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
+    fn commit_worktree_selection_scope(&mut self, path: PathBuf, create: bool, intent: &Intent) -> Task<Message> {
         match intent {
+            Intent::Channel {id,..} => self.select_channel_inner(*id),
+            _ => self.select_worktree_inner(path,create),
+        }
+    }
+
+    pub(super) fn abandon_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
+        match intent {
+            Intent::Channel {after,..} => self.abandon_worktree_selection(*after),
             Intent::Delete(target) => {self.cancel_prepared_worktree_deletion(target); Task::none()},
             Intent::TerminalWithLifecycle {rejected,..} => self.update(*rejected),
             _ => Task::none(),
         }
     }
 
-    fn finish_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
+    pub(super) fn finish_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
         match intent {
             Intent::Navigate => Task::none(),
+            Intent::Channel {after,..} => self.finish_worktree_selection(*after),
+            Intent::EnsureDefaultPane => self.ensure_default_pane(),
             Intent::Terminal(session) => self.insert_terminal_card(session,None),
             Intent::TerminalWithLifecycle {session,committed,rejected} => {
                 if self.refuse_in_deleting_worktree(&session.launch.working_directory) {
@@ -312,6 +334,59 @@ mod tests {
         assert!(matches!(fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
         drop(app);
         fixture_protection(runtime.path(),next.path(),true).unwrap();
+    }
+
+    #[test]
+    fn channel_scope_and_dependent_insertion_wait_for_the_real_prepared_lease() {
+        let runtime = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects = vec![SidebarProject::new(project,RepositoryId::new(),"channel owner".into(),next.path().to_owned(),
+            vec![SidebarWorktree::new(crate::model::WorktreeId::new(),next.path().to_owned(),None,false,false,None,None,None)],Vec::new())];
+        let channel = ChannelId::new();
+        app.durable_mut().channels.push(crate::model::ProjectChannel {id:channel,project_id:project,title:"cold channel".into(),ordinal:0,shared:false,
+            title_source:Default::default(),cards:Vec::new(),focused:None});
+        app.known_worktree_roots.extend([old.path().to_owned(),next.path().to_owned()]);
+        drop(app.select_worktree_inner(old.path().to_owned(),false));
+        app.worktree_protections.install_prepared(Some(crate::worktree_cleanup::fixture_protection(runtime.path(),old.path(),false).unwrap()));
+        let CardKind::Terminal(mut session) = crate::app::tests::terminal_card_state().kind else {unreachable!()};
+        session.launch.working_directory = next.path().to_owned();
+        let terminal = session.id;
+        app.worktree_selection.cancel();
+        app.worktree_selection.pending = true;
+        let generation = app.worktree_selection.generation;
+        let epoch = app.worktree_owner_paths.invalidate_watched();
+        let monitor = app.worktree_owner_paths.watch.clone();
+        let roots = vec![(old.path().to_owned(),None,true),(next.path().to_owned(),None,true)];
+        let worker_runtime = runtime.path().to_owned();
+        let (entered,entered_rx) = crossbeam_channel::bounded(1);
+        let (release,release_rx) = crossbeam_channel::bounded(1);
+        let intent = Intent::Channel {id:channel,path:next.path().to_owned(),after:Box::new(Intent::Terminal(session))};
+        let task = app.prepare_worktree_selection(generation,next.path().to_owned(),false,intent,epoch,move |path| {
+            prepare_target(path,roots,None,&monitor,|path|path.canonicalize(),|physical| {
+                entered.send(()).unwrap();release_rx.recv().unwrap();
+                crate::worktree_cleanup::fixture_protection(&worker_runtime,physical,false).map(Some)
+            })
+        });
+        let worker = std::thread::spawn(move ||crate::app::tests::task_app_message(task));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(app.update(Message::SettingsSearchChanged("typing while opening cold channel".into())));
+        assert_eq!(app.settings_search,"typing while opening cold channel");
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+        assert_eq!(app.durable.active_channel,None);
+        assert!(app.durable.cards.iter().all(|card|!matches!(&card.kind,CardKind::Terminal(session) if session.id==terminal)));
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),old.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        release.send(()).unwrap();
+        let Message::WorktreeSelectionPrepared {generation,create,receipt}=worker.join().unwrap() else {panic!("unexpected channel receipt")};
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        drop(app.worktree_selection_prepared(generation,create,receipt));
+        assert_eq!(app.active_workspace.as_deref(),Some(next.path()));
+        assert_eq!(app.durable.active_channel,Some(channel));
+        let inserted=app.durable.cards.iter().find(|card|matches!(&card.kind,CardKind::Terminal(session) if session.id==terminal)).unwrap();
+        assert!(app.durable.channels.iter().find(|row|row.id==channel).unwrap().cards.contains(&inserted.id));
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
     }
 
     #[test]

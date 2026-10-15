@@ -462,21 +462,10 @@ impl Cagents {
         }
     }
 
-    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let preparation_was_pending = self.worktree_selection.pending;
-        self.worktree_selection.cancel();
-        let Some(channel) = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.id == id)
-        else {
-            return Task::none();
-        };
-        let Some(project) = self.sidebar_model.project(channel.project_id) else {
-            return Task::none();
-        };
-        let path = project
+    fn channel_scope_path(&self, id: ChannelId) -> Option<PathBuf> {
+        let channel = self.durable.channels.iter().find(|channel|channel.id==id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(project
             .worktrees
             .iter()
             .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
@@ -488,18 +477,46 @@ impl Cagents {
                     .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
                     .unwrap_or(&project.repository)
                     .to_path_buf()
-            });
-        if self.durable.active_channel == Some(id)
-            && self.active_workspace.as_ref() == Some(&path)
-            && self.workspace.order().eq(self
-                .durable
-                .cards
-                .iter()
-                .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
-                .map(|card| card.id))
+            }))
+    }
+
+    fn channel_scope_is_current(&self, id: ChannelId, path: &Path) -> bool {
+        if self.durable.active_channel != Some(id) || self.active_workspace.as_deref()!=Some(path) {return false;}
+        let Some(channel) = self.durable.channels.iter().find(|channel|channel.id==id) else {return false;};
+        let members = channel.cards.iter().copied().collect::<HashSet<_>>();
+        self.workspace.order().eq(self.durable.cards.iter()
+            .filter(|card|card.existence.is_open() && members.contains(&card.id)).map(|card|card.id))
+    }
+
+    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.select_channel_then(id, selection::Intent::Navigate)
+    }
+
+    pub(in crate::app) fn select_channel_then(&mut self, id: ChannelId, after: selection::Intent) -> Task<Message> {
+        let Some(path) = self.channel_scope_path(id) else {
+            self.worktree_selection.cancel();
+            return self.abandon_worktree_selection(after);
+        };
+        self.worktree_owner_paths.invalidate_watched();
+        let protected = self.worktree_owner_paths.cached.get(&path)
+            .is_some_and(|physical|self.worktree_protections.protects_exact(physical));
+        // Re-selecting an already displayed, physically protected channel
+        // cannot expose another directory. In particular RepositoryLoaded
+        // with unchanged roots does no new filesystem work.
+        if matches!(&after,selection::Intent::Navigate) && self.channel_scope_is_current(id,&path)
+            && (!crate::instance::window_is_initialized() || crate::device::is_remote() || protected)
         {
-            return if preparation_was_pending { self.initialize_prepared_scope_runtimes() } else {Task::none()};
+            self.worktree_selection.cancel();
+            let initialize = self.initialize_prepared_scope_runtimes();
+            let after = self.finish_worktree_selection(after);
+            return Task::batch([initialize,after]);
         }
+        self.select_worktree_then(path.clone(),false,selection::Intent::Channel { id, path, after: Box::new(after) })
+    }
+
+    fn select_channel_inner(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(path) = self.channel_scope_path(id) else { return Task::none(); };
+        if self.channel_scope_is_current(id,&path) { return Task::none(); }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
             self.discard_unused_default_chats()
@@ -519,8 +536,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        let initialize = if preparation_was_pending {self.initialize_prepared_scope_runtimes()} else {Task::none()};
-        Task::batch([scope,initialize])
+        scope
     }
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in

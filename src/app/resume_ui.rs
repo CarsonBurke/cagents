@@ -746,14 +746,15 @@ impl Cagents {
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
             self.close_resume();
-            let scope = if let Some(channel) = self
+            if let Some(channel) = self
                 .durable
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| channel.id)
             {
-                self.select_channel(channel)
+                return self.select_channel_then(channel,
+                    worktree_ui::selection::Intent::Focus {card, activate: false});
             } else {
                 let owner = self
                     .card_state(card)
@@ -762,8 +763,7 @@ impl Cagents {
                     .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
                 return self.select_worktree_then(owner, false,
                     worktree_ui::selection::Intent::Focus {card, activate: false});
-            };
-            return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
+            }
         }
         if entry.open {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");

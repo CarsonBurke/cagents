@@ -265,11 +265,7 @@ impl State {
 
 impl Cagents {
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
-        let scope = self.select_channel(id);
-        if self.durable.active_channel != Some(id) {
-            return scope;
-        }
-        Task::batch([scope, self.ensure_default_pane()])
+        self.select_channel_then(id,worktree_ui::selection::Intent::EnsureDefaultPane)
     }
 
     pub(super) fn new_project_channel(&mut self) -> Task<Message> {
