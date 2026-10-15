@@ -267,24 +267,11 @@ impl Editor {
         })
     }
 
-    pub(super) fn git_review_action(&mut self, mut action: Action) -> Task<Message> {
+    pub(super) fn git_review_action(&mut self, action: Action) -> Task<Message> {
         let origin = match &action { Action::AmendLoaded { origin, .. } | Action::HistoryLoaded { origin, .. } | Action::CommitLoaded { origin, .. } | Action::Committed { origin, .. } => origin };
         // Physical disappearance refuses effects, but must still settle the
         // exact logical request that reserved this tab's mutation/read slot.
         if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
-        let root_unavailable = origin.authority.validate().is_err();
-        if root_unavailable {
-            let error = "The original worktree binding changed or is unavailable; reopen it before retrying.".to_owned();
-            match &mut action {
-                Action::AmendLoaded { result, .. } => *result = Err(error),
-                Action::HistoryLoaded { result, .. } => *result = Err(error),
-                Action::CommitLoaded { result, .. } => *result = Err(error),
-                // A settled commit result is a fact about its captured worker.
-                // Losing the displayed path afterward cannot turn Created into
-                // failure or discard its known outcome.
-                Action::Committed { .. } => {},
-            }
-        }
         match action {
             Action::AmendLoaded { origin, revision, head, result } => {
                 let tab = self.tab_mut(origin.card).unwrap();
@@ -322,8 +309,7 @@ impl Editor {
                 let tab = self.tab_mut(origin.card).unwrap();
                 if tab.git_review.submitted_revision != Some(revision) { return Task::none(); }
                 tab.git_review.submitted_revision = None;
-                let created = matches!(&result, Ok(CommitOutcome::Created { .. }));
-                let mut notice = match result {
+                let notice = match result {
                     Ok(CommitOutcome::Created { warnings, .. }) => {
                         self.tab_mut(origin.card).unwrap().navigation.clear_submitted_commit(&origin.key, revision);
                         (!warnings.is_empty()).then(|| warnings.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
@@ -332,11 +318,6 @@ impl Editor {
                     Ok(CommitOutcome::OutcomeUnknown { failure, .. }) => Some(format!("Commit outcome is uncertain: {failure}")),
                     Err(error) => Some(error),
                 };
-                if root_unavailable {
-                    let warning = if created { "Commit created in the captured worktree; its original binding changed or is unavailable. Reopen the worktree to inspect it." }
-                        else { "The original worktree binding changed or is unavailable. Reopen it before retrying." };
-                    notice = Some(notice.map_or_else(|| warning.to_owned(), |notice| format!("{notice}\n{warning}")));
-                }
                 for tab in &mut self.tabs { if tab.runtime.descriptor.worktree == origin.key.canonical_path { if let Some(source) = tab.sidebar.source_control.as_mut() { source.set_error(notice.clone()); } } }
                 let prior = self.notice.clone();
                 let task = self.finish_mutation(origin.card, notice);
@@ -673,10 +654,13 @@ mod tests {
         git(root, &["commit", "--allow-empty", "-m", "Captured successful commit"]);
         let oid = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
         let destination = parked.path().join("original"); std::fs::rename(root, &destination).unwrap();
-        drop(app.update(Message::GitReview(Action::Committed { origin, revision, result: Ok(CommitOutcome::Created { oid, warnings: Vec::new() }) })));
+        let task = app.update(Message::GitReview(Action::Committed { origin, revision, result: Ok(CommitOutcome::Created { oid, warnings: Vec::new() }) }));
         assert!(app.tab(card).unwrap().mutation.is_none());
         assert!(app.tab(card).unwrap().navigation.commit_message().is_empty());
-        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("Commit created") && notice.contains("unavailable")), "{:?}", app.notice);
+        // The ordinary asynchronous refresh reports the missing binding; UI
+        // delivery itself performs no filesystem validation or outcome rewrite.
+        run_tasks(&mut app, task);
+        assert!(app.notice.as_deref().is_some_and(|notice| !notice.contains("Commit failed") && (notice.contains("available") || notice.contains("No such file"))), "{:?}", app.notice);
         assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Captured successful commit");
     }
 
