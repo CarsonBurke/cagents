@@ -1,5 +1,5 @@
 //! Shared bounded search rules for editor, diff and project search surfaces.
-use crate::editor_widget::Position;
+use crate::repository_widget::text_editor::{self, Position};
 pub use crate::settings::EditorFindOptions as FindOptions;
 
 const REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -32,7 +32,7 @@ pub fn find_in_lines<T: AsRef<str>>(
 ) -> Result<Option<Vec<(Position, Position)>>, String> {
     if query.is_empty() { return Ok(Some(Vec::new())); }
     if !options.case_sensitive && !options.regex && !options.whole_word {
-        return Ok(crate::editor_widget::find_in_lines(lines, query, cancelled));
+        return Ok(text_editor::find_in_lines(lines, query, cancelled));
     }
     let regex = options.regex.then(|| pattern(query, options)).transpose()?;
     let mut matches = Vec::new();
@@ -44,7 +44,7 @@ pub fn find_in_lines<T: AsRef<str>>(
         } else if options.case_sensitive {
             Box::new(text.match_indices(query).map(|(start, _)| (start, start + query.len())))
         } else {
-            let Some(found) = crate::editor_widget::find_in_lines(std::iter::once(text), query, &cancelled) else { return Ok(None); };
+            let Some(found) = text_editor::find_in_lines(std::iter::once(text), query, &cancelled) else { return Ok(None); };
             Box::new(found.into_iter().map(|(start, end)| (start.column, end.column)))
         };
         for (index, (start, end)) in spans.enumerate() {
