@@ -1228,7 +1228,7 @@ impl Runtime {
                 ));
             }
             for item in &agent.items {
-                let Some(cached) = self.cache.get(&item.id) else {
+                let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
                 let row_index = transcript.message(
