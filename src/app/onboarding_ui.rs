@@ -43,6 +43,28 @@ pub(super) fn clone_focus_id() -> widget::Id {
     widget::Id::new("onboarding.clone.url")
 }
 
+/// Empty-workspace actions own workspace commands without borrowing a pane.
+/// Clone form fields deliberately remain ordinary native text inputs.
+pub(super) fn keyboard_focus_regions() -> Vec<(widget::Id, crate::input_trace::KeyboardRegion)> {
+    [
+        "onboarding.open-folder",
+        "onboarding.clone",
+        "onboarding.home-chat",
+        "empty.new-conversation",
+        "empty.resume-conversation",
+        "empty.new-terminal",
+        "empty.new-browser",
+        "empty.accounts",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(Provider::ALL.into_iter().map(|provider| {
+        format!("onboarding.provider.{}", provider.executable())
+    }))
+    .map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into()))
+    .collect()
+}
+
 fn clone_command(url: &str, destination: &Path) -> Result<CommandSpec, String> {
     let url = url.trim();
     if url.is_empty() || url.starts_with('-') || url.contains(['\n', '\r', '\0']) {
@@ -556,6 +578,48 @@ mod tests {
     use super::*;
     use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
     use cosmic::iced::{Event, Rectangle, Size};
+
+    #[test]
+    fn mounted_empty_workspace_actions_keep_workspace_shortcuts_after_native_focus() {
+        use iced::advanced::widget::operation::focusable;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut renderer = super::super::tests::headless_renderer();
+        for (scoped, ids) in [
+            (false, &["onboarding.open-folder", "onboarding.clone", "onboarding.home-chat"][..]),
+            (true, &["empty.new-conversation", "empty.resume-conversation", "empty.new-terminal",
+                "empty.new-browser", "empty.accounts"][..]),
+        ] {
+            for id in ids {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                if scoped { app.active_workspace = Some(root.path().to_owned()); }
+                // Render the actual application observer, not a test-only
+                // scope wrapper around a synthetic button.
+                let mut ui = UserInterface::build(cosmic::Application::view(&app),
+                    Size::new(1400., 1400.), Cache::new(), &mut renderer);
+                ui.operate(&renderer, &mut focusable::focus::<()>(widget::Id::new(*id)));
+                let key = keyboard::Key::Character("t".into());
+                let event = keyboard::Event::KeyPressed {
+                    key: key.clone(), modified_key: key,
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+                    location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL,
+                    text: None, repeat: false,
+                };
+                let mut messages = Vec::new();
+                let _ = ui.update(&[Event::Keyboard(event.clone())], mouse::Cursor::Unavailable,
+                    &mut renderer, &mut clipboard::Null, &mut messages);
+                let routed: Vec<_> = messages.iter().filter_map(|message| match message {
+                    Message::RoutedKeyEvent { region, widget, .. } => Some((*region, widget.clone())),
+                    _ => None,
+                }).collect();
+                assert_eq!(routed, vec![(workspace_widget::FocusedPane::Other.into(),
+                    Some(widget::Id::new(*id)))], "actual native action focus must retain its identity: {id}");
+                assert_eq!(workspace_widget::global_shortcut(&event, &app.settings.keyboard_shortcuts,
+                    routed[0].0.pane), Some(workspace_widget::GlobalShortcut::NewThread),
+                    "CtrlT must remain available after focusing {id}");
+            }
+        }
+    }
 
     fn activate(mut element: Element<'_, Message>, id: &str) -> Vec<Message> {
         let renderer = super::super::tests::headless_renderer();
