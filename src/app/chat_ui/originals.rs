@@ -562,6 +562,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Toggle(target,"shared-opaque-id".into())));
         let runtime=app.chat_runtime_mut(target).unwrap();
         assert!(runtime.expanded.contains("shared-opaque-id"));
+        assert!(runtime.cache["shared-opaque-id"].item.as_ref().is_some_and(|source|Arc::ptr_eq(source,&child)));
         assert!(runtime.cache["shared-opaque-id"].markdown.items().iter().any(|item|matches!(item,markdown::Item::Paragraph(text) if text.spans(design::markdown_settings(&cosmic::Theme::dark(),design::TEXT_PROSE).style).iter().any(|span|span.text.contains("CHILD")))));
         runtime.selected_subagent=Some("missing-child".into());runtime.copied=None;
         assert!(runtime.active_copy_text("shared-opaque-id",CopyPart::Text).is_none());

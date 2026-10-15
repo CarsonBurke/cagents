@@ -7678,26 +7678,11 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let Some(item)=runtime.active_item(&id).cloned() else {return Task::none();};
                     runtime.find_disclosure.manual_item(&id);
-                    if !runtime.expanded.remove(&id) {
-                        runtime.expanded.insert(id.clone());
-                    }
-                    {
-                        let previous = runtime.cache.remove(&id);
-                        runtime.cache.insert(
-                            id.clone(),
-                            CachedItem::updated(
-                                &item.content,
-                                runtime.syntax_theme,
-                                previous,
-                                runtime.expanded.contains(&id),
-                                false,
-                                chat::coordination::recognize(
-                                    &item,
-                                    runtime.session.launch.provider,
-                                ),
-                            ),
-                        );
-                    }
+                    if !runtime.expanded.remove(&id) {runtime.expanded.insert(id.clone());}
+                    let previous=runtime.cache.remove(&id);
+                    let mut cached=CachedItem::updated(&item.content,runtime.syntax_theme,previous,runtime.expanded.contains(&id),false,
+                        chat::coordination::recognize(&item,runtime.session.launch.provider));
+                    cached.item=Some(item);runtime.cache.insert(id,cached);
                 }
             }
             Action::ToggleTurn(target, key) => {
