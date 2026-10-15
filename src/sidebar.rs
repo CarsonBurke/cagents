@@ -208,10 +208,11 @@ impl SidebarModel {
     /// path/identity fallback, independent of asynchronous load completion.
     pub fn apply_project_order(&mut self, order: &[ProjectId]) {
         self.projects.sort_by_key(|project| {
-            (order
-                .iter()
-                .position(|id| *id == project.id)
-                .unwrap_or(usize::MAX),
+            (
+                order
+                    .iter()
+                    .position(|id| *id == project.id)
+                    .unwrap_or(usize::MAX),
                 project.repository.clone(),
                 project.id,
             )
@@ -866,7 +867,12 @@ impl SidebarWorktree {
                     .as_deref()
                     .and_then(|branch| search_score(branch, query)),
             )
-            .chain(self.chrome.folded_pr_title.as_deref().and_then(|title| search_score(title, query)))
+            .chain(
+                self.chrome
+                    .folded_pr_title
+                    .as_deref()
+                    .and_then(|title| search_score(title, query)),
+            )
             .min()
             .or_else(|| {
                 query
@@ -955,7 +961,9 @@ impl SidebarWorktree {
         self.chrome.paneless_accessible_name = paneless_name(&accessible_name);
         self.chrome.accessible_name = accessible_name.into_boxed_str();
         let mut tooltip = format!(
-            "{}\nBranch: {branch}\n{}\n{status}", self.chrome.label, self.path.display()
+            "{}\nBranch: {branch}\n{}\n{status}",
+            self.chrome.label,
+            self.path.display()
         );
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
@@ -4700,8 +4708,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4725,16 +4738,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4949,8 +4966,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -5270,16 +5287,26 @@ fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
         (Some(first), Some(last)) if letters.len() > 1 => format!("{first}{last}"),
         (Some(first), _) => first.to_string(),
         _ => "?".to_owned(),
-    }.to_uppercase();
-    let hash = name.bytes().fold(2_166_136_261u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(16_777_619));
+    }
+    .to_uppercase();
+    let hash = name.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
     // Saturated, moderately dark colours support white text in either theme.
     let hue = (hash % 360) as f32 / 60.0;
     let x = 0.40 * (1.0 - (hue % 2.0 - 1.0).abs());
     let (r, g, b) = match hue as u8 {
-        0 => (0.40, x, 0.0), 1 => (x, 0.40, 0.0), 2 => (0.0, 0.40, x),
-        3 => (0.0, x, 0.40), 4 => (x, 0.0, 0.40), _ => (0.40, 0.0, x),
+        0 => (0.40, x, 0.0),
+        1 => (x, 0.40, 0.0),
+        2 => (0.0, 0.40, x),
+        3 => (0.0, x, 0.40),
+        4 => (x, 0.0, 0.40),
+        _ => (0.40, 0.0, x),
     };
-    (initials, cosmic::iced::Color::from_rgb(r + 0.08, g + 0.08, b + 0.08))
+    (
+        initials,
+        cosmic::iced::Color::from_rgb(r + 0.08, g + 0.08, b + 0.08),
+    )
 }
 
 /// Derived once for this compact project, rather than rescanning every card
@@ -5290,34 +5317,63 @@ struct CompactProjectAttention {
     waiting_worktrees: BTreeSet<WorktreeId>,
 }
 
-fn compact_project_attention(project: &SidebarProject, state: &SidebarState) -> CompactProjectAttention {
+fn compact_project_attention(
+    project: &SidebarProject,
+    state: &SidebarState,
+) -> CompactProjectAttention {
     use crate::agent::ActivityState;
     let worktrees: BTreeSet<_> = project.worktrees.iter().map(|row| row.id).collect();
     let mut waiting_worktrees = BTreeSet::new();
     let mut working = false;
     for entry in state.agent_activity.values() {
-        let Some((owner, worktree)) = entry.owner else { continue; };
-        if owner != project.id || !worktrees.contains(&worktree) { continue; }
+        let Some((owner, worktree)) = entry.owner else {
+            continue;
+        };
+        if owner != project.id || !worktrees.contains(&worktree) {
+            continue;
+        }
         match entry.activity.state {
-            ActivityState::Waiting => { waiting_worktrees.insert(worktree); },
+            ActivityState::Waiting => {
+                waiting_worktrees.insert(worktree);
+            }
             ActivityState::Working => working = true,
-            _ => {},
+            _ => {}
         }
     }
     let waiting = !waiting_worktrees.is_empty()
-        || project.channels.iter().any(|row| row.activity == Some(ActivityState::Waiting));
-    working |= project.channels.iter().any(|row| row.activity == Some(ActivityState::Working));
+        || project
+            .channels
+            .iter()
+            .any(|row| row.activity == Some(ActivityState::Waiting));
+    working |= project
+        .channels
+        .iter()
+        .any(|row| row.activity == Some(ActivityState::Working));
     let unread = project.channels.iter().any(|row| row.unread)
-        || state.agent_updates.values().flatten().any(|(owner, worktree)|
-            *owner == project.id && worktrees.contains(worktree));
+        || state
+            .agent_updates
+            .values()
+            .flatten()
+            .any(|(owner, worktree)| *owner == project.id && worktrees.contains(worktree));
     CompactProjectAttention {
-        activity: if waiting { Some(ActivityState::Waiting) } else if working { Some(ActivityState::Working) } else { None },
+        activity: if waiting {
+            Some(ActivityState::Waiting)
+        } else if working {
+            Some(ActivityState::Working)
+        } else {
+            None
+        },
         unread,
         waiting_worktrees,
     }
 }
 
-fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open: bool, state: &SidebarState) -> Element<'static, SidebarAction> {
+fn compact_project_identity(
+    project: &SidebarProject,
+    selected: bool,
+    modal_open: bool,
+    state: &SidebarState,
+) -> Element<'static, SidebarAction> {
     let (initials, color) = project_identity(&project.name);
     let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
         project_icon(project, ROW_ICON_WIDTH as u16)
@@ -5327,35 +5383,68 @@ fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open
     let chip = widget::container(identity)
         .center_x(ROW_ICON_WIDTH)
         .center_y(24.0)
-        .class(theme::Container::custom(move |_theme| cosmic::iced::widget::container::Style {
-            background: Some(color.into()),
-            text_color: Some(cosmic::iced::Color::WHITE),
-            border: cosmic::iced::Border {
-                color: if selected { cosmic::iced::Color::WHITE } else { color },
-                width: if selected { 2.0 } else { 0.0 },
-                radius: 4.0.into(),
-            },
-            ..Default::default()
+        .class(theme::Container::custom(move |_theme| {
+            cosmic::iced::widget::container::Style {
+                background: Some(color.into()),
+                text_color: Some(cosmic::iced::Color::WHITE),
+                border: cosmic::iced::Border {
+                    color: if selected {
+                        cosmic::iced::Color::WHITE
+                    } else {
+                        color
+                    },
+                    width: if selected { 2.0 } else { 0.0 },
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
         }));
     let attention = compact_project_attention(project, state);
     let (activity, unread) = (attention.activity, attention.unread);
     let mut description = project.name.clone();
     for worktree in &project.worktrees {
         use std::fmt::Write as _;
-        let selected = state.selection == Some(SidebarSelection::Worktree { project_id: project.id, worktree_id: worktree.id });
-        let _ = write!(description, "\n{}{}: {}", if selected { "Selected " } else { "" }, worktree.label(),
-            status_summary(worktree.detached, worktree.locked, worktree.dirty.as_ref(), worktree.untracked_omitted, worktree.ahead, worktree.behind));
+        let selected = state.selection
+            == Some(SidebarSelection::Worktree {
+                project_id: project.id,
+                worktree_id: worktree.id,
+            });
+        let _ = write!(
+            description,
+            "\n{}{}: {}",
+            if selected { "Selected " } else { "" },
+            worktree.label(),
+            status_summary(
+                worktree.detached,
+                worktree.locked,
+                worktree.dirty.as_ref(),
+                worktree.untracked_omitted,
+                worktree.ahead,
+                worktree.behind
+            )
+        );
         if attention.waiting_worktrees.contains(&worktree.id) {
             description.push_str(", agent needs input");
         }
     }
-    if unread { description.push_str("\nUnread agent update"); }
-    if activity == Some(crate::agent::ActivityState::Waiting) { description.push_str("\nAn agent is waiting for input"); }
+    if unread {
+        description.push_str("\nUnread agent update");
+    }
+    if activity == Some(crate::agent::ActivityState::Waiting) {
+        description.push_str("\nAn agent is waiting for input");
+    }
     let grid = RowGrid::child(true);
-    let control = grid.control(grid.content(chip, None, agent_indicator(activity, unread)), selected)
+    let control = grid
+        .control(
+            grid.content(chip, None, agent_indicator(activity, unread)),
+            selected,
+        )
         .id(project.chrome.open_id.clone())
         .name(description.clone())
-        .on_press_maybe(project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open)));
+        .on_press_maybe(
+            project_primary_action(project, state.filter)
+                .and_then(|action| gated(action, modal_open)),
+        );
     grid.mount(crate::interaction::tooltip(control, description))
 }
 
@@ -5415,21 +5504,24 @@ fn compact_project<'a>(
                 || channel.activity.is_some()
                 || channel.deletion.is_some())
     }) {
-        members.push((SelectionRow::Channel(channel.id), RowInteraction::selectable(
-            channel_view(
-                channel,
-                modal_open,
-                true,
-                project
-                    .state
-                    .rows
-                    .group_size(SelectionRow::Channel(channel.id)),
-                &project.state.query,
-            ),
+        members.push((
             SelectionRow::Channel(channel.id),
-            project.state,
-            !modal_open && channel.deletion != Some(RowDeletion::Deleting),
-        )));
+            RowInteraction::selectable(
+                channel_view(
+                    channel,
+                    modal_open,
+                    true,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Channel(channel.id)),
+                    &project.state.query,
+                ),
+                SelectionRow::Channel(channel.id),
+                project.state,
+                !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+            ),
+        ));
     }
     for &worktree in project.worktrees.iter().filter(|worktree| {
         expanded
@@ -5447,37 +5539,42 @@ fn compact_project<'a>(
                     .agent_activity(entity.id, worktree.id)
                     .is_some())
     }) {
-        members.push((SelectionRow::Worktree(entity.id, worktree.id), RowInteraction::selectable(
-            worktree_view(
-                entity.id,
-                worktree,
-                is_primary_worktree(&entity.repository, &worktree.path),
-                project.state.filter == SidebarFilter::PullRequests,
-                selection,
-                modal_open,
-                entity.github_ready,
-                project.editors,
-                project.state.has_agent_update(entity.id, worktree.id),
-                project.state.agent_activity(entity.id, worktree.id),
-                project.state.worktree_has_panes(entity.id, worktree.id),
-                true,
-                project
-                    .state
-                    .rows
-                    .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
-                &project.state.query,
-                !project.state.hide_worktree_changes_icons,
-            ),
+        members.push((
             SelectionRow::Worktree(entity.id, worktree.id),
-            project.state,
-            !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
-        )));
+            RowInteraction::selectable(
+                worktree_view(
+                    entity.id,
+                    worktree,
+                    is_primary_worktree(&entity.repository, &worktree.path),
+                    project.state.filter == SidebarFilter::PullRequests,
+                    selection,
+                    modal_open,
+                    entity.github_ready,
+                    project.editors,
+                    project.state.has_agent_update(entity.id, worktree.id),
+                    project.state.agent_activity(entity.id, worktree.id),
+                    project.state.worktree_has_panes(entity.id, worktree.id),
+                    true,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                    &project.state.query,
+                    !project.state.hide_worktree_changes_icons,
+                ),
+                SelectionRow::Worktree(entity.id, worktree.id),
+                project.state,
+                !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
+            ),
+        ));
     }
     if !project.state.query.trim().is_empty() {
         let ranks = navigation_search_ranks(entity, &fold(project.state.query.trim()));
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
-    for (_, member) in members { column = column.push(member); }
+    for (_, member) in members {
+        column = column.push(member);
+    }
     widget::container(RowInteraction::group(
         header,
         column.into(),
@@ -6948,15 +7045,21 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
-    if let Some(branch) = worktree.and_then(|row| row.branch.as_deref()).filter(|_| !worktree.is_some_and(|row| row.detached)) {
+    if let Some(branch) = worktree
+        .and_then(|row| row.branch.as_deref())
+        .filter(|_| !worktree.is_some_and(|row| row.detached))
+    {
         header = header.push(icon_action(
             Icon::CopyPath,
             format!("Copy branch {branch}"),
-            gated(SidebarAction::ProjectCommand {
-                project_id: key.project_id,
-                worktree_id: Some(key.worktree_id),
-                command: ProjectCommand::CopyBranch,
-            }, modal_open),
+            gated(
+                SidebarAction::ProjectCommand {
+                    project_id: key.project_id,
+                    worktree_id: Some(key.worktree_id),
+                    command: ProjectCommand::CopyBranch,
+                },
+                modal_open,
+            ),
             entity_id("source.copy-branch", key.worktree_id),
         ));
     }
@@ -9544,14 +9647,26 @@ fn navigation_item(
     }
 }
 
-fn navigation_search_ranks(project: &SidebarProject, query: &str) -> std::collections::HashMap<SelectionRow, usize> {
-    project.channels.iter().map(|channel| (
-        SelectionRow::Channel(channel.id),
-        search_score(&channel.folded_title, query).unwrap_or(usize::MAX),
-    )).chain(project.worktrees.iter().map(|worktree| (
-        SelectionRow::Worktree(project.id, worktree.id),
-        worktree.search_rank(query).unwrap_or(usize::MAX),
-    ))).collect()
+fn navigation_search_ranks(
+    project: &SidebarProject,
+    query: &str,
+) -> std::collections::HashMap<SelectionRow, usize> {
+    project
+        .channels
+        .iter()
+        .map(|channel| {
+            (
+                SelectionRow::Channel(channel.id),
+                search_score(&channel.folded_title, query).unwrap_or(usize::MAX),
+            )
+        })
+        .chain(project.worktrees.iter().map(|worktree| {
+            (
+                SelectionRow::Worktree(project.id, worktree.id),
+                worktree.search_rank(query).unwrap_or(usize::MAX),
+            )
+        }))
+        .collect()
 }
 
 /// The selectable rows actually drawn, including disclosure and filter state.
@@ -9605,7 +9720,8 @@ pub fn visible_selection_rows(
             );
             if searching {
                 let ranks = navigation_search_ranks(project.project, &fold(state.query.trim()));
-                rows[first..].sort_by_cached_key(|row| ranks.get(row).copied().unwrap_or(usize::MAX));
+                rows[first..]
+                    .sort_by_cached_key(|row| ranks.get(row).copied().unwrap_or(usize::MAX));
             } else if !compact {
                 apply_navigation_order(
                     &mut rows[first..],
@@ -9959,44 +10075,72 @@ fn search_label(
         // renderer cannot ellipsize spans. Reuse the fit until the slot changes.
         let label = {
             let mut fitted = fitted.borrow_mut();
-            if fitted.as_ref().is_none_or(|(width, _)| *width != slot.width.to_bits()) {
-                *fitted = Some((slot.width.to_bits(), ellipsize_search_label(&label, slot.width, |candidate| {
-                    search_spans_width(candidate, &query, size, font, emphasis)
-                })));
+            if fitted
+                .as_ref()
+                .is_none_or(|(width, _)| *width != slot.width.to_bits())
+            {
+                *fitted = Some((
+                    slot.width.to_bits(),
+                    ellipsize_search_label(&label, slot.width, |candidate| {
+                        search_spans_width(candidate, &query, size, font, emphasis)
+                    }),
+                ));
             }
             fitted.as_ref().expect("fitted label").1.clone()
         };
         let spans = search_label_spans(&label, &query, emphasis);
-        widget::container(cosmic::iced::widget::rich_text(spans)
-            .size(size)
-            .font(font)
-            .class(class.clone())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .width(Length::Fill))
-            .width(Length::Fill)
-            .clip(true)
-            .into()
+        widget::container(
+            cosmic::iced::widget::rich_text(spans)
+                .size(size)
+                .font(font)
+                .class(class.clone())
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .into()
     })
     .height(size * 1.5)
     .into()
 }
 
-fn search_label_spans(label: &str, query: &str, emphasis: cosmic::iced::Font) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
+fn search_label_spans(
+    label: &str,
+    query: &str,
+    emphasis: cosmic::iced::Font,
+) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
     use cosmic::iced::widget::text::Span;
     let mut spans = Vec::new();
     let mut cursor = 0;
     for range in search_highlight_ranges(label, query) {
-        if cursor < range.start { spans.push(Span::new(label[cursor..range.start].to_owned())); }
-        spans.push(Span::new(label[range.clone()].to_owned()).font(emphasis)
-            .color(design::accent_color(&cosmic::theme::active())));
+        if cursor < range.start {
+            spans.push(Span::new(label[cursor..range.start].to_owned()));
+        }
+        spans.push(
+            Span::new(label[range.clone()].to_owned())
+                .font(emphasis)
+                .color(design::accent_color(&cosmic::theme::active())),
+        );
         cursor = range.end;
     }
-    if cursor < label.len() { spans.push(Span::new(label[cursor..].to_owned())); }
+    if cursor < label.len() {
+        spans.push(Span::new(label[cursor..].to_owned()));
+    }
     spans
 }
 
-fn search_spans_width(label: &str, query: &str, size: f32, font: cosmic::iced::Font, emphasis: cosmic::iced::Font) -> f32 {
-    use cosmic::iced::{Pixels, Size, advanced::text::{self, Paragraph as _}};
+fn search_spans_width(
+    label: &str,
+    query: &str,
+    size: f32,
+    font: cosmic::iced::Font,
+    emphasis: cosmic::iced::Font,
+) -> f32 {
+    use cosmic::iced::{
+        Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
     let spans = search_label_spans(label, query, emphasis);
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_spans(text::Text {
         content: &spans,
@@ -10033,7 +10177,6 @@ fn ellipsize_search_label(label: &str, width: f32, measure: impl Fn(&str) -> f32
         }
     }
     format!("{}…", &label[..boundaries[low.saturating_sub(1)]])
-
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -10603,7 +10746,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11205,8 +11350,10 @@ pub(crate) mod tests {
         let mut source = source_control();
         source.key.worktree_id = row.id;
         let state = SidebarState::default();
-        let actions = frame_enter_presses(&renderer, source_control_header(
-            &state, &source, Some(&row), false, PanelView::Files));
+        let actions = frame_enter_presses(
+            &renderer,
+            source_control_header(&state, &source, Some(&row), false, PanelView::Files),
+        );
         assert!(actions.iter().any(|action| matches!(action,
             SidebarAction::ProjectCommand { worktree_id: Some(id), command: ProjectCommand::CopyBranch, .. } if *id == row.id)));
         assert_eq!(row.label(), row.branch.as_deref().unwrap());
@@ -11218,8 +11365,16 @@ pub(crate) mod tests {
         let matching = worktree(60, "feature login", false);
         let row = SelectionRow::Worktree(project.id, matching.id);
         project.worktrees.push(matching);
-        project.channels.push(SidebarChannel::new(ChannelId::new(),
-            "Investigate task in alpha-wt-feat".into(), false, None, false, 1, true, 1));
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "Investigate task in alpha-wt-feat".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        ));
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
         let mut state = SidebarState::default();
         state.query = "feat".into();
@@ -11229,11 +11384,29 @@ pub(crate) mod tests {
 
     #[test]
     fn literal_branch_labels_preserve_prefixes_and_punctuation() {
-        for branch in ["feature/auth-fix", "bugfix/auth-fix", "feat-z", "snake_case"] {
-            assert_eq!(worktree_display_name(Path::new("/repo/worktree-dir"), Some(branch), false), branch);
+        for branch in [
+            "feature/auth-fix",
+            "bugfix/auth-fix",
+            "feat-z",
+            "snake_case",
+        ] {
+            assert_eq!(
+                worktree_display_name(Path::new("/repo/worktree-dir"), Some(branch), false),
+                branch
+            );
         }
-        assert_eq!(worktree_display_name(Path::new("/repo/detached-dir"), Some("ignored/branch"), true), "detached-dir");
-        assert_eq!(worktree_display_name(Path::new("/repo/no-branch"), None, false), "no-branch");
+        assert_eq!(
+            worktree_display_name(
+                Path::new("/repo/detached-dir"),
+                Some("ignored/branch"),
+                true
+            ),
+            "detached-dir"
+        );
+        assert_eq!(
+            worktree_display_name(Path::new("/repo/no-branch"), None, false),
+            "no-branch"
+        );
     }
 
     #[test]
@@ -11245,44 +11418,81 @@ pub(crate) mod tests {
         assert_ne!(first.1, second.1);
         let project = project();
         let mut state = SidebarState::default();
-        state.set_agent_activity(CardId::new(), project.id, project.worktrees[0].id,
-            crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Waiting });
+        state.set_agent_activity(
+            CardId::new(),
+            project.id,
+            project.worktrees[0].id,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
         let attention = compact_project_attention(&project, &state);
         let (activity, unread) = (attention.activity, attention.unread);
         assert_eq!(activity, Some(crate::agent::ActivityState::Waiting));
         assert!(agent_indicator(activity, unread).is_some());
         let renderer = headless_renderer();
-        let names = accessible_names(&renderer, compact_project_identity(&project, true, false, &state));
-        assert!(names.iter().any(|name| name.contains(&project.name)
-            && name.contains("agent is waiting for input")), "{names:?}");
+        let names = accessible_names(
+            &renderer,
+            compact_project_identity(&project, true, false, &state),
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains(&project.name)
+                    && name.contains("agent is waiting for input")),
+            "{names:?}"
+        );
     }
 
     #[test]
     fn highlighted_labels_truncate_to_measured_slot_with_an_ellipsis() {
         let _renderer = headless_renderer();
         let font = cosmic::font::default();
-        let emphasis = cosmic::iced::Font { weight: cosmic::iced::font::Weight::Bold, ..font };
+        let emphasis = cosmic::iced::Font {
+            weight: cosmic::iced::font::Weight::Bold,
+            ..font
+        };
         let label = "feature/authentication-long-λ-branch";
         for width in [55.0, 105.0, 170.0] {
-            let truncated = ellipsize_search_label(label, width, |label| search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis));
+            let truncated = ellipsize_search_label(label, width, |label| {
+                search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
+            });
             assert!(truncated.ends_with('…'), "{truncated}");
-            assert!(search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis) <= width);
+            assert!(
+                search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
+                    <= width
+            );
             assert!(!search_highlight_ranges(&truncated, "feat").is_empty());
         }
-        assert_eq!(ellipsize_search_label(label, 2000.0, |label| search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)), label);
+        assert_eq!(
+            ellipsize_search_label(label, 2000.0, |label| search_spans_width(
+                label,
+                "feat",
+                CHILD_ROW_TEXT_SIZE,
+                font,
+                emphasis
+            )),
+            label
+        );
         assert!(search_highlight_ranges("fast elegant audit trail", "feat").is_empty());
     }
 
     #[test]
     fn shuffled_unknown_projects_use_a_stable_fallback_then_durable_order() {
-        let projects: Vec<_> = ["gamma", "alpha", "beta"].into_iter().enumerate().map(|(index, name)| {
-            let mut project = project();
-            project.id = project_id(index as u128 + 20);
-            project.repository = PathBuf::from(format!("/repo/{name}"));
-            project
-        }).collect();
+        let projects: Vec<_> = ["gamma", "alpha", "beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut project = project();
+                project.id = project_id(index as u128 + 20);
+                project.repository = PathBuf::from(format!("/repo/{name}"));
+                project
+            })
+            .collect();
         let mut first = SidebarModel::ready(SidebarMode::Expanded, projects.clone());
-        let mut second = SidebarModel::ready(SidebarMode::Expanded, projects.into_iter().rev().collect());
+        let mut second =
+            SidebarModel::ready(SidebarMode::Expanded, projects.into_iter().rev().collect());
         first.apply_project_order(&[]);
         second.apply_project_order(&[]);
         assert_eq!(first.projects, second.projects);
@@ -11486,58 +11696,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 
@@ -12097,7 +12310,11 @@ pub(crate) mod tests {
         row.set_pull_request(pr);
         assert_eq!(&*row.chrome.label, branch);
         assert!(row.matches("challenge"));
-        assert!(row.chrome.tooltip.contains("Fix browser challenge handling"));
+        assert!(
+            row.chrome
+                .tooltip
+                .contains("Fix browser challenge handling")
+        );
         assert!(row.chrome.tooltip.contains(branch));
         row.clear_pull_request();
         assert_eq!(&*row.chrome.label, branch);
