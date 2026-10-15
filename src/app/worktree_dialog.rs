@@ -1083,10 +1083,16 @@ mod tests {
         assert!(token.is_cancelled());
 
         // A new dialog is not answered by the old resolution.
-        let _ = app.update(Message::Sidebar(SidebarAction::NewWorktree {
-            project_id: project,
-            repository: PathBuf::from("/repo"),
-        }));
+        drop(app.open_worktree_dialog_with_source(
+            project,
+            PathBuf::from("/repo"),
+            WorktreeDraft::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
         let _ = app.update(Message::WorktreeInputResolved {
             project_id: project,
             operation_id: id,
