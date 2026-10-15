@@ -2389,8 +2389,7 @@ mod tests {
                 linked_directory.path().to_owned(),
                 Some("feature/login".into()),
             );
-            let (mut app, _state, project) =
-                deletable_app(repository.path(), &linked, &primary);
+            let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
             drop(app.select_worktree(repository.path().to_owned(), false));
             let old_scope = app.active_workspace.clone();
             let old_channel = app.durable.active_channel;
@@ -2413,31 +2412,52 @@ mod tests {
                 worktree_id: Some(linked.id),
                 command: ProjectCommand::NewChannel,
             });
-            assert_eq!(app.durable.cards, old_cards, "no eager draft before preparation");
+            assert_eq!(
+                app.durable.cards, old_cards,
+                "no eager draft before preparation"
+            );
             assert_eq!(app.active_workspace, old_scope);
             let prepared = super::super::tests::task_app_message(task);
-            assert!(calls.load(Ordering::Relaxed) > 0, "exercise actual local preparation");
-            assert!(matches!(&prepared, Message::WorktreeSelectionPrepared { .. }));
+            assert!(
+                calls.load(Ordering::Relaxed) > 0,
+                "exercise actual local preparation"
+            );
+            assert!(matches!(
+                &prepared,
+                Message::WorktreeSelectionPrepared { .. }
+            ));
             drop(app.update(prepared));
             if blocked {
-                assert_eq!(app.durable.cards, old_cards, "refused acquisition creates no draft");
+                assert_eq!(
+                    app.durable.cards, old_cards,
+                    "refused acquisition creates no draft"
+                );
                 assert_eq!(app.durable.card_scopes, old_scopes);
                 assert_eq!(app.workspace.order().collect::<Vec<_>>(), old_order);
                 assert_eq!(app.active_workspace, old_scope);
                 assert_eq!(app.durable.active_channel, old_channel);
             } else {
-                assert_eq!(app.active_workspace.as_deref(), Some(linked_directory.path()));
+                assert_eq!(
+                    app.active_workspace.as_deref(),
+                    Some(linked_directory.path())
+                );
                 assert!(app.durable.active_channel.is_none());
-                assert!(app.durable.channels.is_empty(), "worktree action creates a native thread");
+                assert!(
+                    app.durable.channels.is_empty(),
+                    "worktree action creates a native thread"
+                );
                 assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
                     CardKind::Chat(session)
                         if session.launch.recipe.working_directory == linked_directory.path())));
-                assert!(matches!(
-                    crate::worktree_cleanup::fixture_protection(
-                        runtime.path(), linked_directory.path(), true,
+                assert!(
+                    matches!(
+                        crate::worktree_cleanup::fixture_protection(
+                            runtime.path(), linked_directory.path(), true,
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
                     ),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                ), "committed draft retains the actual selected directory lease");
+                    "committed draft retains the actual selected directory lease"
+                );
             }
         }
     }

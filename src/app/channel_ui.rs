@@ -881,7 +881,9 @@ impl Cagents {
                 .push(channel);
         }
         for project in &mut self.sidebar_model.projects {
-            let primary_branch = project.worktrees.iter()
+            let primary_branch = project
+                .worktrees
+                .iter()
                 .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
                 .and_then(|worktree| worktree.branch.as_deref());
             let mut index = 0;
@@ -996,8 +998,14 @@ mod tests {
 
     #[test]
     fn new_channel_titles_name_the_branch() {
-        assert_eq!(new_channel_title(Some("feature/login")), "New channel · feature/login");
-        assert_eq!(new_channel_title(Some("refs/heads/main")), "New channel · main");
+        assert_eq!(
+            new_channel_title(Some("feature/login")),
+            "New channel · feature/login"
+        );
+        assert_eq!(
+            new_channel_title(Some("refs/heads/main")),
+            "New channel · main"
+        );
         assert_eq!(new_channel_title(None), "New channel");
     }
 
@@ -1092,7 +1100,10 @@ mod tests {
         let first = app.durable.active_channel.expect("the first channel opens");
         assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
         app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_model.projects[0].channels[0].title, "New channel · main");
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0].title,
+            "New channel · main"
+        );
         let _ = app.handle_channel_ui(Action::Create(project));
         let second = app
             .durable
