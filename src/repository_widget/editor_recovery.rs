@@ -24,8 +24,8 @@ impl RepositoryRuntime {
         }
     }
     pub(super) fn retain_action_recovery(&mut self, action: &RepositoryAction) {
-        if let RepositoryAction::DiskLoaded { ticket, .. } = action
-            && self.recovery_capture_ticket == Some(*ticket) {
+        if let RepositoryAction::DiskLoaded { capture: Some(nonce), .. } = action
+            && self.recovery_capture_ticket == Some(*nonce) {
             self.recovery_capture_ticket = None;
         }
         let authority = match action {
@@ -119,6 +119,11 @@ mod tests {
         let task = runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 7, result: Ok(Some(stamp)) });
         assert!(runtime.has_editor_recovery()); assert!(runtime.blocks_navigation());
         assert!(runtime.recovery.is_none(), "this is an admitted worker, not an invented error");
+        let owned_nonce = runtime.recovery_capture_ticket;
+        let old_identity = runtime.current_identity(card, "notes.txt".into());
+        drop(runtime.update(RepositoryAction::DiskLoaded { identity: old_identity, ticket: 7, capture: None, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Io("older normal Runtime read".into())) }));
+        assert_eq!(runtime.recovery_capture_ticket, owned_nonce, "a reconstructed Runtime can reuse both poll ticket and AsyncIdentity");
+        assert!(runtime.has_editor_recovery());
         let mut stream = iced::runtime::task::into_stream(task).expect("real capture worker");
         let mut received = false;
         while let Some(iced::runtime::Action::Output(action)) = stream.next().await {
@@ -139,7 +144,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("file"), "text").unwrap();
         let state = crate::editor_reload::stamp(directory.path(), Path::new("file"), Path::new("file")).unwrap().unwrap();
-        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, stamp: state, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "retained late failure".into(), authority: authority.clone() }) }));
+        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, capture: None, stamp: state, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "retained late failure".into(), authority: authority.clone() }) }));
         assert!(runtime.has_editor_recovery());
         let (mut replacement, _) = RepositoryRuntime::post_persist_failure_fixture(card);
         drop(replacement.update(RepositoryAction::ResolveEditorRecovery { card, authority: authority.clone() }));

@@ -702,7 +702,7 @@ pub enum RepositoryAction {
     NavigateLocation { card: CardId, forward: bool },
     DiskMetadata { identity: AsyncIdentity, ticket: u64, result: Result<Option<crate::editor_reload::Stamp>, String> },
     ComparisonMetadata { identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String> },
-    DiskLoaded { identity: AsyncIdentity, ticket: u64, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, FileIoError> },
+    DiskLoaded { identity: AsyncIdentity, ticket: u64, capture: Option<uuid::Uuid>, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, FileIoError> },
     CompareDisk { card: CardId },
     DiskComparisonLoaded { identity: AsyncIdentity, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
     KeepMine { card: CardId },
@@ -2557,7 +2557,7 @@ pub struct RepositoryRuntime {
     pending_source_location: Option<(PathBuf, usize)>,
     pending_editor_focus: Option<AsyncIdentity>,
     recovery: Option<editor_recovery::State>,
-    recovery_capture_ticket: Option<u64>,
+    recovery_capture_ticket: Option<uuid::Uuid>,
     next_save_ticket: u64,
     next_diff_request: u64,
     /// Identity the application gave the open buffer at the LSP boundary, or
@@ -6644,7 +6644,10 @@ impl RepositoryRuntime {
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         // Retain before stale-ticket/context guards: a rejected receipt must
         // never discard its only live recovery authority.
+        let stale_capture = matches!(&action, RepositoryAction::DiskLoaded { capture, .. }
+            if *capture != self.recovery_capture_ticket && (capture.is_some() || self.recovery_capture_ticket.is_some()));
         self.retain_action_recovery(&action);
+        if stale_capture { return Task::none(); }
         if self.has_editor_recovery() && matches!(&action,
             RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }
             | RepositoryAction::DiscardEdits { .. } | RepositoryAction::StageSelected { .. }) {
@@ -6726,15 +6729,16 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 document.external_check_pending = true;
-                if capture { self.recovery_capture_ticket = Some(ticket); }
+                let capture_nonce = capture.then(uuid::Uuid::new_v4);
+                if capture { self.recovery_capture_ticket = capture_nonce; }
                 let baseline = document.disk_hash; let before = document.saved_text.clone();
                 let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || crate::editor_reload::load_with_restoration(&worktree, &path, &before, tone, capture)).await.map_err(|error| FileIoError::Io(error.to_string())).and_then(|result| result);
-                    RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result }
+                    RepositoryAction::DiskLoaded { identity, ticket, capture: capture_nonce, stamp, baseline, result }
                 })
             }
-            RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result } => {
+            RepositoryAction::DiskLoaded { identity, ticket, capture: _, stamp, baseline, result } => {
                 if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
                 self.disk_poll = None;
                 let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
@@ -14015,7 +14019,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap(); std::fs::write(directory.path().join("file"), "text").unwrap();
             let stamp = crate::editor_reload::stamp(directory.path(), Path::new("file"), Path::new("file")).unwrap().unwrap();
             let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("late source".into(), || Ok(()));
-            drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "late read cleanup".into(), authority: authority.clone() }) }));
+            drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, capture: None, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "late read cleanup".into(), authority: authority.clone() }) }));
             let action = click_native_repository_control(view(card, &runtime), "Retry file recovery");
             let task = runtime.update(action);
             if loading {
@@ -16122,7 +16126,7 @@ mod tests {
         let path = runtime.selected_path().unwrap().to_path_buf();
         let identity = runtime.current_identity(card, path.clone());
         runtime.disk_poll = Some((1, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
+        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, capture: None, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
             text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
             mapping: crate::editor_reload::LineMap::between(before, after), restoration: None,
         }) }));
