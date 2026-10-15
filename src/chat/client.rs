@@ -501,7 +501,19 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
-        let inner = Self::fixture_unbound(session, snapshot);
+        Self::fixture_account_home(session, snapshot, None)
+    }
+
+    /// Models trusted attachment metadata before binding any cached reader.
+    /// It conveys association only, never provider read authority.
+    #[cfg(test)]
+    pub(crate) fn fixture_account_home(
+        session: Session,
+        snapshot: Snapshot,
+        account_home: Option<crate::account::HomeIdentity>,
+    ) -> Self {
+        let mut inner = Self::fixture_unbound(session, snapshot);
+        Arc::get_mut(&mut inner).unwrap().account_home = account_home;
         inner.offline.bind(&inner);
         Self { inner }
     }
