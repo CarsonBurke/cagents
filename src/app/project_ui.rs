@@ -204,6 +204,8 @@ struct Dialog {
     branch_choice_edited: bool,
     busy_agents: Vec<BusyAgent>,
     session_census: Vec<BusyAgent>,
+    /// Explicit consent covers the complete observed roster, including idle
+    /// sessions and all work they may admit before the guarded stop takes it.
     busy_confirmed: Option<Vec<BusyAgent>>,
     stale_lock: bool,
 }
@@ -235,6 +237,11 @@ struct CleanupPolicyDialog {
 }
 
 impl Dialog {
+    fn sessions_consented(&self) -> bool {
+        self.session_census.is_empty()
+            || self.busy_confirmed.as_ref() == Some(&self.session_census)
+    }
+
     fn message(&self) -> Option<&str> {
         self.blocker.as_deref().or(self.failure.as_deref())
     }
@@ -1851,7 +1858,7 @@ impl Cagents {
                     .as_mut()
                     .filter(|dialog| dialog.request == request && !dialog.loading && !dialog.options_loading)
                 {
-                    dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone());
+                    dialog.busy_confirmed = value.then(|| dialog.session_census.clone());
                 }
             }
             Action::StaleUnlocked { request, result } => {
@@ -1889,12 +1896,11 @@ impl Cagents {
                     return Task::none();
                 };
                 let target = dialog.target.clone();
-                let busy = self.worktree_busy_agents(&target);
                 if dialog.blocker.is_some()
                     || dialog.loading
                     || dialog.options_loading
                     || dialog.safety.is_none()
-                    || (busy > 0 && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents))
+                    || !dialog.sessions_consented()
                 {
                     return Task::none();
                 }
@@ -1967,7 +1973,6 @@ impl Cagents {
                             || dialog.session_census != agents.census;
                         dialog.busy_agents = agents.agents;
                         dialog.session_census = agents.census;
-                        let busy = dialog.busy_agents.len();
                         if confirming && !on_top {
                             dialog.safety = Some(snapshot);
                             dialog.busy_confirmed = None;
@@ -1979,13 +1984,11 @@ impl Cagents {
                             dialog.delete_branch = default_branch;
                         }
                         if confirming
-                            && (agents_changed
-                                || (busy > 0
-                                    && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents)))
+                            && (agents_changed || !dialog.sessions_consented())
                         {
                             dialog.safety = Some(snapshot);
                             dialog.busy_confirmed = None;
-                            dialog.failure = Some("The working agents or their active turns changed. Review and confirm their interruption again.".into());
+                            dialog.failure = Some("The sessions or their ongoing work changed. Review the current sessions and confirm stopping them again.".into());
                             return Task::none();
                         }
                         if confirming && unchanged {
@@ -2857,10 +2860,13 @@ impl Cagents {
                 "{busy} {} working in this worktree.",
                 if busy == 1 { "agent is" } else { "agents are" }
             )));
+        }
+        let sessions = dialog.session_census.len();
+        if sessions > 0 {
             rows.push(
                 crate::settings_widgets::toggle(
-                    "Interrupt these agents and delete",
-                    dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents),
+                    &format!("Stop {sessions} session{} and all their ongoing work", if sessions == 1 { "" } else { "s" }),
+                    dialog.sessions_consented(),
                     move |value| Message::ProjectUi(Action::BusyAgentsConfirmed(request, value)),
                 )
                 .into(),
@@ -2890,7 +2896,7 @@ impl Cagents {
             && !dialog.loading
             && !dialog.options_loading
             && dialog.safety.is_some()
-            && (busy == 0 || dialog.busy_confirmed.as_ref() == Some(&dialog.busy_agents)))
+            && dialog.sessions_consented())
         .then_some(Message::ProjectUi(Action::ConfirmDelete(request)));
         let label = match dialog.safety.as_ref() {
             Some(snapshot) if snapshot.detached_only_commits > 0 => {
@@ -4248,6 +4254,13 @@ mod tests {
             )),
         }));
         drop(app.handle_project_action(Action::ConfirmDelete(request)));
+        assert!(!app.project_ui.dialog.as_ref().unwrap().loading,
+            "even idle sessions require explicit consent to stop all their ongoing work");
+        assert!(!app.project_ui.dialog.as_ref().unwrap().sessions_consented());
+        drop(app.handle_project_action(Action::BusyAgentsConfirmed(request, true)));
+        drop(app.handle_project_action(Action::ConfirmDelete(request)));
+        assert!(app.project_ui.dialog.as_ref().unwrap().loading,
+            "consent starts a fresh safety/census read before stopping sessions");
         actor.close_revision = Some(2);
         drop(app.handle_project_action(Action::SafetyRead {
             request,
