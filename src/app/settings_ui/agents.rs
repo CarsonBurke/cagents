@@ -143,7 +143,7 @@ pub(super) fn controls<'a>(
         ])
         .spacing(space::S)
         .align_y(Alignment::Center);
-        options.push(setting_field("Executable", "Use an absolute path to a provider binary or wrapper. Detect searches PATH without starting the provider.", executable.into()).error(context.invalid.get(&field(AgentSetting::Executable)).map(String::as_str)).keywords(format!("agents.{}.executable", settings::agents::provider_key(provider))).keywords(configuration.executable.as_deref().unwrap_or("")));
+        options.push(setting_field("Executable", "Use an absolute path to a provider binary or wrapper. Detect searches the provider's configured PATH, or the shell PATH when absent, without starting the provider.", executable.into()).error(context.invalid.get(&field(AgentSetting::Executable)).map(String::as_str)).keywords(format!("agents.{}.executable", settings::agents::provider_key(provider))).keywords(configuration.executable.as_deref().unwrap_or("")));
 
         let mut arguments: Vec<Element<'a, Message>> = Vec::new();
         for (index, argument) in configuration.arguments.iter().enumerate() {

@@ -4455,7 +4455,12 @@ pub enum Message {
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
     DetectAgentExecutable(crate::agent::Provider),
-    AgentExecutableDetected(crate::agent::Provider, Option<String>, Option<String>),
+    AgentExecutableDetected {
+        provider: crate::agent::Provider,
+        previous_executable: Option<String>,
+        previous_path: Option<String>,
+        result: Result<String, String>,
+    },
     SettingsChanged {
         field: SettingsField,
         value: String,
@@ -16242,47 +16247,55 @@ impl Application for Cagents {
                 crate::settings_widgets::reveal_content_start()
             }
             Message::DetectAgentExecutable(provider) => {
-                let previous = self
+                let mut configuration = self
                     .settings_draft
                     .agents
                     .get(&provider)
-                    .and_then(|draft| draft.configuration.executable.clone());
+                    .map(|draft| draft.configuration.clone())
+                    .unwrap_or_default();
+                let previous_executable = configuration.executable.take();
+                let previous_path = configuration.environment.get("PATH").cloned();
                 cosmic::task::future(async move {
-                    let search = crate::account::probe::search_path().await;
-                    let path = tokio::task::spawn_blocking(move || {
-                        crate::account::probe::find_executable(
-                            provider.executable(),
-                            search.as_deref(),
-                        )
+                    let search = if previous_path.is_none() {
+                        crate::account::probe::search_path().await
+                    } else {
+                        None
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        configuration.resolve_executable(provider, search.as_deref())
                         .map(|path| path.to_string_lossy().into_owned())
                     })
                     .await
-                    .ok()
-                    .flatten();
-                    Message::AgentExecutableDetected(provider, previous, path)
+                    .unwrap_or_else(|_| Err("Could not detect the executable. Try again.".into()));
+                    Message::AgentExecutableDetected {
+                        provider,
+                        previous_executable,
+                        previous_path,
+                        result,
+                    }
                 })
             }
-            Message::AgentExecutableDetected(provider, previous, _)
+            Message::AgentExecutableDetected { provider, previous_executable, previous_path, .. }
                 if self
                     .settings_draft
                     .agents
                     .get(&provider)
                     .and_then(|draft| draft.configuration.executable.as_ref())
-                    != previous.as_ref() =>
+                    != previous_executable.as_ref()
+                    || self.settings_draft.agents.get(&provider)
+                        .and_then(|draft| draft.configuration.environment.get("PATH"))
+                        != previous_path.as_ref() =>
             {
                 Task::none()
             }
-            Message::AgentExecutableDetected(provider, _, Some(path)) => self.apply_setting_input(
+            Message::AgentExecutableDetected { provider, result: Ok(path), .. } => self.apply_setting_input(
                 SettingsField::Agent(provider, AgentSetting::Executable),
                 path,
             ),
-            Message::AgentExecutableDetected(provider, _, None) => {
+            Message::AgentExecutableDetected { provider, result: Err(reason), .. } => {
                 self.settings_invalid.insert(
                     SettingsField::Agent(provider, AgentSetting::Executable),
-                    format!(
-                        "{} was not found on PATH. Choose an executable path.",
-                        provider.label()
-                    ),
+                    reason,
                 );
                 self.refresh_settings_feedback();
                 Task::none()
@@ -19597,6 +19610,49 @@ mod tests {
                     }
                 }
             });
+    }
+
+    #[test]
+    fn settings_executable_detection_uses_provider_path_and_fences_changed_inputs() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join(crate::agent::Provider::Claude.executable());
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let configured = settings::AgentLaunchSettings {
+            executable: Some("/missing/old-provider".into()),
+            environment: [("PATH".into(), directory.path().to_str().unwrap().into())].into(),
+            ..Default::default()
+        };
+        let mut app = context_inspector_test_app(false);
+        app.settings.agents.insert("claude".into(), configured.clone());
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        assert!(matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap()));
+        app.settings_draft.agents.get_mut(&provider).unwrap().configuration.environment.insert("PATH".into(), "/changed/path".into());
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"], configured);
+        assert!(app.settings_invalid.is_empty());
+
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        app.settings_draft.agents.get_mut(&provider).unwrap().configuration.executable = Some("/manual/new-provider".into());
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"], configured);
+
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"].executable.as_deref(), executable.to_str());
+        assert_eq!(app.settings.agents["claude"].environment, configured.environment);
+
+        app.settings_draft.agents.get_mut(&provider).unwrap().configuration.environment.insert("PATH".into(), "relative-tools".into());
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        assert!(matches!(&message, Message::AgentExecutableDetected { result: Err(reason), .. } if reason.contains("absolute")));
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"].executable.as_deref(), executable.to_str());
+        assert!(app.settings_invalid[&SettingsField::Agent(provider, AgentSetting::Executable)].contains("absolute"));
     }
 
     #[test]
