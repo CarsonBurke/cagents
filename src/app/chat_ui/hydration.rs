@@ -48,6 +48,19 @@ pub(super) struct State {
     selected:Option<String>,
     aliases:BTreeMap<(Option<String>,String),Key>,
 }
+/// Coverage of the authoritative active raw source publication, not an RSS or
+/// parser-completion claim. No inline prefix is promoted to a whole message.
+#[derive(Clone,Debug,Default,PartialEq,Eq)]
+pub(super) struct PresentationCoverage {
+    pub known:bool,
+    pub sources:usize,
+    pub complete_sources:usize,
+    pub expected_bytes:usize,
+    pub complete_bytes:usize,
+    pub pending_sources:usize,
+    pub generation:Option<u64>,
+    pub source_revision:Option<u64>,
+}
 static ATTEMPT: AtomicU64=AtomicU64::new(1);
 fn next_attempt()->u64 {ATTEMPT.fetch_add(1,Ordering::Relaxed)}
 
@@ -77,6 +90,50 @@ impl State {
     /// one complete logical root. Unknown IDs must retain their own identity.
     pub(super) fn logical_item_id(&self,agent_id:Option<&str>,item_id:&str)->Option<&str> {
         self.aliases.get(&(agent_id.map(str::to_owned),item_id.to_owned())).map(|source|source.source_id.as_str())
+    }
+    pub(super) fn presentation_coverage(&self,selected:Option<&str>)->PresentationCoverage {
+        let Some(raw)=self.raw.as_ref().filter(|_|self.selected.as_deref()==selected) else {return PresentationCoverage::default();};
+        let mut result=PresentationCoverage {known:true,generation:Some(raw.generation),source_revision:Some(raw.source_revision),..Default::default()};
+        let active=match selected {
+            Some(id)=>raw.subagents.iter().find(|agent|agent.id==id).map(|agent|&agent.items),
+            None=>Some(&raw.items),
+        };
+        let Some(active)=active else {result.known=false;return result;};
+        let mut by_item:HashMap<&str,&chat::cache::SourcePart>=HashMap::new();
+        for part in raw.source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected) {
+            if by_item.insert(&part.item_id,part).is_some() {result.known=false;}
+        }
+        let mut groups:BTreeMap<&Key,Vec<(&chat::cache::SourcePart,&Arc<chat::Item>)>>=BTreeMap::new();
+        let mut invalid=HashSet::new();
+        for item in active {
+            let ItemContent::Text {text,thinking,phase}=&item.content else {continue;};
+            let Some(part)=by_item.get(item.id.as_str()).copied() else {result.known=false;continue;};
+            if part.start>part.end || part.end>part.source_len || part.source.source_id.is_empty()
+                || (!part.replacement && (part.end-part.start!=text.len() || item.role!=part.metadata.role
+                    || *thinking!=part.metadata.thinking || *phase!=part.metadata.phase)) {result.known=false;invalid.insert(&part.source);}
+            groups.entry(&part.source).or_default().push((part,item));
+        }
+        for (key,parts) in groups {
+            result.sources+=1;
+            let first=parts[0].0;
+            let consistent=parts.iter().all(|(part,_)|part.epoch==first.epoch && part.source_len==first.source_len
+                && part.metadata==first.metadata);
+            if !consistent {result.known=false;}
+            let Some(expected)=result.expected_bytes.checked_add(first.source_len) else {result.known=false;continue;};
+            result.expected_bytes=expected;
+            let complete=consistent && !invalid.contains(key) && if parts.len()==1 && !first.replacement && first.start==0 && first.end==first.source_len {
+                matches!(&parts[0].1.content,ItemContent::Text {text,..} if text.len()==first.source_len)
+            } else {
+                self.entries.get(key).is_some_and(|entry|entry.complete && entry.error.is_none()
+                    && entry.request_version==entry.version && entry.loaded.as_ref().is_some_and(|loaded|
+                        loaded.epoch==first.epoch && loaded.item.id==key.source_id
+                        && chat::cache::SourceMetadata::from_item(&loaded.item).as_ref()==Some(&first.metadata)
+                        && matches!(&loaded.item.content,ItemContent::Text {text,..} if text.len()==first.source_len)))
+            };
+            if complete {result.complete_sources+=1;result.complete_bytes+=first.source_len;}
+        }
+        result.pending_sources=result.sources-result.complete_sources;
+        result
     }
     pub(super) fn aliases(&self,agent_id:Option<&str>,root:&str)->Vec<(String,Range<usize>)> {
         self.entries.get(&Key {agent_id:agent_id.map(str::to_owned),source_id:root.into()})
@@ -480,6 +537,40 @@ mod tests {
         assert!(state.complete(&key,probe,Ok(Loaded {item,epoch:2})));
         assert!(state.entries[&key].complete);
     }
+    #[test]
+    fn presentation_coverage_never_qualifies_transport_tail_or_stale_source() {
+        let complete=text("complete","whole");let tail=text("tail-alias","tail");
+        let key=Key {agent_id:None,source_id:"opaque-root:native-part:looks-real".into()};
+        let part=|item:&Arc<chat::Item>,source:Key,start,len|chat::cache::SourcePart {item_id:item.id.clone(),source,
+            start,end:start+body(item).len(),source_len:len,replacement:false,epoch:7,
+            metadata:chat::cache::SourceMetadata::from_item(item).unwrap()};
+        let raw=Arc::new(Snapshot {generation:8,source_revision:12,items:vec![complete.clone(),tail.clone()],
+            source_parts:vec![part(&complete,Key {agent_id:None,source_id:complete.id.clone()},0,5),part(&tail,key.clone(),6,10)],
+            ..Default::default()});
+        let mut state=State::default();state.project(raw.clone(),None);
+        let coverage=state.presentation_coverage(None);
+        assert!(coverage.known);assert_eq!((coverage.sources,coverage.complete_sources,coverage.expected_bytes,coverage.complete_bytes,coverage.pending_sources),(2,1,15,5,1));
+        assert_eq!((coverage.generation,coverage.source_revision),(Some(8),Some(12)));
+        let request=state.requests().remove(0);
+        state.complete(&key,request.1,Ok(Loaded {item:text(&key.source_id,"whole tail"),epoch:7}));
+        state.project(raw.clone(),None);
+        let coverage=state.presentation_coverage(None);assert_eq!((coverage.complete_sources,coverage.complete_bytes,coverage.pending_sources),(2,15,0));
+        let mut changed=(*raw).clone();changed.generation+=1;changed.source_revision+=1;changed.source_parts[1].epoch=8;
+        state.project(Arc::new(changed),None);
+        assert_eq!(state.presentation_coverage(None).pending_sources,1,"old full body does not qualify a replacement epoch");
+        assert!(!state.presentation_coverage(Some("not-selected")).known);
+        state.clear();assert!(!state.presentation_coverage(None).known);
+    }
+    #[test]
+    fn missing_or_inconsistent_source_metadata_makes_coverage_unknown() {
+        let item=text("missing","whole");let mut state=State::default();
+        state.project(Arc::new(Snapshot {items:vec![item.clone()],..Default::default()}),None);
+        assert!(!state.presentation_coverage(None).known);
+        let mut raw=(*source_snapshot(Snapshot {items:vec![item],..Default::default()})).clone();
+        raw.source_parts[0].end=usize::MAX;
+        state.project(Arc::new(raw),None);assert!(!state.presentation_coverage(None).known);
+    }
+
     #[test]
     fn all_pending_sources_progress_and_unrelated_metadata_does_not_probe_them() {
         let items=vec![text("a",&"a".repeat(PART_BYTES)),text("b",&"b".repeat(PART_BYTES))];
