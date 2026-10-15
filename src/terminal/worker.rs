@@ -388,6 +388,7 @@ struct PublishedState {
     /// 0 unadmitted, 1 retained by the join service, 2 joined, 3 panicked.
     worker_join: AtomicU8,
     join_reservation: OnceLock<joins::Reservation>,
+    join_escalation_at: OnceLock<std::time::Instant>,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -438,6 +439,7 @@ impl PublishedState {
             completed: AtomicBool::new(false),
             worker_join: AtomicU8::new(0),
             join_reservation: OnceLock::new(),
+            join_escalation_at: OnceLock::new(),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -1348,6 +1350,7 @@ impl TerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(mut holder) = holder {
+            self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = true;
             holder.leave_for_successor();
         }
     }
@@ -2201,6 +2204,7 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
+            self.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = true;
             self.holder.leave_for_successor();
             drop(self.holder);
         } else if !shutting_down && completion.is_some() && self.holder.registered() {
@@ -2500,6 +2504,7 @@ impl Worker {
                     ));
                     return false;
                 }
+                self.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = true;
                 self.carried = true;
                 self.holder.leave_for_successor();
                 let _ = reply.send(Ok(()));
@@ -6660,6 +6665,79 @@ mod tests {
     }
 
     #[test]
+    fn final_drop_escalates_an_owned_root_while_all_join_workers_are_blocked() {
+        struct Releases(Vec<Sender<()>>);
+        impl Drop for Releases { fn drop(&mut self) { for release in &self.0 { let _ = release.try_send(()); } } }
+        let mut releases = Releases(Vec::new());
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let (worker, release) = latched_tls_worker(); releases.0.push(release);
+            let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+            published.join_reservation.set(joins::reserve().unwrap()).unwrap();
+            let slot = Arc::new(Mutex::new(Some(worker)));
+            assert!(!joins::join_until(&slot, &published, Instant::now()+WORKER_JOIN_TIMEOUT, false, false));
+            owners.push(published);
+        }
+        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        assert!(descriptor >= 0);
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        published.join_reservation.set(joins::reserve().unwrap()).unwrap();
+        published.shutdown_pidfd.set(unsafe { File::from_raw_fd(descriptor as i32) }).unwrap();
+        struct Kill(Arc<PublishedState>);
+        impl Drop for Kill { fn drop(&mut self) { let _ = close_processes::signal(self.0.shutdown_pidfd.get().unwrap(), libc::SIGKILL); } }
+        let _kill = Kill(Arc::clone(&published));
+        let (release, blocked) = crossbeam_channel::bounded(1); releases.0.push(release);
+        let worker = thread::spawn(move || { let _ = blocked.recv(); });
+        let slot = Arc::new(Mutex::new(Some(worker)));
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands: command_channel(1).0, events: crossbeam_channel::unbounded().1,
+            published: Arc::clone(&published), worker: Arc::clone(&slot),
+        }) };
+        let started=Instant::now(); drop(handle);
+        assert!(started.elapsed()<Duration::from_millis(250));
+        assert_eq!(published.worker_join.load(Ordering::Acquire),1);
+        assert!(child.try_wait().unwrap().is_none(), "Drop must not signal before its deadline");
+        let deadline=started+WORKER_JOIN_TIMEOUT+Duration::from_secs(2);
+        let status=loop {
+            if let Some(status)=child.try_wait().unwrap() {break status;}
+            assert!(Instant::now()<deadline,"background owner did not escalate queued final Drop");
+            thread::sleep(Duration::from_millis(5));
+        };
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(),Some(libc::SIGKILL));
+        assert_eq!(published.worker_join.load(Ordering::Acquire),1,"signaling does not invent join completion");
+        assert!(Arc::strong_count(&slot)>1,"the queued actual join still owns its original slot");
+        drop(releases);
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while published.worker_join.load(Ordering::Acquire)==1 || owners.iter().any(|owner|owner.worker_join.load(Ordering::Acquire)==1) {
+            assert!(Instant::now()<deadline); thread::yield_now();
+        }
+        assert_eq!(published.worker_join.load(Ordering::Acquire),2);
+    }
+
+    #[test]
+    fn worker_join_escalation_cannot_signal_a_root_retained_for_handoff() {
+        let mut child=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,child.id(),0)}; assert!(descriptor>=0);
+        let published=Arc::new(PublishedState::new(true,Arc::new(|_|{})));
+        published.join_reservation.set(joins::reserve().unwrap()).unwrap();
+        published.shutdown_pidfd.set(unsafe {File::from_raw_fd(descriptor as i32)}).unwrap();
+        let (release,blocked)=crossbeam_channel::bounded(1);
+        struct Cleanup {owner:Arc<PublishedState>,release:Sender<()>}
+        impl Drop for Cleanup {fn drop(&mut self){let _=close_processes::signal(self.owner.shutdown_pidfd.get().unwrap(),libc::SIGKILL);let _=self.release.try_send(());}}
+        let _cleanup=Cleanup {owner:Arc::clone(&published),release};
+        let slot=Arc::new(Mutex::new(Some(thread::spawn(move||{let _=blocked.recv();}))));
+        published.input_order.lock().unwrap().handoff=true;
+        assert!(!joins::join_until(&slot,&published,Instant::now()+Duration::from_millis(20),true,false));
+        thread::sleep(Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(),"a retired local worker must not kill its successor's root");
+        drop(_cleanup);child.wait().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while published.worker_join.load(Ordering::Acquire)==1 {assert!(Instant::now()<deadline);thread::yield_now();}
+    }
+
+    #[test]
     fn final_drop_reserves_cleanup_capacity_before_any_terminal_child_starts() {
         const CHILD: &str = "CAGENTS_TERMINAL_JOIN_RESERVATION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
@@ -6677,9 +6755,11 @@ mod tests {
             let (worker, release) = latched_tls_worker(); releases.0.push(release);
             let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
             published.join_reservation.set(reservation).unwrap();
-            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+            let mut exited = std::process::Command::new("/bin/true").spawn().unwrap();
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, exited.id(), 0) };
             assert!(descriptor >= 0);
             published.shutdown_pidfd.set(unsafe { File::from_raw_fd(descriptor as i32) }).unwrap();
+            exited.wait().unwrap();
             let slot = Arc::new(Mutex::new(Some(worker)));
             owners.push(Arc::downgrade(&published)); slots.push(Arc::downgrade(&slot));
             let handle = TerminalHandle { inner: Arc::new(HandleInner {
