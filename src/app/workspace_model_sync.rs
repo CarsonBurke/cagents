@@ -742,6 +742,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        self.reconcile_project_close_instances();
         let relocated = self.recover_shared_project_relocations();
         let closed = self
             .workspace_model
@@ -775,6 +776,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        self.join_project_close_registry(identity);
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
