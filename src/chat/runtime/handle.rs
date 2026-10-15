@@ -32,6 +32,21 @@ impl Handle {
     pub(crate) fn source_authority_conflict(&self) -> Option<super::SourceAuthority> {
         match &self.0 { Owner::Local(_) => None, Owner::Remote(remote) => remote.state().source_authority_conflict }
     }
+    /// Capture only the observer handoff for an actual shared local Store.
+    /// Remote ownership and process cleanup remain independent obligations.
+    pub(crate) fn source_observer_restore(&self, previous: Option<&Self>) -> Option<super::SourceObserverRestore> {
+        match (&self.0, &previous?.0) {
+            (Owner::Local(current), Owner::Local(previous)) => current.source_observer_restore(previous),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn source_observer_is_current_for_test(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.0.store.lock().unwrap().source_authority_observer().ptr_eq(&std::sync::Arc::downgrade(&local.0)),
+            Owner::Remote(_) => false,
+        }
+    }
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {

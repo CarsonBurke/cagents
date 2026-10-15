@@ -287,6 +287,14 @@ impl LocalHandle {
         refresh_source_authority_observer(observer);
     }
 
+    fn source_observer_restore(&self, previous: &Self) -> Option<SourceObserverRestore> {
+        Arc::ptr_eq(&self.0.store, &previous.0.store).then(|| SourceObserverRestore {
+            store: self.0.store.clone(),
+            previous: Arc::downgrade(&previous.0),
+            bound: Arc::downgrade(&self.0),
+        })
+    }
+
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         self.0.native_holder_record.as_ref()
     }
@@ -295,6 +303,28 @@ impl LocalHandle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+/// A successful constructor can still be refused by its host publication.
+/// This metadata-only capability never owns a provider. The host may consume
+/// it only after restoring the exact previous Record and dropping HostState.
+/// Dropping an unused capability has no effect on a published successor.
+pub(crate) struct SourceObserverRestore {
+    store: Arc<Mutex<Store>>,
+    previous: std::sync::Weak<Inner>,
+    bound: std::sync::Weak<Inner>,
+}
+impl SourceObserverRestore {
+    pub(crate) fn restore(self) {
+        let restored = {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            if store.source_authority_observer().ptr_eq(&self.bound) {
+                store.register_source_authority_observer(self.previous.clone());
+                true
+            } else { false }
+        };
+        if restored { refresh_source_authority_observer(self.previous); }
+    }
+}
+
 /// A constructor may fail after registering but before publishing its Handle.
 /// Restore only this exact unfinished binding; the Store clock is never rolled
 /// back, and a later constructor's registration must survive this guard.
@@ -5354,6 +5384,50 @@ mod tests {
         SourceObserverBinding::bind(&successor.0).commit();
         drop(failed);
         assert!(successor.0.store.lock().unwrap().source_authority_observer().ptr_eq(&Arc::downgrade(&successor.0)));
+    }
+
+    #[test]
+    fn rejected_successful_publication_restores_old_reader_authority_without_retaining_a_provider() {
+        let (_root, spec, source, original) = closed_source_replacement_fixture();
+        let reader = original.transcript_reader();
+        reader.read(None).unwrap();
+        let before = original.source_authority().unwrap();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        let successor = LocalHandle::start_owned(spec, adapter, initial, preparation, source, Default::default(), Some(&original), |_| {}).unwrap();
+        until(&successor, |state| state.ready);
+        let restore = successor.source_observer_restore(&original).unwrap();
+        successor.close().unwrap();
+        let failed = Arc::downgrade(&successor.0);
+        drop(successor);
+        assert!(failed.upgrade().is_none(), "metadata handoff must not retain the failed provider owner");
+        restore.restore();
+        original.0.store.lock().unwrap().deny_source_release_for_test();
+        assert!(reader.read(None).is_err());
+        assert_ne!(original.source_authority().unwrap().incarnation, before.incarnation,
+            "an old reader refreshes the actually restored published owner");
+    }
+
+    #[test]
+    fn rejected_publication_cannot_restore_over_a_newer_source_owner() {
+        let (_root, spec, source, original) = closed_source_replacement_fixture();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        let successor = LocalHandle::start_owned(spec.clone(), adapter, initial, preparation, source.clone(), Default::default(), Some(&original), |_| {}).unwrap();
+        until(&successor, |state| state.ready);
+        let restore = successor.source_observer_restore(&original).unwrap();
+        successor.close().unwrap();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        let latest = LocalHandle::start_owned(spec, adapter, initial, preparation, source, Default::default(), Some(&successor), |_| {}).unwrap();
+        until(&latest, |state| state.ready);
+        restore.restore();
+        assert!(latest.0.store.lock().unwrap().source_authority_observer().ptr_eq(&Arc::downgrade(&latest.0)),
+            "an older failed publication cannot overwrite a newer real shared-Store owner");
+        latest.close().unwrap();
     }
 
     #[test]

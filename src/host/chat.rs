@@ -809,6 +809,11 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_CHAT_PUBLICATION_AFTER_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -1263,6 +1268,9 @@ fn start_with_execution(
         state.inventory_generation += 1;
         source_handle
     };
+    // The constructor commits its local observer before this host can publish
+    // the Handle. Keep only a weak metadata handoff for a rejected publication.
+    let mut source_observer_restore = None;
     // Joining a completed actor must never happen while holding the host lock:
     // its final notification may still be acquiring that same lock.
     let result = (|| {
@@ -1449,6 +1457,7 @@ fn start_with_execution(
                 .err()
                 .unwrap_or_else(|| unavailable(message))
         })?;
+        source_observer_restore = handle.source_observer_restore(previous.as_ref());
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -1525,6 +1534,10 @@ fn start_with_execution(
             .actor_identity()
             .map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
+        #[cfg(test)]
+        if FAIL_CHAT_PUBLICATION_AFTER_START.with(|failure| failure.replace(false)) {
+            host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down = true;
+        }
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);
@@ -1585,13 +1598,26 @@ fn start_with_execution(
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.chat_spawning.remove(&reservation_id);
-    if result.is_err()
-        && let Some(record) = retired.take()
-    {
-        state.chats.entry(reservation_id).or_insert(record);
-    }
+    let restored_previous = if result.is_err() && let Some(record) = retired.take() {
+        match state.chats.entry(reservation_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                retired = Some(record);
+                false
+            }
+        }
+    } else { false };
     state.inventory_generation += 1;
     drop(state);
+    // Restore only after the exact previous Record won publication. The Store
+    // compares the failed binding again, so a later replacement cannot be
+    // overwritten. Refresh can do cache I/O and must remain outside HostState.
+    if restored_previous && let Some(restore) = source_observer_restore {
+        restore.restore();
+    }
     // A final actor callback may still be acquiring the host lock.
     drop(retired);
     result
@@ -4540,6 +4566,35 @@ for line in sys.stdin:
                 .handle
                 .same_actor(&previous)
         );
+    }
+
+    #[test]
+    fn failed_host_publication_restores_the_completed_records_actual_source_observer() {
+        let (_directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let (session, previous, instance) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone(), record.execution_instance)
+        };
+        previous.close().unwrap();
+        assert!(previous.source_observer_is_current_for_test());
+        struct ResetFailure;
+        impl Drop for ResetFailure {
+            fn drop(&mut self) { FAIL_CHAT_PUBLICATION_AFTER_START.with(|failure| failure.set(false)); }
+        }
+        let _reset = ResetFailure;
+        FAIL_CHAT_PUBLICATION_AFTER_START.with(|failure| failure.set(true));
+        let error = process(&host, 1, ClientRequest::ChatAttach { session }).unwrap_err();
+        assert!(error.message.contains("shutdown cancelled chat start"), "{error:?}");
+        let state = host.lock().unwrap();
+        let restored = &state.chats[&saved.source.id];
+        assert!(restored.handle.same_actor(&previous));
+        assert_eq!(restored.execution_instance, instance);
+        drop(state);
+        assert!(previous.source_observer_is_current_for_test(),
+            "constructor success followed by host refusal must restore the actual surviving observer");
     }
 
     #[test]
