@@ -11,10 +11,9 @@ use crate::automations::{
     Occurrence, Summary,
 };
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    db.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS automations (
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automations (
              id TEXT PRIMARY KEY,
              repository TEXT NOT NULL,
              revision INTEGER NOT NULL,
@@ -52,9 +51,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS automation_history ON automation_firings(automation, created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_all_history ON automation_firings(created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_active ON automation_firings(state);
-         CREATE UNIQUE INDEX IF NOT EXISTS automation_run ON automation_firings(run_id) WHERE run_id IS NOT NULL;
-         PRAGMA user_version = 2;
-         COMMIT;"
+         CREATE UNIQUE INDEX IF NOT EXISTS automation_run ON automation_firings(run_id) WHERE run_id IS NOT NULL;"
     ).map_err(|error| error.to_string())
 }
 

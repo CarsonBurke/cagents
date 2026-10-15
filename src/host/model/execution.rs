@@ -16,11 +16,10 @@ const AGENTS_FOR_ORIGIN: &str =
 const ACTIVE_AGENTS: &str =
     "SELECT record FROM agents WHERE closed = 0 ORDER BY rowid DESC LIMIT 1024";
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
-    db.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS agents (
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agents (
              id TEXT PRIMARY KEY,
              origin TEXT NOT NULL,
              record TEXT NOT NULL,
@@ -60,25 +59,20 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
              directory TEXT,
              interactive INTEGER NOT NULL DEFAULT 0 CHECK(interactive IN (0, 1)),
              interactive_run TEXT
-         ) STRICT;
-         PRAGMA user_version = 1;
-         COMMIT;",
+         ) STRICT;",
     )
     .map_err(|error| error.to_string())
 }
 
 /// Legacy records omit the name, so SQLite's NULL uniqueness semantics allow
 /// them all. The index also fences writes outside the acceptance helper.
-pub(super) fn migrate_names(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS agents_by_name
-        ON agents(origin, json_extract(record, '$.name')) WHERE closed = 0;
-        PRAGMA user_version = 10;",
+        ON agents(origin, json_extract(record, '$.name')) WHERE closed = 0;",
     )
     .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 impl Registry {
