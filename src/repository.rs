@@ -14952,6 +14952,78 @@ mod worktree_journal_tests {
         }
     }
 
+
+    #[cfg(target_os = "linux")]
+    struct AlterProvisionalCheckout {
+        destination: PathBuf,
+        old: String,
+        alteration: &'static str,
+        phase: &'static str,
+        added: AtomicBool,
+        lists: std::sync::atomic::AtomicUsize,
+        changed: AtomicBool,
+        branch_attempted: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AlterProvisionalCheckout {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            let branch = command.arguments.windows(2).any(|pair| pair[0] == "branch" && pair[1] == "--force");
+            let list = self.added.load(Ordering::SeqCst) && command.arguments.windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "list")
+                && self.lists.fetch_add(1, Ordering::SeqCst) == 1;
+            if branch { self.branch_attempted.store(true, Ordering::SeqCst); }
+            if ((self.phase == "prepared" && branch) || (self.phase == "census" && list))
+                && !self.changed.swap(true, Ordering::SeqCst)
+            {
+                let locator = fs::read(self.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                if self.alteration == "HEAD" {
+                    fs::write(admin.join("HEAD"), format!("{}\n", self.old)).unwrap();
+                } else {
+                    fs::write(admin.join("locked"), b"foreign operation\n").unwrap();
+                }
+            }
+            let output = SystemProcessExecutor.execute(&command.clone()
+                .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1"), token)?;
+            if output.success && command.arguments.windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
+            { self.added.store(true, Ordering::SeqCst); }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_existing_branch_requires_exact_provisional_head_and_operation_lock() {
+        for (phase, alteration) in [("census", "HEAD"), ("prepared", "HEAD"), ("prepared", "locked")] {
+            let (fixture, _remote, old, _new) = existing_branch_advance_fixture();
+            let executor = Arc::new(AlterProvisionalCheckout {
+                destination: fixture.request.destination.clone(), old: old.clone(), alteration, phase,
+                added: AtomicBool::new(false), lists: std::sync::atomic::AtomicUsize::new(0),
+                changed: AtomicBool::new(false), branch_attempted: AtomicBool::new(false),
+            });
+            let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.changed.load(Ordering::SeqCst), "{phase}/{alteration}: {report:?}");
+            assert_eq!(executor.branch_attempted.load(Ordering::SeqCst), phase == "prepared");
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{phase}/{alteration}: {report:?}");
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), old, "branch must not advance without its exact provisional authority");
+            let locator = fs::read(fixture.request.destination.join(".git")).unwrap();
+            let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+            let altered = fs::read(admin.join(alteration)).unwrap();
+            let restored = scoped.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(restored[0].state, WorktreeOperationState::OutcomeUnknown);
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), old);
+            assert_eq!(fs::read(admin.join(alteration)).unwrap(), altered, "reconciliation must not overwrite the external change");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     struct AliasPolicyExecutor {
         inner: AdvanceRace,

@@ -44,6 +44,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // the registry never substitutes or unwraps that executor.
         let mut registry = registered_heads::RegisteredHeads::capture(self, repository, cancellation)
             .map_err(invalid)?;
+        let (provisional_head, provisional_lock) = created.provisional_metadata()?;
         registry.acquire().map_err(invalid)?;
         if census()?.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
             return Err(invalid("The branch became checked out while acquiring checkout guards"));
@@ -70,6 +71,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         write(&hook, PROBE, 0o700)?;
         write(&directory.join("config-expected"), &config.stdout, 0o600)?;
+        write(&directory.join("created-HEAD"), &provisional_head, 0o600)?;
+        write(&directory.join("created-locked"), &provisional_lock, 0o600)?;
         let mut files = Vec::new();
         let mut paths = Vec::new();
         for root in &held {
@@ -110,6 +113,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let environment = |mut command: CommandSpec| -> Result<CommandSpec, RepositoryError> {
             command = command.env("CAGENTS_BRANCH_PROOF", &child_proof)
                 .env("CAGENTS_BRANCH_PRIVATE", &child_directory)
+                .env("CAGENTS_BRANCH_CREATED_ADMIN", &paths[5])
                 .env("CAGENTS_BRANCH_REF", &full_ref).env("CAGENTS_BRANCH_OLD", old)
                 .env("CAGENTS_BRANCH_NEW", new).env("CAGENTS_BRANCH_GIT", &self.git)
                 .env("CAGENTS_BRANCH_PREVIOUS_HOOK", &previous)
@@ -137,6 +141,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         drop(file);
         session.validate()?;
         registry.check().map_err(invalid)?;
+        created.provisional_metadata()?;
         let command = environment(self.git_mutation(repository, [OsString::from("-c"), hooks,
             "branch".into(), "--force".into(), "--".into(), branch.as_str().into(), new.into()]))?;
         self.run_checked(&command, cancellation)?;
@@ -147,6 +152,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // exact final branch/OID/registration after inherited lease retirement.
         session.validate()?;
         registry.check().map_err(invalid)?;
+        created.provisional_metadata()?;
         Ok(())
     }
 }

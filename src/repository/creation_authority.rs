@@ -303,7 +303,7 @@ impl CreationSession {
             common.try_clone().map_err(filesystem)?)?;
         let created = Arc::new(VerifiedCreatedRoot { source: self.clone(), owned,
             authority, admin: admin_witness.clone(), operation: request.operation_id,
-            branch: expected_branch });
+            branch: expected_branch, oid: expected_oid.to_owned() });
         created.validate()?;
         evidence.admin = Some(admin_witness);
         Ok(created)
@@ -334,6 +334,7 @@ pub(super) struct VerifiedCreatedRoot {
     admin: DirectoryWitness,
     operation: OperationId,
     branch: Option<String>,
+    oid: String,
 }
 
 impl fmt::Debug for VerifiedCreatedRoot {
@@ -341,6 +342,7 @@ impl fmt::Debug for VerifiedCreatedRoot {
         formatter.debug_struct("VerifiedCreatedRoot").field("operation", &self.operation)
             .field("destination", &self.owned.root.path()).field("admin", &self.admin)
             .field("registered_branch", &self.branch)
+            .field("registered_oid", &self.oid)
             .finish_non_exhaustive()
     }
 }
@@ -362,7 +364,25 @@ impl VerifiedCreatedRoot {
         {
             return Err(invalid("The created checkout lost its journal-owned metadata"));
         }
+        if self.branch.is_none()
+            && trim_one_line_ending(&regular_locator(&admin, "HEAD")?) != self.oid.as_bytes()
+        {
+            return Err(invalid("The provisional checkout changed its detached commit"));
+        }
         Ok(())
+    }
+
+    pub(super) fn provisional_metadata(&self) -> Result<(Vec<u8>, Vec<u8>), RepositoryError> {
+        self.validate()?;
+        let (_, admin, _) = self.authority.retained_roots()?;
+        let head = regular_locator(&admin, "HEAD")?;
+        let locked = regular_locator(&admin, "locked")?;
+        if self.branch.is_some() || trim_one_line_ending(&head) != self.oid.as_bytes()
+            || trim_one_line_ending(&locked) != format!("cagents:{}", self.operation).as_bytes()
+        {
+            return Err(invalid("The provisional checkout no longer has its exact detached journal state"));
+        }
+        Ok((head, locked))
     }
 
     pub(super) fn authority(&self) -> Result<WorktreeAuthority, RepositoryError> {

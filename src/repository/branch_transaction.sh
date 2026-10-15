@@ -14,6 +14,11 @@ repo_git() (
 verify() {
     . "$CAGENTS_BRANCH_PRIVATE/check-identities"
     "$CAGENTS_BRANCH_PRIVATE/check-registered-heads"
+    for field in HEAD locked; do
+        actual="$CAGENTS_BRANCH_CREATED_ADMIN/$field"
+        [ ! -L "$actual" ] && [ -f "$actual" ]
+        /usr/bin/cmp -s -- "$CAGENTS_BRANCH_PRIVATE/created-$field" "$actual"
+    done
     count=0
     while IFS=' ' read -r old new ref extra; do
         [ -z "$extra" ]
