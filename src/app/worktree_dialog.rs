@@ -1381,8 +1381,9 @@ mod tests {
         const TEST: &str = "app::worktree_dialog::tests::actual_history_menu_uses_displayed_linked_source_and_retains_its_authority";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("displayed");
-        let primary = temporary.path().join("primary");
+        let physical_parent = temporary.path().canonicalize().unwrap();
+        let root = physical_parent.join("displayed");
+        let primary = physical_parent.join("primary");
         super::super::git_binding::tests::init(&primary, "original\n");
         isolated_git(&primary, &["worktree", "add", "-b", "displayed", root.to_str().unwrap()]);
         let (mut app, key) = super::super::git_binding::tests::app_for(&root);
@@ -1423,6 +1424,7 @@ mod tests {
         let files = tempfile::tempdir().unwrap();
         let root = files.path().join("repository");
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         isolated_git(&root, &["init", "--template=", "-b", "main"]);
         isolated_git(&root, &["config", "user.name", "Fixture"]);
         isolated_git(&root, &["config", "user.email", "fixture@example.invalid"]);
