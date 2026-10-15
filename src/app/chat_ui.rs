@@ -24,6 +24,7 @@ mod fold;
 mod hover;
 mod hydration;
 mod changes_sources;
+mod disclosure_intent;
 mod clipboard_intent;
 mod changes_find;
 mod reader_source;
