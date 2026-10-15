@@ -152,9 +152,9 @@ impl FrameContext {
                 }
                 _ => {}
             }
-            if matches!(event, Event::Error { fatal: true, .. }) {
-                break;
-            }
+            // A fatal/cache error does not discard already decoded final
+            // semantic proof later in this same frame. Keep projecting its
+            // bounded original excerpt until the actual turn/reset fence.
         }
         flush(&self, &mut pending, &mut out);
         out
@@ -421,6 +421,27 @@ mod tests {
                 .count()
                 <= presentation::PREVIEW_LIMIT
         );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn immutable_frame_context_preserves_final_excerpt_across_fatal_error_ordering() {
+        let final_item = Event::Item(super::super::Item {
+            id: "answer".into(), role: Role::Assistant, at: None, started_at: None,
+            content: ItemContent::Text {
+                text: "Exact final response".into(), thinking: false, phase: Phase::Final,
+            },
+        });
+        let finished = Event::TurnFinished { key: Some("turn".into()), outcome: Kind::Succeeded };
+        let fatal = Event::Error { message: "Actual provider failure".into(), fatal: true };
+        for events in [
+            vec![fatal.clone(), final_item.clone(), finished.clone()],
+            vec![finished, fatal, final_item],
+        ] {
+            let contexts = FrameContext::capture(&Snapshot::default()).project(&events);
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].preview, "Exact final response");
+        }
     }
 
     #[cfg(feature = "host")]

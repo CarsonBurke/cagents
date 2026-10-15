@@ -4959,8 +4959,16 @@ fn trim_subagent(agent: &mut Subagent) {
 mod tests {
     #[test]
     fn final_provider_proof_survives_a_pending_transcript_flush_failure() {
+        final_frame_proof(true, false);
+    }
+    #[test]
+    fn final_provider_proof_survives_a_fatal_error_before_the_final_item() {
+        final_frame_proof(false, true);
+    }
+    fn final_frame_proof(cache_failure: bool, fatal: bool) {
         struct FinalFrame {
             run: Option<crate::model::RunId>,
+            fatal: bool,
         }
         impl Adapter for FinalFrame {
             fn initialize(&mut self) -> Result<Step, String> {
@@ -4994,7 +5002,7 @@ mod tests {
             fn receive(&mut self, frame: Value) -> Result<Step, String> {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
-                Ok(Step {
+                let mut step = Step {
                     writes: Vec::new(),
                     events: vec![
                         Event::Execution {
@@ -5037,7 +5045,13 @@ mod tests {
                             },
                         },
                     ],
-                })
+                };
+                if self.fatal {
+                    step.events.insert(3, Event::Error {
+                        message: "Actual provider failure".into(), fatal: true,
+                    });
+                }
+                Ok(step)
             }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -5051,7 +5065,7 @@ mod tests {
             working_directory: directory.path().into(),
             environment: BTreeMap::new(),
         };
-        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
+        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None, fatal });
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
@@ -5060,7 +5074,9 @@ mod tests {
         })
         .unwrap();
         until(&handle, |state| state.ready);
-        handle.0.store.lock().unwrap().refuse_writes_for_test();
+        if cache_failure {
+            handle.0.store.lock().unwrap().refuse_writes_for_test();
+        }
         let run = crate::model::RunId::new();
         handle
             .command_for_run(
@@ -5130,7 +5146,7 @@ mod tests {
         assert_eq!(content.preview, "Exact final response");
         assert!(
             handle.failure().is_some(),
-            "the transcript I/O failure remains visible independently of provider success"
+            "the original frame failure remains visible independently of provider success"
         );
     }
 
