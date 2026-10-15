@@ -2838,7 +2838,8 @@ impl Adapter for Codex {
                 } else if params["willRetry"] == true {
                     self.retrying=true;
                     self.retry_turn=params["turnId"].as_str().map(str::to_owned).or_else(||self.turn.clone());
-                    self.retry_detail=Some(format!("Retrying: {message}"));
+                    let detail:String=message.chars().take(512).collect();
+                    self.retry_detail=Some(format!("Retrying: {detail}"));
                     self.busy=true;
                     step.events.push(Event::Status {busy:true,detail:self.retry_detail.clone().unwrap()});
                     step.events.push(session_notice(message));
@@ -6540,6 +6541,16 @@ mod tests {
         let failed=adapter.receive(frame(false)).unwrap();
         assert!(!adapter.retrying);assert!(adapter.retry_turn.is_none());assert!(adapter.retry_detail.is_none());
         assert!(failed.events.iter().any(|event|matches!(event,Event::Error {fatal:false,message} if message=="current overload")));
+    }
+
+    #[test]
+    fn retry_footer_retains_only_bounded_unicode_detail() {
+        let mut adapter=adapter();adapter.turn=Some("current".into());adapter.busy=true;
+        let waiting=adapter.receive(json!({"method":"error","params":{"threadId":"thread-exact",
+            "turnId":"current","willRetry":true,"error":{"message":"🦀".repeat(4096)}}})).unwrap();
+        let expected=format!("Retrying: {}","🦀".repeat(512));
+        assert_eq!(adapter.retry_detail.as_deref(),Some(expected.as_str()));
+        assert!(waiting.events.iter().any(|event|matches!(event,Event::Status {busy:true,detail} if detail==&expected)));
     }
 
 }
