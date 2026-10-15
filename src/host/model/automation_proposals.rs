@@ -56,6 +56,8 @@ fn read(db: &Connection, id: Uuid, owner: Option<&Origin>) -> Result<Option<Prop
         .transpose()
 }
 
+const PENDING_PAGE_SQL: &str = "SELECT summary FROM automation_proposals WHERE pending=1 AND id>?1 ORDER BY id LIMIT ?2";
+
 impl Registry {
     pub(crate) fn pending_automation_proposal_count(&self) -> Result<u64, String> {
         self.db.query_row("SELECT count(*) FROM automation_proposals WHERE pending=1", [], |row| row.get(0))
@@ -68,10 +70,11 @@ impl Registry {
     }
 
     pub(crate) fn pending_automation_proposals_page(&self, after: Option<Uuid>, limit: usize) -> Result<Vec<ProposalSummary>, String> {
-        let mut query = self.db.prepare(
-            "SELECT summary FROM automation_proposals WHERE pending=1 AND (?1 IS NULL OR id>?1) ORDER BY id LIMIT ?2")
+        // Every stored ID is a nonempty canonical UUID. The empty lower bound
+        // starts page one; all pages retain a genuine indexed range seek.
+        let mut query = self.db.prepare(PENDING_PAGE_SQL)
             .map_err(|error| error.to_string())?;
-        query.query_map(params![after.map(|id| id.to_string()), limit.clamp(1, crate::automations::PROPOSAL_PAGE_SIZE)], |row| row.get::<_, String>(0))
+        query.query_map(params![after.map(|id| id.to_string()).unwrap_or_default(), limit.clamp(1, crate::automations::PROPOSAL_PAGE_SIZE)], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .map(|row| serde_json::from_str(&row.map_err(|error| error.to_string())?).map_err(|error| error.to_string()))
             .collect()
@@ -693,6 +696,14 @@ mod tests {
         }
         assert_eq!(seen.len(), 10_000);
         assert!(seen.contains(&Uuid::from_u128(10_000)));
+        // Assert the actual production SQL seeks both the first and late page,
+        // rather than scanning all earlier pending IDs on every request.
+        for after in [String::new(), Uuid::from_u128(9_984).to_string()] {
+            let mut explain = registry.db.prepare(&format!("EXPLAIN QUERY PLAN {PENDING_PAGE_SQL}")).unwrap();
+            let plan = explain.query_map(params![after,64],|row|row.get::<_,String>(3)).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap().join("\n");
+            assert!(plan.contains("SEARCH") && plan.contains("id>?"), "page lookup must seek: {plan}");
+        }
     }
 
     #[test]
