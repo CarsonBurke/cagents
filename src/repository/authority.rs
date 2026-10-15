@@ -37,6 +37,11 @@ impl WorktreeAuthority {
         if (metadata.dev(), metadata.ino()) != self.identity {
             return Err(ValidationError::Io("The original worktree directory was replaced; no action was applied to the replacement".into()).into());
         }
+        let named_private = open_metadata_root(self.git_dir.path())?;
+        let named_common = open_metadata_root(self.common_dir.path())?;
+        if !same_directory(&named_private, &self.git_dir)? || !same_directory(&named_common, &self.common_dir)? {
+            return Err(ValidationError::Io("The original Git metadata directory name was replaced; reopen the worktree before retrying".into()).into());
+        }
         let private = open_metadata_root(&resolve_private_git_dir(&self.anchored_path())?)?;
         let common = open_metadata_root(&resolve_common_git_dir(&descriptor_path(&self.git_dir))?)?;
         if !same_directory(&private, &self.git_dir)? || !same_directory(&common, &self.common_dir)? {
@@ -127,6 +132,10 @@ fn resolve_common_git_dir(private: &Path) -> Result<PathBuf, RepositoryError> {
 pub struct WorktreeExecutor<E> {
     inner: Arc<E>,
     authority: WorktreeAuthority,
+}
+
+impl<E> Clone for WorktreeExecutor<E> {
+    fn clone(&self) -> Self { Self { inner: self.inner.clone(), authority: self.authority.clone() } }
 }
 
 impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
@@ -419,6 +428,25 @@ mod authority_tests {
         assert!(result.success, "{}", String::from_utf8_lossy(&result.stderr));
         assert!(root.join(".git").join(&object).is_file(), "original common object store receives the staged object");
         assert!(!foreign.join(".git").join(&object).exists(), "foreign common object store remains untouched");
+    }
+
+    #[test]
+    fn captured_authority_refuses_redirected_separate_gitdir_with_replaced_original_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worktree");
+        let metadata = directory.path().join("metadata");
+        let moved = directory.path().join("moved-metadata");
+        let foreign = directory.path().join("foreign");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        actual_git(&root, &["init", "-b", "main", "--separate-git-dir", metadata.to_str().unwrap()]);
+        actual_git(&foreign, &["init", "-b", "main"]);
+        let authority = WorktreeAuthority::capture(&root).unwrap();
+        assert_eq!(authority.stable_private_metadata_path(), metadata);
+        std::fs::rename(&metadata, &moved).unwrap();
+        std::fs::write(root.join(".git"), format!("gitdir: {}\n", moved.display())).unwrap();
+        std::fs::rename(foreign.join(".git"), &metadata).unwrap();
+        assert!(authority.validate().is_err(), "durable metadata names must never name foreign directories even if the locator still resolves to the retained inode");
     }
 
 }
