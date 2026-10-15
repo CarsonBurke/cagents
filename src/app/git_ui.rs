@@ -161,7 +161,7 @@ fn defer_mutating_worktrees(
     let paths = change
         .worktrees
         .iter()
-        .filter(|worktree| blocked.contains(worktree))
+        .filter(|worktree| blocked.contains(*worktree))
         .copied()
         .collect::<BTreeSet<_>>();
     if !blocked.is_empty()
