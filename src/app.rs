@@ -15970,7 +15970,7 @@ impl Application for Cagents {
                     && let Some(card) = self.focused_repository_card_with_find() {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
-                    } else { RepositoryAction::FindNext { card }));
+                    } else { RepositoryAction::FindNext { card } }));
                 }
                 if let keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
