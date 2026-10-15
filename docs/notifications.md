@@ -9,10 +9,14 @@ By default, desktop notifications show the provider and folder with a concise
 outcome. In Settings → Notifications, **Show message previews** opts in to the
 conversation name and a short response, question, approval request or error
 excerpt. These details may be visible on a shared or locked screen. Disabling
-previews removes retained excerpts from the attention journal's current records and
-withdraws rich desktop notices. The existing event-category, enabled and
-while-focused switches still control delivery. Disabling delivery or a category
-withdraws its current desktop notices without marking the journal attention read.
+previews hides excerpts in the app, withdraws rich desktop notices and attempts to
+remove retained excerpts from the attention journal's current records. If storage
+cleanup fails, previously stored excerpts may remain on disk until a later
+successful cleanup during a settings reload or daemon startup. They remain hidden
+from notification presentation while previews are disabled. The existing
+event-category, enabled and while-focused switches still control delivery.
+Disabling delivery or a category withdraws its current desktop notices without
+marking the journal attention read.
 
 This preference controls notification presentation and the attention journal. It
 does not delete ordinary conversation history or private, bounded semantic replay
