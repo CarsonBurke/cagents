@@ -45,6 +45,9 @@ impl Cagents {
             let Some(shared) = self.workspace_model.projects.iter().find(|shared| shared.repository == project.repository) else {
                 return Err("Wait for the project to be registered before changing files with recovery.".into());
             };
+            if shared.ordinal == crate::workspace_model::PENDING_ORDINAL {
+                return Err("Wait for the registry to confirm the project before changing files with recovery.".into());
+            }
             required_projects.push((shared.repository.clone(), shared.ordinal));
         }
         if required_projects.len() > MAX_RECOVERY_ROOTS {
@@ -133,6 +136,9 @@ mod tests {
         app.workspace_model.projects.push(serde_json::from_value(serde_json::json!({
             "repository": row.repository, "name": row.name, "kind": row.kind, "ordinal": 7,
         })).unwrap());
+        app.workspace_model.projects[0].ordinal = crate::workspace_model::PENDING_ORDINAL;
+        assert!(app.recovery_window_roots().is_err(), "a locally folded pending rank is not registry admission");
+        app.workspace_model.projects[0].ordinal = 7;
         let source = app.retained_project_creation_source(key.project_id).unwrap();
         let (original, common) = source.recovery_roots().unwrap();
         let resolved = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
