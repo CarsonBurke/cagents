@@ -99,6 +99,8 @@ pub(crate) fn main_with_before_start(
         previous_hook(panic);
     }));
 
+    #[cfg(feature = "integrated-browser")]
+    let _browser_cleanup = cagents::browser::ProcessShutdown;
     let result = run(options);
     match &result {
         Err(error) => report_startup_failure(&error.to_string()),
