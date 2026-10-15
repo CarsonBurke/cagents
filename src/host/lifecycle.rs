@@ -65,13 +65,14 @@ impl Lifecycle {
 
     fn settle_retirements(&mut self, host: &SharedHost) {
         use std::sync::mpsc::TryRecvError;
+        use crate::terminal::CompletedRelease;
         let (gate, ready) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let ready = state.terminal_retirements.iter_mut().filter_map(|(id, retirement)| {
                 let outcome = match retirement.result.as_ref()?.try_recv() {
                     Ok(outcome) => outcome,
                     Err(TryRecvError::Empty) => return None,
-                    Err(TryRecvError::Disconnected) => Err("Terminal cleanup owner ended without a proof result".into()),
+                    Err(TryRecvError::Disconnected) => CompletedRelease::Retained("Terminal cleanup owner ended without a proof result".into()),
                 };
                 retirement.result = None;
                 Some((*id, retirement.ticket, outcome))
@@ -91,11 +92,17 @@ impl Lifecycle {
             let Some(mut reservation) = state.terminal_retirements.remove(&id) else { continue; };
             if state.terminals.get(&id).is_some_and(|record| record.handle.same_worker(&reservation.handle)) {
                 match outcome {
-                    Ok(()) => {
+                    CompletedRelease::Released => {
                         if let Some(record) = state.retire_terminal_if_current(id, &reservation.handle) { retired.push(record); }
                         reports.push((id, None));
                     }
-                    Err(error) => {
+                    CompletedRelease::Deferred => {
+                        // No join or holder operation began. Clearing this
+                        // reservation permits a fresh attachment/pin census
+                        // before another nonblocking pool admission attempt.
+                        state.inventory_generation += 1;
+                    }
+                    CompletedRelease::Retained(error) => {
                         reports.push((id, Some(error.clone())));
                         reservation.failure = Some(error);
                         state.terminal_retirements.insert(id, reservation);

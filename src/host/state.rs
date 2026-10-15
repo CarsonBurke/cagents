@@ -6865,7 +6865,7 @@ for line in sys.stdin:
         assert!(gate.try_read().is_ok(), "cleanup waiting must not retain global control admission");
         // A constructed service outcome exercises the failure publication;
         // this is not a claim that a legacy helper was actually contacted.
-        reply.send(Err("fixture cleanup unconfirmed".into())).unwrap();
+        reply.send(crate::terminal::CompletedRelease::Retained("fixture cleanup unconfirmed".into())).unwrap();
         let mut lifecycle = crate::host::lifecycle::Lifecycle::testing(Duration::ZERO);
         assert!(lifecycle.maintain(&host, false).is_none());
         {
@@ -6876,6 +6876,42 @@ for line in sys.stdin:
             assert!(state.attach(2, id).is_ok(), "failed cleanup restores explicit access to its retained result");
         }
         // An explicit retry still reaches the original exact holder.
+        handle.release_completed_holder_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        let retired = host.lock().unwrap().retire_terminal_if_current(id, &handle).unwrap();
+        drop(retired);
+    }
+
+    #[test]
+    fn deferred_capacity_restores_eligibility_and_rechecks_new_pins_instead_of_recording_cleanup_failure() {
+        let (mut state, id, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        let directory = tempfile::tempdir().unwrap();
+        state.install_model(super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap());
+        let registry = state.execution_registry.clone().unwrap();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let mut retirement = Retirement::submitting(handle.clone());
+        retirement.result = Some(result);
+        state.terminal_retirements.insert(id, retirement);
+        // Keep this constructed deferred-result test from immediately queuing
+        // a real retry, so restored eligibility can be observed independently.
+        state.shutting_down = true;
+        reply.send(crate::terminal::CompletedRelease::Deferred).unwrap();
+        let host = Arc::new(HostLock::new(state));
+        let mut lifecycle = crate::host::lifecycle::Lifecycle::testing(Duration::ZERO);
+        assert!(lifecycle.maintain(&host, false).is_none());
+        {
+            let mut state = host.lock().unwrap();
+            assert!(state.terminals[&id].handle.same_worker(&handle));
+            assert!(!state.terminal_retirements.contains_key(&id), "capacity deferral must not become a retained cleanup failure");
+            state.shutting_down = false;
+            assert_eq!(state.expired_terminal_handles(Instant::now(), Duration::ZERO, &BTreeSet::new()).len(), 1);
+        }
+        // A newly accepted pin must be reread before a deferred retry; cached
+        // eligibility from the earlier submission is not ownership authority.
+        registry.lock().unwrap().pin_window_terminals(&[id]).unwrap();
+        assert!(lifecycle.maintain(&host, false).is_none());
+        assert!(!host.lock().unwrap().terminal_retirements.contains_key(&id));
+        assert!(host.lock().unwrap().terminals.contains_key(&id));
         handle.release_completed_holder_until(Instant::now() + Duration::from_secs(5)).unwrap();
         let retired = host.lock().unwrap().retire_terminal_if_current(id, &handle).unwrap();
         drop(retired);
@@ -6918,7 +6954,7 @@ for line in sys.stdin:
         let mut retirement = Retirement::submitting(old.clone());
         retirement.result = Some(result);
         state.terminal_retirements.insert(id, retirement);
-        reply.send(Ok(())).unwrap();
+        reply.send(crate::terminal::CompletedRelease::Released).unwrap();
         let host = Arc::new(HostLock::new(state));
         crate::host::lifecycle::Lifecycle::testing(Duration::ZERO).maintain(&host, false);
         assert!(host.lock().unwrap().terminals[&id].handle.same_worker(&replacement));

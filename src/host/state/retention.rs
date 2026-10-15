@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 pub(in crate::host) struct Retirement {
     pub(in crate::host) handle: TerminalHandle,
     pub(in crate::host) ticket: uuid::Uuid,
-    pub(in crate::host) result: Option<Receiver<Result<(), String>>>,
+    pub(in crate::host) result: Option<Receiver<crate::terminal::CompletedRelease>>,
     pub(in crate::host) failure: Option<String>,
 }
 impl Retirement {
