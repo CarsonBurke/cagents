@@ -197,6 +197,7 @@ impl Registry {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
+            agent_locations: agent_locations::all(&self.db)?,
             identity,
             sequence: sequence as u64,
             projects,

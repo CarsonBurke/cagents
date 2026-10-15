@@ -1,6 +1,6 @@
 //! Mutable logical placement and a verified current spelling of an agent's
 //! approved directory. Accepted specs and process descriptors remain immutable.
-use std::{fs::File, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
+use std::{fs::File, path::{Path, PathBuf}};
 use rusqlite::{Connection, OptionalExtension, params};
 use crate::{agent_execution::{Agent, DirectoryIdentity}, model::AgentId, project_recovery::Relocation};
 use super::{Registry, execution::{decode, encode}, repository_key};
@@ -43,8 +43,16 @@ pub(super) fn insert_new(db: &Connection, agent: &Agent) -> Result<(), String> {
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
-    crate::secure_file::reject_symlink_components(path)?;
-    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
+    let root = crate::fs_safety::Root::open(Path::new("/"))?;
+    let relative = path.strip_prefix("/").map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput,error))?;
+    let directory = crate::fs_safety::open_beneath(&root, relative).map_err(std::io::Error::other)?;
+    if !directory.metadata()?.is_dir() { return Err(std::io::Error::new(std::io::ErrorKind::NotADirectory,"approved path is not a directory")); }
+    Ok(directory)
+}
+
+pub(super) fn all(db: &Connection) -> Result<Vec<crate::workspace_model::AgentLocation>, String> {
+    let rows = db.prepare("SELECT l.agent,l.repository,l.directory,l.blocked_directory FROM agent_locations l JOIN agents a ON a.id=l.agent WHERE a.closed=0 ORDER BY l.agent").map_err(|error| error.to_string())?.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,Option<String>>(3)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?;
+    rows.into_iter().map(|(agent,repository,directory,blocked)| Ok(crate::workspace_model::AgentLocation { agent: agent.parse().map_err(|error| format!("invalid agent location identity: {error}"))?, repository: repository.into(), directory: directory.into(), blocked_directory: blocked.map(PathBuf::from) })).collect()
 }
 
 pub(super) fn read(db: &Connection, agent: &Agent) -> Result<Location, String> {
