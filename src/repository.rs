@@ -5595,14 +5595,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         input: &WorktreeInput,
         cancellation: &CancellationToken,
     ) -> Result<CreateWorktreeRequest, RepositoryError> {
+        self.resolve_worktree_request_selected(input, None, cancellation)
+    }
+
+    /// An autocomplete selection names a full ref, so a local branch named
+    /// `origin/topic` stays distinct from the remote branch `origin/topic`.
+    /// The selected identity is checked against a fresh local ref inventory.
+    pub fn resolve_worktree_request_selected(
+        &self,
+        input: &WorktreeInput,
+        selected_ref: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateWorktreeRequest, RepositoryError> {
         let discovered = self.discover(&input.repository, cancellation)?;
         let repository = discovered.worktree_root.unwrap_or(discovered.common_dir);
         let output = self.run_checked(&self.refs_command(&repository), cancellation)?;
         let refs = parse_refs(&output.stdout)?;
         let remotes = self.remotes(&repository, cancellation)?;
         let mut name = worktree_branch_input(&input.input)?;
+        let selected_local = selected_ref.filter(|reference| reference.starts_with("refs/heads/"));
+        if let Some(reference) = selected_ref {
+            let valid = if let Some(local_name) = reference.strip_prefix("refs/heads/") {
+                local_name == name && refs.local.iter().any(|local| local.name.as_str() == reference)
+            } else if let Some(remote_name) = reference.strip_prefix("refs/remotes/") {
+                remote_name == name && refs.remote.iter().any(|remote| remote.name.as_str() == reference)
+                    && remotes.iter().any(|remote| remote_name.strip_prefix(&format!("{}/", remote.name)).is_some_and(|branch| !branch.is_empty()))
+            } else { false };
+            if !valid { return Err(ValidationError::InvalidBranch("The selected branch changed or disappeared; choose it again".into()).into()); }
+        }
         let explicit = remotes
             .iter()
+            .filter(|_| selected_local.is_none())
             .filter_map(|remote| {
                 name.strip_prefix(&format!("{}/", remote.name))
                     .map(|branch| (remote.name.clone(), branch.to_owned()))
@@ -11948,6 +11971,22 @@ mod worktree_journal_tests {
             crate::linear::context::resolve_at(&fixture.request.repository).unwrap_err().kind,
             "linear_issue_required",
         );
+    }
+
+    #[test]
+    fn explicit_local_selection_distinguishes_a_remote_named_local_branch() {
+        let fixture = Fixture::new();
+        fixture.git(&["branch", "origin/topic"]);
+        fixture.git(&["remote", "add", "origin", fixture.request.repository.to_str().unwrap()]);
+        fixture.git(&["update-ref", "refs/remotes/origin/topic", "HEAD"]);
+        let input = fixture.input("origin/topic"); let token = CancellationToken::new();
+        let local = fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/origin/topic"), &token).unwrap();
+        assert_eq!(local.branch.as_str(), "origin/topic");
+        assert!(!local.track);
+        assert!(matches!(local.base, BaseRevision::LocalBranch(ref branch) if branch.as_str() == "origin/topic"));
+        let remote = fixture.service.resolve_worktree_request_selected(&input, Some("refs/remotes/origin/topic"), &token).unwrap();
+        assert_eq!(remote.branch.as_str(), "topic"); assert!(remote.track);
+        assert!(fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/disappeared"), &token).is_err());
     }
 
     /// Deleting a created worktree in the app frees its identity, so the same

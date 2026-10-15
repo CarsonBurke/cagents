@@ -100,14 +100,17 @@ impl Choices {
     }
 
     pub fn existing_branch(&self, name: &str) -> Option<&Choice> {
-        if let Some(choice) = self.find(name).filter(|choice| choice.kind != Kind::Tag) { return Some(choice); }
+        // Configured remote prefixes are explicit remote intent in the core
+        // resolver. A dropdown's full local identity overrides that separately.
+        if let Some(choice) = self.refs.iter().find(|choice| choice.kind == Kind::Remote && choice.name == name && choice.remote_branch.is_some()) { return Some(choice); }
+        if let Some(choice) = self.refs.iter().find(|choice| choice.kind == Kind::Local && choice.name == name) { return Some(choice); }
         let mut remote = self.refs.iter().filter(|choice| choice.kind == Kind::Remote && choice.remote_branch.as_deref() == Some(name));
         let choice = remote.next()?;
         remote.next().is_none().then_some(choice)
     }
 
     pub fn find(&self, name: &str) -> Option<&Choice> {
-        self.refs.iter().find(|choice| choice.name == name || choice.reference == name)
+        self.refs.iter().find(|choice| choice.reference == name).or_else(|| self.refs.iter().find(|choice| choice.name == name))
     }
 
     pub fn suggestions(&self, query: &str, tags: bool) -> Vec<&Choice> {
@@ -131,8 +134,13 @@ impl Choices {
     }
 
     pub fn outcome(&self, branch: &str, base: &str) -> String {
+        self.outcome_selected(branch, base, None)
+    }
+
+    pub fn outcome_selected(&self, branch: &str, base: &str, selected_ref: Option<&str>) -> String {
         let branch = self.effective_branch(branch);
-        if let Some(existing) = self.existing_branch(&branch) {
+        let selected = selected_ref.and_then(|reference| self.refs.iter().find(|choice| choice.reference == reference));
+        if let Some(existing) = selected.or_else(|| self.existing_branch(&branch)) {
             let progress = if existing.ahead > 0 { format!(" ({} ahead)", existing.ahead) } else { String::new() };
             return format!("Checks out existing {}{progress}", existing.name);
         }
@@ -188,7 +196,15 @@ mod tests {
         assert_eq!(choices.outcome("origin/feature/y", ""), "Checks out existing origin/feature/y");
         assert_eq!(choices.outcome("new", "main"), "New branch new from main · local main is 14 behind its upstream");
     }
-    #[test] fn autocomplete_includes_remote_branches_and_base_tags() {
+    #[test] fn selected_local_identity_wins_over_a_matching_remote_display_name() {
+        let mut choices = choices();
+        let mut local = choices.refs.iter().find(|choice| choice.name == "origin/feature/y").unwrap().clone();
+        local.kind = Kind::Local; local.reference = "refs/heads/origin/feature/y".into(); local.ahead = 7;
+        choices.refs.push(local);
+        assert_eq!(choices.outcome("origin/feature/y", ""), "Checks out existing origin/feature/y");
+        assert_eq!(choices.outcome_selected("origin/feature/y", "", Some("refs/heads/origin/feature/y")), "Checks out existing origin/feature/y (7 ahead)");
+    }
+        #[test] fn autocomplete_includes_remote_branches_and_base_tags() {
         let choices = choices();
         assert_eq!(choices.suggestions("ofy", false)[0].name, "origin/feature/y");
         assert!(choices.suggestions("v1", false).is_empty());

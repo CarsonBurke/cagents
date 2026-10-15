@@ -21,6 +21,7 @@ pub struct WorktreeDraft {
     pub base: String,
     pub destination: String,
     pub skip_setup: bool,
+    pub selected_branch_reference: Option<String>,
 }
 
 impl WorktreeDraft {
@@ -255,6 +256,7 @@ impl WorktreeDialog {
         self.submit_after_linear = false;
         self.submit_after_choices = false;
         if field == WorktreeField::Branch {
+            self.draft.selected_branch_reference = None;
             if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
             self.linear = LinearLookup::None;
             self.submit_after_linear = false;
@@ -503,7 +505,7 @@ impl Cagents {
         let Some(choice) = dialog.choices.find(&reference) else { return Task::none(); };
         let value = if field == WorktreeField::Base { choice.reference.clone() } else { choice.name.clone() };
         dialog.edit(field, value);
-        if field == WorktreeField::Branch { dialog.draft.base.clear(); }
+        if field == WorktreeField::Branch { dialog.draft.base.clear(); dialog.draft.selected_branch_reference = Some(reference); }
         dialog.focused_field = None;
         Task::none()
     }
@@ -553,6 +555,7 @@ impl Cagents {
             LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue { issue_id: issue.id.clone(), workspace: None }),
             _ => None,
         };
+        let selected_ref = dialog.draft.selected_branch_reference.clone();
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
         let trust = (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
             .then(|| dialog.choices.primary.clone().zip(dialog.choices.setup_plan.clone())).flatten();
@@ -574,7 +577,7 @@ impl Cagents {
                         .map_err(WorktreeInputError::general)?;
                 }
                 RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &token)
+                    .resolve_worktree_request_selected(&input, selected_ref.as_deref(), &token)
                     .map(|mut request| { request.linear_issue = linear_issue; request })
                     .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
@@ -755,7 +758,7 @@ impl Cagents {
             iced::widget::Space::new().into()
         } else {
             let branch = crate::repository::worktree_branch_input(dialog.branch_input()).unwrap_or_else(|_| dialog.draft.branch.clone());
-            design::caption(dialog.choices.outcome(&branch, &dialog.draft.base)).into()
+            design::caption(dialog.choices.outcome_selected(&branch, &dialog.draft.base, dialog.draft.selected_branch_reference.as_deref())).into()
         };
         rows.insert(2, outcome);
         rows.push(match &dialog.choices_error {
@@ -1008,6 +1011,11 @@ mod tests {
         assert_eq!(dialog(&app).draft.branch, "origin/release");
         assert!(dialog(&app).draft.base.is_empty());
         assert_eq!(dialog(&app).effective_branch().unwrap(), "origin/release");
+        assert_eq!(dialog(&app).draft.selected_branch_reference.as_deref(), Some("refs/remotes/origin/release"));
+        let saved = dialog(&app).draft.clone();
+        assert_eq!(WorktreeDialog::new(ProjectId::new(), "/repo".into(), saved).draft.selected_branch_reference.as_deref(), Some("refs/remotes/origin/release"));
+        app.worktree_dialog.as_mut().unwrap().edit(WorktreeField::Branch, "new-local".into());
+        assert!(dialog(&app).draft.selected_branch_reference.is_none());
     }
 
     #[test]
