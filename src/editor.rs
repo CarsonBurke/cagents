@@ -484,7 +484,8 @@ fn load_regular_file(
         OversizeKind::Document => MAX_DOCUMENT_BYTES,
         OversizeKind::Editable => MAX_EDITABLE_FILE_BYTES,
     };
-    if metadata.len() > limit && !document {
+    if metadata.len() > limit && !document && image::ImageFormat::from_path(relative_path).is_err()
+    {
         let mut sample = [0; 4096];
         let mut descriptor = &file;
         let read = descriptor.read(&mut sample).map_err(io_error)?;
