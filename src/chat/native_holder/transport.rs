@@ -182,6 +182,8 @@ pub(crate) struct Holder {
     release_on_drop: bool,
     durable: bool,
     identity: super::Detached,
+    wire_source: Session,
+    alias_publisher: Option<super::aliases::Publisher>,
 }
 
 impl Holder {
@@ -195,10 +197,12 @@ impl Holder {
         process: Process,
     ) -> Result<(), String> {
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        let version = super::verified_codex_version(&identity.user_agent)
+            .ok_or("Unverified native provider version")?.to_owned();
         send(
             control,
             &Request::Confirm {
-                thread,
+                thread: thread.clone(),
                 identity,
                 process,
             },
@@ -207,12 +211,18 @@ impl Holder {
         match receive(control, TIMEOUT)? {
             Some(Report::Confirmed) => {
                 self.durable = true;
+                self.identity.source.launch.session_id = Some(thread.clone());
+                self.identity.source.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: version.clone() };
+                self.wire_source.launch.session_id = Some(thread);
+                self.wire_source.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: version };
                 Ok(())
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge provider identity".into()),
         }
     }
+
+    pub fn published_source(&self) -> &Session { &self.identity.source }
 
     pub fn preserve(mut self) -> super::Detached {
         self.release_on_drop = false;
@@ -226,18 +236,22 @@ impl Holder {
         execution_console: Option<crate::model::LaunchRecipe>,
         paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
+        let mut expected = self.identity.source.clone();
+        expected.terminal = source.terminal.clone();
+        if source != expected { return Err("Published native descriptor changed immutable ownership".into()); }
+        let mut wire = self.wire_source.clone();
+        wire.terminal = source.terminal.clone();
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
-        send(
-            control,
-            &Request::UpdateSource {
-                source,
-                execution_console,
-                paired_holder,
-            },
-            TIMEOUT,
-        )?;
+        send(control, &Request::UpdateSource { source: wire.clone(), execution_console: execution_console.clone(), paired_holder: paired_holder.clone() }, TIMEOUT)?;
         match receive(control, TIMEOUT)? {
-            Some(Report::SourceUpdated) => Ok(()),
+            Some(Report::SourceUpdated) => {
+                if let Some(publisher) = &self.alias_publisher {
+                    publisher.retain(&self.identity.record, &source, &wire)?;
+                }
+                self.wire_source = wire;
+                self.identity.source = source;
+                Ok(())
+            }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge paired view ownership".into()),
         }
@@ -454,6 +468,8 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             control: Some(control),
             release_on_drop: true,
             durable: false,
+            wire_source: retained_source.clone(),
+            alias_publisher: None,
             identity: super::Detached {
                 record,
                 proof: source_proof.clone(),
@@ -522,6 +538,8 @@ pub(crate) fn adopt(
     source: &Session,
     proof: &HostSessionProof,
 ) -> Result<(Holder, Recovery), String> {
+    let (before, _) = inspect(record, proof)?;
+    let wire = super::aliases::recognized_source(record, &before, source)?;
     let control = connect(record)?;
     if record.is_outdated() {
         tracing::warn!(terminal = %record.terminal, holder_pid = record.holder.pid,
@@ -533,7 +551,7 @@ pub(crate) fn adopt(
     send(
         &control,
         &Request::Adopt {
-            source: source.clone(),
+            source: wire.clone(),
             proof: proof.clone(),
         },
         TIMEOUT,
@@ -543,18 +561,34 @@ pub(crate) fn adopt(
             recovery.validate(&record.boot)?;
             if recovery.source.id != source.id
                 || recovery.source.proof.as_ref() != Some(proof)
-                || (&recovery.source != source && !recovery.previous_sources.contains(source))
+                || (&recovery.source != &wire && !recovery.previous_sources.contains(&wire))
+                || recovery.confirmed_thread != before.confirmed_thread
+                || recovery.server_identity != before.server_identity
+                || recovery.server_version != before.server_version
+                || recovery.server_process != before.server_process
             {
                 return Err("Native holder did not preserve exact adoption lineage".into());
             }
+            // Bind the formerly published alias while its canonical source is
+            // still retained. The new presentation is persisted after pairing.
+            super::aliases::retain(record, &recovery, source, &wire)?;
+            let mut published = source.clone();
+            published.proof = Some(proof.clone());
+            published.launch.session_id = recovery.confirmed_thread.clone();
+            published.native_continuity = recovery.source.native_continuity.clone();
+            // A historical pane may predate the paired console. Retain the
+            // holder's current exact pair, then the host authenticates its worker.
+            published.terminal = recovery.source.terminal.clone();
             Ok((
                 Holder {
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
+                    wire_source: recovery.source.clone(),
+                    alias_publisher: Some(super::aliases::Publisher::new(&recovery)?),
                     identity: super::Detached {
                         record: record.clone(),
-                        source: recovery.source.clone(),
+                        source: published,
                         proof: proof.clone(),
                     },
                 },

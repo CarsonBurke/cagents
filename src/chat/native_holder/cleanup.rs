@@ -193,6 +193,7 @@ fn consume(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
+    super::aliases::forget(&receipt.record);
     Ok(true)
 }
 
@@ -262,6 +263,7 @@ fn find_source(
         };
         let holder = Process { pid, start };
         let mut matched = None;
+        let mut alias_error = None;
         let complete = consume(source.id, &holder, true, |receipt| {
             if matches!(receipt.record.version, 3 | 4)
                 && receipt.record.terminal == source.id
@@ -271,13 +273,17 @@ fn find_source(
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()
-                && receipt.sources.contains(&digest)
+                && (receipt.sources.contains(&digest) || match super::aliases::receipt_covers(&receipt.record, &digest, &receipt.sources) {
+                    Ok(covered) => covered,
+                    Err(error) => { alias_error = Some(error); false }
+                })
             {
                 matched = Some(receipt.clone());
             }
             // Unrelated old receipts are harmless; only a matching digest is authority.
             true
         })?;
+        if let Some(error) = alias_error { return Err(error); }
         if complete && matched.is_some() {
             if current.is_some() {
                 return Err("A replacement native holder exists after this exact close receipt; it was not stopped".into());

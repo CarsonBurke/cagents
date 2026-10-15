@@ -1,8 +1,10 @@
 //! Durable ownership of a native provider server, independent of the daemon's
 //! protocol actor. The holder never submits a prompt or answers an approval.
 
+mod aliases;
 mod cleanup;
 mod transport;
+pub(crate) use aliases::recognized_source;
 pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
 pub(crate) use transport::{Holder, adopt, inspect, spawn};
 
@@ -135,7 +137,6 @@ impl Recovery {
         source.native_continuity = super::NativeContinuity::Durable {
             provider_version: version.into(),
         };
-        super::protocol::align_resume_identity(&mut source.launch)?;
         if source != self.source {
             self.remember_source()?;
             self.source = source;
@@ -331,6 +332,7 @@ mod tests {
             )
             .unwrap();
         assert!(recovery.is_durable());
+        assert_eq!(recovery.source.launch.recipe, original.launch.recipe, "confirmation must preserve the issued recipe");
         assert_eq!(recovery.confirmed_thread.as_ref(), Some(&thread));
         assert!(recovery.previous_sources.contains(&original));
         recovery.adopt(&original, successor.clone()).unwrap();
