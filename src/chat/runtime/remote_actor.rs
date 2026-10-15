@@ -1822,6 +1822,10 @@ impl Server {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+        // Ready may be published inside the initial decoded step before its
+        // actual Store token is seeded. Do not expose a body-ready attachment
+        // through that narrow window. Typed unavailability is added separately.
+        let ready = ready && journal.source_authority().is_some();
         let continuity_loss = journal.continuity_loss()?;
         let failure = continuity_loss
             .as_ref()
@@ -2701,6 +2705,9 @@ mod tests {
         }
     }
     fn resident_fixture() -> Fixture {
+        resident_fixture_with_notify(|_| {})
+    }
+    fn resident_fixture_with_notify(notify: impl Fn(Update) + Send + Sync + 'static) -> Fixture {
         use crate::chat::protocol::{Adapter, Step};
         struct Idle;
         impl Adapter for Idle {
@@ -2744,7 +2751,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Idle);
         let mut initial = adapter.initialize().unwrap();
         let store = super::super::preflight(&spec, &mut initial).unwrap();
-        let actor = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let actor = LocalHandle::start(spec, adapter, initial, store, None, notify).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !actor.0.state.lock().unwrap().ready {
             assert!(Instant::now() < deadline);
@@ -2783,6 +2790,29 @@ mod tests {
                 attachment_preserved: false,
             },
             _root: root,
+        }
+    }
+    #[test]
+    fn initial_ready_waits_for_actual_store_seed_before_remote_body_admission() {
+        struct Release(Option<crossbeam_channel::Sender<()>>);
+        impl Drop for Release { fn drop(&mut self) { if let Some(tx)=self.0.take() { let _=tx.try_send(()); } } }
+        let (ready, arrived) = crossbeam_channel::bounded(1);
+        let (release, held) = crossbeam_channel::bounded(1);
+        let mut release = Release(Some(release));
+        let fixture = resident_fixture_with_notify(move |update| {
+            if matches!(update, Update::Ready) { let _=ready.try_send(()); let _=held.recv_timeout(Duration::from_secs(3)); }
+        });
+        arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(fixture.server.actor.0.state.lock().unwrap().ready);
+        let waiting = fixture.server.resident().unwrap();
+        assert!(waiting.source_authority.is_none());
+        assert!(!waiting.ready, "initial provider Ready is not yet a source-ready attachment");
+        release.0.take().unwrap().try_send(()).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {
+            let state=fixture.server.resident().unwrap();
+            if state.ready { assert_eq!(state.source_authority, fixture.server.actor.source_authority()); break; }
+            assert!(Instant::now()<deadline); thread::yield_now();
         }
     }
     #[test]
