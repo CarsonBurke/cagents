@@ -28,9 +28,26 @@ pub fn recovery_directory_stamp(root: &Root) -> io::Result<RecoveryDirectoryStam
 /// retain its actual epoch/lease, reject adoption of a source enclosing pending
 /// payloads, and invalidate writes when that authority changes. A fresh always-
 /// successful closure is not a substitute for the domain's registry proof.
+pub trait RecoveryRegistrationLease: Send + Sync {
+    fn validate(&self) -> io::Result<()>;
+    /// Enroll the actual retained Published holding before any payload write.
+    /// Exact-identity repeats must be idempotent. Unknown handoff outcomes keep
+    /// a negative obligation inside this owned lease even when returning Err.
+    /// Admission/registration exclusion must span validation through effects;
+    /// three sequential checks alone do not provide that domain exclusion.
+    fn register_payload(&self, payload: &Root) -> io::Result<()>;
+    /// Hard upper bound for all LOCAL native descriptors retained by this
+    /// lease/same-process guards, including future local enrollment handles.
+    /// Reject growth beyond the reservation. A remote daemon must independently
+    /// pre-reserve its GLOBAL descriptor budget before issuance/enrollment;
+    /// its received handles are not silently treated as zero-cost remote state.
+    fn descriptor_budget(&self) -> usize;
+}
+
 #[derive(Clone)]
 pub struct RecoveryRegistryCheck {
     check: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    register_payload: Option<Arc<dyn Fn(&Root) -> io::Result<()> + Send + Sync>>,
     retained_descriptors: usize,
 }
 impl RecoveryRegistryCheck {
@@ -38,7 +55,19 @@ impl RecoveryRegistryCheck {
     /// opaque callback/lease. The domain must measure it, including shared
     /// handles not present in the explicit Root set; do not charge an Arc zero.
     pub fn new(check: Arc<dyn Fn() -> io::Result<()> + Send + Sync>, retained_descriptors: usize) -> Self {
-        Self { check, retained_descriptors }
+        Self { check, register_payload: None, retained_descriptors }
+    }
+    /// Real domain issuance retains an owned registration/adoption lease.
+    /// The callback-only constructor supports isolated static predicate tests;
+    /// it deliberately cannot authorize payload enrollment.
+    pub fn from_lease(lease: Arc<dyn RecoveryRegistrationLease>) -> Self {
+        let retained_descriptors = lease.descriptor_budget();
+        let validator = lease.clone();
+        Self {
+            check: Arc::new(move || validator.validate()),
+            register_payload: Some(Arc::new(move |payload| lease.register_payload(payload))),
+            retained_descriptors,
+        }
     }
 }
 
@@ -148,6 +177,15 @@ impl RecoveryPlacement {
     /// safe does not prove that this directory has not moved into a checkout.
     pub fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
         self.validate_payload_against_roots(payload, &[])
+    }
+    /// The holding already exists. On any failure, the producer must retain its
+    /// exact publication AND this lease in its pre-reserved recovery slot;
+    /// neither an error string nor a fresh pathname grants cleanup authority.
+    pub fn register_payload_root(&self, payload: &Root) -> io::Result<()> {
+        self.validate_payload_root(payload)?;
+        let register = self.registry.register_payload.as_ref().ok_or_else(|| unsupported("Recovery payloads require an owned registration/adoption lease; no payload was written."))?;
+        register(payload)?;
+        self.validate_payload_root(payload)
     }
     /// Registry/adoption companion for an actual held pending payload. Retain
     /// the exact payload Root and census through the domain's admission turn.
