@@ -219,11 +219,18 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn activate_project(&mut self, repository: PathBuf) -> Task<Message> {
-        let project = self.sidebar_model.projects.iter().find(|project| project.repository == repository);
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == repository);
         if let Some(project) = project {
-            let primary = project.worktrees.iter().find(|worktree| {
-                crate::sidebar::is_primary_worktree(&repository, &worktree.path)
-            }).or_else(|| project.worktrees.first()).map(|worktree| worktree.path.clone());
+            let primary = project
+                .worktrees
+                .iter()
+                .find(|worktree| crate::sidebar::is_primary_worktree(&repository, &worktree.path))
+                .or_else(|| project.worktrees.first())
+                .map(|worktree| worktree.path.clone());
             if let Some(path) = primary {
                 self.project_ui.select_on_load = None;
                 return self.select_worktree(path, false);
@@ -1030,7 +1037,11 @@ impl Cagents {
                 }
                 match command {
                     ProjectCommand::MarkRead => {
-                        return worktree_id.map_or_else(Task::none, |worktree| self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project_id, worktree))));
+                        return worktree_id.map_or_else(Task::none, |worktree| {
+                            self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+                                project_id, worktree,
+                            )))
+                        });
                     }
                     ProjectCommand::CopyPath => {
                         return iced::clipboard::write(target.path.display().to_string());

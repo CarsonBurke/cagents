@@ -208,10 +208,11 @@ impl SidebarModel {
     /// path/identity fallback, independent of asynchronous load completion.
     pub fn apply_project_order(&mut self, order: &[ProjectId]) {
         self.projects.sort_by_key(|project| {
-            (order
-                .iter()
-                .position(|id| *id == project.id)
-                .unwrap_or(usize::MAX),
+            (
+                order
+                    .iter()
+                    .position(|id| *id == project.id)
+                    .unwrap_or(usize::MAX),
                 project.repository.clone(),
                 project.id,
             )
@@ -484,30 +485,83 @@ impl SidebarChannel {
 
 /// Attribute a channel only when all of its launch directories resolve to one
 /// known root. Mixed-worktree channels deliberately keep their project scope.
-pub fn channel_worktree<'a>(worktrees: &[SidebarWorktree], directories: impl IntoIterator<Item = &'a Path>) -> Option<(WorktreeId, String)> {
-    let roots: std::collections::HashMap<_, _> = worktrees.iter().map(|worktree| (worktree.path.as_path(), worktree)).collect();
+pub fn channel_worktree<'a>(
+    worktrees: &[SidebarWorktree],
+    directories: impl IntoIterator<Item = &'a Path>,
+) -> Option<(WorktreeId, String)> {
+    let roots: std::collections::HashMap<_, _> = worktrees
+        .iter()
+        .map(|worktree| (worktree.path.as_path(), worktree))
+        .collect();
     let mut owner = None;
     for directory in directories {
-        let worktree = directory.ancestors().find_map(|ancestor| roots.get(ancestor).copied())?;
-        if owner.as_ref().is_some_and(|(id, _)| *id != worktree.id) { return None; }
-        owner = Some((worktree.id, worktree.branch.clone().unwrap_or_else(|| worktree.label().to_owned())));
+        let worktree = directory
+            .ancestors()
+            .find_map(|ancestor| roots.get(ancestor).copied())?;
+        if owner.as_ref().is_some_and(|(id, _)| *id != worktree.id) {
+            return None;
+        }
+        owner = Some((
+            worktree.id,
+            worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| worktree.label().to_owned()),
+        ));
     }
     owner
 }
 
 impl SidebarChannel {
-    pub fn set_attribution(&mut self, worktree: Option<(WorktreeId, String)>, outcome: Option<crate::agent::ActivityOutcome>) {
+    pub fn set_attribution(
+        &mut self,
+        worktree: Option<(WorktreeId, String)>,
+        outcome: Option<crate::agent::ActivityOutcome>,
+    ) {
         self.worktree = worktree;
         self.outcome = outcome;
-        let branch = self.worktree.as_ref().map(|(_, branch)| format!(" · {branch}")).unwrap_or_default();
-        let failure = self.outcome.as_ref().map(|outcome| {
-            outcome.reason().map_or_else(|| {
-                if matches!(outcome, crate::agent::ActivityOutcome::Cancelled) { format!(" · {}", outcome.label()) } else { String::new() }
-            }, |reason| format!(" · {}: {reason}", outcome.label()))
-        }).unwrap_or_default();
-        let contents = format!("{} chat{}", self.chats, if self.chats == 1 { "" } else { "s" });
+        let branch = self
+            .worktree
+            .as_ref()
+            .map(|(_, branch)| format!(" · {branch}"))
+            .unwrap_or_default();
+        let failure = self
+            .outcome
+            .as_ref()
+            .map(|outcome| {
+                outcome.reason().map_or_else(
+                    || {
+                        if matches!(outcome, crate::agent::ActivityOutcome::Cancelled) {
+                            format!(" · {}", outcome.label())
+                        } else {
+                            String::new()
+                        }
+                    },
+                    |reason| format!(" · {}: {reason}", outcome.label()),
+                )
+            })
+            .unwrap_or_default();
+        let contents = format!(
+            "{} chat{}",
+            self.chats,
+            if self.chats == 1 { "" } else { "s" }
+        );
         self.tooltip = format!("{} · {contents}{branch}{failure}", self.title).into_boxed_str();
-        self.accessible_name = format!("Open channel {}, {contents}{}{}{branch}{failure}", self.title, if self.has_panes { "" } else { ", no open panes" }, if self.unread { ", unread agent update" } else { "" }).into_boxed_str();
+        self.accessible_name = format!(
+            "Open channel {}, {contents}{}{}{branch}{failure}",
+            self.title,
+            if self.has_panes {
+                ""
+            } else {
+                ", no open panes"
+            },
+            if self.unread {
+                ", unread agent update"
+            } else {
+                ""
+            }
+        )
+        .into_boxed_str();
     }
 }
 
@@ -877,8 +931,8 @@ impl SidebarWorktree {
         // A -uno watcher read has no authority over the last complete untracked
         // count. Keep that fact until a full read replaces it, including zero.
         let mut dirty = status.dirty.clone();
-        let untracked_omitted = status.untracked_omitted &&
-            (self.dirty.is_none() || self.untracked_omitted);
+        let untracked_omitted =
+            status.untracked_omitted && (self.dirty.is_none() || self.untracked_omitted);
         if status.untracked_omitted && !untracked_omitted {
             dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
         }
@@ -909,7 +963,12 @@ impl SidebarWorktree {
                     .as_deref()
                     .and_then(|branch| search_score(branch, query)),
             )
-            .chain(self.chrome.folded_pr_title.as_deref().and_then(|title| search_score(title, query)))
+            .chain(
+                self.chrome
+                    .folded_pr_title
+                    .as_deref()
+                    .and_then(|title| search_score(title, query)),
+            )
             .min()
             .or_else(|| {
                 query
@@ -998,7 +1057,9 @@ impl SidebarWorktree {
         self.chrome.paneless_accessible_name = paneless_name(&accessible_name);
         self.chrome.accessible_name = accessible_name.into_boxed_str();
         let mut tooltip = format!(
-            "{}\nBranch: {branch}\n{}\n{status}", self.chrome.label, self.path.display()
+            "{}\nBranch: {branch}\n{}\n{status}",
+            self.chrome.label,
+            self.path.display()
         );
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
@@ -2745,8 +2806,14 @@ pub enum AttentionState {
     Waiting,
 }
 
-pub fn cycle_attention(cards: &[CardId], current: Option<CardId>, backwards: bool) -> Option<CardId> {
-    if cards.is_empty() { return None; }
+pub fn cycle_attention(
+    cards: &[CardId],
+    current: Option<CardId>,
+    backwards: bool,
+) -> Option<CardId> {
+    if cards.is_empty() {
+        return None;
+    }
     let index = current.and_then(|id| cards.iter().position(|card| *card == id));
     let index = match (index, backwards) {
         (Some(index), true) => (index + cards.len() - 1) % cards.len(),
@@ -2758,9 +2825,13 @@ pub fn cycle_attention(cards: &[CardId], current: Option<CardId>, backwards: boo
 }
 
 pub(crate) fn outcome_priority(outcome: &crate::agent::ActivityOutcome) -> u8 {
-    if outcome.reason().is_some() { 2 }
-    else if matches!(outcome, crate::agent::ActivityOutcome::Cancelled) { 1 }
-    else { 0 }
+    if outcome.reason().is_some() {
+        2
+    } else if matches!(outcome, crate::agent::ActivityOutcome::Cancelled) {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn attention_state(
@@ -2998,14 +3069,22 @@ impl SidebarState {
         if self.filter == SidebarFilter::Attention
             && let Some(Some((project, worktree))) = self.agent_updates.get(&card)
         {
-            self.retained_attention.insert(SelectionRow::Worktree(*project, *worktree));
+            self.retained_attention
+                .insert(SelectionRow::Worktree(*project, *worktree));
         }
         self.agent_updates.remove(&card);
     }
 
-    pub fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> { &self.agent_updates }
+    pub fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
+        &self.agent_updates
+    }
 
-    pub fn restore_unread_updates(&mut self, updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>) { self.agent_updates = updates; }
+    pub fn restore_unread_updates(
+        &mut self,
+        updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    ) {
+        self.agent_updates = updates;
+    }
 
     pub fn has_card_update(&self, card: CardId) -> bool {
         self.agent_updates.contains_key(&card)
@@ -3026,7 +3105,11 @@ impl SidebarState {
         self.worktrees_with_panes.contains(&(project, worktree))
     }
 
-    pub fn set_card_outcome(&mut self, card: CardId, outcome: Option<crate::agent::ActivityOutcome>) {
+    pub fn set_card_outcome(
+        &mut self,
+        card: CardId,
+        outcome: Option<crate::agent::ActivityOutcome>,
+    ) {
         if let Some(outcome) = outcome {
             self.agent_outcomes.insert(card, outcome);
         } else {
@@ -3039,44 +3122,85 @@ impl SidebarState {
     }
 
     pub fn card_attention(&self, card: CardId) -> Option<AttentionState> {
-        attention_state(self.card_activity(card).map(|a| a.state), self.has_card_update(card), self.card_outcome(card))
+        attention_state(
+            self.card_activity(card).map(|a| a.state),
+            self.has_card_update(card),
+            self.card_outcome(card),
+        )
     }
 
-    pub fn worktree_outcome(&self, project: ProjectId, worktree: WorktreeId) -> Option<&crate::agent::ActivityOutcome> {
-        self.agent_activity.iter().filter(|(_, entry)| entry.owner == Some((project, worktree)))
+    pub fn worktree_outcome(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<&crate::agent::ActivityOutcome> {
+        self.agent_activity
+            .iter()
+            .filter(|(_, entry)| entry.owner == Some((project, worktree)))
             .filter_map(|(card, _)| self.card_outcome(*card))
             .max_by_key(|outcome| outcome_priority(outcome))
     }
 
-    pub fn worktree_attention(&self, project: ProjectId, worktree: WorktreeId) -> Option<AttentionState> {
-        self.agent_activity.iter()
+    pub fn worktree_attention(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<AttentionState> {
+        self.agent_activity
+            .iter()
             .filter(|(_, entry)| entry.owner == Some((project, worktree)))
             .filter_map(|(card, _)| self.card_attention(*card))
-            .chain(self.has_agent_update(project, worktree).then_some(AttentionState::Unread))
+            .chain(
+                self.has_agent_update(project, worktree)
+                    .then_some(AttentionState::Unread),
+            )
             .max()
     }
 
     /// Stable across workspaces; rank intervention ahead of completion, then
     /// use pane identity to break ties without hash-map iteration jitter.
     pub fn attention_cards(&self) -> Vec<CardId> {
-        let cards: BTreeSet<_> = self.agent_activity.keys().chain(self.agent_updates.keys()).copied().collect();
-        let mut cards: Vec<_> = cards.into_iter().filter_map(|card| {
-            self.card_attention(card).and_then(|state| {
-                if matches!(state, AttentionState::Waiting | AttentionState::Failed) { Some((state, card)) }
-                else if self.has_card_update(card) { Some((AttentionState::Unread, card)) }
-                else { None }
+        let cards: BTreeSet<_> = self
+            .agent_activity
+            .keys()
+            .chain(self.agent_updates.keys())
+            .copied()
+            .collect();
+        let mut cards: Vec<_> = cards
+            .into_iter()
+            .filter_map(|card| {
+                self.card_attention(card).and_then(|state| {
+                    if matches!(state, AttentionState::Waiting | AttentionState::Failed) {
+                        Some((state, card))
+                    } else if self.has_card_update(card) {
+                        Some((AttentionState::Unread, card))
+                    } else {
+                        None
+                    }
+                })
             })
-        }).collect();
-        cards.sort_by(|a,b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            .collect();
+        cards.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         cards.into_iter().map(|(_, card)| card).collect()
     }
 
     pub fn waiting_count(&self) -> usize {
-        self.agent_activity.values().filter(|entry| entry.activity.state == crate::agent::ActivityState::Waiting).count()
+        self.agent_activity
+            .values()
+            .filter(|entry| entry.activity.state == crate::agent::ActivityState::Waiting)
+            .count()
     }
 
     pub fn intervention_count(&self) -> usize {
-        self.agent_activity.keys().filter(|card| matches!(self.card_attention(**card), Some(AttentionState::Waiting | AttentionState::Failed))).count()
+        self.agent_activity
+            .keys()
+            .filter(|card| {
+                matches!(
+                    self.card_attention(**card),
+                    Some(AttentionState::Waiting | AttentionState::Failed)
+                )
+            })
+            .count()
     }
 
     pub fn attention_retained(&self, row: SelectionRow) -> bool {
@@ -3085,7 +3209,8 @@ impl SidebarState {
 
     pub fn retain_attention_channel(&mut self, channel: ChannelId) {
         if self.filter == SidebarFilter::Attention {
-            self.retained_attention.insert(SelectionRow::Channel(channel));
+            self.retained_attention
+                .insert(SelectionRow::Channel(channel));
         }
     }
 
@@ -3345,7 +3470,10 @@ impl SidebarState {
     pub fn apply(&mut self, action: &SidebarAction) {
         match action {
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
-            SidebarAction::SetFilter(filter) => { self.retained_attention.clear(); self.filter = *filter; },
+            SidebarAction::SetFilter(filter) => {
+                self.retained_attention.clear();
+                self.filter = *filter;
+            }
             SidebarAction::ToggleControls => {
                 self.controls_expanded = !self.controls_expanded;
                 if !self.controls_expanded {
@@ -4185,10 +4313,17 @@ fn header<'a>(
         ));
         let count = state.intervention_count();
         if count > 0 {
-            actions.push(crate::interaction::tooltip(design::caption(count.to_string()), format!("{count} agents need attention")));
+            actions.push(crate::interaction::tooltip(
+                design::caption(count.to_string()),
+                format!("{count} agents need attention"),
+            ));
         }
         if attention {
-            actions.push(button::text("Mark all read").on_press_maybe(gated(SidebarAction::MarkAllRead, modal_open)).into());
+            actions.push(
+                button::text("Mark all read")
+                    .on_press_maybe(gated(SidebarAction::MarkAllRead, modal_open))
+                    .into(),
+            );
         }
         let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
@@ -4891,8 +5026,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4916,16 +5056,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -5140,8 +5284,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -5396,8 +5540,15 @@ fn project_view<'a>(
                         project.editors,
                         project.state.has_agent_update(project_id, worktree.id),
                         project.state.agent_activity(project_id, worktree.id),
-                project.state.worktree_outcome(project_id, worktree.id),
-                project.state.attention_retained(SelectionRow::Worktree(project_id, worktree.id)) && !project.state.has_agent_update(project_id, worktree.id) && !project.state.worktree_attention(project_id, worktree.id).is_some_and(AttentionState::needs_attention),
+                        project.state.worktree_outcome(project_id, worktree.id),
+                        project
+                            .state
+                            .attention_retained(SelectionRow::Worktree(project_id, worktree.id))
+                            && !project.state.has_agent_update(project_id, worktree.id)
+                            && !project
+                                .state
+                                .worktree_attention(project_id, worktree.id)
+                                .is_some_and(AttentionState::needs_attention),
                         project.state.worktree_has_panes(project_id, worktree.id),
                         false,
                         project
@@ -5463,22 +5614,45 @@ fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
         (Some(first), Some(last)) if letters.len() > 1 => format!("{first}{last}"),
         (Some(first), _) => first.to_string(),
         _ => "?".to_owned(),
-    }.to_uppercase();
-    let hash = name.bytes().fold(2_166_136_261u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(16_777_619));
+    }
+    .to_uppercase();
+    let hash = name.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
     // Saturated, moderately dark colours support white text in either theme.
     let hue = (hash % 360) as f32 / 60.0;
     let x = 0.40 * (1.0 - (hue % 2.0 - 1.0).abs());
     let (r, g, b) = match hue as u8 {
-        0 => (0.40, x, 0.0), 1 => (x, 0.40, 0.0), 2 => (0.0, 0.40, x),
-        3 => (0.0, x, 0.40), 4 => (x, 0.0, 0.40), _ => (0.40, 0.0, x),
+        0 => (0.40, x, 0.0),
+        1 => (x, 0.40, 0.0),
+        2 => (0.0, 0.40, x),
+        3 => (0.0, x, 0.40),
+        4 => (x, 0.0, 0.40),
+        _ => (0.40, 0.0, x),
     };
-    (initials, cosmic::iced::Color::from_rgb(r + 0.08, g + 0.08, b + 0.08))
+    (
+        initials,
+        cosmic::iced::Color::from_rgb(r + 0.08, g + 0.08, b + 0.08),
+    )
 }
 
-fn compact_project_attention(project: &SidebarProject, state: &SidebarState) -> Option<AttentionState> {
-    project.channels.iter().filter_map(|channel| {
-        attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
-    }).chain(project.worktrees.iter().filter_map(|row| state.worktree_attention(project.id, row.id))).max()
+fn compact_project_attention(
+    project: &SidebarProject,
+    state: &SidebarState,
+) -> Option<AttentionState> {
+    project
+        .channels
+        .iter()
+        .filter_map(|channel| {
+            attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
+        })
+        .chain(
+            project
+                .worktrees
+                .iter()
+                .filter_map(|row| state.worktree_attention(project.id, row.id)),
+        )
+        .max()
 }
 
 fn attention_description(attention: AttentionState) -> &'static str {
@@ -5491,7 +5665,12 @@ fn attention_description(attention: AttentionState) -> &'static str {
     }
 }
 
-fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open: bool, state: &SidebarState) -> Element<'static, SidebarAction> {
+fn compact_project_identity(
+    project: &SidebarProject,
+    selected: bool,
+    modal_open: bool,
+    state: &SidebarState,
+) -> Element<'static, SidebarAction> {
     let (initials, color) = project_identity(&project.name);
     let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
         project_icon(project, ROW_ICON_WIDTH as u16)
@@ -5501,41 +5680,79 @@ fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open
     let chip = widget::container(identity)
         .center_x(ROW_ICON_WIDTH)
         .center_y(24.0)
-        .class(theme::Container::custom(move |_theme| cosmic::iced::widget::container::Style {
-            background: Some(color.into()),
-            text_color: Some(cosmic::iced::Color::WHITE),
-            border: cosmic::iced::Border {
-                color: if selected { cosmic::iced::Color::WHITE } else { color },
-                width: if selected { 2.0 } else { 0.0 },
-                radius: 4.0.into(),
-            },
-            ..Default::default()
+        .class(theme::Container::custom(move |_theme| {
+            cosmic::iced::widget::container::Style {
+                background: Some(color.into()),
+                text_color: Some(cosmic::iced::Color::WHITE),
+                border: cosmic::iced::Border {
+                    color: if selected {
+                        cosmic::iced::Color::WHITE
+                    } else {
+                        color
+                    },
+                    width: if selected { 2.0 } else { 0.0 },
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
         }));
     let attention = compact_project_attention(project, state);
     let mut description = project.name.clone();
     for worktree in &project.worktrees {
         use std::fmt::Write as _;
-        let selected = state.selection == Some(SidebarSelection::Worktree { project_id: project.id, worktree_id: worktree.id });
-        let _ = write!(description, "\n{}{}: {}", if selected { "Selected " } else { "" }, worktree.label(),
-            status_summary(worktree.detached, worktree.locked, worktree.dirty.as_ref(), worktree.untracked_omitted, worktree.ahead, worktree.behind));
+        let selected = state.selection
+            == Some(SidebarSelection::Worktree {
+                project_id: project.id,
+                worktree_id: worktree.id,
+            });
+        let _ = write!(
+            description,
+            "\n{}{}: {}",
+            if selected { "Selected " } else { "" },
+            worktree.label(),
+            status_summary(
+                worktree.detached,
+                worktree.locked,
+                worktree.dirty.as_ref(),
+                worktree.untracked_omitted,
+                worktree.ahead,
+                worktree.behind
+            )
+        );
         if let Some(attention) = state.worktree_attention(project.id, worktree.id) {
             let _ = write!(description, ", {}", attention_description(attention));
         }
         if let Some(outcome) = state.worktree_outcome(project.id, worktree.id) {
-            if let Some(reason) = outcome.reason() { let _ = write!(description, ": {reason}"); }
+            if let Some(reason) = outcome.reason() {
+                let _ = write!(description, ": {reason}");
+            }
         }
     }
     for channel in &project.channels {
-        if let Some(attention) = attention_state(channel.activity, channel.unread, channel.outcome.as_ref()) {
+        if let Some(attention) =
+            attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
+        {
             use std::fmt::Write as _;
-            let _ = write!(description, "\n{}: {}", channel.title, attention_description(attention));
+            let _ = write!(
+                description,
+                "\n{}: {}",
+                channel.title,
+                attention_description(attention)
+            );
         }
     }
     let grid = RowGrid::child(true);
-    let control = grid.control(grid.content(chip, None, attention_indicator(attention)), selected)
+    let control = grid
+        .control(
+            grid.content(chip, None, attention_indicator(attention)),
+            selected,
+        )
         .id(project.chrome.open_id.clone())
         .name(description.clone())
-        .on_press_maybe(project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open)));
+        .on_press_maybe(
+            project_primary_action(project, state.filter)
+                .and_then(|action| gated(action, modal_open)),
+        );
     grid.mount(crate::interaction::tooltip(control, description))
 }
 
@@ -5595,21 +5812,24 @@ fn compact_project<'a>(
                 || channel.activity.is_some()
                 || channel.deletion.is_some())
     }) {
-        members.push((SelectionRow::Channel(channel.id), RowInteraction::selectable(
-            channel_view(
-                channel,
-                modal_open,
-                true,
-                project
-                    .state
-                    .rows
-                    .group_size(SelectionRow::Channel(channel.id)),
-                &project.state.query,
-            ),
+        members.push((
             SelectionRow::Channel(channel.id),
-            project.state,
-            !modal_open && channel.deletion != Some(RowDeletion::Deleting),
-        )));
+            RowInteraction::selectable(
+                channel_view(
+                    channel,
+                    modal_open,
+                    true,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Channel(channel.id)),
+                    &project.state.query,
+                ),
+                SelectionRow::Channel(channel.id),
+                project.state,
+                !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+            ),
+        ));
     }
     for &worktree in project.worktrees.iter().filter(|worktree| {
         expanded
@@ -5627,39 +5847,51 @@ fn compact_project<'a>(
                     .agent_activity(entity.id, worktree.id)
                     .is_some())
     }) {
-        members.push((SelectionRow::Worktree(entity.id, worktree.id), RowInteraction::selectable(
-            worktree_view(
-                entity.id,
-                worktree,
-                is_primary_worktree(&entity.repository, &worktree.path),
-                project.state.filter == SidebarFilter::PullRequests,
-                selection,
-                modal_open,
-                entity.github_ready,
-                project.editors,
-                project.state.has_agent_update(entity.id, worktree.id),
-                project.state.agent_activity(entity.id, worktree.id),
-                project.state.worktree_outcome(entity.id, worktree.id),
-                project.state.attention_retained(SelectionRow::Worktree(entity.id, worktree.id)) && !project.state.has_agent_update(entity.id, worktree.id) && !project.state.worktree_attention(entity.id, worktree.id).is_some_and(AttentionState::needs_attention),
-                project.state.worktree_has_panes(entity.id, worktree.id),
-                true,
-                project
-                    .state
-                    .rows
-                    .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
-                &project.state.query,
-                !project.state.hide_worktree_changes_icons,
-            ),
+        members.push((
             SelectionRow::Worktree(entity.id, worktree.id),
-            project.state,
-            !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
-        )));
+            RowInteraction::selectable(
+                worktree_view(
+                    entity.id,
+                    worktree,
+                    is_primary_worktree(&entity.repository, &worktree.path),
+                    project.state.filter == SidebarFilter::PullRequests,
+                    selection,
+                    modal_open,
+                    entity.github_ready,
+                    project.editors,
+                    project.state.has_agent_update(entity.id, worktree.id),
+                    project.state.agent_activity(entity.id, worktree.id),
+                    project.state.worktree_outcome(entity.id, worktree.id),
+                    project
+                        .state
+                        .attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
+                        && !project.state.has_agent_update(entity.id, worktree.id)
+                        && !project
+                            .state
+                            .worktree_attention(entity.id, worktree.id)
+                            .is_some_and(AttentionState::needs_attention),
+                    project.state.worktree_has_panes(entity.id, worktree.id),
+                    true,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                    &project.state.query,
+                    !project.state.hide_worktree_changes_icons,
+                ),
+                SelectionRow::Worktree(entity.id, worktree.id),
+                project.state,
+                !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
+            ),
+        ));
     }
     if !project.state.query.trim().is_empty() {
         let ranks = navigation_search_ranks(entity, &fold(project.state.query.trim()));
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
-    for (_, member) in members { column = column.push(member); }
+    for (_, member) in members {
+        column = column.push(member);
+    }
     widget::container(RowInteraction::group(
         header,
         column.into(),
@@ -5736,7 +5968,11 @@ impl GlyphTone {
 
 fn channel_ink(channel: &SidebarChannel) -> RowInk {
     deletion_ink(
-        if channel.acknowledged_attention { RowInk::Muted } else { RowInk::of(channel.has_panes, channel.unread) },
+        if channel.acknowledged_attention {
+            RowInk::Muted
+        } else {
+            RowInk::of(channel.has_panes, channel.unread)
+        },
         channel.deletion.as_ref(),
     )
 }
@@ -5773,37 +6009,81 @@ fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'static, Sideba
 
 /// Waiting is a live state, independent of whether its notification was read.
 /// Channels and worktrees share the same vocabulary and priority.
-pub(crate) fn attention_indicator(state: Option<AttentionState>) -> Option<Element<'static, SidebarAction>> {
+pub(crate) fn attention_indicator(
+    state: Option<AttentionState>,
+) -> Option<Element<'static, SidebarAction>> {
     match state {
-        Some(AttentionState::Failed) => Some(status_icon(Icon::Warning, "Agent failed", BadgeTone::Danger)),
-        Some(AttentionState::Cancelled) => Some(status_icon(Icon::Cancel, "Agent cancelled", BadgeTone::Neutral)),
-        Some(AttentionState::Waiting) => agent_indicator(Some(crate::agent::ActivityState::Waiting), false),
-        Some(AttentionState::Working) => agent_indicator(Some(crate::agent::ActivityState::Working), false),
+        Some(AttentionState::Failed) => Some(status_icon(
+            Icon::Warning,
+            "Agent failed",
+            BadgeTone::Danger,
+        )),
+        Some(AttentionState::Cancelled) => Some(status_icon(
+            Icon::Cancel,
+            "Agent cancelled",
+            BadgeTone::Neutral,
+        )),
+        Some(AttentionState::Waiting) => {
+            agent_indicator(Some(crate::agent::ActivityState::Waiting), false)
+        }
+        Some(AttentionState::Working) => {
+            agent_indicator(Some(crate::agent::ActivityState::Working), false)
+        }
         Some(AttentionState::Unread) => agent_indicator(None, true),
         None => None,
     }
 }
 
-fn with_unread_indicator(base: Element<'static, SidebarAction>, label: &'static str) -> Element<'static, SidebarAction> {
+fn with_unread_indicator(
+    base: Element<'static, SidebarAction>,
+    label: &'static str,
+) -> Element<'static, SidebarAction> {
     let unread = widget::container(Icon::Attention.handle().icon().size(8))
-        .align_right(Length::Fill).align_bottom(Length::Fill);
-    crate::interaction::tooltip(cosmic::iced::widget::Stack::with_children(vec![base, unread.into()])
-        .width(f32::from(ROW_ICON_SIZE)).height(f32::from(ROW_ICON_SIZE)), label)
+        .align_right(Length::Fill)
+        .align_bottom(Length::Fill);
+    crate::interaction::tooltip(
+        cosmic::iced::widget::Stack::with_children(vec![base, unread.into()])
+            .width(f32::from(ROW_ICON_SIZE))
+            .height(f32::from(ROW_ICON_SIZE)),
+        label,
+    )
 }
 
 fn outcome_indicator(
-    activity: Option<crate::agent::ActivityState>, unread: bool,
+    activity: Option<crate::agent::ActivityState>,
+    unread: bool,
     outcome: Option<&crate::agent::ActivityOutcome>,
 ) -> Option<Element<'static, SidebarAction>> {
-    if matches!(outcome, Some(crate::agent::ActivityOutcome::Cancelled)) && unread && !matches!(activity, Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting)) {
-        return Some(with_unread_indicator(status_icon(Icon::Cancel, "Agent cancelled", BadgeTone::Neutral), "Cancelled · unread agent update"));
+    if matches!(outcome, Some(crate::agent::ActivityOutcome::Cancelled))
+        && unread
+        && !matches!(
+            activity,
+            Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting)
+        )
+    {
+        return Some(with_unread_indicator(
+            status_icon(Icon::Cancel, "Agent cancelled", BadgeTone::Neutral),
+            "Cancelled · unread agent update",
+        ));
     }
     match attention_state(activity, unread, outcome) {
         Some(AttentionState::Failed) => {
-            let reason = outcome.map(|outcome| format!("{}: {}", outcome.label(), outcome.reason().unwrap_or("No reason reported"))).unwrap_or_else(|| "Agent failed".into());
+            let reason = outcome
+                .map(|outcome| {
+                    format!(
+                        "{}: {}",
+                        outcome.label(),
+                        outcome.reason().unwrap_or("No reason reported")
+                    )
+                })
+                .unwrap_or_else(|| "Agent failed".into());
             Some(status_icon(Icon::Warning, reason, BadgeTone::Danger))
         }
-        Some(AttentionState::Cancelled) => Some(status_icon(Icon::Cancel, "Agent cancelled", BadgeTone::Neutral)),
+        Some(AttentionState::Cancelled) => Some(status_icon(
+            Icon::Cancel,
+            "Agent cancelled",
+            BadgeTone::Neutral,
+        )),
         _ => agent_indicator(activity, unread),
     }
 }
@@ -5826,7 +6106,9 @@ fn agent_indicator<'a>(
         );
         return Some(if unread {
             with_unread_indicator(spinner, "Working · unread agent update")
-        } else { spinner });
+        } else {
+            spinner
+        });
     }
     if unread {
         return Some(status_icon(
@@ -5923,10 +6205,20 @@ fn channel_view(
             }
         }));
     let label = (!compact).then(|| {
-        let label = search_label(&channel.title, query, CHILD_ROW_TEXT_SIZE, channel_ink(channel).text_class(), false);
+        let label = search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            channel_ink(channel).text_class(),
+            false,
+        );
         if let Some((_, branch)) = &channel.worktree {
-            widget::row::with_children(vec![label, design::caption(branch.clone()).into()]).spacing(space::XS).into()
-        } else { label }
+            widget::row::with_children(vec![label, design::caption(branch.clone()).into()])
+                .spacing(space::XS)
+                .into()
+        } else {
+            label
+        }
     });
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
@@ -6154,7 +6446,11 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
-    if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+    if worktree
+        .dirty
+        .as_ref()
+        .is_some_and(|dirty| dirty.conflicted > 0)
+    {
         Icon::Warning
     } else {
         Icon::Changes
@@ -6162,7 +6458,11 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
-    if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+    if worktree
+        .dirty
+        .as_ref()
+        .is_some_and(|dirty| dirty.conflicted > 0)
+    {
         BadgeTone::Danger
     } else {
         BadgeTone::Warning
@@ -6189,9 +6489,13 @@ fn worktree_indicator(
         ));
     }
     if compact && show_changes_icons {
-        return indicators
-            .dirty
-            .map(|label| status_icon(worktree_change_icon(worktree), label.to_owned(), worktree_change_tone(worktree)));
+        return indicators.dirty.map(|label| {
+            status_icon(
+                worktree_change_icon(worktree),
+                label.to_owned(),
+                worktree_change_tone(worktree),
+            )
+        });
     }
     None
 }
@@ -6224,7 +6528,15 @@ fn worktree_view<'a>(
             &chrome.label,
             query,
             CHILD_ROW_TEXT_SIZE,
-            deletion_ink(if acknowledged_attention { RowInk::Muted } else { RowInk::of(has_panes, agent_update) }, deletion).text_class(),
+            deletion_ink(
+                if acknowledged_attention {
+                    RowInk::Muted
+                } else {
+                    RowInk::of(has_panes, agent_update)
+                },
+                deletion,
+            )
+            .text_class(),
             false,
         )
     });
@@ -6250,7 +6562,11 @@ fn worktree_view<'a>(
             }))
             .into()
     } else {
-        worktree_status_icon(worktree, false, !acknowledged_attention && (has_panes || agent_update))
+        worktree_status_icon(
+            worktree,
+            false,
+            !acknowledged_attention && (has_panes || agent_update),
+        )
     };
     let mut content = grid.content(glyph, label, indicator);
     if !compact {
@@ -6270,12 +6586,19 @@ fn worktree_view<'a>(
         let indicators = worktree_indicators(worktree);
         if show_changes_icons && let Some(label) = indicators.dirty {
             let count = worktree.dirty.as_ref().map_or(0, dirty_count);
-            let count = if count > 999 { "999+".to_owned() } else { count.to_string() };
+            let count = if count > 999 {
+                "999+".to_owned()
+            } else {
+                count.to_string()
+            };
             content = content.push(crate::interaction::tooltip(
                 widget::row::with_capacity(2)
                     .spacing(2)
                     .align_y(Alignment::Center)
-                    .push(toned_icon(worktree_change_icon(worktree), worktree_change_tone(worktree)))
+                    .push(toned_icon(
+                        worktree_change_icon(worktree),
+                        worktree_change_tone(worktree),
+                    ))
                     .push(design::caption(count)),
                 label.to_owned(),
             ));
@@ -6360,7 +6683,12 @@ fn worktree_view<'a>(
         crate::interaction::hover(action)
     };
     let tip = match outcome {
-        Some(outcome) if outcome.reason().is_some() => format!("{} · {}: {}", chrome.tooltip, outcome.label(), outcome.reason().unwrap()),
+        Some(outcome) if outcome.reason().is_some() => format!(
+            "{} · {}: {}",
+            chrome.tooltip,
+            outcome.label(),
+            outcome.reason().unwrap()
+        ),
         Some(crate::agent::ActivityOutcome::Cancelled) => format!("{} · Cancelled", chrome.tooltip),
         _ => chrome.tooltip.to_string(),
     };
@@ -6480,7 +6808,9 @@ impl widget::menu::Action for ContextCommand<'_> {
         if self.3 {
             return SidebarAction::DeleteSelectedRows;
         }
-        if *self.2 == ProjectCommand::MarkRead && let Some(worktree) = self.1 {
+        if *self.2 == ProjectCommand::MarkRead
+            && let Some(worktree) = self.1
+        {
             return SidebarAction::MarkWorktreeRead(self.0, worktree);
         }
         SidebarAction::ProjectCommand {
@@ -7200,15 +7530,21 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
-    if let Some(branch) = worktree.and_then(|row| row.branch.as_deref()).filter(|_| !worktree.is_some_and(|row| row.detached)) {
+    if let Some(branch) = worktree
+        .and_then(|row| row.branch.as_deref())
+        .filter(|_| !worktree.is_some_and(|row| row.detached))
+    {
         header = header.push(icon_action(
             Icon::CopyPath,
             format!("Copy branch {branch}"),
-            gated(SidebarAction::ProjectCommand {
-                project_id: key.project_id,
-                worktree_id: Some(key.worktree_id),
-                command: ProjectCommand::CopyBranch,
-            }, modal_open),
+            gated(
+                SidebarAction::ProjectCommand {
+                    project_id: key.project_id,
+                    worktree_id: Some(key.worktree_id),
+                    command: ProjectCommand::CopyBranch,
+                },
+                modal_open,
+            ),
             entity_id("source.copy-branch", key.worktree_id),
         ));
     }
@@ -9799,14 +10135,26 @@ fn navigation_item(
     }
 }
 
-fn navigation_search_ranks(project: &SidebarProject, query: &str) -> std::collections::HashMap<SelectionRow, usize> {
-    project.channels.iter().map(|channel| (
-        SelectionRow::Channel(channel.id),
-        search_score(&channel.folded_title, query).unwrap_or(usize::MAX),
-    )).chain(project.worktrees.iter().map(|worktree| (
-        SelectionRow::Worktree(project.id, worktree.id),
-        worktree.search_rank(query).unwrap_or(usize::MAX),
-    ))).collect()
+fn navigation_search_ranks(
+    project: &SidebarProject,
+    query: &str,
+) -> std::collections::HashMap<SelectionRow, usize> {
+    project
+        .channels
+        .iter()
+        .map(|channel| {
+            (
+                SelectionRow::Channel(channel.id),
+                search_score(&channel.folded_title, query).unwrap_or(usize::MAX),
+            )
+        })
+        .chain(project.worktrees.iter().map(|worktree| {
+            (
+                SelectionRow::Worktree(project.id, worktree.id),
+                worktree.search_rank(query).unwrap_or(usize::MAX),
+            )
+        }))
+        .collect()
 }
 
 /// The selectable rows actually drawn, including disclosure and filter state.
@@ -9860,7 +10208,8 @@ pub fn visible_selection_rows(
             );
             if searching {
                 let ranks = navigation_search_ranks(project.project, &fold(state.query.trim()));
-                rows[first..].sort_by_cached_key(|row| ranks.get(row).copied().unwrap_or(usize::MAX));
+                rows[first..]
+                    .sort_by_cached_key(|row| ranks.get(row).copied().unwrap_or(usize::MAX));
             } else if !compact {
                 apply_navigation_order(
                     &mut rows[first..],
@@ -9914,9 +10263,16 @@ fn filtered_projects<'a>(
                         && match state.filter {
                             SidebarFilter::All => true,
                             SidebarFilter::Attention => {
-                                state.retained_attention.contains(&SelectionRow::Channel(channel.id))
+                                state
+                                    .retained_attention
+                                    .contains(&SelectionRow::Channel(channel.id))
                                     || channel.unread
-                                    || attention_state(channel.activity, channel.unread, channel.outcome.as_ref()).is_some_and(AttentionState::needs_attention)
+                                    || attention_state(
+                                        channel.activity,
+                                        channel.unread,
+                                        channel.outcome.as_ref(),
+                                    )
+                                    .is_some_and(AttentionState::needs_attention)
                                     || channel.activity
                                         == Some(crate::agent::ActivityState::Waiting)
                             }
@@ -9933,9 +10289,13 @@ fn filtered_projects<'a>(
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => worktree.pull_request().is_some(),
                         SidebarFilter::Attention => {
-                            state.retained_attention.contains(&SelectionRow::Worktree(project.id, worktree.id))
+                            state
+                                .retained_attention
+                                .contains(&SelectionRow::Worktree(project.id, worktree.id))
                                 || state.has_agent_update(project.id, worktree.id)
-                                || state.worktree_attention(project.id, worktree.id).is_some_and(AttentionState::needs_attention)
+                                || state
+                                    .worktree_attention(project.id, worktree.id)
+                                    .is_some_and(AttentionState::needs_attention)
                         }
                     })
                     .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
@@ -10216,44 +10576,72 @@ fn search_label(
         // renderer cannot ellipsize spans. Reuse the fit until the slot changes.
         let label = {
             let mut fitted = fitted.borrow_mut();
-            if fitted.as_ref().is_none_or(|(width, _)| *width != slot.width.to_bits()) {
-                *fitted = Some((slot.width.to_bits(), ellipsize_search_label(&label, slot.width, |candidate| {
-                    search_spans_width(candidate, &query, size, font, emphasis)
-                })));
+            if fitted
+                .as_ref()
+                .is_none_or(|(width, _)| *width != slot.width.to_bits())
+            {
+                *fitted = Some((
+                    slot.width.to_bits(),
+                    ellipsize_search_label(&label, slot.width, |candidate| {
+                        search_spans_width(candidate, &query, size, font, emphasis)
+                    }),
+                ));
             }
             fitted.as_ref().expect("fitted label").1.clone()
         };
         let spans = search_label_spans(&label, &query, emphasis);
-        widget::container(cosmic::iced::widget::rich_text(spans)
-            .size(size)
-            .font(font)
-            .class(class.clone())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .width(Length::Fill))
-            .width(Length::Fill)
-            .clip(true)
-            .into()
+        widget::container(
+            cosmic::iced::widget::rich_text(spans)
+                .size(size)
+                .font(font)
+                .class(class.clone())
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .clip(true)
+        .into()
     })
     .height(size * 1.5)
     .into()
 }
 
-fn search_label_spans(label: &str, query: &str, emphasis: cosmic::iced::Font) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
+fn search_label_spans(
+    label: &str,
+    query: &str,
+    emphasis: cosmic::iced::Font,
+) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
     use cosmic::iced::widget::text::Span;
     let mut spans = Vec::new();
     let mut cursor = 0;
     for range in search_highlight_ranges(label, query) {
-        if cursor < range.start { spans.push(Span::new(label[cursor..range.start].to_owned())); }
-        spans.push(Span::new(label[range.clone()].to_owned()).font(emphasis)
-            .color(design::accent_color(&cosmic::theme::active())));
+        if cursor < range.start {
+            spans.push(Span::new(label[cursor..range.start].to_owned()));
+        }
+        spans.push(
+            Span::new(label[range.clone()].to_owned())
+                .font(emphasis)
+                .color(design::accent_color(&cosmic::theme::active())),
+        );
         cursor = range.end;
     }
-    if cursor < label.len() { spans.push(Span::new(label[cursor..].to_owned())); }
+    if cursor < label.len() {
+        spans.push(Span::new(label[cursor..].to_owned()));
+    }
     spans
 }
 
-fn search_spans_width(label: &str, query: &str, size: f32, font: cosmic::iced::Font, emphasis: cosmic::iced::Font) -> f32 {
-    use cosmic::iced::{Pixels, Size, advanced::text::{self, Paragraph as _}};
+fn search_spans_width(
+    label: &str,
+    query: &str,
+    size: f32,
+    font: cosmic::iced::Font,
+    emphasis: cosmic::iced::Font,
+) -> f32 {
+    use cosmic::iced::{
+        Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
     let spans = search_label_spans(label, query, emphasis);
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_spans(text::Text {
         content: &spans,
@@ -10290,7 +10678,6 @@ fn ellipsize_search_label(label: &str, width: f32, measure: impl Fn(&str) -> f32
         }
     }
     format!("{}…", &label[..boundaries[low.saturating_sub(1)]])
-
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -10860,7 +11247,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11462,8 +11851,10 @@ pub(crate) mod tests {
         let mut source = source_control();
         source.key.worktree_id = row.id;
         let state = SidebarState::default();
-        let actions = frame_enter_presses(&renderer, source_control_header(
-            &state, &source, Some(&row), false, PanelView::Files));
+        let actions = frame_enter_presses(
+            &renderer,
+            source_control_header(&state, &source, Some(&row), false, PanelView::Files),
+        );
         assert!(actions.iter().any(|action| matches!(action,
             SidebarAction::ProjectCommand { worktree_id: Some(id), command: ProjectCommand::CopyBranch, .. } if *id == row.id)));
         assert_eq!(row.label(), row.branch.as_deref().unwrap());
@@ -11475,8 +11866,16 @@ pub(crate) mod tests {
         let matching = worktree(60, "feature login", false);
         let row = SelectionRow::Worktree(project.id, matching.id);
         project.worktrees.push(matching);
-        project.channels.push(SidebarChannel::new(ChannelId::new(),
-            "Investigate task in alpha-wt-feat".into(), false, None, false, 1, true, 1));
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "Investigate task in alpha-wt-feat".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        ));
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
         let mut state = SidebarState::default();
         state.query = "feat".into();
@@ -11486,11 +11885,29 @@ pub(crate) mod tests {
 
     #[test]
     fn literal_branch_labels_preserve_prefixes_and_punctuation() {
-        for branch in ["feature/auth-fix", "bugfix/auth-fix", "feat-z", "snake_case"] {
-            assert_eq!(worktree_display_name(Path::new("/repo/worktree-dir"), Some(branch), false), branch);
+        for branch in [
+            "feature/auth-fix",
+            "bugfix/auth-fix",
+            "feat-z",
+            "snake_case",
+        ] {
+            assert_eq!(
+                worktree_display_name(Path::new("/repo/worktree-dir"), Some(branch), false),
+                branch
+            );
         }
-        assert_eq!(worktree_display_name(Path::new("/repo/detached-dir"), Some("ignored/branch"), true), "detached-dir");
-        assert_eq!(worktree_display_name(Path::new("/repo/no-branch"), None, false), "no-branch");
+        assert_eq!(
+            worktree_display_name(
+                Path::new("/repo/detached-dir"),
+                Some("ignored/branch"),
+                true
+            ),
+            "detached-dir"
+        );
+        assert_eq!(
+            worktree_display_name(Path::new("/repo/no-branch"), None, false),
+            "no-branch"
+        );
     }
 
     #[test]
@@ -11500,7 +11917,10 @@ pub(crate) mod tests {
         full.dirty.untracked = 12;
         full.dirty.unstaged = 2;
         row.apply_status(&full);
-        let mut tracked = StatusSnapshot { untracked_omitted: true, ..StatusSnapshot::default() };
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
         tracked.dirty.unstaged = 3;
         row.apply_status(&tracked);
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
@@ -11535,8 +11955,15 @@ pub(crate) mod tests {
         assert_ne!(first.1, second.1);
         let project = project();
         let mut state = SidebarState::default();
-        state.set_agent_activity(CardId::new(), project.id, project.worktrees[0].id,
-            crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Waiting });
+        state.set_agent_activity(
+            CardId::new(),
+            project.id,
+            project.worktrees[0].id,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
         let attention = compact_project_attention(&project, &state);
         assert_eq!(attention, Some(AttentionState::Waiting));
         assert!(attention_indicator(attention).is_some());
@@ -11545,14 +11972,34 @@ pub(crate) mod tests {
     #[test]
     fn compact_project_badge_uses_the_shared_failed_over_working_ranking() {
         let mut project = project();
-        let mut channel = SidebarChannel::new(ChannelId::new(), "failed task".into(), false,
-            None, true, 1, true, 1);
-        channel.outcome = Some(crate::agent::ActivityOutcome::Failed { reason: "fixture failure".into() });
+        let mut channel = SidebarChannel::new(
+            ChannelId::new(),
+            "failed task".into(),
+            false,
+            None,
+            true,
+            1,
+            true,
+            1,
+        );
+        channel.outcome = Some(crate::agent::ActivityOutcome::Failed {
+            reason: "fixture failure".into(),
+        });
         project.channels.push(channel);
         let mut state = SidebarState::default();
-        state.set_agent_activity(CardId::new(), project.id, project.worktrees[0].id,
-            crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Working });
-        assert_eq!(compact_project_attention(&project, &state), Some(AttentionState::Failed));
+        state.set_agent_activity(
+            CardId::new(),
+            project.id,
+            project.worktrees[0].id,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
+        assert_eq!(
+            compact_project_attention(&project, &state),
+            Some(AttentionState::Failed)
+        );
         assert!(attention_indicator(compact_project_attention(&project, &state)).is_some());
     }
 
@@ -11560,28 +12007,50 @@ pub(crate) mod tests {
     fn highlighted_labels_truncate_to_measured_slot_with_an_ellipsis() {
         let _renderer = headless_renderer();
         let font = cosmic::font::default();
-        let emphasis = cosmic::iced::Font { weight: cosmic::iced::font::Weight::Bold, ..font };
+        let emphasis = cosmic::iced::Font {
+            weight: cosmic::iced::font::Weight::Bold,
+            ..font
+        };
         let label = "feature/authentication-long-λ-branch";
         for width in [55.0, 105.0, 170.0] {
-            let truncated = ellipsize_search_label(label, width, |label| search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis));
+            let truncated = ellipsize_search_label(label, width, |label| {
+                search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
+            });
             assert!(truncated.ends_with('…'), "{truncated}");
-            assert!(search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis) <= width);
+            assert!(
+                search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
+                    <= width
+            );
             assert!(!search_highlight_ranges(&truncated, "feat").is_empty());
         }
-        assert_eq!(ellipsize_search_label(label, 2000.0, |label| search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)), label);
+        assert_eq!(
+            ellipsize_search_label(label, 2000.0, |label| search_spans_width(
+                label,
+                "feat",
+                CHILD_ROW_TEXT_SIZE,
+                font,
+                emphasis
+            )),
+            label
+        );
         assert!(search_highlight_ranges("fast elegant audit trail", "feat").is_empty());
     }
 
     #[test]
     fn shuffled_unknown_projects_use_a_stable_fallback_then_durable_order() {
-        let projects: Vec<_> = ["gamma", "alpha", "beta"].into_iter().enumerate().map(|(index, name)| {
-            let mut project = project();
-            project.id = project_id(index as u128 + 20);
-            project.repository = PathBuf::from(format!("/repo/{name}"));
-            project
-        }).collect();
+        let projects: Vec<_> = ["gamma", "alpha", "beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut project = project();
+                project.id = project_id(index as u128 + 20);
+                project.repository = PathBuf::from(format!("/repo/{name}"));
+                project
+            })
+            .collect();
         let mut first = SidebarModel::ready(SidebarMode::Expanded, projects.clone());
-        let mut second = SidebarModel::ready(SidebarMode::Expanded, projects.into_iter().rev().collect());
+        let mut second =
+            SidebarModel::ready(SidebarMode::Expanded, projects.into_iter().rev().collect());
         first.apply_project_order(&[]);
         second.apply_project_order(&[]);
         assert_eq!(first.projects, second.projects);
@@ -11785,58 +12254,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 
@@ -12400,7 +12872,11 @@ pub(crate) mod tests {
         row.set_pull_request(pr);
         assert_eq!(&*row.chrome.label, branch);
         assert!(row.matches("challenge"));
-        assert!(row.chrome.tooltip.contains("Fix browser challenge handling"));
+        assert!(
+            row.chrome
+                .tooltip
+                .contains("Fix browser challenge handling")
+        );
         assert!(row.chrome.tooltip.contains(branch));
         row.clear_pull_request();
         assert_eq!(&*row.chrome.label, branch);
@@ -13103,15 +13579,32 @@ pub(crate) mod tests {
         let other = WorktreeId::from_uuid(Uuid::from_u128(100));
         let project = project_id(1);
         let worktree = WorktreeId::from_uuid(Uuid::from_u128(2));
-        let activity = |state| Activity { provider: Provider::Omp, state };
+        let activity = |state| Activity {
+            provider: Provider::Omp,
+            state,
+        };
         state.set_agent_activity(first, project, worktree, activity(ActivityState::Working));
         state.set_agent_activity(waiting, project, worktree, activity(ActivityState::Waiting));
         state.set_agent_activity(failed, project_id(2), other, activity(ActivityState::Idle));
-        state.set_card_outcome(failed, Some(ActivityOutcome::Failed { reason: "exit 3".into() }));
+        state.set_card_outcome(
+            failed,
+            Some(ActivityOutcome::Failed {
+                reason: "exit 3".into(),
+            }),
+        );
         state.observe_agent_update(first, project, worktree);
-        assert_eq!(state.agent_activity(project, worktree), Some(ActivityState::Waiting));
-        assert_eq!(state.worktree_attention(project, worktree), Some(AttentionState::Waiting));
-        assert_eq!(state.worktree_attention(project_id(2), other), Some(AttentionState::Failed));
+        assert_eq!(
+            state.agent_activity(project, worktree),
+            Some(ActivityState::Waiting)
+        );
+        assert_eq!(
+            state.worktree_attention(project, worktree),
+            Some(AttentionState::Waiting)
+        );
+        assert_eq!(
+            state.worktree_attention(project_id(2), other),
+            Some(AttentionState::Failed)
+        );
         // Unread work remains navigable even while it works on a subsequent turn.
         assert_eq!(state.attention_cards(), vec![waiting, failed, first]);
         let cards = [waiting, failed, first];
@@ -13122,16 +13615,41 @@ pub(crate) mod tests {
         assert_eq!(cycle_attention(&[], Some(first), true), None);
         assert_eq!(state.waiting_count(), 1);
         assert_eq!(state.intervention_count(), 2);
-        for live in [None, Some(ActivityState::Idle), Some(ActivityState::Working), Some(ActivityState::Waiting)] {
+        for live in [
+            None,
+            Some(ActivityState::Idle),
+            Some(ActivityState::Working),
+            Some(ActivityState::Waiting),
+        ] {
             for unread in [false, true] {
-                for outcome in [None, Some(ActivityOutcome::Succeeded), Some(ActivityOutcome::Cancelled), Some(ActivityOutcome::Failed { reason: "boom".into() }), Some(ActivityOutcome::Interrupted { reason: "missing final result".into() })] {
+                for outcome in [
+                    None,
+                    Some(ActivityOutcome::Succeeded),
+                    Some(ActivityOutcome::Cancelled),
+                    Some(ActivityOutcome::Failed {
+                        reason: "boom".into(),
+                    }),
+                    Some(ActivityOutcome::Interrupted {
+                        reason: "missing final result".into(),
+                    }),
+                ] {
                     let expected = attention_state(live, unread, outcome.as_ref());
                     let mut pane = SidebarState::default();
-                    pane.set_agent_activity(first, project, worktree, activity(live.unwrap_or(ActivityState::Unknown)));
+                    pane.set_agent_activity(
+                        first,
+                        project,
+                        worktree,
+                        activity(live.unwrap_or(ActivityState::Unknown)),
+                    );
                     pane.set_card_outcome(first, outcome);
-                    if unread { pane.observe_agent_update(first, project, worktree); }
+                    if unread {
+                        pane.observe_agent_update(first, project, worktree);
+                    }
                     assert_eq!(pane.card_attention(first), expected);
-                    assert_eq!(pane.worktree_attention(project, worktree), expected.max(unread.then_some(AttentionState::Unread)));
+                    assert_eq!(
+                        pane.worktree_attention(project, worktree),
+                        expected.max(unread.then_some(AttentionState::Unread))
+                    );
                 }
             }
         }
@@ -13152,7 +13670,11 @@ pub(crate) mod tests {
         restored.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
         restored.acknowledge_agent_update(card);
         assert!(!restored.has_card_update(card));
-        assert!(restored.retained_attention.contains(&SelectionRow::Worktree(project, worktree)));
+        assert!(
+            restored
+                .retained_attention
+                .contains(&SelectionRow::Worktree(project, worktree))
+        );
         restored.apply(&SidebarAction::SetFilter(SidebarFilter::All));
         restored.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
         assert!(restored.retained_attention.is_empty());
@@ -13160,14 +13682,34 @@ pub(crate) mod tests {
 
     #[test]
     fn channel_attribution_uses_the_longest_known_launch_root() {
-        let root = SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
-        let linked = SidebarWorktree::from_durable(WorktreeId::new(), "/repo/.worktrees/topic".into(), Some("topic".into()));
+        let root =
+            SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            "/repo/.worktrees/topic".into(),
+            Some("topic".into()),
+        );
         let roots = [root.clone(), linked.clone()];
-        assert_eq!(channel_worktree(&roots, [Path::new("/repo/src")]), Some((root.id, "main".into())));
-        assert_eq!(channel_worktree(&roots, [Path::new("/repo/.worktrees/topic/src")]), Some((linked.id, "topic".into())));
+        assert_eq!(
+            channel_worktree(&roots, [Path::new("/repo/src")]),
+            Some((root.id, "main".into()))
+        );
+        assert_eq!(
+            channel_worktree(&roots, [Path::new("/repo/.worktrees/topic/src")]),
+            Some((linked.id, "topic".into()))
+        );
         assert_eq!(channel_worktree(&roots, [Path::new("/unknown")]), None);
-        assert_eq!(channel_worktree(&roots, [Path::new("/repo"), Path::new("/repo/.worktrees/topic")]), None);
-        assert_eq!(channel_worktree(&roots, [Path::new("/repo"), Path::new("/unknown")]), None);
+        assert_eq!(
+            channel_worktree(
+                &roots,
+                [Path::new("/repo"), Path::new("/repo/.worktrees/topic")]
+            ),
+            None
+        );
+        assert_eq!(
+            channel_worktree(&roots, [Path::new("/repo"), Path::new("/unknown")]),
+            None
+        );
     }
 
     #[test]
@@ -14951,7 +15493,11 @@ pub(crate) mod tests {
             Some("fix-sidebar")
         );
         state.acknowledge_agent_update(second);
-        assert_eq!(filtered_projects(&model, &state, false)[0].worktrees.len(), 1, "read rows stay in the attention inbox");
+        assert_eq!(
+            filtered_projects(&model, &state, false)[0].worktrees.len(),
+            1,
+            "read rows stay in the attention inbox"
+        );
         state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
         assert!(filtered_projects(&model, &state, false).is_empty());

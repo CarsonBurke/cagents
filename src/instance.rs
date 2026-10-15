@@ -1362,7 +1362,10 @@ pub(crate) fn record_focused_window() -> io::Result<()> {
 #[cfg(feature = "ui")]
 fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
     validate_window_slot(slot)?;
-    let lock = owned_lock(&runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")), libc::LOCK_EX)?;
+    let lock = owned_lock(
+        &runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        libc::LOCK_EX,
+    )?;
     lock.set_len(0)?;
     writeln!(&*lock, "{slot}")
 }
@@ -1370,7 +1373,10 @@ fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
 /// Select a project in one running window, without starting the UI or a terminal.
 /// JSON preserves spaces and Unicode in canonical repository paths.
 pub fn activate_project(repository: &Path) -> io::Result<bool> {
-    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute()) else {
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
         return Ok(false);
     };
     activate_project_in(&runtime, repository)
@@ -1392,10 +1398,19 @@ fn activate_project_in(runtime: &Path, repository: &Path) -> io::Result<bool> {
     slots.extend(running_window_slots(&runtime)?);
     let encoded = serde_json::to_string(repository).map_err(io::Error::other)?;
     for slot in slots {
-        if !window_matches_selected_device(&slot)? { continue; }
+        if !window_matches_selected_device(&slot)? {
+            continue;
+        }
         let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(&slot))) {
             Ok(stream) => stream,
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error),
         };
         stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
@@ -1752,12 +1767,15 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 let _ = writeln!(&stream, "ok");
             }
             Ok(ActivationRequest::Project(project)) => {
-                if events.send_blocking(UiActivation {
-                    token: None,
-                    session: None,
-                    project: Some(project),
-                    update: None,
-                }).is_err() {
+                if events
+                    .send_blocking(UiActivation {
+                        token: None,
+                        session: None,
+                        project: Some(project),
+                        update: None,
+                    })
+                    .is_err()
+                {
                     let _ = writeln!(&stream, "error: window is no longer accepting activations");
                     break;
                 }
@@ -1833,7 +1851,10 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
             let path: PathBuf = serde_json::from_str(encoded)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             if !path.is_absolute() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "project path must be absolute"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "project path must be absolute",
+                ));
             }
             Ok(ActivationRequest::Project(path))
         }
@@ -2643,19 +2664,34 @@ mod tests {
         let runtime = tempdir().unwrap();
         let (first_tx, first_rx) = async_channel::unbounded();
         let (second_tx, second_rx) = async_channel::unbounded();
-        let _first = UiActivationListener::bind_named(runtime.path(), slot_socket_name(PRIMARY_WINDOW), first_tx).unwrap();
-        let _second = UiActivationListener::bind_named(runtime.path(), slot_socket_name("second"), second_tx).unwrap();
+        let _first = UiActivationListener::bind_named(
+            runtime.path(),
+            slot_socket_name(PRIMARY_WINDOW),
+            first_tx,
+        )
+        .unwrap();
+        let _second =
+            UiActivationListener::bind_named(runtime.path(), slot_socket_name("second"), second_tx)
+                .unwrap();
         record_focused_window_in(runtime.path(), "second").unwrap();
         let repository = Path::new("/tmp/project with spaces/λ.git");
         assert!(activate_project_in(runtime.path(), repository).unwrap());
-        assert_eq!(second_rx.recv_blocking().unwrap().project.as_deref(), Some(repository));
+        assert_eq!(
+            second_rx.recv_blocking().unwrap().project.as_deref(),
+            Some(repository)
+        );
         assert!(first_rx.try_recv().is_err());
-        assert!(matches!(parse_activation_request("project \"/tmp/project with spaces\"").unwrap(), ActivationRequest::Project(path) if path == Path::new("/tmp/project with spaces")));
+        assert!(
+            matches!(parse_activation_request("project \"/tmp/project with spaces\"").unwrap(), ActivationRequest::Project(path) if path == Path::new("/tmp/project with spaces"))
+        );
         assert!(parse_activation_request("project \"relative\"").is_err());
         assert!(parse_activation_request("project not-json").is_err());
         drop(_second);
         assert!(activate_project_in(runtime.path(), repository).unwrap());
-        assert_eq!(first_rx.recv_blocking().unwrap().project.as_deref(), Some(repository));
+        assert_eq!(
+            first_rx.recv_blocking().unwrap().project.as_deref(),
+            Some(repository)
+        );
     }
 
     #[cfg(feature = "ui")]
