@@ -256,7 +256,7 @@ pub enum LoginShellError {
 impl LaunchRecipe {
     pub fn shell(working_directory: PathBuf) -> Result<Self, LoginShellError> {
         Ok(Self {
-            program: login_shell()?,
+            program: terminal_shell()?,
             arguments: Vec::new(),
             working_directory,
             environment: BTreeMap::new(),
@@ -274,23 +274,23 @@ impl LaunchRecipe {
 
 /// The configured shell for new terminals, otherwise the passwd entry's,
 /// `SHELL`, then `/bin/sh`.
-pub(crate) fn login_shell() -> Result<String, LoginShellError> {
-    login_shell_for_device(crate::device::shell())
+pub(crate) fn terminal_shell() -> Result<String, LoginShellError> {
+    terminal_shell_for_device(crate::device::shell())
 }
 
-fn login_shell_for_device(remote_shell: Option<&str>) -> Result<String, LoginShellError> {
+fn terminal_shell_for_device(remote_shell: Option<&str>) -> Result<String, LoginShellError> {
     // Device preparation obtains this from the filesystem-owning daemon.
     // Local preferences and filesystem checks cannot validate a remote path.
     if let Some(shell) = remote_shell { return Ok(shell.to_owned()); }
     if let Some(shell) = crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell) {
         return if crate::settings::agents::executable_available(&shell) { Ok(shell) } else { Err(LoginShellError::ConfiguredUnavailable) };
     }
-    system_login_shell()
+    login_shell()
 }
 
 /// Login environment discovery uses the account's login shell, independently
 /// of a terminal-only executable override (which may be a wrapper).
-pub(crate) fn system_login_shell() -> Result<String, LoginShellError> {
+pub(crate) fn login_shell() -> Result<String, LoginShellError> {
     choose_login_shell(
         passwd_shell(),
         std::env::var_os("SHELL").and_then(|shell| shell.into_string().ok()),
@@ -1506,7 +1506,7 @@ mod tests {
     fn remote_shell_does_not_depend_on_local_preferences_or_executables() {
         let shell = "/cagents-fixture-remote-only/configured-shell";
         assert!(!std::path::Path::new(shell).exists());
-        assert_eq!(login_shell_for_device(Some(shell)).unwrap(), shell);
+        assert_eq!(terminal_shell_for_device(Some(shell)).unwrap(), shell);
     }
 
     #[test]
