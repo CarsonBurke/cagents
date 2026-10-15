@@ -949,10 +949,11 @@ impl SidebarWorktree {
             _ => (None, None),
         };
         // A -uno watcher read has no authority over the last complete untracked
-        // count. Keep that fact until a full read replaces it, including zero.
+        // count. Reuse it until a full read replaces it or a failed read makes
+        // that old count explicitly last-known rather than current.
         let mut dirty = status.dirty.clone();
-        let untracked_omitted =
-            status.untracked_omitted && (self.dirty.is_none() || self.untracked_omitted);
+        let untracked_omitted = status.untracked_omitted
+            && (self.status_error.is_some() || self.dirty.is_none() || self.untracked_omitted);
         if status.untracked_omitted && !untracked_omitted {
             dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
         }
@@ -12189,6 +12190,22 @@ pub(crate) mod tests {
         assert!(row.chrome.dirty_badge.is_none());
         assert!(!row.chrome.tooltip.contains("Git status unavailable"));
         assert!(row.chrome.tooltip.contains("No changes"));
+
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        row.apply_status(&full);
+        row.apply_status_error(Some("full refresh failed"));
+        let mut tracked = StatusSnapshot { untracked_omitted: true, ..StatusSnapshot::default() };
+        tracked.dirty.unstaged = 1;
+        row.apply_status(&tracked);
+        assert!(row.status_error.is_none(), "the tracked status read itself succeeded");
+        assert!(row.untracked_omitted, "failed refresh invalidates authority to reuse the old complete untracked count");
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
+        assert!(row.chrome.tooltip.contains("1 tracked changes"));
+        row.apply_status(&full);
+        assert!(!row.untracked_omitted);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
+        assert!(row.chrome.tooltip.contains("12 changes"));
     }
 
     #[test]
