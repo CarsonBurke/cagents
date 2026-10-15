@@ -176,7 +176,8 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
             match start_time(pid) {
                 Ok(start) if start == original_start => {}
                 Ok(_) => break, // The original was reaped before PID reuse.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) => break,
                 Err(error) => panic!("could not inspect the private PTY root: {error}"),
             }
             assert!(Instant::now() < healthy_by, "healthy PTY root was not reaped while the first worker was blocked");
