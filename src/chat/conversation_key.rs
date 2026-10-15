@@ -5,6 +5,9 @@ use std::os::unix::ffi::OsStrExt;
 use sha2::{Digest, Sha256};
 
 pub(crate) fn metadata_key(session: &Session) -> Option<String> {
+    // Read-only reports preserve the original provider identity for provenance.
+    // They must never read or replace that conversation's editable UI metadata.
+    if session.archive_report.is_some() { return None; }
     let id = session.launch.session_id.as_deref()?.trim();
     if id.is_empty() { return None; }
     let recipe = &session.launch.recipe;
@@ -41,13 +44,25 @@ pub(crate) fn metadata_key(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     fn session(provider: crate::agent::Provider) -> Session {
-        Session { id: crate::model::TerminalId::new(), proof: None, terminal: None,
+        Session { archive_report: None, id: crate::model::TerminalId::new(), proof: None, terminal: None,
             owned_codex_listener: None, native_continuity: Default::default(),
             launch: super::super::Launch { provider, session_id: Some("copied-provider-uuid".into()),
                 recipe: crate::model::LaunchRecipe { program: provider.executable().into(), arguments: Vec::new(),
                     working_directory: "/project".into(), environment: Default::default(),
                     unset_environment: crate::account::credential_overrides(provider).iter().map(|name| (*name).to_owned()).collect() } } }
     }
+    #[test]
+    fn readonly_report_cannot_read_or_replace_the_original_conversation_metadata() {
+        let mut original = session(crate::agent::Provider::Claude);
+        original.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "/accounts/A".into());
+        assert!(metadata_key(&original).is_some());
+        original.archive_report = Some(crate::chat::ArchiveReportReference {
+            format: 1, registry: uuid::Uuid::new_v4(),
+            agent: crate::model::AgentId::new(), source_operation: uuid::Uuid::new_v4(),
+        });
+        assert!(metadata_key(&original).is_none());
+    }
+
     #[test]
     fn copied_provider_ids_partition_by_recorded_home_and_project_without_reading_ambient_state() {
         for provider in [crate::agent::Provider::Claude, crate::agent::Provider::Codex] {

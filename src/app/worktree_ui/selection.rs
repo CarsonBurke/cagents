@@ -82,6 +82,7 @@ pub(in crate::app) enum Intent {
         entry: crate::persistence::SavedConversation,
         replace: Option<CardId>,
     },
+    ArchiveReport(Box<crate::app::resume_ui::ReportRestore>),
     Focus {
         card: CardId,
         activate: bool,
@@ -120,6 +121,21 @@ pub(in crate::app) struct Receipt(
         >,
     >,
 );
+impl Receipt {
+    /// Classification only. The App combines this with the state-aware current
+    /// successful receipt predicate before deferring any navigation.
+    pub(in crate::app) fn restores_archive_report(&self) -> bool {
+        fn is_report(intent: &Intent) -> bool {
+            match intent {
+                Intent::Channel { after, .. } => is_report(after),
+                Intent::ArchiveReport(_) => true,
+                _ => false,
+            }
+        }
+        self.0.lock().unwrap().as_ref()
+            .is_some_and(|(_, _, _, intent, _)| is_report(intent))
+    }
+}
 impl std::fmt::Debug for Receipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PreparedWorktreeSelection")
@@ -202,6 +218,17 @@ fn prepare_target(
 }
 
 impl Cagents {
+    /// Visibility is handled by the App's navigation barrier. This predicate
+    /// checks only the original report request/source, so a current successful
+    /// receipt remains deferred while a higher modal owns navigation.
+    fn archive_report_selection_current(&self, intent: &Intent) -> bool {
+        match intent {
+            Intent::Channel { after, .. } => self.archive_report_selection_current(after),
+            Intent::ArchiveReport(restore) => self.archive_report_restore_is_current(restore),
+            _ => true,
+        }
+    }
+
     pub(in crate::app) fn select_worktree_then(
         &mut self,
         path: PathBuf,
@@ -230,6 +257,9 @@ impl Cagents {
         intent: Intent,
         local_window: bool,
     ) -> Task<Message> {
+        if !self.archive_report_selection_current(&intent) {
+            return self.abandon_worktree_selection(intent);
+        }
         let cancelled = self.cancel_worktree_selection();
         let epoch = local_window.then(|| self.worktree_owner_paths.invalidate_watched());
         let resolved = self.refresh_worktree_owners(Some(&path));
@@ -390,6 +420,7 @@ impl Cagents {
                 |(_, epoch, roots, intent, result)| {
                     *epoch == self.worktree_owner_paths.watch.epoch()
                         && roots == &self.known_worktree_roots
+                        && self.archive_report_selection_current(intent)
                         && match intent {
                             Intent::Channel { id, path, .. } => {
                                 self.channel_scope_path(*id).as_ref() == Some(path)
@@ -502,6 +533,10 @@ impl Cagents {
         }
         self.worktree_selection.pending = false;
         self.worktree_selection.requested = None;
+        if !self.archive_report_selection_current(&intent) {
+            drop(result);
+            return self.abandon_worktree_selection(intent);
+        }
         self.refresh_worktree_owners(Some(&requested));
         if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested, create, intent);
@@ -624,6 +659,7 @@ impl Cagents {
     pub(super) fn abandon_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
         match intent {
             Intent::Channel { after, .. } => self.abandon_worktree_selection(*after),
+            Intent::ArchiveReport(restore) => self.abandon_archive_report_restore(*restore),
             Intent::Delete(target) => {
                 self.cancel_prepared_worktree_deletion(target);
                 Task::none()
@@ -650,6 +686,7 @@ impl Cagents {
                 self.finish_worktree_selection_with_context(*after, context_scope)
             }
             Intent::EnsureDefaultPane => self.ensure_default_pane(),
+            Intent::ArchiveReport(restore) => self.finish_archive_report_restore(*restore),
             Intent::PrAgentContext {
                 worktree,
                 card,

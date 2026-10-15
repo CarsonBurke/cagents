@@ -168,6 +168,11 @@ impl State {
 }
 
 impl Cagents {
+    #[cfg(test)]
+    pub(in crate::app) fn pending_shared_view_changes_for_test(&self) -> Vec<(Scope, Change)> {
+        self.shared_views.pending.iter().map(|(_,scope,change)|(scope.clone(),change.clone())).collect()
+    }
+
     pub(super) fn insert_archive_report_card(
         &mut self,
         session: chat::Session,
@@ -250,11 +255,6 @@ impl Cagents {
             change,
         });
         true
-    }
-
-    #[cfg(test)]
-    pub(in crate::app) fn pending_shared_view_changes_for_test(&self) -> Vec<(Scope, Change)> {
-        self.shared_views.pending.iter().map(|(_, scope, change)| (scope.clone(), change.clone())).collect()
     }
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {

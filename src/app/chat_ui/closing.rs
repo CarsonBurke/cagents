@@ -275,7 +275,20 @@ impl Cagents {
             }
         }
     }
+    // This is only a conservative metadata-write exclusion. A pending archive
+    // map entry grants no private-body readiness or execution authority. Notes
+    // continue to persist per card while its original provider namespace stays
+    // untouched, including during Loading and after a legacy map is pruned.
+    pub(super) fn conversation_metadata_is_readonly(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
+            _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),
+        };
+        self.durable.automation_archives.contains_key(&card)
+            || runtime.is_some_and(|runtime| matches!(runtime.connection, Connection::Archived))
+    }
     pub(in crate::app) fn remember_conversation_draft(&mut self, card: CardId) {
+        if self.conversation_metadata_is_readonly(card) { return; }
         let Some(session) = self.chat_return_session(card) else {
             return;
         };
@@ -605,6 +618,101 @@ pub(in crate::app) fn set_model(recipe: &mut LaunchRecipe, model: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualified_readonly_reports_preserve_the_editable_conversation_metadata_through_persist_hide_and_end() {
+        let (mut app, legacy, owner, archive) = super::super::qualified_closed_console_archive_with_metadata_for_test();
+        let original = app.chat_return_session(legacy).unwrap();
+        assert!(original.archive_report.is_none());
+        assert_eq!(app.archived_pane_readiness(legacy), Ok(Some(true)));
+        let key = draft_key(&original).expect("explicit recorded selector, never live account authority");
+        let bookmark = ChannelId::new();
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.conversation_drafts.insert(key.clone(), "Keep this unsent provider request".into());
+            durable.conversation_models.insert(key.clone(), "user-selected-model".into());
+            durable.conversation_channels.insert(key.clone(), bookmark);
+        }
+        // The actual legacy no-marker archived runtime must not remove a
+        // provider draft or publish the model recorded in its saved snapshot.
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&legacy) {
+            Arc::make_mut(&mut runtime.snapshot).selected_model = Some("archived-model".into());
+        }
+        app.remember_conversation_draft(legacy);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.conversation_drafts[&key], "Keep this unsent provider request");
+        assert_eq!(saved.conversation_models[&key], "user-selected-model");
+        assert_eq!(saved.conversation_channels[&key], bookmark);
+
+        // Archived qualification can preserve an existing nonempty composer.
+        // Keep that text per card without publishing it over the provider draft.
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&legacy) {
+            runtime.replace_draft(widget::text_editor::Content::with_text("A local read-only report note"));
+        }
+        app.remember_conversation_draft(legacy);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&legacy], "A local read-only report note");
+        assert_eq!(saved.conversation_drafts[&key], "Keep this unsent provider request");
+        assert_eq!(saved.conversation_models[&key], "user-selected-model");
+        assert_eq!(saved.conversation_channels[&key], bookmark);
+
+        // A private archive read can temporarily leave only Loading plus a
+        // pending archive index and local draft. That index excludes writes;
+        // it does not grant readiness or permit reading the private body.
+        let runtime = app.cards.insert(legacy, CardRuntime::Loading).unwrap();
+        app.chat_ui.drafts.insert(legacy, "A note retained while loading".into());
+        app.remember_conversation_draft(legacy);
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&legacy], "A note retained while loading");
+        assert_eq!(saved.conversation_drafts[&key], "Keep this unsent provider request");
+        assert_eq!(saved.conversation_models[&key], "user-selected-model");
+        assert_eq!(saved.conversation_channels[&key], bookmark);
+        assert_eq!(app.archived_pane_readiness(legacy), Ok(Some(false)));
+        app.cards.insert(legacy, runtime);
+        app.chat_ui.drafts.remove(&legacy);
+
+        let reference = chat::ArchiveReportReference {
+            format: 1, registry: app.workspace_model.identity, agent: owner,
+            source_operation: uuid::Uuid::new_v4(),
+        };
+        let mut issued = original.clone(); issued.archive_report = Some(reference.clone());
+        assert!(draft_key(&issued).is_none(), "report insertion cannot read the provider draft namespace");
+        let report = crate::automations::ArchiveReport {
+            reference, scope: app.workspace_model.views[0].scope.clone(),
+            repository: archive.agent.spec.target.repository.clone(), source_revision: 1,
+            presentation_scope: Some(original.launch.recipe.working_directory.clone()),
+            session_digest: crate::automations::ArchiveReport::session_digest(&issued).unwrap(),
+            archive: (*archive).clone(),
+        };
+        let (card, hydration) = app.new_archive_report_card(issued).unwrap();
+        drop(hydration); // Private body RPC is supplied below; no provider task is polled.
+        assert!(!app.chat_ui.drafts.contains_key(&card), "opening a report must not copy the saved provider composer");
+        let target = app.pending_archive_read_for_test(card).unwrap();
+        drop(app.handle_chat_ui(super::super::Action::ArchiveReport(target, Arc::new(Ok(report)))));
+        assert_eq!(app.archived_pane_readiness(card), Ok(Some(true)));
+        assert!(matches!(&app.cards[&card], CardRuntime::Chat(runtime) if runtime.composer.is_empty() && runtime.handle().is_none()));
+        // Simulate adoption of the exact typed presentation publication. This
+        // is UI metadata coverage, not a host SQL commit/durability fixture.
+        let pane = crate::workspace_model::views::Pane::from_card(app.card_state(card).unwrap(), app.durable.card_scopes.get(&card).cloned()).unwrap();
+        app.workspace_model.views[0].panes.push(pane);
+        app.workspace_model.views[0].revision += 1;
+        app.workspace_model.sequence += 1;
+        let hide = app.request_chat_tab_close(card);
+        drop(hide); // Native focus is covered elsewhere; retain the actual typed checkpoint.
+        let removal = app.pending_card_removal_target(card).unwrap();
+        drop(app.update(Message::ChatClose(Action::CommitHide(removal))));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        drop(app.begin_chat_close(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.chat_ui.phases.is_empty());
+        assert!(app.chat_ui.retiring.is_empty());
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.conversation_drafts[&key], "Keep this unsent provider request");
+        assert_eq!(saved.conversation_models[&key], "user-selected-model");
+        assert_eq!(saved.conversation_channels[&key], bookmark);
+        assert_eq!(archive.agent.id, owner);
+    }
+
     fn fixture() -> (Cagents, CardId, tempfile::TempDir) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let directory = tempfile::tempdir().unwrap();

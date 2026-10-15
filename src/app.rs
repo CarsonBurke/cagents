@@ -16524,11 +16524,22 @@ impl Cagents {
         if self.modal_is_open() || repository_blocks {
             return Task::none();
         }
-        Task::batch(
-            self.deferred_navigation
-                .drain(..)
-                .map(cosmic::task::message),
-        )
+        let mut ready = Vec::new();
+        for message in std::mem::take(&mut self.deferred_navigation) {
+            let keep_report = self.update_prepared && match &message {
+                Message::WorktreeSelectionPrepared { generation, receipt, .. }
+                    if receipt.restores_archive_report() =>
+                        self.prepared_selection_navigates(*generation, receipt),
+                _ => false,
+            };
+            if keep_report {
+                self.deferred_navigation.push_back(message);
+            } else {
+                // A stale/error report receipt still retires its owned guard.
+                ready.push(cosmic::task::message(message));
+            }
+        }
+        Task::batch(ready)
     }
 
     /// Leaves the application: the window first, the process once the window
@@ -18559,8 +18570,11 @@ impl Application for Cagents {
             } => self.prepared_selection_navigates(*generation, receipt),
             _ => false,
         };
-        if (self.focused_repository_is_saving() || self.modal_is_open())
-            && (completion_navigates(&message) || prepared_navigation)
+        let prepared_report_navigation = prepared_navigation && matches!(&message,
+            Message::WorktreeSelectionPrepared { receipt, .. } if receipt.restores_archive_report());
+        if (self.update_prepared && prepared_report_navigation)
+            || ((self.focused_repository_is_saving() || self.modal_is_open())
+                && (completion_navigates(&message) || prepared_navigation))
         {
             self.deferred_navigation.push_back(message);
             return Task::none();

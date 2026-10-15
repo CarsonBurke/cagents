@@ -968,11 +968,10 @@ impl Cagents {
     fn report_resume_navigation_allowed(&self, picker: bool) -> bool {
         !self.update_prepared
             && self.resume_ui.open == picker
-            && self.update_ui.confirmation.is_none()
-            && !self.modal_over_form_dialogs()
-            && !self.device_ui.open
-            && self.worktree_dialog.is_none()
-            && self.pull_request_dialog.is_none()
+            && matches!(
+                (picker, self.top_modal()),
+                (true, Some(modal_ui::Modal::Resume)) | (false, None)
+            )
     }
 
     fn lookup_archive_report_source(&mut self, entry: SavedConversation) -> Task<Message> {
@@ -1069,38 +1068,24 @@ impl Cagents {
             self.close_resume();
         }
         self.resume_ui.report_restore_nonce = Some(restore.nonce);
-        let selected = match &restore.report.scope {
-            crate::agent_execution::Placement::Channel(channel) => {
-                if !self
-                    .durable
-                    .channels
-                    .iter()
-                    .any(|current| current.id == *channel && current.shared)
-                    || self.workspace_model.channel(*channel).is_none()
-                {
-                    self.resume_error(
-                        "Open the saved report's original project and channel before reopening it.",
-                    );
-                    return self.abandon_archive_report_restore(restore);
-                }
-                self.select_channel(*channel)
-            }
-            crate::agent_execution::Placement::Worktree { path, .. } => {
-                if self.worktree_view_scope(path).as_ref() != Some(&restore.report.scope) {
-                    self.resume_error(
-                        "Open the saved report's original project before reopening it.",
-                    );
-                    return self.abandon_archive_report_restore(restore);
-                }
-                self.select_worktree(path.clone(), false)
-            }
-        };
-        // The legacy synchronous provider can refuse selection. Do not insert
-        // into the old channel/strip merely because a selection was requested.
-        // The protected asynchronous provider carries this typed intent and
-        // invokes finish only after its exact scope/lease receipt commits.
-        let after = self.finish_archive_report_restore(restore);
-        Task::batch([selected, after])
+        if !self.archive_report_restore_is_current(&restore) {
+            self.status = Some(TransientNotice::warning(
+                "The saved report's original project or destination changed. No pane was opened.",
+            ));
+            return self.abandon_archive_report_restore(restore);
+        }
+        let scope = restore.report.scope.clone();
+        match scope {
+            crate::agent_execution::Placement::Channel(channel) => self.select_channel_then(
+                channel,
+                worktree_ui::selection::Intent::ArchiveReport(Box::new(restore)),
+            ),
+            crate::agent_execution::Placement::Worktree { path, .. } => self.select_worktree_then(
+                path,
+                false,
+                worktree_ui::selection::Intent::ArchiveReport(Box::new(restore)),
+            ),
+        }
     }
 
     pub(in crate::app) fn archive_report_restore_is_current(
@@ -1662,6 +1647,101 @@ mod tests {
         assert_eq!(resumed.launch, launch);
     }
 
+    fn resume_selection_receipt(task: Task<Message>) -> (Message, Vec<Message>) {
+        use iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("selection produces a receipt");
+        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut selection = None;
+        let mut lifecycle = Vec::new();
+        while let Some(action) = executor.block_on(stream.next()) {
+            match action {
+                iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                    if matches!(&message, Message::WorktreeSelectionPrepared { .. }) && selection.is_none() {
+                        selection = Some(message);
+                    } else { lifecycle.push(message); }
+                }
+                // This scope/lease fixture does not assert focus. Normal
+                // close tasks can emit Widget operations before the receipt.
+                _ => {}
+            }
+        }
+        (selection.expect("exact production prepared-scope receipt"), lifecycle)
+    }
+
+    #[test]
+    fn catalog_resume_waits_for_real_physical_scope_receipts_and_the_modal_barrier() {
+        for in_channel in [false, true] {
+            let old_scope = tempfile::tempdir().unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            let lease_runtime = tempfile::tempdir().unwrap();
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let project = ProjectId::new();
+            let channel = crate::model::ChannelId::new();
+            app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(
+                project, crate::repository::RepositoryId::new(), "Recorded project".into(),
+                destination.path().into(), Vec::new(), Vec::new()));
+            app.known_worktree_roots.extend([old_scope.path().to_owned(), destination.path().to_owned()]);
+            app.active_workspace = Some(old_scope.path().to_owned());
+            app.worktree_protections.install_prepared(Some(
+                crate::worktree_cleanup::fixture_protection(lease_runtime.path(), old_scope.path(), false).unwrap()));
+            let canonicalize_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            app.force_local_selection_with_counter_for_test(Arc::clone(&canonicalize_calls));
+            app.force_selection_guard_runtime_for_test(lease_runtime.path().to_owned());
+            let entry = saved(destination.path());
+            let conversation = entry.session.launch.session_id.clone();
+            let launch = entry.session.launch.clone();
+            let key = chat_ui::closing::draft_key(&entry.session).unwrap();
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.conversation_drafts.insert(key.clone(), "Keep my resumed prompt".into());
+            durable.conversation_models.insert(key.clone(), "recorded-before-first-turn".into());
+            if in_channel {
+                durable.channels.push(crate::model::ProjectChannel { id: channel, project_id: project,
+                    title: "Original channel".into(), title_source: Default::default(), ordinal: 0,
+                    shared: false, cards: Vec::new(), focused: None });
+                durable.conversation_channels.insert(key.clone(), channel);
+            }
+            let task = app.resume_saved_conversation(entry);
+            assert_eq!(app.active_workspace.as_deref(), Some(old_scope.path()));
+            assert!(app.durable.active_channel.is_none());
+            assert!(app.durable.cards.iter().all(|card| !matches!(&card.kind,
+                CardKind::Chat(session) if session.launch.session_id == conversation)), "resume insertion must not race lease preparation");
+            let (prepared, lifecycle) = resume_selection_receipt(task);
+            for message in lifecycle { drop(app.update(message)); }
+            assert!(matches!(&prepared, Message::WorktreeSelectionPrepared { .. }), "production preparation receipt");
+            assert!(canonicalize_calls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            assert!(matches!(crate::worktree_cleanup::fixture_protection(lease_runtime.path(), destination.path(), true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock), "receipt owns the actual filesystem lease before exposure");
+            app.settings_reset_confirm = true;
+            drop(app.finish_modal_update(Task::none()));
+            drop(app.update(prepared));
+            assert_eq!(app.deferred_navigation.len(), 1);
+            assert_eq!(app.active_workspace.as_deref(), Some(old_scope.path()));
+            assert!(app.durable.cards.iter().all(|card| !matches!(&card.kind,
+                CardKind::Chat(session) if session.launch.session_id == conversation)));
+            let ready = app.update(Message::CancelResetSettings);
+            let (receipt, lifecycle) = resume_selection_receipt(ready);
+            drop(app.update(receipt));
+            for message in lifecycle { drop(app.update(message)); }
+            assert_eq!(app.active_workspace.as_deref(), Some(destination.path()));
+            assert_eq!(app.durable.active_channel, in_channel.then_some(channel));
+            assert!(app.deferred_navigation.is_empty());
+            let card = app.durable.cards.iter().find(|card| matches!(&card.kind,
+                CardKind::Chat(session) if session.launch.session_id == conversation)).expect("resumed conversation");
+            let card_id = card.id;
+            let CardKind::Chat(session) = &card.kind else { unreachable!() };
+            assert_eq!(session.launch, launch);
+            if in_channel {
+                assert!(app.durable.channels.iter().find(|saved| saved.id == channel).unwrap().cards.contains(&card_id));
+            } else {
+                assert_eq!(app.durable.card_scopes.get(&card_id).map(PathBuf::as_path), Some(destination.path()));
+            }
+            assert_eq!(app.durable.conversation_drafts[&key], "Keep my resumed prompt");
+            assert_eq!(app.durable.conversation_models[&key], "recorded-before-first-turn");
+            assert!(matches!(crate::worktree_cleanup::fixture_protection(lease_runtime.path(), destination.path(), true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock), "visible destination retains the installed lease");
+        }
+    }
+
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(
             Provider::Claude,
@@ -1671,6 +1751,15 @@ mod tests {
         )
         .unwrap();
         session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        // This fixture intentionally exercises recorded metadata reuse, without
+        // claiming live account or physical home authority.
+        let variable = crate::account::home_variable(session.launch.provider).unwrap();
+        session.launch.recipe.environment.insert(variable.into(), "/fixture/resume-account".into());
+        session.launch.recipe.unset_environment.remove(variable);
+        for variable in crate::account::credential_overrides(session.launch.provider) {
+            session.launch.recipe.environment.remove(*variable);
+            session.launch.recipe.unset_environment.insert((*variable).into());
+        }
         SavedConversation {
             card: CardId::new(),
             title: "Review peripheral Rust modules".into(),
@@ -1713,6 +1802,193 @@ mod tests {
         assert!(app.resume_ui.error.as_deref().unwrap().contains("registry"));
         assert!(app.cards.values().all(|runtime| !matches!(runtime,
             CardRuntime::Chat(chat) if chat.session.id == original.id)));
+    }
+
+
+    // Joint fixture: requires the real protected-selection provider plus the
+    // ArchiveReport feature and modal adapters. No provider/daemon task runs.
+    fn report_physical_fixture(
+        destination: &Path,
+        old_scope: &Path,
+        runtime: &Path,
+        channel: bool,
+    ) -> (Cagents, SavedConversation, crate::automations::ArchiveReport, Arc<std::sync::atomic::AtomicUsize>) {
+        let (mut app, old_card, owner, archive) =
+            crate::app::chat_ui::qualified_closed_console_archive_at_root_for_test(destination);
+        let CardKind::Chat(original) = app.card_state(old_card).unwrap().kind.clone() else { unreachable!() };
+        let entry=SavedConversation{card:old_card,title:"Exact saved report".into(),session:original.clone(),open:false,updated_at_unix_ms:2};
+        app.workspace.request_close(old_card).unwrap();
+        drop(app.commit_card_removal(old_card,None).unwrap());
+        app.workspace_model.views[0].panes.clear();
+        app.workspace_model.views[0].retired.push(old_card);
+        app.workspace_model.views[0].revision+=1;
+        let mut scope=app.workspace_model.views[0].scope.clone();
+        if channel {
+            let id=ChannelId::new();
+            let project=app.sidebar_model.projects[0].id;
+            Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel{
+                id,project_id:project,title:"Report's original channel".into(),title_source:Default::default(),
+                ordinal:0,shared:true,cards:Vec::new(),focused:None,
+            });
+            app.workspace_model.channels.push(crate::workspace_model::ModelChannel{
+                id,repository:destination.into(),title:"Report's original channel".into(),title_source:Default::default(),ordinal:1,
+            });
+            scope=crate::agent_execution::Placement::Channel(id);
+            app.workspace_model.views[0].scope=scope.clone();
+        }
+        let reference=chat::ArchiveReportReference{format:1,registry:app.workspace_model.identity,agent:owner,source_operation:uuid::Uuid::new_v4()};
+        let mut issued=original.clone();issued.archive_report=Some(reference.clone());
+        let report=crate::automations::ArchiveReport{
+            reference,scope,repository:destination.into(),source_revision:1,
+            presentation_scope:(!channel).then(||destination.to_owned()),
+            session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive:(*archive).clone(),
+        };
+        app.active_workspace=Some(old_scope.into());
+        Arc::make_mut(&mut app.durable).active_channel=None;
+        app.known_worktree_roots.extend([old_scope.to_owned(),destination.to_owned()]);
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime,old_scope,false).unwrap()));
+        let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        app.force_local_selection_with_counter_for_test(Arc::clone(&calls));
+        app.force_selection_guard_runtime_for_test(runtime.to_owned());
+        (app,entry,report,calls)
+    }
+
+    fn report_scope_receipt(task:Task<Message>)->(Message,Vec<Message>) {
+        let mut stream=iced::runtime::task::into_stream(task).expect("real preparation must emit a receipt");
+        let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        executor.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10),async {
+                let mut receipt=None;let mut lifecycle=Vec::new();
+                while let Some(action)=stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message))=action {
+                        if matches!(&message,Message::WorktreeSelectionPrepared{..}) && receipt.is_none() {receipt=Some(message);}
+                        else {lifecycle.push(message);}
+                    }
+                    // Focus Widget operations do not carry a navigation receipt.
+                }
+                (receipt.expect("actual worker WorktreeSelectionPrepared"),lifecycle)
+            }).await.expect("bounded physical selection preparation")
+        })
+    }
+
+    fn start_report_scope_receipt(app:&mut Cagents,entry:SavedConversation,report:crate::automations::ArchiveReport)->Message {
+        use cosmic::app::Application;
+        app.resume_ui.open=true;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.resume_saved_conversation(entry.clone())); // Drop the remote lookup, inject only its private typed reply.
+        let nonce=app.resume_ui.report_query.as_ref().unwrap().nonce;
+        let generation=app.resume_ui.generation;
+        let task=app.update(Message::ResumeConversation(Action::ReportSource(generation,nonce,entry,Arc::new(Ok(Some(report))))));
+        assert!(!app.resume_ui.open,"the exact submitting picker hands off before guard preparation");
+        let (receipt,lifecycle)=report_scope_receipt(task);
+        for message in lifecycle {drop(app.update(message));}
+        receipt
+    }
+
+    fn report_presentations(app:&Cagents)->Vec<CardId> {
+        app.durable.cards.iter().filter_map(|card|{
+            (card.existence.is_open() && matches!(&card.kind,CardKind::Chat(session) if session.archive_report.is_some())).then_some(card.id)
+        }).collect()
+    }
+
+    fn assert_report_only_insert(app:&Cagents,entry:&SavedConversation,report:&crate::automations::ArchiveReport) {
+        let cards=report_presentations(app);assert_eq!(cards.len(),1);let card=cards[0];
+        assert_ne!(card,entry.card,"permanent old-card tombstone must not be reused");
+        assert!(!app.card_state(entry.card).unwrap().existence.is_open());
+        let CardKind::Chat(session)=&app.card_state(card).unwrap().kind else {unreachable!()};
+        assert_eq!(session.archive_report.as_ref(),Some(&report.reference));
+        assert_eq!(session.id,entry.session.id);assert_eq!(session.proof,entry.session.proof);
+        assert!(!app.chat_has_live_handle(card));
+        assert!(app.pending_archive_read_for_test(card).is_some(),"only the private archive-body read phase may remain pending");
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        let changes=app.pending_shared_view_changes_for_test();
+        assert!(changes.iter().any(|(scope,change)|scope==&report.scope && matches!(change,
+            crate::workspace_model::views::Change::InsertArchiveReport{reference,pane,..}
+            if reference==&report.reference && pane.id==card)),"publish only the original qualified report membership");
+    }
+
+    #[test]
+    fn readonly_report_waits_for_real_scope_guard_and_upper_modal_before_exact_once_insertion() {
+        use cosmic::app::Application;
+        for channel in [false,true] {
+            let old=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();let runtime=tempfile::tempdir().unwrap();
+            let (mut app,entry,report,calls)=report_physical_fixture(destination.path(),old.path(),runtime.path(),channel);
+            let receipt=start_report_scope_receipt(&mut app,entry.clone(),report.clone());
+            assert_eq!(app.active_workspace.as_deref(),Some(old.path()));assert!(report_presentations(&app).is_empty());
+            assert!(calls.load(std::sync::atomic::Ordering::Relaxed)>0,"actual physical preparation ran");
+            assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),destination.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+            app.settings_reset_confirm=true;drop(app.finish_modal_update(Task::none()));
+            drop(app.update(receipt));
+            assert_eq!(app.deferred_navigation.len(),1);assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+            assert!(report_presentations(&app).is_empty());
+            let ready=app.update(Message::CancelResetSettings);
+            let (receipt,lifecycle)=report_scope_receipt(ready);let repeated=receipt.clone();
+            drop(app.update(receipt));for message in lifecycle {drop(app.update(message));}
+            assert_report_only_insert(&app,&entry,&report);
+            assert_eq!(app.active_workspace.as_deref(),Some(destination.path()));
+            match &report.scope {
+                crate::agent_execution::Placement::Channel(id)=>assert_eq!(app.durable.active_channel,Some(*id)),
+                _=>assert!(app.durable.active_channel.is_none()),
+            }
+            drop(app.update(repeated));assert_report_only_insert(&app,&entry,&report);
+            assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),destination.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"committed scope retains its real guard");
+        }
+    }
+
+    #[test]
+    fn readonly_report_prepared_update_retains_only_current_receipt_and_releases_it_once() {
+        use cosmic::app::Application;
+        let old=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();let runtime=tempfile::tempdir().unwrap();
+        let (mut app,entry,report,_)=report_physical_fixture(destination.path(),old.path(),runtime.path(),false);
+        let receipt=start_report_scope_receipt(&mut app,entry.clone(),report.clone());
+        app.update_prepared=true;drop(app.update(receipt));
+        for _ in 0..3 {
+            drop(app.update(Message::ResumeConversation(Action::Indexed(app.resume_ui.generation,Progress::Counted(0)))));
+            assert_eq!(app.deferred_navigation.len(),1);
+            assert_eq!(app.active_workspace.as_deref(),Some(old.path()));assert!(report_presentations(&app).is_empty());
+        }
+        app.update_prepared=false;
+        let (receipt,lifecycle)=report_scope_receipt(app.release_deferred_navigation_if_unblocked());
+        let duplicate=receipt.clone();drop(app.update(receipt));for message in lifecycle {drop(app.update(message));}
+        assert_report_only_insert(&app,&entry,&report);drop(app.update(duplicate));
+        assert_report_only_insert(&app,&entry,&report);
+    }
+
+    #[test]
+    fn readonly_report_stale_original_filing_or_nonce_retires_held_guard_without_scope_mutation() {
+        use cosmic::app::Application;
+        for scenario in 0..3 {
+            let old=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();let runtime=tempfile::tempdir().unwrap();
+            let (mut app,entry,report,_)=report_physical_fixture(destination.path(),old.path(),runtime.path(),scenario==2);
+            let receipt=start_report_scope_receipt(&mut app,entry,report);
+            let nonce=uuid::Uuid::new_v4();
+            match scenario {
+                0=>app.resume_ui.report_restore_nonce=Some(nonce),
+                1=>app.sidebar_model.projects.clear(),
+                _=>app.workspace_model.channels[0].repository=old.path().to_owned(),
+            }
+            app.update_prepared=true;drop(app.update(receipt));
+            assert!(app.deferred_navigation.is_empty(),"stale receipt must retire instead of being deferred forever");
+            assert_eq!(app.active_workspace.as_deref(),Some(old.path()));assert!(report_presentations(&app).is_empty());
+            assert!(app.durable.active_channel.is_none());assert!(app.terminal_starts.lock().unwrap().is_empty());
+            if scenario==0 {assert_eq!(app.resume_ui.report_restore_nonce,Some(nonce),"old abandonment cannot cancel a new intent");}
+            drop(crate::worktree_cleanup::fixture_protection(runtime.path(),destination.path(),true).expect("stale receipt released the exact held lease"));
+        }
+    }
+
+    #[test]
+    fn readonly_report_real_guard_failure_never_changes_scope_or_inserts_membership() {
+        use cosmic::app::Application;
+        let old=tempfile::tempdir().unwrap();let destination=tempfile::tempdir().unwrap();let runtime=tempfile::tempdir().unwrap();
+        let (mut app,entry,report,_)=report_physical_fixture(destination.path(),old.path(),runtime.path(),false);
+        let invalid_runtime=runtime.path().join("not-a-directory");std::fs::write(&invalid_runtime,b"owned fixture file").unwrap();
+        app.force_selection_guard_runtime_for_test(invalid_runtime);
+        let receipt=start_report_scope_receipt(&mut app,entry,report);
+        drop(app.update(receipt));
+        assert!(app.resume_ui.report_restore_nonce.is_none());assert!(app.deferred_navigation.is_empty());
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));assert!(report_presentations(&app).is_empty());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1915,6 +2191,9 @@ mod tests {
                 2 => app.resume_ui.open = false,
                 _ => app.settings_reset_confirm = true,
             }
+            // Register the actual visible owner before the held completion.
+            // Lower Resume retention never grants navigation ownership.
+            drop(app.finish_modal_update(Task::none()));
             // An Err is deliberately supplied: even presenting a completion's
             // error must not move focus through the modal that took ownership.
             let task = app.update(Message::ResumeConversation(Action::ReportSource(
@@ -1923,7 +2202,21 @@ mod tests {
                 entry,
                 Arc::new(Err("must not surface behind upper modal".into())),
             )));
-            assert!(iced::runtime::task::into_stream(task).is_none());
+            if app.settings_reset_confirm {
+                let cancel = widget::Id::new("dialog.reset-settings.cancel");
+                let preserve = Task::batch([
+                    iced::widget::operation::focus(cancel.clone()).map(cosmic::Action::App),
+                    task,
+                ]);
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), preserve),
+                    Some(cancel)
+                );
+            } else {
+                // Modal reconciliation may emit guarded Widget operations;
+                // state assertions below prove the completion did not navigate.
+                drop(task);
+            }
             assert_eq!(app.resume_ui.deferred_report.is_some(), scenario != 2);
             assert_eq!(app.resume_ui.report_query.is_some(), scenario != 2);
             assert!(!app.resume_ui.loading);

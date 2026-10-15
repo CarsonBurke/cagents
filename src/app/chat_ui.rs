@@ -4532,13 +4532,17 @@ impl Cagents {
         let mut conversation_drafts = self.durable.conversation_drafts.clone();
         let mut conversation_models = self.durable.conversation_models.clone();
         for (card, draft) in &chat_drafts {
+            if self.conversation_metadata_is_readonly(*card) {
+                continue;
+            }
             if let Some(CardKind::Chat(session)) = self.card_state(*card).map(|card| &card.kind)
                 && let Some(key) = closing::draft_key(session)
             {
                 conversation_drafts.insert(key, draft.clone());
             }
         }
-        for runtime in self.chat_ui.parked.values() {
+        for (card, runtime) in &self.chat_ui.parked {
+            if self.conversation_metadata_is_readonly(*card) { continue; }
             if let Some(key) = closing::draft_key(&runtime.session) {
                 if let Some(model) = runtime
                     .snapshot
@@ -4558,6 +4562,7 @@ impl Cagents {
         }
         for (card, state) in &self.cards {
             if let CardRuntime::Chat(runtime) = state
+                && !self.conversation_metadata_is_readonly(*card)
                 && let Some(session) = self.chat_return_session(*card)
                 && let Some(key) = closing::draft_key(&session)
             {
@@ -9985,6 +9990,20 @@ pub(in crate::app) fn qualified_closed_console_archive_for_test() -> (
     Arc<crate::automations::ArchivedConversation>,
 ) {
     tests::qualified_closed_console_archive()
+}
+
+#[cfg(test)]
+pub(in crate::app) fn qualified_closed_console_archive_at_root_for_test(root: &std::path::Path) -> (
+    Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+) {
+    tests::qualified_closed_console_archive_configured(false, Some(root))
+}
+
+#[cfg(test)]
+pub(in crate::app) fn qualified_closed_console_archive_with_metadata_for_test() -> (
+    Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+) {
+    tests::qualified_closed_console_archive_configured(true, None)
 }
 
 #[cfg(test)]
@@ -19181,6 +19200,11 @@ mod tests {
         crate::model::AgentId,
         Arc<crate::automations::ArchivedConversation>,
     ) {
+        qualified_closed_console_archive_configured(false, None)
+    }
+    pub(super) fn qualified_closed_console_archive_configured(recorded_metadata: bool, root: Option<&std::path::Path>) -> (
+        Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+    ) {
         use crate::agent_execution::{
             Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
         };
@@ -19191,6 +19215,7 @@ mod tests {
         let CardKind::Terminal(mut console) = app.card_state(card).unwrap().kind.clone() else {
             panic!("fixture terminal")
         };
+        if let Some(root) = root { console.launch.working_directory = root.to_path_buf(); }
         let id = crate::model::AgentId::from_uuid(card.as_uuid());
         let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("console-archive"),
@@ -19214,6 +19239,15 @@ mod tests {
         .unwrap();
         saved.proof = Some(proof);
         saved.launch.session_id = Some("confirmed-console-archive".into());
+        if recorded_metadata {
+            let variable = crate::account::home_variable(saved.launch.provider).unwrap();
+            saved.launch.recipe.environment.insert(variable.into(), "/fixture/recorded-home".into());
+            saved.launch.recipe.unset_environment.remove(variable);
+            for variable in crate::account::credential_overrides(saved.launch.provider) {
+                saved.launch.recipe.environment.remove(*variable);
+                saved.launch.recipe.unset_environment.insert((*variable).into());
+            }
+        }
         let agent = Agent {
             name: None,
             id,
