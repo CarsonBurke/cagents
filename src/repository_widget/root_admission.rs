@@ -26,7 +26,9 @@ pub struct RootFileAdmission {
 
 impl RootFilePreparation {
     fn refuse(self) {
-        if let Some(prepared) = self.prepared { prepared.ticket().request_retirement(); }
+        if let Some(prepared) = self.prepared {
+            prepared.ticket().request_retirement();
+        }
     }
 }
 
@@ -36,11 +38,21 @@ struct Intake {
 }
 
 pub(super) fn is_mutable(result: &Result<LoadedFile, FileIoError>) -> bool {
-    matches!(result, Ok(LoadedFile { content: FileContent::Editable { .. } | FileContent::SavedAbsence, .. }))
+    matches!(
+        result,
+        Ok(LoadedFile {
+            content: FileContent::Editable { .. } | FileContent::SavedAbsence,
+            ..
+        })
+    )
 }
 
 impl RepositoryRuntime {
-    pub(super) fn admitted_file_task(&mut self, identity: AsyncIdentity, absent: Option<(PathBuf, crate::editor::FileRootIdentity)>) -> Task<RepositoryAction> {
+    pub(super) fn admitted_file_task(
+        &mut self,
+        identity: AsyncIdentity,
+        absent: Option<(PathBuf, crate::editor::FileRootIdentity)>,
+    ) -> Task<RepositoryAction> {
         // This short lock does no I/O. A sealed window cannot create a later
         // lazy task that escapes exit's retirement census.
         let request = uuid::Uuid::new_v4();
@@ -53,58 +65,149 @@ impl RepositoryRuntime {
             }
             _ => Err("Original root registration is unavailable. Reopen this file after the local recovery service is available.".into()),
         };
-        file_preparation_task(identity, request, self.document_tone, absent, self.original_editor_root.clone(), self.retained_editor_root_admissions(), intake)
+        file_preparation_task(
+            identity,
+            request,
+            self.document_tone,
+            absent,
+            self.original_editor_root.clone(),
+            self.retained_editor_root_admissions(),
+            intake,
+        )
     }
 
     fn root_admissions_sealed(&self) -> bool {
-        self.edited_root_admissions.as_ref().is_some_and(|ledger| ledger.lock().unwrap_or_else(|error| error.into_inner()).is_sealed())
+        self.edited_root_admissions.as_ref().is_some_and(|ledger| {
+            ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_sealed()
+        })
     }
 
-    pub(super) fn editor_file_admitted(&mut self, identity: AsyncIdentity, admission: RootFileAdmission) -> Task<RepositoryAction> {
-        if self.editor_root_load != Some(admission.request) || !self.accepts_selected(&identity) || self.workspace_edit_pending() || self.root_admissions_sealed() {
+    pub(super) fn editor_file_admitted(
+        &mut self,
+        identity: AsyncIdentity,
+        admission: RootFileAdmission,
+    ) -> Task<RepositoryAction> {
+        if self.editor_root_load != Some(admission.request)
+            || !self.accepts_selected(&identity)
+            || self.workspace_edit_pending()
+            || self.root_admissions_sealed()
+        {
             return Task::none();
         }
         self.editor_root_load = None;
-        let RootFileAdmission { result, indentation, root, .. } = admission;
-        let result = if is_mutable(&result) && !root.as_ref().is_some_and(crate::editor::FileRootIdentity::has_active_admission) {
-            Err(FileIoError::Io("Original edited-root admission closed before the file could become editable.".into()))
-        } else { result };
+        let RootFileAdmission {
+            result,
+            indentation,
+            root,
+            ..
+        } = admission;
+        let result = if is_mutable(&result)
+            && !root
+                .as_ref()
+                .is_some_and(crate::editor::FileRootIdentity::has_active_admission)
+        {
+            Err(FileIoError::Io(
+                "Original edited-root admission closed before the file could become editable."
+                    .into(),
+            ))
+        } else {
+            result
+        };
         self.finish_configured_file(identity, result, indentation, root)
     }
 
-    pub(super) fn editor_file_prepared(&mut self, identity: AsyncIdentity, preparation: RootFilePreparation) -> Task<RepositoryAction> {
-        if self.editor_root_load != Some(preparation.request) || !self.accepts_selected(&identity) || self.workspace_edit_pending() || self.root_admissions_sealed() {
+    pub(super) fn editor_file_prepared(
+        &mut self,
+        identity: AsyncIdentity,
+        preparation: RootFilePreparation,
+    ) -> Task<RepositoryAction> {
+        if self.editor_root_load != Some(preparation.request)
+            || !self.accepts_selected(&identity)
+            || self.workspace_edit_pending()
+            || self.root_admissions_sealed()
+        {
             preparation.refuse();
             return Task::none();
         }
-        let RootFilePreparation { request, result, indentation, root, prepared } = preparation;
+        let RootFilePreparation {
+            request,
+            result,
+            indentation,
+            root,
+            prepared,
+        } = preparation;
         let Some(prepared) = prepared else {
-            return self.editor_file_admitted(identity, RootFileAdmission { request, result, indentation, root });
+            return self.editor_file_admitted(
+                identity,
+                RootFileAdmission {
+                    request,
+                    result,
+                    indentation,
+                    root,
+                },
+            );
         };
         let enrollment = match prepared.begin_enrollment() {
             Ok(work) => work,
-            Err(error) => return self.editor_file_admitted(identity, RootFileAdmission {
-                request, result: Err(FileIoError::Io(error.to_string())), indentation, root: None,
-            }),
+            Err(error) => {
+                return self.editor_file_admitted(
+                    identity,
+                    RootFileAdmission {
+                        request,
+                        result: Err(FileIoError::Io(error.to_string())),
+                        indentation,
+                        root: None,
+                    },
+                );
+            }
         };
         // EnrollmentWork is already fenced in the window's preheld ticket.
         // Dropping this lazy task or a panicking worker retains that owner.
         cosmic::task::future(async move {
             let loaded = tokio::task::spawn_blocking(move || {
                 let deadline = Instant::now() + Duration::from_secs(10);
-                let admission = enrollment.run(&CancellationToken::new(), deadline)
+                let admission = enrollment
+                    .run(&CancellationToken::new(), deadline)
                     .map_err(|error| FileIoError::Io(error.to_string()))?;
-                let root = root.ok_or_else(|| FileIoError::Io("Original file root was lost before enrollment.".into()))?
+                let root = root
+                    .ok_or_else(|| {
+                        FileIoError::Io("Original file root was lost before enrollment.".into())
+                    })?
                     .with_admission(admission, deadline)?;
                 Ok::<_, FileIoError>((result, root))
-            }).await.map_err(|error| FileIoError::Io(format!("Root enrollment worker failed: {error}"))).and_then(|result| result);
-            let (result, root) = match loaded { Ok((result, root)) => (result, Some(root)), Err(error) => (Err(error), None) };
-            RepositoryAction::EditorFileAdmitted { identity, admission: RootFileAdmission { request, result, indentation, root } }
+            })
+            .await
+            .map_err(|error| FileIoError::Io(format!("Root enrollment worker failed: {error}")))
+            .and_then(|result| result);
+            let (result, root) = match loaded {
+                Ok((result, root)) => (result, Some(root)),
+                Err(error) => (Err(error), None),
+            };
+            RepositoryAction::EditorFileAdmitted {
+                identity,
+                admission: RootFileAdmission {
+                    request,
+                    result,
+                    indentation,
+                    root,
+                },
+            }
         })
     }
 }
 
-fn file_preparation_task(identity: AsyncIdentity, request: uuid::Uuid, tone: crate::editor::PdfTone, absent: Option<(PathBuf, crate::editor::FileRootIdentity)>, source: Option<crate::editor::FileRootIdentity>, existing: Vec<crate::editor::FileRootIdentity>, intake: Result<Intake, String>) -> Task<RepositoryAction> {
+fn file_preparation_task(
+    identity: AsyncIdentity,
+    request: uuid::Uuid,
+    tone: crate::editor::PdfTone,
+    absent: Option<(PathBuf, crate::editor::FileRootIdentity)>,
+    source: Option<crate::editor::FileRootIdentity>,
+    existing: Vec<crate::editor::FileRootIdentity>,
+    intake: Result<Intake, String>,
+) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
@@ -152,9 +255,18 @@ fn file_preparation_task(identity: AsyncIdentity, request: uuid::Uuid, tone: cra
             }
         }).await;
         let preparation = result.unwrap_or_else(|error| RootFilePreparation {
-            request, result: Err(FileIoError::Io(format!("File admission worker failed: {error}"))), indentation: crate::editor_indent::Overrides::default(), root: None, prepared: None,
+            request,
+            result: Err(FileIoError::Io(format!(
+                "File admission worker failed: {error}"
+            ))),
+            indentation: crate::editor_indent::Overrides::default(),
+            root: None,
+            prepared: None,
         });
-        RepositoryAction::EditorFilePrepared { identity, preparation }
+        RepositoryAction::EditorFilePrepared {
+            identity,
+            preparation,
+        }
     })
 }
 
@@ -179,7 +291,9 @@ mod tests {
     async fn receipt(task: Task<RepositoryAction>) -> RepositoryAction {
         let mut stream = iced::runtime::task::into_stream(task).expect("actual file worker task");
         while let Some(action) = stream.next().await {
-            if let iced::runtime::Action::Output(action) = action { return action; }
+            if let iced::runtime::Action::Output(action) = action {
+                return action;
+            }
         }
         panic!("file worker must return its owned receipt");
     }
@@ -194,12 +308,23 @@ mod tests {
         runtime.descriptor.worktree = directory.path().to_path_buf();
         let task = runtime.open_file(card, "source.txt".into());
         finish(&mut runtime, task).await;
-        assert!(matches!(&runtime.document, DocumentState::Failed { message, .. } if message.contains("registration is unavailable")));
+        assert!(
+            matches!(&runtime.document, DocumentState::Failed { message, .. } if message.contains("registration is unavailable"))
+        );
         assert!(runtime.editor_text().is_none());
-        assert_eq!(std::fs::read(directory.path().join("source.txt")).unwrap(), b"keep original");
+        assert_eq!(
+            std::fs::read(directory.path().join("source.txt")).unwrap(),
+            b"keep original"
+        );
         let task = runtime.open_file(card, "binary.bin".into());
         finish(&mut runtime, task).await;
-        assert!(matches!(runtime.document, DocumentState::ReadOnly { reason: ReadOnlyReason::BinaryPreview(_), .. }));
+        assert!(matches!(
+            runtime.document,
+            DocumentState::ReadOnly {
+                reason: ReadOnlyReason::BinaryPreview(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -208,9 +333,14 @@ mod tests {
         let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "source.txt");
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(LoadedFile { source: "source.txt".into(), content: FileContent::Editable {
-                text: "unregistered".into(), content_hash: blake3::hash(b"unregistered"), markdown: false,
-            }}),
+            result: Ok(LoadedFile {
+                source: "source.txt".into(),
+                content: FileContent::Editable {
+                    text: "unregistered".into(),
+                    content_hash: blake3::hash(b"unregistered"),
+                    markdown: false,
+                },
+            }),
         }));
         assert!(matches!(runtime.document, DocumentState::Failed { .. }));
         assert!(runtime.editor_text().is_none());
@@ -223,12 +353,23 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "source.txt");
         runtime.descriptor.worktree = directory.path().to_path_buf();
-        let ledger = Arc::new(std::sync::Mutex::new(crate::edited_root_admission::EditedRootAdmissions::default()));
+        let ledger = Arc::new(std::sync::Mutex::new(
+            crate::edited_root_admission::EditedRootAdmissions::default(),
+        ));
         ledger.lock().unwrap().seal_new_admissions();
         runtime.set_edited_root_admissions(ledger.clone());
-        runtime.set_recovery_endpoint(crate::recovery_domain::LocalRecoveryEndpoint::fixture(directory.path().join("never-connect.sock"), None).unwrap());
+        runtime.set_recovery_endpoint(
+            crate::recovery_domain::LocalRecoveryEndpoint::fixture(
+                directory.path().join("never-connect.sock"),
+                None,
+            )
+            .unwrap(),
+        );
         let task = runtime.open_file(card, "source.txt".into());
-        assert!(ledger.lock().unwrap().is_empty(), "no late admission was reserved before returning the task");
+        assert!(
+            ledger.lock().unwrap().is_empty(),
+            "no late admission was reserved before returning the task"
+        );
         finish(&mut runtime, task).await;
         assert!(!matches!(runtime.document, DocumentState::Editable(_)));
         assert!(ledger.lock().unwrap().is_empty());
@@ -244,17 +385,32 @@ mod tests {
         old.descriptor.worktree = directory.path().to_path_buf();
         let task = old.open_file(card, "binary.bin".into());
         let receipt = receipt(task).await;
-        let RepositoryAction::EditorFilePrepared { identity: old_identity, .. } = &receipt else { panic!("actual phase-one file receipt"); };
+        let RepositoryAction::EditorFilePrepared {
+            identity: old_identity,
+            ..
+        } = &receipt
+        else {
+            panic!("actual phase-one file receipt");
+        };
         let (mut replacement, _) = RepositoryRuntime::selection_fixture(card, "binary.bin");
         replacement.descriptor.worktree = directory.path().to_path_buf();
         let current = replacement.open_file(card, "binary.bin".into());
-        assert!(replacement.accepts_selected(old_identity), "numeric generation/path alone really collide");
+        assert!(
+            replacement.accepts_selected(old_identity),
+            "numeric generation/path alone really collide"
+        );
         let nonce = replacement.editor_root_load;
         drop(replacement.update(receipt));
         assert_eq!(replacement.editor_root_load, nonce);
         assert!(matches!(replacement.document, DocumentState::Loading));
         finish(&mut replacement, current).await;
-        assert!(matches!(replacement.document, DocumentState::ReadOnly { reason: ReadOnlyReason::BinaryPreview(_), .. }));
+        assert!(matches!(
+            replacement.document,
+            DocumentState::ReadOnly {
+                reason: ReadOnlyReason::BinaryPreview(_),
+                ..
+            }
+        ));
     }
 
     // This peer exercises actual client framing and original descriptor
@@ -262,7 +418,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn framed_original_pair_is_installed_before_enrollment_and_reused_by_undo() {
-        use crate::edited_root_admission::{AdmissionPhase, EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        use crate::edited_root_admission::{
+            AdmissionPhase, EditedRootAdmissions,
+            test_peer::{Event, ScriptedEditedRootPeer},
+        };
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("source.txt"), "original").unwrap();
         std::fs::write(directory.path().join("other.txt"), "second").unwrap();
@@ -275,46 +434,93 @@ mod tests {
         runtime.set_recovery_endpoint(peer.endpoint());
         runtime.set_edited_root_admissions(ledger.clone());
         let task = runtime.open_file(card, "source.txt".into());
-        assert_eq!(ledger.lock().unwrap().len(), 1, "window owns the ticket before the lazy phase-one task");
+        assert_eq!(
+            ledger.lock().unwrap().len(),
+            1,
+            "window owns the ticket before the lazy phase-one task"
+        );
         let prepared = receipt(task).await;
-        assert!(matches!(prepared, RepositoryAction::EditorFilePrepared { .. }));
-        assert!(peer.events().is_empty(), "phase one performed no negative registration");
+        assert!(matches!(
+            prepared,
+            RepositoryAction::EditorFilePrepared { .. }
+        ));
+        assert!(
+            peer.events().is_empty(),
+            "phase one performed no negative registration"
+        );
         let ticket = ledger.lock().unwrap().tickets().next().unwrap().clone();
         assert_eq!(ticket.phase(), AdmissionPhase::Prepared);
         let task = runtime.update(prepared);
-        assert!(ticket.has_worker(), "phase two is fenced before returning a lazy task");
+        assert!(
+            ticket.has_worker(),
+            "phase two is fenced before returning a lazy task"
+        );
         assert!(peer.events().is_empty());
         finish(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("original"));
         let task = runtime.open_file(card, "other.txt".into());
         finish(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("second"));
-        assert_eq!(peer.events().iter().filter(|event| **event == Event::Prepared).count(), 1, "same original checkout reuses its real lease");
+        assert_eq!(
+            peer.events()
+                .iter()
+                .filter(|event| **event == Event::Prepared)
+                .count(),
+            1,
+            "same original checkout reuses its real lease"
+        );
         let roots = runtime.retained_editor_root_admissions();
         assert!(!roots.is_empty());
         let pair = roots[0].retained_admission().unwrap();
         let foreign = tempfile::tempdir().unwrap();
         let foreign = Arc::new(crate::editor::worktree_root(foreign.path()).unwrap());
-        assert!(crate::editor::FileRootIdentity::admitted(foreign, pair.clone(), Instant::now() + Duration::from_secs(2)).is_err(), "an actual successful pair cannot authorize a different original root");
+        assert!(
+            crate::editor::FileRootIdentity::admitted(
+                foreign,
+                pair.clone(),
+                Instant::now() + Duration::from_secs(2)
+            )
+            .is_err(),
+            "an actual successful pair cannot authorize a different original root"
+        );
         drop(roots);
         drop(runtime);
         ledger.lock().unwrap().request_unowned_retirements();
-        assert!(ledger.lock().unwrap().next_retirement().unwrap().is_none(), "actual queued/Undo owner still retains the raw lease");
+        assert!(
+            ledger.lock().unwrap().next_retirement().unwrap().is_none(),
+            "actual queued/Undo owner still retains the raw lease"
+        );
         drop(pair);
         ledger.lock().unwrap().request_unowned_retirements();
-        let retirement = ledger.lock().unwrap().next_retirement().unwrap().expect("last actual holder drained");
-        retirement.run(Instant::now() + Duration::from_secs(2)).unwrap();
+        let retirement = ledger
+            .lock()
+            .unwrap()
+            .next_retirement()
+            .unwrap()
+            .expect("last actual holder drained");
+        retirement
+            .run(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         assert_eq!(ticket.phase(), AdmissionPhase::Settled);
         drop(ticket);
         drop(ledger);
         let events = peer.finish();
-        assert_eq!(events.iter().filter(|event| **event == Event::Released).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == Event::Released)
+                .count(),
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn held_actual_enrollment_receipt_cannot_publish_in_replacement_runtime() {
-        use crate::edited_root_admission::{EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        use crate::edited_root_admission::{
+            EditedRootAdmissions,
+            test_peer::{Event, ScriptedEditedRootPeer},
+        };
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("source.txt"), "original").unwrap();
         let original = crate::editor::worktree_root(directory.path()).unwrap();
@@ -329,7 +535,9 @@ mod tests {
         let prepared = receipt(task).await;
         let task = old.update(prepared);
         let admitted = receipt(task).await;
-        let RepositoryAction::EditorFileAdmitted { identity, .. } = &admitted else { panic!("actual successful enrollment worker receipt"); };
+        let RepositoryAction::EditorFileAdmitted { identity, .. } = &admitted else {
+            panic!("actual successful enrollment worker receipt");
+        };
         assert!(peer.events().contains(&Event::Activated));
         drop(old);
         // A new Runtime reuses the numeric path/generation, while its actual
@@ -342,11 +550,24 @@ mod tests {
         drop(replacement.update(admitted));
         assert!(matches!(replacement.document, DocumentState::Loading));
         finish(&mut replacement, current).await;
-        assert!(matches!(replacement.document, DocumentState::ReadOnly { reason: ReadOnlyReason::BinaryPreview(_), .. }));
+        assert!(matches!(
+            replacement.document,
+            DocumentState::ReadOnly {
+                reason: ReadOnlyReason::BinaryPreview(_),
+                ..
+            }
+        ));
         drop(replacement);
         ledger.lock().unwrap().request_unowned_retirements();
-        let retirement = ledger.lock().unwrap().next_retirement().unwrap().expect("late completion dropped only its passive original pair");
-        retirement.run(Instant::now() + Duration::from_secs(2)).unwrap();
+        let retirement = ledger
+            .lock()
+            .unwrap()
+            .next_retirement()
+            .unwrap()
+            .expect("late completion dropped only its passive original pair");
+        retirement
+            .run(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         drop(ledger);
         assert!(peer.finish().contains(&Event::Released));
     }
