@@ -25,6 +25,10 @@ pub struct TerminalSurface {
 }
 
 impl TerminalSurface {
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        self.handle.same_attachment(&other.handle)
+    }
+
     /// Marks a terminal this client just started, so its first layout sizes
     /// the PTY at once rather than as a resize that waits to settle.
     pub fn spawned(self) -> Self {

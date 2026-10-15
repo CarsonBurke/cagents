@@ -827,6 +827,10 @@ impl std::fmt::Debug for HostedTerminalHandle {
 }
 
 impl HostedTerminalHandle {
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn connect(
         terminal_id: TerminalId,
         expected_host: Option<HostSessionProof>,

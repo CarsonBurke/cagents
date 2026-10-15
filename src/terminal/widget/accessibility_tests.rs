@@ -30,6 +30,7 @@ enum Message {
     Focus,
     Shortcut,
     Paste,
+    Edited(String),
 }
 struct Peer {
     _directory: tempfile::TempDir,
@@ -294,6 +295,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     let mut new_widget = widget(&new, "new-card", shared.clone(), false, false);
     let mut old_tree = Tree::new(&old_widget as &dyn Widget<Message, Theme, Renderer>);
     let mut new_tree = Tree::new(&new_widget as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut old_widget, &mut old_tree, &renderer);
     let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
@@ -506,6 +508,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     assert_no_pty_input(&old.fence());
     old_widget.on_shortcut = None;
+    native_focus(&mut old_widget, &mut old_tree, &renderer);
     dispatch(
         &mut old_widget,
         &mut old_tree,
@@ -749,4 +752,156 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     widget.review_revision = 6;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
+}
+
+
+fn native_focus(widget: &mut TerminalWidget<Message>, tree: &mut Tree, renderer: &Renderer) {
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+    let mut operation = operation::focusable::focus::<()>(widget.id.clone().unwrap());
+    widget.operate(tree, Layout::new(&layout), renderer, &mut operation);
+}
+fn raw_letter(code: keyboard::key::Code, letter: &str, down: bool, modifiers: keyboard::Modifiers) -> Event {
+    let key = keyboard::Key::Character(letter.to_owned().into());
+    let physical_key = keyboard::key::Physical::Code(code);
+    Event::Keyboard(if down {
+        keyboard::Event::KeyPressed { key: key.clone(), modified_key: key, physical_key, location: keyboard::Location::Standard, modifiers, text: None, repeat: false }
+    } else {
+        keyboard::Event::KeyReleased { key: key.clone(), modified_key: key, physical_key, location: keyboard::Location::Standard, modifiers }
+    })
+}
+
+#[test]
+fn native_field_owns_ignored_keys_and_ime_while_original_terminal_release_stays_paired() {
+    use crate::input_trace::{InputTrace, KeyboardRegion, observe_keyboard_events};
+    use crate::workspace_widget::FocusedPane;
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    for field_first in [false, true] {
+        let peer = Peer::new();
+        let mut renderer = renderer();
+        let barrier = ReviewInputBarrier::default();
+        let trace = InputTrace::default();
+        trace.bind_terminal_keys(barrier.clone());
+        let terminal_id = Id::unique();
+        let field_id = Id::unique();
+        let mut terminal = widget(&peer, "raw-pane", barrier.clone(), true, false);
+        terminal.id = Some(terminal_id.clone());
+        terminal.on_shortcut = None;
+        let terminal: Element<'_, Message> = terminal.into();
+        let field: Element<'_, Message> = cosmic::widget::text_input("Query", "retained")
+            .id(field_id.clone()).on_input(Message::Edited).width(160.0).into();
+        let row = cosmic::widget::row::with_children(if field_first { vec![field, terminal] } else { vec![terminal, field] });
+        let element = observe_keyboard_events(row, &trace, vec![
+            (terminal_id.clone(), KeyboardRegion { pane: FocusedPane::Terminal, card: Some(crate::model::CardId::new()) }),
+            (field_id.clone(), KeyboardRegion { pane: FocusedPane::TextInput, card: None }),
+        ], |_, _, _, _| Message::Shortcut);
+        let mut ui = UserInterface::build(element, Size::new(800.0, 320.0), Cache::new(), &mut renderer);
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(terminal_id.clone()));
+        let mut messages = Vec::new();
+        let _ = ui.update(&[raw_letter(keyboard::key::Code::KeyR, "r", true, keyboard::Modifiers::empty())], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+        let requests = peer.fence();
+        let keys: Vec<_> = requests.iter().filter_map(|r| match r { ClientRequest::Key { input, .. } => Some(input), _ => None }).collect();
+        assert_eq!(keys.len(), 1, "{requests:?}");
+        assert_eq!(keys[0].action, KeyAction::Press);
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(field_id.clone()));
+        messages.clear();
+        // The stock field captures key-up. The observer must still retire the
+        // original transport lease, using the current release modifiers.
+        let _ = ui.update(&[
+            raw_letter(keyboard::key::Code::KeyR, "r", false, keyboard::Modifiers::CTRL),
+            raw_letter(keyboard::key::Code::KeyF, "f", true, keyboard::Modifiers::CTRL),
+            raw_letter(keyboard::key::Code::KeyT, "t", true, keyboard::Modifiers::CTRL),
+            raw_letter(keyboard::key::Code::KeyZ, "z", true, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+            Event::InputMethod(input_method::Event::Commit("ime".into())),
+        ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+        let requests = peer.fence();
+        let keys: Vec<_> = requests.iter().filter_map(|r| match r { ClientRequest::Key { input, .. } => Some(input), _ => None }).collect();
+        assert_eq!(keys.len(), 1, "{requests:?}");
+        assert_eq!(keys[0].action, KeyAction::Release);
+        assert_eq!(keys[0].key, TerminalKey::Character('r'));
+        assert!(keys[0].modifiers.control);
+        assert!(!requests.iter().any(|r| matches!(r, ClientRequest::Input { .. } | ClientRequest::Paste { .. })), "{requests:?}");
+        let edited: Vec<_> = messages.iter().filter_map(|m| if let Message::Edited(value) = m { Some(value) } else { None }).collect();
+        assert_eq!(edited.len(), 1, "{messages:?}");
+        assert_eq!(edited[0].matches("ime").count(), 1);
+        assert_eq!(edited[0].replacen("ime", "", 1), "retained");
+        ui.operate(&renderer, &mut operation::focusable::focus::<()>(terminal_id));
+        let _ = ui.update(&[
+            raw_letter(keyboard::key::Code::KeyR, "r", false, keyboard::Modifiers::empty()),
+            raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()),
+            raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::empty()),
+            Event::InputMethod(input_method::Event::Commit("raw-ime".into())),
+        ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let requests = peer.fence();
+        let actions: Vec<_> = requests.iter().filter_map(|r| match r { ClientRequest::Key { input, .. } => Some((input.key, input.action)), _ => None }).collect();
+        assert_eq!(actions, vec![(TerminalKey::Character('a'), KeyAction::Press), (TerminalKey::Character('a'), KeyAction::Release)], "{requests:?}");
+        assert!(requests.iter().any(|r| matches!(r, ClientRequest::Input { bytes, .. } if bytes == b"raw-ime")), "{requests:?}");
+    }
+}
+
+
+#[test]
+fn native_window_event_overrides_stale_builder_only_until_the_next_widget_diff() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "window-pane", barrier, true, false).window_focused(false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(&mut terminal, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    for down in [true, false] {
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", down, keyboard::Modifiers::empty()));
+    }
+    assert_eq!(peer.fence().iter().filter(|r| matches!(r, ClientRequest::Key { .. })).count(), 2);
+    dispatch(&mut terminal, &mut tree, &renderer, Event::Window(window::Event::Unfocused));
+    dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyB, "b", true, keyboard::Modifiers::empty()));
+    assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+    assert!(tree.state.downcast_ref::<WidgetState>().input_focused, "window blur preserves logical native focus");
+    // A parked tree can miss Window::Focused: a new authoritative view must
+    // reset the per-native-batch false observation too.
+    terminal.window_focused = true;
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    for down in [true, false] {
+        dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyC, "c", down, keyboard::Modifiers::empty()));
+    }
+    assert_eq!(peer.fence().iter().filter(|r| matches!(r, ClientRequest::Key { .. })).count(), 2);
+    // Conversely an old in-batch true observation cannot defeat a newer
+    // inactive builder after the tree was parked during blur.
+    dispatch(&mut terminal, &mut tree, &renderer, Event::Window(window::Event::Focused));
+    terminal.window_focused = false;
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyD, "d", true, keyboard::Modifiers::empty()));
+    assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+}
+
+#[test]
+fn unmounted_owned_key_waits_for_review_exit_and_releases_only_the_original_attachment() {
+    let old = Peer::new();
+    let new = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&old, "original-pane", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
+    assert_eq!(old.fence().iter().filter(|r| matches!(r, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
+    barrier.note_review(old.handle.terminal_id(), true);
+    drop(tree);
+    assert!(!barrier.flush_owned_keys(), "Review suppresses original cleanup input");
+    assert!(!old.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+    let up = raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
+    let Event::Keyboard(up) = up else { unreachable!() };
+    barrier.observe_key_event(&up);
+    barrier.note_review(old.handle.terminal_id(), false);
+    assert!(!barrier.flush_owned_keys());
+    let requests = old.fence();
+    let keys: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
+    assert_eq!(keys.len(), 1, "{requests:?}");
+    assert_eq!(keys[0].key, TerminalKey::Character('a'));
+    assert_eq!(keys[0].action, KeyAction::Release);
+    assert!(keys[0].modifiers.control && keys[0].modifiers.shift);
+    assert!(!barrier.flush_owned_keys());
+    assert!(!old.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+    assert!(!new.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })), "cleanup cannot retarget another attachment");
 }
