@@ -12613,18 +12613,22 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
-                while let Some(action) = stream.next().await {
-                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                        message @ Message::ChatUi(
-                            Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
-                        ),
-                    )) = action
-                    {
-                        return message;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::ChatUi(
+                                Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                            ),
+                        )) = action
+                        {
+                            return message;
+                        }
                     }
-                }
-                panic!("account commit produced no acknowledgment");
+                    panic!("account commit produced no acknowledgment");
+                })
+                .await
+                .expect("session writer did not acknowledge the exact transition within 10 seconds")
             })
     }
 
@@ -15234,7 +15238,14 @@ mod tests {
 
     #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for (stale_reply, codex_resume, legacy_paired, learns_identity, paired_recipe, writer_refused) in [
+        for (
+            stale_reply,
+            codex_resume,
+            legacy_paired,
+            learns_identity,
+            paired_recipe,
+            writer_refused,
+        ) in [
             (false, false, false, false, 0, false),
             (true, false, false, false, 0, false),
             (false, true, false, false, 0, false),
@@ -15294,9 +15305,14 @@ mod tests {
                     // The daemon owns no private listener for this pairing.
                     source.reset_owned_codex_listener();
                     source.launch.recipe.arguments = vec![
-                        "--remote".into(), "unix:///run/test-paired-codex.sock".into(),
+                        "--remote".into(),
+                        "unix:///run/test-paired-codex.sock".into(),
                     ];
-                    source.launch.recipe.environment.insert("CODEX_HOME".into(), "/private/test-codex-home".into());
+                    source
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/private/test-codex-home".into());
                     let mut issued = source.launch.recipe.clone();
                     if paired_recipe == 2 {
                         issued.program = "/bin/bash".into();
@@ -15322,7 +15338,12 @@ mod tests {
                 .flush(Duration::from_secs(10))
                 .unwrap();
             if writer_refused {
-                app.session.as_ref().unwrap().operation_store().shutdown().unwrap();
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .shutdown()
+                    .unwrap();
             }
             let mut replacement = source.clone();
             if learns_identity {
@@ -15394,15 +15415,27 @@ mod tests {
                         if reason == &crate::persistence::StoreError::Closed.to_string()));
                 let _ = app.update(receipt);
                 assert!(!app.chat_start_pending(card));
-                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source.clone()));
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(source.clone())
+                );
                 assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
                 let database = rusqlite::Connection::open_with_flags(
-                    directory.path().join("state.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                ).unwrap();
-                let stored: String = database.query_row(
-                    "SELECT content_json FROM cards WHERE card_id=?1", [card.to_string()], |row| row.get(0),
-                ).unwrap();
-                assert_eq!(serde_json::from_str::<chat::Session>(&stored).unwrap(), source);
+                    directory.path().join("state.sqlite3"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let stored: String = database
+                    .query_row(
+                        "SELECT content_json FROM cards WHERE card_id=?1",
+                        [card.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<chat::Session>(&stored).unwrap(),
+                    source
+                );
                 continue;
             }
             assert!(matches!(

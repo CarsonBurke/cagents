@@ -632,9 +632,12 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
             ..Default::default()
         },
         |_| {},
-    ).unwrap_err();
-    assert!(refused.to_string().contains("retained holder context"),
-        "public configuration cannot supply a separate execution recipe");
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("retained holder context"),
+        "public configuration cannot supply a separate execution recipe"
+    );
     let mut handle = TerminalHandle::spawn_with_execution(
         issued.clone(),
         TerminalConfig {

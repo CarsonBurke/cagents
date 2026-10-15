@@ -730,7 +730,14 @@ impl TerminalHandle {
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(session, config, execution_recipe, command_rx, event_tx, worker_published);
+                let result = Worker::start(
+                    session,
+                    config,
+                    execution_recipe,
+                    command_rx,
+                    event_tx,
+                    worker_published,
+                );
                 match result {
                     Ok(worker) => {
                         let _ = startup_tx.send(Ok(()));
@@ -1528,9 +1535,11 @@ impl Worker {
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
     ) -> Result<Self, String> {
-        if config.holder_recovery.as_ref().is_some_and(|recovery| {
-            recovery.execution_recipe.as_ref() != execution_recipe.as_ref()
-        }) {
+        if config
+            .holder_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.execution_recipe.as_ref() != execution_recipe.as_ref())
+        {
             return Err("Terminal execution does not match its retained holder context".into());
         }
         let current_size = TerminalSize {

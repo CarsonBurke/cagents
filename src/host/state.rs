@@ -3723,9 +3723,14 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
-    let handle = match TerminalHandle::spawn_with_execution(session.clone(), config, execution_recipe.clone(), move |wake| {
-        broadcast_redraw(&weak, terminal_id, wake.generation);
-    }) {
+    let handle = match TerminalHandle::spawn_with_execution(
+        session.clone(),
+        config,
+        execution_recipe.clone(),
+        move |wake| {
+            broadcast_redraw(&weak, terminal_id, wake.generation);
+        },
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             shared
