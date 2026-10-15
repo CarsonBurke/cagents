@@ -1311,6 +1311,7 @@ mod tests {
                 state: crate::github::RemoteValue("APPROVED".into()),
             }],
             truncated: false,
+            threads_truncated: false,
         };
         assert_eq!(discussion_count(&conversation, "", false), 4);
         // Hiding resolved threads drops the settled one and nothing else.
