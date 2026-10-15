@@ -111,7 +111,14 @@ impl Choices {
                 return Err("Git returned an invalid branch list".into());
             };
             if !symbolic.is_empty() {
-                if *reference == "refs/remotes/origin/HEAD" || choices.default_base.is_empty() {
+                // A local symbolic branch is an alias, not the remote's
+                // advertised default. It must not outrank a later remote HEAD.
+                if reference.starts_with("refs/remotes/")
+                    && reference.ends_with("/HEAD")
+                    && symbolic.starts_with("refs/remotes/")
+                    && (*reference == "refs/remotes/origin/HEAD"
+                        || choices.default_base.is_empty())
+                {
                     choices.default_base = symbolic.to_string();
                 }
                 continue;
@@ -154,7 +161,7 @@ impl Choices {
             });
         }
         if !choices.refs.iter().any(|choice| {
-            choice.name == choices.default_base || choice.reference == choices.default_base
+            choice.kind == Kind::Remote && choice.reference == choices.default_base
         }) {
             choices.default_base.clear();
         }
@@ -420,6 +427,30 @@ mod tests {
             "refs/remotes/origin/main"
         );
     }
+    #[test]
+    fn symbolic_local_alias_does_not_override_a_remote_default() {
+        let old = "a".repeat(40);
+        let current = "b".repeat(40);
+        let listing = format!(
+            "refs/heads/alias\0{old}\0\0refs/heads/main\0 \n\
+             refs/heads/main\0{old}\0[behind 1]\0\0*\n\
+             refs/remotes/upstream/HEAD\0{current}\0\0refs/remotes/upstream/main\0 \n\
+             refs/remotes/upstream/main\0{current}\0\0\0 \n"
+        );
+        let choices = Choices::parse(listing.as_bytes()).unwrap();
+        assert_eq!(choices.default_base, "refs/remotes/upstream/main");
+        assert_eq!(
+            choices.creation_base("new", "", None),
+            "refs/remotes/upstream/main"
+        );
+        assert_eq!(choices.find(&choices.default_base).unwrap().oid, current);
+        assert_eq!(
+            choices.outcome("new", ""),
+            "New branch new from upstream/main"
+        );
+        assert_eq!(choices.find("refs/heads/main").unwrap().oid, old);
+    }
+
     #[test]
     fn selected_local_identity_wins_over_a_matching_remote_display_name() {
         let mut choices = choices();
