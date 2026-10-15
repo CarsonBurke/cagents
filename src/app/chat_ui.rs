@@ -7388,6 +7388,14 @@ impl Cagents {
                     {
                         handle.take_account_usage();
                     }
+                    if matches!(wake, Wake::Activity)
+                        && let Some(handle) = self.chat_runtime_mut(target).and_then(|runtime| runtime.handle())
+                    {
+                        // A refused account handoff can preserve this exact
+                        // attachment. Release its coalesced edge so future
+                        // activity changes can still wake the waiting choice.
+                        handle.take_activity();
+                    }
                     return Task::none();
                 }
                 // Before the runtime is borrowed, as the account it reports
@@ -7399,6 +7407,13 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
+                    if matches!(wake, Wake::Activity)
+                        && let Some(handle) = runtime.handle()
+                    {
+                        // The current state remains available to the cheap
+                        // readiness hint; only the delivered edge is consumed.
+                        handle.take_activity();
+                    }
                     let name = match runtime.handle() {
                         Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
                             snapshot_channel_name(&handle.snapshot())
@@ -12353,7 +12368,8 @@ mod tests {
         use crate::agent::ActivityState;
         use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
         use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
-        for parked in [false, true] {
+        for mode in ["hidden", "parked", "starting"] {
+            let parked = mode == "parked";
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 450);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -12371,7 +12387,7 @@ mod tests {
             assert!(initial.transcript_bytes() > 0);
             let attached_snapshot = initial.clone();
             let (client, mut server) = UnixStream::pair().unwrap();
-            let (emit_tx, emit_rx) = mpsc::channel();
+            let (emit_tx, emit_rx) = mpsc::channel::<(ActivityState, u64)>();
             let (done_tx, done_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
                 server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -12390,9 +12406,11 @@ mod tests {
                     request_id: Some(start.request_id), proof: proof.clone(),
                     message: ServerMessage::Response { response: ServerResponse::ChatAttached {
                         session, snapshot: attached_snapshot, account_home: None } } }).unwrap();
-                emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof,
-                    message: ServerMessage::ChatActivity { chat_id, state: ActivityState::Idle, generation: 2 } }).unwrap();
+                for _ in 0..2 {
+                    let (state, generation) = emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
+                        message: ServerMessage::ChatActivity { chat_id, state, generation } }).unwrap();
+                }
                 done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             let (wake_tx, wake_rx) = mpsc::channel();
@@ -12411,19 +12429,38 @@ mod tests {
                 let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
                 app.chat_ui.parked.insert(card, runtime);
             }
-            emit_tx.send(()).unwrap();
+            if mode == "starting" {
+                app.chat_ui.phases.insert(card, Phase::Starting(Attempt {
+                    target: Target { generation: target.generation.wrapping_add(1), ..target },
+                    session: source.clone(), recovery: None, upgrade_committed: false,
+                }));
+            }
+            // A parked surface must consume this earlier coalesced edge;
+            // otherwise the subsequent Idle frame cannot wake it at all.
+            emit_tx.send((ActivityState::Waiting, 2)).unwrap();
+            let waiting = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(waiting, Wake::Activity));
+            drop(app.handle_chat_ui(Action::Wake(target, waiting)));
+            assert_eq!(handle.account_switch_idle_observation(), None);
+            assert!(!app.chat_runtime_mut(target).unwrap().account_switch_recheck);
+            if mode == "starting" {
+                // The admission window ends while preserving the old reader;
+                // its next real activity frame still needs a notification.
+                app.chat_ui.phases.remove(&card);
+            }
+            emit_tx.send((ActivityState::Idle, 3)).unwrap();
             let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(wake, Wake::Activity));
             assert!(handle.snapshot().busy, "hidden activity never refreshed the old body snapshot");
             assert_eq!(handle.snapshot().generation, 1);
             assert_eq!(handle.snapshot().transcript_bytes(), 0);
-            assert_eq!(handle.account_switch_idle_observation(), Some(2));
+            assert_eq!(handle.account_switch_idle_observation(), Some(3));
             drop(app.handle_chat_ui(Action::Wake(target, wake)));
             drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(runtime.account_switch_checking, "one newer hidden idle edge schedules one new read");
             assert!(!runtime.account_switch_recheck);
-            assert_eq!(runtime.account_switch_checked_idle, Some(2));
+            assert_eq!(runtime.account_switch_checked_idle, Some(3));
             assert_eq!(runtime.session, source);
             assert_eq!(runtime.composer.text(), "Preserve hidden request");
             assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
