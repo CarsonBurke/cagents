@@ -35,3 +35,29 @@ pub(super) fn execute(host: &SharedHost, request: Request) -> Result<Report, Str
     let root = crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("account-reset-attempts"));
     controller::execute(&handle, request, root.as_deref(), expires, current)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{account::reset::{ProviderAccount, request::Action}, model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalId}};
+    use std::sync::{Arc,Mutex};
+    #[test]
+    fn missing_target_unauthorized_reset_and_shutdown_never_create_a_replacement_source() {
+        let host=Arc::new(Mutex::new(super::super::state::HostState::new(HostSessionProof {
+            host_session_id:HostSessionId::new("private-allowance-test"),
+            boot_id:BootId::new("private-boot"),host_incarnation:HostIncarnation::new("private-incarnation")})));
+        let session=TerminalId::new();
+        let error=execute(&host,Request {session,action:Action::Inspect}).unwrap_err();
+        assert!(error.contains("not an existing live native conversation"));
+        let error=execute(&host,Request {session,action:Action::Redeem {
+            expected:ProviderAccount {account_id:"private-account".into(),backend_origin:"https://chatgpt.com".into()},
+            credit_id:"private-credit".into(),authorized:false,condition:None}}).unwrap_err();
+        assert!(error.contains("explicit --authorize"));
+        host.lock().unwrap().shutting_down=true;
+        let error=execute(&host,Request {session,action:Action::Inspect}).unwrap_err();
+        assert!(error.contains("shutting down"));
+        let state=host.lock().unwrap();
+        assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty() && state.spawning.is_empty());
+        assert!(state.chat_handoffs.is_empty());
+    }
+}
