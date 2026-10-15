@@ -59,14 +59,25 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
         let mut anchored = false;
         let mut index = 0;
         while index < scoped.arguments.len() {
-            if scoped.arguments[index] == "-C" {
-                let Some(path) = scoped.arguments.get_mut(index + 1) else { return Err(refuse("Missing worktree argument".into())); };
-                if Path::new(path.as_os_str()) != self.authority.path() { return Err(refuse("The command no longer names the captured worktree".into())); }
-                *path = self.authority.anchored_path().into_os_string();
-                anchored = true;
-                index += 1;
+            let argument = scoped.arguments[index].to_string_lossy();
+            if argument == "--" || !argument.starts_with('-') { break; }
+            match argument.as_ref() {
+                "-C" => {
+                    let Some(path) = scoped.arguments.get_mut(index + 1) else { return Err(refuse("Missing worktree argument".into())); };
+                    if Path::new(path.as_os_str()) != self.authority.path() { return Err(refuse("The command no longer names the captured worktree".into())); }
+                    *path = self.authority.anchored_path().into_os_string();
+                    anchored = true;
+                    index += 2;
+                }
+                // Values may themselves be '-C'. They are not global options.
+                "-c" | "--config-env" => {
+                    if index + 1 >= scoped.arguments.len() { return Err(refuse("Missing Git configuration argument".into())); }
+                    index += 2;
+                }
+                "--git-dir" | "--work-tree" => return Err(refuse("A captured worktree cannot be overridden by another Git scope".into())),
+                value if value.starts_with("--git-dir=") || value.starts_with("--work-tree=") => return Err(refuse("A captured worktree cannot be overridden by another Git scope".into())),
+                _ => index += 1,
             }
-            index += 1;
         }
         if let Some(path) = scoped.current_dir.as_mut() {
             if path.as_path() != self.authority.path() { return Err(refuse("The command no longer names the captured worktree".into())); }
