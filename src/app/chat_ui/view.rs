@@ -1,5 +1,6 @@
 use super::coordination::Coordinated;
 use super::*;
+use crate::workspace_widget::GlobalShortcut as RegisteredAction;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -1150,11 +1151,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
-        let available = !transitioning
-            && !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none();
+        let available = self.command_controls_available(transitioning);
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
@@ -1479,7 +1476,7 @@ impl Runtime {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))
                     .class(crate::ui_controls::control_style(true, None))
-                    .on_press_maybe((!self.disconnected).then(|| action(Action::Latest(target))))
+                    .on_press_maybe(self.registered_chat_request(RegisteredAction::ChatLatest, transitioning, false).and_then(|request| request.action()).map(action))
                     .into(),
             );
         }
@@ -1808,11 +1805,7 @@ impl Runtime {
             .height(Length::Fill)
             .into(),
         ];
-        let has_text = self
-            .composer
-            .lines()
-            .any(|line| !line.text.trim().is_empty());
-        let has_draft = has_text || !self.attachments.is_empty();
+        let has_draft = self.composer_has_draft();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
         let modes: &[PromptMode] = if snapshot.busy {
@@ -1921,6 +1914,7 @@ impl Runtime {
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
+                    if !matches!(press.status, text_editor::Status::Focused { .. }) { return None; }
                     if press.modifiers.command()
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
                     {
@@ -2012,7 +2006,6 @@ impl Runtime {
         }
         if !snapshot.capabilities.interrupt_modes.is_empty() {
             let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
-            let next = if mode == "wait" { "immediate" } else { "wait" };
             actions.push(
                 crate::ui_controls::icon_button(
                     Icon::Jump,
@@ -2022,12 +2015,7 @@ impl Runtime {
                         "Steering: after tools"
                     },
                 )
-                .on_press_maybe(available.then(|| {
-                    action(Action::Command(
-                        target,
-                        Command::SetInterruptMode { mode: next.into() },
-                    ))
-                }))
+                .on_press_maybe(self.registered_chat_request(RegisteredAction::ChatToggleSteering, transitioning, false).and_then(|request| request.action()).map(action))
                 .into(),
             );
         }
@@ -2035,7 +2023,7 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                self.registered_chat_request(RegisteredAction::ChatAttach, transitioning, false).is_some(),
                 Action::Attach(target),
             ));
         }
@@ -2093,7 +2081,7 @@ impl Runtime {
                         design::muted_icon_color
                     }))
                     .on_press_maybe(
-                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                        self.registered_chat_request(match mode { PromptMode::Send => RegisteredAction::ChatSend, PromptMode::Steer => RegisteredAction::ChatSteer, PromptMode::Queue => RegisteredAction::ChatQueue }, transitioning, has_draft).and_then(|request| request.action()).map(action),
                     )
                     .into(),
             );
@@ -2591,7 +2579,7 @@ impl Runtime {
                             )
                             .width(Length::Fill)
                             .on_press_maybe(
-                                enabled.then(|| action(Action::Command(target, Command::Compact))),
+                                self.registered_chat_request(RegisteredAction::ChatCompact, !available, false).and_then(|request| request.action()).map(action),
                             )
                             .into(),
                     );
@@ -3026,28 +3014,13 @@ impl Runtime {
         let Some(mode) = &self.snapshot.fast_mode else {
             return Some(models);
         };
-        let available = !self.disconnected
-            && !self.snapshot.exited
-            && self.pending.is_none()
-            && self.queued.is_none()
-            && self.snapshot.ready
-            && self.snapshot.capabilities.fast_mode
-            && self.snapshot.read_only_reason.is_none()
-            && mode.changeable();
         let label = match mode.state {
             crate::chat::FastModeState::Off => "Fast mode: off",
             crate::chat::FastModeState::On => "Fast mode: on",
             crate::chat::FastModeState::Cooldown => "Fast mode: cooldown",
         };
         let control = crate::interaction::tooltip(
-            crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
-                action(Action::Command(
-                    self.target,
-                    Command::SetFastMode {
-                        enabled: !mode.enabled(),
-                    },
-                ))
-            })),
+            crate::ui_controls::button::quiet(label).on_press_maybe(self.registered_chat_request(RegisteredAction::ChatToggleFastMode, false, false).and_then(|request| request.action()).map(action)),
             fast_mode_tooltip(mode),
         );
         Some(
@@ -6969,6 +6942,44 @@ mod tests {
         let mut unfocused = key(Named::ArrowUp, Modifiers::empty());
         unfocused.status = text_editor::Status::Active;
         assert!(!queue_key(&unfocused, true));
+    }
+
+    #[test]
+    fn mounted_chat_composers_dispatch_only_the_actual_keyboard_focus_owner() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use iced::keyboard::{Key, key::{Code, Physical, Named}};
+        let (mut first, _first_handle) = frame_cost::live_runtime(&[]);
+        let (mut second, _second_handle) = frame_cost::live_runtime(&[]);
+        first.replace_draft(text_editor::Content::with_text("first draft"));
+        second.replace_draft(text_editor::Content::with_text("second draft"));
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        fn pane<'a>(runtime: &'a Runtime, shortcuts: &'a crate::settings::KeyboardShortcuts) -> Element<'a, Message> { runtime.view(None, false, false, shortcuts, 400.0, Place { channel: None, name: "Fixture".into(), branch: None }, true, None, vec![]) }
+        let sidebar = widget::Id::new("chat.registry.sidebar");
+        let mut element: Element<'_, Message> = widget::row::with_children(vec![
+            widget::container(pane(&first, &shortcuts)).width(400).height(600).into(),
+            widget::container(pane(&second, &shortcuts)).width(400).height(600).into(),
+            widget::text_input("Sidebar", "query").id(sidebar.clone()).on_input(|_| Message::ChatUi(Action::CopyLiteral(String::new()))).width(240).into(),
+        ]).into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1100.0, 620.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+        for (target, expected) in [(sidebar, None), (card_control_id(first.target.card, "chat-composer"), Some(first.target)), (card_control_id(second.target.card, "chat-composer"), Some(second.target))] {
+            let mut focus = iced::advanced::widget::operation::focusable::focus::<()>(target);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            for (key, code, latest) in [(Named::End, Code::End, true), (Named::Enter, Code::Enter, false)] {
+                let event = iced::Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(key), modified_key: Key::Named(key), physical_key: Physical::Code(code), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false });
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                let actions: Vec<_> = messages.iter().filter_map(|message| match message {
+                    Message::ChatUi(Action::Latest(target)) if latest => Some(*target),
+                    Message::ChatUi(Action::Submit(target, PromptMode::Send)) if !latest => Some(*target),
+                    _ => None,
+                }).collect();
+                assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
+                assert_eq!(messages.len(), actions.len(), "inactive composers and sidebar fields must not publish another chat action");
+            }
+        }
     }
 
     fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {

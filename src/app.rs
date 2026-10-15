@@ -2939,11 +2939,23 @@ pub enum SettingsField {
     ShortcutBrowserAddress,
     ShortcutBrowserOpenSystem,
     ShortcutBrowserImportLogins,
+    ShortcutChatSend,
+    ShortcutChatSteer,
+    ShortcutChatQueue,
+    ShortcutChatInterrupt,
+    ShortcutChatCompact,
+    ShortcutChatAttach,
+    ShortcutChatReasoning,
+    ShortcutChatLatest,
+    ShortcutChatTakeBackQueued,
+    ShortcutChatCancelQueued,
+    ShortcutChatToggleSteering,
+    ShortcutChatToggleFastMode,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 181] = [
+    const SHORTCUTS: [Self; 193] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3125,6 +3137,18 @@ impl SettingsField {
         Self::ShortcutBrowserAddress,
         Self::ShortcutBrowserOpenSystem,
         Self::ShortcutBrowserImportLogins,
+        Self::ShortcutChatSend,
+        Self::ShortcutChatSteer,
+        Self::ShortcutChatQueue,
+        Self::ShortcutChatInterrupt,
+        Self::ShortcutChatCompact,
+        Self::ShortcutChatAttach,
+        Self::ShortcutChatReasoning,
+        Self::ShortcutChatLatest,
+        Self::ShortcutChatTakeBackQueued,
+        Self::ShortcutChatCancelQueued,
+        Self::ShortcutChatToggleSteering,
+        Self::ShortcutChatToggleFastMode,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3315,6 +3339,18 @@ impl SettingsField {
             Self::ShortcutBrowserAddress => "Focus browser address",
             Self::ShortcutBrowserOpenSystem => "Open page in system browser",
             Self::ShortcutBrowserImportLogins => "Import browser logins",
+            Self::ShortcutChatSend => "Send chat message",
+            Self::ShortcutChatSteer => "Steer active chat turn",
+            Self::ShortcutChatQueue => "Queue chat message",
+            Self::ShortcutChatInterrupt => "Interrupt active chat turn",
+            Self::ShortcutChatCompact => "Compact conversation",
+            Self::ShortcutChatAttach => "Attach files to chat",
+            Self::ShortcutChatReasoning => "Choose chat reasoning effort",
+            Self::ShortcutChatLatest => "Jump to latest chat activity",
+            Self::ShortcutChatTakeBackQueued => "Take back newest queued message",
+            Self::ShortcutChatCancelQueued => "Take back pending first message",
+            Self::ShortcutChatToggleSteering => "Toggle chat steering timing",
+            Self::ShortcutChatToggleFastMode => "Toggle chat fast mode",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3559,6 +3595,18 @@ impl SettingsField {
             | Self::ShortcutBrowserAddress
             | Self::ShortcutBrowserOpenSystem
             | Self::ShortcutBrowserImportLogins
+            | Self::ShortcutChatSend
+            | Self::ShortcutChatSteer
+            | Self::ShortcutChatQueue
+            | Self::ShortcutChatInterrupt
+            | Self::ShortcutChatCompact
+            | Self::ShortcutChatAttach
+            | Self::ShortcutChatReasoning
+            | Self::ShortcutChatLatest
+            | Self::ShortcutChatTakeBackQueued
+            | Self::ShortcutChatCancelQueued
+            | Self::ShortcutChatToggleSteering
+            | Self::ShortcutChatToggleFastMode
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3767,6 +3815,18 @@ struct ShortcutDraft {
     browser_address: String,
     browser_open_system: String,
     browser_import_logins: String,
+    chat_send: String,
+    chat_steer: String,
+    chat_queue: String,
+    chat_interrupt: String,
+    chat_compact: String,
+    chat_attach: String,
+    chat_reasoning: String,
+    chat_latest: String,
+    chat_take_back_queued: String,
+    chat_cancel_queued: String,
+    chat_toggle_steering: String,
+    chat_toggle_fast_mode: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -3964,6 +4024,18 @@ impl ShortcutDraft {
             browser_address: settings::format_chords(&shortcuts.browser_address),
             browser_open_system: settings::format_chords(&shortcuts.browser_open_system),
             browser_import_logins: settings::format_chords(&shortcuts.browser_import_logins),
+            chat_send: settings::format_chords(&shortcuts.chat_send),
+            chat_steer: settings::format_chords(&shortcuts.chat_steer),
+            chat_queue: settings::format_chords(&shortcuts.chat_queue),
+            chat_interrupt: settings::format_chords(&shortcuts.chat_interrupt),
+            chat_compact: settings::format_chords(&shortcuts.chat_compact),
+            chat_attach: settings::format_chords(&shortcuts.chat_attach),
+            chat_reasoning: settings::format_chords(&shortcuts.chat_reasoning),
+            chat_latest: settings::format_chords(&shortcuts.chat_latest),
+            chat_take_back_queued: settings::format_chords(&shortcuts.chat_take_back_queued),
+            chat_cancel_queued: settings::format_chords(&shortcuts.chat_cancel_queued),
+            chat_toggle_steering: settings::format_chords(&shortcuts.chat_toggle_steering),
+            chat_toggle_fast_mode: settings::format_chords(&shortcuts.chat_toggle_fast_mode),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4442,6 +4514,18 @@ impl SettingsDraft {
             SettingsField::ShortcutBrowserAddress => self.keyboard_shortcuts.browser_address = value,
             SettingsField::ShortcutBrowserOpenSystem => self.keyboard_shortcuts.browser_open_system = value,
             SettingsField::ShortcutBrowserImportLogins => self.keyboard_shortcuts.browser_import_logins = value,
+            SettingsField::ShortcutChatSend => self.keyboard_shortcuts.chat_send = value,
+            SettingsField::ShortcutChatSteer => self.keyboard_shortcuts.chat_steer = value,
+            SettingsField::ShortcutChatQueue => self.keyboard_shortcuts.chat_queue = value,
+            SettingsField::ShortcutChatInterrupt => self.keyboard_shortcuts.chat_interrupt = value,
+            SettingsField::ShortcutChatCompact => self.keyboard_shortcuts.chat_compact = value,
+            SettingsField::ShortcutChatAttach => self.keyboard_shortcuts.chat_attach = value,
+            SettingsField::ShortcutChatReasoning => self.keyboard_shortcuts.chat_reasoning = value,
+            SettingsField::ShortcutChatLatest => self.keyboard_shortcuts.chat_latest = value,
+            SettingsField::ShortcutChatTakeBackQueued => self.keyboard_shortcuts.chat_take_back_queued = value,
+            SettingsField::ShortcutChatCancelQueued => self.keyboard_shortcuts.chat_cancel_queued = value,
+            SettingsField::ShortcutChatToggleSteering => self.keyboard_shortcuts.chat_toggle_steering = value,
+            SettingsField::ShortcutChatToggleFastMode => self.keyboard_shortcuts.chat_toggle_fast_mode = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5031,6 +5115,18 @@ fn settings_update(
         SettingsField::ShortcutBrowserAddress => { next.keyboard_shortcuts.browser_address = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutBrowserOpenSystem => { next.keyboard_shortcuts.browser_open_system = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutBrowserImportLogins => { next.keyboard_shortcuts.browser_import_logins = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatSend => { next.keyboard_shortcuts.chat_send = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatSteer => { next.keyboard_shortcuts.chat_steer = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatQueue => { next.keyboard_shortcuts.chat_queue = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatInterrupt => { next.keyboard_shortcuts.chat_interrupt = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatCompact => { next.keyboard_shortcuts.chat_compact = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatAttach => { next.keyboard_shortcuts.chat_attach = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatReasoning => { next.keyboard_shortcuts.chat_reasoning = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatLatest => { next.keyboard_shortcuts.chat_latest = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatTakeBackQueued => { next.keyboard_shortcuts.chat_take_back_queued = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatCancelQueued => { next.keyboard_shortcuts.chat_cancel_queued = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatToggleSteering => { next.keyboard_shortcuts.chat_toggle_steering = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutChatToggleFastMode => { next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

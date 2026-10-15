@@ -201,6 +201,18 @@ pub enum GlobalShortcut {
     BrowserAddress,
     BrowserOpenSystem,
     BrowserImportLogins,
+    ChatSend,
+    ChatSteer,
+    ChatQueue,
+    ChatInterrupt,
+    ChatCompact,
+    ChatAttach,
+    ChatReasoning,
+    ChatLatest,
+    ChatTakeBackQueued,
+    ChatCancelQueued,
+    ChatToggleSteering,
+    ChatToggleFastMode,
 
     CommandPalette,
     NewThread,
@@ -494,6 +506,18 @@ impl GlobalShortcut {
             Self::BrowserAddress => "browser_address",
             Self::BrowserOpenSystem => "browser_open_system",
             Self::BrowserImportLogins => "browser_import_logins",
+            Self::ChatSend => "chat_send",
+            Self::ChatSteer => "chat_steer",
+            Self::ChatQueue => "chat_queue",
+            Self::ChatInterrupt => "chat_interrupt",
+            Self::ChatCompact => "chat_compact",
+            Self::ChatAttach => "chat_attach",
+            Self::ChatReasoning => "chat_reasoning",
+            Self::ChatLatest => "chat_latest",
+            Self::ChatTakeBackQueued => "chat_take_back_queued",
+            Self::ChatCancelQueued => "chat_cancel_queued",
+            Self::ChatToggleSteering => "chat_toggle_steering",
+            Self::ChatToggleFastMode => "chat_toggle_fast_mode",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -696,6 +720,7 @@ pub struct CommandContext {
     pub diff_hunk_commands: u8,
     pub pdf_commands: u8,
     pub browser_commands: u8,
+    pub chat_user_commands: u16,
     pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
     pub diff_commands: u8,
@@ -816,6 +841,7 @@ impl ShortcutDescriptor {
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
+        if let Some(bit) = chat_user_command_bit(self.action) { return context.chat_user_commands & bit != 0; }
         if let Some(bit) = browser_command_bit(self.action) { return context.browser_commands & bit != 0; }
         if let Some(bit) = pdf_command_bit(self.action) {
             return context.pdf_commands & bit != 0;
@@ -1857,6 +1883,18 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::BrowserAddress, label: "Focus browser address", repeatable: false, scope: ShortcutScope::Browser },
     ShortcutDescriptor { action: GlobalShortcut::BrowserOpenSystem, label: "Open page in system browser", repeatable: false, scope: ShortcutScope::Browser },
     ShortcutDescriptor { action: GlobalShortcut::BrowserImportLogins, label: "Import browser logins", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::ChatSend, label: "Send chat message", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatSteer, label: "Steer active chat turn", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatQueue, label: "Queue chat message", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatInterrupt, label: "Interrupt active chat turn", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatCompact, label: "Compact conversation", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatAttach, label: "Attach files to chat", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatReasoning, label: "Choose chat reasoning effort", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatLatest, label: "Jump to latest chat activity", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatTakeBackQueued, label: "Take back newest queued message", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatCancelQueued, label: "Take back pending first message", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatToggleSteering, label: "Toggle chat steering timing", repeatable: false, scope: ShortcutScope::Chat },
+    ShortcutDescriptor { action: GlobalShortcut::ChatToggleFastMode, label: "Toggle chat fast mode", repeatable: false, scope: ShortcutScope::Chat },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -2023,6 +2061,18 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::BrowserAddress => &shortcuts.browser_address,
         GlobalShortcut::BrowserOpenSystem => &shortcuts.browser_open_system,
         GlobalShortcut::BrowserImportLogins => &shortcuts.browser_import_logins,
+        GlobalShortcut::ChatSend => &shortcuts.chat_send,
+        GlobalShortcut::ChatSteer => &shortcuts.chat_steer,
+        GlobalShortcut::ChatQueue => &shortcuts.chat_queue,
+        GlobalShortcut::ChatInterrupt => &shortcuts.chat_interrupt,
+        GlobalShortcut::ChatCompact => &shortcuts.chat_compact,
+        GlobalShortcut::ChatAttach => &shortcuts.chat_attach,
+        GlobalShortcut::ChatReasoning => &shortcuts.chat_reasoning,
+        GlobalShortcut::ChatLatest => &shortcuts.chat_latest,
+        GlobalShortcut::ChatTakeBackQueued => &shortcuts.chat_take_back_queued,
+        GlobalShortcut::ChatCancelQueued => &shortcuts.chat_cancel_queued,
+        GlobalShortcut::ChatToggleSteering => &shortcuts.chat_toggle_steering,
+        GlobalShortcut::ChatToggleFastMode => &shortcuts.chat_toggle_fast_mode,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2671,6 +2721,19 @@ pub const fn diff_mutation_registry_command(kind: crate::git_patch::Kind, select
         (crate::git_patch::Kind::Stage, false) => GlobalShortcut::DiffStageHunk,
         (crate::git_patch::Kind::Unstage, false) => GlobalShortcut::DiffUnstageHunk,
         (crate::git_patch::Kind::Revert, false) => GlobalShortcut::DiffRevertHunk,
+    }
+}
+
+pub const CHAT_USER_COMMANDS: [GlobalShortcut; 12] = [GlobalShortcut::ChatSend, GlobalShortcut::ChatSteer, GlobalShortcut::ChatQueue, GlobalShortcut::ChatInterrupt, GlobalShortcut::ChatCompact, GlobalShortcut::ChatAttach, GlobalShortcut::ChatReasoning, GlobalShortcut::ChatLatest, GlobalShortcut::ChatTakeBackQueued, GlobalShortcut::ChatCancelQueued, GlobalShortcut::ChatToggleSteering, GlobalShortcut::ChatToggleFastMode];
+pub const fn chat_user_command_bit(command: GlobalShortcut) -> Option<u16> {
+    match command {
+        GlobalShortcut::ChatSend => Some(1 << 0), GlobalShortcut::ChatSteer => Some(1 << 1),
+        GlobalShortcut::ChatQueue => Some(1 << 2), GlobalShortcut::ChatInterrupt => Some(1 << 3),
+        GlobalShortcut::ChatCompact => Some(1 << 4), GlobalShortcut::ChatAttach => Some(1 << 5),
+        GlobalShortcut::ChatReasoning => Some(1 << 6), GlobalShortcut::ChatLatest => Some(1 << 7),
+        GlobalShortcut::ChatTakeBackQueued => Some(1 << 8), GlobalShortcut::ChatCancelQueued => Some(1 << 9),
+        GlobalShortcut::ChatToggleSteering => Some(1 << 10), GlobalShortcut::ChatToggleFastMode => Some(1 << 11),
+        _ => None,
     }
 }
 

@@ -14,6 +14,8 @@ use std::sync::{
 };
 
 mod auth_recovery;
+mod commands;
+pub(in crate::app) use commands::RegisteredChatCommand;
 mod changes;
 mod clipboard_image;
 mod completion;

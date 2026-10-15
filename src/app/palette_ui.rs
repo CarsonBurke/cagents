@@ -33,6 +33,7 @@ pub enum Action {
     ClosePane(CardId),
     MovePane(CardId),
     RunDiffMutation(Command, Box<RepositoryAction>),
+    RunChatUser(chat_ui::RegisteredChatCommand),
     RunGitStash(
         sidebar::git_commands::GitTarget,
         Command,
@@ -85,6 +86,7 @@ fn entry_category(message: &Message) -> char {
 
 fn entry_key(message: &Message) -> String {
     match message {
+        Message::Palette(Action::RunChatUser(request)) => format!("command:{}", request.command.id()),
         Message::RunCommand(command) | Message::Palette(Action::RunDiffMutation(command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::RunGitStash(_, command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::MovePaneToChannel(_, _)) => {
@@ -110,6 +112,7 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
+        (Message::Palette(Action::RunChatUser(left)), Message::Palette(Action::RunChatUser(right))) => left == right,
         (Message::RunCommand(left), Message::RunCommand(right)) => left == right,
         (Message::Palette(Action::RunDiffMutation(lc, la)), Message::Palette(Action::RunDiffMutation(rc, ra))) => lc == rc && match (la.as_ref(), ra.as_ref()) {
             (RepositoryAction::ApplyDiffHunk { card: left, kind: lk, request: lr }, RepositoryAction::ApplyDiffHunk { card: right, kind: rk, request: rr }) => left == right && lk == rk && lr == rr,
@@ -458,6 +461,13 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::RunChatUser(request) => {
+                if self.workspace_inputs_blocked() || self.registered_chat_request(request.target.card, request.command).as_ref() != Some(&request) {
+                    self.status = Some(TransientNotice::warning("The conversation action changed; choose it again"));
+                    return Task::none();
+                }
+                request.action().map_or_else(Task::none, |action| self.update(Message::ChatUi(action)))
             }
             Action::RunDiffMutation(command, action) => {
                 let current = match action.as_ref() {
@@ -855,7 +865,7 @@ impl Cagents {
             } else {
                 match message {
                     Message::FocusAttention(_) => "Needs attention",
-                    Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _)) => "Commands",
+                    Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => "Commands",
                     Message::Palette(Action::FocusPane(_)) => "Panes",
                     _ => "Workspaces",
                 }
@@ -1043,7 +1053,9 @@ impl Cagents {
                     .filter(|descriptor| descriptor.action != Command::CommandPalette)
                     .filter(|descriptor| descriptor.available(&context))
                     .filter_map(|descriptor| {
-                        let message = if workspace_widget::diff_selection_command_kind(descriptor.action).is_some() || workspace_widget::diff_hunk_command_kind(descriptor.action).is_some() {
+                        let message = if workspace_widget::chat_user_command_bit(descriptor.action).is_some() {
+                            Message::Palette(Action::RunChatUser(self.workspace.focused().and_then(|card| self.registered_chat_request(card, descriptor.action))?))
+                        } else if workspace_widget::diff_selection_command_kind(descriptor.action).is_some() || workspace_widget::diff_hunk_command_kind(descriptor.action).is_some() {
                             let action = self.workspace.focused().and_then(|card| self.registered_diff_mutation_action(card, descriptor.action))?;
                             Message::Palette(Action::RunDiffMutation(descriptor.action, Box::new(action)))
                         } else { Message::RunCommand(descriptor.action) };
@@ -1171,7 +1183,7 @@ impl Cagents {
                         } else {
                             match message {
                                 Message::FocusAttention(_) => 1,
-                                Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _)) => 2,
+                                Message::RunCommand(_) | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_)) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
                             }
@@ -1673,6 +1685,7 @@ impl Cagents {
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
             browser_commands: card.map_or(0, |card| self.browser_command_capabilities(card)),
+            chat_user_commands: card.map_or(0, |card| self.registered_chat_command_capabilities(card)),
             pdf_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.pdf_command_capabilities(id), _ => 0 }),
             diff_presentation_commands: card.map_or(0, |card| self.diff_presentation_command_capabilities(card)),
             diff_selection_commands: card.map_or(0, |card| self.diff_selection_command_capabilities(card)),
@@ -1857,6 +1870,10 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::chat_user_command_bit(command).is_some() {
+            return self.workspace.focused().and_then(|card| self.registered_chat_request(card, command)).and_then(|request| request.action()).map_or_else(Task::none, |action| self.update(Message::ChatUi(action)));
+        }
+
         if workspace_widget::browser_command_bit(command).is_some() {
             return self.workspace.focused().and_then(|card| self.registered_browser_action(card, command)).map_or_else(Task::none, |message| self.update(message));
         }
@@ -2256,6 +2273,18 @@ impl Cagents {
             | Command::BrowserAddress
             | Command::BrowserOpenSystem
             | Command::BrowserImportLogins
+            | Command::ChatSend
+            | Command::ChatSteer
+            | Command::ChatQueue
+            | Command::ChatInterrupt
+            | Command::ChatCompact
+            | Command::ChatAttach
+            | Command::ChatReasoning
+            | Command::ChatLatest
+            | Command::ChatTakeBackQueued
+            | Command::ChatCancelQueued
+            | Command::ChatToggleSteering
+            | Command::ChatToggleFastMode
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -2571,6 +2600,18 @@ impl SettingsField {
             Self::ShortcutBrowserAddress => Some(Command::BrowserAddress),
             Self::ShortcutBrowserOpenSystem => Some(Command::BrowserOpenSystem),
             Self::ShortcutBrowserImportLogins => Some(Command::BrowserImportLogins),
+            Self::ShortcutChatSend => Some(Command::ChatSend),
+            Self::ShortcutChatSteer => Some(Command::ChatSteer),
+            Self::ShortcutChatQueue => Some(Command::ChatQueue),
+            Self::ShortcutChatInterrupt => Some(Command::ChatInterrupt),
+            Self::ShortcutChatCompact => Some(Command::ChatCompact),
+            Self::ShortcutChatAttach => Some(Command::ChatAttach),
+            Self::ShortcutChatReasoning => Some(Command::ChatReasoning),
+            Self::ShortcutChatLatest => Some(Command::ChatLatest),
+            Self::ShortcutChatTakeBackQueued => Some(Command::ChatTakeBackQueued),
+            Self::ShortcutChatCancelQueued => Some(Command::ChatCancelQueued),
+            Self::ShortcutChatToggleSteering => Some(Command::ChatToggleSteering),
+            Self::ShortcutChatToggleFastMode => Some(Command::ChatToggleFastMode),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -2831,6 +2872,18 @@ impl ShortcutDraft {
             (Command::BrowserAddress, self.browser_address.as_str()),
             (Command::BrowserOpenSystem, self.browser_open_system.as_str()),
             (Command::BrowserImportLogins, self.browser_import_logins.as_str()),
+            (Command::ChatSend, self.chat_send.as_str()),
+            (Command::ChatSteer, self.chat_steer.as_str()),
+            (Command::ChatQueue, self.chat_queue.as_str()),
+            (Command::ChatInterrupt, self.chat_interrupt.as_str()),
+            (Command::ChatCompact, self.chat_compact.as_str()),
+            (Command::ChatAttach, self.chat_attach.as_str()),
+            (Command::ChatReasoning, self.chat_reasoning.as_str()),
+            (Command::ChatLatest, self.chat_latest.as_str()),
+            (Command::ChatTakeBackQueued, self.chat_take_back_queued.as_str()),
+            (Command::ChatCancelQueued, self.chat_cancel_queued.as_str()),
+            (Command::ChatToggleSteering, self.chat_toggle_steering.as_str()),
+            (Command::ChatToggleFastMode, self.chat_toggle_fast_mode.as_str()),
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),
