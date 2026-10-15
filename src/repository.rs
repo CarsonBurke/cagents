@@ -702,6 +702,7 @@ pub struct SnapshotCache {
     publication_dependencies: Option<PublicationDependencies>,
     publication_system_root: Option<PublicationSystemRoot>,
     last_status: Option<StatusSnapshot>,
+    row_operation: Option<Result<Option<GitOperationKind>, String>>,
     status_attempt_failed: bool,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
@@ -1007,6 +1008,13 @@ impl SnapshotCache {
     pub fn row_status(&self) -> Option<&StatusSnapshot> {
         self.last_status.as_ref()
     }
+
+    /// Display observation paired with this read. A marker error does not
+    /// turn a successful Git status into a status-command failure.
+    pub fn row_operation(&self) -> Option<&Result<Option<GitOperationKind>, String>> {
+        self.row_operation.as_ref()
+    }
+
 
     /// The publication remote proven by the last successful snapshot read.
     /// This display identity never grants permission to mutate a worktree.
@@ -4610,7 +4618,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )))
             }
         })?;
-        let _git_dir = observation.git_dir;
+        let git_dir = observation.git_dir;
         let common_dir = observation.common_dir;
         let admin = observation.fingerprint;
         if cache
@@ -4699,6 +4707,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             )
             .inspect_err(|_| cache.status_attempt_failed = true)?;
+        cache.row_operation = Some(match git_dir.as_deref() {
+            Some(directory) => operation_metadata::read_operation_state(directory)
+                .map(|operation| operation.map(|operation| operation.kind))
+                .map_err(|error| error.to_string()),
+            None => Ok(None),
+        });
         use sha2::Digest;
         let mut digest = sha2::Sha256::new();
         digest.update(&output.stdout);
