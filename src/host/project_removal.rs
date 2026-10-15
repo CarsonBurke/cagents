@@ -512,6 +512,7 @@ mod tests {
             .map(ProviderIncarnation::from_process);
         let host = fixture.host.clone();
         let expected = fixture.expected.clone();
+        let reserved_session=session.clone();
         let (closed, closing) = crossbeam_channel::bounded(1);
         let close = thread::spawn(move || {
             let result = super::super::client::process_request(
@@ -645,6 +646,11 @@ mod tests {
                 .message
                 .contains("being removed")
         );
+        for request in [ClientRequest::ChatCloseSession{session:reserved_session.clone()},ClientRequest::ChatAttach{session:reserved_session}] {
+            let refusal=super::super::client::process_request(&fixture.host,1,request).unwrap_err();
+            assert!(refusal.message.contains("being removed"));
+            assert!(fixture.host.lock().unwrap().chats[&id].handle.same_actor(&handle));
+        }
         assert!(!fixture.root.join("pending.txt").exists());
         release.0.send(()).unwrap();
         let _ = command.join().unwrap();
