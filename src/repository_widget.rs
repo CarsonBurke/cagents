@@ -14077,6 +14077,19 @@ mod tests {
         assert!(!runtime.observes_open_sources()); assert!(runtime.save_error().is_some());
         assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable);
         assert!(!runtime.is_saving());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert!(runtime.desired_file_present());
+        assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable, "an otherwise editable present buffer remains unbound");
+        // Explicit Verify can retry at the same logical pathname after the
+        // original physical directory is restored there. Preserve the clone.
+        let located = runtime.descriptor.worktree.clone();
+        let clone = directory.path().join("retained-clone");
+        std::fs::rename(&located, &clone).unwrap(); std::fs::rename(&moved, &located).unwrap();
+        let retry = runtime.rebind_editor_root_after_relocation(card); finish_navigation_task(&mut runtime, retry).await;
+        assert!(runtime.observes_open_sources()); assert!(runtime.save_error().is_none());
+        let save = runtime.request_save(card, false); finish_navigation_task(&mut runtime, save).await;
+        assert_eq!(std::fs::read_to_string(located.join("a.rs")).unwrap(), saved);
+        assert_eq!(std::fs::read_to_string(clone.join("a.rs")).unwrap(), "clone");
     }
 
     #[tokio::test]
