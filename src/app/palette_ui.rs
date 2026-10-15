@@ -1242,6 +1242,75 @@ mod settings_recorder_tests {
     use super::*;
 
     #[test]
+    fn settings_palette_release_commits_recent_panes_before_modal_capture() {
+        for release_key in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let first = app.durable.cards[0].clone();
+            let mut second = first.clone();
+            second.id = CardId::new();
+            let mut third = first.clone();
+            third.id = CardId::new();
+            let ids = [first.id, second.id, third.id];
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards = vec![first, second, third];
+            durable.focused = Some(ids[2]);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.tab_history = crate::tab_history::TabHistory::from_recent([
+                ids[2], ids[1], ids[0],
+            ]);
+            let press = |key: keyboard::Key, physical, modifiers| Message::KeyEvent {
+                event: keyboard::Event::KeyPressed {
+                    modified_key: key.clone(),
+                    key,
+                    physical_key: keyboard::key::Physical::Code(physical),
+                    location: keyboard::Location::Standard,
+                    modifiers,
+                    text: None,
+                    repeat: false,
+                },
+                captured: true,
+            };
+            let tab = || press(
+                keyboard::Key::Named(keyboard::key::Named::Tab),
+                keyboard::key::Code::Tab,
+                keyboard::Modifiers::CTRL,
+            );
+            drop(app.update(tab()));
+            assert_eq!(app.workspace.focused(), Some(ids[1]));
+            assert!(app.tab_history.cycle_order().is_some());
+            drop(app.update(press(
+                keyboard::Key::Character("p".into()),
+                keyboard::key::Code::KeyP,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            )));
+            assert!(app.palette.is_open());
+            let event = if release_key {
+                keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(keyboard::key::Named::Control),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Control),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ControlLeft),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            } else {
+                keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty())
+            };
+            drop(app.update(Message::KeyEvent { event, captured: true }));
+            assert!(app.palette.is_open());
+            assert!(app.tab_history.cycle_order().is_none());
+            drop(app.update(press(
+                keyboard::Key::Named(keyboard::key::Named::Escape),
+                keyboard::key::Code::Escape,
+                keyboard::Modifiers::empty(),
+            )));
+            assert!(!app.palette.is_open());
+            drop(app.update(tab()));
+            assert_eq!(app.workspace.focused(), Some(ids[2]));
+        }
+    }
+
+    #[test]
     fn recorder_refuses_shell_controls_and_fixed_chords_before_editing_the_draft() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let field = SettingsField::ShortcutToggleProjects;
