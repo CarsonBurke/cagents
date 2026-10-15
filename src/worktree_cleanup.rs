@@ -609,7 +609,7 @@ mod tests {
         let foreign_config = std::fs::read(foreign.join(".git/config")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "worktree_cleanup::tests::cleanup_commands_ignore_inherited_git_redirection", "--nocapture"])
-            .env(FIXTURE, root).env("GIT_DIR", foreign.join(".git"))
+            .env(FIXTURE, root).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_DIR", foreign.join(".git"))
             .env("GIT_WORK_TREE", &foreign).env("GIT_INDEX_FILE", foreign.join(".git/index"))
             .env("GIT_COMMON_DIR", foreign.join(".git")).output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
