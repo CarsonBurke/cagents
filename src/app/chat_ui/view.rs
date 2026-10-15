@@ -398,13 +398,19 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
-fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
+fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    ("transcript-notice", anchor, message).hash(&mut hash); hash.finish()
+}
+
+fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(Icon::Warning.handle())
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
-            widget::container(selectable_prose::text(
+            widget::container(selectable_prose::logical_text(
                 vec![
                     iced::widget::text::Span::new(message.to_owned())
                         .color(design::warning_color(&cosmic::theme::active())),
@@ -414,6 +420,7 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
                 iced::Font::default(),
                 target,
                 None,
+                selectable_prose::Logical { identity, start: 0 },
             ))
             .width(Length::Fill)
             .into(),
@@ -1169,6 +1176,7 @@ impl Runtime {
         let mut opened: Vec<_> = self.opened.iter().collect(); opened.sort_unstable(); opened.hash(&mut fingerprint);
         self.tool_groups_expanded.hash(&mut fingerprint);
         self.failures.hash(&mut fingerprint);
+        self.error.as_ref().or(self.snapshot.error.as_ref()).hash(&mut fingerprint);
         self.queued.as_ref().map(|queued| &queued.text).hash(&mut fingerprint);
         let fingerprint = fingerprint.finish();
         let mut document = self.selection_document.borrow_mut();
@@ -1177,15 +1185,25 @@ impl Runtime {
             if selected.is_some() {
                 for item in items { self.selection_item(&mut builder, item, turn::slot_of(item), true); }
             } else {
+                for (anchor, error) in self.failures.iter().filter(|(anchor, error)| anchor.is_none() && !self.active_auth_notice(anchor, error)) {
+                    builder.logical(notice_identity(anchor.as_deref(), error), Arc::from(error.as_str()));
+                }
                 for turn in &self.turns {
                     for index in &turn.prompt { if let Some(item) = items.get(*index) { self.selection_item(&mut builder, item, turn::Slot::Prose, true); } }
                     if self.opened.get(&turn.key).copied().unwrap_or(self.tool_groups_expanded) {
                         for placed in &turn.steps { if let Some(item) = items.get(placed.index) { self.selection_item(&mut builder, item, placed.slot, true); } }
                     }
                     for placed in &turn.prose { if let Some(item) = items.get(placed.index) { self.selection_item(&mut builder, item, placed.slot, true); } }
+                    for (anchor, error) in self.failures.iter().filter(|(anchor, error)| anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)) {
+                        builder.logical(notice_identity(anchor.as_deref(), error), Arc::from(error.as_str()));
+                    }
                 }
-                for (_, error) in &self.failures { builder.plain(&format!("failure-{error}"), &[2], Arc::from(error.as_str())); }
                 if let Some(queued) = &self.queued { builder.plain("queued-prompt", &[2], Arc::from(queued.text.trim_end())); }
+            }
+            if let Some(error) = self.error.as_ref().or(self.snapshot.error.as_ref())
+                && !chat::requires_sign_in(self.session.launch.provider, error)
+                && !self.failures.iter().any(|(_, recorded)| recorded == error) {
+                builder.logical(notice_identity(None, error), Arc::from(error.as_str()));
             }
             *document = Some((fingerprint, builder.finish()));
         }
@@ -1417,7 +1435,7 @@ impl Runtime {
             for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                 anchor.is_none() && !self.active_auth_notice(anchor, error)
             }) {
-                transcript.push(notice_entry(error, target));
+                transcript.push(notice_entry(error, target, notice_identity(None, error)));
             }
             for turn in &self.turns {
                 use std::hash::{Hash, Hasher};
@@ -1437,7 +1455,7 @@ impl Runtime {
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                     anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
                 }) {
-                    transcript.push(notice_entry(error, target));
+                    transcript.push(notice_entry(error, target, notice_identity(Some(&turn.key), error)));
                 }
             }
             if !snapshot.has_later
@@ -1499,7 +1517,7 @@ impl Runtime {
             && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
-            transcript.push(notice_entry(error, target));
+            transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -3605,11 +3623,10 @@ impl Runtime {
             .as_ref()
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
         let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(selectable_prose::plain(
-                queued.text.trim_end(),
-                design::TEXT_PROSE,
-                iced::Font::default(),
-                self.target,
+            widget::container(selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new(queued.text.trim_end().to_owned())].into(),
+                design::TEXT_PROSE.into(), iced::Font::default(), self.target, None,
+                selectable_prose::Logical { identity: selection::logical_identity("queued-prompt", &[2]), start: 0 },
             ))
             .class(design::surface(
                 Some(design::accent_wash),
@@ -3814,11 +3831,10 @@ impl Runtime {
                     body.clone()
                 };
                 rows.push(
-                    widget::container(selectable_prose::plain(
-                        text,
-                        design::TEXT_CAPTION,
-                        iced::Font::MONOSPACE,
-                        self.target,
+                    widget::container(selectable_prose::logical_text(
+                        vec![iced::widget::text::Span::new(text)].into(), design::TEXT_CAPTION.into(),
+                        iced::Font::MONOSPACE, self.target, None,
+                        selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0 },
                     ))
                     .width(Length::Fill)
                     .into(),
@@ -6034,7 +6050,7 @@ mod tests {
         let content = widget::column::with_children(vec![
             runtime.prompt_view(prompt),
             transcript_body("Queued message", runtime.target),
-            notice_entry("Provider warning", runtime.target),
+            notice_entry("Provider warning", runtime.target, notice_identity(None, "Provider warning")),
             output.view(
                 crate::settings::EditorSyntaxTheme::Auto,
                 None,
@@ -6153,6 +6169,176 @@ mod tests {
         assert_eq!(
             clipboard.0,
             format!("{expected}\n\nQueued message\n\nProvider warning\n\ntool output\n")
+        );
+    }
+
+    #[test]
+    fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
+        let items = frame_cost::transcript(2);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        assert_eq!(runtime.turns.len(), 2);
+        let first = runtime.turns[0].key.clone();
+        let second = runtime.turns[1].key.clone();
+        runtime.failures = vec![
+            (Some(first.clone()), "Repeated failure".into()),
+            (Some(second.clone()), "Repeated failure".into()),
+        ];
+        runtime.error = Some("Current failure".into());
+        let (catalog, _) = runtime.selection_document();
+        let blocks = catalog.search_blocks();
+        let identities: Vec<_> = blocks.iter().map(|(identity, _)| *identity).collect();
+        let position = |identity| identities.iter().position(|candidate| *candidate == identity).unwrap();
+        let first_notice = position(notice_identity(Some(&first), "Repeated failure"));
+        let second_notice = position(notice_identity(Some(&second), "Repeated failure"));
+        let second_prompt = &items[runtime.turns[1].prompt[0]];
+        assert!(first_notice < position(selection::logical_identity(&second_prompt.id, &[2])));
+        assert!(second_notice > first_notice);
+        assert_eq!(blocks.last().unwrap().1.as_ref(), "Current failure");
+    }
+
+    #[test]
+    fn queued_and_notice_widgets_copy_through_logical_catalog() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let items = frame_cost::transcript(1);
+        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let queued = Queued {
+            text: "Queued message".into(), resolved_text: "Queued message".into(),
+            attachments: vec![], model: None, draft: runtime.session.clone(),
+            since: None, rechecking: false,
+        };
+        let mut delivery = items[0].clone();
+        delivery.id = "delivery-notice".into();
+        delivery.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice, from: String::new(), sender: String::new(),
+            summary: "Provider report".into(), body: "Delivered warning".into(),
+        };
+        let cached = CachedItem::new(&delivery.content, crate::settings::EditorSyntaxTheme::Auto);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let first = notice_identity(Some("turn-a"), "Repeated failure");
+        let second = notice_identity(Some("turn-b"), "Repeated failure");
+        assert_ne!(first, second);
+        let mut builder = selection::Catalog::builder();
+        builder.logical(first, Arc::from("Repeated failure"));
+        builder.plain("queued-prompt", &[2], Arc::from("Queued message"));
+        builder.plain(&delivery.id, &[2], Arc::from("Delivered warning"));
+        builder.logical(second, Arc::from("Repeated failure"));
+        let content = widget::column::with_children(vec![
+            notice_entry("Repeated failure", runtime.target, first),
+            runtime.queued_view(&queued),
+            runtime.delivery_view(&delivery, &cached, settings),
+            notice_entry("Repeated failure", runtime.target, second),
+        ]);
+        let mut element = selection::transcript_virtualized(
+            content, runtime.target, None, builder.finish(), Default::default(),
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct ReadText(Vec<(String, iced::Rectangle)>);
+        impl Operation for ReadText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push((prose.plain.to_string(), bounds));
+                }
+            }
+        }
+        let mut text = ReadText::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut text,
+        );
+        assert_eq!(
+            text.0
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect::<Vec<_>>(),
+            ["Repeated failure", "Queued message", "Delivered warning", "Repeated failure"]
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, contents: String) {
+                self.0 = contents;
+            }
+        }
+        let first = text.0.first().unwrap().1;
+        let last = text.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
+        let mut clipboard = ClipboardText::default();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 1200.0));
+        for (event, pointer) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                start,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                end,
+            ),
+            (
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("c".into()),
+                    modified_key: keyboard::Key::Character("c".into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+        }
+        assert_eq!(
+            clipboard.0,
+            "Repeated failure\n\nQueued message\n\nDelivered warning\n\nRepeated failure"
         );
     }
 
