@@ -821,7 +821,14 @@ where
             let size = self.size.unwrap_or_else(|| renderer.default_size().0);
             let line_height = self.line_height;
             let state = tree.state.downcast_mut::<State>();
-            if state.dirty {
+            // Text may be unchanged while a retained input adopts a new theme
+            // or explicit typography. Drawing uses these current attributes;
+            // its caret, selection and hit tests must use the same paragraph.
+            if state.dirty
+                || state.value.raw().font() != font
+                || state.value.raw().size() != iced::Pixels(size)
+                || state.value.raw().line_height() != line_height
+            {
                 state.dirty = false;
                 let value = if self.is_secure {
                     &self.value.secure()
