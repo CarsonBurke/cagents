@@ -2231,8 +2231,67 @@ mod tests {
     }
 }
 
+/// Reconnect only the read surface. Authority and AgentId stay captured by the
+/// frontend; each replacement socket performs the normal proof-pinning
+/// handshake. This never starts a daemon or resends a mutation.
+struct ConsoleConnection {
+    socket:PathBuf,
+    client:Option<ControlClient>,
+    retry_at:Instant,
+    retry_delay:Duration,
+}
+impl ConsoleConnection {
+    fn new(socket:PathBuf)->Self {
+        Self {socket,client:None,retry_at:Instant::now(),retry_delay:Duration::from_millis(250)}
+    }
+    fn lost(&mut self) {
+        self.client=None;
+        self.retry_at=Instant::now()+self.retry_delay;
+        self.retry_delay=(self.retry_delay*2).min(Duration::from_secs(2));
+    }
+    fn read(&mut self,authority:&Authority,agent:AgentId,generation:Option<u64>,last_run:Option<(RunId,u64)>)->Result<Option<Reply>,ControlError> {
+        let mut fresh=false;
+        if self.client.is_none() {
+            if Instant::now()<self.retry_at {return Ok(None);}
+            match ControlClient::connect(&self.socket) {
+                Ok(client)=>{self.client=Some(client);fresh=true;}
+                Err(error) if console_transport_loss(&error)=>{self.lost();return Ok(None);}
+                Err(error)=>return Err(error),
+            }
+        }
+        let result=self.client.as_mut().expect("connected console").agent_before(
+            authority.clone(),Operation::Console {agent,command:crate::agent_execution::ConsoleCommand::Read {
+                // Generations belong to an attachment; force a bounded full
+                // view after the new daemon handshake, keeping run evidence.
+                after_generation:if fresh {None} else {generation},after_run:last_run,
+            }},Some(Instant::now()+Duration::from_secs(2)));
+        match result {
+            Ok(reply)=>{self.retry_delay=Duration::from_millis(250);Ok(Some(reply))}
+            Err(error) if console_transport_loss(&error)=>{self.lost();Ok(None)}
+            Err(error)=>Err(error),
+        }
+    }
+    fn command(&mut self,authority:&Authority,agent:AgentId,command:crate::agent_execution::ConsoleCommand)->Result<Reply,ControlError> {
+        let Some(client)=self.client.as_mut() else {return Err(ControlError::ConnectionClosed);};
+        let result=client.agent_before(authority.clone(),Operation::Console {agent,command},Some(Instant::now()+Duration::from_secs(5)));
+        if result.as_ref().is_err_and(console_transport_loss) {self.lost();}
+        result
+    }
+}
+fn console_transport_loss(error:&ControlError)->bool {
+    let transient=|error:&io::Error| matches!(error.kind(),
+        io::ErrorKind::NotFound|io::ErrorKind::ConnectionRefused|io::ErrorKind::ConnectionReset
+        |io::ErrorKind::ConnectionAborted|io::ErrorKind::BrokenPipe|io::ErrorKind::NotConnected
+        |io::ErrorKind::TimedOut|io::ErrorKind::WouldBlock|io::ErrorKind::UnexpectedEof|io::ErrorKind::Interrupted);
+    match error {
+        ControlError::ConnectionClosed=>true,
+        ControlError::Connect(error)|ControlError::Frame(crate::terminal::ipc::FrameError::Io(error))=>transient(error),
+        ControlError::ReplyTimeout {error:crate::terminal::ipc::FrameError::Io(error),..}=>transient(error),
+        _=>false,
+    }
+}
+
 fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
-    use crate::agent_execution::ConsoleCommand;
     use std::io::{BufRead, Write};
     let authority = Authority::from_environment();
     if authority.token().is_none() {
@@ -2242,7 +2301,8 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         ));
     }
     let socket = terminal::ipc::daemon_socket_path().map_err(|e| AppError::new("daemon", e))?;
-    let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+    let mut connection = ConsoleConnection::new(socket);
+    let mut reconnect_notice=false;
     let (sender, input) = std::sync::mpsc::sync_channel(8);
     thread::Builder::new()
         .name("console-input".into())
@@ -2285,17 +2345,14 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
     let mut last_run = None;
     let mut last_requests = Vec::new();
     loop {
-        match client.agent(
-            authority.clone(),
-            Operation::Console {
-                agent,
-                command: ConsoleCommand::Read {
-                    after_generation: generation,
-                    after_run: last_run,
-                },
-            },
-        ) {
-            Ok(Reply::Console(Some(view))) => {
+        let read=connection.read(&authority,agent,generation,last_run);
+        if connection.client.is_none() && !reconnect_notice {
+            eprintln!("Console connection unavailable; waiting for the daemon. Commands will not be replayed, and inputs are not sent while disconnected.");reconnect_notice=true;
+        } else if read.is_ok() && connection.client.is_some() && reconnect_notice {
+            eprintln!("Console connection restored.");reconnect_notice=false;
+        }
+        match read {
+            Ok(Some(Reply::Console(Some(view)))) => {
                 generation = Some(view.generation);
                 let text: String = view
                     .text
@@ -2335,7 +2392,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                 }
                 let _ = io::stdout().flush();
             }
-            Ok(Reply::Console(None)) => {}
+            Ok(Some(Reply::Console(None))) | Ok(None) => {}
             Ok(_) => {
                 return Err(AppError::new(
                     "agent_console",
@@ -2368,9 +2425,14 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                         continue;
                     }
                 };
-                match client.agent(authority.clone(), Operation::Console { agent, command }) {
+                if connection.client.is_none() {
+                    eprintln!("Not sent while disconnected. Re-enter this input after the console reconnects.");
+                    continue;
+                }
+                match connection.command(&authority,agent,command) {
                     Ok(Reply::Accepted(accepted)) => println!("Accepted run {}", accepted.run.id),
                     Ok(_) => {}
+                    Err(error) if console_transport_loss(&error) => eprintln!("The command acknowledgement was lost. It may have been accepted; it will not be sent again. Reconnecting to read its durable state: {error}"),
                     Err(error) => eprintln!("{error}"),
                 }
                 generation = None;
@@ -2422,4 +2484,65 @@ fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, S
         prompt: line.into(),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
     })
+}
+
+#[cfg(test)]
+mod console_reconnect_tests {
+    use super::*;
+    use crate::agent_execution::ConsoleCommand;
+    use crate::terminal::ipc::{ClientEnvelope,ClientRequest,ServerEnvelope,ServerMessage,ServerResponse,read_frame,write_frame};
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn lost_mutation_ack_reconnects_only_read_with_exact_agent_authority_and_new_proof() {
+        let root=tempfile::tempdir().unwrap();let socket=root.path().join("daemon.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let agent=AgentId::new();let authority=Authority::session(uuid::Uuid::new_v4().to_string());
+        let expected=authority.clone();
+        let worker=thread::spawn(move || {
+            for epoch in ["old","new"] {
+                let (mut stream,_)=listener.accept().unwrap();
+                let connect:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(connect.request,ClientRequest::Connect {..}));
+                let proof=crate::model::HostSessionProof {host_session_id:epoch.into(),boot_id:"boot".into(),host_incarnation:epoch.into()};
+                write_frame(&mut stream,&ServerEnvelope {version:crate::terminal::ipc::PROTOCOL_VERSION,request_id:Some(connect.request_id),proof:proof.clone(),message:ServerMessage::Response {response:ServerResponse::Connected {proof:proof.clone(),terminals:Vec::new()}}}).unwrap();
+                let request:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+                assert_eq!(request.proof,Some(proof.clone()));
+                match request.request {
+                    ClientRequest::Agent {authority,operation:Operation::Console {agent:actual,command:ConsoleCommand::Read {after_generation,..}}}=> {
+                        assert_eq!(authority.token(),expected.token());assert_eq!(actual,agent);assert_eq!(after_generation,None);
+                    }
+                    _=>panic!("a new attachment must read; it must not replay the ambiguous mutation"),
+                }
+                write_frame(&mut stream,&ServerEnvelope {version:crate::terminal::ipc::PROTOCOL_VERSION,request_id:Some(request.request_id),proof,message:ServerMessage::Response {response:ServerResponse::Agent(Reply::Console(None))}}).unwrap();
+                if epoch=="old" {
+                    let request:ClientEnvelope=read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(request.request,ClientRequest::Agent {operation:Operation::Console {agent:actual,command:ConsoleCommand::Submit {ref prompt,..}},..} if actual==agent && prompt=="accepted exactly once"));
+                    // Host loss after acceptance and before the reply. The
+                    // replacement connection may only read durable evidence.
+                }
+            }
+        });
+        let mut connection=ConsoleConnection::new(socket);
+        assert!(matches!(connection.read(&authority,agent,Some(99),None).unwrap(),Some(Reply::Console(None))));
+        let command=ConsoleCommand::Submit {prompt:"accepted exactly once".into(),idempotency_key:uuid::Uuid::new_v4().to_string()};
+        assert!(connection.command(&authority,agent,command).is_err());
+        assert!(connection.client.is_none());connection.retry_at=Instant::now();
+        assert!(matches!(connection.read(&authority,agent,Some(99),None).unwrap(),Some(Reply::Console(None))));
+        assert_eq!(connection.client.as_ref().unwrap().proof().host_incarnation.as_str(),"new");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_refusal_and_invalid_frames_are_not_reconnect_authority() {
+        assert!(console_transport_loss(&ControlError::ConnectionClosed));
+        assert!(console_transport_loss(&ControlError::Connect(io::ErrorKind::ConnectionRefused.into())));
+        for error in [
+            ControlError::ProofMismatch,
+            ControlError::IncompleteProof,
+            ControlError::UnsupportedVersion {actual:77},
+            ControlError::Connect(io::ErrorKind::PermissionDenied.into()),
+            ControlError::Remote {code:crate::terminal::ipc::ProtocolErrorCode::PermissionDenied,message:"retired authority".into(),retryable:true},
+        ] {assert!(!console_transport_loss(&error));}
+    }
 }
