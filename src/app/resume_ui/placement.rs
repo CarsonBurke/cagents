@@ -32,6 +32,12 @@ pub(in crate::app) struct Resolved {
     pub physical_root: PathBuf,
 }
 
+/// Stable provider-history identity; independent of the close UI module.
+pub(in crate::app) fn conversation_key(session: &chat::Session) -> Option<String> {
+    let id = session.launch.session_id.as_deref()?.trim();
+    (!id.is_empty()).then(|| format!("{}:{id}", session.launch.provider.label()))
+}
+
 // Identical to select_channel's lexical scope choice; this performs no IO.
 fn project_scope(project: &sidebar::SidebarProject) -> PathBuf {
     project.worktrees.iter()
@@ -52,7 +58,7 @@ impl Snapshot {
         let original = app.durable.channels.iter()
             .find(|channel| channel.cards.contains(&original))
             .map(|channel| channel.id)
-            .or_else(|| chat_ui::closing::draft_key(session)
+            .or_else(|| conversation_key(session)
                 .and_then(|key| app.durable.conversation_channels.get(&key).copied())
                 .filter(|id| app.durable.channels.iter().any(|channel| channel.id == *id)))
             .map(|id| (id, channel_root(id)));
