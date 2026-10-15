@@ -2513,7 +2513,7 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
         ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
         ShortcutKey::Tab => Key::Named(Named::Tab),
-        ShortcutKey::Space => Key::Named(Named::Space),
+        ShortcutKey::Space => Key::Character(" ".into()),
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
         ShortcutKey::End => Key::Named(Named::End),
@@ -3344,12 +3344,7 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
-            ShortcutKey::Space => {
-                matches!(
-                    key.as_ref(),
-                    keyboard::Key::Named(keyboard::key::Named::Space)
-                ) || matches!(key.as_ref(), keyboard::Key::Character(value) if value == " ")
-            }
+            ShortcutKey::Space => matches!(key.as_ref(), keyboard::Key::Character(value) if value == " "),
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)

@@ -20918,7 +20918,7 @@ mod tests {
                 }
             )))
         ));
-        for key in [Key::Named(Named::Space), Key::Character(" ".into())] {
+        for key in [Key::Character(" ".into())] {
             assert!(matches!(
                 registered_editor_binding(
                     card,
@@ -20962,7 +20962,7 @@ mod tests {
             registered_editor_binding(
                 card,
                 &runtime,
-                &press(Key::Named(Named::Space), iced::keyboard::Modifiers::CTRL)
+                &press(Key::Character(" ".into()), iced::keyboard::Modifiers::CTRL)
             )
             .is_none()
         );
