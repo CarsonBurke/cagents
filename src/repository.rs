@@ -4528,7 +4528,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let source = entry
                 .old_path
                 .as_ref()
-                .filter(|source| indexed.contains(source));
+                .filter(|source| indexed.contains(*source));
             for path in [source, Some(&entry.path)].into_iter().flatten() {
                 if seen.insert(path.clone()) {
                     paths.push(path.clone());
@@ -4562,14 +4562,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .collect();
             let unindexed: Vec<&RepoPath> = paths
                 .iter()
-                .filter(|path| !indexed.contains(path))
+                .filter(|path| !indexed.contains(*path))
                 .collect();
             if !unindexed.is_empty() {
                 let in_head: HashSet<_> = self
                     .head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?
                     .into_iter()
                     .collect();
-                if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(path)) {
+                if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(**path)) {
                     return Ok(MutationOutcome::NotApplied {
                         failure: MutationFailure::Rejected {
                             reason: format!("{ghost}: path does not match anything known to git"),
@@ -4635,7 +4635,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         Ok(paths
             .iter()
-            .filter(|path| listed.contains(path))
+            .filter(|path| listed.contains(*path))
             .cloned()
             .collect())
     }
