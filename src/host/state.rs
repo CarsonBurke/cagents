@@ -255,6 +255,7 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    pub(super) transcript_readers: BTreeMap<(ClientId, crate::model::AgentId), crate::chat::runtime::TranscriptReader>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
@@ -333,6 +334,7 @@ impl HostState {
             model: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            transcript_readers: BTreeMap::new(),
             automations: None,
             mailbox: None,
             mailbox_seal: None,
@@ -396,7 +398,7 @@ impl HostState {
 
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
-    pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+    pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) -> Vec<crate::chat::runtime::TranscriptReader> {
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -407,6 +409,12 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.take_transcript_readers(client_id)
+    }
+
+    fn take_transcript_readers(&mut self, client_id: ClientId) -> Vec<crate::chat::runtime::TranscriptReader> {
+        let keys = self.transcript_readers.keys().filter(|(reader, _)| *reader == client_id).copied().collect::<Vec<_>>();
+        keys.into_iter().filter_map(|key| self.transcript_readers.remove(&key)).collect()
     }
 
     /// Installs the durable shared sidebar model.
@@ -677,7 +685,7 @@ impl HostState {
         }
     }
 
-    pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+    pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> (Vec<TerminalHandle>, Vec<crate::chat::runtime::TranscriptReader>) {
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -723,7 +731,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
-        handles
+        (handles, self.take_transcript_readers(client_id))
     }
 
     pub(crate) fn attach(

@@ -323,18 +323,20 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    let handles = {
+    let (handles, transcript_readers) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             // Shutdown owns the remaining session state. Removing delivery is
             // safe, but unregistering would enqueue visibility/redraw effects
             // after the upgrade's terminal snapshots have been committed.
-            state.forget_client_delivery(client_id);
-            Vec::new()
+            let readers = state.forget_client_delivery(client_id);
+            (Vec::new(), readers)
         } else {
             state.unregister_client(client_id)
         }
     };
+    // Cache deletion and SQLite cleanup must never hold the host's global lock.
+    drop(transcript_readers);
     // Clear a disconnected GUI's outstanding redraw edge outside HostState.
     for handle in handles {
         handle.acknowledge_redraw(handle.generation());
@@ -466,7 +468,7 @@ pub(super) fn process_request(
             operation,
         } => {
             let reply =
-                super::agent_execution::process(host, authority, operation).map_err(|message| {
+                super::agent_execution::process_for_client(host, client_id, authority, operation).map_err(|message| {
                     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
