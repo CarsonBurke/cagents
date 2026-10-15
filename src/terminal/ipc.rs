@@ -646,6 +646,7 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// A terminal some other client created, delivered only to a connection
     /// that subscribed with [`ClientRequest::WatchTerminals`].
