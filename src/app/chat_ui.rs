@@ -13634,13 +13634,18 @@ mod tests {
                 model: Some("configured-model".into()),
                 effort: Some("low".into()),
                 permission_mode: Some("plan".into()),
-                ..Default::default()
+                arguments: vec!["--append-system-prompt".into(), "UI fixture argument with spaces".into()],
+                environment: std::collections::BTreeMap::from([("PROVIDER_FIXTURE_VALUE".into(), "UI fixture environment".into())]),
             },
         );
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let card = app.workspace.focused().unwrap();
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.session.launch.recipe.program, "/bin/sh");
+        assert!(runtime.session.launch.recipe.arguments.windows(2)
+            .any(|pair| pair == ["--append-system-prompt", "UI fixture argument with spaces"]));
+        assert_eq!(runtime.session.launch.recipe.environment["PROVIDER_FIXTURE_VALUE"],
+            "UI fixture environment");
         assert_eq!(
             runtime.snapshot.selected_model.as_deref(),
             Some("configured-model")
@@ -13674,6 +13679,11 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "configured-model")
         );
+        let launch = &chat_runtime(&app, card).session.launch.recipe;
+        assert!(launch.arguments.windows(2)
+            .any(|pair| pair == ["--append-system-prompt", "UI fixture argument with spaces"]));
+        assert_eq!(launch.environment["PROVIDER_FIXTURE_VALUE"], "UI fixture environment",
+            "per-conversation model changes must preserve configured launch policy");
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let next = app.workspace.focused().unwrap();
         assert_ne!(next, card);
