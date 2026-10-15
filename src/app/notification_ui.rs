@@ -313,11 +313,22 @@ impl Cagents {
         }
         self.notification_ui.visible_focus = visible;
         self.notification_ui.visible_acknowledged = false;
-        let session = visible.and_then(|card| self.card_state(card)).and_then(card_session);
-        self.notification_ui.visible_notices = self.notification_ui.snapshot.notices.iter()
-            .filter(|notice| session.is_some() && notice.event.source_session() == session
-                && !notice.acknowledged && !self.notification_ui.acknowledged.contains(&notice.id))
-            .map(|notice| notice.id).collect();
+        let session = visible
+            .and_then(|card| self.card_state(card))
+            .and_then(card_session);
+        self.notification_ui.visible_notices = self
+            .notification_ui
+            .snapshot
+            .notices
+            .iter()
+            .filter(|notice| {
+                session.is_some()
+                    && notice.event.source_session() == session
+                    && !notice.acknowledged
+                    && !self.notification_ui.acknowledged.contains(&notice.id)
+            })
+            .map(|notice| notice.id)
+            .collect();
         self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
         let epoch = self.attention_focus_epoch;
         visible.map_or_else(Task::none, |card| {
@@ -1245,15 +1256,32 @@ mod tests {
         app.context_inspector_open = false;
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         let card = app.workspace.focused().unwrap();
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
         let stale_epoch = app.attention_focus_epoch;
-        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
+        assert_eq!(
+            app.notification_ui.focused_session_for_test(),
+            Some(session)
+        );
         assert!(!app.notification_ui.acknowledged_for_test(id));
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
-        assert!(!app.notification_ui.acknowledged_for_test(id),
-            "returning then leaving before dwell cannot read an unseen journal entry");
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
+        assert!(
+            !app.notification_ui.acknowledged_for_test(id),
+            "returning then leaving before dwell cannot read an unseen journal entry"
+        );
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
         let epoch = app.attention_focus_epoch;
         assert_ne!(epoch, stale_epoch);
         assert!(!app.notification_ui.acknowledged_for_test(id));
@@ -1305,8 +1333,14 @@ mod tests {
             "notification snapshots must not withdraw an explicitly requested focused alert"
         );
 
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
         let epoch = app.attention_focus_epoch;
         assert!(!app.notification_ui.acknowledged_for_test(id));
         let newer = uuid::Uuid::new_v4();
@@ -1319,11 +1353,15 @@ mod tests {
         assert!(!app.notification_ui.acknowledged_for_test(newer));
         drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
         assert!(app.notification_ui.acknowledged_for_test(id));
-        assert!(!app.notification_ui.acknowledged_for_test(newer),
-            "an older dwell cannot withdraw a newer opted-in alert");
+        assert!(
+            !app.notification_ui.acknowledged_for_test(newer),
+            "an older dwell cannot withdraw a newer opted-in alert"
+        );
         drop(app.mark_cards_read(vec![card]));
-        assert!(app.notification_ui.acknowledged_for_test(newer),
-            "explicit Mark Read retains its declared current scope");
+        assert!(
+            app.notification_ui.acknowledged_for_test(newer),
+            "explicit Mark Read retains its declared current scope"
+        );
     }
 
     fn scheduled_attention_fixture() -> (Cagents, crate::agent_execution::Agent) {
