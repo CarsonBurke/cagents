@@ -23501,11 +23501,6 @@ mod tests {
             assert!(conflict_blocks(text).is_empty(), "{text}");
         }
     }
-}
-
-/// The virtualized diff canvas used by a language-server workspace-edit preview.
-pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    diff_surface(card, runtime, None)
     #[test]
     fn registered_diagnostic_bindings_follow_remapping_and_clearing() {
         use crate::workspace_widget::GlobalShortcut as Command;
@@ -24037,4 +24032,9 @@ pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Elem
         );
     }
 
+}
+
+/// The virtualized diff canvas used by a language-server workspace-edit preview.
+pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    diff_surface(card, runtime, None)
 }
