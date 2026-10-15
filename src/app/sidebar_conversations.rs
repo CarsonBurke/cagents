@@ -232,8 +232,18 @@ mod tests {
             let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("composer"); };
             let target = runtime.target;
             for _ in 0..10 {
+                drop(app.update(Message::KeyEvent { event: keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("t".into()), modified_key: keyboard::Key::Character("t".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT), location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(), text: Some("t".into()), repeat: false,
+                }, captured: true }));
                 drop(app.update(Message::ChatUi(chat_ui::Action::Composer(target,
-                    widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new("typed".into())))))));
+                    widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('t'))))));
+                drop(app.update(Message::KeyEvent { event: keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Character("t".into()), modified_key: keyboard::Key::Character("t".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT), location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }, captured: false }));
                 drop(app.update(Message::ChatUi(chat_ui::Action::ComposerCursor(target,
                     widget::text_editor::Cursor { position: widget::text_editor::Position { line: 0, column: 0 }, selection: None }))));
                 drop(app.update(Message::TerminalWake { card: CardId::new(), generation: 0 }));
@@ -243,7 +253,7 @@ mod tests {
             let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("same composer"); };
             let text = runtime.unsent_text();
             assert!(text.contains("retain this draft"));
-            assert_eq!(text.matches("typed").count(), 10);
+            assert_eq!(text.len(), "retain this draft".len() + 10);
             // Actual incoming registry identity remains a semantic invalidation.
             let mut model = app.workspace_model.clone(); model.identity = uuid::Uuid::new_v4(); model.sequence += 1;
             drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model))));

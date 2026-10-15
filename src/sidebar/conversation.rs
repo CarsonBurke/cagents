@@ -85,7 +85,7 @@ fn entries(rows: &[Entry], offset: usize) -> Vec<cosmic::widget::menu::Item<EndC
 pub(super) fn append_menu(
     menu: &mut Vec<cosmic::widget::menu::Tree<super::SidebarAction>>,
     rows: &Rows,
-    shortcuts: &crate::settings::KeyboardShortcuts,
+    _shortcuts: &crate::settings::KeyboardShortcuts,
 ) {
     if rows.0.is_empty() { return; }
     use cosmic::widget::menu::{Item, items};
@@ -93,7 +93,6 @@ pub(super) fn append_menu(
     // generic keyboard binding addresses the focused conversation. Assigning
     // that one chord to all parameterized entries would misleadingly choose
     // an arbitrary last row. These captured targets have no implicit chord.
-    let _ = shortcuts;
     menu.extend(items(&std::collections::HashMap::new(), vec![Item::Divider, Item::Folder(
         super::commands::label(crate::workspace_widget::GlobalShortcut::EndConversation).to_owned(),
         entries(&rows.0, 0),
