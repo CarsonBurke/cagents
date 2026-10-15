@@ -216,8 +216,8 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if !self.force_branches.is_empty() {
-            return widget::Id::new("dialog.branch.keep");
+        if let Some((request, _)) = self.force_branches.front() {
+            return force_branch_control_id(request.id, "keep");
         }
         if let Some(dialog) = &self.cleanup_dialog {
             return widget::Id::new(if dialog.loading {
@@ -229,12 +229,23 @@ impl State {
         if let Some(removal) = &self.remove_dialog {
             return removal_control_id(removal.request, "cancel");
         }
+        if let Some(dialog) = &self.dialog {
+            return deletion_control_id(dialog.request, "cancel");
+        }
         widget::Id::new("dialog.project.close")
     }
 }
 
 fn removal_control_id(request: crate::model::OperationId, role: &str) -> widget::Id {
     widget::Id::new(format!("dialog.project.remove.{role}.{request}"))
+}
+
+fn deletion_control_id(request: u64, role: &str) -> widget::Id {
+    widget::Id::new(format!("dialog.worktree.delete.{role}.{request}"))
+}
+
+fn force_branch_control_id(request: crate::model::OperationId, role: &str) -> widget::Id {
+    widget::Id::new(format!("dialog.branch.{role}.{request}"))
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +372,7 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete(u64),
+    DismissDelete(u64),
     DeleteOptionsRead {
         request: u64,
         result: Result<DeleteOptions, String>,
@@ -443,6 +455,7 @@ impl Action {
             self,
             Self::Command { .. }
                 | Self::ConfirmDelete(_)
+                | Self::DismissDelete(_)
                 | Self::DeleteBranchChanged(..)
                 | Self::ForceDeleteBranch(_)
                 | Self::KeepBranch(_)
@@ -1108,7 +1121,7 @@ impl Cagents {
         Task::batch([
             read,
             options.unwrap_or_else(Task::none),
-            iced::widget::operation::focus(widget::Id::new("dialog.project.close"))
+            iced::widget::operation::focus(deletion_control_id(request, "cancel"))
                 .map(cosmic::Action::App),
         ])
     }
@@ -1621,6 +1634,7 @@ impl Cagents {
         self.project_dialog_on_top()
             && self.project_ui.force_branches.is_empty()
             && self.project_ui.cleanup_dialog.is_none()
+            && self.project_ui.remove_dialog.is_none()
             && self.project_ui.dialog.is_some()
     }
 
@@ -1636,6 +1650,10 @@ impl Cagents {
             Action::ConfirmDelete(_)
             | Action::DeleteBranchChanged(..)
             | Action::BusyAgentsConfirmed(..) => !self.worktree_delete_dialog_on_top(),
+            Action::DismissDelete(request) => {
+                !self.worktree_delete_dialog_on_top()
+                    || self.project_ui.dialog.as_ref().map(|dialog| dialog.request) != Some(*request)
+            }
             Action::ConfirmRemove(request) | Action::DismissRemove(request) => {
                 self.project_ui.removal_request() != Some(*request)
                     || !self.project_ui.force_branches.is_empty()
@@ -1643,9 +1661,9 @@ impl Cagents {
                     || self.project_ui.dialog.is_some()
             }
             Action::Dismiss => {
-                self.project_ui.remove_dialog.is_some()
-                    && self.project_ui.force_branches.is_empty()
-                    && self.project_ui.cleanup_dialog.is_none()
+                !self.project_ui.force_branches.is_empty()
+                    || ((self.project_ui.remove_dialog.is_some() || self.project_ui.dialog.is_some())
+                        && self.project_ui.cleanup_dialog.is_none())
             }
             _ => false,
         };
@@ -2064,26 +2082,10 @@ impl Cagents {
                 self.project_ui.remove_dialog = None;
                 return self.project_dialog_closed();
             }
+            Action::DismissDelete(_) => return self.dismiss_worktree_delete_dialog(),
             Action::Dismiss => {
-                if self.project_ui.force_branches.pop_front().is_some() {
-                    return self.project_dialog_closed();
-                }
                 self.project_ui.cleanup_dialog = None;
-                self.project_ui.pending_delete.clear();
-                let dismissed = self.project_ui.dialog.take();
-                // Declining to run a failed deletion again is the answer to
-                // it, so its row stops asking.
-                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-                    && self
-                        .project_ui
-                        .deletions
-                        .get(&id)
-                        .is_some_and(|deletion| deletion.failure.is_some())
-                {
-                    self.project_ui.deletions.remove(&id);
-                    self.sync_worktree_operation_rows();
-                }
-                return self.project_dialog_closed();
+                return self.dismiss_worktree_delete_dialog();
             }
             Action::ConfirmRemove(_) => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
@@ -2185,9 +2187,7 @@ impl Cagents {
                         self.project_ui
                             .force_branches
                             .push_back((request, failure.detail));
-                        return iced::widget::operation::focus(widget::Id::new(
-                            "dialog.branch.keep",
-                        ))
+                        return iced::widget::operation::focus(self.project_ui.focus_target())
                         .map(cosmic::Action::App);
                     }
                     Err(failure)
@@ -3056,6 +3056,22 @@ impl Cagents {
         true
     }
 
+    /// Cancels this review and its not-yet-started queued deletions.
+    fn dismiss_worktree_delete_dialog(&mut self) -> Task<Message> {
+        self.project_ui.pending_delete.clear();
+        let dismissed = self.project_ui.dialog.take();
+        // Declining to run a failed deletion again is the answer to it,
+        // so its row stops asking.
+        if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
+            && self.project_ui.deletions.get(&id)
+                .is_some_and(|deletion| deletion.failure.is_some())
+        {
+            self.project_ui.deletions.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
+        self.project_dialog_closed()
+    }
+
     /// Hands focus back to whatever the dialog covered.
     fn project_dialog_closed(&mut self) -> Task<Message> {
         let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
@@ -3261,11 +3277,20 @@ impl Cagents {
     }
 
     pub(super) fn project_dialog_dismiss_action(&self) -> Action {
+        if let Some((request, _)) = self.project_ui.force_branches.front() {
+            return Action::KeepBranch(request.id);
+        }
         if self.project_ui.force_branches.is_empty()
             && self.project_ui.cleanup_dialog.is_none()
             && let Some(request) = self.project_ui.removal_request()
         {
             return Action::DismissRemove(request);
+        }
+        if self.project_ui.force_branches.is_empty()
+            && self.project_ui.cleanup_dialog.is_none()
+            && let Some(dialog) = &self.project_ui.dialog
+        {
+            return Action::DismissDelete(dialog.request);
         }
         Action::Dismiss
     }
@@ -3273,20 +3298,33 @@ impl Cagents {
     pub(super) fn project_dialog_overlay(&self) -> Option<Element<'_, Message>> {
         let surface = self.project_dialog_view()?;
         let dismiss = self.project_dialog_dismiss_action();
-        let request = match &dismiss {
-            Action::DismissRemove(request) => Some(*request),
-            _ => None,
-        };
-        let overlay = super::dialog_ui::overlay(surface, Some(Message::ProjectUi(dismiss)), 1.0);
-        Some(if let Some(request) = request {
-            // Replace unnamed native press state too. Named controls also carry
-            // this request because iced restores their state outside keyed diff.
-            iced::widget::keyed::Column::with_children([(request, overlay)])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            overlay
+        let overlay = super::dialog_ui::overlay(
+            surface,
+            Some(Message::ProjectUi(dismiss.clone())),
+            1.0,
+        );
+        Some(match dismiss {
+            Action::DismissRemove(request) => {
+                // Replace unnamed native press state too. Named controls also
+                // carry this request: iced restores them outside keyed diff.
+                iced::widget::keyed::Column::with_children([(request, overlay)])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            Action::DismissDelete(request) => {
+                iced::widget::keyed::Column::with_children([(request, overlay)])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            Action::KeepBranch(request) => {
+                iced::widget::keyed::Column::with_children([(request, overlay)])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            _ => overlay,
         })
     }
 
@@ -3299,8 +3337,8 @@ impl Cagents {
                 super::notice_body("Force deletion can lose commits that are not merged. This confirmation applies only to the commit shown below; a changed or checked-out branch is retained."),
                 super::notice_detail(&request.expected_oid),
                 super::dialog_ui::confirmation_actions(
-                    crate::ui_controls::button::secondary("Keep branch").id(widget::Id::new("dialog.branch.keep")).on_press(Message::ProjectUi(Action::KeepBranch(request.id))),
-                    crate::ui_controls::button::destructive("Force delete branch").on_press(Message::ProjectUi(Action::ForceDeleteBranch(request.id))),
+                    crate::ui_controls::button::secondary("Keep branch").id(force_branch_control_id(request.id, "keep")).on_press(Message::ProjectUi(Action::KeepBranch(request.id))),
+                    crate::ui_controls::button::destructive("Force delete branch").id(force_branch_control_id(request.id, "force")).on_press(Message::ProjectUi(Action::ForceDeleteBranch(request.id))),
                 ),
             ]).spacing(space::M), 500.0));
         }
@@ -3551,10 +3589,10 @@ impl Cagents {
         };
         let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
-                .id(widget::Id::new("dialog.project.close"))
-                .on_press(Message::ProjectUi(Action::Dismiss)),
+                .id(deletion_control_id(request, "cancel"))
+                .on_press(Message::ProjectUi(Action::DismissDelete(request))),
             crate::ui_controls::button::destructive(label)
-                .id(widget::Id::new("dialog.project.confirm"))
+                .id(deletion_control_id(request, "confirm"))
                 .on_press_maybe(confirm),
         );
         let form = widget::container(
@@ -6033,6 +6071,256 @@ mod tests {
         }
     }
 
+    fn deletion_review_fixture() -> (Cagents, tempfile::TempDir, WorktreeId) {
+        let repository = PathBuf::from("/delete-native-owner");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(), repository.clone(), Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(), repository.join("linked"), Some("feature".into()),
+        );
+        let (mut app, directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        app.project_ui.deletions.insert(linked.id, Deletion {
+            target, started_at: Instant::now(), failure: Some("owned earlier attempt failed".into()),
+        });
+        ready_deletion_retry(&mut app, linked.id);
+        (app, directory, linked.id)
+    }
+
+    fn ready_deletion_retry(app: &mut Cagents, worktree: WorktreeId) -> u64 {
+        // Use the actual failed-row retry route, including its replacement of
+        // an existing review; worker tasks stay unpolled in this UI fixture.
+        drop(app.handle_project_action(Action::RetryDelete(worktree)));
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::DeleteOptionsRead {
+            request,
+            result: Ok(DeleteOptions {
+                branch_elsewhere: false, stale_lock: false, lock_error: None,
+            }),
+        }));
+        let result = fixture_safety_result(app, Ok((clean_snapshot(), AgentCensus::default())), false);
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result }));
+        let review = app.project_ui.dialog.as_ref().unwrap();
+        assert!(review.safety.is_some() && review.stop_authorization.is_some());
+        assert!(!review.loading && !review.options_loading && review.blocker.is_none());
+        request
+    }
+
+    #[test]
+    fn deletion_old_cancel_and_backdrop_preserve_the_replacement_review() {
+        use cosmic::iced::{Point, advanced::widget::Tree, mouse};
+        for role in [None, Some("cancel")] {
+            let (mut app, _directory, worktree) = deletion_review_fixture();
+            let old = app.project_ui.dialog.as_ref().unwrap().request;
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut tree, &renderer);
+            let point = role.map(|role| bounds[&deletion_control_id(old, role).to_string()].center())
+                .unwrap_or(Point::new(4.0, 4.0));
+            let mut messages = removal_pointer_event(
+                &mut element, &mut tree, &renderer, &node, point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            );
+            messages.extend(removal_pointer_event(
+                &mut element, &mut tree, &renderer, &node, point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ));
+            assert!(matches!(messages.as_slice(), [Message::ProjectUi(Action::DismissDelete(request))] if *request == old));
+            drop(element);
+            let current = ready_deletion_retry(&mut app, worktree);
+            assert_ne!(old, current);
+            for message in messages { drop(app.update(message)); }
+            drop(app.handle_project_action(Action::Dismiss));
+            assert_eq!(app.project_ui.dialog.as_ref().unwrap().request, current);
+            assert!(!app.project_ui.is_deleting(worktree));
+            drop(app.handle_project_action(Action::DismissDelete(current)));
+            assert!(app.project_ui.dialog.is_none());
+            assert!(app.project_ui.pending_delete.is_empty());
+        }
+    }
+
+    #[test]
+    fn deletion_native_press_does_not_transfer_to_a_replacement_review() {
+        use cosmic::iced::{advanced::widget::{Tree, tree}, mouse};
+        for role in ["cancel", "confirm"] {
+            let (mut app, _directory, worktree) = deletion_review_fixture();
+            let old = app.project_ui.dialog.as_ref().unwrap().request;
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut state = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let point = bounds[&deletion_control_id(old, role).to_string()].center();
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            ).is_empty());
+            drop(element);
+            let current = ready_deletion_retry(&mut app, worktree);
+            let mut element = app.dialog().unwrap();
+            // Actual pinned runtime ordering: named state is lifted before
+            // keyed diff and restored afterward, with no empty frame between.
+            tree::NAMED.with(|named| *named.borrow_mut() = state.take_all_named());
+            state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let current_point = bounds[&deletion_control_id(current, role).to_string()].center();
+            assert_ne!(old, current);
+            assert_eq!(point, current_point);
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ).is_empty());
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            ).is_empty());
+            let messages = removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            );
+            assert_eq!(messages.len(), 1, "the current review remains usable");
+            assert!(match &messages[0] {
+                Message::ProjectUi(Action::DismissDelete(request)) if role == "cancel" => *request == current,
+                Message::ProjectUi(Action::ConfirmDelete(request)) if role == "confirm" => *request == current,
+                _ => false,
+            });
+            drop(element);
+            for message in messages { drop(app.update(message)); }
+            if role == "cancel" {
+                assert!(app.project_ui.dialog.is_none());
+            } else {
+                let review = app.project_ui.dialog.as_ref().unwrap();
+                assert_eq!(review.request, current);
+                assert!(review.loading, "only a fresh current press starts its recheck");
+            }
+            assert!(!app.project_ui.is_deleting(worktree), "no worker was polled");
+        }
+    }
+
+    fn queued_force_reviews() -> (Cagents, crate::model::OperationId, crate::model::OperationId) {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut ids = Vec::new();
+        for branch in ["branch-a", "branch-b"] {
+            let request = BranchDeletion {
+                id: crate::model::OperationId::new(), repository: "/repo".into(),
+                branch: branch.into(), expected_oid: "a".repeat(40), warnings: Vec::new(),
+                continuation: Some(fixture_branch_continuation()),
+            };
+            ids.push(request.id);
+            app.project_ui.branch_requests.insert(request.id);
+            drop(app.handle_project_action(Action::BranchDeleted {
+                request,
+                result: Err(crate::worktree_branch::BranchDeleteFailure {
+                    kind: crate::worktree_branch::BranchDeleteFailureKind::Unmerged,
+                    detail: "Original checked branch was not merged".into(),
+                }),
+            }));
+        }
+        assert_eq!(app.project_ui.force_branches.len(), 2);
+        (app, ids[0], ids[1])
+    }
+
+    fn escape_project_review(app: &mut Cagents) {
+        use cosmic::iced::keyboard::{self, key::{Code, Named}};
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(Named::Escape),
+                modified_key: keyboard::Key::Named(Named::Escape),
+                physical_key: keyboard::key::Physical::Code(Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+            },
+            captured: false,
+        }));
+    }
+
+    #[test]
+    fn queued_force_old_keep_and_backdrop_preserve_the_next_branch() {
+        use cosmic::iced::{Point, advanced::widget::Tree, mouse};
+        for role in [None, Some("keep")] {
+            let (mut app, old, current) = queued_force_reviews();
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut tree, &renderer);
+            let point = role.map(|role| bounds[&force_branch_control_id(old, role).to_string()].center())
+                .unwrap_or(Point::new(4.0, 4.0));
+            let mut messages = removal_pointer_event(
+                &mut element, &mut tree, &renderer, &node, point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            );
+            messages.extend(removal_pointer_event(
+                &mut element, &mut tree, &renderer, &node, point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ));
+            assert!(matches!(messages.as_slice(), [Message::ProjectUi(Action::KeepBranch(id))] if *id == old));
+            drop(element);
+            escape_project_review(&mut app);
+            assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
+            for message in messages { drop(app.update(message)); }
+            drop(app.handle_project_action(Action::Dismiss));
+            assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
+            assert!(app.project_ui.branch_requests.is_empty());
+            drop(app.handle_project_action(Action::KeepBranch(current)));
+            assert!(app.project_ui.force_branches.is_empty());
+        }
+    }
+
+    #[test]
+    fn queued_force_native_press_does_not_transfer_after_escape() {
+        use cosmic::iced::{advanced::widget::{Tree, tree}, mouse};
+        for role in ["keep", "force"] {
+            let (mut app, old, current) = queued_force_reviews();
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.dialog().unwrap();
+            let mut state = Tree::new(element.as_widget());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let point = bounds[&force_branch_control_id(old, role).to_string()].center();
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            ).is_empty());
+            drop(element);
+            escape_project_review(&mut app);
+            assert_eq!(app.project_ui.force_branches.front().unwrap().0.id, current);
+            let mut element = app.dialog().unwrap();
+            tree::NAMED.with(|named| *named.borrow_mut() = state.take_all_named());
+            state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            let (node, bounds) = removal_native_frame(&mut element, &mut state, &renderer);
+            let current_point = bounds[&force_branch_control_id(current, role).to_string()].center();
+            assert_eq!(point, current_point);
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ).is_empty());
+            assert!(removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+            ).is_empty());
+            let messages = removal_pointer_event(
+                &mut element, &mut state, &renderer, &node, current_point,
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(match &messages[0] {
+                Message::ProjectUi(Action::KeepBranch(id)) if role == "keep" => *id == current,
+                Message::ProjectUi(Action::ForceDeleteBranch(id)) if role == "force" => *id == current,
+                _ => false,
+            });
+            drop(element);
+            for message in messages { drop(app.update(message)); }
+            assert!(app.project_ui.force_branches.is_empty());
+            assert_eq!(app.project_ui.branch_requests.contains(&current), role == "force");
+            assert!(!app.project_ui.branch_requests.contains(&old));
+            // The returned force-delete task is deliberately never polled.
+        }
+    }
+
     #[test]
     fn opened_project_and_worktree_removal_focus_the_cancel_button() {
         let repository = PathBuf::from("/focus-repo");
@@ -6072,7 +6360,7 @@ mod tests {
         assert!(app.project_ui.dialog.as_ref().unwrap().blocker.is_some());
         assert_eq!(
             super::super::tests::focused_element(app.project_dialog_view().unwrap(), task),
-            Some(widget::Id::new("dialog.project.close")),
+            Some(deletion_control_id(app.project_ui.dialog.as_ref().unwrap().request, "cancel")),
         );
     }
 
@@ -6882,7 +7170,8 @@ mod tests {
         }));
         assert!(!app.project_ui.is_deleting(linked.id));
         assert!(app.project_ui.dialog.is_some());
-        drop(app.handle_project_action(Action::Dismiss));
+        let dismiss = app.project_dialog_dismiss_action();
+        drop(app.handle_project_action(dismiss));
         assert!(app.project_ui.force_branches.is_empty());
         assert!(
             app.project_ui.dialog.is_some(),
@@ -8166,7 +8455,8 @@ mod tests {
             app.project_ui.dialog.as_ref().unwrap().failure.as_deref(),
             Some("fatal: cannot remove")
         );
-        let _ = app.handle_project_action(Action::Dismiss);
+        let dismiss = app.project_dialog_dismiss_action();
+        let _ = app.handle_project_action(dismiss);
         assert_eq!(row(&app, id).unwrap().deletion, None);
         assert!(app.project_ui.deletions.is_empty());
     }
@@ -8956,7 +9246,7 @@ mod tests {
         }));
         assert_eq!(
             app.project_ui.focus_target(),
-            widget::Id::new("dialog.project.close")
+            deletion_control_id(request, "cancel")
         );
         drop(app.handle_project_action(Action::ConfirmDelete(request)));
         assert!(app.project_ui.dialog.as_ref().unwrap().loading);
@@ -8991,7 +9281,8 @@ mod tests {
             !app.project_ui.is_deleting(linked.id),
             "changed inspection cannot be rebound within the same dialog"
         );
-        drop(app.handle_project_action(Action::Dismiss));
+        let dismiss = app.project_dialog_dismiss_action();
+        drop(app.handle_project_action(dismiss));
         drop(app.handle_project_action(Action::Command {
             project_id: project,
             worktree_id: Some(linked.id),
@@ -9047,7 +9338,8 @@ mod tests {
         };
         drop(app.handle_project_action(command.clone()));
         let old_request = app.project_ui.dialog.as_ref().unwrap().request;
-        drop(app.handle_project_action(Action::Dismiss));
+        let dismiss = app.project_dialog_dismiss_action();
+        drop(app.handle_project_action(dismiss));
         drop(app.handle_project_action(command));
         drop(app.handle_project_action(Action::SafetyRead {
             request: old_request,
@@ -9187,7 +9479,8 @@ mod tests {
             app.project_ui.dialog.as_ref().unwrap().target.worktree,
             Some(second.id)
         );
-        drop(app.handle_project_action(Action::Dismiss));
+        let dismiss = app.project_dialog_dismiss_action();
+        drop(app.handle_project_action(dismiss));
         assert!(!app.project_ui.is_deleting(second.id));
         assert!(app.project_ui.pending_delete.is_empty());
     }
