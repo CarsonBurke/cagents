@@ -972,7 +972,6 @@ mod tests {
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("{}:{}", metadata.dev(), metadata.ino()));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn inherited_file_keeps_parent_cloexec_and_distinct_descriptor_identity() {
         let temporary = tempfile::tempdir().unwrap();
@@ -982,11 +981,14 @@ mod tests {
         // SAFETY: fcntl only inspects the live, owned descriptor.
         let before = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
         assert_ne!(before & libc::FD_CLOEXEC, 0);
-        let spec = CommandSpec::new("/usr/bin/stat")
-            .args(["-L", &format!("/proc/self/fd/{descriptor}")])
+        // This fixture checks descriptor identity and parent flags on Unix;
+        // the Linux-only fixture above proves actual directory access through
+        // an inherited descriptor across exec without assuming BSD stat flags.
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c", ":"])
             .inherit_file(original.clone()).unwrap();
-        let other = CommandSpec::new("/usr/bin/stat")
-            .args(["-L", &format!("/proc/self/fd/{descriptor}")])
+        let other = CommandSpec::new("/bin/sh")
+            .args(["-c", ":"])
             .inherit_file(duplicate).unwrap();
         assert_ne!(spec, other);
         assert!(spec.to_command().output().unwrap().status.success());
