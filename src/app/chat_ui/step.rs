@@ -288,7 +288,7 @@ impl Runtime {
 
     pub(super) fn observed_turn_time(&self, turn: &turn::Turn, now: Option<u64>) -> Option<u64> {
         if turn.running && !self.observes_live_work() {
-            self.snapshot.sampled_at.or(turn.ended_at)
+            turn.last_observed_at()
         } else {
             now
         }

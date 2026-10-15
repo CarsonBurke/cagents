@@ -1041,6 +1041,14 @@ impl Runtime {
         }
     }
 
+    fn native_child_empty_message(&self, agent: &chat::Subagent) -> &'static str {
+        if agent.status == chat::ToolStatus::Running && self.observes_live_work() {
+            "Waiting for subagent activity…"
+        } else {
+            "No recent subagent activity is available here."
+        }
+    }
+
     fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
@@ -1207,7 +1215,7 @@ impl Runtime {
                     chat_title(Self::short_description(Self::native_child_name(agent), 80))
                         .width(Length::Fill)
                         .into(),
-                    design::heading(Self::native_child_status(agent))
+                    design::heading(self.observed_native_child_status(agent))
                         .size(design::TEXT_CAPTION)
                         .into(),
                 ])
@@ -1255,11 +1263,7 @@ impl Runtime {
             );
             if agent.items.is_empty() {
                 transcript.push(transcript_body(
-                    if agent.status == chat::ToolStatus::Running {
-                        "Waiting for subagent activity…"
-                    } else {
-                        "No recent subagent activity is available here."
-                    },
+                    self.native_child_empty_message(agent),
                     target,
                 ));
             }
@@ -5512,7 +5516,7 @@ mod tests {
             assert!(!runtime.observes_live_work());
             assert_eq!(runtime.conversation_status(false).1, "Cancelled");
             assert!(runtime.observed_turn_summary(turn).ends_with(" · last reported running"));
-            assert_eq!(runtime.observed_turn_duration(turn, Some(5000)).as_deref(), Some("observed 3s"));
+            assert_eq!(runtime.observed_turn_duration(turn, Some(5000)).as_deref(), Some("observed 1s"));
             assert_eq!(
                 runtime.observed_turn_duration(turn, Some(5000)),
                 runtime.observed_turn_duration(turn, Some(90000))
@@ -5521,6 +5525,27 @@ mod tests {
             assert_ne!(unknown, live, "observation loss invalidates the retained live strip");
             assert_eq!(unknown, runtime.turn_fingerprint_at(turn, true, Some(90000)));
             assert_eq!(runtime.observed_native_child_status(&runtime.snapshot.subagents[0]), "Last reported waiting");
+            assert_eq!(runtime.native_child_empty_message(&runtime.snapshot.subagents[0]), "No recent subagent activity is available here.");
+            // Publication time is not fresh native evidence. Repeated reads
+            // of retained items cannot advance the last-observed duration.
+            for sampled_at in [15000, 90000] {
+                snapshot.sampled_at = Some(sampled_at);
+                snapshot.generation += 1;
+                handle.replace_snapshot_for_test(snapshot.clone());
+                runtime.refresh();
+                runtime.disconnected = !exited;
+                assert_eq!(runtime.observed_turn_duration(&runtime.turns[0], Some(sampled_at)).as_deref(), Some("observed 1s"));
+                assert_eq!(runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(sampled_at)), unknown);
+            }
+            // A fresh native item observation can legitimately renew evidence
+            // even while the observer remains unavailable.
+            Arc::make_mut(&mut snapshot.items[0]).at = Some(6000);
+            snapshot.generation += 1;
+            handle.replace_snapshot_for_test(snapshot.clone());
+            runtime.refresh();
+            runtime.disconnected = !exited;
+            assert_eq!(runtime.observed_turn_duration(&runtime.turns[0], Some(90000)).as_deref(), Some("observed 5s"));
+            assert_ne!(runtime.turn_fingerprint_at(&runtime.turns[0], true, Some(90000)), unknown);
             // A fresh observed snapshot can report the same still-running
             // external work. This is a presentation fixture, not rehosting.
             snapshot.exited = false;

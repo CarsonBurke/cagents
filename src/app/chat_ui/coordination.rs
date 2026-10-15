@@ -323,7 +323,7 @@ fn arrival(arrival: Arrival) -> &'static str {
 }
 
 /// How a run stands, and which agent runs it, as one status line.
-fn run_line(run: &Run) -> Option<(String, Tone)> {
+fn run_line(run: &Run, observed: bool) -> Option<(String, Tone)> {
     let agent = (!run.agent.is_empty()).then(|| format!("agent {}", run.agent));
     let tone = match run.state {
         Some(State::Failed | State::Interrupted) => Tone::Error,
@@ -331,7 +331,7 @@ fn run_line(run: &Run) -> Option<(String, Tone)> {
         _ => Tone::Plain,
     };
     let state = run.state.map(|state| {
-        let mut state = state_phrase(state).to_owned();
+        let mut state = observed_state_phrase(state, observed).to_owned();
         if run.timed_out {
             state.push_str(", wait timed out");
         }
@@ -355,6 +355,14 @@ fn state_phrase(state: State) -> &'static str {
         State::Failed => "Failed",
         State::Cancelled => "Cancelled",
         State::Interrupted => "Interrupted",
+    }
+}
+
+fn observed_state_phrase(state: State, observed: bool) -> &'static str {
+    match (state, observed) {
+        (State::Running, false) => "Last reported running",
+        (State::Waiting, false) => "Last reported waiting for an answer",
+        _ => state_phrase(state),
     }
 }
 
@@ -709,7 +717,7 @@ impl Runtime {
                 Some((arrival(receipt.arrival).to_owned(), Tone::Plain))
             }
             // A prompt to an agent starts a run of it.
-            _ => reading.outcome.run.as_ref().and_then(run_line),
+            _ => reading.outcome.run.as_ref().and_then(|run| run_line(run, self.observes_live_work())),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
@@ -863,7 +871,7 @@ impl Runtime {
                     Tone::Error,
                 ))
             }
-            _ => run.and_then(run_line),
+            _ => run.and_then(|run| run_line(run, self.observes_live_work())),
         };
         if let Some((text, tone)) = line {
             rows.push(status_caption(text, tone));
@@ -1116,7 +1124,7 @@ impl Runtime {
             // session. Report its observed state, or only the accepted launch.
             Some(
                 match coordinated.reading.outcome.run.as_ref() {
-                    Some(run) => run.state.map_or("Launch accepted", state_phrase),
+                    Some(run) => run.state.map_or("Launch accepted", |state| observed_state_phrase(state, self.observes_live_work())),
                     None => "Launch command finished",
                 }
                 .to_owned(),
@@ -1151,6 +1159,25 @@ impl Runtime {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn attention_completed_spawn_retains_last_reported_run_labels_when_unobserved() {
+        // A completed launch command can retain a still-running independent
+        // run. Both its card and disclosure use these shared label helpers.
+        for (state, expected) in [
+            (State::Running, "Last reported running"),
+            (State::Waiting, "Last reported waiting for an answer"),
+        ] {
+            let run = Run { agent: "worker".into(), state: Some(state), ..Default::default() };
+            assert_eq!(run_line(&run, false).unwrap().0, format!("{expected} as agent worker"));
+            assert_eq!(observed_state_phrase(state, false), expected);
+            assert_eq!(run_line(&run, true).unwrap().0, format!("{} as agent worker", state_phrase(state)));
+            assert_eq!(run.state, Some(state));
+        }
+        for state in [State::Accepted, State::Succeeded, State::Failed, State::Cancelled, State::Interrupted] {
+            assert_eq!(observed_state_phrase(state, false), state_phrase(state));
+        }
+    }
 
     #[test]
     fn launches_distinguish_native_children_and_separate_sessions_without_guessing() {

@@ -126,6 +126,11 @@ impl Turn {
         self.outcome
     }
 
+    /// Latest actual item observation, independent of snapshot read/publication time.
+    pub(super) fn last_observed_at(&self) -> Option<u64> {
+        self.ended_at
+    }
+
     /// How long this stretch of work has taken, in milliseconds.
     ///
     /// A finished group spans its earliest start to its latest update. A running
