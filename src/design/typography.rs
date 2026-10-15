@@ -394,14 +394,34 @@ mod settings_typography_tests {
         let normal_line = LineHeight::default();
         let mut retained = Tree::new(input(false, normal_line).as_widget());
         let mut fixed = Tree::new(input(true, normal_line).as_widget());
+        let paragraph = |tree: &Tree| {
+            tree.state
+                .downcast_ref::<cosmic::widget::text_input::State>()
+                .value.raw().clone()
+        };
         let original = metrics(input(false, normal_line), &mut retained);
+        let initial_paragraph = paragraph(&retained);
+        assert_eq!(metrics(input(false, normal_line), &mut retained), original);
+        assert!(std::ptr::eq(initial_paragraph.buffer(), paragraph(&retained).buffer()),
+            "unchanged relative line height must reuse the retained paragraph");
+        let equivalent_line = LineHeight::Absolute(normal_line.to_absolute(cosmic::iced::Pixels(13.0)));
+        assert_eq!(metrics(input(false, equivalent_line), &mut retained), original);
+        assert!(std::ptr::eq(initial_paragraph.buffer(), paragraph(&retained).buffer()),
+            "equivalent relative and absolute line heights must reuse the paragraph");
         let fixed_original = metrics(input(true, normal_line), &mut fixed);
         for (family, size) in [(first, 24.0), (second, 24.0), (first, 13.0)] {
             configure_typography(family, size, "", 14.0);
             let actual = metrics(input(false, normal_line), &mut retained);
             assert_eq!(actual.0, cosmic::font::default());
             assert_eq!(actual.1, cosmic::iced::Pixels(size));
-            assert_eq!(actual.2, normal_line);
+            assert_eq!(actual.2.to_absolute(cosmic::iced::Pixels(size)),
+                normal_line.to_absolute(cosmic::iced::Pixels(size)));
+            // Holding the prior Arc keeps its allocation alive: a needless
+            // replacement cannot pass by reusing a just-freed buffer address.
+            let cached = paragraph(&retained);
+            assert_eq!(metrics(input(false, normal_line), &mut retained), actual);
+            assert!(std::ptr::eq(cached.buffer(), paragraph(&retained).buffer()),
+                "unchanged layouts after typography adoption must reuse caret metrics");
             let mut expected: cosmic::Element<'_, ()> = cosmic::widget::text(value)
                 .font(cosmic::font::default()).size(size).line_height(normal_line)
                 .shaping(cosmic::iced::advanced::text::Shaping::Advanced).into();
