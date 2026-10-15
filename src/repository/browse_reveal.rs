@@ -7,7 +7,7 @@ use std::path::Path;
 /// Include only an entry verified beneath this worktree. For a deleted file,
 /// include its nearest existing parent; a root-level deletion reveals the root
 /// without inventing a child or treating a missing path as an existing file.
-pub(crate) fn include(
+pub fn include(
     worktree: &Path,
     files: &mut WorkingFiles,
     requested: &RepoPath,

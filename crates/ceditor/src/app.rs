@@ -158,6 +158,12 @@ pub enum Message {
     Notification(notification_ui::Action),
     StartupWindowOpened,
     Snapshot(CardId, Result<RepositorySnapshot, String>),
+    RevealedInFiles {
+        card: CardId,
+        key: sidebar::ActiveWorktreeKey,
+        requested: RepoPath,
+        result: Result<(RepositorySnapshot, Option<RepoPath>), String>,
+    },
     Mutation(CardId, Result<MutationOutcome, String>),
     Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
     Committed(CardId, String, Result<CommitOutcome, String>),
@@ -3878,6 +3884,30 @@ impl Application for Editor {
                                     ),
                             }
                         }
+                        SidebarAction::RevealChangeInFiles { key, path } => {
+                            tab.navigation.reveal_in_files(path.clone());
+                            self.sidebar_panel = WorktreePanel::Files;
+                            let requested = path.clone();
+                            let root = key.canonical_path.clone();
+                            cosmic::task::future(async move {
+                                let worker_path = path.clone();
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let mut snapshot = RepositoryService::system("git").snapshot(&root, &CancellationToken::default()).map_err(|error| error.to_string())?;
+                                    let target = cagents::repository::include_revealed_path(&root, &mut snapshot.files, &worker_path).map_err(|error| error.to_string())?;
+                                    Ok((snapshot, target))
+                                }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                                Message::RevealedInFiles { card: id, key, requested, result }
+                            })
+                        }
+                        SidebarAction::IgnoreChangePath { path, .. } => {
+                            let eligible = tab.sidebar.source_control.as_ref().is_some_and(|source| source.group(cagents::repository::ChangeArea::Untracked).is_some_and(|group| group.rows().iter().any(|row| row.entry.path == path)));
+                            if !eligible { return Task::none(); }
+                            let Some(root) = self.begin_mutation(id, MutationKind::Other) else { return Task::none(); };
+                            cosmic::task::future(async move {
+                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").git_operation(&root, &cagents::repository::GitOperation::IgnorePath { path }, &CancellationToken::default())).await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::Mutation(id, result)
+                            })
+                        }
                         SidebarAction::OpenFile { path, .. } => {
                             self.request_file(id, path.as_path().to_path_buf())
                         }
@@ -3977,6 +4007,21 @@ impl Application for Editor {
                         }
                     }
                     Task::batch([task, report])
+                }
+                Message::RevealedInFiles { card, key, requested, result } => {
+                    let Some(tab) = self.tab_mut(card).filter(|tab| tab.navigation.active_worktree() == Some(&key) && tab.navigation.files_reveal_demand() == Some(&requested)) else { return Task::none(); };
+                    match result {
+                        Ok((snapshot, target)) => {
+                            let mut source = SourceControlModel::ready(key, &snapshot);
+                            source.revealed_path = target;
+                            if let Some(previous) = tab.sidebar.source_control.as_ref() { previous.carry_mutation_into(&mut source); }
+                            tab.navigation.reconcile_change_rows(&source);
+                            let focus = tab.navigation.finish_reveal_in_files(&source);
+                            tab.sidebar.source_control = Some(source);
+                            focus.map_or_else(Task::none, |id| iced::widget::operation::focus(id).map(cosmic::Action::App))
+                        }
+                        Err(error) => { self.notice = Some(format!("Could not reveal the requested path: {error}")); Task::none() }
+                    }
                 }
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
@@ -7214,6 +7259,32 @@ mod tests {
             file_operation_destination(source, " renamed λ.txt ").unwrap(),
             Path::new("src/ renamed λ.txt "),
         );
+    }
+
+    #[test]
+    fn registered_change_navigation_and_ignore_keep_their_exact_host_path() {
+        use cagents::workspace_widget::GlobalShortcut as Command;
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        std::fs::write(root.join("nested/deep/a.txt"), "first\n").unwrap();
+        std::fs::write(root.join("other.txt"), "second\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let path = RepoPath::parse("nested/deep/a.txt").unwrap();
+        let row = sidebar::ChangeSelectionRow { area: cagents::repository::ChangeArea::Untracked, path: path.clone() };
+        let capture = |app: &Editor, command| SidebarAction::RunChangeCommand { command, key: key.clone(), row: row.clone(), selection_revision: app.tab(id).unwrap().navigation.change_selection_revision() };
+        let reveal = capture(&app, Command::RevealInFiles);
+        sidebar_action(&mut app, reveal);
+        assert_eq!(app.sidebar_panel, WorktreePanel::Files);
+        assert_eq!(app.tab(id).unwrap().navigation.selected_file(), Some(&path));
+        assert!(app.tab(id).unwrap().navigation.directory_is_expanded(&RepoPath::parse("nested/deep").unwrap()));
+        let ignore = capture(&app, Command::IgnoreChangePath);
+        sidebar_action(&mut app, ignore);
+        assert!(git(root, &["ls-files", "--others", "--exclude-standard", "--", "nested/deep/a.txt"]).is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("other.txt")).unwrap(), "second\n");
+        assert!(std::fs::read_to_string(root.join(".gitignore")).unwrap().contains("a.txt"));
     }
 
     #[test]

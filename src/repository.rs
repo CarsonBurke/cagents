@@ -20,7 +20,7 @@ use std::{
 
 mod ignore_path;
 mod browse_reveal;
-pub(crate) use browse_reveal::include as include_revealed_path;
+pub use browse_reveal::include as include_revealed_path;
 mod status_limit;
 
 use crate::fs_safety;
