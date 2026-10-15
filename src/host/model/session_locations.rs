@@ -547,8 +547,12 @@ impl Registry {
         &self,
         retained: &[HostedSession],
     ) -> Result<Option<PathBuf>, String> {
-        let Some(first) = retained.first() else { return Ok(None) };
-        let Some(location) = read(&self.db, first.id())? else { return Ok(None) };
+        let Some(first) = retained.first() else {
+            return Ok(None);
+        };
+        let Some(location) = read(&self.db, first.id())? else {
+            return Ok(None);
+        };
         if retained.iter().any(|source| source.id() != first.id()) {
             return Err("Orphan sources contain different session identities".into());
         }

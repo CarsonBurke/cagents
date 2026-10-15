@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod reservation;
 mod census;
+mod reservation;
 use reservation::Reservation;
 pub(super) use reservation::{
     Reservations, admit, ensure_agent_available, ensure_available, reserve,
@@ -739,108 +739,243 @@ mod tests {
 
     #[test]
     fn authenticated_stalled_holder_census_expires_without_closing_healthy_pane() {
-        const STAGE:&str="CAGENTS_STALLED_PROJECT_HOLDER_TEST";
+        const STAGE: &str = "CAGENTS_STALLED_PROJECT_HOLDER_TEST";
         if std::env::var_os(STAGE).is_none() {
-            let runtime=tempfile::tempdir_in("/var/tmp").unwrap();
+            let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
             let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","host::project_removal::tests::authenticated_stalled_holder_census_expires_without_closing_healthy_pane","--nocapture"]).env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path()).env("XDG_DATA_HOME",runtime.path().join("data")).output().unwrap();
-            assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        use crate::daemon::holder_registry::{self as holders,Kind,Process,Record};
-        let mut fixture=Fixture::with_proof(HostSessionProof {
-            host_session_id:HostSessionId::new("stalled-census"),
-            boot_id:crate::daemon::read_boot_id().unwrap(),
-            host_incarnation:HostIncarnation::new("original"),
+        use crate::daemon::holder_registry::{self as holders, Kind, Process, Record};
+        let mut fixture = Fixture::with_proof(HostSessionProof {
+            host_session_id: HostSessionId::new("stalled-census"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("original"),
         });
-        let healthy=fixture.spawn(crate::model::TerminalId::new());
-        let directory=holders::directory(Kind::Native).unwrap();
+        let healthy = fixture.spawn(crate::model::TerminalId::new());
+        let directory = holders::directory(Kind::Native).unwrap();
         crate::secure_file::prepare_private_directory(&directory).unwrap();
-        let record=Record { version:3,kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:crate::daemon::read_boot_id().unwrap(),terminal:crate::model::TerminalId::new(),holder:Process::read(std::process::id() as i32).unwrap(),root:Process::read(std::process::id() as i32).unwrap() };
-        let endpoint=holders::socket(&directory,record.terminal);
-        let listener=std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let record = Record {
+            version: 3,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: crate::daemon::read_boot_id().unwrap(),
+            terminal: crate::model::TerminalId::new(),
+            holder: Process::read(std::process::id() as i32).unwrap(),
+            root: Process::read(std::process::id() as i32).unwrap(),
+        };
+        let endpoint = holders::socket(&directory, record.terminal);
+        let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
         record.create(&directory).unwrap();
-        let (release,wait)=crossbeam_channel::bounded::<()>(1);
-        let server=std::thread::spawn(move || { let (_socket,_)=listener.accept().unwrap(); wait.recv_timeout(Duration::from_secs(3)).unwrap(); });
-        let reservation=reserve(&fixture.host,&fixture.expected,&[healthy]).unwrap();
-        let start=Instant::now();
-        let failure=census::require_no_unhosted_owners_until(&fixture.host,&reservation,start+Duration::from_millis(80)).unwrap_err();
-        assert!(failure.message.contains("could not be authenticated"),"{failure:?}");
-        assert!(start.elapsed()<Duration::from_secs(2));
+        let (release, wait) = crossbeam_channel::bounded::<()>(1);
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let reservation = reserve(&fixture.host, &fixture.expected, &[healthy]).unwrap();
+        let start = Instant::now();
+        let failure = census::require_no_unhosted_owners_until(
+            &fixture.host,
+            &reservation,
+            start + Duration::from_millis(80),
+        )
+        .unwrap_err();
+        assert!(
+            failure.message.contains("could not be authenticated"),
+            "{failure:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
         assert!(!fixture.handles[0].is_completed());
-        assert!(super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().model().unwrap().project(&fixture.root).is_some());
+        assert!(
+            super::super::agent_execution::registry(&fixture.host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .model()
+                .unwrap()
+                .project(&fixture.root)
+                .is_some()
+        );
         drop(reservation);
-        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .host
+                .lock()
+                .unwrap()
+                .project_removals
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         release.send(()).unwrap();
         server.join().unwrap();
         assert!(endpoint.exists());
-        assert!(holders::evidence(&endpoint,Kind::Native).unwrap().is_some());
+        assert!(
+            holders::evidence(&endpoint, Kind::Native)
+                .unwrap()
+                .is_some()
+        );
         record.remove(&directory);
     }
 
     #[test]
-    fn authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not() {
+    fn authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not()
+     {
         const STAGE: &str = "CAGENTS_PROJECT_ORPHAN_CENSUS_TEST";
         if std::env::var_os(STAGE).is_none() {
             let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "host::project_removal::tests::authenticated_orphan_holder_refuses_missing_project_before_healthy_close_but_foreign_does_not", "--nocapture"])
                 .env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path()).env("XDG_DATA_HOME",runtime.path().join("data")).output().unwrap();
-            assert!(output.status.success(), "{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         struct Retained(crate::chat::native_holder::Detached);
-        impl Drop for Retained { fn drop(&mut self) { let _ = self.0.close(); } }
-        for foreign in [false,true] {
+        impl Drop for Retained {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+            }
+        }
+        for foreign in [false, true] {
             let mut source = crate::chat::native_holder::fixture_source();
             let boot = crate::daemon::read_boot_id().unwrap();
             source.proof.as_mut().unwrap().boot_id = boot.clone();
-            source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+            source
+                .owned_codex_listener
+                .as_mut()
+                .unwrap()
+                .allocator
+                .boot_id = boot;
             let proof = source.proof.clone().unwrap();
             let paths = crate::daemon::RuntimePaths::discover().unwrap();
-            let _lease = crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+            let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
             let mut fixture = Fixture::with_proof(proof);
             let healthy = fixture.spawn(crate::model::TerminalId::new());
-            let directory = if foreign { let path=fixture._directory.path().join("foreign"); std::fs::create_dir(&path).unwrap(); path } else { fixture.root.clone() };
+            let directory = if foreign {
+                let path = fixture._directory.path().join("foreign");
+                std::fs::create_dir(&path).unwrap();
+                path
+            } else {
+                fixture.root.clone()
+            };
             source.launch.recipe.working_directory = directory.clone();
             if foreign {
-                let mut state=fixture.host.lock().unwrap();
-                state.edit_model(1,ModelEdit::OpenProject { repository:directory.clone(),checkout:None,primary_checkout:None,name:"Foreign".into(),kind:ProjectKind::Folder }).unwrap();
-                state.edit_model(1,ModelEdit::SeedView { scope:Scope::Worktree { repository:directory.clone(),path:directory.clone() },panes:vec![crate::workspace_model::views::Pane { id:crate::model::CardId::new(),title:"Retained foreign native".into(),user_title:None,pending_terminal_start:false,width_fraction:0.5,kind:crate::model::CardKind::Chat(source.clone()),scope:Some(directory.clone()) }],closed:vec![] }).unwrap();
+                let mut state = fixture.host.lock().unwrap();
+                state
+                    .edit_model(
+                        1,
+                        ModelEdit::OpenProject {
+                            repository: directory.clone(),
+                            checkout: None,
+                            primary_checkout: None,
+                            name: "Foreign".into(),
+                            kind: ProjectKind::Folder,
+                        },
+                    )
+                    .unwrap();
+                state
+                    .edit_model(
+                        1,
+                        ModelEdit::SeedView {
+                            scope: Scope::Worktree {
+                                repository: directory.clone(),
+                                path: directory.clone(),
+                            },
+                            panes: vec![crate::workspace_model::views::Pane {
+                                id: crate::model::CardId::new(),
+                                title: "Retained foreign native".into(),
+                                user_title: None,
+                                pending_terminal_start: false,
+                                width_fraction: 0.5,
+                                kind: crate::model::CardKind::Chat(source.clone()),
+                                scope: Some(directory.clone()),
+                            }],
+                            closed: vec![],
+                        },
+                    )
+                    .unwrap();
             }
-            let context = Arc::new(crate::chat::protocol::ExecutionContext::capture(&directory).unwrap());
+            let context =
+                Arc::new(crate::chat::protocol::ExecutionContext::capture(&directory).unwrap());
             let spec = crate::chat::protocol::ProcessSpec {
-                execution:Some(context.clone()),messages:None,
-                transport:crate::chat::protocol::TransportSpec::OwnedUnixWebSocket { socket:source.owned_codex_listener.as_ref().unwrap().socket.clone() },
-                program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory,
-                environment:Default::default(),unset_environment:Default::default(),
+                execution: Some(context.clone()),
+                messages: None,
+                transport: crate::chat::protocol::TransportSpec::OwnedUnixWebSocket {
+                    socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+                },
+                program: "/bin/sleep".into(),
+                arguments: vec!["60".into()],
+                working_directory: directory,
+                environment: Default::default(),
+                unset_environment: Default::default(),
             };
-            let mut holder = crate::chat::native_holder::spawn(spec,source).unwrap();
+            let mut holder = crate::chat::native_holder::spawn(spec, source).unwrap();
             context.installed();
-            let record=holder.record().clone();
-            holder.confirm(uuid::Uuid::new_v4().to_string(), crate::chat::protocol::ServerIdentity {
-                user_agent:"cagents/0.157.1 (Linux)".into(),
-                canonical_home:fixture._directory.path().join("codex-home"),
-                reported_home:fixture._directory.path().join("codex-home").to_string_lossy().into_owned(),
-            },record.root.clone()).unwrap();
-            let retained=Retained(holder.preserve());
+            let record = holder.record().clone();
+            holder
+                .confirm(
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::chat::protocol::ServerIdentity {
+                        user_agent: "cagents/0.157.1 (Linux)".into(),
+                        canonical_home: fixture._directory.path().join("codex-home"),
+                        reported_home: fixture
+                            ._directory
+                            .path()
+                            .join("codex-home")
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                    record.root.clone(),
+                )
+                .unwrap();
+            let retained = Retained(holder.preserve());
             assert!(record.root.is_current());
-            if !foreign { std::fs::rename(&fixture.root,fixture._directory.path().join("moved")).unwrap(); }
+            if !foreign {
+                std::fs::rename(&fixture.root, fixture._directory.path().join("moved")).unwrap();
+            }
             // No saved/native adoption failure map or installed chat exists:
             // the authenticated orphan census is the only ownership evidence.
             assert!(fixture.host.lock().unwrap().chats.is_empty());
-            let result=fixture.request(fixture.expected.clone(),vec![healthy]);
+            let result = fixture.request(fixture.expected.clone(), vec![healthy]);
             if foreign {
-                assert!(result.is_ok(),"{result:?}");
+                assert!(result.is_ok(), "{result:?}");
                 assert!(fixture.handles[0].is_completed());
             } else {
-                let failure=result.unwrap_err();
-                assert!(failure.message.contains("Retained session"),"{failure:?}");
+                let failure = result.unwrap_err();
+                assert!(failure.message.contains("Retained session"), "{failure:?}");
                 assert!(!fixture.handles[0].is_completed());
-                let model=super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().model().unwrap();
+                let model = super::super::agent_execution::registry(&fixture.host)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .model()
+                    .unwrap();
                 assert!(model.project(&fixture.root).is_some());
             }
-            assert!(record.root.is_current(),"census must not adopt or terminate an orphan provider");
-            assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+            assert!(
+                record.root.is_current(),
+                "census must not adopt or terminate an orphan provider"
+            );
+            assert!(
+                fixture
+                    .host
+                    .lock()
+                    .unwrap()
+                    .project_removals
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
             drop(retained);
             assert!(!record.root.is_current());
         }
@@ -848,25 +983,126 @@ mod tests {
 
     #[test]
     fn known_unhosted_native_owner_refuses_before_healthy_close_and_foreign_owner_does_not() {
-        use crate::{agent::Provider, chat::{self, Launch}, upgrade::handoff::Chat};
-        for foreign in [false,true] {
-            let mut fixture = Fixture::new(); let healthy = fixture.spawn(crate::model::TerminalId::new());
-            let root = if foreign { let path=fixture._directory.path().join("foreign"); std::fs::create_dir(&path).unwrap(); path } else { fixture.root.clone() };
-            let thread=uuid::Uuid::new_v4().to_string();
-            let mut recipe=LaunchRecipe::shell(root.clone()).unwrap(); recipe.program="claude".into(); recipe.arguments=vec!["--resume".into(),thread.clone()];
-            let source = chat::Session { id:crate::model::TerminalId::new(), launch:Launch { provider:Provider::Claude,session_id:Some(thread),recipe },proof:Some(fixture.host.lock().unwrap().proof().clone()),terminal:None,native_continuity:Default::default(),owned_codex_listener:None };
+        use crate::{
+            agent::Provider,
+            chat::{self, Launch},
+            upgrade::handoff::Chat,
+        };
+        for foreign in [false, true] {
+            let mut fixture = Fixture::new();
+            let healthy = fixture.spawn(crate::model::TerminalId::new());
+            let root = if foreign {
+                let path = fixture._directory.path().join("foreign");
+                std::fs::create_dir(&path).unwrap();
+                path
+            } else {
+                fixture.root.clone()
+            };
+            let thread = uuid::Uuid::new_v4().to_string();
+            let mut recipe = LaunchRecipe::shell(root.clone()).unwrap();
+            recipe.program = "claude".into();
+            recipe.arguments = vec!["--resume".into(), thread.clone()];
+            let source = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: Launch {
+                    provider: Provider::Claude,
+                    session_id: Some(thread),
+                    recipe,
+                },
+                proof: Some(fixture.host.lock().unwrap().proof().clone()),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+            };
             {
-                let mut state=fixture.host.lock().unwrap();
-                if foreign { state.edit_model(1,ModelEdit::OpenProject {repository:root.clone(),checkout:None,primary_checkout:None,name:"Foreign".into(),kind:ProjectKind::Folder}).unwrap(); }
-                state.edit_model(1,ModelEdit::SeedView {scope:Scope::Worktree {repository:root.clone(),path:root.clone()},panes:vec![crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:"Retained native".into(),user_title:None,pending_terminal_start:false,width_fraction:0.5,kind:crate::model::CardKind::Chat(source.clone()),scope:Some(root.clone())}],closed:vec![]}).unwrap();
-                state.native_adoption_failures.remember_upgrade(&Chat {launch:source.launch.clone(),source:source.clone(),previous_sources:vec![]},"Retained provider history cannot be read");
+                let mut state = fixture.host.lock().unwrap();
+                if foreign {
+                    state
+                        .edit_model(
+                            1,
+                            ModelEdit::OpenProject {
+                                repository: root.clone(),
+                                checkout: None,
+                                primary_checkout: None,
+                                name: "Foreign".into(),
+                                kind: ProjectKind::Folder,
+                            },
+                        )
+                        .unwrap();
+                }
+                state
+                    .edit_model(
+                        1,
+                        ModelEdit::SeedView {
+                            scope: Scope::Worktree {
+                                repository: root.clone(),
+                                path: root.clone(),
+                            },
+                            panes: vec![crate::workspace_model::views::Pane {
+                                id: crate::model::CardId::new(),
+                                title: "Retained native".into(),
+                                user_title: None,
+                                pending_terminal_start: false,
+                                width_fraction: 0.5,
+                                kind: crate::model::CardKind::Chat(source.clone()),
+                                scope: Some(root.clone()),
+                            }],
+                            closed: vec![],
+                        },
+                    )
+                    .unwrap();
+                state.native_adoption_failures.remember_upgrade(
+                    &Chat {
+                        launch: source.launch.clone(),
+                        source: source.clone(),
+                        previous_sources: vec![],
+                    },
+                    "Retained provider history cannot be read",
+                );
                 assert!(!state.chats.contains_key(&source.id));
             }
-            let result=fixture.request(fixture.expected.clone(),vec![healthy]);
-            if foreign { assert!(result.is_ok()); assert!(fixture.handles[0].is_completed()); }
-            else { assert!(result.unwrap_err().message.contains("unresolved provider ownership")); assert!(!fixture.handles[0].is_completed()); assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some()); }
-            assert!(fixture.host.lock().unwrap().native_adoption_failures.contains_id(source.id),"the uncertain retained owner must remain reachable for its own explicit cleanup");
-            assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+            let result = fixture.request(fixture.expected.clone(), vec![healthy]);
+            if foreign {
+                assert!(result.is_ok());
+                assert!(fixture.handles[0].is_completed());
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .message
+                        .contains("unresolved provider ownership")
+                );
+                assert!(!fixture.handles[0].is_completed());
+                assert!(
+                    fixture
+                        .host
+                        .lock()
+                        .unwrap()
+                        .read_model()
+                        .unwrap()
+                        .project(&fixture.root)
+                        .is_some()
+                );
+            }
+            assert!(
+                fixture
+                    .host
+                    .lock()
+                    .unwrap()
+                    .native_adoption_failures
+                    .contains_id(source.id),
+                "the uncertain retained owner must remain reachable for its own explicit cleanup"
+            );
+            assert!(
+                fixture
+                    .host
+                    .lock()
+                    .unwrap()
+                    .project_removals
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

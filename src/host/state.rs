@@ -671,29 +671,57 @@ impl HostState {
                 ));
             }
         }
-        if let ModelEdit::ChangeView {operation,change:crate::workspace_model::views::Change::RemoveSource {before,execution_instance,..},..}=&edit {
+        if let ModelEdit::ChangeView {
+            operation,
+            change:
+                crate::workspace_model::views::Change::RemoveSource {
+                    before,
+                    execution_instance,
+                    ..
+                },
+            ..
+        } = &edit
+        {
             // The HostState mutex spans this resident/pending-start fence and
             // Registry's source+revision transaction. A same-ID successor cannot
             // be published between them. Replaying an already applied edit is
             // harmless and must not acquire a new execution authority.
-            if !self.registry()?.view_operation_seen(*operation).map_err(model_unavailable)? {
-                if let CardKind::Terminal(source)=&before.kind {
-                    let current=self.terminals.get(&source.id);
-                    if execution_instance.is_none_or(|instance|instance.is_nil())
-                        || self.spawning.contains(&source.id) || self.chat_spawning.contains_key(&source.id)
+            if !self
+                .registry()?
+                .view_operation_seen(*operation)
+                .map_err(model_unavailable)?
+            {
+                if let CardKind::Terminal(source) = &before.kind {
+                    let current = self.terminals.get(&source.id);
+                    if execution_instance.is_none_or(|instance| instance.is_nil())
+                        || self.spawning.contains(&source.id)
+                        || self.chat_spawning.contains_key(&source.id)
                         || self.chats.contains_key(&source.id)
-                        || current.is_some_and(|record|Some(record.handle.execution_instance())!=*execution_instance) {
-                        return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"The terminal worker changed or a handoff is pending; its shared pane was preserved",false));
+                        || current.is_some_and(|record| {
+                            Some(record.handle.execution_instance()) != *execution_instance
+                        })
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The terminal worker changed or a handoff is pending; its shared pane was preserved",
+                            false,
+                        ));
                     }
                 } else if execution_instance.is_some() {
-                    return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"Unexpected terminal worker authority for a non-terminal pane",false));
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Unexpected terminal worker authority for a non-terminal pane",
+                        false,
+                    ));
                 }
             }
         }
         let applied = self.registry()?.apply(&edit).map_err(|error| {
             if error == "workspace view revision conflict" {
-                ProtocolError::new(ProtocolErrorCode::ViewConflict,error,true)
-            } else {model_unavailable(error)}
+                ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true)
+            } else {
+                model_unavailable(error)
+            }
         })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
@@ -4331,32 +4359,149 @@ mod tests {
 
     #[test]
     fn shared_remove_source_fences_resident_worker_and_pending_spawn_before_transaction() {
-        use crate::workspace_model::views::{Pane,Scope,Change};
-        let directory=tempfile::tempdir().unwrap();
-        let launch=crate::model::LaunchRecipe {program:"/bin/sleep".into(),arguments:vec!["30".into()],working_directory:directory.path().into(),environment:Default::default(),unset_environment:Default::default()};
-        let session=TerminalSession {id:TerminalId::new(),launch:launch.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe:launch,last_exit:None}};
-        let mut state=test_host();state.register_client(1);state.reserve_spawn(session.id).unwrap();
-        let handle=TerminalHandle::spawn(session.clone(),TerminalConfig::default(),|_|{}).unwrap();
-        let descriptor=state.finish_spawn(1,session.clone(),handle.clone(),true).unwrap();
-        let mut registry=super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        registry.apply(&ModelEdit::OpenProject {repository:directory.path().into(),checkout:None,primary_checkout:None,name:"fixture".into(),kind:Default::default()}).unwrap();
-        let scope=Scope::Worktree {repository:directory.path().into(),path:directory.path().into()};
-        let pane=Pane {id:crate::model::CardId::new(),title:"original pane".into(),user_title:None,pending_terminal_start:false,width_fraction:1.0,scope:None,kind:CardKind::Terminal(descriptor.session.clone())};
-        registry.apply(&ModelEdit::SeedView {scope:scope.clone(),panes:vec![pane.clone()],closed:vec![]}).unwrap();state.install_model(registry);
-        for (worker,pending) in [(None,false),(Some(uuid::Uuid::new_v4()),false),(Some(descriptor.execution_instance),true)] {
-            if pending {state.spawning.insert(session.id);}
-            let before=state.read_model().unwrap();let operation=uuid::Uuid::new_v4();
-            let edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:before.views[0].revision,operation,change:Change::RemoveSource {registry:before.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:worker}};
-            assert!(state.edit_model(1,edit).is_err());assert_eq!(state.read_model().unwrap(),before);
-            assert!(!state.model.as_ref().unwrap().view_operation_seen(operation).unwrap());assert!(!handle.is_completed());state.spawning.remove(&session.id);
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let directory = tempfile::tempdir().unwrap();
+        let launch = crate::model::LaunchRecipe {
+            program: "/bin/sleep".into(),
+            arguments: vec!["30".into()],
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: launch.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: launch,
+                last_exit: None,
+            },
+        };
+        let mut state = test_host();
+        state.register_client(1);
+        state.reserve_spawn(session.id).unwrap();
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let descriptor = state
+            .finish_spawn(1, session.clone(), handle.clone(), true)
+            .unwrap();
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: directory.path().into(),
+                checkout: None,
+                primary_checkout: None,
+                name: "fixture".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let scope = Scope::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        let pane = Pane {
+            id: crate::model::CardId::new(),
+            title: "original pane".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            scope: None,
+            kind: CardKind::Terminal(descriptor.session.clone()),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        state.install_model(registry);
+        for (worker, pending) in [
+            (None, false),
+            (Some(uuid::Uuid::new_v4()), false),
+            (Some(descriptor.execution_instance), true),
+        ] {
+            if pending {
+                state.spawning.insert(session.id);
+            }
+            let before = state.read_model().unwrap();
+            let operation = uuid::Uuid::new_v4();
+            let edit = ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: before.views[0].revision,
+                operation,
+                change: Change::RemoveSource {
+                    registry: before.identity,
+                    repository: directory.path().into(),
+                    before: pane.clone(),
+                    execution_instance: worker,
+                },
+            };
+            assert!(state.edit_model(1, edit).is_err());
+            assert_eq!(state.read_model().unwrap(), before);
+            assert!(
+                !state
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .view_operation_seen(operation)
+                    .unwrap()
+            );
+            assert!(!handle.is_completed());
+            state.spawning.remove(&session.id);
         }
         handle.shutdown().unwrap();
-        let mut ended=pane.clone();if let CardKind::Terminal(source)=&mut ended.kind {source.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:1}};}
-        let before=state.read_model().unwrap();
-        state.model.as_mut().unwrap().apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:before.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::Update {before:pane.clone(),pane:ended}}).unwrap();
-        let before=state.read_model().unwrap();
-        state.edit_model(1,ModelEdit::ChangeView {scope,expected_revision:before.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:before.identity,repository:directory.path().into(),before:pane,execution_instance:Some(descriptor.execution_instance)}}).unwrap();
-        assert!(state.read_model().unwrap().views[0].panes.is_empty(),"natural completion keeps original logical source and exact worker cleanup authority");
+        let mut ended = pane.clone();
+        if let CardKind::Terminal(source) = &mut ended.kind {
+            source.continuity = TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+        }
+        let before = state.read_model().unwrap();
+        state
+            .model
+            .as_mut()
+            .unwrap()
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: before.views[0].revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: pane.clone(),
+                    pane: ended,
+                },
+            })
+            .unwrap();
+        let before = state.read_model().unwrap();
+        state
+            .edit_model(
+                1,
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision: before.views[0].revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::RemoveSource {
+                        registry: before.identity,
+                        repository: directory.path().into(),
+                        before: pane,
+                        execution_instance: Some(descriptor.execution_instance),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(
+            state.read_model().unwrap().views[0].panes.is_empty(),
+            "natural completion keeps original logical source and exact worker cleanup authority"
+        );
     }
 
     #[test]

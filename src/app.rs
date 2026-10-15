@@ -4130,8 +4130,8 @@ pub enum Message {
     CompletedTerminalClosed {
         card: CardId,
         session: TerminalSession,
-        batch:Option<uuid::Uuid>,
-        attempt:uuid::Uuid,
+        batch: Option<uuid::Uuid>,
+        attempt: uuid::Uuid,
         result: Result<terminal_close::CompletedCloseOutcome, String>,
     },
     SaveAndCloseRepository(CardId),
@@ -4418,7 +4418,7 @@ struct PendingPanelOpen {
 }
 
 struct DirtyRepositoryClose {
-    batch:Option<uuid::Uuid>,
+    batch: Option<uuid::Uuid>,
     card: CardId,
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
@@ -9452,7 +9452,9 @@ impl Cagents {
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
         }
-        if let Some(notice)=self.local_terminal_unavailable_notice(id){rows.push(notice);}
+        if let Some(notice) = self.local_terminal_unavailable_notice(id) {
+            rows.push(notice);
+        }
         if let Some(notice) = self.project_location_notice(id) {
             rows.push(notice);
         }
@@ -11891,16 +11893,23 @@ impl Cagents {
         }
     }
 
-    fn begin_dirty_close(&mut self,intent:DirtyCloseIntent,cards:VecDeque<CardId>)->Task<Message> {
-        self.begin_dirty_close_for(intent,cards,None)
+    fn begin_dirty_close(
+        &mut self,
+        intent: DirtyCloseIntent,
+        cards: VecDeque<CardId>,
+    ) -> Task<Message> {
+        self.begin_dirty_close_for(intent, cards, None)
     }
     fn begin_dirty_close_for(
-        &mut self,intent:DirtyCloseIntent,mut cards:VecDeque<CardId>,batch:Option<uuid::Uuid>,
-    )->Task<Message> {
+        &mut self,
+        intent: DirtyCloseIntent,
+        mut cards: VecDeque<CardId>,
+        batch: Option<uuid::Uuid>,
+    ) -> Task<Message> {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-                DirtyCloseIntent::Card(card) => self.resume_card_close_for(card,batch),
+                DirtyCloseIntent::Card(card) => self.resume_card_close_for(card, batch),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
         };
@@ -11935,7 +11944,9 @@ impl Cagents {
         let Some(mut close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
-        if !self.pane_close_batch_current(close.batch) {return Task::none();}
+        if !self.pane_close_batch_current(close.batch) {
+            return Task::none();
+        }
         // Every close resolution is revalidated at this boundary. In
         // particular, discarding an editor buffer cannot clear an unresolved
         // post-persist durability warning, and no stale control message may
@@ -11963,7 +11974,7 @@ impl Cagents {
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-            DirtyCloseIntent::Card(card) => self.resume_card_close_for(card,close.batch),
+            DirtyCloseIntent::Card(card) => self.resume_card_close_for(card, close.batch),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
     }
@@ -13183,7 +13194,10 @@ impl Application for Cagents {
     fn update(&mut self, message: Message) -> Task<Message> {
         // The captured queue origin survives normalization only in this update.
         // Independent clicks and lifecycle continuations never infer a group.
-        let pane_close_origin=match &message {Message::CloseQueuedCard(queued)=>queued.origin(),_=>None};
+        let pane_close_origin = match &message {
+            Message::CloseQueuedCard(queued) => queued.origin(),
+            _ => None,
+        };
         let message = match message {
             Message::CloseQueuedCard(queued) => match self.resolve_queued_card_close(queued) {
                 Some(message) => message,
@@ -13191,9 +13205,19 @@ impl Application for Cagents {
             },
             message => message,
         };
-        if matches!(&message,Message::SaveAndCloseRepository(_)|Message::OverwriteAndCloseRepository(_)|Message::DiscardAndCloseRepository(_))
-            && self.dirty_repository_close.as_ref().is_some_and(|close|!self.pane_close_batch_current(close.batch)) {
-            self.status=Some(TransientNotice::warning("The Close panes selection changed. Cancel this old dialog before choosing a new action."));
+        if matches!(
+            &message,
+            Message::SaveAndCloseRepository(_)
+                | Message::OverwriteAndCloseRepository(_)
+                | Message::DiscardAndCloseRepository(_)
+        ) && self
+            .dirty_repository_close
+            .as_ref()
+            .is_some_and(|close| !self.pane_close_batch_current(close.batch))
+        {
+            self.status = Some(TransientNotice::warning(
+                "The Close panes selection changed. Cancel this old dialog before choosing a new action.",
+            ));
             return Task::none();
         }
         self.reconcile_terminal_review_owner();
@@ -14761,7 +14785,11 @@ impl Application for Cagents {
             }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
-                self.begin_dirty_close_for(DirtyCloseIntent::Card(id), VecDeque::from([id]),pane_close_origin)
+                self.begin_dirty_close_for(
+                    DirtyCloseIntent::Card(id),
+                    VecDeque::from([id]),
+                    pane_close_origin,
+                )
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::StartupWindowOpened(window) => {
@@ -15086,8 +15114,8 @@ impl Application for Cagents {
             {
                 self.begin_chat_close(id)
             }
-            Message::CloseCard(id) => self.begin_card_close_for(id,pane_close_origin),
-            Message::CloseCardUnasked(id) => self.close_card_unasked_for(id,pane_close_origin),
+            Message::CloseCard(id) => self.begin_card_close_for(id, pane_close_origin),
+            Message::CloseCardUnasked(id) => self.close_card_unasked_for(id, pane_close_origin),
             Message::CloseQueuedCard(_) => unreachable!("queued close normalized before dispatch"),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
@@ -15108,8 +15136,8 @@ impl Application for Cagents {
                 generation,
                 outcome,
             } => self.terminal_close_finished(card, terminal, proof, generation, outcome),
-            Message::DismissTerminalLocally(target)=>self.dismiss_terminal_locally(target),
-            Message::RestoreLocallyDismissedTerminals=>self.restore_locally_dismissed_terminals(),
+            Message::DismissTerminalLocally(target) => self.dismiss_terminal_locally(target),
+            Message::RestoreLocallyDismissedTerminals => self.restore_locally_dismissed_terminals(),
             Message::CompletedTerminalClosed {
                 card,
                 session,
@@ -15158,12 +15186,18 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(_) => {
-                self.status=Some(TransientNotice::warning("This queued pane removal has no captured operation identity. Its current pane was kept."));
+                self.status = Some(TransientNotice::warning(
+                    "This queued pane removal has no captured operation identity. Its current pane was kept.",
+                ));
                 Task::none()
             }
             Message::CommitCloseTarget(target) => {
-                if !self.card_removal_current(target) {return self.commit_card_removal_target(target,None).unwrap_or_else(Task::none);}
-                let id=target.card();
+                if !self.card_removal_current(target) {
+                    return self
+                        .commit_card_removal_target(target, None)
+                        .unwrap_or_else(Task::none);
+                }
+                let id = target.card();
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
@@ -17271,7 +17305,13 @@ impl Application for Cagents {
             )
         };
 
-        let workspace=if let Some(notice)=self.locally_dismissed_terminals_notice(){widget::column::with_children(vec![notice,workspace]).height(Length::Fill).into()}else{workspace};
+        let workspace = if let Some(notice) = self.locally_dismissed_terminals_notice() {
+            widget::column::with_children(vec![notice, workspace])
+                .height(Length::Fill)
+                .into()
+        } else {
+            workspace
+        };
         let main_content = self.workspace_chrome(workspace);
 
         let context_model = (self.context_inspector_visible()
@@ -18744,7 +18784,7 @@ mod tests {
         let third = CardId::new();
         let window = window::Id::unique();
         let mut close = DirtyRepositoryClose {
-            batch:None,
+            batch: None,
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
@@ -20642,8 +20682,12 @@ mod tests {
             app.cards.get(&card),
             Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
         ));
-        let Message::CloseQueuedCard(resumed)=task_app_message(close) else {panic!("dirty resolution retains its captured origin");};
-        assert!(matches!(app.resolve_queued_card_close(resumed),Some(Message::CloseCard(candidate))if candidate==card));
+        let Message::CloseQueuedCard(resumed) = task_app_message(close) else {
+            panic!("dirty resolution retains its captured origin");
+        };
+        assert!(
+            matches!(app.resolve_queued_card_close(resumed),Some(Message::CloseCard(candidate))if candidate==card)
+        );
     }
 
     #[test]
@@ -20711,21 +20755,37 @@ mod tests {
 
     #[test]
     fn revoked_project_batch_dirty_actions_preserve_buffer_and_new_batch() {
-        let (mut app,card)=editing_repository_app();
+        let (mut app, card) = editing_repository_app();
         drop(app.close_cards_in_order(vec![card]));
-        let origin=app.pane_close_batch_for(card);
-        drop(app.begin_dirty_close_for(DirtyCloseIntent::Card(card),VecDeque::from([card]),origin));
-        let old=app.dirty_repository_close.as_ref().unwrap().batch;
-        drop(app.close_cards_in_order(vec![card]));let current=app.pane_close_batch_for(card);
-        assert_ne!(old,current);
-        for message in [Message::SaveAndCloseRepository(card),Message::OverwriteAndCloseRepository(card),Message::DiscardAndCloseRepository(card)] {
+        let origin = app.pane_close_batch_for(card);
+        drop(app.begin_dirty_close_for(
+            DirtyCloseIntent::Card(card),
+            VecDeque::from([card]),
+            origin,
+        ));
+        let old = app.dirty_repository_close.as_ref().unwrap().batch;
+        drop(app.close_cards_in_order(vec![card]));
+        let current = app.pane_close_batch_for(card);
+        assert_ne!(old, current);
+        for message in [
+            Message::SaveAndCloseRepository(card),
+            Message::OverwriteAndCloseRepository(card),
+            Message::DiscardAndCloseRepository(card),
+        ] {
             drop(app.update(message));
-            let CardRuntime::Repository(runtime)=app.cards.get(&card).unwrap()else{panic!()};
-            assert!(runtime.blocks_navigation());assert!(!runtime.is_saving());
-            assert!(app.card_state(card).unwrap().existence.is_open());assert_eq!(app.pane_close_batch_for(card),current);
+            let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+                panic!()
+            };
+            assert!(runtime.blocks_navigation());
+            assert!(!runtime.is_saving());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.pane_close_batch_for(card), current);
         }
         drop(app.cancel_dirty_close());
-        assert!(app.pane_close_batch_current(current),"old dirty-dialog cancellation must not revoke a later batch");
+        assert!(
+            app.pane_close_batch_current(current),
+            "old dirty-dialog cancellation must not revoke a later batch"
+        );
         assert!(app.dirty_repository_close.is_none());
     }
 
@@ -20737,7 +20797,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
-            batch:None,
+            batch: None,
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Card(card),
@@ -20801,7 +20861,7 @@ mod tests {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.dirty_repository_close = Some(DirtyRepositoryClose {
-            batch:None,
+            batch: None,
             card,
             remaining: VecDeque::new(),
             intent: DirtyCloseIntent::Application(window),
@@ -22145,9 +22205,9 @@ mod tests {
         let _focus_close = startup.update(Message::ToggleContextInspector);
         assert!(startup.context_inspector_overlay_active);
         let final_card = startup.workspace.focused().unwrap();
-        startup.card_state_mut(final_card).unwrap().kind=CardKind::Settings;
-        startup.cards.insert(final_card,CardRuntime::Settings);
-        assert!(startup.reserve_card_removal_for(final_card,None).is_some());
+        startup.card_state_mut(final_card).unwrap().kind = CardKind::Settings;
+        startup.cards.insert(final_card, CardRuntime::Settings);
+        assert!(startup.reserve_card_removal_for(final_card, None).is_some());
         let _restore_focus = startup.update(startup.commit_close_message(final_card));
         assert!(startup.workspace.focused().is_none());
         assert!(!startup.context_inspector_is_overlay());
@@ -24070,7 +24130,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(app.reserve_card_removal_for(card,None).is_some());
+        assert!(app.reserve_card_removal_for(card, None).is_some());
         let state = lsp_state(&mut app, card);
         state.document = Some(LspDocumentId(1));
         state.path = Some(PathBuf::from("/repo/a.rs"));

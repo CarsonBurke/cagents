@@ -30,19 +30,41 @@ pub(crate) struct Reservation {
     token: uuid::Uuid,
 }
 impl Reservation {
-    pub(super) fn proves_foreign_orphan(&self, sources: &[HostedSession], repository: Option<&Path>) -> bool {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(&self.token).is_some_and(|scope| {
-            if sources.is_empty() { return false; }
-            if let Some(repository) = repository {
-                if repository == scope.project.repository { return false; }
-                return !sources.iter().any(|source| scope.sessions.contains(&source.id()) && !scope.protected_sessions.contains(&source.id()));
-            }
-            if sources.iter().any(|source| scope.qualifies(source)) { return false; }
-            // Old recipe paths may have been moved and reused by another
-            // project. Only exact authenticated saved membership (or the
-            // private logical binding above) can positively exclude an orphan.
-            sources.iter().any(|source| scope.protected_sources.iter().any(|saved| saved.same_process(source)))
-        })
+    pub(super) fn proves_foreign_orphan(
+        &self,
+        sources: &[HostedSession],
+        repository: Option<&Path>,
+    ) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.token)
+            .is_some_and(|scope| {
+                if sources.is_empty() {
+                    return false;
+                }
+                if let Some(repository) = repository {
+                    if repository == scope.project.repository {
+                        return false;
+                    }
+                    return !sources.iter().any(|source| {
+                        scope.sessions.contains(&source.id())
+                            && !scope.protected_sessions.contains(&source.id())
+                    });
+                }
+                if sources.iter().any(|source| scope.qualifies(source)) {
+                    return false;
+                }
+                // Old recipe paths may have been moved and reused by another
+                // project. Only exact authenticated saved membership (or the
+                // private logical binding above) can positively exclude an orphan.
+                sources.iter().any(|source| {
+                    scope
+                        .protected_sources
+                        .iter()
+                        .any(|saved| saved.same_process(source))
+                })
+            })
     }
 
     pub(super) fn qualifies(&self, source: &HostedSession) -> bool {
@@ -153,7 +175,9 @@ impl ReservedProject {
                             self.pane(pane)
                         }
                         Change::Update { before, pane } => self.pane(before) || self.pane(pane),
-                        Change::RemoveSource { before, repository, .. } => self.pane(before) || self.directory(repository),
+                        Change::RemoveSource {
+                            before, repository, ..
+                        } => self.pane(before) || self.directory(repository),
                         Change::Remove { id } | Change::Move { id, .. } => self.panes.contains(id),
                     }
             }
@@ -262,11 +286,19 @@ pub(crate) fn reserve(
             match &pane.kind {
                 crate::model::CardKind::Terminal(session) => {
                     ids.insert(session.id);
-                    if !own { reserved.protected_sources.push(HostedSession::Terminal(session.clone())); }
+                    if !own {
+                        reserved
+                            .protected_sources
+                            .push(HostedSession::Terminal(session.clone()));
+                    }
                 }
                 crate::model::CardKind::Chat(session) => {
                     ids.insert(session.id);
-                    if !own { reserved.protected_sources.push(HostedSession::Chat(session.clone())); }
+                    if !own {
+                        reserved
+                            .protected_sources
+                            .push(HostedSession::Chat(session.clone()));
+                    }
                     if let Some(terminal) = &session.terminal {
                         ids.insert(terminal.id);
                     }
@@ -303,7 +335,9 @@ pub(crate) fn reserve(
             }
             if let Some(console) = &agent.console {
                 reserved.protected_sessions.insert(console.id);
-                reserved.protected_sources.push(HostedSession::Terminal(console.clone()));
+                reserved
+                    .protected_sources
+                    .push(HostedSession::Terminal(console.clone()));
             }
         }
     }
@@ -332,12 +366,19 @@ pub(crate) fn reserve(
                 || state.native_closing.contains_key(id)
                 || state.chat_handoffs.contains_key(id)
                 || state.chat_bindings.contains_key(id)
-                || (!state.chats.contains_key(id) && state.upgrade_chats.contains_key(id)) {
-                return Err(error(format!("Session {id} retains unresolved provider ownership or a pending handoff. Reconnect or close that pane explicitly, then retry. No project sessions were closed.")));
+                || (!state.chats.contains_key(id) && state.upgrade_chats.contains_key(id))
+            {
+                return Err(error(format!(
+                    "Session {id} retains unresolved provider ownership or a pending handoff. Reconnect or close that pane explicitly, then retry. No project sessions were closed."
+                )));
             }
         }
-        if state.execution_startups.iter().any(|(id,(source,_))| reserved.panes.contains(&CardId::from_uuid(id.as_uuid())) || reserved.qualifies(source)) {
-            return Err(error("An accepted session in this project still retains startup or cleanup ownership. Resolve its pane before removing the project; no sessions were closed."));
+        if state.execution_startups.iter().any(|(id, (source, _))| {
+            reserved.panes.contains(&CardId::from_uuid(id.as_uuid())) || reserved.qualifies(source)
+        }) {
+            return Err(error(
+                "An accepted session in this project still retains startup or cleanup ownership. Resolve its pane before removing the project; no sessions were closed.",
+            ));
         }
     }
     let entries = entries(host);

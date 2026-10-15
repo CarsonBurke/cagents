@@ -132,7 +132,10 @@ pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> 
 }
 
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    connect_until(path, std::time::Instant::now() + std::time::Duration::from_secs(5))
+    connect_until(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
 }
 
 impl Record {

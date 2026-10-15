@@ -1630,7 +1630,12 @@ pub(crate) fn inspect(
     expected: &Record,
     proof: &crate::model::HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
-    inspect_until(socket, expected, proof, Instant::now() + HANDOVER_TIMEOUT * 2)
+    inspect_until(
+        socket,
+        expected,
+        proof,
+        Instant::now() + HANDOVER_TIMEOUT * 2,
+    )
 }
 
 pub(crate) fn inspect_until(
@@ -1639,8 +1644,8 @@ pub(crate) fn inspect_until(
     proof: &crate::model::HostSessionProof,
     deadline: Instant,
 ) -> Result<(Recovery, bool), String> {
-    let control =
-        crate::daemon::holder_registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
+    let control = crate::daemon::holder_registry::connect_until(socket, deadline)
+        .map_err(|error| error.to_string())?;
     let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
     if peer.uid != crate::daemon::current_uid()
         || peer.pid != expected.holder.pid
@@ -1707,13 +1712,30 @@ fn send(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd]) -
 
 fn io_budget(control: &UnixStream, deadline: Option<Instant>, write: bool) -> io::Result<()> {
     if let Some(deadline) = deadline {
-        let remaining = deadline.checked_duration_since(Instant::now()).filter(|duration| !duration.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut,"Holder inspection deadline expired"))?;
-        if write { control.set_write_timeout(Some(remaining))?; } else { control.set_read_timeout(Some(remaining))?; }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Holder inspection deadline expired",
+                )
+            })?;
+        if write {
+            control.set_write_timeout(Some(remaining))?;
+        } else {
+            control.set_read_timeout(Some(remaining))?;
+        }
     }
     Ok(())
 }
 
-fn send_before(control: &UnixStream, message: &impl Serialize, descriptors: &[RawFd], deadline: Option<Instant>) -> io::Result<()> {
+fn send_before(
+    control: &UnixStream,
+    message: &impl Serialize,
+    descriptors: &[RawFd],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let body = serde_json::to_vec(message)?;
     let length = u32::try_from(body.len())
         .ok()
@@ -1742,7 +1764,10 @@ fn receive<T: DeserializeOwned>(control: &UnixStream) -> io::Result<Option<(T, V
     receive_before(control, None)
 }
 
-fn receive_before<T: DeserializeOwned>(control: &UnixStream, deadline: Option<Instant>) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
+fn receive_before<T: DeserializeOwned>(
+    control: &UnixStream,
+    deadline: Option<Instant>,
+) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
     let mut header = [0u8; 4];
     let mut descriptors = Vec::new();
     let mut filled = 0;
@@ -1765,14 +1790,14 @@ fn receive_before<T: DeserializeOwned>(control: &UnixStream, deadline: Option<In
     }
     let mut body = vec![0; length as usize];
     if deadline.is_some() {
-        let mut filled=0;
-        while filled<body.len() {
-            io_budget(control,deadline,false)?;
+        let mut filled = 0;
+        while filled < body.len() {
+            io_budget(control, deadline, false)?;
             match (&*control).read(&mut body[filled..]) {
-                Ok(0)=>return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(count)=>filled+=count,
-                Err(error) if error.kind()==io::ErrorKind::Interrupted=>{},
-                Err(error)=>return Err(error),
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => filled += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
         }
     } else {
@@ -1874,19 +1899,30 @@ mod tests {
 
     #[test]
     fn inspection_deadline_is_not_extended_by_partial_frame_progress() {
-        let (reader,mut writer)=UnixStream::pair().unwrap();
-        let body=serde_json::to_vec(&Report::Failed("x".repeat(128))).unwrap();
-        let producer=thread::spawn(move || {
-            if writer.write_all(&(body.len() as u32).to_le_bytes()).is_err() { return; }
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let body = serde_json::to_vec(&Report::Failed("x".repeat(128))).unwrap();
+        let producer = thread::spawn(move || {
+            if writer
+                .write_all(&(body.len() as u32).to_le_bytes())
+                .is_err()
+            {
+                return;
+            }
             for byte in body {
-                if writer.write_all(&[byte]).is_err() { break; }
+                if writer.write_all(&[byte]).is_err() {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(15));
             }
         });
-        let start=Instant::now();
-        let failure=receive_before::<Report>(&reader,Some(start+Duration::from_millis(80))).unwrap_err();
-        assert!(matches!(failure.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut));
-        assert!(start.elapsed()<Duration::from_secs(2));
+        let start = Instant::now();
+        let failure =
+            receive_before::<Report>(&reader, Some(start + Duration::from_millis(80))).unwrap_err();
+        assert!(matches!(
+            failure.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
         drop(reader);
         producer.join().unwrap();
     }

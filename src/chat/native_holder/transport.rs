@@ -497,7 +497,11 @@ pub(crate) fn inspect_until(
     proof: &HostSessionProof,
     deadline: Instant,
 ) -> Result<(Recovery, bool), String> {
-    let remaining = || deadline.checked_duration_since(Instant::now()).ok_or("Native holder census deadline expired");
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Native holder census deadline expired")
+    };
     let control = connect_before(record, deadline)?;
     send(
         &control,

@@ -2,11 +2,11 @@
 //! are layered over snapshots until acknowledged; snapshots never erase them.
 use super::*;
 mod removal;
-pub(super) use removal::{RemovalSource, removal_current};
 use crate::workspace_model::{
     ModelEdit,
     views::{self, Change, Pane, Scope, View},
 };
+pub(super) use removal::{RemovalSource, removal_current};
 
 /// One immutable projection for a publication pass. Scope discovery includes
 /// historical directories, but their cards never become open shared panes.
@@ -556,13 +556,19 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
-                let change=if let Change::Remove {id}=&change {
-                    let Some(source)=self.shared_views.removal_sources.get(id).filter(|source|source.scope==scope && source.current(&self.workspace_model)) else {
-                        self.status=Some(TransientNotice::warning("An uncaptured shared pane removal was refused; its authoritative pane will be restored."));
+                let change = if let Change::Remove { id } = &change {
+                    let Some(source) = self.shared_views.removal_sources.get(id).filter(|source| {
+                        source.scope == scope && source.current(&self.workspace_model)
+                    }) else {
+                        self.status = Some(TransientNotice::warning(
+                            "An uncaptured shared pane removal was refused; its authoritative pane will be restored.",
+                        ));
                         continue;
                     };
                     source.change()
-                } else {change};
+                } else {
+                    change
+                };
                 let operation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
@@ -612,7 +618,12 @@ impl Cagents {
 
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
         if let Some(operation) = operation {
-            if let Some((_,_,Change::RemoveSource {before,..}))=self.shared_views.pending.iter().find(|(id,_,_)|*id==operation) {
+            if let Some((_, _, Change::RemoveSource { before, .. })) = self
+                .shared_views
+                .pending
+                .iter()
+                .find(|(id, _, _)| *id == operation)
+            {
                 self.shared_views.removal_sources.remove(&before.id);
             }
             self.shared_views
@@ -629,11 +640,21 @@ impl Cagents {
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
         self.prune_local_terminal_dismissals();
         self.shared_views.prune_restoration_requests(&self.durable);
-        let stale=self.shared_views.pending.iter().filter_map(|(operation,scope,change)|
-            (!removal_current(&self.workspace_model,scope,change)).then_some(*operation)).collect::<HashSet<_>>();
+        let stale = self
+            .shared_views
+            .pending
+            .iter()
+            .filter_map(|(operation, scope, change)| {
+                (!removal_current(&self.workspace_model, scope, change)).then_some(*operation)
+            })
+            .collect::<HashSet<_>>();
         if !stale.is_empty() {
-            self.shared_views.pending.retain(|(operation,_,_)|!stale.contains(operation));
-            self.status=Some(TransientNotice::warning("A pending Close no longer matches the shared pane. Its current source was preserved."));
+            self.shared_views
+                .pending
+                .retain(|(operation, _, _)| !stale.contains(operation));
+            self.status = Some(TransientNotice::warning(
+                "A pending Close no longer matches the shared pane. Its current source was preserved.",
+            ));
         }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
@@ -1235,12 +1256,19 @@ impl Cagents {
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
         // Validate the sparse local overlay once. Keep borrowed panes so a
         // presentation-only filter never clones every launch/history payload.
-        let hidden=self.locally_dismissed_terminal_ids();
-        let panes=panes.iter().filter(|pane|!hidden.contains(&pane.id)).collect::<Vec<_>>();
+        let hidden = self.locally_dismissed_terminal_ids();
+        let panes = panes
+            .iter()
+            .filter(|pane| !hidden.contains(&pane.id))
+            .collect::<Vec<_>>();
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
-        let visible = visible.iter().copied().filter(|card|!hidden.contains(card)).collect::<HashSet<_>>();
+        let visible = visible
+            .iter()
+            .copied()
+            .filter(|card| !hidden.contains(card))
+            .collect::<HashSet<_>>();
         let removed = self
             .workspace
             .order()
@@ -1249,20 +1277,22 @@ impl Cagents {
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
             // local runtime available in the destination view.
-            if !hidden.contains(&id) { match self.cards.get_mut(&id) {
-                Some(CardRuntime::Terminal(surface)) => {
-                    let _ = surface.focus(false);
-                    let _ = surface.hide();
+            if !hidden.contains(&id) {
+                match self.cards.get_mut(&id) {
+                    Some(CardRuntime::Terminal(surface)) => {
+                        let _ = surface.focus(false);
+                        let _ = surface.hide();
+                    }
+                    Some(CardRuntime::Chat(runtime)) => {
+                        let _ = runtime.set_visible(false);
+                    }
+                    #[cfg(feature = "integrated-browser")]
+                    Some(CardRuntime::Browser(browser)) => {
+                        let _ = browser.handle.set_visible(false);
+                    }
+                    _ => {}
                 }
-                Some(CardRuntime::Chat(runtime)) => {
-                    let _ = runtime.set_visible(false);
-                }
-                #[cfg(feature = "integrated-browser")]
-                Some(CardRuntime::Browser(browser)) => {
-                    let _ = browser.handle.set_visible(false);
-                }
-                _ => {}
-            } }
+            }
             if let Some(state) = self.card_state_mut(id) {
                 state.exposure = Exposure::Offscreen;
             }
@@ -1519,48 +1549,64 @@ mod tests {
     }
     #[test]
     fn held_focus_removal_cannot_close_a_replaced_shared_logical_source() {
-        for same_chat_id in [false,true] {
-            let (mut app,channel,_,mut pane)=removal_fixture();
-            let recipe=LaunchRecipe::shell(PathBuf::from("/repo")).unwrap();
-            let chat=crate::chat::Session {
-                id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:recipe.clone(),session_id:Some(uuid::Uuid::new_v4().to_string())},
-                proof:None,terminal:None,owned_codex_listener:None,native_continuity:Default::default(),
+        for same_chat_id in [false, true] {
+            let (mut app, channel, _, mut pane) = removal_fixture();
+            let recipe = LaunchRecipe::shell(PathBuf::from("/repo")).unwrap();
+            let chat = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: recipe.clone(),
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
             };
-            pane.kind=if same_chat_id {CardKind::Chat(chat.clone())} else {CardKind::Terminal(fresh_terminal_session(recipe))};
-            let mut view=View::empty(channel);view.panes.push(pane.clone());
-            Arc::make_mut(&mut app.durable).active_channel=Some(channel);
-            app.workspace_model.views=vec![view.clone()];
-            let owned=HashSet::from([pane.id]);
-            drop(app.project_shared_view(&view,&owned));
+            pane.kind = if same_chat_id {
+                CardKind::Chat(chat.clone())
+            } else {
+                CardKind::Terminal(fresh_terminal_session(recipe))
+            };
+            let mut view = View::empty(channel);
+            view.panes.push(pane.clone());
+            Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+            app.workspace_model.views = vec![view.clone()];
+            let owned = HashSet::from([pane.id]);
+            drop(app.project_shared_view(&view, &owned));
             assert!(app.workspace.card(pane.id).is_some());
             drop(app.request_card_removal(pane.id));
-            let old=app.pending_card_removal_target(pane.id).unwrap();
-            let mut replacement=chat;
-            replacement.launch.session_id=Some(uuid::Uuid::new_v4().to_string());
-            view.revision+=1;view.panes[0].kind=CardKind::Chat(replacement.clone());
-            app.workspace_model.views=vec![view.clone()];
-            drop(app.project_shared_view(&view,&owned));
-            let before=app.card_state(pane.id).unwrap().clone();
-            let observed_before=app.chat_return_session(pane.id);
+            let old = app.pending_card_removal_target(pane.id).unwrap();
+            let mut replacement = chat;
+            replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            view.revision += 1;
+            view.panes[0].kind = CardKind::Chat(replacement.clone());
+            app.workspace_model.views = vec![view.clone()];
+            drop(app.project_shared_view(&view, &owned));
+            let before = app.card_state(pane.id).unwrap().clone();
+            let observed_before = app.chat_return_session(pane.id);
             assert!(before.existence.is_open());
             assert!(!app.card_removal_current(old));
             drop(app.update(Message::CommitCloseTarget(old)));
-            assert_eq!(app.card_state(pane.id),Some(&before));
-            assert_eq!(app.workspace_model.views,vec![view]);
+            assert_eq!(app.card_state(pane.id), Some(&before));
+            assert_eq!(app.workspace_model.views, vec![view]);
             assert!(app.recently_closed.is_empty());
             assert!(app.workspace.card(pane.id).is_some());
             assert!(app.workspace.pending_close().is_none());
             assert!(!app.closed_terminal_cards.contains(&pane.id));
             // Even a newer explicit reservation cannot be consumed by old A.
-            assert!(app.reserve_card_removal_for(pane.id,None).is_some());
-            let current=app.pending_card_removal_target(pane.id).unwrap();
+            assert!(app.reserve_card_removal_for(pane.id, None).is_some());
+            let current = app.pending_card_removal_target(pane.id).unwrap();
             drop(app.update(Message::CommitCloseTarget(old)));
             drop(app.update(Message::CommitClose(pane.id)));
-            assert_eq!(app.pending_card_removal_target(pane.id),Some(current));
+            assert_eq!(app.pending_card_removal_target(pane.id), Some(current));
             assert!(app.card_removal_current(current));
-            assert_eq!(app.chat_return_session(pane.id),observed_before);
-            assert!(matches!(&app.card_state(pane.id).unwrap().kind,CardKind::Chat(source)if source.launch==replacement.launch));
-            assert_eq!(app.card_state(pane.id),Some(&before));
+            assert_eq!(app.chat_return_session(pane.id), observed_before);
+            assert!(
+                matches!(&app.card_state(pane.id).unwrap().kind,CardKind::Chat(source)if source.launch==replacement.launch)
+            );
+            assert_eq!(app.card_state(pane.id), Some(&before));
         }
     }
 
@@ -2543,232 +2589,528 @@ mod tests {
         app.acknowledge_view_edit(Scope::Channel(a), None);
         assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
     }
-    fn local_dismissal_fixture()->(Cagents,CardId,crate::app::terminal_close::LocalDismissalTarget) {
-        let (mut app,a,_,browser)=fixture();
-        let mut terminal=browser.clone();terminal.id=CardId::new();terminal.title="Unavailable terminal".into();
-        terminal.kind=CardKind::Terminal(TerminalSession{id:TerminalId::new(),launch:LaunchRecipe{program:"/bin/sh".into(),arguments:Vec::new(),working_directory:"/repo".into(),environment:Default::default(),unset_environment:Default::default()},continuity:TerminalContinuity::Exited{last_exit:crate::model::TerminalExit{code:Some(0),signal:None,occurred_at_unix_ms:1}}});
-        let card=terminal.id;
-        let mut right=browser.clone();right.id=CardId::new();
-        let mut view=View::empty(Scope::Channel(a));view.revision=7;view.panes=vec![browser,terminal,right];
-        app.workspace_model.views=vec![view.clone()];
-        app.active_workspace=Some("/repo".into());Arc::make_mut(&mut app.durable).active_channel=Some(a);
-        app.shared_views.applying=true;
-        drop(app.project_shared_view(&view,&view.panes.iter().map(|pane|pane.id).collect()));
-        app.shared_views.applying=false;
-        app.shared_views.baseline.insert(view.scope.clone(),app.local_view_panes(&view.scope));
-        app.cards.insert(card,CardRuntime::Completed);
-        let target=app.local_terminal_dismissal_target(card).unwrap();
-        (app,card,target)
+    fn local_dismissal_fixture() -> (
+        Cagents,
+        CardId,
+        crate::app::terminal_close::LocalDismissalTarget,
+    ) {
+        let (mut app, a, _, browser) = fixture();
+        let mut terminal = browser.clone();
+        terminal.id = CardId::new();
+        terminal.title = "Unavailable terminal".into();
+        terminal.kind = CardKind::Terminal(TerminalSession {
+            id: TerminalId::new(),
+            launch: LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                working_directory: "/repo".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            continuity: TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            },
+        });
+        let card = terminal.id;
+        let mut right = browser.clone();
+        right.id = CardId::new();
+        let mut view = View::empty(Scope::Channel(a));
+        view.revision = 7;
+        view.panes = vec![browser, terminal, right];
+        app.workspace_model.views = vec![view.clone()];
+        app.active_workspace = Some("/repo".into());
+        Arc::make_mut(&mut app.durable).active_channel = Some(a);
+        app.shared_views.applying = true;
+        drop(app.project_shared_view(&view, &view.panes.iter().map(|pane| pane.id).collect()));
+        app.shared_views.applying = false;
+        app.shared_views
+            .baseline
+            .insert(view.scope.clone(), app.local_view_panes(&view.scope));
+        app.cards.insert(card, CardRuntime::Completed);
+        let target = app.local_terminal_dismissal_target(card).unwrap();
+        (app, card, target)
     }
 
     #[test]
     fn local_completed_dismissal_preserves_shared_membership_order_and_real_saved_history() {
-        let directory=tempfile::tempdir().unwrap();
-        let (mut app,card,target)=local_dismissal_fixture();
-        let mut history=app.card_state(card).unwrap().clone();history.id=CardId::new();
-        if let CardKind::Terminal(source)=&mut history.kind {source.id=TerminalId::new();}
-        history.existence=super::super::project_ui::removed_existence("historical fixture");
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, target) = local_dismissal_fixture();
+        let mut history = app.card_state(card).unwrap().clone();
+        history.id = CardId::new();
+        if let CardKind::Terminal(source) = &mut history.kind {
+            source.id = TerminalId::new();
+        }
+        history.existence = super::super::project_ui::removed_existence("historical fixture");
         Arc::make_mut(&mut app.durable).cards.push(history.clone());
-        let (runtime,_)=crate::session::SessionRuntime::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("local-dismissal")).unwrap();
-        runtime.snapshot(Arc::clone(&app.durable));runtime.flush(Duration::from_secs(5)).unwrap();
-        let store=runtime.operation_store();app.session=Some(runtime);
-        let model=app.workspace_model.clone();let source=app.card_state(card).unwrap().kind.clone();
-        let scope=model.views[0].scope.clone();let panes=app.local_view_panes(&scope);
-        let order=app.durable.channels[0].cards.clone();
+        let (runtime, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("local-dismissal"),
+        )
+        .unwrap();
+        runtime.snapshot(Arc::clone(&app.durable));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+        let store = runtime.operation_store();
+        app.session = Some(runtime);
+        let model = app.workspace_model.clone();
+        let source = app.card_state(card).unwrap().kind.clone();
+        let scope = model.views[0].scope.clone();
+        let panes = app.local_view_panes(&scope);
+        let order = app.durable.channels[0].cards.clone();
         app.offer_local_terminal_dismissal(Some(target.clone()));
         drop(app.dismiss_terminal_locally(target));
         assert!(app.workspace.card(card).is_none());
         assert!(app.card_state(card).unwrap().existence.is_open());
-        assert_eq!(app.card_state(card).unwrap().kind,source);
-        assert_eq!(app.workspace_model,model);
-        app.persist();app.publish_view_changes();
-        assert_eq!(app.local_view_panes(&scope),panes);
-        assert_eq!(app.durable.channels[0].cards,order,"hidden slots must not be moved to the end by persistence");
-        assert!(app.shared_views.pending.is_empty(),"local absence must never publish Change::Remove or a layout mutation");
-        assert!(app.recently_closed.is_empty());assert!(!app.closed_terminal_cards.contains(&card));
-        app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
-        let saved=store.load_card(card,None).unwrap().unwrap();
-        assert!(saved.existence.is_open());assert_eq!(saved.kind,source);
-        let saved_history=store.load_card(history.id,None).unwrap().unwrap();
-        assert_eq!(saved_history.existence,history.existence);assert_eq!(saved_history.kind,history.kind);
+        assert_eq!(app.card_state(card).unwrap().kind, source);
+        assert_eq!(app.workspace_model, model);
+        app.persist();
+        app.publish_view_changes();
+        assert_eq!(app.local_view_panes(&scope), panes);
+        assert_eq!(
+            app.durable.channels[0].cards, order,
+            "hidden slots must not be moved to the end by persistence"
+        );
+        assert!(
+            app.shared_views.pending.is_empty(),
+            "local absence must never publish Change::Remove or a layout mutation"
+        );
+        assert!(app.recently_closed.is_empty());
+        assert!(!app.closed_terminal_cards.contains(&card));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let saved = store.load_card(card, None).unwrap().unwrap();
+        assert!(saved.existence.is_open());
+        assert_eq!(saved.kind, source);
+        let saved_history = store.load_card(history.id, None).unwrap().unwrap();
+        assert_eq!(saved_history.existence, history.existence);
+        assert_eq!(saved_history.kind, history.kind);
         drop(app.restore_locally_dismissed_terminals());
-        assert!(app.workspace.card(card).is_some());assert_eq!(app.workspace_model,model);
+        assert!(app.workspace.card(card).is_some());
+        assert_eq!(app.workspace_model, model);
     }
 
     #[test]
     fn local_dismissal_revision_source_and_resident_changes_restore_visibility() {
         for change in 0..3 {
-            let (mut app,card,target)=local_dismissal_fixture();
+            let (mut app, card, target) = local_dismissal_fixture();
             app.offer_local_terminal_dismissal(Some(target.clone()));
-            drop(app.dismiss_terminal_locally(target));assert!(app.workspace.card(card).is_none());
+            drop(app.dismiss_terminal_locally(target));
+            assert!(app.workspace.card(card).is_none());
             match change {
-                0=>{app.workspace_model.views[0].revision+=1;drop(app.reconcile_shared_views());},
-                1=>{let pane=app.workspace_model.views[0].panes.iter_mut().find(|pane|pane.id==card).unwrap();if let CardKind::Terminal(source)=&mut pane.kind {source.launch.arguments.push("replacement".into());}drop(app.reconcile_shared_views());},
-                _=>{let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};let mut descriptor=crate::terminal::ipc::TerminalDescriptor::relaunchable(source.id,source.launch.clone(),None);descriptor.session=source;descriptor.execution_instance=uuid::Uuid::new_v4();drop(app.observe_local_terminal_residents(&[descriptor]));},
+                0 => {
+                    app.workspace_model.views[0].revision += 1;
+                    drop(app.reconcile_shared_views());
+                }
+                1 => {
+                    let pane = app.workspace_model.views[0]
+                        .panes
+                        .iter_mut()
+                        .find(|pane| pane.id == card)
+                        .unwrap();
+                    if let CardKind::Terminal(source) = &mut pane.kind {
+                        source.launch.arguments.push("replacement".into());
+                    }
+                    drop(app.reconcile_shared_views());
+                }
+                _ => {
+                    let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone()
+                    else {
+                        panic!()
+                    };
+                    let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+                        source.id,
+                        source.launch.clone(),
+                        None,
+                    );
+                    descriptor.session = source;
+                    descriptor.execution_instance = uuid::Uuid::new_v4();
+                    drop(app.observe_local_terminal_residents(&[descriptor]));
+                }
             }
-            assert!(!app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_some(),"a replacement must not inherit the local hidden flag");
+            assert!(!app.locally_dismissed_terminal(card));
+            assert!(
+                app.workspace.card(card).is_some(),
+                "a replacement must not inherit the local hidden flag"
+            );
         }
     }
     #[test]
     fn queued_local_dismissal_cannot_hide_a_new_revision_or_observed_successor() {
-        for resident in [false,true] {
-            let (mut app,card,target)=local_dismissal_fixture();
+        for resident in [false, true] {
+            let (mut app, card, target) = local_dismissal_fixture();
             app.offer_local_terminal_dismissal(Some(target.clone()));
-            if resident {let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};let descriptor=crate::terminal::ipc::TerminalDescriptor::relaunchable(source.id,source.launch,None);drop(app.observe_local_terminal_residents(&[descriptor]));}else{app.workspace_model.views[0].revision+=1;}
+            if resident {
+                let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+                    panic!()
+                };
+                let descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+                    source.id,
+                    source.launch,
+                    None,
+                );
+                drop(app.observe_local_terminal_residents(&[descriptor]));
+            } else {
+                app.workspace_model.views[0].revision += 1;
+            }
             drop(app.dismiss_terminal_locally(target));
-            assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));
+            assert!(app.workspace.card(card).is_some());
+            assert!(!app.locally_dismissed_terminal(card));
             assert!(app.shared_views.pending.is_empty());
         }
     }
 
     #[test]
-    fn absent_completed_handler_does_not_offer_an_unavailable_control_for_stale_or_unbound_identity() {
-        for registry_missing in [false,true] {
-            let (mut app,card,target)=local_dismissal_fixture();
-            let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
-            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
-            if registry_missing {app.workspace_model.identity=crate::workspace_model::NO_REGISTRY;}else{app.workspace_model.views[0].revision+=1;}
-            drop(app.completed_terminal_closed(card,source,None,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
+    fn absent_completed_handler_does_not_offer_an_unavailable_control_for_stale_or_unbound_identity()
+     {
+        for registry_missing in [false, true] {
+            let (mut app, card, target) = local_dismissal_fixture();
+            let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+                panic!()
+            };
+            drop(app.begin_card_close(card));
+            let attempt = app.completed_terminal_close_attempt(card).unwrap();
+            if registry_missing {
+                app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
+            } else {
+                app.workspace_model.views[0].revision += 1;
+            }
+            drop(app.completed_terminal_closed(
+                card,
+                source,
+                None,
+                attempt,
+                Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                    expected_worker: None,
+                    presentation: Some(target),
+                }),
+            ));
             assert!(app.local_terminal_unavailable_notice(card).is_none());
-            assert!(!app.status.as_ref().unwrap().message.contains("Dismiss locally"));
+            assert!(
+                !app.status
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("Dismiss locally")
+            );
             assert!(app.status.as_ref().unwrap().message.contains("Reconnect"));
             assert!(app.workspace.card(card).is_some());
         }
     }
     #[test]
     fn unavailable_completed_pane_stops_its_batch_before_local_dismissal() {
-        let (mut app,card,target)=local_dismissal_fixture();
-        let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
-        let model=app.workspace_model.clone();
-        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
-        drop(app.close_cards_in_order(vec![card,other]));
-        assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.queued_card_closes.len(),1);
-        let batch=app.pane_close_batch_for(card);
-        drop(app.begin_card_close_for(card,batch));let attempt=app.completed_terminal_close_attempt(card).unwrap();
-        drop(app.completed_terminal_closed(card,source,batch,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
-        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
-        assert!(app.status.as_ref().unwrap().message.contains("Other selected panes were kept"));
+        let (mut app, card, target) = local_dismissal_fixture();
+        let other = app.workspace_model.views[0]
+            .panes
+            .iter()
+            .find(|pane| pane.id != card)
+            .unwrap()
+            .id;
+        let model = app.workspace_model.clone();
+        let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+            panic!()
+        };
+        drop(app.close_cards_in_order(vec![card, other]));
+        assert!(app.project_recovery_ui.closing_panes);
+        assert_eq!(app.queued_card_closes.len(), 1);
+        let batch = app.pane_close_batch_for(card);
+        drop(app.begin_card_close_for(card, batch));
+        let attempt = app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.completed_terminal_closed(
+            card,
+            source,
+            batch,
+            attempt,
+            Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                expected_worker: None,
+                presentation: Some(target.clone()),
+            }),
+        ));
+        assert!(!app.project_recovery_ui.closing_panes);
+        assert!(app.queued_card_closes.is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Other selected panes were kept")
+        );
         assert!(app.local_terminal_unavailable_notice(card).is_some());
         drop(app.dismiss_terminal_locally(target));
-        assert!(app.workspace.card(other).is_some());assert!(app.card_state(other).unwrap().existence.is_open());
-        assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+        assert!(app.workspace.card(other).is_some());
+        assert!(app.card_state(other).unwrap().existence.is_open());
+        assert_eq!(app.workspace_model, model);
+        assert!(app.shared_views.pending.is_empty());
     }
 
     #[test]
     fn old_completed_result_cannot_revoke_or_offer_dismissal_for_a_new_batch() {
-        for failed in [false,true] {
-            let (mut app,card,target)=local_dismissal_fixture();
-            let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
-            let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
-            drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
-            drop(app.begin_card_close_for(card,old));let attempt=app.completed_terminal_close_attempt(card).unwrap();
-            drop(app.close_cards_in_order(vec![card,other]));let current=app.pane_close_batch_for(card);
-            let queued=app.queued_card_closes.len();let model=app.workspace_model.clone();
-            assert_ne!(old,current);
-            let result=if failed {Err("old failure".into())}else{Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})};
-            drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:old,attempt,result}));
-            assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.pane_close_batch_for(card),current);
-            assert_eq!(app.queued_card_closes.len(),queued);assert!(app.local_terminal_unavailable_notice(card).is_none());
-            assert!(app.workspace.card(card).is_some());assert!(app.workspace.card(other).is_some());
-            assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+        for failed in [false, true] {
+            let (mut app, card, target) = local_dismissal_fixture();
+            let other = app.workspace_model.views[0]
+                .panes
+                .iter()
+                .find(|pane| pane.id != card)
+                .unwrap()
+                .id;
+            let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+                panic!()
+            };
+            drop(app.close_cards_in_order(vec![card]));
+            let old = app.pane_close_batch_for(card);
+            drop(app.begin_card_close_for(card, old));
+            let attempt = app.completed_terminal_close_attempt(card).unwrap();
+            drop(app.close_cards_in_order(vec![card, other]));
+            let current = app.pane_close_batch_for(card);
+            let queued = app.queued_card_closes.len();
+            let model = app.workspace_model.clone();
+            assert_ne!(old, current);
+            let result = if failed {
+                Err("old failure".into())
+            } else {
+                Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                    expected_worker: None,
+                    presentation: Some(target),
+                })
+            };
+            drop(app.update(Message::CompletedTerminalClosed {
+                card,
+                session: source,
+                batch: old,
+                attempt,
+                result,
+            }));
+            assert!(app.project_recovery_ui.closing_panes);
+            assert_eq!(app.pane_close_batch_for(card), current);
+            assert_eq!(app.queued_card_closes.len(), queued);
+            assert!(app.local_terminal_unavailable_notice(card).is_none());
+            assert!(app.workspace.card(card).is_some());
+            assert!(app.workspace.card(other).is_some());
+            assert_eq!(app.workspace_model, model);
+            assert!(app.shared_views.pending.is_empty());
         }
     }
 
     #[test]
     fn pending_completed_attempt_stops_new_batch_and_duplicate_receipt_preserves_fresh_attempt() {
-        let (mut app,card,target)=local_dismissal_fixture();
-        let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
-        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
-        drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
+        let (mut app, card, target) = local_dismissal_fixture();
+        let other = app.workspace_model.views[0]
+            .panes
+            .iter()
+            .find(|pane| pane.id != card)
+            .unwrap()
+            .id;
+        let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+            panic!()
+        };
+        drop(app.close_cards_in_order(vec![card]));
+        let old = app.pane_close_batch_for(card);
         // Construct the real UI asynchronous close task, held before IO.
-        drop(app.begin_card_close_for(card,old));let first=app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.begin_card_close_for(card, old));
+        let first = app.completed_terminal_close_attempt(card).unwrap();
         assert!(app.terminal_close_attempts.contains(&source.id));
-        let held=super::super::tests::task_app_message(app.close_cards_in_order(vec![card,other]));
+        let held =
+            super::super::tests::task_app_message(app.close_cards_in_order(vec![card, other]));
         drop(app.update(held));
-        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
-        assert_eq!(app.completed_terminal_close_attempt(card),Some(first));
+        assert!(!app.project_recovery_ui.closing_panes);
+        assert!(app.queued_card_closes.is_empty());
+        assert_eq!(app.completed_terminal_close_attempt(card), Some(first));
         assert!(app.terminal_close_attempts.contains(&source.id));
-        assert!(app.status.as_ref().unwrap().message.contains("previous Close request"));
-        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:old,attempt:first,result:Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})}));
-        assert!(app.completed_terminal_close_attempt(card).is_none());assert!(!app.terminal_close_attempts.contains(&source.id));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("previous Close request")
+        );
+        drop(app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            batch: old,
+            attempt: first,
+            result: Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                expected_worker: None,
+                presentation: Some(target.clone()),
+            }),
+        }));
+        assert!(app.completed_terminal_close_attempt(card).is_none());
+        assert!(!app.terminal_close_attempts.contains(&source.id));
         assert!(app.local_terminal_unavailable_notice(card).is_none());
-        drop(app.close_cards_in_order(vec![card]));let fresh_batch=app.pane_close_batch_for(card);
-        drop(app.begin_card_close_for(card,fresh_batch));let fresh=app.completed_terminal_close_attempt(card).unwrap();
-        assert_ne!(fresh,first);
-        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:old,attempt:first,result:Err("duplicate old result".into())}));
-        assert_eq!(app.completed_terminal_close_attempt(card),Some(fresh));assert!(app.terminal_close_attempts.contains(&source.id));
-        assert_eq!(app.pane_close_batch_for(card),fresh_batch);
-        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:fresh_batch,attempt:fresh,result:Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})}));
-        assert!(app.completed_terminal_close_attempt(card).is_none());assert!(!app.terminal_close_attempts.contains(&source.id));
-        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
+        drop(app.close_cards_in_order(vec![card]));
+        let fresh_batch = app.pane_close_batch_for(card);
+        drop(app.begin_card_close_for(card, fresh_batch));
+        let fresh = app.completed_terminal_close_attempt(card).unwrap();
+        assert_ne!(fresh, first);
+        drop(app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            batch: old,
+            attempt: first,
+            result: Err("duplicate old result".into()),
+        }));
+        assert_eq!(app.completed_terminal_close_attempt(card), Some(fresh));
+        assert!(app.terminal_close_attempts.contains(&source.id));
+        assert_eq!(app.pane_close_batch_for(card), fresh_batch);
+        drop(app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            batch: fresh_batch,
+            attempt: fresh,
+            result: Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                expected_worker: None,
+                presentation: Some(target),
+            }),
+        }));
+        assert!(app.completed_terminal_close_attempt(card).is_none());
+        assert!(!app.terminal_close_attempts.contains(&source.id));
+        assert!(!app.project_recovery_ui.closing_panes);
+        assert!(app.queued_card_closes.is_empty());
         assert!(app.local_terminal_unavailable_notice(card).is_some());
-        assert!(app.card_state(other).unwrap().existence.is_open());assert!(app.shared_views.pending.is_empty());
+        assert!(app.card_state(other).unwrap().existence.is_open());
+        assert!(app.shared_views.pending.is_empty());
     }
 
     #[test]
     fn old_absence_cannot_offer_or_hide_a_fresh_start_without_confirmed_worker_metadata() {
-        let (mut app,card,target)=local_dismissal_fixture();
-        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
-        drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
+        let (mut app, card, target) = local_dismissal_fixture();
+        let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+            panic!()
+        };
+        drop(app.begin_card_close(card));
+        let attempt = app.completed_terminal_close_attempt(card).unwrap();
         // A new successful startup may publish the same ended descriptor before
         // optional worker metadata arrives; its presentation generation differs.
         drop(app.terminal_local_presentation_started(card));
-        drop(app.completed_terminal_closed(card,source,None,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        drop(app.completed_terminal_closed(
+            card,
+            source,
+            None,
+            attempt,
+            Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent {
+                expected_worker: None,
+                presentation: Some(target.clone()),
+            }),
+        ));
         assert!(app.local_terminal_unavailable_notice(card).is_none());
         drop(app.dismiss_terminal_locally(target));
-        assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));
+        assert!(app.workspace.card(card).is_some());
+        assert!(!app.locally_dismissed_terminal(card));
     }
 
     #[test]
     fn repeated_empty_inventory_and_unrelated_view_edits_preserve_explicit_local_hide() {
-        let (mut app,card,target)=local_dismissal_fixture();
-        app.offer_local_terminal_dismissal(Some(target.clone()));drop(app.dismiss_terminal_locally(target));
-        let before=app.workspace_model.clone();
-        for _ in 0..4 {drop(app.observe_local_terminal_residents(&[]));assert!(app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_none());}
-        assert_eq!(app.workspace_model,before);
-        let other=app.durable.channels[1].id;
-        let mut view=View::empty(Scope::Channel(other));view.revision=123;
-        app.workspace_model.views.push(view);app.workspace_model.sequence+=1;
-        let model=app.workspace_model.clone();drop(app.reconcile_shared_views());
-        assert!(app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_none());
-        assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+        let (mut app, card, target) = local_dismissal_fixture();
+        app.offer_local_terminal_dismissal(Some(target.clone()));
+        drop(app.dismiss_terminal_locally(target));
+        let before = app.workspace_model.clone();
+        for _ in 0..4 {
+            drop(app.observe_local_terminal_residents(&[]));
+            assert!(app.locally_dismissed_terminal(card));
+            assert!(app.workspace.card(card).is_none());
+        }
+        assert_eq!(app.workspace_model, before);
+        let other = app.durable.channels[1].id;
+        let mut view = View::empty(Scope::Channel(other));
+        view.revision = 123;
+        app.workspace_model.views.push(view);
+        app.workspace_model.sequence += 1;
+        let model = app.workspace_model.clone();
+        drop(app.reconcile_shared_views());
+        assert!(app.locally_dismissed_terminal(card));
+        assert!(app.workspace.card(card).is_none());
+        assert_eq!(app.workspace_model, model);
+        assert!(app.shared_views.pending.is_empty());
         assert!(app.card_state(card).unwrap().existence.is_open());
     }
 
-    fn removal_fixture()->(Cagents,ChannelId,ChannelId,Pane) {
-        let (mut app,a,b,pane)=fixture();
-        app.workspace_model.projects=vec![crate::workspace_model::ModelProject {repository:"/repo".into(),checkout:None,primary_checkout:None,name:"repo".into(),kind:Default::default(),ordinal:1}];
-        app.workspace_model.channels=[a,b].into_iter().map(|id|crate::workspace_model::ModelChannel {id,repository:"/repo".into(),title:"view".into(),title_source:Default::default(),ordinal:1}).collect();
-        (app,a,b,pane)
+    fn removal_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, a, b, pane) = fixture();
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: "/repo".into(),
+            checkout: None,
+            primary_checkout: None,
+            name: "repo".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = [a, b]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: "/repo".into(),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
+        (app, a, b, pane)
     }
     #[test]
     fn pending_source_remove_never_projects_a_replacement_or_replaced_registry() {
-        for registry_replaced in [false,true] {
-            let (mut app,a,_,pane)=removal_fixture();
-            let mut view=View::empty(Scope::Channel(a));view.revision=7;view.panes=vec![pane.clone()];
-            app.workspace_model.views=vec![view.clone()];
-            app.shared_views.applying=true;drop(app.project_shared_view(&view,&HashSet::from([pane.id])));app.shared_views.applying=false;
-            let basis=app.capture_shared_removal_source(pane.id).unwrap().unwrap();
-            let operation=uuid::Uuid::new_v4();app.shared_views.pending.push((operation,view.scope.clone(),basis.change()));
-            if registry_replaced {app.workspace_model.identity=uuid::Uuid::new_v4();}
-            else {if let CardKind::Browser(source)=&mut app.workspace_model.views[0].panes[0].kind {source.id=BrowserId::new();}app.workspace_model.views[0].revision+=1;}
-            let expected=app.workspace_model.views[0].panes[0].clone();
+        for registry_replaced in [false, true] {
+            let (mut app, a, _, pane) = removal_fixture();
+            let mut view = View::empty(Scope::Channel(a));
+            view.revision = 7;
+            view.panes = vec![pane.clone()];
+            app.workspace_model.views = vec![view.clone()];
+            app.shared_views.applying = true;
+            drop(app.project_shared_view(&view, &HashSet::from([pane.id])));
+            app.shared_views.applying = false;
+            let basis = app.capture_shared_removal_source(pane.id).unwrap().unwrap();
+            let operation = uuid::Uuid::new_v4();
+            app.shared_views
+                .pending
+                .push((operation, view.scope.clone(), basis.change()));
+            if registry_replaced {
+                app.workspace_model.identity = uuid::Uuid::new_v4();
+            } else {
+                if let CardKind::Browser(source) = &mut app.workspace_model.views[0].panes[0].kind {
+                    source.id = BrowserId::new();
+                }
+                app.workspace_model.views[0].revision += 1;
+            }
+            let expected = app.workspace_model.views[0].panes[0].clone();
             drop(app.reconcile_shared_views());
-            assert!(!app.shared_views.pending.iter().any(|(id,_,_)|*id==operation));
+            assert!(
+                !app.shared_views
+                    .pending
+                    .iter()
+                    .any(|(id, _, _)| *id == operation)
+            );
             assert!(app.card_state(pane.id).unwrap().existence.is_open());
-            assert_eq!(crate::workspace_model::views::shared_kind(&app.card_state(pane.id).unwrap().kind),expected.kind);
-            assert!(!app.install_shared_removal_source(pane.id,Some(basis)),"old source must not acquire new shared authority");
+            assert_eq!(
+                crate::workspace_model::views::shared_kind(&app.card_state(pane.id).unwrap().kind),
+                expected.kind
+            );
+            assert!(
+                !app.install_shared_removal_source(pane.id, Some(basis)),
+                "old source must not acquire new shared authority"
+            );
         }
     }
     #[test]
     fn seed_never_publishes_uncaptured_historical_closed_ids() {
-        let (mut app,a,_,pane)=fixture();
-        let mut view=View::empty(Scope::Channel(a));view.panes=vec![pane.clone()];app.workspace_model.views=vec![view];
-        app.shared_views.initialized.remove(&Scope::Channel(a));app.shared_views.seeding.clear();
-        let (tx,rx)=async_channel::unbounded();app.workspace_model_tx=tx;
-        if let Some(state)=app.card_state_mut(pane.id) {state.existence=super::super::project_ui::removed_existence("legacy cache");}
+        let (mut app, a, _, pane) = fixture();
+        let mut view = View::empty(Scope::Channel(a));
+        view.panes = vec![pane.clone()];
+        app.workspace_model.views = vec![view];
+        app.shared_views.initialized.remove(&Scope::Channel(a));
+        app.shared_views.seeding.clear();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        if let Some(state) = app.card_state_mut(pane.id) {
+            state.existence = super::super::project_ui::removed_existence("legacy cache");
+        }
         app.publish_view_changes();
-        for edit in std::iter::from_fn(||rx.try_recv().ok()) {if let ModelEdit::SeedView {closed,..}=edit {assert!(closed.is_empty());}}
+        for edit in std::iter::from_fn(|| rx.try_recv().ok()) {
+            if let ModelEdit::SeedView { closed, .. } = edit {
+                assert!(closed.is_empty());
+            }
+        }
     }
-
 }

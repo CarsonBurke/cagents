@@ -101,7 +101,7 @@ impl Cagents {
         &mut self,
         terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
     ) -> Task<Message> {
-        let presentation=self.observe_local_terminal_residents(&terminals);
+        let presentation = self.observe_local_terminal_residents(&terminals);
         let mut reconnect = Vec::new();
         for terminal in &terminals {
             self.corroborate_terminal_close_adoption(terminal);
