@@ -706,6 +706,7 @@ pub struct SidebarWorktree {
     /// Held by the application rather than read from the checkout, and
     /// reapplied whenever a read replaces the row.
     pub deletion: Option<RowDeletion>,
+    pub cleanup_kept: Option<String>,
     chrome: WorktreeChrome,
 }
 
@@ -764,6 +765,7 @@ impl SidebarWorktree {
             head_repository: None,
             pull_request_state: None,
             deletion: None,
+            cleanup_kept: None,
             chrome,
         }
     }
@@ -5927,6 +5929,12 @@ fn worktree_view<'a>(
             None => {}
         }
     }
+    if !deleting && let Some(reason) = &worktree.cleanup_kept {
+        let badge: Element<'static, SidebarAction> = if compact {
+            widget::icon(Icon::Info.handle()).size(design::COMPACT_ICON_SIZE).into()
+        } else { design::caption("Kept").into() };
+        content = content.push(crate::interaction::tooltip(badge, format!("Merged, kept: {reason}")));
+    }
     // Durable attributes, after the reserved slot: each is a fact about the
     // worktree rather than live activity, so none of them moves while an agent
     // starts or stops working. The rail has no room for any of them, and a
@@ -6005,7 +6013,10 @@ fn worktree_view<'a>(
         .control(content, selected)
         .id(chrome.open_id.clone())
         .name(with_deletion_name(
-            worktree_accessible_name(worktree, agent_update, activity, has_panes),
+            match &worktree.cleanup_kept {
+                Some(reason) => Cow::Owned(format!("{}, merged, kept: {reason}", worktree_accessible_name(worktree, agent_update, activity, has_panes))),
+                None => worktree_accessible_name(worktree, agent_update, activity, has_panes),
+            },
             "worktree",
             &chrome.label,
             deletion,
@@ -6019,7 +6030,8 @@ fn worktree_view<'a>(
     } else {
         crate::interaction::hover(action)
     };
-    let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
+    let tooltip = worktree.cleanup_kept.as_ref().map_or_else(|| chrome.tooltip.to_string(), |reason| format!("{}\nMerged, kept: {reason}", chrome.tooltip));
+    let action = crate::interaction::tooltip(action, tooltip);
     let action = if !primary
         && worktree
             .pull_request()
