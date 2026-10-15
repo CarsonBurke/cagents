@@ -39,6 +39,7 @@ struct NativeCandidate {
     session: chat::Session,
     handle: chat::runtime::Handle,
     pair_valid: bool,
+    paired_live: bool,
     paired_directory: Option<Option<Directory>>,
 }
 struct Candidates {
@@ -145,6 +146,7 @@ fn candidates(host: &SharedHost) -> Result<Candidates, String> {
         };
         NativeCandidate {
             execution_instance: record.execution_instance, session: record.session.clone(), handle: record.handle.clone(), pair_valid,
+            paired_live: record.paired_terminal.as_ref().is_some_and(|handle| !handle.is_completed()),
             paired_directory: record.paired_terminal.as_ref().map(|handle| handle.admitted_directory()),
         }
     }).collect();
@@ -162,6 +164,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
     let candidates = candidates(host)?;
     let mut actors = BTreeMap::new();
     for (instance, session, handle, directory) in candidates.terminals {
+        if directory.is_none() && handle.is_completed() { continue; }
         let (directory, identity) = directory.ok_or_else(|| format!("Terminal {} has no authoritative admitted physical directory; close it explicitly before worktree removal", session.id))?;
         // Operational/launch aliases may expand removal protection, but cannot
         // newly authorize closing an actor admitted in another physical scope.
@@ -170,8 +173,13 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
     }
-    for NativeCandidate { execution_instance, session, handle, pair_valid, paired_directory } in candidates.natives {
+    for NativeCandidate { execution_instance, session, handle, pair_valid, paired_live, paired_directory } in candidates.natives {
         let observation = handle.close_observation();
+        // History readers and fully completed actors without observed scope
+        // own no provider execution. Preserve their records instead of making
+        // an unrelated historical card block every worktree's live census.
+        // A retained console is independent ownership and must not disappear.
+        if !observation.owns_work && observation.directory_identity.is_none() && !paired_live { continue; }
         let identity = observation.directory_identity.ok_or_else(|| format!("Native session {} has no authoritative physical scope; reconnect or explicitly close it before worktree removal", session.id))?;
         let native_inside = admitted_scope(&observation.working_directory, identity, path)?;
         if let Some(paired_directory) = paired_directory {
@@ -308,6 +316,44 @@ mod tests {
                 recipe: crate::model::LaunchRecipe { program: "/bin/false".into(), arguments: Vec::new(), working_directory: directory, environment: BTreeMap::new(), unset_environment: Default::default() },
             },
         }
+    }
+    fn history_record(directory: PathBuf) -> super::super::chat::Record {
+        struct History;
+        impl chat::protocol::Adapter for History {
+            fn initialize(&mut self)->Result<chat::protocol::Step,String> {Ok(Default::default())}
+            fn command(&mut self,_:chat::Command)->Result<chat::protocol::Step,String> {Err("Fixture history is read only".into())}
+            fn receive(&mut self,_:serde_json::Value)->Result<chat::protocol::Step,String> {Ok(Default::default())}
+        }
+        let session=starting_session(directory.clone());
+        let spec=chat::protocol::ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:chat::protocol::TransportSpec::History,program:"/bin/false".into(),arguments:Vec::new(),working_directory:directory,environment:BTreeMap::new() };
+        let mut initial=chat::protocol::Step::default();
+        let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let handle=chat::runtime::Handle::start(spec,Box::new(History),initial,store,None,|_|{}).unwrap();
+        super::super::chat::Record { execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,session,handle,source_process:None,subscribers:BTreeMap::new(),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false }
+    }
+    #[test]
+    fn unscoped_history_is_preserved_without_blocking_unrelated_live_census() {
+        let selected=tempfile::tempdir_in("/var/tmp").unwrap();
+        let record=history_record(selected.path().join("missing-history-directory"));
+        let id=record.session.id; let handle=record.handle.clone(); let host=host();
+        assert!(!handle.close_observation().owns_work);
+        host.lock().unwrap().chats.insert(id,record);
+        assert!(census(&host,selected.path()).unwrap().is_empty());
+        assert!(host.lock().unwrap().chats.contains_key(&id),"read-only history must not be retired using inferred scope");
+        handle.close().unwrap();
+    }
+    #[test]
+    fn unscoped_history_never_hides_its_retained_live_console() {
+        let selected=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut record=history_record(selected.path().into());
+        let mut recipe=record.session.launch.recipe.clone();recipe.program="/bin/sh".into();recipe.arguments=vec!["-c".into(),"exec sleep 600".into()];
+        let terminal=TerminalSession { id:record.session.id,launch:recipe.clone(),owned_codex_listener:None,recovery_origin:None,predecessor:None,transcript_path:None,resume_hint:None,continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe,last_exit:None} };
+        let paired=TerminalHandle::spawn(terminal.clone(),crate::terminal::TerminalConfig::default(),|_|{}).unwrap();
+        record.paired_terminal=Some(paired.clone()); record.session.terminal=Some(terminal);
+        let handle=record.handle.clone(); let host=host();host.lock().unwrap().chats.insert(record.session.id,record);
+        assert!(census(&host,selected.path()).is_err(),"the actual retained worker remains ownership even when absent from inventory");
+        assert!(!paired.is_completed());
+        paired.shutdown().unwrap();handle.close().unwrap();
     }
     #[test]
     fn detached_startup_is_in_the_candidate_census_without_any_subscriber() {

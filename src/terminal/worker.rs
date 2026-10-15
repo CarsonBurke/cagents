@@ -1283,7 +1283,7 @@ impl TerminalHandle {
             reply,
         }).map_err(|error| error.to_string())?;
         result.recv_timeout(Duration::from_secs(3)).map_err(|_| "Terminal close outcome is unconfirmed; refresh its census before retrying".to_owned())??;
-        // The owner already fenced admission and killed its pinned family.
+        // A future successful owner command must fence admission and confirm teardown.
         self.shutdown().map_err(|error| error.to_string())
     }
 
