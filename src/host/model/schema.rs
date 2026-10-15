@@ -216,7 +216,16 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
             legacy(&path, checkpoint);
+            if checkpoint<=1 {
+                let predecessor=Connection::open(&path).unwrap();
+                let notification_table:bool=predecessor.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='automation_notifications')",[],|row|row.get(0)).unwrap();
+                assert!(!notification_table,"published predecessor {checkpoint} must not precreate private19 notification authority");
+            }
             let registry = Registry::at(&path).unwrap();
+            let discovery:(Option<String>,Option<String>)=registry.db.query_row("SELECT checkout,primary_checkout FROM projects WHERE repository='/fixture'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(discovery,(None,None),"legacy checkpoint {checkpoint} must not infer discovery from repository identity");
+            assert_eq!(registry.db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='automation_notifications'",[],|row|row.get::<_,u64>(0)).unwrap(),1);
+
             assert_eq!(version(&registry.db).unwrap(), SCHEMA_VERSION, "from {checkpoint}");
             assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/fixture'", [], |row| row.get::<_, String>(0)).unwrap(), "preserved");
             let identity: String = registry.db.query_row("SELECT identity FROM metadata", [], |row| row.get(0)).unwrap();
