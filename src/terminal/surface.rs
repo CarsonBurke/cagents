@@ -131,6 +131,10 @@ impl TerminalSurface {
         self.handle.key(key)
     }
 
+    pub(crate) fn abandon_key_delivery(&self, reason: &str) {
+        self.handle.abandon_key_delivery(reason);
+    }
+
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
         self.handle.mouse(mouse)
     }

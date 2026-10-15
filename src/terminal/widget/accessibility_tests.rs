@@ -1067,7 +1067,7 @@ fn native_release_observation_cannot_clear_a_newer_review_press_from_an_old_app_
 /// A real framed peer whose key ACKs are controlled by the test. It owns no
 /// client handle, so last-owner tests cannot accidentally pass because a
 /// fixture retained an extra attachment.
-struct HeldKeyPeer {
+pub(crate) struct HeldKeyPeer {
     _directory: tempfile::TempDir,
     keys: crossbeam_channel::Receiver<KeyInput>,
     acknowledge: crossbeam_channel::Sender<bool>,
@@ -1077,7 +1077,7 @@ struct HeldKeyPeer {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl HeldKeyPeer {
-    fn connect() -> (TerminalSurface, Self) { Self::connect_mode(false) }
+    pub(crate) fn connect() -> (TerminalSurface, Self) { Self::connect_mode(false) }
     fn connect_mode(reconnect: bool) -> (TerminalSurface, Self) {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = directory.path().join("held-key.sock");
@@ -1163,10 +1163,10 @@ impl HeldKeyPeer {
         handle.wait_until_attached(Duration::from_secs(3)).unwrap();
         (handle.into(), Self { _directory: directory, keys, acknowledge, resume, closed, stop, worker: Some(worker) })
     }
-    fn next(&self, action: KeyAction) {
+    pub(crate) fn next(&self, action: KeyAction) {
         assert_eq!(self.keys.recv_timeout(Duration::from_secs(3)).unwrap().action, action);
     }
-    fn ack(&self, accepted: bool) { self.acknowledge.send(accepted).unwrap(); }
+    pub(crate) fn ack(&self, accepted: bool) { self.acknowledge.send(accepted).unwrap(); }
 }
 impl Drop for HeldKeyPeer {
     fn drop(&mut self) {
@@ -1279,4 +1279,47 @@ fn acknowledged_press_retains_historical_authority_across_detach_before_reap() {
     peer.next(KeyAction::Release); peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
     assert!(barrier.take_failures().is_empty());
+}
+
+
+/// Retains the real mounted widget/tree while an App lifecycle fixture drives
+/// close. It avoids creating an artificial orphan before exit commits.
+pub(crate) struct HeldKeyWidget {
+    _tree: Tree,
+    _widget: TerminalWidget<Message>,
+    _renderer: Renderer,
+}
+impl HeldKeyWidget {
+    pub(crate) fn enter_review(&mut self) {
+        self._widget.review_active = true;
+        self._widget.suppress_focus_reports = true;
+        self._widget.review_revision += 1;
+        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())));
+        assert!(self._tree.state.downcast_ref::<WidgetState>().a11y.borrow().review);
+    }
+}
+pub(crate) fn hold_key_in_widget(surface: &TerminalSurface, barrier: ReviewInputBarrier) -> HeldKeyWidget {
+    let renderer = renderer();
+    let mut widget = TerminalWidget::<Message>::new(surface.clone()).id(Id::new("window-exit-key")).model_focused(true)
+        .review_boundary(barrier, false, false, 0, Message::Review);
+    let mut tree = widget_tree(&widget);
+    dispatch(&mut widget, &mut tree, &renderer, key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
+    HeldKeyWidget { _tree: tree, _widget: widget, _renderer: renderer }
+}
+#[test]
+fn bounded_window_exit_fences_unknown_delivery_without_killing_the_pty() {
+    let (surface, peer) = HeldKeyPeer::connect();
+    let barrier = ReviewInputBarrier::default();
+    barrier.press(keyboard::key::Physical::Code(keyboard::key::Code::KeyA), &surface, held_input(KeyAction::Press)).unwrap();
+    peer.next(KeyAction::Press); // Deliberately withhold its authenticated ACK.
+    assert!(barrier.begin_window_exit());
+    assert_eq!(barrier.press(keyboard::key::Physical::Code(keyboard::key::Code::KeyB), &surface, held_input(KeyAction::Press)), Err(TerminalSendError::Closed));
+    barrier.note_review(surface.terminal_id(), true); // A late native action cannot reopen Review during committed exit.
+    let failures = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+        barrier.drain_window_exit_for_test(Duration::from_millis(30)));
+    assert!(failures.iter().any(|reason| reason.contains("not confirmed before window exit")));
+    assert_eq!(barrier.pending_counts(), (0, 0));
+    assert_eq!(surface.key(held_input(KeyAction::Press)), Err(TerminalSendError::Closed));
+    assert!(peer.keys.try_recv().is_err(), "no guessed late release may follow a failed original admission");
 }

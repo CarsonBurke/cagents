@@ -130,6 +130,8 @@ struct ConsumedInputs {
     native_review: Option<crate::model::TerminalId>,
     retiring: Vec<RetiringKey>,
     failures: Vec<String>,
+    exit_failures: Vec<String>,
+    closing: bool,
 }
 const MAX_OWNED_KEYS: usize = 512;
 struct OwnedKey {
@@ -173,6 +175,7 @@ impl KeyAuthority {
 impl ConsumedInputs {
     fn failure(&mut self, reason: String) {
         tracing::warn!(%reason, "terminal key admission failed or was not confirmed");
+        if self.closing && self.exit_failures.len() < 8 && !self.exit_failures.contains(&reason) { self.exit_failures.push(reason.clone()); }
         if self.failures.len() < 8 && !self.failures.contains(&reason) { self.failures.push(reason); }
     }
     fn reap(&mut self) {
@@ -213,11 +216,13 @@ pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
     pub(crate) fn note_review(&self, terminal: crate::model::TerminalId, active: bool) {
         let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.closing { return; }
         if active { shared.native_review=Some(terminal); }
         else if shared.native_review==Some(terminal) { shared.native_review=None; }
     }
     pub(crate) fn confirm_review(&self, previous: Option<crate::model::TerminalId>, current: Option<crate::model::TerminalId>) {
         let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.closing { return; }
         if current.is_some() || shared.native_review==previous { shared.native_review=current; }
     }
     /// Queues both initial presses and repeats under the window ownership
@@ -226,6 +231,7 @@ impl ReviewInputBarrier {
     pub(super) fn press(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) -> Result<(), super::TerminalSendError> {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
+        if shared.closing { return Err(super::TerminalSendError::Closed); }
         if shared.occupied() >= MAX_OWNED_KEYS { return Err(super::TerminalSendError::Full); }
         if let Some(key) = shared.owned.iter().find(|key| key.physical == physical) {
             if key.orphaned || !key.surface.same_attachment(surface) { return Err(super::TerminalSendError::Full); }
@@ -272,6 +278,57 @@ impl ReviewInputBarrier {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
         (shared.owned.len(), shared.retiring.len())
+    }
+    /// Called only after the application commits its normal exit. Review has
+    /// ended and no subsequent native event may create a new key lease.
+    pub(crate) fn begin_window_exit(&self) -> bool {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.closing = true;
+        shared.native_review = None;
+        shared.reap();
+        for key in &mut shared.owned { key.orphaned = true; }
+        shared.occupied() != 0
+    }
+    /// One bounded task per closing window, never one thread per key. The
+    /// short retry exists only during exit: an ordinary untracked command can
+    /// fill the client inbox without producing a key receipt to await.
+    pub(crate) async fn drain_window_exit(&self) -> Vec<String> {
+        self.drain_window_exit_until(Instant::now() + Duration::from_secs(6)).await
+    }
+    #[cfg(test)]
+    pub(super) async fn drain_window_exit_for_test(&self, budget: Duration) -> Vec<String> {
+        self.drain_window_exit_until(Instant::now() + budget).await
+    }
+    async fn drain_window_exit_until(&self, deadline: Instant) -> Vec<String> {
+        loop {
+            self.flush_orphans(false);
+            let pending = {
+                let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                shared.reap();
+                if shared.occupied() == 0 { return std::mem::take(&mut shared.exit_failures); }
+                if Instant::now() < deadline { None } else {
+                    let mut surfaces = Vec::<super::TerminalSurface>::new();
+                    for surface in shared.owned.iter().map(|key| &key.surface)
+                        .chain(shared.retiring.iter().map(|key| &key._surface)) {
+                        if !surfaces.iter().any(|old| old.same_attachment(surface)) { surfaces.push(surface.clone()); }
+                    }
+                    Some(surfaces)
+                }
+            };
+            if let Some(surfaces) = pending {
+                let reason = "terminal key releases were not confirmed before window exit; the original attachments were disconnected without claiming delivery";
+                // This disconnects only the original UI actors, never the
+                // daemon-owned PTYs. No old command can replay after failure.
+                for surface in surfaces { surface.abandon_key_delivery(reason); }
+                let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                shared.reap();
+                shared.owned.clear();
+                shared.retiring.clear();
+                shared.failure(reason.into());
+                return std::mem::take(&mut shared.exit_failures);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     pub(crate) fn take_failures(&self) -> Vec<String> {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());

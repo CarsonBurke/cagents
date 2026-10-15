@@ -4405,6 +4405,7 @@ pub enum Message {
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
     LanguageServersReaped,
+    TerminalKeysDrained(Vec<String>),
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
@@ -4417,19 +4418,20 @@ pub enum Message {
 /// An application exit in progress.
 ///
 /// The window closes as soon as the exit is committed. The process ends only
-/// once both halves below are done: before the window is gone, iced's
-/// teardown would run while it is still on screen, and before the servers
-/// are reaped it would take away the runtime that stops them.
+/// once the window, language servers and terminal key leases are resolved:
+/// tearing down earlier could leave a visible window, an unreaped server or
+/// a surviving daemon terminal with an admitted press and no paired release.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ApplicationExit {
     /// The window the exit closed, until iced reports it gone.
     closing: Option<window::Id>,
     servers_reaped: bool,
+    terminal_keys_drained: bool,
 }
 
 impl ApplicationExit {
     fn is_complete(self) -> bool {
-        self.closing.is_none() && self.servers_reaped
+        self.closing.is_none() && self.servers_reaped && self.terminal_keys_drained
     }
 }
 
@@ -5051,6 +5053,7 @@ pub struct Cagents {
 
 impl Cagents {
     fn set_terminal_review_owner(&mut self, owner: Option<CardId>) {
+        if self.exit.is_some() && owner.is_some() { return; }
         let previous=self.terminal_review_identity;
         self.terminal_review_card = owner;
         self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
@@ -11783,6 +11786,14 @@ impl Cagents {
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
         self.activation_rx.close();
+        self.set_terminal_review_owner(None);
+        let pending_keys = self.terminal_review_input.begin_window_exit();
+        let keys = if pending_keys {
+            let ownership = self.terminal_review_input.clone();
+            cosmic::task::future(async move {
+                Message::TerminalKeysDrained(ownership.drain_window_exit().await)
+            })
+        } else { Task::none() };
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
         self.persist();
@@ -11795,18 +11806,19 @@ impl Cagents {
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
+            terminal_keys_drained: !pending_keys,
         });
         let Some((window, close)) = close else {
-            return reap;
+            return Task::batch([reap, keys]);
         };
         let close_timeout = cosmic::task::future(async move {
             tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
             Message::WindowClosed(window)
         });
-        Task::batch([close, reap, close_timeout])
+        Task::batch([close, reap, close_timeout, keys])
     }
 
-    /// Records one half of the exit and ends the process once both are done.
+    /// Records an exit gate and ends the process once all owners resolve.
     fn advance_exit(&mut self, advance: impl FnOnce(&mut ApplicationExit)) -> Task<Message> {
         let Some(exit) = self.exit.as_mut() else {
             return Task::none();
@@ -16322,6 +16334,15 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::TerminalKeysDrained(failures) => {
+                for reason in failures {
+                    // The window may already be gone. Preserve a diagnostic;
+                    // this is an unconfirmed/failed release, never delivery.
+                    tracing::warn!(%reason, "terminal input cleanup failed during application exit");
+                    self.notices.record(TransientNotice::warning(reason));
+                }
+                self.advance_exit(|exit| exit.terminal_keys_drained = true)
+            }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
             Message::WindowClosed(window) => self.advance_exit(|exit| {
                 if exit.closing == Some(window) {
@@ -18835,6 +18856,7 @@ mod tests {
         let closing = Some(ApplicationExit {
             closing: Some(window),
             servers_reaped: false,
+            terminal_keys_drained: true,
         });
         assert_eq!(app.exit, closing);
         // Released, so libcosmic's report of the closed window cannot end the
@@ -19012,6 +19034,56 @@ mod tests {
             assert!(!app.exit.unwrap().is_complete());
             let _ = app.update(second);
             assert!(app.exit.unwrap().is_complete());
+        }
+    }
+
+    #[test]
+    fn window_exit_waits_for_real_key_receipts_after_review_and_both_other_gates() {
+        use cosmic::iced::futures::StreamExt;
+        for (review, window_first, accepted) in [(true, true, true), (true, false, true), (false, true, false)] {
+            let (mut app, card, _directory) = live_agent_app("window-key-exit-fixture");
+            let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
+            app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
+            let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+            peer.next(crate::terminal::KeyAction::Press); peer.ack(true);
+            if review { app.set_terminal_review_owner(Some(card)); mounted.enter_review(); }
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            let close = app.update(Message::WindowCloseRequested(window));
+            assert!(app.exit.is_some());
+            assert!(!app.exit.unwrap().terminal_keys_drained);
+            assert!(app.terminal_review_card.is_none(), "committed close explicitly ends Review");
+            assert_eq!(app.core.main_window_id(), None, "the visible close is not delayed by key receipts");
+            let (first, second) = if window_first { (Message::WindowClosed(window), Message::LanguageServersReaped) }
+                else { (Message::LanguageServersReaped, Message::WindowClosed(window)) };
+            drop(app.update(first)); drop(mounted); drop(app.update(second));
+            assert!(!app.exit.unwrap().is_complete(), "window/LSP cannot retire admitted terminal input");
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(close).unwrap();
+                // Poll the actual App close task, including its bounded drain.
+                let early = tokio::time::timeout(Duration::from_millis(40), async {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::TerminalKeysDrained(_))) = action {
+                            return;
+                        }
+                    }
+                    panic!("close task ended before key admission");
+                }).await;
+                assert!(early.is_err(), "withheld ACK must keep final process exit fenced");
+                peer.next(crate::terminal::KeyAction::Release);
+                assert!(!app.exit.unwrap().is_complete());
+                peer.ack(accepted);
+                let failures = tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::TerminalKeysDrained(failures))) = action { return failures; }
+                    }
+                    panic!("missing App key-drain completion");
+                }).await.unwrap();
+                assert_eq!(failures.is_empty(), accepted, "refusal must be an explicit failure, never delivered");
+                drop(app.update(Message::TerminalKeysDrained(failures)));
+                assert!(app.exit.unwrap().is_complete());
+            });
         }
     }
 

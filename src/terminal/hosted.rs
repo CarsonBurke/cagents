@@ -77,7 +77,7 @@ impl WorkerStop {
     fn request(&self) {
         self.requested.store(true, Ordering::Release);
         self.async_wake.notify_one();
-        if let Ok(connection) = self.connection.lock()
+        if let Ok(connection) = self.connection.try_lock()
             && let Some(connection) = connection.as_ref()
         {
             let _ = connection.shutdown(std::net::Shutdown::Both);
@@ -1293,6 +1293,15 @@ impl HostedTerminalHandle {
         }
         self.inner.published.delivery_changed.notify_one();
         Ok(receipt)
+    }
+
+    /// Fail only this UI attachment after a bounded key cleanup deadline.
+    /// The daemon-owned terminal keeps running; this actor can never replay
+    /// an uncertain release after the caller has reported failure.
+    #[cfg(feature = "ui")]
+    pub(crate) fn abandon_key_delivery(&self, reason: &str) {
+        self.inner.stop.request();
+        self.inner.published.fail_keys(reason);
     }
 
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
@@ -3776,6 +3785,18 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn abandoning_key_delivery_never_waits_for_socket_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = HostedTerminalHandle::connect_at(directory.path().join("absent.sock"), TerminalId::new(), None, |_| {}).unwrap();
+        let metadata = handle.inner.stop.connection.lock().unwrap();
+        handle.abandon_key_delivery("fixture unconfirmed exit");
+        assert!(handle.inner.stop.is_requested());
+        assert_eq!(handle.key(receipt_key(super::super::KeyAction::Release)), Err(TerminalSendError::Closed));
+        drop(metadata);
     }
 
     fn receipt_key(action: super::super::KeyAction) -> KeyInput {
