@@ -8925,7 +8925,7 @@ mod tests {
             manager.servers[0].configuration=json!({"rust-analyzer":{"check":{"command":"clippy"}}});
             let edit=json!({"documentChanges":[{"textDocument":{"uri":uri,"version":1},"edits":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"bar"}]},{"textDocument":{"uri":other_uri,"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}]}]});
             let response_edit=edit.clone();
-            let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":{"prepareProvider":true},"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"codeActionProvider":{"resolveProvider":true},"executeCommandProvider":{"commands":["fixture.fix"]},"signatureHelpProvider":{"triggerCharacters":["(",","],"retriggerCharacters":[","]}}),move |request|{
+            let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":{"prepareProvider":true},"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"codeActionProvider":{"resolveProvider":true},"executeCommandProvider":{"commands":["fixture.fix"]},"signatureHelpProvider":{"triggerCharacters":["(",","],"retriggerCharacters":[";"]}}),move |request|{
                 let result=match request.method.as_str(){
                     "textDocument/prepareRename"=>json!({"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"placeholder":"foo"}),
                     "textDocument/rename"=>response_edit.clone(),
@@ -8964,6 +8964,11 @@ mod tests {
             let request=manager.execute_command(doc,item.command.unwrap());next_matching(&events,|e|match e{LspEvent::CommandExecuted{request:r,..}if *r==request=>Some(()),_=>None}).await;
             let request=manager.request_signature_help(doc,LspPosition::new(0,2),Some("(".into()));let help=next_matching(&events,|e|match e{LspEvent::SignatureHelp{request:r,help,..}if *r==request=>Some(help.clone()),_=>None}).await.unwrap();
             assert_eq!(help.active_parameter,Some(1));assert_eq!(help.signatures[0].parameters[0].range,Some(2..6));assert_eq!(help.signatures[0].parameters[1].label,"value");
+            assert!(!manager.signature_trigger(doc,';'));assert!(manager.signature_trigger_with_context(doc,';',true));
+            let request=manager.request_signature_help_retrigger(doc,LspPosition::new(0,2),Some(";".into()),true,Some(help.clone()));
+            next_matching(&events,|event|match event{LspEvent::SignatureHelp{request:at,..}if *at==request=>Some(()),_=>None}).await;
+            let entries=handle.entries("textDocument/signatureHelp");let context=&entries.last().unwrap().params["context"];
+            assert_eq!(context["isRetrigger"],json!(true));assert_eq!(context["activeSignatureHelp"]["activeParameter"],json!(1));assert_eq!(context["activeSignatureHelp"]["signatures"][0]["parameters"][0]["label"],json!([2,4]));
             handle.notify("window/showMessage",json!({"type":1,"message":"workspace failed to load"}));
             let message=next_matching(&events,|e|match e{LspEvent::ServerMessage{level:LspMessageLevel::Error,message,..}=>Some(message.clone()),_=>None}).await;assert_eq!(message,"workspace failed to load");
             let key=manager.documents.get(&doc).unwrap().session.clone();manager.sessions.get(&key).unwrap().request_retirement();assert!(!manager.capabilities(doc).ready);
