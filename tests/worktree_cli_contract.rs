@@ -292,7 +292,7 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     drop(connection);
     let device_service::Reply::Worktree(Reply::SetupIntents {intents,warnings})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntents {repository:repository.clone()}}).unwrap() else {panic!("wrong setup inventory")};
     assert!(warnings.is_empty(),"{warnings:?}");assert_eq!(intents.len(),1);assert_eq!(intents[0].path,path);
-    assert_eq!(serde_json::from_str::<WorktreeSetupIntent>(&intents[0].intent).unwrap(),crash_intent);
+    assert_eq!(intents[0].run_id,crash_intent.run_id);assert!(intents[0].copy_done);assert!(intents[0].has_commands);assert!(!intents[0].skip);
     assert!(client.list().unwrap().is_empty(),"inventory must discover the retained run without a marker terminal");
     let device_service::Reply::Worktree(Reply::SetupIntent {intent,current_plan,plan_error,trusted,active,primary,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
     assert_eq!(primary,project);assert!(!trusted);assert!(!active);assert!(plan_error.is_none());
