@@ -16614,6 +16614,10 @@ impl Application for Cagents {
         Subscription::batch(subscriptions)
     }
 
+    fn native_surface<'a>(&'a self, surface: Element<'a, cosmic::Action<Message>>) -> Element<'a, cosmic::Action<Message>> {
+        self.chat_ui.clipboard_surface(surface)
+    }
+
     fn dialog(&self) -> Option<Element<'_, Message>> {
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);

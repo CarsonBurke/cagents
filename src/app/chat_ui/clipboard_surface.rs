@@ -8,10 +8,10 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, r
 use iced::{Event, Rectangle, Size, Vector};
 use iced::clipboard::{dnd, mime};
 
-pub(super) fn surface<'a>(content: Element<'a, Message>, intents: Intents) -> Element<'a, Message> {
-    Element::new(Scope { content, intents })
+pub(super) fn surface<'a, M: 'a>(content: cosmic::Element<'a, M>, intents: Intents) -> cosmic::Element<'a, M> {
+    cosmic::Element::new(Scope { content, intents })
 }
-struct Scope<'a> {content: Element<'a, Message>, intents: Intents}
+struct Scope<'a, M> {content: cosmic::Element<'a, M>, intents: Intents}
 struct ScopeState;
 struct Proxy<'a> {inner: &'a mut dyn Clipboard, intents: &'a Intents}
 impl Clipboard for Proxy<'_> {
@@ -42,7 +42,7 @@ impl Clipboard for Proxy<'_> {
     fn peek_dnd(&self, mime:String)->Option<(Vec<u8>,String)> {self.inner.peek_dnd(mime)}
     fn request_logical_window_size(&self,width:f32,height:f32) {self.inner.request_logical_window_size(width,height);}
 }
-impl Widget<Message,cosmic::Theme,cosmic::Renderer> for Scope<'_> {
+impl<M> Widget<M,cosmic::Theme,cosmic::Renderer> for Scope<'_, M> {
     fn tag(&self)->tree::Tag {tree::Tag::of::<ScopeState>()}
     fn state(&self)->tree::State {tree::State::new(ScopeState)}
     fn children(&self)->Vec<Tree> {vec![Tree::new(&self.content)]}
@@ -63,7 +63,7 @@ impl Widget<Message,cosmic::Theme,cosmic::Renderer> for Scope<'_> {
         self.content.as_widget_mut().operate(&mut tree.children[0],layout,renderer,operation);
     }
     fn update(&mut self, tree:&mut Tree,event:&Event,layout:Layout<'_>,cursor:mouse::Cursor,renderer:&cosmic::Renderer,
-        clipboard:&mut dyn Clipboard,shell:&mut Shell<'_,Message>,viewport:&Rectangle) {
+        clipboard:&mut dyn Clipboard,shell:&mut Shell<'_,M>,viewport:&Rectangle) {
         self.content.as_widget_mut().update(&mut tree.children[0],event,layout,cursor,renderer,
             &mut Proxy {inner:clipboard,intents:&self.intents},shell,viewport);
     }
@@ -75,14 +75,14 @@ impl Widget<Message,cosmic::Theme,cosmic::Renderer> for Scope<'_> {
         self.content.as_widget().mouse_interaction(&tree.children[0],layout,cursor,viewport,renderer)
     }
     fn overlay<'a>(&'a mut self,tree:&'a mut Tree,layout:Layout<'a>,renderer:&cosmic::Renderer,viewport:&Rectangle,translation:Vector)
-        ->Option<overlay::Element<'a,Message,cosmic::Theme,cosmic::Renderer>> {
+        ->Option<overlay::Element<'a,M,cosmic::Theme,cosmic::Renderer>> {
         let intents=self.intents.clone();
         self.content.as_widget_mut().overlay(&mut tree.children[0],layout,renderer,viewport,translation)
             .map(|content|overlay::Element::new(Box::new(OverlayScope {content,intents})))
     }
 }
-struct OverlayScope<'a> {content:overlay::Element<'a,Message,cosmic::Theme,cosmic::Renderer>,intents:Intents}
-impl overlay::Overlay<Message,cosmic::Theme,cosmic::Renderer> for OverlayScope<'_> {
+struct OverlayScope<'a,M> {content:overlay::Element<'a,M,cosmic::Theme,cosmic::Renderer>,intents:Intents}
+impl<M> overlay::Overlay<M,cosmic::Theme,cosmic::Renderer> for OverlayScope<'_,M> {
     fn layout(&mut self,renderer:&cosmic::Renderer,bounds:Size)->layout::Node {self.content.as_overlay_mut().layout(renderer,bounds)}
     fn draw(&self,renderer:&mut cosmic::Renderer,theme:&cosmic::Theme,style:&renderer::Style,layout:Layout<'_>,cursor:mouse::Cursor) {
         self.content.as_overlay().draw(renderer,theme,style,layout,cursor);
@@ -90,18 +90,25 @@ impl overlay::Overlay<Message,cosmic::Theme,cosmic::Renderer> for OverlayScope<'
     fn operate(&mut self,layout:Layout<'_>,renderer:&cosmic::Renderer,operation:&mut dyn Operation) {
         self.content.as_overlay_mut().operate(layout,renderer,operation);
     }
-    fn update(&mut self,event:&Event,layout:Layout<'_>,cursor:mouse::Cursor,renderer:&cosmic::Renderer,clipboard:&mut dyn Clipboard,shell:&mut Shell<'_,Message>) {
+    fn update(&mut self,event:&Event,layout:Layout<'_>,cursor:mouse::Cursor,renderer:&cosmic::Renderer,clipboard:&mut dyn Clipboard,shell:&mut Shell<'_,M>) {
         self.content.as_overlay_mut().update(event,layout,cursor,renderer,&mut Proxy {inner:clipboard,intents:&self.intents},shell);
     }
     fn mouse_interaction(&self,layout:Layout<'_>,cursor:mouse::Cursor,renderer:&cosmic::Renderer)->mouse::Interaction {
         self.content.as_overlay().mouse_interaction(layout,cursor,renderer)
     }
-    fn overlay<'a>(&'a mut self,layout:Layout<'a>,renderer:&cosmic::Renderer)->Option<overlay::Element<'a,Message,cosmic::Theme,cosmic::Renderer>> {
+    fn overlay<'a>(&'a mut self,layout:Layout<'a>,renderer:&cosmic::Renderer)->Option<overlay::Element<'a,M,cosmic::Theme,cosmic::Renderer>> {
         let intents=self.intents.clone();
         self.content.as_overlay_mut().overlay(layout,renderer)
             .map(|content|overlay::Element::new(Box::new(OverlayScope {content,intents})))
     }
     fn index(&self)->f32 {self.content.as_overlay().index()}
+}
+
+/// Shared native-event harness for actual async copy Ready-handler races.
+/// Construct the renderer outside an async runtime, as in other UI fixtures.
+#[cfg(test)]
+pub(super) fn native_copy_for_test(renderer: &cosmic::Renderer, intents: Intents, selected: &str) -> String {
+    tests::drive_native_copy(renderer, intents, selected, None)
 }
 
 #[cfg(test)]
@@ -121,6 +128,10 @@ mod tests {
             }
         }
         fn read_data(&self,_:Kind,_:Vec<String>)->Option<(Vec<u8>,String)> {Some((b"read forwarded".to_vec(),"test/type".into()))}
+        fn write_data(&mut self,kind:Kind,contents:mime::ClipboardStoreData<Box<dyn Send+Sync+'static+mime::AsMimeTypes>>) {
+            let bytes=contents.0.as_bytes("test/type").expect("forward original MIME payload");
+            self.write(kind,String::from_utf8(bytes.into_owned()).unwrap());
+        }
         fn peek_dnd(&self,_:String)->Option<(Vec<u8>,String)> {Some((b"drag forwarded".to_vec(),"test/drag".into()))}
     }
     struct HeldInput(AtomicBool);
@@ -131,6 +142,30 @@ mod tests {
             physical_key:keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
             location:keyboard::Location::Standard,modifiers:keyboard::Modifiers::CTRL,text:None,repeat:false,
         })
+    }
+    pub(super) fn drive_native_copy(renderer:&cosmic::Renderer,intents:Intents,selected:&str,before:Option<Intent>)->String {
+        let target=Target {card:CardId::new(),generation:1};
+        let text=super::super::selectable_prose::plain(selected,16.0,iced::Font::default(),target);
+        let mut element=surface(super::super::selection::transcript(text,target,None),intents.clone());
+        let mut tree=Tree::new(&element);
+        let viewport=Rectangle::with_size(Size::new(400.0,80.0));
+        let limits=layout::Limits::new(Size::ZERO,viewport.size());
+        let mut node=element.as_widget_mut().layout(&mut tree,renderer,&limits);
+        let start=iced::Point::new(0.0,3.0);let end=iced::Point::new(350.0,3.0);
+        let mut clipboard=NativeClipboard {text:"old clipboard".into(),stale_before_native_write:before};
+        for (event,cursor) in [
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),mouse::Cursor::Available(start)),
+            (Event::Mouse(mouse::Event::CursorMoved {position:end}),mouse::Cursor::Available(end)),
+            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),mouse::Cursor::Available(end)),
+            (copy_key(),mouse::Cursor::Unavailable),
+        ] {
+            let mut messages=Vec::new();let mut shell=Shell::new(&mut messages);
+            element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),cursor,renderer,&mut clipboard,&mut shell,&viewport);
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid() {node=element.as_widget_mut().layout(&mut tree,renderer,&limits);}
+        }
+        assert_eq!(clipboard.text,selected);
+        clipboard.text
     }
     #[test]
     fn actual_native_selection_copy_invalidates_a_held_task_before_late_ready() {
@@ -152,28 +187,10 @@ mod tests {
         let task=iced::Task::perform(async move {held.await.unwrap();(late,"older asynchronous copy".to_owned())},|ready|ready);
         let mut outputs=iced::runtime::task::into_stream(task).unwrap();
         assert!(outputs.next().now_or_never().is_none(),"the real Task is held before native copy");
-        let target=Target {card:CardId::new(),generation:1};
         let selected="new native selected text";
-        let text=super::super::selectable_prose::plain(selected,16.0,iced::Font::default(),target);
-        let mut element=surface(super::super::selection::transcript(text,target,None),intents.clone());
-        let mut tree=Tree::new(&element);
-        let viewport=Rectangle::with_size(Size::new(400.0,80.0));
-        let limits=layout::Limits::new(Size::ZERO,viewport.size());
-        let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
-        let start=iced::Point::new(0.0,3.0);let end=iced::Point::new(350.0,3.0);
-        let mut clipboard=NativeClipboard {text:"old clipboard".into(),stale_before_native_write:Some(older.clone())};
-        for (event,cursor) in [
-            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),mouse::Cursor::Available(start)),
-            (Event::Mouse(mouse::Event::CursorMoved {position:end}),mouse::Cursor::Available(end)),
-            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),mouse::Cursor::Available(end)),
-            (copy_key(),mouse::Cursor::Unavailable),
-        ] {
-            let mut messages=Vec::new();let mut shell=Shell::new(&mut messages);
-            element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),cursor,&renderer,&mut clipboard,&mut shell,&viewport);
-            assert!(shell.is_event_captured());
-            if shell.is_layout_invalid() {node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);}
-        }
-        assert_eq!(clipboard.text,selected);assert!(input.0.load(Ordering::Acquire));assert!(!older.current());
+        let copied=drive_native_copy(&renderer,intents.clone(),selected,Some(older.clone()));
+        let mut clipboard=NativeClipboard {text:copied,..Default::default()};
+        assert!(input.0.load(Ordering::Acquire));assert!(!older.current());
         release.send(()).unwrap();
         let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let Some(iced::runtime::Action::Output((intent,text)))=executor.block_on(outputs.next()) else {panic!("held Task must complete");};
@@ -193,6 +210,19 @@ mod tests {
         let current=intents.next();drop(proxy);
         clipboard.write(Kind::Standard,"current programmatic result".into());
         assert!(current.current(),"programmatic writes outside native update do not invalidate themselves");
+    }
+    struct MimePayload;
+    impl mime::AsMimeTypes for MimePayload {
+        fn available(&self)->std::borrow::Cow<'static,[String]> {vec!["test/type".into()].into()}
+        fn as_bytes(&self,kind:&str)->Option<std::borrow::Cow<'static,[u8]>> {(kind=="test/type").then(||std::borrow::Cow::Borrowed(&b"native MIME payload"[..]))}
+    }
+    #[test]
+    fn native_standard_mime_copy_invalidates_before_forwarding_original_data() {
+        let intents=Intents::default();let older=intents.next();
+        let mut clipboard=NativeClipboard {stale_before_native_write:Some(older.clone()),..Default::default()};
+        let contents:Box<dyn Send+Sync+'static+mime::AsMimeTypes>=Box::new(MimePayload);
+        Proxy {inner:&mut clipboard,intents:&intents}.write_data(Kind::Standard,mime::ClipboardStoreData(contents));
+        assert!(!older.current());assert_eq!(clipboard.text,"native MIME payload");
     }
     struct CopyOverlay {nested:bool}
     impl overlay::Overlay<Message,cosmic::Theme,cosmic::Renderer> for CopyOverlay {
@@ -218,4 +248,106 @@ mod tests {
         nested.as_overlay_mut().update(&copy_key(),Layout::new(&node),mouse::Cursor::Unavailable,&renderer,&mut clipboard,&mut Shell::new(&mut messages));
         assert!(!old.current());assert_eq!(clipboard.text,"nested native overlay copy");
     }
+    #[test]
+    fn actual_application_dialog_copy_and_cut_supersede_held_async_results() {
+        use iced::futures::{FutureExt,StreamExt};
+        for key in ["c", "x"] {
+            let renderer=crate::app::tests::headless_renderer();
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let selected="new native dialog text";
+            app.pull_request_dialog=Some(crate::app::PullRequestDialog {
+                project_id:crate::model::ProjectId::new(),
+                repository:crate::app::GitHubRepoKey::new("github.com",None,"owner","repo").unwrap(),
+                worktree:None,base:"main".into(),head:"topic".into(),title:selected.into(),body:String::new().into(),draft:true,retry_confirmation:None,
+            });
+            let older=app.chat_ui.copy_intents.next();
+            let (release,held)=tokio::sync::oneshot::channel::<()>();let late=older.clone();
+            let task=iced::Task::perform(async move {held.await.unwrap();(late,"older asynchronous copy".to_owned())},|ready|ready);
+            let mut outputs=iced::runtime::task::into_stream(task).unwrap();
+            assert!(outputs.next().now_or_never().is_none());
+            // Use the actual Application dialog return: libcosmic mounts it
+            // beside the main view. A main-view-only wrapper fails this test.
+            let mut cosmic=cosmic::app::cosmic::Cosmic::new(app);
+            let window=iced::window::Id::unique();cosmic.app.core.set_main_window_id(Some(window));
+            let mut element=cosmic.view(window);
+            let mut tree=Tree::new(&element);let viewport=Rectangle::with_size(Size::new(1000.0,800.0));
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,viewport.size()));
+            let id=crate::app::pull_request_dialog_focus_id();
+            let mut dialog=element.as_widget_mut().overlay(&mut tree,Layout::new(&node),&renderer,&viewport,Vector::ZERO).expect("libcosmic sibling dialog overlay");
+            let dialog_node=dialog.as_overlay_mut().layout(&renderer,viewport.size());
+            let mut focus=iced::advanced::widget::operation::focusable::focus::<()>(id.clone());
+            dialog.as_overlay_mut().operate(Layout::new(&dialog_node),&renderer,&mut focus);
+            let mut select=iced::advanced::widget::operation::text_input::select_all::<()>(id);
+            dialog.as_overlay_mut().operate(Layout::new(&dialog_node),&renderer,&mut select);
+            let mut clipboard=NativeClipboard {text:"previous clipboard".into(),stale_before_native_write:Some(older.clone())};
+            let mut messages=Vec::new();
+            let mut key_event=copy_key();
+            if let Event::Keyboard(keyboard::Event::KeyPressed {key: logical,modified_key,..})=&mut key_event {
+                *logical=keyboard::Key::Character(key.into());*modified_key=keyboard::Key::Character(key.into());
+            }
+            for event in [Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),key_event] {
+                dialog.as_overlay_mut().update(&event,Layout::new(&dialog_node),mouse::Cursor::Unavailable,&renderer,&mut clipboard,&mut Shell::new(&mut messages));
+            }
+            assert_eq!(clipboard.text,selected,"native dialog {key} must still write");assert!(!older.current());
+            if key=="x" {assert!(messages.iter().any(|message|matches!(message,cosmic::Action::App(Message::PullRequestTitleChanged(text)) if text.is_empty())),"native cut still edits the selected field");}
+            release.send(()).unwrap();let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let Some(iced::runtime::Action::Output((intent,text)))=executor.block_on(outputs.next()) else {panic!("held Task must finish");};
+            if intent.current() {clipboard.write(Kind::Standard,text);}
+            assert_eq!(clipboard.text,selected,"older Ready guard must not overwrite dialog {key}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_popup_surface_text_input_copy_and_cut_use_the_same_app_hub() {
+        use iced::futures::{FutureExt,StreamExt};
+        for key in ["c", "x"] {
+            let renderer=crate::app::tests::headless_renderer();
+            let mut cosmic=cosmic::app::cosmic::Cosmic::new(crate::app::tests::context_inspector_test_app(false));
+            let parent=iced::window::Id::unique();let popup=iced::window::Id::unique();
+            cosmic.app.core.set_main_window_id(Some(parent));
+            let selected="new native popup text";
+            let older=cosmic.app.chat_ui.copy_intents.next();let late=older.clone();
+            let (release,held)=tokio::sync::oneshot::channel::<()>();
+            let task=iced::Task::perform(async move {held.await.unwrap();(late,"older async popup copy".to_owned())},|ready|ready);
+            let mut outputs=iced::runtime::task::into_stream(task).unwrap();assert!(outputs.next().now_or_never().is_none());
+            // Register through the real native-popup surface API. Its callback
+            // used to return before the app view and bypass its clipboard scope.
+            // This drives real COSMIC TextInput copy/cut in that popup branch;
+            // actual right-click menu/compositor routing is a native UI gate.
+            drop(cosmic.get_popup(
+                iced::runtime::platform_specific::wayland::popup::SctkPopupSettings {
+                    parent,id:popup,positioner:Default::default(),parent_size:Some((400,80)),grab:true,close_with_children:false,input_zone:None,
+                },
+                Box::new(|_|Default::default()),
+                Some(Box::new(move |_| {
+                    cosmic::widget::text_input("",selected).id(widget::Id::new("native-copy-popup"))
+                        .on_input(|text|cosmic::Action::App(Message::PullRequestTitleChanged(text))).into()
+                })),
+            ));
+            assert!(cosmic.surface_views.contains_key(&popup));
+            let mut element=cosmic.view(popup);let mut tree=Tree::new(&element);
+            let viewport=Rectangle::with_size(Size::new(400.0,80.0));
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,viewport.size()));
+            let id=widget::Id::new("native-copy-popup");
+            let mut focus=iced::advanced::widget::operation::focusable::focus::<()>(id.clone());
+            element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut focus);
+            let mut select=iced::advanced::widget::operation::text_input::select_all::<()>(id);
+            element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut select);
+            let mut key_event=copy_key();if let Event::Keyboard(keyboard::Event::KeyPressed {key:logical,modified_key,..})=&mut key_event {
+                *logical=keyboard::Key::Character(key.into());*modified_key=keyboard::Key::Character(key.into());
+            }
+            let mut clipboard=NativeClipboard {text:"previous clipboard".into(),stale_before_native_write:Some(older.clone())};let mut messages=Vec::new();
+            for event in [Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),key_event] {
+                element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),mouse::Cursor::Unavailable,&renderer,&mut clipboard,&mut Shell::new(&mut messages),&viewport);
+            }
+            assert_eq!(clipboard.text,selected);assert!(!older.current());
+            if key=="x" {assert!(messages.iter().any(|message|matches!(message,cosmic::Action::App(Message::PullRequestTitleChanged(text)) if text.is_empty())));}
+            release.send(()).unwrap();let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let Some(iced::runtime::Action::Output((intent,text)))=executor.block_on(outputs.next()) else {panic!("held Task must finish");};
+            if intent.current() {clipboard.write(Kind::Standard,text);}
+            assert_eq!(clipboard.text,selected,"older Ready cannot overwrite actual popup {key}");
+        }
+    }
+
 }

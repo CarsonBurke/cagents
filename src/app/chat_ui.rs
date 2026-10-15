@@ -530,7 +530,7 @@ impl Default for State {
 impl State {
     /// Scope every native widget clipboard write to the same hub as async chat
     /// copies. Keep the hub private; the app root only wraps its final surface.
-    pub(super) fn clipboard_surface<'a>(&self, content: Element<'a, Message>) -> Element<'a, Message> {
+    pub(super) fn clipboard_surface<'a, M: 'a>(&self, content: cosmic::Element<'a, M>) -> cosmic::Element<'a, M> {
         clipboard_surface::surface(content, self.copy_intents.clone())
     }
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {

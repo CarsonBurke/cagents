@@ -353,6 +353,17 @@ where
         None
     }
 
+    /// Decorates each fully assembled native surface, including popup callbacks.
+    /// Called after message mapping and template/dialog composition. The default
+    /// preserves the surface. Applications can scope native input/clipboard
+    /// handling without missing separate platform popup or auxiliary roots.
+    fn native_surface<'a>(
+        &'a self,
+        surface: Element<'a, crate::Action<Self::Message>>,
+    ) -> Element<'a, crate::Action<Self::Message>> {
+        surface
+    }
+
     /// Displays a dialog in the center of the application window when `Some`.
     fn dialog(&self) -> Option<Element<'_, Self::Message>> {
         None
