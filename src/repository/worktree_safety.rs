@@ -74,11 +74,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // need not enumerate hundreds of thousands of disposable artifacts.
         let command = self.git_read(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z"]);
         let output = self.run_checked(&command, cancellation)?;
-        let paths = parse_path_list(&output.stdout, "ignored worktree files")?;
         let mut notable = std::collections::BTreeSet::new();
         let mut directories = Vec::new();
-        for (path, raw) in paths.into_iter().zip(output.stdout.split(|byte| *byte == 0).filter(|raw| !raw.is_empty())) {
+        for (index, raw) in nul_fields(&output.stdout, "ignored worktree files")?.into_iter().filter(|raw| !raw.is_empty()).enumerate() {
             let directory = raw.ends_with(b"/");
+            let path = repo_path_field(raw, "ignored worktree files", index)?;
             if disposable(&path, directory) { continue; }
             if directory { directories.push(path); } else { notable.insert(path); }
         }
@@ -196,6 +196,13 @@ mod tests {
         names.push("cache".into());
         service.set_disposable_ignored_directories(root, &names, &cancellation).unwrap();
         assert!(service.notable_ignored_files(root, &cancellation).unwrap().is_empty());
+        // Git sorts a file cache.data before directory cache/. Preserve each
+        // record's directory flag before canonical path sorting removes '/'.
+        fs::write(root.join(".gitignore"), ".env\nnode_modules\ntarget/\ncache/\ncache.data\n").unwrap();
+        fs::write(root.join("cache.data"), "user data").unwrap();
+        names.push("cache.data".into());
+        service.set_disposable_ignored_directories(root, &names, &cancellation).unwrap();
+        assert_eq!(service.notable_ignored_files(root, &cancellation).unwrap(), vec![RepoPath::from_bytes(b"cache.data").unwrap()]);
         assert!(service.set_disposable_ignored_directories(root, &["../secret".into()], &cancellation).is_err());
     }
 
