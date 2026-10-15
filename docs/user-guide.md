@@ -617,7 +617,10 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   **Shift+Enter** move forward and backward; replacement controls offer one
   match or all matches.
 - With a language server running, diagnostics appear in the gutter and under
-  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  the affected text. They stay visible while you edit and follow inserted or
+  removed lines until the server publishes a new set. **F8** / **Shift+F8**
+  move to the next or previous diagnostic and show its message; the command
+  palette offers the same actions. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
