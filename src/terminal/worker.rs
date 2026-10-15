@@ -89,6 +89,7 @@ const BELL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 enum Command {
+    OrderedInput { generation: u64, input: Box<Command> },
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
@@ -353,6 +354,12 @@ pub(crate) fn flush_archived_notices() {
         .expect("the archive notifier stalled");
 }
 
+#[derive(Default)]
+struct InputOrder {
+    generation: u64,
+    interrupt_key: Option<KeyInput>,
+}
+
 struct PublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
@@ -372,7 +379,7 @@ struct PublishedState {
     completed: AtomicBool,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
-    interrupt_key: Mutex<Option<KeyInput>>,
+    input_order: Mutex<InputOrder>,
     shutdown_pidfd: OnceLock<File>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
@@ -419,7 +426,7 @@ impl PublishedState {
             completed: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
-            interrupt_key: Mutex::new(None),
+            input_order: Mutex::new(InputOrder::default()),
             shutdown_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -430,6 +437,14 @@ impl PublishedState {
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
         }
+    }
+
+    fn request_interrupt(&self, key: Option<KeyInput>) {
+        let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        order.generation = order.generation.checked_add(1).expect("terminal input generation exhausted");
+        order.interrupt_key = key;
+        self.interrupt_requested.store(true, Ordering::Release);
+        let _ = self.capture_tx.try_send(());
     }
 
     fn request_shutdown(&self) {
@@ -989,8 +1004,7 @@ impl TerminalHandle {
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         let bytes = bytes.into();
         if bytes == [3] {
-            self.inner.published.interrupt_requested.store(true, Ordering::Release);
-            let _ = self.inner.published.capture_tx.try_send(());
+            self.inner.published.request_interrupt(None);
             return Ok(());
         }
         self.try_command(Command::Input(bytes))
@@ -1007,9 +1021,7 @@ impl TerminalHandle {
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         if key.action != KeyAction::Release && is_interrupt_key(&key)
         {
-            *self.inner.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
-            self.inner.published.interrupt_requested.store(true, Ordering::Release);
-            let _ = self.inner.published.capture_tx.try_send(());
+            self.inner.published.request_interrupt(Some(key));
             return Ok(());
         }
         self.try_command(Command::Key(key))
@@ -1394,6 +1406,12 @@ impl TerminalHandle {
         if matches!(*phase, ArchivePhase::Released) {
             return Err(TerminalSendError::Closed);
         }
+        // Serialize input admission with the priority cancellation boundary.
+        // Commands submitted after Ctrl+C must survive its queue drain.
+        let order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+        let command = if matches!(command, Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)) {
+            Command::OrderedInput { generation: order.generation, input: Box::new(command) }
+        } else { command };
         self.inner
             .commands
             .try_send(command)
@@ -1419,8 +1437,9 @@ fn is_interrupt_key(key: &KeyInput) -> bool {
         && matches!(key.key, TerminalKey::Character('c' | 'C'))
 }
 
-fn is_cancelable_input(command: &Command) -> bool {
+fn is_cancelable_input_before(command: &Command, boundary: u64) -> bool {
     match command {
+        Command::OrderedInput { generation, input } => *generation < boundary && is_cancelable_input_before(input, boundary),
         // A press may already be consumed. Preserve key and button releases
         // while canceling bulk input, so raw/extended apps never keep a key or
         // button pressed merely because Ctrl+C overtook its queued release.
@@ -1901,9 +1920,9 @@ impl Worker {
                 shutting_down = true;
                 break;
             }
-            if self.published.interrupt_requested.swap(false, Ordering::AcqRel) {
-                if carried_command.as_ref().is_some_and(is_cancelable_input) { carried_command = None; }
-                self.interrupt_input();
+            if self.published.interrupt_requested.load(Ordering::Acquire) {
+                let boundary = self.interrupt_input();
+                if carried_command.as_ref().is_some_and(|command| is_cancelable_input_before(command, boundary)) { carried_command = None; }
             }
             self.flush_pty_input();
             self.publish_bell();
@@ -1933,6 +1952,12 @@ impl Worker {
                 });
             match event {
                 WorkerEvent::Command(Some(command)) => {
+                    // A command selected together with the priority wake must
+                    // cross the cancellation boundary before it can write.
+                    if self.published.interrupt_requested.load(Ordering::Acquire) {
+                        carried_command = Some(command);
+                        continue;
+                    }
                     // Wheel bursts otherwise queue one repaint per event. Fold
                     // adjacent viewport deltas before publishing a snapshot.
                     let command =
@@ -2206,6 +2231,7 @@ impl Worker {
     /// Returns true when shutdown was requested.
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::OrderedInput { input, .. } => return self.handle_command(*input),
             Command::ReadViewport {
                 offset,
                 rows,
@@ -3101,18 +3127,26 @@ impl Worker {
         true
     }
 
-    fn interrupt_input(&mut self) {
-        let key = self.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()).take();
+    fn interrupt_input(&mut self) -> u64 {
+        let (boundary, key) = {
+            let mut order = self.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+            self.published.interrupt_requested.store(false, Ordering::Release);
+            (order.generation, order.interrupt_key.take())
+        };
         let encoded = match key {
             Some(key) => match encode_key_input(&self.terminal, &mut self.key_encoder, key) {
                 Ok(encoded) => encoded,
-                Err(error) => { self.error("encode interrupt", error.to_string()); return; }
+                Err(error) => { self.error("encode interrupt", error.to_string()); return boundary; }
             },
             None => vec![3],
         };
         self.pending_input.clear();
-        while let Ok(command) = self.commands.try_recv() {
-            if !is_cancelable_input(&command) { self.retained_commands.push_back(command); }
+        self.retained_commands.retain(|command| !is_cancelable_input_before(command, boundary));
+        // A producer may keep filling the bounded inbox. Drain only the
+        // commands present at this boundary so cancellation itself is bounded.
+        for _ in 0..self.commands.len() {
+            let Ok(command) = self.commands.try_recv() else { break; };
+            if !is_cancelable_input_before(&command, boundary) { self.retained_commands.push_back(command); }
         }
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
         // The master exposes its exact slave's line discipline. POLLOUT only
@@ -3132,6 +3166,7 @@ impl Worker {
         } else {
             self.write_pty(&encoded, "interrupt terminal");
         }
+        boundary
     }
 
     fn cancel_kernel_input(&self) {
@@ -5786,7 +5821,7 @@ mod tests {
                 x: 0.0, y: 0.0, screen_width: 80, screen_height: 24, cell_width: 1, cell_height: 1, any_button_pressed: false,
             })).unwrap();
             commands.send(Command::Paste("canceled".into(), PasteOrigin::Clipboard)).unwrap();
-            *worker.published.interrupt_key.lock().unwrap() = Some(key);
+            worker.published.request_interrupt(Some(key));
             worker.interrupt_input();
             assert_eq!(worker.retained_commands.len(), 2, "key/button releases survive canceled paste");
             assert!(worker.retained_commands.iter().any(|command| matches!(command, Command::Mouse(mouse) if mouse.action == MouseAction::Release)));
@@ -5814,6 +5849,47 @@ mod tests {
             drop(commands);
             worker.run();
         }
+    }
+
+    #[test]
+    fn priority_interrupt_preserves_input_submitted_after_its_boundary() {
+        let (mut worker, _) = capture_worker_for(shell_session("stty raw -echo; printf 'ready\\r\\n'; kill -STOP $$; od -An -tu1 -N7").launch);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(5).any(|word| word == b"ready"));
+            worker.handle_pty_message(Some(message));
+            if ready { break; }
+        }
+        let (commands, receiver) = command_channel(4);
+        worker.commands = receiver;
+        let published = Arc::clone(&worker.published);
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands, events: crossbeam_channel::unbounded().1, published, worker: Mutex::new(None),
+        }) };
+        handle.paste("canceled", PasteOrigin::Clipboard).unwrap();
+        handle.input(vec![3]).unwrap();
+        handle.input(b"after\n".to_vec()).unwrap();
+        worker.interrupt_input();
+        assert_eq!(worker.retained_commands.len(), 1);
+        while let Some(command) = worker.retained_commands.pop_front() { worker.handle_command(command); }
+        close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
+        let mut output = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            worker.flush_pty_input();
+            match worker.pty_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(PtyMessage::Bytes(bytes)) => output.push_str(&String::from_utf8_lossy(&bytes)),
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            }
+            let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+            if observed.len() >= 7 { break; }
+        }
+        let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+        assert_eq!(observed, b"\x03after\n", "{output}");
+        drop(handle);
+        worker.run();
     }
 
     #[test]
