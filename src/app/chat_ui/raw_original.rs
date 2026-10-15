@@ -69,12 +69,13 @@ fn prefixes(text:&str)->Arc<Vec<[u8;32]>> {
 }
 struct Loaded {record:ResidentRaw,view:tool_text::ToolText,prefixes:Arc<Vec<[u8;32]>>}
 struct Entry {part:RawSourcePart,revision:u64,opened:bool,rehydrating:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
+struct Disclosure {epoch:SourceEpoch,rehydrating:bool}
 impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,rehydrating:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
-pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
+pub(super) struct State {intents:disclosure_intent::Cache<Key,Disclosure>,entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,incarnation:Option<uuid::Uuid>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
     pub(super) fn clear(&mut self) {
-        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.incarnation=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
+        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.intents.clear();self.aliases.clear();self.actor=None;self.session=None;self.incarnation=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
         self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
     }
     /// Hidden views retain only exact-source disclosure intent. A live reveal
@@ -108,11 +109,25 @@ impl State {
                 Some(entry)=>{
                     let old=std::mem::replace(entry,Entry::new(part.clone()));retire_entry(old);self.revision=self.revision.wrapping_add(1);
                 }
-                None=>{self.entries.insert(key,Entry::new(part.clone()));self.revision=self.revision.wrapping_add(1);}
+                None=>{
+                    let mut entry=Entry::new(part.clone());
+                    if let Some(intent)=self.intents.take(&key).filter(|intent|intent.epoch==part.epoch) {
+                        entry.opened=true;entry.rehydrating=intent.rehydrating;
+                    }
+                    self.entries.insert(key,entry);self.revision=self.revision.wrapping_add(1);
+                }
             }
         }
         let removed:Vec<_>=self.entries.keys().filter(|key|!present.contains(*key)).cloned().collect();
-        for key in removed {if let Some(entry)=self.entries.remove(&key) {retire_entry(entry);self.revision=self.revision.wrapping_add(1);}}
+        for key in removed {if let Some(entry)=self.entries.remove(&key) {
+            // A bounded page can omit a still-existing source. Retain no
+            // descriptor/body/read permission, only a same-epoch open choice.
+            if entry.opened {
+                let bytes=key.source.source_id.len()+key.source.agent_id.as_ref().map_or(0,String::len)+std::mem::size_of::<Disclosure>()+std::mem::size_of::<Key>();
+                self.intents.remember(key,Disclosure {epoch:entry.part.epoch,rehydrating:entry.rehydrating || entry.loaded.is_some() || entry.restored.is_some()},bytes);
+            }
+            retire_entry(entry);self.revision=self.revision.wrapping_add(1);
+        }}
         self.aliases=aliases;
         for entry in self.entries.values_mut() {
             if entry.opened && entry.loaded.is_none() && entry.restored.is_none() && entry.attempt.is_none() && entry.error.is_none() {
@@ -634,6 +649,31 @@ mod tests {
         fn send<T:Send>() {}send::<Pending>();send::<Reply>();send::<ResidentRawCalls>();send::<Leaf>();
         fn future<T:Send>(_:T) {}future(read(part("{}"),|_|std::future::ready(Err(SourceError::NotFound))));
     }
+    #[tokio::test]
+    async fn page_omission_keeps_only_bounded_exact_source_disclosure_intent() {
+        let text=r#"{ "original": "same paged source" }"#;let(mut runtime,part)=runtime_fixture(text);
+        runtime.expanded.insert(part.item_id.clone());toggle(&mut runtime,&part.item_id,part.field,false);
+        let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        let owner=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+        let page=runtime.snapshot.clone();let mut away=(*page).clone();away.items.clear();away.raw_source_parts.clear();away.has_earlier=true;
+        runtime.snapshot=Arc::new(away);sync(&mut runtime);flush();
+        assert!(runtime.expanded.contains(&part.item_id));assert!(owner.upgrade().is_none());
+        assert!(runtime.raw_original.entries.is_empty() && runtime.raw_original.aliases.is_empty());
+        assert!(runtime.raw_original.pending_paths(&part.item_id).is_empty());assert!(runtime.raw_original.loaded_leaves(&part.item_id).is_empty());
+        assert_eq!(runtime.raw_original.intents.usage().0,1);
+        runtime.snapshot=page.clone();sync(&mut runtime);
+        let entry=&runtime.raw_original.entries[&Key::of(&part)];assert!(entry.opened && entry.attempt.is_some());
+        assert_eq!(runtime.raw_original.pending_paths(&part.item_id),vec![[10,0]]);
+        let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        assert_eq!(runtime.raw_original.loaded_leaves(&part.item_id)[0].text.as_ref(),text);
+        let mut away=(*page).clone();away.items.clear();away.raw_source_parts.clear();runtime.snapshot=Arc::new(away);sync(&mut runtime);
+        let mut rewritten=(*page).clone();rewritten.raw_source_parts[0].epoch.revision+=1;runtime.snapshot=Arc::new(rewritten);sync(&mut runtime);
+        assert!(!runtime.raw_original.entries[&Key::of(&part)].opened);assert!(runtime.raw_original.pending_paths(&part.item_id).is_empty());
+        runtime.raw_original.clear();assert_eq!(runtime.raw_original.intents.usage(),(0,0));
+    }
+
 }
 
 impl Cagents {
