@@ -775,13 +775,18 @@ pub(super) fn process_request(
                 return Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id,
                     outcome: crate::terminal_ipc::TerminalCloseResult::Active }, Vec::new(), false));
             }
+            let pin = retention_pin_generation(host, session.id);
             let outcome = if handle.is_completed() {
                 handle.shutdown().map_err(send_error)?;
                 crate::terminal_ipc::TerminalCloseResult::Closed
             } else { handle.close_checked(allow_active) };
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
-                host.lock().unwrap_or_else(|p| p.into_inner()).close_terminal_attention(session.id, Some(&handle));
                 super::chat::close_for_terminal(host, session.id)?;
+                let retired = host.lock().unwrap_or_else(|p| p.into_inner()).retire_terminal_if_current(session.id, &handle);
+                let retired_current = retired.is_some();
+                drop(retired);
+                if retired_current { forget_retention_pin(host, session.id, pin); }
+                crate::daemon::wake();
             }
             Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome }, Vec::new(), false))
         }
@@ -1710,13 +1715,10 @@ mod tests {
             }
         ));
         assert!(actor.is_completed());
-        assert!(!host.lock().unwrap().chats.contains_key(&session.id));
-        assert!(
-            host.lock()
-                .unwrap()
-                .notification_closed
-                .contains(&session.id)
-        );
+        let state = host.lock().unwrap();
+        assert!(!state.chats.contains_key(&session.id));
+        assert!(!state.terminals.contains_key(&session.id), "explicit release retires the completed descriptor too");
+        assert!(!state.notification_closed.contains(&session.id), "no closed-record suppression remains after retirement");
     }
 
     #[test]

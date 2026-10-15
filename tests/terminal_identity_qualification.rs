@@ -232,7 +232,8 @@ for line in sys.stdin:
     assert_eq!(client.reconcile_terminal_close(source.clone(), false).unwrap(), TerminalCloseResult::Active);
     assert!(fixture.owned.iter().all(OwnedProcess::current));
     assert_eq!(client.reconcile_terminal_close(source.clone(), true).unwrap(), TerminalCloseResult::Closed);
-    assert_eq!(client.reconcile_terminal_close(source.clone(), true).unwrap(), TerminalCloseResult::Closed, "lost close acknowledgement must be idempotent");
+    assert!(!client.list().unwrap().iter().any(|terminal| terminal.session.id == source.id), "explicit close must retire its listing and relaunch descriptor");
+    assert_eq!(client.reconcile_terminal_close(source.clone(), true).unwrap(), TerminalCloseResult::Closed, "lost close acknowledgement must use its exact teardown receipt after retirement");
     let deadline = Instant::now() + Duration::from_secs(10);
     while fixture.owned.iter().any(OwnedProcess::current) {
         assert!(Instant::now() < deadline, "original fixture process survived explicit Close");
