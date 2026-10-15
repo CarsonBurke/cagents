@@ -3525,13 +3525,16 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (first, second) = futures_util::future::join(
-                handle.original_prompt(Some("one"), Some("native-session"), 0, 256),
-                handle.original_prompt(Some("two"), Some("native-session"), 0, 256),
-            )
-            .await;
-            assert_eq!(first.unwrap().text, "one");
-            assert_eq!(second.unwrap().text, "two");
+            let first = handle.clone();
+            let second = handle.clone();
+            let first = tokio::spawn(async move {
+                first.original_prompt(Some("one"), Some("native-session"), 0, 256).await
+            });
+            let second = tokio::spawn(async move {
+                second.original_prompt(Some("two"), Some("native-session"), 0, 256).await
+            });
+            assert_eq!(first.await.unwrap().unwrap().text, "one");
+            assert_eq!(second.await.unwrap().unwrap().text, "two");
         });
         assert_eq!(handle.snapshot().generation, 7);
         assert!(handle.snapshot().items.is_empty());

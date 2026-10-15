@@ -327,6 +327,7 @@ mod tests {
             "/project".into(),
             &Account::system(Provider::Claude),
             false,
+            &crate::settings::AgentLaunchSettings::default(),
         )
         .unwrap();
         let handle = Arc::new(ClientHandle::fixture(

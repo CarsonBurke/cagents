@@ -670,6 +670,7 @@ mod tests {
             "/project".into(),
             &Account::system(Provider::Claude),
             false,
+            &crate::settings::AgentLaunchSettings::default(),
         )
         .unwrap();
         let handle = Arc::new(ClientHandle::fixture(
@@ -922,7 +923,12 @@ mod tests {
         let mut runtime = runtime();
         let context = Context::current(&runtime).unwrap();
         let mut original = original("native-user", "accepted text with complete images");
-        original.settings = chat::annotations::OriginalSettings::unknown();
+        original.settings = chat::annotations::OriginalSettings {
+            model: chat::annotations::Setting::Unknown,
+            reasoning: chat::annotations::Setting::Unknown,
+            fast: chat::annotations::Setting::Unknown,
+            permission: chat::annotations::Setting::Unknown,
+        };
         original
             .attachments
             .push(chat::annotations::OriginalAttachment {
