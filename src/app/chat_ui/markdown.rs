@@ -32,7 +32,7 @@ pub use cosmic::widget::markdown::{Settings, Style, HeadingLevel};
 pub type Uri = String;
 
 /// A bunch of Markdown that has been parsed.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Content {
     items: Vec<Item>,
     incomplete: HashMap<usize, Section>,
@@ -43,7 +43,7 @@ pub struct Content {
     parsed_bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Section {
     content: String,
     broken_links: HashSet<String>,
@@ -191,7 +191,7 @@ fn plain_character(ch: char) -> bool {
 
 /// Only a zero-indented top-level fence is fast-pathed. Nested/indented
 /// fences, CRLF and parser-normalized content retain the general parser path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OpenFence {
     marker: u8,
     length: usize,
@@ -456,7 +456,7 @@ impl Bullet {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct State {
     leftover: String,
     references: HashMap<String, String>,

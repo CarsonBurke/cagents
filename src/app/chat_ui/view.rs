@@ -1532,6 +1532,12 @@ impl Runtime {
             transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
         content.extend(self.plan_view());
+        if let Some(error)=self.preparation.error() {
+            content.push(widget::row::with_children(vec![design::caption(error.to_owned()).width(Length::Fill).into(),
+                crate::ui_controls::button::secondary("Retry loading")
+                    .on_press(action(Action::RetryMarkdown(target))).into()])
+                .spacing(step::GAP_S).width(Length::Fill).into());
+        }
         if let Some(query) = &self.find {
             content.push(
                 widget::row::with_children(vec![

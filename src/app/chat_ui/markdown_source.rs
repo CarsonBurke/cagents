@@ -50,7 +50,7 @@ pub(super) enum Step {
 }
 
 /// The rewrite of one answer, resumable from the last line it was sure of.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct Source {
     blocks: Blocks,
     /// The bytes of the answer that were whole lines read for good, which is
