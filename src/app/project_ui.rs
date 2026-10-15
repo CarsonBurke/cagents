@@ -582,8 +582,14 @@ impl Cagents {
     }
 
     fn project_close_registry_current(&self, project: ProjectId) -> bool {
-        self.project_ui.close_registry.get(&project)
-            .is_some_and(|basis|basis.matches(self.workspace_model.identity))
+        // Reconciliation temporarily takes workspace_model while it folds
+        // channels. The durable joined identity remains concrete throughout;
+        // an empty transient model never supplies shared registry authority.
+        let joined=self.durable.workspace_model_identity.unwrap_or(crate::workspace_model::NO_REGISTRY);
+        self.project_ui.close_registry.get(&project).is_some_and(|basis| {
+            basis.matches(joined) && (self.workspace_model.identity==crate::workspace_model::NO_REGISTRY
+                || basis.matches(self.workspace_model.identity))
+        })
     }
 
     pub(super) fn complete_closed_projects(&mut self) -> Task<Message> {
