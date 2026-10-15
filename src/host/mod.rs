@@ -9,6 +9,8 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
+#[cfg(test)]
+mod provider_shutdown_tests;
 mod service;
 mod session_locations;
 mod state;
@@ -407,11 +409,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for outcome in finish_terminal_shutdown(&handles) {
+        if let Err(error) = outcome {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -425,6 +424,17 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+// Request every terminal before waiting on any one worker, and retain every
+// outcome so a failed provider/worker cannot skip another terminal's cleanup.
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles.iter().map(|handle| handle.shutdown()).collect()
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {

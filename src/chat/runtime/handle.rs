@@ -36,6 +36,17 @@ impl Handle {
         LocalHandle::start(spec, adapter, initial, store, session_id, notify)
             .map(|local| Self(Owner::Local(local)))
     }
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_native_holder(
+        &self,
+        holder: super::super::native_holder::Holder,
+        reason: String,
+    ) {
+        self.local_actor()
+            .expect("the host shutdown fixture requires a local actor")
+            .fixture_retained_native_holder(holder, reason);
+    }
+
     pub(crate) fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
