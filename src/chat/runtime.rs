@@ -420,7 +420,8 @@ impl Handle {
                 }
                 .unwrap_or_else(|_| {
                     Err("Native chat worker panicked; exact provider state is unconfirmed".into())
-                });
+                })
+                .map_err(|error|super::protocol::preview(error.as_bytes(),1024));
                 // The actor has stopped answering commands, yet teardown below can
                 // take seconds. Reject commands now so a caller is told the provider
                 // exited instead of waiting out an acknowledgement nobody will send.
@@ -2225,7 +2226,7 @@ impl Actor {
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
-            };
+            }.map_err(|error|super::protocol::preview(error.as_bytes(),1024));
             match prepared {
                 Ok(step) => {
                     let acknowledgement = self.adapter.command_ack();
@@ -3589,6 +3590,32 @@ mod tests {
         let invalid=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(0)),"Provider printed 8 consecutive invalid protocol lines. Last output: garbage","");
         assert!(invalid.summary.contains("status 0"));
         assert!(invalid.summary.contains("8 consecutive invalid protocol lines. Last output: garbage"),"a status must not erase the bounded framing diagnosis");
+    }
+
+    #[test]
+    fn adapter_refusals_and_fatal_provider_errors_are_bounded_at_the_runtime_boundary() {
+        struct Verbose;
+        impl Adapter for Verbose {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                if matches!(command,Command::Compact) {Ok(Step {writes:vec![serde_json::json!({"fail":true})],..Default::default()})}
+                else {Err(format!("Provider refusal: {}\x1b", "x".repeat(1024*1024)))}
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Err(format!("Provider failure: {}\x1b", "x".repeat(1024*1024)))}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Verbose),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let refusal=handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap_err();
+        assert!(refusal.len()<=1024 && refusal.starts_with("Provider refusal:"));
+        assert!(!refusal.contains('\x1b'));assert!(handle.snapshot(None).unwrap().error.is_none());
+        handle.command(Command::Compact).unwrap();
+        let snapshot=until(&handle,|state|state.exited);
+        let error=snapshot.error.as_deref().unwrap();
+        assert!(error.len()<=1024 && error.contains("Provider failure:"));assert!(!error.contains('\x1b'));
+        let failure=handle.failure().unwrap();assert!(failure.len()<=1024 && failure.starts_with("Provider failure:"));
+        handle.close().unwrap();
     }
 
     #[test]
