@@ -152,6 +152,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Maximum scalar values retained in a descriptor's observed terminal title.
+pub const MAX_TERMINAL_TITLE_CHARACTERS: usize = 256;
 /// Production full and browserless builds retain the runtime namespace; a
 /// mismatched daemon is preserved and reported, never automatically replaced.
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
@@ -903,6 +905,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Last observed native terminal title; absent before any title event.
+    /// This display metadata never authorizes process/session recovery.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -943,6 +949,7 @@ impl TerminalDescriptor {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
         }
     }
 }
