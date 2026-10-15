@@ -25,7 +25,7 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
         font: design::interface_font(),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
+        shaping: text::Shaping::default(),
         wrapping: text::Wrapping::None,
         ellipsize: text::Ellipsize::None,
     });
