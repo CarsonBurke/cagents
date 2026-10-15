@@ -1183,4 +1183,51 @@ mod tests {
         assert!(entry.manual_pages.contains(&128) && entry.requested.contains_key(&128));
     }
 
+    #[test]
+    fn actual_changes_actions_and_same_tree_clear_identical_ready_selection_on_new_epoch() {
+        const CHILD:&str="CAGENTS_TEST_CHANGES_SELECTION_EPOCH";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","app::chat_ui::changes_sources::tests::actual_changes_actions_and_same_tree_clear_identical_ready_selection_on_new_epoch","--nocapture","--test-threads=1"]).env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));return;
+        }
+        let renderer=crate::app::tests::headless_renderer();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use iced::{advanced::{layout,widget::Tree},futures::StreamExt as _};
+            let text="@@ -1 +1 @@\n-before\n+identical after\n";let page=fixture(text);
+            let(mut state,raw,expanded)=open(&page,"visible-part");let request=state.entries[&page.source].patch_requests[&0];
+            let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+            let handle=Arc::new(ClientHandle::fixture(session.clone(),(*raw).clone()));
+            let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle.clone()),true,crate::settings::EditorSyntaxTheme::default());
+            runtime.logical_changes=state;runtime.expanded=expanded;runtime.tool_groups_expanded=true;runtime.refresh();let target=runtime.target;
+            let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+            drop(app.handle_chat_ui(Action::ChangePatchReady(target,page.source.clone(),0,request,Ok(ready(&page,text).await))));
+            let mut worker=changes_find::fixture_stream(app.chat_runtime_mut(target).unwrap()).expect("actual production metadata worker");
+            let Message::ChatUi(action)=worker.next().await.unwrap() else {panic!("Changes index completion");};drop(app.handle_chat_ui(action));drop(worker);
+            let runtime=app.chat_runtime_mut(target).unwrap();let (catalog,bookmark)=runtime.selection_document();let (anchor,end)=catalog.endpoints().unwrap();
+            *bookmark.borrow_mut()=selection::Bookmark {anchor:Some(anchor),end:Some(end),anchor_prefix:catalog.fingerprint(anchor),end_prefix:catalog.fingerprint(end),
+                anchor_source:catalog.source_stamp_at(anchor),end_source:catalog.source_stamp_at(end)};
+            let old_stamp=catalog.source_stamp_at(end);let old_copy=catalog.copy(anchor,end).unwrap();assert!(old_stamp.is_some());drop(catalog);
+            let frame=|runtime:&Runtime,tree:&mut Option<Tree>| {
+                let (catalog,bookmark)=runtime.selection_document();let mut element=selection::transcript_virtualized(detail(runtime,&page.source.source_id).unwrap(),target,None,catalog,bookmark);
+                let tree=tree.get_or_insert_with(||Tree::new(&element));tree.diff(element.as_widget_mut());
+                let _=element.as_widget_mut().layout(tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
+            };
+            let mut tree=None;frame(runtime,&mut tree);assert!(bookmark.borrow().anchor.is_some());
+            // Publish, install manifest, patch and real metadata-worker result
+            // before laying out this same Tree again: there is no loading gap.
+            let mut changed=(*page).clone();changed.epoch.revision+=1;let changed=Arc::new(changed);
+            let mut changed_raw=(*raw).clone();changed_raw.generation+=1;changed_raw.changes_revision+=1;changed_raw.changes_parts[0].epoch=changed.epoch;
+            handle.publish_snapshot_for_test(changed_raw);runtime.refresh();
+            let request=runtime.logical_changes.entries[&page.source].requested[&0];
+            drop(app.handle_chat_ui(Action::ChangesManifestReady(target,page.source.clone(),0,request,Ok(changed.clone()))));
+            let request=app.chat_runtime_mut(target).unwrap().logical_changes.entries[&page.source].patch_requests[&0];
+            drop(app.handle_chat_ui(Action::ChangePatchReady(target,page.source.clone(),0,request,Ok(ready(&changed,text).await))));
+            let mut worker=changes_find::fixture_stream(app.chat_runtime_mut(target).unwrap()).expect("replacement actual production worker");
+            let Message::ChatUi(action)=worker.next().await.unwrap() else {panic!("replacement Changes index completion");};drop(app.handle_chat_ui(action));drop(worker);
+            let runtime=app.chat_runtime_mut(target).unwrap();let (current,_)=runtime.selection_document();let (current_anchor,current_end)=current.endpoints().unwrap();
+            assert_eq!(current.copy(current_anchor,current_end).unwrap(),old_copy);assert_ne!(current.source_stamp_at(current_end),old_stamp);drop(current);
+            frame(runtime,&mut tree);assert!(bookmark.borrow().anchor.is_none() && bookmark.borrow().end.is_none(),"same Tree clears old-source selection immediately, before input");
+        });
+    }
+
 }
