@@ -4434,16 +4434,27 @@ impl Cagents {
         // Item IDs are scoped to the selected transcript. A parent or another
         // child may legitimately use the same opaque logical source ID.
         let items = match runtime.selected_subagent.as_deref() {
-            Some(selected) => runtime.snapshot.subagents.iter()
+            Some(selected) => runtime
+                .snapshot
+                .subagents
+                .iter()
                 .find(|agent| agent.id == selected)
                 .map(|agent| agent.items.as_slice()),
             None => Some(runtime.snapshot.items.as_slice()),
         };
-        let Some(item) = items.and_then(|items| items.iter()
-            .find(|item| item.id.as_str() == found.item.as_ref())).cloned() else {
+        let Some(item) = items
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.id.as_str() == found.item.as_ref())
+            })
+            .cloned()
+        else {
             return Task::none();
         };
-        runtime.find_disclosure.turn(&found.turn, &mut runtime.opened);
+        runtime
+            .find_disclosure
+            .turn(&found.turn, &mut runtime.opened);
         {
             if runtime
                 .find_disclosure
@@ -9753,8 +9764,11 @@ pub(super) fn show_chat_snapshot_for_test(
 ) -> usize {
     let requests = snapshot.requests.len();
     let items = snapshot.items.len();
-    let child_items: Vec<_> = snapshot.subagents.iter()
-        .map(|agent| (agent.id.clone(), agent.items.len())).collect();
+    let child_items: Vec<_> = snapshot
+        .subagents
+        .iter()
+        .map(|agent| (agent.id.clone(), agent.items.len()))
+        .collect();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
         panic!("chat snapshot requires a chat runtime");
     };
@@ -9767,11 +9781,21 @@ pub(super) fn show_chat_snapshot_for_test(
         .replace_snapshot_for_test(snapshot);
     runtime.show(true);
     preparation::drain_fixture(runtime);
-    assert_eq!(runtime.snapshot.items.len(), items,
-        "visible fixtures must retain their published parent body");
-    assert_eq!(runtime.snapshot.subagents.iter()
-        .map(|agent| (agent.id.clone(), agent.items.len())).collect::<Vec<_>>(), child_items,
-        "visible fixtures must retain their published child bodies");
+    assert_eq!(
+        runtime.snapshot.items.len(),
+        items,
+        "visible fixtures must retain their published parent body"
+    );
+    assert_eq!(
+        runtime
+            .snapshot
+            .subagents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.items.len()))
+            .collect::<Vec<_>>(),
+        child_items,
+        "visible fixtures must retain their published child bodies"
+    );
     assert_eq!(
         runtime.snapshot.requests.len(),
         requests,
@@ -12102,19 +12126,33 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("scoped-find-reveal"));
         let target = chat_runtime(&app, card).target;
-        let item = |output: &str| Arc::new(chat::Item {
-            id: "opaque-root".into(), role: chat::Role::Assistant,
-            content: ItemContent::Tool { name: "Inspect".into(), input: "{}".into(),
-                output: output.into(), status: chat::ToolStatus::Succeeded },
-            at: None, started_at: None,
-        });
+        let item = |output: &str| {
+            Arc::new(chat::Item {
+                id: "opaque-root".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "Inspect".into(),
+                    input: "{}".into(),
+                    output: output.into(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
         let parent = item("parent has no matches");
         let child = item("needle needle in the selected child");
         let other = item("a different child's output");
         let agent = |id: &str, item: Arc<chat::Item>| chat::Subagent {
-            id: id.into(), kind: "Worker".into(), description: id.into(),
-            status: chat::ToolStatus::Succeeded, model: None, waiting: false,
-            detail: String::new(), background: true, items: vec![item],
+            id: id.into(),
+            kind: "Worker".into(),
+            description: id.into(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![item],
         };
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
@@ -12126,23 +12164,40 @@ mod tests {
         complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.find_matches.len(), 2);
-        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child),
-            "automatic reveal must never replace the selected child's cache with the parent's same-ID item");
+        assert!(
+            Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child),
+            "automatic reveal must never replace the selected child's cache with the parent's same-ID item"
+        );
         assert!(runtime.find_reveal_source_current());
         assert!(runtime.find_paint_for(&child).is_some());
         assert!(runtime.find_paint_for(&parent).is_none());
-        app.chat_runtime_mut(target).unwrap().expanded.remove("opaque-root");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .expanded
+            .remove("opaque-root");
         drop(app.handle_chat_ui(Action::FindNext(target, true)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.find_index, 1);
-        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child));
+        assert!(Arc::ptr_eq(
+            runtime.cache["opaque-root"].item.as_ref().unwrap(),
+            &child
+        ));
         assert!(runtime.find_reveal_source_current());
         app.chat_runtime_mut(target).unwrap().selected_subagent = Some("missing-child".into());
-        app.chat_runtime_mut(target).unwrap().expanded.remove("opaque-root");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .expanded
+            .remove("opaque-root");
         drop(app.handle_chat_ui(Action::FindNext(target, false)));
         let runtime = chat_runtime(&app, card);
-        assert!(!runtime.expanded.contains("opaque-root"), "missing child cannot disclose a parent's same-ID item");
-        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child));
+        assert!(
+            !runtime.expanded.contains("opaque-root"),
+            "missing child cannot disclose a parent's same-ID item"
+        );
+        assert!(Arc::ptr_eq(
+            runtime.cache["opaque-root"].item.as_ref().unwrap(),
+            &child
+        ));
     }
 
     #[test]
@@ -12327,49 +12382,79 @@ mod tests {
             Some((0, 0))
         );
         let late = Arc::new(find::External {
-            item: "patch-root".into(), revision: 99,
+            item: "patch-root".into(),
+            revision: 99,
             blocks: vec![find::Block {
                 identity: selection::logical_identity("patch-root", &[6, 5]),
                 text: Arc::from("needle from a late catalog completion"),
-            }].into(),
+            }]
+            .into(),
         });
         let late_body = Arc::downgrade(&late.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_external(
-            HashMap::from([("patch-root".into(), late)]), true);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), late)]), true);
         assert!(chat_runtime(&app, card).find.is_none());
         assert!(chat_runtime(&app, card).find_external.is_empty());
-        assert!(late_body.upgrade().is_none(), "closed search rejects late body ownership");
+        assert!(
+            late_body.upgrade().is_none(),
+            "closed search rejects late body ownership"
+        );
 
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         let document = Arc::new(find::External {
-            item: "patch-root".into(), revision: 100,
+            item: "patch-root".into(),
+            revision: 100,
             blocks: vec![find::Block {
                 identity: selection::logical_identity("patch-root", &[6, 5]),
                 text: Arc::from("needle before clearing the query"),
-            }].into(),
+            }]
+            .into(),
         });
         let clear_body = Arc::downgrade(&document.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_external(
-            HashMap::from([("patch-root".into(), document)]), true);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), document)]), true);
         complete_find_for_test(&mut app, target);
         let origin = chat_runtime(&app, card).find_origin.unwrap().from_top();
-        assert!(chat_runtime(&app, card).find_retained_source_bytes().unwrap().0 > 0);
+        assert!(
+            chat_runtime(&app, card)
+                .find_retained_source_bytes()
+                .unwrap()
+                .0
+                > 0
+        );
         drop(app.handle_chat_ui(Action::Find(target, String::new())));
         assert_eq!(chat_runtime(&app, card).find.as_deref(), Some(""));
-        assert_eq!(chat_runtime(&app, card).find_origin.unwrap().from_top(), origin);
-        assert!(clear_body.upgrade().is_none(), "empty query retires indexed body owners");
-        assert_eq!(chat_runtime(&app, card).find_retained_source_bytes(), Some((0, 0)));
+        assert_eq!(
+            chat_runtime(&app, card).find_origin.unwrap().from_top(),
+            origin
+        );
+        assert!(
+            clear_body.upgrade().is_none(),
+            "empty query retires indexed body owners"
+        );
+        assert_eq!(
+            chat_runtime(&app, card).find_retained_source_bytes(),
+            Some((0, 0))
+        );
         let late = Arc::new(find::External {
-            item: "patch-root".into(), revision: 101,
+            item: "patch-root".into(),
+            revision: 101,
             blocks: vec![find::Block {
                 identity: selection::logical_identity("patch-root", &[6, 5]),
                 text: Arc::from("needle arriving after query was cleared"),
-            }].into(),
+            }]
+            .into(),
         });
         let late_body = Arc::downgrade(&late.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_external(
-            HashMap::from([("patch-root".into(), late)]), false);
-        assert!(late_body.upgrade().is_none(), "empty search rejects late body ownership");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::from([("patch-root".into(), late)]), false);
+        assert!(
+            late_body.upgrade().is_none(),
+            "empty search rejects late body ownership"
+        );
         assert!(!chat_runtime(&app, card).find_dirty);
         assert_eq!(chat_runtime(&app, card).find_result_label(), "0 matches");
 
@@ -12530,8 +12615,10 @@ mod tests {
             "an obsolete empty result must not publish a new complete paint/result snapshot"
         );
         let runtime = chat_runtime(&app, card);
-        assert!(runtime.find_dirty || runtime.find_waiting.is_some(),
-            "a rejected obsolete result schedules another search");
+        assert!(
+            runtime.find_dirty || runtime.find_waiting.is_some(),
+            "a rejected obsolete result schedules another search"
+        );
         complete_find_for_test(&mut app, target);
         assert_eq!(chat_runtime(&app, card).find_matches.len(), 1);
         assert_eq!(chat_runtime(&app, card).find_matches[0].range, 0..6);
