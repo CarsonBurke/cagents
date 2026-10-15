@@ -497,7 +497,7 @@ impl Cagents {
                 Ok(Target {
                     row,
                     directory: project.repository.clone(),
-                    label: channel_ui::channel_display_title(channel).to_owned(),
+                    label: channel_ui::channel_display_title(channel, self.sidebar_model.project(channel.project_id)).into_owned(),
                     detail: project.name.clone(),
                     blocker,
                 })

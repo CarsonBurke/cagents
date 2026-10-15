@@ -846,16 +846,7 @@ impl Cagents {
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card))
-                .map(|channel| {
-                    if channel.title.trim().is_empty() {
-                        format!(
-                            "Channel {}",
-                            channel.id.to_string().chars().take(8).collect::<String>()
-                        )
-                    } else {
-                        channel.title.clone()
-                    }
-                }),
+                .map(|channel| channel_ui::channel_display_title(channel, self.sidebar_model.project(channel.project_id)).into_owned()),
             name: directory
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())

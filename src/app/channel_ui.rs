@@ -330,7 +330,8 @@ impl Cagents {
                         .channels
                         .iter()
                         .find(|channel| channel.id == id)
-                        .map_or("the channel", channel_display_title);
+                        .map(|channel| channel_display_title(channel, self.sidebar_model.project(channel.project_id)))
+                        .unwrap_or(Cow::Borrowed("the channel"));
                     self.status = Some(TransientNotice::error(format!(
                         "Could not delete {title}: {error}"
                     )));
@@ -367,6 +368,13 @@ impl Cagents {
                     || self.project_ui.closed.contains(&project.repository)
                 {
                     self.status = Some(TransientNotice::warning("That project is being removed."));
+                    return Task::none();
+                }
+                let Some(directory) = self.project_primary_worktree(project_id) else {
+                    return Task::none();
+                };
+                if let Err(error) = self.worktree_protections.protect_next(&directory) {
+                    self.status = Some(TransientNotice::warning(format!("Cannot open this worktree yet: {error}")));
                     return Task::none();
                 }
                 let id = ChannelId::new();
@@ -510,7 +518,7 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let title = channel_display_title(channel).to_owned();
+        let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id)).into_owned();
         let chats = self.channel_conversation_count(channel);
         if chats == 0 && !always_confirm {
             return self.delete_channel(id);
@@ -898,6 +906,9 @@ impl Cagents {
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
+            // One primary-branch lookup and placeholder per project refresh,
+            // regardless of how many unnamed channels it contains.
+            let unnamed = default_channel_title(Some(project));
             let mut index = 0;
             // Built in the durable vector's own order, which is the registry's
             // ascending creation ranks. Display order is not decided here:
@@ -908,7 +919,11 @@ impl Cagents {
                 .iter()
                 .filter(|channel| channel.project_id == project.id)
             {
-                let title = channel_display_title(channel);
+                let title = if channel.title.is_empty() {
+                    Cow::Borrowed(unnamed.as_ref())
+                } else {
+                    Cow::Borrowed(channel.title.as_str())
+                };
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
                 let mut activity = None;
@@ -955,7 +970,7 @@ impl Cagents {
                 if !unchanged {
                     let mut row = SidebarChannel::new(
                         channel.id,
-                        title.to_owned(),
+                        title.into_owned(),
                         selected,
                         activity,
                         unread,
@@ -984,11 +999,20 @@ fn channel_title_from_prompt(prompt: &str) -> Option<String> {
 /// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
-pub(super) fn channel_display_title(channel: &ProjectChannel) -> &str {
-    if channel.title.is_empty() {
-        "New channel"
-    } else {
-        &channel.title
+pub(super) fn channel_display_title<'a>(channel: &'a ProjectChannel, project: Option<&SidebarProject>) -> Cow<'a, str> {
+    if !channel.title.is_empty() {
+        return Cow::Borrowed(&channel.title);
+    }
+    default_channel_title(project)
+}
+
+fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> {
+    let branch = project.and_then(|project| project.worktrees.iter()
+        .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+        .and_then(|worktree| worktree.branch.as_deref()));
+    match branch {
+        Some(branch) => Cow::Owned(format!("New channel · {}", branch.strip_prefix("refs/heads/").unwrap_or(branch))),
+        None => Cow::Borrowed("New channel"),
     }
 }
 

@@ -4132,6 +4132,13 @@ impl Cagents {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
 
+    /// Row actions preserve their selected directory even if a focused shell
+    /// last reported a different cwd. Provider/account choices use the newly
+    /// selected workspace, through the ordinary configured draft constructor.
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
+    }
+
     fn preferred_chat_provider(&self) -> Provider {
         self.workspace
             .focused()

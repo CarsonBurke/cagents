@@ -612,6 +612,17 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.select_worktree_checked(path, create_if_empty).1
+    }
+
+    /// A synchronous success witness for callers that expose a new draft only
+    /// after worktree protection and scope selection succeeded. A no-op selection
+    /// is successful; a refused protection is not.
+    pub(super) fn select_worktree_checked(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -619,7 +630,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(format!(
                 "Cannot open this worktree yet: {error}"
             )));
-            return Task::none();
+            return (false, Task::none());
         }
         let roots = self
             .known_worktree_roots
@@ -657,13 +668,13 @@ impl Cagents {
                 .map(|card| card.id))
         {
             if !create_if_empty {
-                return Task::none();
+                return (true, Task::none());
             }
-            return if !has_terminal {
+            return (true, if !has_terminal {
                 self.add_default_pane(path, self.settings.default_worktree_pane)
             } else {
                 Task::none()
-            };
+            });
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {
@@ -723,7 +734,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        Task::batch([scope, terminal])
+        (true, Task::batch([scope, terminal]))
     }
 
     fn install_workspace_scope(
