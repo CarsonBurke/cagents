@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Exercise only private daemon instances from a matched development build.
+
+Run under the campaign/development build lock. No provider credentials or real
+agents are used. Every signal targets a child process this fixture started.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def wait_until(predicate, timeout=10, description="condition"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.025)
+    raise AssertionError(f"Timed out waiting for {description}")
+
+
+def process_is_current(identity):
+    try:
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19]) == identity["start"]
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def evidence_ignores(directory, names):
+    # Holder sockets use the terminal UUID as their basename, without a suffix.
+    # A failed teardown must still preserve its log and registry evidence.
+    return {name for name in names if name in ("cagents", "cagentsd")
+            or (Path(directory) / name).is_socket()}
+
+
+class Instance:
+    def __init__(self, root, binaries, *, idle=60, retention=1):
+        self.root = root
+        self.binaries = binaries
+        self.root.mkdir(mode=0o700)
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        # No production provider/account state or credential environment belongs
+        # in these shell-only fixtures, even though no provider is launched.
+        self.env = {
+            "HOME": str(home),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "TERM": "xterm-256color",
+            "XDG_RUNTIME_DIR": str(runtime),
+            "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={self.root / 'absent-bus'}",
+            "CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS": str(idle),
+            "CAGENTS_EXITED_TERMINAL_RETENTION_SECS": str(retention),
+            "CAGENTS_LOCAL_DEBUG": "1",
+            "RUST_LOG": "cagents=debug,cagentsd=debug,warn",
+        }
+        help_result = subprocess.run([str(binaries / "cagents"), "terminal", "list", "--help"],
+                                     env=self.env, capture_output=True, text=True, timeout=10)
+        self.list_all = "--all" in help_result.stdout
+        self.socket = runtime / "cagents-development" / "cagentsd.sock"
+        self.log = open(self.root / "daemon.log", "wb")
+        self.process = subprocess.Popen([str(binaries / "cagentsd")], env=self.env,
+                                        stdout=self.log, stderr=subprocess.STDOUT)
+        try:
+            wait_until(lambda: self.socket.is_socket(), description="development listener")
+            assert self.process.poll() is None, "daemon exited during startup"
+        except BaseException:
+            # Construction can fail before the caller has an Instance to close.
+            self.close()
+            raise
+
+    def cli(self, *args, executable=None):
+        result = subprocess.run([str(executable or self.binaries / "cagents"), "--json", *args],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise AssertionError(f"CLI {args!r} failed: {result.stdout}\n{result.stderr}")
+        reply = json.loads(result.stdout)
+        assert reply.get("ok", True), reply
+        return reply["data"]
+
+    def spawn(self, *command):
+        result = self.cli("terminal", "spawn", "--", *command)["terminal"]
+        return result.get("id") or result["session"]["id"]
+
+    def terminals(self):
+        options = ("--all",) if self.list_all else ()
+        return self.cli("terminal", "list", *options)["terminals"]
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()  # exact fixture child, never process discovery
+                self.process.wait(timeout=5)
+        self.log.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bin-directory", required=True, type=Path)
+    parser.add_argument("--legacy-bin-directory", type=Path,
+                        help="Matched older development pair without the idle-only cleanup capability")
+    parser.add_argument("--evidence", required=True, type=Path)
+    args = parser.parse_args()
+    binaries = args.bin_directory.resolve()
+    products = {}
+    for product in ("cagents", "cagentsd"):
+        assert (binaries / product).is_file(), f"Missing matched {product}"
+        with (binaries / product).open("rb") as executable:
+            products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
+    legacy = args.legacy_bin_directory.resolve() if args.legacy_bin_directory else None
+    legacy_products = {}
+    if legacy:
+        for product in ("cagents", "cagentsd"):
+            with (legacy / product).open("rb") as executable:
+                legacy_products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
+    args.evidence.mkdir(parents=True, exist_ok=False)
+    checks = []
+    with tempfile.TemporaryDirectory(prefix="cagents-lifecycle-", dir="/var/tmp") as temporary:
+        root = Path(temporary)
+        try:
+            # Leave time to capture the retained holder even on a loaded host.
+            instance = Instance(root / "retention", binaries, retention=3)
+            try:
+                terminal = instance.spawn("/bin/true")
+                holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
+                holders = [json.loads(path.read_text())["holder"] for path in holder_paths]
+                assert holders, "the completed terminal never published a retained holder"
+                wait_until(lambda: not instance.terminals(), description="exited terminal retirement")
+                for holder in holders:
+                    wait_until(lambda: not process_is_current(holder),
+                               description="retired terminal holder exit")
+                checks.append({"contract": "exited_unattached_terminal_and_holder_retire", "terminal": terminal,
+                               "holders": holders})
+            finally:
+                instance.close()
+            instance = Instance(root / "idle", binaries, idle=1)
+            try:
+                instance.process.wait(timeout=10)
+                assert instance.process.returncode == 0
+                checks.append({"contract": "empty_development_daemon_exits", "exit_code": 0})
+            finally:
+                instance.close()
+            instance = Instance(root / "busy", binaries, idle=1)
+            try:
+                terminal = instance.spawn("/bin/sleep", "60")
+                time.sleep(2)
+                assert instance.process.poll() is None, "idle policy stopped a detached live terminal"
+                instance.cli("terminal", "close", terminal)
+                instance.process.wait(timeout=10)
+                checks.append({"contract": "detached_terminal_prevents_idle_exit_until_closed", "terminal": terminal})
+            finally:
+                instance.close()
+            for busy in (False, True):
+                version = root / f"version-{busy}"
+                version.mkdir()
+                for product in ("cagents", "cagentsd"):
+                    try:
+                        os.link(binaries / product, version / product)
+                    except OSError:
+                        shutil.copy2(binaries / product, version / product)
+                instance = Instance(root / f"stale-{busy}", version)
+                try:
+                    terminal = instance.spawn("/bin/sleep", "60") if busy else None
+                    (version / "cagentsd").unlink()
+                    result = instance.cli("daemon", "cleanup-stale-development")
+                    if busy:
+                        assert not result["stopped"], result
+                        assert instance.process.poll() is None
+                        assert instance.terminals(), "cleanup discarded a hosted terminal"
+                    else:
+                        assert result["stopped"], result
+                        instance.process.wait(timeout=5)
+                        assert instance.process.returncode == 0
+                    checks.append({"contract": "stale_executable_cleanup", "busy": busy, "stopped": result["stopped"],
+                                   "terminal": terminal})
+                finally:
+                    instance.close()
+            if legacy:
+                version = root / "legacy-version"
+                version.mkdir()
+                for product in ("cagents", "cagentsd"):
+                    try:
+                        os.link(legacy / product, version / product)
+                    except OSError:
+                        shutil.copy2(legacy / product, version / product)
+                instance = Instance(root / "stale-legacy", version)
+                try:
+                    (version / "cagentsd").unlink()
+                    result = instance.cli("daemon", "cleanup-stale-development",
+                                          executable=binaries / "cagents")
+                    assert not result["stopped"], result
+                    assert instance.process.poll() is None, "unsupported old daemon received a stop signal"
+                    assert not instance.terminals()
+                    checks.append({"contract": "unsupported_old_development_daemon_is_preserved",
+                                   "pid": instance.process.pid, "stopped": False})
+                finally:
+                    instance.close()
+        finally:
+            # Preserve failure evidence before TemporaryDirectory removes the
+            # isolated state; no fixture binary copies are retained.
+            shutil.copytree(root, args.evidence / "instances", ignore=evidence_ignores)
+            (args.evidence / "result.json").write_text(json.dumps({"products": products, "legacy_products": legacy_products,
+                "checks": checks, "completed": len(checks) == 5 + bool(legacy)}, indent=2) + "\n")
+    print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
+
+
+if __name__ == "__main__":
+    main()

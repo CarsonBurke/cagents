@@ -64,6 +64,7 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
+    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -618,6 +619,9 @@ impl HostState {
         let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
+            // Removing a saved pane can unpin a completed terminal whose
+            // retention deadline already passed while it was pinned.
+            crate::daemon::wake();
         }
         Ok(applied.model)
     }
@@ -756,10 +760,9 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<(), ProtocolError> {
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+        // Closing a terminal retires its subscriptions before the controlling
+        // CLI sends its final detach. That release remains idempotent.
+        let Some(record) = self.terminals.get(&terminal_id) else { return Ok(()); };
         let Some(old_requested) = self
             .subscriptions
             .by_client
@@ -781,6 +784,7 @@ impl HostState {
         }
         self.refresh_presentation_owner(terminal_id);
         self.disarm_output_if_observed(terminal_id);
+        crate::daemon::wake();
         Ok(())
     }
 
@@ -993,6 +997,59 @@ impl HostState {
         Some(record)
     }
 
+    /// Explicit close and retention both retire only the worker they inspected.
+    /// Return ownership so holder teardown happens after releasing HostState.
+    pub(super) fn retire_terminal_if_current(
+        &mut self, id: TerminalId, expected: &TerminalHandle,
+    ) -> Option<TerminalRecord> {
+        self.terminals.get(&id).is_some_and(|record| record.handle.same_worker(expected))
+            .then(|| self.retire_terminal(id)).flatten()
+    }
+
+    pub(super) fn development_idle(&self) -> bool {
+        self.clients.is_empty() && self.terminals.is_empty()
+            && self.spawning.is_empty() && self.browser_logins_spawning.is_empty()
+            && self.chat_spawning.is_empty() && self.chat_bindings.is_empty()
+            && self.execution_startups.is_empty() && self.native_closing.is_empty()
+            && self.chat_handoffs.is_empty()
+            && !self.chats.values().any(|record| record.handle.owns_work())
+            && self.upgrade.is_none() && !self.shutting_down
+    }
+
+    pub(super) fn observe_completed_terminals(&mut self, now: Instant) {
+        for record in self.terminals.values_mut() {
+            if record.handle.is_completed() { record.completed_at.get_or_insert(now); }
+        }
+    }
+
+    pub(super) fn terminal_retention_deadline(
+        &self, retention: Duration, pinned: &BTreeSet<TerminalId>,
+    ) -> Option<Instant> {
+        if self.shutting_down || self.upgrade.is_some() { return None; }
+        self.terminals.iter().filter(|(id, record)| {
+            record.handle.is_completed()
+                && self.subscriptions.clients(**id).is_empty()
+                && !pinned.contains(*id)
+                && !self.chats.contains_key(*id)
+                && !self.chat_handoffs.contains_key(*id)
+        }).filter_map(|(_, record)| record.completed_at?.checked_add(retention)).min()
+    }
+
+    pub(super) fn retire_expired_terminals(
+        &mut self, now: Instant, retention: Duration, pinned: &BTreeSet<TerminalId>,
+    ) -> Vec<TerminalRecord> {
+        if self.shutting_down || self.upgrade.is_some() { return Vec::new(); }
+        let expired = self.terminals.iter().filter(|(id, record)| {
+            record.handle.is_completed()
+                && record.completed_at.and_then(|at| at.checked_add(retention)).is_some_and(|at| at <= now)
+                && self.subscriptions.clients(**id).is_empty()
+                && !pinned.contains(*id)
+                && !self.chats.contains_key(*id)
+                && !self.chat_handoffs.contains_key(*id)
+        }).map(|(id, _)| *id).collect::<Vec<_>>();
+        expired.into_iter().filter_map(|id| self.retire_terminal(id)).collect()
+    }
+
     pub(super) fn close_terminal_attention(
         &mut self,
         terminal_id: TerminalId,
@@ -1163,6 +1220,7 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
+                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -3964,6 +4022,10 @@ fn record_event_from(
         if let WireTerminalEvent::ResumeHintChanged { hint } = &wire_event {
             record.session.resume_hint = hint.clone();
         }
+        if matches!(wire_event, WireTerminalEvent::Completed { .. }) {
+            record.completed_at.get_or_insert_with(Instant::now);
+            crate::daemon::wake();
+        }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
@@ -6695,4 +6757,92 @@ for line in sys.stdin:
             TerminalVisibility::Hidden
         );
     }
+    fn completed_retention_fixture() -> (HostState, TerminalId, TerminalHandle) {
+        let mut recipe = crate::model::LaunchRecipe::shell(PathBuf::from("/")).unwrap();
+        recipe.program = "/bin/true".into();
+        recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(), launch: recipe.clone(), transcript_path: None,
+            resume_hint: None, owned_codex_listener: None, recovery_origin: None,
+            predecessor: None,
+            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+        };
+        let id = session.id;
+        let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let mut state = test_host();
+        state.register_client(1);
+        state.finish_spawn(1, session, handle.clone(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline, "fixture terminal did not complete");
+            thread::sleep(Duration::from_millis(5));
+        }
+        state.observe_completed_terminals(Instant::now() - Duration::from_secs(20));
+        (state, id, handle)
+    }
+
+    #[test]
+    fn completed_terminal_retention_preserves_attached_and_pinned_results() {
+        let (mut state, id, handle) = completed_retention_fixture();
+        let now = Instant::now();
+        let retention = Duration::from_secs(10);
+        assert!(state.retire_expired_terminals(now, retention, &BTreeSet::new()).is_empty());
+        state.unregister_client(1);
+        assert!(state.retire_expired_terminals(now, retention, &BTreeSet::from([id])).is_empty());
+        assert!(state.terminal_retention_deadline(retention, &BTreeSet::from([id])).is_none());
+        let retired = state.retire_expired_terminals(now, retention, &BTreeSet::new());
+        assert_eq!(retired.len(), 1);
+        assert!(!state.terminals.contains_key(&id));
+        // Teardown outside HostState releases the retained childless holder.
+        let holder = handle.holder_identity().map(|identity| identity.holder.clone());
+        retired[0].handle.shutdown().unwrap();
+        drop(retired);
+        if let Some(holder) = holder {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while holder.is_current() {
+                assert!(Instant::now() < deadline, "retired holder did not exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_terminal_retention_waits_for_the_full_retention_period() {
+        let (mut state, id, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        let now = Instant::now();
+        state.terminals.get_mut(&id).unwrap().completed_at = Some(now);
+        let retention = Duration::from_secs(10);
+        assert_eq!(state.terminal_retention_deadline(retention, &BTreeSet::new()), Some(now + retention));
+        assert!(state.retire_expired_terminals(now + retention - Duration::from_nanos(1), retention, &BTreeSet::new()).is_empty());
+        assert_eq!(state.retire_expired_terminals(now + retention, retention, &BTreeSet::new()).len(), 1);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_suppresses_an_overdue_retention_deadline() {
+        let (mut state, _, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        let retention = Duration::from_secs(1);
+        assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_some());
+        state.shutting_down = true;
+        assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_none());
+        assert!(state.retire_expired_terminals(Instant::now(), retention, &BTreeSet::new()).is_empty());
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn development_idle_requires_no_clients_or_detached_terminals() {
+        let mut empty = test_host();
+        assert!(empty.development_idle());
+        empty.register_client(1);
+        assert!(!empty.development_idle());
+        empty.unregister_client(1);
+        assert!(empty.development_idle());
+        let (mut state, _, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        assert!(!state.development_idle(), "a detached terminal keeps the daemon alive");
+        handle.shutdown().unwrap();
+    }
+
 }

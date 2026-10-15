@@ -275,6 +275,25 @@ pub(super) fn apply(
 }
 
 impl Registry {
+    /// Saved pane membership pins an exited terminal even while no window is
+    /// attached. CLI-only short-lived terminals have no persistent pane owner.
+    pub(crate) fn pinned_terminals(&self, candidates: &std::collections::BTreeSet<crate::model::TerminalId>) -> Result<std::collections::BTreeSet<crate::model::TerminalId>, String> {
+        let mut statement = self.db.prepare("SELECT panes FROM shared_views")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut pinned = self.retention_pins(candidates)?;
+        for row in rows {
+            let panes: Vec<crate::workspace_model::views::Pane> = serde_json::from_str(
+                &row.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+            for pane in panes {
+                if let crate::model::CardKind::Terminal(session) = pane.kind
+                    && candidates.contains(&session.id) { pinned.insert(session.id); }
+            }
+        }
+        Ok(pinned)
+    }
+
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
         Ok(read(&self.db, scope)?.revision)
     }

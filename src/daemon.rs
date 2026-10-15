@@ -54,6 +54,8 @@ const POLL_FOREVER: c_int = -1;
 
 #[cfg(feature = "host")]
 static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "host")]
+static IDLE_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The daemon's wakeup pipe. It is created once and never dropped, because the
 /// signal handler writes to its sending descriptor: that descriptor must never
@@ -126,11 +128,27 @@ pub(crate) fn wake() {
 /// There is no timeout: an idle daemon causes no wakeups at all.
 #[cfg(feature = "host")]
 pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
-    wait_for_activity_with(listener, wakeup()?)
+    wait_for_activity_until(listener, None)
+}
+
+/// A single pending lifecycle deadline replaces the infinite wait only while
+/// there is an actual retention/idle action scheduled.
+#[cfg(feature = "host")]
+pub(crate) fn wait_for_activity_until(listener: &UnixListener, deadline: Option<std::time::Instant>) -> io::Result<()> {
+    wait_for_activity_deadline(listener, wakeup()?, deadline)
 }
 
 #[cfg(feature = "host")]
 fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
+    wait_for_activity_deadline(listener, wakeup, None)
+}
+
+#[cfg(feature = "host")]
+fn wait_for_activity_deadline(listener: &UnixListener, wakeup: &Wakeup, deadline: Option<std::time::Instant>) -> io::Result<()> {
+    let timeout = deadline.map_or(POLL_FOREVER, |deadline| {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        i32::try_from(remaining.as_millis().saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))).unwrap_or(i32::MAX)
+    });
     let mut fds = [
         libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -145,7 +163,7 @@ fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Resul
     ];
     // SAFETY: fds is a live, fully initialised array of the length passed to
     // poll, and both descriptors are owned for the duration of the call.
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_FOREVER) };
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     if ready < 0 {
         let error = io::Error::last_os_error();
         // A signal handler ran. The caller re-reads the termination flag, so an
@@ -416,6 +434,7 @@ impl Drop for HostLease {
 struct LockMetadata<'a> {
     pid: u32,
     proof: &'a HostSessionProof,
+    idle_exit_signal: Option<c_int>,
 }
 
 #[cfg(feature = "host")]
@@ -427,6 +446,7 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
         &LockMetadata {
             pid: std::process::id(),
             proof,
+            idle_exit_signal: crate::instance::IS_DEVELOPMENT.then_some(libc::SIGUSR2),
         },
     )?;
     lock.write_all(b"\n")?;
@@ -434,9 +454,11 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct StoredLockMetadata {
     pid: u32,
+    #[serde(default)]
+    idle_exit_signal: Option<c_int>,
 }
 
 /// Locate the executable of this instance's live, kernel-verified lock owner.
@@ -568,6 +590,41 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
     Ok(true)
 }
 
+/// Ask a stale development executable to retire only if it is empty. The
+/// advertised signal is separate from the wire protocol; old daemons lacking
+/// this capability are preserved, since SIGUSR2 could otherwise kill them.
+pub(crate) fn cleanup_stale_development_daemon() -> Result<bool, PlatformError> {
+    if !crate::instance::IS_DEVELOPMENT { return Ok(false); }
+    let paths = RuntimePaths::discover()?;
+    let mut lock = match OpenOptions::new().read(true).custom_flags(LOCK_OPEN_FLAGS).open(&paths.lock) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(_previous_owner) = daemon_pidfd_from_lock(&mut lock, &paths)? else { return Ok(false); };
+    lock.seek(SeekFrom::Start(0))?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    if stored.idle_exit_signal != Some(libc::SIGUSR2) { return Ok(false); }
+    // A predecessor can release the lease between the first validation and
+    // reading capability metadata. Bind the advertised capability to this
+    // metadata's own kernel-validated process, never the earlier pidfd.
+    let pidfd = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
+    lock.seek(SeekFrom::Start(0))?;
+    let current: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    if current != stored { return Ok(false); }
+    let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
+    if !stale_executable(&executable) { return Ok(false); }
+    signal_process(&pidfd, libc::SIGUSR2)?;
+    // A busy daemon ignores the request. There is deliberately no escalation.
+    wait_process(&pidfd, std::time::Duration::from_secs(2)).map_err(Into::into)
+}
+
+fn stale_executable(path: &Path) -> bool {
+    // procfs appends " (deleted)" to the unlinked executable's target;
+    // a normal existing filename with that suffix is still a valid binary.
+    !path.exists()
+}
+
 /// A confirmation pins the process before it is displayed. A successor cannot
 /// inherit the person's approval merely by acquiring the same lock pathname.
 #[cfg(feature = "ui")]
@@ -641,10 +698,10 @@ impl RestartTarget {
     }
 }
 
-#[cfg(feature = "ui")]
 fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     // SAFETY: the owned descriptor is a validated pidfd; the caller supplies
-    // SIGTERM or SIGKILL. No PID lookup occurs after authentication.
+    // SIGTERM, SIGKILL, or the capability-verified idle signal. No PID lookup
+    // occurs after authentication.
     if unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -663,7 +720,6 @@ fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "ui")]
 fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -921,6 +977,17 @@ pub(crate) fn read_boot_id() -> io::Result<BootId> {
 #[cfg(feature = "host")]
 extern "C" fn request_termination(_signal: c_int) {
     TERMINATION_REQUESTED.store(true, Ordering::Release);
+    wake_from_signal();
+}
+
+#[cfg(feature = "host")]
+extern "C" fn request_idle_exit(_signal: c_int) {
+    IDLE_EXIT_REQUESTED.store(true, Ordering::Release);
+    wake_from_signal();
+}
+
+#[cfg(feature = "host")]
+fn wake_from_signal() {
     let fd = WAKEUP_FD.load(Ordering::Acquire);
     if fd < 0 {
         return;
@@ -952,6 +1019,9 @@ pub(crate) fn install_signal_handlers() -> io::Result<()> {
             libc::SIGTERM,
             request_termination as *const () as libc::sighandler_t,
         );
+        if crate::instance::IS_DEVELOPMENT {
+            libc::signal(libc::SIGUSR2, request_idle_exit as *const () as libc::sighandler_t);
+        }
     }
     Ok(())
 }
@@ -959,6 +1029,11 @@ pub(crate) fn install_signal_handlers() -> io::Result<()> {
 #[cfg(feature = "host")]
 pub(crate) fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn take_idle_exit_request() -> bool {
+    IDLE_EXIT_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
 #[cfg(test)]
@@ -1583,4 +1658,15 @@ while True: time.sleep(1)
         );
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
     }
+    #[test]
+    fn removed_executable_detection_is_literal_and_keeps_existing_binaries() {
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("cagentsd");
+        fs::write(&executable, b"fixture").unwrap();
+        assert!(!stale_executable(&executable));
+        assert!(stale_executable(&directory.path().join("cagentsd (deleted)")));
+        fs::remove_file(&executable).unwrap();
+        assert!(stale_executable(&executable));
+    }
+
 }

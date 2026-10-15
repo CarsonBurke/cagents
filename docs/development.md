@@ -154,6 +154,25 @@ How the runner works:
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
 
+### Development daemon lifetime
+
+An empty development daemon exits after 30 minutes with no connected clients,
+terminals, live native providers, retained holders, pending handoffs, or accepted
+agent/automation work or enabled scheduled automations. Becoming empty arms
+one deadline; new work cancels it.
+Production identities never arm this timer. Set
+`CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS` in the daemon environment to adjust the
+period (0 through 31,536,000 seconds; default 1800).
+
+After its matched builds succeed, the runner checks the current development
+lease for a removed executable. New daemons advertise an idle-only cleanup
+signal in their lock metadata. The runner pins that exact owner with a Linux
+pidfd and asks it to retire; the daemon rechecks its own clients, process
+ownership and durable work before exiting. Busy daemons, production daemons,
+and older daemons without this capability are preserved. There is no forced
+termination or escalation on this automatic path; `--fresh-daemon` remains the
+explicit restart of every hosted development job.
+
 ### Experimental hot reload
 
 The opt-in lane uses the same application modules and startup entry in a separate

@@ -341,6 +341,24 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
 }
 
+fn retention_pin_generation(host: &SharedHost, terminal: crate::model::TerminalId) -> Option<String> {
+    match super::agent_execution::registry(host).and_then(|registry|
+        registry.lock().unwrap_or_else(|p| p.into_inner()).retention_pin_generation(terminal)) {
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::warn!(%error, %terminal, "Retaining terminal ownership because its pin could not be read");
+            None
+        }
+    }
+}
+
+fn forget_retention_pin(host: &SharedHost, terminal: crate::model::TerminalId, generation: Option<String>) {
+    let Some(generation) = generation else { return; };
+    let result = super::agent_execution::registry(host).and_then(|registry|
+        registry.lock().unwrap_or_else(|p| p.into_inner()).forget_retention_pin(terminal, &generation));
+    if let Err(error) = result { tracing::warn!(%error, %terminal, "Could not compact a closed terminal retention pin"); }
+}
+
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
 pub(super) fn process_request(
@@ -523,6 +541,17 @@ pub(super) fn process_request(
                     "Invalid notification window ownership",
                     false,
                 ));
+            }
+            if presence.application == crate::notifications::Application::Cagents && !presence.sessions.is_empty() {
+                // This includes saved local panes absent from shared_views. A
+                // disconnect is not a card close, so pins remain durable.
+                if let Ok(registry) = super::agent_execution::registry(host) {
+                    registry.lock().unwrap_or_else(|p| p.into_inner())
+                        .pin_window_terminals(&presence.sessions).map_err(|message|
+                            ProtocolError::new(ProtocolErrorCode::Internal, message, true))?;
+                }
+                // Without a model registry retention already fails closed;
+                // notification delivery can remain usable in that condition.
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             // Watch and subsequent focus reports share the same live window
@@ -1071,11 +1100,16 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
+            let pin = retention_pin_generation(host, terminal_id);
             handle.shutdown().map_err(send_error)?;
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(terminal_id, Some(&handle));
+            super::chat::close_for_terminal(host, terminal_id)?;
+            let retired = host.lock().unwrap_or_else(|p| p.into_inner())
+                .retire_terminal_if_current(terminal_id, &handle);
+            let retired_current = retired.is_some();
+            drop(retired);
+            if retired_current { forget_retention_pin(host, terminal_id, pin); }
+            crate::daemon::wake();
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ReleaseCompletedTerminal {
@@ -1130,6 +1164,7 @@ pub(super) fn process_request(
                 }).transpose()?;
                 (handle, paired)
             };
+            let pin = handle.as_ref().and_then(|_| retention_pin_generation(host, session.id));
             if paired.as_ref().is_some_and(|handle| handle.owns_work()) && !allow_active {
                 return Ok((
                     ServerResponse::TerminalCloseChecked {
@@ -1146,9 +1181,14 @@ pub(super) fn process_request(
             if let Some(handle) = &handle {
                 handle.shutdown().map_err(send_error)?;
             }
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(session.id, handle.as_ref());
+            let retired = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                handle.as_ref().and_then(|handle| state.retire_terminal_if_current(session.id, handle))
+            };
+            let retired_current = retired.is_some();
+            drop(retired); // Drop holder ownership outside the global host lock.
+            if retired_current { forget_retention_pin(host, session.id, pin); }
+            crate::daemon::wake();
             Ok((
                 ServerResponse::TerminalCloseChecked {
                     terminal_id: session.id,
@@ -1165,13 +1205,17 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
+            let pin = retention_pin_generation(host, terminal_id);
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
-                host.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .close_terminal_attention(terminal_id, Some(&handle));
                 super::chat::close_for_terminal(host, terminal_id)?;
+                let retired = host.lock().unwrap_or_else(|p| p.into_inner())
+                    .retire_terminal_if_current(terminal_id, &handle);
+                let retired_current = retired.is_some();
+                drop(retired);
+                if retired_current { forget_retention_pin(host, terminal_id, pin); }
+                crate::daemon::wake();
             }
             Ok((
                 ServerResponse::TerminalCloseChecked {
@@ -1646,13 +1690,10 @@ mod tests {
             }
         ));
         assert!(actor.is_completed());
-        assert!(!host.lock().unwrap().chats.contains_key(&session.id));
-        assert!(
-            host.lock()
-                .unwrap()
-                .notification_closed
-                .contains(&session.id)
-        );
+        let state = host.lock().unwrap();
+        assert!(!state.chats.contains_key(&session.id));
+        assert!(!state.terminals.contains_key(&session.id), "explicit release retires the completed descriptor too");
+        assert!(!state.notification_closed.contains(&session.id), "no closed-record suppression remains after retirement");
     }
 
     #[test]

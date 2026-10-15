@@ -486,3 +486,22 @@ reviewed handoff before starting the replacement. Unlocked stale lease records
 do not block startup. Public staged-owner routing and explicit reviewed update
 handoffs keep their existing ownership checks; admission does not stop windows
 or hosted terminals automatically.
+
+## Exited terminal retention
+
+A terminal is eligible for automatic retirement only after its worker confirms
+that all owned process work has completed. Once it has no attached client and
+no saved pane referencing it, the daemon retains its final result for ten
+minutes, then removes the inventory entry and releases its holder. Saved pane
+membership and the window's complete durable-card presence pin results across
+closed windows, including local panes outside shared projects. Those narrow
+pins survive daemon restart and are removed on explicit terminal close;
+paired native conversations
+and pending handoffs also preserve their terminal ownership. Explicitly closing
+a completed terminal removes it immediately, including finished sign-in panes.
+
+Set `CAGENTS_EXITED_TERMINAL_RETENTION_SECS` in the daemon's environment to
+change the retention period (0 through 31,536,000 seconds). The default is 600.
+Only completed, unattached results can arm a retention deadline. The daemon
+checks saved pane pins before retirement and does not poll live or attached
+terminals on a cleanup timer.
