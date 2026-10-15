@@ -1465,27 +1465,55 @@ impl TerminalHandle {
 
     /// The daemon keeps the exact listed record pending until this result
     /// proves cleanup. Queue refusal and failure leave its holder retryable.
-    pub(crate) fn release_completed_holder_async(&self) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
+    pub(crate) fn release_completed_holder_async(
+        &self,
+    ) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
         holder::release::completed(self)
     }
 
-    pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
-        if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
-        let mut retained = self.inner.published.retained_holder.try_lock()
-            .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
-        if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
-        else if !self.inner.published.cleanup_published.load(Ordering::Acquire) {
+    pub(crate) fn release_completed_holder_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "Terminal family cleanup deadline expired; its exact owner remains retained".into(),
+            );
+        }
+        let mut retained = self
+            .inner
+            .published
+            .retained_holder
+            .try_lock()
+            .map_err(|_| {
+                "Another close retains this terminal holder; retry after its deadline".to_owned()
+            })?;
+        if let Some(holder) = retained.as_mut() {
+            holder.close_until(deadline)?;
+        } else if !self
+            .inner
+            .published
+            .cleanup_published
+            .load(Ordering::Acquire)
+        {
             return Err("Terminal has no retained cleanup owner or published family proof; preserved ownership cannot be released".into());
         }
-        let mut archive = self.inner.published.archive.try_lock()
-            .map_err(|_| "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned())?;
+        let mut archive = self.inner.published.archive.try_lock().map_err(|_| {
+            "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned()
+        })?;
         *archive = ArchivePhase::Released;
         let holder = retained.take();
         drop(archive);
         drop(retained);
         drop(holder);
-        self.inner.published.cleanup_published.store(true, Ordering::Release);
-        self.inner.published.completed.store(true, Ordering::Release);
+        self.inner
+            .published
+            .cleanup_published
+            .store(true, Ordering::Release);
+        self.inner
+            .published
+            .completed
+            .store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
     }
@@ -7051,17 +7079,61 @@ mod tests {
 
     #[test]
     fn preserved_completed_owner_cannot_be_reported_as_published_cleanup() {
-        let handle=TerminalHandle::spawn(shell_session("exit 0"),TerminalConfig::default(),|_|{}).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(5);
-        while !handle.is_completed() {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_some());
+        let handle =
+            TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_some()
+        );
         handle.preserve_completed_for_restart();
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_none()
+        );
         assert!(handle.inner.published.input_order.lock().unwrap().handoff);
-        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
-        assert!(handle.release_completed_holder_until(Instant::now()+Duration::from_secs(1)).is_err());
-        assert!(matches!(handle.release_completed_holder_async().unwrap().recv_timeout(Duration::from_secs(5)).unwrap(),CompletedRelease::Retained(_)));
-        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
+        assert!(
+            !handle
+                .inner
+                .published
+                .cleanup_published
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            handle
+                .release_completed_holder_until(Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(matches!(
+            handle
+                .release_completed_holder_async()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            CompletedRelease::Retained(_)
+        ));
+        assert!(
+            !handle
+                .inner
+                .published
+                .cleanup_published
+                .load(Ordering::Acquire)
+        );
     }
 
     #[test]
@@ -7088,12 +7160,29 @@ mod tests {
         let retained = handle.inner.published.retained_holder.lock().unwrap();
         assert!(retained.is_some());
         let result = handle.release_completed_holder_async().unwrap();
-        assert!(matches!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Retained(_)));
-        assert!(retained.is_some(), "contention cannot discard exact cleanup ownership");
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CompletedRelease::Retained(_)
+        ));
+        assert!(
+            retained.is_some(),
+            "contention cannot discard exact cleanup ownership"
+        );
         drop(retained);
         let result = handle.release_completed_holder_async().unwrap();
-        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Released);
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CompletedRelease::Released
+        );
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
