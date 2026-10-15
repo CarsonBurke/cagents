@@ -1052,6 +1052,14 @@ where
     .into()
 }
 
+#[cfg(all(test, feature = "integrated-browser"))]
+pub(crate) fn browser_keyboard_reservation_fixture<'a>(
+    content: Element<'a, ()>,
+    shortcuts: &'a KeyboardShortcuts,
+) -> Element<'a, ()> {
+    WorkspaceSurface::new(content, shortcuts, FocusedPane::Browser, 400.0, |_| ()).into()
+}
+
 struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
     on_pointer_focus: Option<Message>,

@@ -1441,6 +1441,44 @@ mod tests {
         assert!(native.placement.source_y + native.placement.source_height <= native.buffer.height);
     }
     #[test]
+    fn actual_workspace_reservation_preserves_browser_owned_up_across_modifier_changes() {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use keyboard::key::Code;
+        for (initial_shortcut, raw_repeat) in [(false, false), (true, false), (true, true)] {
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let handle = BrowserHandle::fixture();
+            let content = Id::unique();
+            let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+            shortcuts.new_thread = vec!["Ctrl+R".into()];
+            let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true);
+            let parent = crate::workspace_widget::browser_keyboard_reservation_fixture(browser.into(), &shortcuts);
+            let mut ui = UserInterface::build(parent, Size::new(400.0, 240.0), Cache::new(), &mut renderer);
+            ui.operate(&renderer, &mut focusable::focus::<()>(content));
+            let first_modifiers = if initial_shortcut { keyboard::Modifiers::CTRL } else { keyboard::Modifiers::empty() };
+            let final_modifiers = if initial_shortcut { keyboard::Modifiers::empty() } else { keyboard::Modifiers::CTRL };
+            let mut events = vec![press("r", Code::KeyR, first_modifiers), Event::Keyboard(keyboard::Event::ModifiersChanged(final_modifiers))];
+            if raw_repeat {
+                let mut event = press("r", Code::KeyR, final_modifiers);
+                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut event { *repeat = true; }
+                events.push(event);
+            }
+            events.push(Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
+                physical_key: keyboard::key::Physical::Code(Code::KeyR), location: keyboard::Location::Standard, modifiers: final_modifiers,
+            }));
+            let mut messages = Vec::new();
+            let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+            // Inspect before TreeDrop can synthesize a missing up. A globally
+            // intercepted down alone must never generate an unmatched raw up.
+            let input = queued_input(&handle);
+            if !initial_shortcut || raw_repeat {
+                assert!(matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"), "{input:?}");
+            } else { assert!(input.is_empty(), "global-only down cannot produce phantom up: {input:?}"); }
+        }
+    }
+
+    #[test]
     fn admitted_raw_repeat_owns_release_even_after_the_initial_browser_shortcut() {
         use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
