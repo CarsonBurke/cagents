@@ -30,7 +30,7 @@ impl State {
 fn terminal_status(session: &TerminalSession, open: bool) -> WorktreeSetupStatus {
     let ended = |exit: &crate::model::TerminalExit| {
         if exit.code == Some(0) && exit.signal.is_none() { WorktreeSetupStatus::Succeeded }
-        else { WorktreeSetupStatus::Failed(match (exit.code, exit.signal) {
+        else { WorktreeSetupStatus::Failed(match (exit.code, exit.signal.as_deref()) {
             (Some(code), _) => format!("Setup exited with status {code}"),
             (_, Some(signal)) => format!("Setup ended with signal {signal}"),
             _ => "Setup ended without a successful exit status".into(),
