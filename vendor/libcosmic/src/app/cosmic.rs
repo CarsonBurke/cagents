@@ -744,6 +744,13 @@ where
     #[cfg(feature = "multi-window")]
     pub fn view(&self, id: window::Id) -> Element<'_, crate::Action<T::Message>> {
         crate::widget::text_context_menu::set_current_window_id(id);
+        self.app.native_surface(self.view_content(id))
+    }
+
+    // Select the complete root first. Dialogs in view_main and independently
+    // registered native popup/window callbacks all pass through view().
+    #[cfg(feature = "multi-window")]
+    fn view_content(&self, id: window::Id) -> Element<'_, crate::Action<T::Message>> {
         #[cfg(all(wayland_platform, target_os = "linux"))]
         if let Some((_, _, _, Some(v))) = self.surface_views.get(&id) {
             return v(&self.app);
@@ -779,7 +786,7 @@ where
         #[cfg(all(target_env = "gnu", not(target_os = "windows")))]
         crate::malloc::trim(0);
 
-        view
+        self.app.native_surface(view)
     }
 }
 

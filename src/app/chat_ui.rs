@@ -29,6 +29,7 @@ mod permissions;
 mod prose;
 mod provider_exit;
 mod clipboard_intent;
+mod clipboard_surface;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -504,6 +505,12 @@ pub(super) struct State {
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
+impl State {
+    pub(super) fn clipboard_surface<'a, M: 'a>(&self, content: cosmic::Element<'a, M>) -> cosmic::Element<'a, M> {
+        clipboard_surface::surface(content, self.copy_intents.clone())
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
@@ -7654,6 +7661,7 @@ impl Cagents {
                 }
             }
             Action::Copy(target, id, part) => {
+                self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -7811,6 +7819,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }

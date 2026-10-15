@@ -132,3 +132,6 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+#[cfg(all(test, feature = "ui"))]
+pub(crate) mod ui_test_process;
