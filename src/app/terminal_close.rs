@@ -1,4 +1,6 @@
 use super::*;
+mod local_presentation;
+pub use local_presentation::Target as LocalDismissalTarget;
 use crate::{control::ControlClient, terminal::ipc::TerminalCloseResult};
 
 #[derive(Debug, Clone)]
@@ -15,6 +17,7 @@ pub(super) struct Bindings {
     bound: HashMap<CardId, CapturedTerminal>,
     adoptions: HashMap<CardId, (uuid::Uuid, HostSessionProof, uuid::Uuid, HostSessionProof)>,
     removals: HashMap<CardId, CapturedTerminal>,
+    local: local_presentation::State,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +55,7 @@ pub enum CompletedCloseOutcome {
     /// List found no resident owner; this cannot authorize shared pane removal.
     Absent {
         expected_worker: Option<(uuid::Uuid, HostSessionProof)>,
+        presentation: Option<LocalDismissalTarget>,
     },
     Active(HostSessionProof),
     ActiveWorker {
@@ -223,6 +227,7 @@ impl Cagents {
         self.terminal_close_bindings.bound.remove(&card);
         self.terminal_close_bindings.adoptions.remove(&card);
         self.terminal_close_bindings.removals.remove(&card);
+        self.terminal_close_bindings.local.forget(card);
     }
 
     fn surface_close_binding_current(&self, card:CardId, captured:Option<&CapturedTerminal>)->bool {
@@ -419,9 +424,10 @@ impl Cagents {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
             }
+            let presentation=self.local_terminal_dismissal_target(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let mut result = tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
                     let mut client =
@@ -436,6 +442,7 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
+                if let Ok(CompletedCloseOutcome::Absent{presentation:target,..})=&mut result {*target=presentation;}
                 Message::CompletedTerminalClosed {
                     card,
                     session,
@@ -547,7 +554,7 @@ impl Cagents {
             result => result,
         };
         match result {
-            Ok(CompletedCloseOutcome::Absent { expected_worker }) => {
+            Ok(CompletedCloseOutcome::Absent { expected_worker,presentation }) => {
                 if captured
                     .as_ref()
                     .map(|current| (current.execution_instance, current.proof.clone()))
@@ -555,10 +562,11 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // A List absence is not an atomic execution or shared-pane generation fence.
-                // Keep its shared membership and history rather than hiding a successor.
+                // Absence grants only an explicit, revision-bound local
+                // presentation option. Shared membership/history remain intact.
+                self.offer_local_terminal_dismissal(presentation);
                 self.status = Some(TransientNotice::warning(
-                    "No resident terminal was found. Its saved pane was kept because absence cannot authorize shared session removal. Refresh its connection, or use guarded project removal after inspecting remaining sessions.",
+                    "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved.",
                 ));
                 Task::none()
             }
@@ -1277,6 +1285,7 @@ mod tests {
             },
             CompletedCloseOutcome::Absent {
                 expected_worker: None,
+                presentation:None,
             },
         ] {
             let (mut app, card, captured) = bound_fixture();
@@ -1443,6 +1452,7 @@ mod tests {
             ended,
             Ok(CompletedCloseOutcome::Absent {
                 expected_worker: Some((captured.execution_instance, captured.proof)),
+                presentation:None,
             }),
         );
         assert!(app.card_state(card).unwrap().existence.is_open());
@@ -1806,6 +1816,7 @@ fn close_completed_with_client(
         // A successor may appear after List. Report absence without granting
         // teardown or shared pane removal authority.
         return Ok(CompletedCloseOutcome::Absent {
+            presentation:None,
             expected_worker: captured
                 .map(|captured| (captured.execution_instance, captured.proof.clone())),
         });

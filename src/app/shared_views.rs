@@ -627,6 +627,7 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        self.prune_local_terminal_dismissals();
         self.shared_views.prune_restoration_requests(&self.durable);
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
@@ -1226,10 +1227,11 @@ impl Cagents {
     }
 
     fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
+        let panes=panes.iter().filter(|pane|!self.locally_dismissed_terminal(pane.id)).cloned().collect::<Vec<_>>();
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
-        let visible = visible.iter().copied().collect::<HashSet<_>>();
+        let visible = visible.iter().copied().filter(|card|!self.locally_dismissed_terminal(*card)).collect::<HashSet<_>>();
         let removed = self
             .workspace
             .order()
@@ -1238,7 +1240,7 @@ impl Cagents {
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
             // local runtime available in the destination view.
-            match self.cards.get_mut(&id) {
+            if !self.locally_dismissed_terminal(id) { match self.cards.get_mut(&id) {
                 Some(CardRuntime::Terminal(surface)) => {
                     let _ = surface.focus(false);
                     let _ = surface.hide();
@@ -1251,7 +1253,7 @@ impl Cagents {
                     let _ = browser.handle.set_visible(false);
                 }
                 _ => {}
-            }
+            } }
             if let Some(state) = self.card_state_mut(id) {
                 state.exposure = Exposure::Offscreen;
             }
@@ -2485,4 +2487,82 @@ mod tests {
         app.acknowledge_view_edit(Scope::Channel(a), None);
         assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|edit|matches!(edit, ModelEdit::ChangeView {change:Change::Insert {pane: inserted,..},..} if inserted.id==pane.id)));
     }
+    fn local_dismissal_fixture()->(Cagents,CardId,crate::app::terminal_close::LocalDismissalTarget) {
+        let (mut app,a,_,browser)=fixture();
+        let mut terminal=browser.clone();terminal.id=CardId::new();terminal.title="Unavailable terminal".into();
+        terminal.kind=CardKind::Terminal(TerminalSession{id:TerminalId::new(),launch:LaunchRecipe{program:"/bin/sh".into(),arguments:Vec::new(),working_directory:"/repo".into(),environment:Default::default(),unset_environment:Default::default()},continuity:TerminalContinuity::Exited{last_exit:crate::model::TerminalExit{code:Some(0),signal:None,occurred_at_unix_ms:1}}});
+        let card=terminal.id;
+        let mut right=browser.clone();right.id=CardId::new();
+        let mut view=View::empty(Scope::Channel(a));view.revision=7;view.panes=vec![browser,terminal,right];
+        app.workspace_model.views=vec![view.clone()];
+        app.active_workspace=Some("/repo".into());Arc::make_mut(&mut app.durable).active_channel=Some(a);
+        app.shared_views.applying=true;
+        drop(app.project_shared_view(&view,&view.panes.iter().map(|pane|pane.id).collect()));
+        app.shared_views.applying=false;
+        app.shared_views.baseline.insert(view.scope.clone(),app.local_view_panes(&view.scope));
+        app.cards.insert(card,CardRuntime::Completed);
+        let target=app.local_terminal_dismissal_target(card).unwrap();
+        (app,card,target)
+    }
+
+    #[test]
+    fn local_completed_dismissal_preserves_shared_membership_order_and_real_saved_history() {
+        let directory=tempfile::tempdir().unwrap();
+        let (mut app,card,target)=local_dismissal_fixture();
+        let mut history=app.card_state(card).unwrap().clone();history.id=CardId::new();
+        if let CardKind::Terminal(source)=&mut history.kind {source.id=TerminalId::new();}
+        history.existence=super::super::project_ui::removed_existence("historical fixture");
+        Arc::make_mut(&mut app.durable).cards.push(history.clone());
+        let (runtime,_)=crate::session::SessionRuntime::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("local-dismissal")).unwrap();
+        runtime.snapshot(Arc::clone(&app.durable));runtime.flush(Duration::from_secs(5)).unwrap();
+        let store=runtime.operation_store();app.session=Some(runtime);
+        let model=app.workspace_model.clone();let source=app.card_state(card).unwrap().kind.clone();
+        let scope=model.views[0].scope.clone();let panes=app.local_view_panes(&scope);
+        let order=app.durable.channels[0].cards.clone();
+        app.offer_local_terminal_dismissal(Some(target.clone()));
+        drop(app.dismiss_terminal_locally(target));
+        assert!(app.workspace.card(card).is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.card_state(card).unwrap().kind,source);
+        assert_eq!(app.workspace_model,model);
+        app.persist();app.publish_view_changes();
+        assert_eq!(app.local_view_panes(&scope),panes);
+        assert_eq!(app.durable.channels[0].cards,order,"hidden slots must not be moved to the end by persistence");
+        assert!(app.shared_views.pending.is_empty(),"local absence must never publish Change::Remove or a layout mutation");
+        assert!(app.recently_closed.is_empty());assert!(!app.closed_terminal_cards.contains(&card));
+        app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+        let saved=store.load_card(card,None).unwrap().unwrap();
+        assert!(saved.existence.is_open());assert_eq!(saved.kind,source);
+        let saved_history=store.load_card(history.id,None).unwrap().unwrap();
+        assert_eq!(saved_history.existence,history.existence);assert_eq!(saved_history.kind,history.kind);
+        drop(app.restore_locally_dismissed_terminals());
+        assert!(app.workspace.card(card).is_some());assert_eq!(app.workspace_model,model);
+    }
+
+    #[test]
+    fn local_dismissal_revision_source_and_resident_changes_restore_visibility() {
+        for change in 0..3 {
+            let (mut app,card,target)=local_dismissal_fixture();
+            app.offer_local_terminal_dismissal(Some(target.clone()));
+            drop(app.dismiss_terminal_locally(target));assert!(app.workspace.card(card).is_none());
+            match change {
+                0=>{app.workspace_model.views[0].revision+=1;drop(app.reconcile_shared_views());},
+                1=>{let pane=app.workspace_model.views[0].panes.iter_mut().find(|pane|pane.id==card).unwrap();if let CardKind::Terminal(source)=&mut pane.kind {source.launch.arguments.push("replacement".into());}drop(app.reconcile_shared_views());},
+                _=>{let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};let mut descriptor=crate::terminal::ipc::TerminalDescriptor::relaunchable(source.id,source.launch.clone(),None);descriptor.session=source;descriptor.execution_instance=uuid::Uuid::new_v4();drop(app.observe_local_terminal_residents(&[descriptor]));},
+            }
+            assert!(!app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_some(),"a replacement must not inherit the local hidden flag");
+        }
+    }
+    #[test]
+    fn queued_local_dismissal_cannot_hide_a_new_revision_or_observed_successor() {
+        for resident in [false,true] {
+            let (mut app,card,target)=local_dismissal_fixture();
+            app.offer_local_terminal_dismissal(Some(target.clone()));
+            if resident {let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};let descriptor=crate::terminal::ipc::TerminalDescriptor::relaunchable(source.id,source.launch,None);drop(app.observe_local_terminal_residents(&[descriptor]));}else{app.workspace_model.views[0].revision+=1;}
+            drop(app.dismiss_terminal_locally(target));
+            assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));
+            assert!(app.shared_views.pending.is_empty());
+        }
+    }
+
 }

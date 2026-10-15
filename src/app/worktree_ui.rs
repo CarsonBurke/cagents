@@ -234,6 +234,7 @@ impl Cagents {
                         .order()
                         .filter(|card| members.contains(card))
                         .collect::<Vec<_>>();
+                    order=self.preserve_locally_dismissed_order(&channel.cards,order);
                     let mounted = order.iter().copied().collect::<HashSet<_>>();
                     order.extend(
                         channel
@@ -729,7 +730,7 @@ impl Cagents {
 
     fn install_workspace_scope(
         &mut self,
-        scoped: WorkspaceState,
+        mut scoped: WorkspaceState,
         path: PathBuf,
         offset: Option<f32>,
     ) -> Task<Message> {
@@ -745,6 +746,7 @@ impl Cagents {
             "workspace-strip-{}",
             self.workspace_view_generation
         ));
+        scoped.cards.retain(|card|!self.locally_dismissed_terminal(card.id));
         self.workspace = Self::rebuild_workspace(&scoped);
         self.workspace.resize_viewport(width);
         // Focus selects the initial position only on the first visit. Returning

@@ -2495,6 +2495,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResizeCardFinished(_)
         | Message::CyclePaneWidth
         | Message::CloseCard(_)
+        | Message::DismissTerminalLocally(_)
+        | Message::RestoreLocallyDismissedTerminals
         | Message::OpenBrowser(_)
         | Message::OpenBrowserInSystem(_)
         | Message::OpenLink(..)
@@ -4121,6 +4123,8 @@ pub enum Message {
         generation: u64,
         outcome: terminal_close::CloseOutcome,
     },
+    DismissTerminalLocally(terminal_close::LocalDismissalTarget),
+    RestoreLocallyDismissedTerminals,
     CompletedTerminalClosed {
         card: CardId,
         session: TerminalSession,
@@ -5652,6 +5656,7 @@ impl Cagents {
                 // as a closed visibility channel.
                 self.cards.insert(card, CardRuntime::Terminal(handle));
                 self.capture_terminal_close_binding(card, started.spawned);
+                tasks.push(self.terminal_local_presentation_started(card));
                 tasks.push(self.drain_terminal(card, 0));
                 if ended_terminal(self.card_state(card)).is_some() {
                     // The daemon can report a session that already
@@ -9442,6 +9447,7 @@ impl Cagents {
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
         }
+        if let Some(notice)=self.local_terminal_unavailable_notice(id){rows.push(notice);}
         if let Some(notice) = self.project_location_notice(id) {
             rows.push(notice);
         }
@@ -15089,6 +15095,8 @@ impl Application for Cagents {
                 generation,
                 outcome,
             } => self.terminal_close_finished(card, terminal, proof, generation, outcome),
+            Message::DismissTerminalLocally(target)=>self.dismiss_terminal_locally(target),
+            Message::RestoreLocallyDismissedTerminals=>self.restore_locally_dismissed_terminals(),
             Message::CompletedTerminalClosed {
                 card,
                 session,
@@ -17258,6 +17266,7 @@ impl Application for Cagents {
             )
         };
 
+        let workspace=if let Some(notice)=self.locally_dismissed_terminals_notice(){widget::column::with_children(vec![notice,workspace]).height(Length::Fill).into()}else{workspace};
         let main_content = self.workspace_chrome(workspace);
 
         let context_model = (self.context_inspector_visible()
