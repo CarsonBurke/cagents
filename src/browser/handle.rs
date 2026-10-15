@@ -84,6 +84,7 @@ pub(crate) struct CommandMailbox {
     coalesced: Mutex<CoalescedCommands>,
     keyboard: Mutex<KeyboardInput>,
     deferred_releases: Mutex<VecDeque<BrowserInput>>,
+    wake_admission: Mutex<()>,
     wake_pending: AtomicBool,
     shutdown_requested: AtomicBool,
     /// Set by the engine once this card can never be serviced again: it was
@@ -101,6 +102,7 @@ impl CommandMailbox {
             coalesced: Mutex::new(CoalescedCommands::default()),
             keyboard: Mutex::new(KeyboardInput::default()),
             deferred_releases: Mutex::new(VecDeque::new()),
+            wake_admission: Mutex::new(()),
             wake_pending: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             engine_gone: AtomicBool::new(false),
@@ -142,7 +144,8 @@ impl CommandMailbox {
         drop(pending);
         // A full queue may have refused the blur wake. Every receive creates
         // another opportunity, including when the originating tree is parked.
-        if !self.coalesced().is_empty() { let _ = self.wake_coalesced(); }
+        let needs_wake = !self.coalesced().is_empty();
+        if needs_wake { let _ = self.wake_coalesced(); }
     }
 
     pub(crate) fn press_key(&self, physical: cosmic::iced::keyboard::key::Physical,
@@ -196,9 +199,18 @@ impl CommandMailbox {
     }
 
     fn wake_coalesced(&self) -> Result<(), BrowserError> {
+        self.admit_wake(|| {})
+    }
+
+    fn admit_wake(&self, after_failure: impl FnOnce()) -> Result<(), BrowserError> {
+        // The engine's receive/refill cannot pass a failed producer before
+        // its pending flag is reset. Otherwise it could drain the full queue
+        // while observing true, then park just before the producer clears it.
+        let _admission = self.wake_admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.wake_pending.swap(true, Ordering::AcqRel)
             && let Err(error) = self.tx.try_send(Command::WakeCoalesced)
         {
+            after_failure();
             self.wake_pending.store(false, Ordering::Release);
             return Err(map_send_error(error));
         }
@@ -206,8 +218,10 @@ impl CommandMailbox {
     }
 
     pub(crate) fn drain_coalesced(&self) -> CoalescedCommands {
+        let admission = self.wake_admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let drained = std::mem::take(&mut *self.coalesced());
         self.wake_pending.store(false, Ordering::Release);
+        drop(admission);
         // A producer can race between the take and clearing `wake_pending`. Ensure
         // any values deposited during that window receive another wake packet.
         let has_more = !self.coalesced().is_empty();
@@ -701,6 +715,44 @@ impl Drop for BrowserHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_wake_reset_is_serialized_with_engine_receive_refill() {
+        let mailbox = CommandMailbox::new();
+        for _ in 0..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
+        mailbox.coalesced().focused = Some(false);
+        let (failed_tx, failed_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        let (received_tx, received_rx) = crossbeam_channel::bounded(1);
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| mailbox.admit_wake(|| {
+                failed_tx.send(()).unwrap();
+                resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            }));
+            failed_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(mailbox.wake_pending.load(Ordering::Acquire));
+            assert!(matches!(mailbox.wake_admission.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "failed admission must retain serialization until reset");
+            let engine = scope.spawn(|| {
+                let mut observed = Vec::new();
+                let mut first = true;
+                while let Ok(command) = mailbox.receiver().try_recv() {
+                    if first { received_tx.send(()).unwrap(); first = false; }
+                    mailbox.refill_after_receive();
+                    if matches!(command, Command::WakeCoalesced) {
+                        observed.push(mailbox.drain_coalesced().focused);
+                    }
+                }
+                observed
+            });
+            received_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(matches!(mailbox.wake_admission.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            resume_tx.send(()).unwrap();
+            assert!(matches!(producer.join().unwrap(), Err(BrowserError::CommandQueueFull)));
+            assert_eq!(engine.join().unwrap(), vec![Some(false)]);
+        });
+        assert!(!mailbox.wake_pending.load(Ordering::Acquire));
+    }
 
     #[test]
     fn engine_receive_retries_a_blur_wake_refused_by_a_full_queue() {
