@@ -167,9 +167,14 @@ impl State {
     /// Placeholder identities carry no text, only current-source suspended
     /// selection intent while an already-open disclosure rehydrates.
     pub(super) fn pending_paths(&self,item:&str)->Vec<[u32;2]> {
+        self.pending_sources(item).into_iter().map(|(path,_)|path).collect()
+    }
+    /// Current authoritative epoch for a prior same-source pending leaf. The
+    /// body-free page tombstone alone cannot expose this capability.
+    pub(super) fn pending_sources(&self,item:&str)->Vec<([u32;2],SourceEpoch)> {
         [RawSourceField::ToolInput,RawSourceField::CommandCall].into_iter().filter_map(|field| {
             let key=self.key(item,field)?;let entry=self.entries.get(&key)?;
-            (entry.rehydrating && entry.opened && entry.loaded.is_none()).then_some([10,field_index(field)])
+            (entry.rehydrating && entry.opened && entry.loaded.is_none()).then_some(([10,field_index(field)],entry.part.epoch))
         }).collect()
     }
     pub(super) fn complete_for_find(&self,item:&str)->bool {
@@ -667,6 +672,7 @@ mod tests {
         runtime.snapshot=page.clone();sync(&mut runtime);
         let entry=&runtime.raw_original.entries[&Key::of(&part)];assert!(entry.opened && entry.attempt.is_some());
         assert_eq!(runtime.raw_original.pending_paths(&part.item_id),vec![[10,0]]);
+        assert_eq!(runtime.raw_original.pending_sources(&part.item_id),vec![([10,0],part.epoch)]);
         let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
         complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
         assert_eq!(runtime.raw_original.loaded_leaves(&part.item_id)[0].text.as_ref(),text);
