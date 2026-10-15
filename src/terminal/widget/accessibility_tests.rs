@@ -905,3 +905,41 @@ fn unmounted_owned_key_waits_for_review_exit_and_releases_only_the_original_atta
     assert!(!old.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
     assert!(!new.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })), "cleanup cannot retarget another attachment");
 }
+
+
+#[test]
+fn observed_window_return_admits_first_fresh_down_when_old_physical_up_was_outside_the_app() {
+    use crate::input_trace::{InputTrace, observe};
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    let peer = Peer::new();
+    let mut renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let trace = InputTrace::default();
+    trace.bind_terminal_keys(barrier.clone());
+    let terminal_id = Id::unique();
+    let mut terminal = widget(&peer, "return-pane", barrier, true, false);
+    terminal.id = Some(terminal_id.clone());
+    terminal.on_shortcut = None;
+    let mut ui = UserInterface::build(observe(terminal, &trace), Size::new(640.0, 320.0), Cache::new(), &mut renderer);
+    ui.operate(&renderer, &mut operation::focusable::focus::<()>(terminal_id));
+    let _ = ui.update(&[
+        raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()),
+        Event::Window(window::Event::Unfocused),
+    ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+    let requests = peer.fence();
+    let actions: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input.action) } else { None }).collect();
+    assert_eq!(actions, vec![KeyAction::Press, KeyAction::Release], "{requests:?}");
+    // A held repeat after reactivation must not manufacture a second raw down.
+    let mut repeat = raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty());
+    if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat { *repeat = true; }
+    let _ = ui.update(&[Event::Window(window::Event::Focused), repeat], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+    assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+    // No old up is delivered. This first actual new press must succeed.
+    let _ = ui.update(&[
+        raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()),
+        raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::empty()),
+    ], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+    let requests = peer.fence();
+    let actions: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some((input.key, input.action)) } else { None }).collect();
+    assert_eq!(actions, vec![(TerminalKey::Character('a'), KeyAction::Press), (TerminalKey::Character('a'), KeyAction::Release)], "{requests:?}");
+}

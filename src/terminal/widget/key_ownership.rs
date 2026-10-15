@@ -44,6 +44,11 @@ impl ReviewInputBarrier {
     pub(super) fn press(&self, physical: keyboard::key::Physical, surface: &TerminalSurface, input: KeyInput) -> Result<(), TerminalSendError> {
         let mut owned = self.1.lock().unwrap_or_else(|e| e.into_inner());
         owned.modifiers = input.modifiers;
+        // Window blur can hide the old physical up entirely. A genuine new
+        // down proves that hold ended; a repeat cannot establish a new cycle.
+        if input.action == KeyAction::Press {
+            owned.awaiting_up.retain(|key| *key != physical);
+        }
         if owned.native_review.is_some() || owned.awaiting_up.contains(&physical) { return Err(TerminalSendError::Full); }
         if let Some(key) = owned.keys.iter_mut().find(|key| key.physical == physical && !(key.failed && key.released)) {
             if key.orphaned || key.released || key.failed || !key.surface.same_attachment(surface) || surface.host_proof().as_ref() != Some(&key.proof) {
