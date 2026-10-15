@@ -849,7 +849,7 @@ mod tests {
         match stream.next().now_or_never().expect("recent copy is synchronous") {
             Some(iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { contents, target })) => {
                 assert_eq!(contents, expected);
-                assert_eq!(target, iced::runtime::clipboard::Kind::Standard);
+                assert_eq!(target, iced::advanced::clipboard::Kind::Standard);
             }
             _ => panic!("current recent output must produce its actual clipboard write"),
         }
