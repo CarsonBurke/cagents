@@ -242,6 +242,8 @@ pub(super) fn require(
 /// never launch or close authority; no client requirement is accepted here.
 /// A started native recipient may now be its proved console presentation. Keep
 /// the original stored target kind/tuple, rather than rebinding it to that view.
+/// A different-ID handoff must supply its independently authenticated ORIGINAL
+/// source for lookup; card identity alone never chooses a historical target.
 pub(super) fn retirement_requirement(
     tx: &rusqlite::Transaction<'_>,
     before: &crate::workspace_model::views::Pane,
@@ -263,6 +265,16 @@ pub(super) fn retirement_requirement(
         .is_some_and(|record| record.requirement.card != before.id)
     {
         return Err("The removed pane does not match its original directory-start obligation".into());
+    }
+    if by_session.is_none() && by_card.is_none() {
+        let started_card: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM created_start_requirements WHERE card_id=?1 AND phase='started')",
+            [before.id.to_string()],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if started_card {
+            return Err("Resolve the original directory-start target through its authenticated handoff receipt before retiring this replacement".into());
+        }
     }
     Ok(by_session.or(by_card).map(|record| record.requirement))
 }
@@ -695,6 +707,15 @@ mod tests {
             .unwrap();
         let stored = retirement_requirement(&tx, &console).unwrap().unwrap();
         assert_eq!(stored, native, "console view cannot rewrite the stored target");
+        let mut distinct_console = console.clone();
+        let CardKind::Terminal(session) = &mut distinct_console.kind else {
+            panic!()
+        };
+        session.id = TerminalId::new();
+        assert!(
+            retirement_requirement(&tx, &distinct_console).is_err(),
+            "different-ID native handoff cannot silently become ordinary; original receipt is required"
+        );
         let mut console_alias = console;
         console_alias.id = CardId::new();
         assert!(retirement_requirement(&tx, &console_alias).is_err());
