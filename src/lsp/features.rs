@@ -299,6 +299,9 @@ impl LspManager {
     }
 }
 
+struct ServerEditGuard {id:LspServerEditId,edits:Arc<ServerEdits>}
+impl Drop for ServerEditGuard {fn drop(&mut self){self.edits.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id);}}
+
 pub(super) fn apply_workspace_edit(state:&mut RouterState,params:lsp_types::ApplyWorkspaceEditParams)->impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::Error>>+Send+'static {
     let result=(||{
         if state.retired.load(Ordering::Acquire){return Err("language server retired".to_owned());}
@@ -309,14 +312,15 @@ pub(super) fn apply_workspace_edit(state:&mut RouterState,params:lsp_types::Appl
         {let mut pending=state.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner());if pending.len()>=64{return Err("too many pending workspace-edit previews".to_owned());}pending.insert(id,(doc,tx));}
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
     })();
-    let edits=Arc::clone(&state.server_edits);
+    let guard=result.as_ref().ok().map(|(id,_)|ServerEditGuard{id:*id,edits:Arc::clone(&state.server_edits)});
     async move {
+        let _guard=guard;
         let failure=|message|lsp_types::ApplyWorkspaceEditResponse{applied:false,failure_reason:Some(message),failed_change:None};
         Ok(match result {
             Err(message)=>failure(message),
-            Ok((id,rx))=>{
+            Ok((_id,rx))=>{
                 let response=match tokio::time::timeout(Duration::from_secs(120),rx).await {Ok(Ok(response))=>response,_=>failure("workspace-edit preview closed or timed out".into())};
-                edits.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id);response
+                response
             }
         })
     }
