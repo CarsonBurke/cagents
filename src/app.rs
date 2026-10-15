@@ -21573,7 +21573,10 @@ mod tests {
                 }
                 settle(&mut app, load).await;
             }
-            assert!(app.lsp_documents.is_empty(), "a read-only diff must not open an LSP document");
+            assert!(
+                app.lsp_documents.is_empty(),
+                "a read-only diff must not open an LSP document"
+            );
             let model = |app: &Cagents, card| {
                 match app.cards.get(&card).unwrap() {
                     CardRuntime::Repository(runtime) => runtime.current_diff_model_snapshot(),
@@ -21590,7 +21593,10 @@ mod tests {
             app.settings_reset_confirm = true;
             let reset = app.update(Message::ConfirmResetSettings);
             settle(&mut app, reset).await;
-            assert!(app.lsp_documents.is_empty(), "reset must not introduce an editor-open intent");
+            assert!(
+                app.lsp_documents.is_empty(),
+                "reset must not introduce an editor-open intent"
+            );
             for card in [repository, pr] {
                 let ready = model(&app, card);
                 assert_eq!(ready.syntax_theme(), settings::EditorSyntaxTheme::Auto);
