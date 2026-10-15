@@ -134,15 +134,21 @@ mod tests {
         old: PathBuf,
         moved: PathBuf,
         calls: Arc<Mutex<Vec<PathBuf>>>,
+        original_context: Option<Arc<chat::protocol::ExecutionContext>>,
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = self.handle.close(); } }
-    fn fixture(pinned: bool) -> Fixture {
+    fn fixture(context_mode: u8) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let old = directory.path().join("original"); std::fs::create_dir(&old).unwrap();
         let moved = directory.path().join("located");
         let proof = HostSessionProof { host_session_id: HostSessionId::new("session-location-test"), boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: HostIncarnation::new("original") };
         let source = chat::Session { id: TerminalId::new(), launch: chat::Launch { provider: Provider::Omp, recipe: LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new(), unset_environment: Default::default() }, session_id: None }, proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
-        let context = pinned.then(|| Arc::new(chat::protocol::ExecutionContext::capture(&old).unwrap()));
+        let context = match context_mode {
+            0 => Some(Arc::new(chat::protocol::ExecutionContext::capture(&old).unwrap())),
+            1 => None,
+            _ => Some(Arc::new(chat::protocol::ExecutionContext::new(None))),
+        };
+        let original_context = context.clone();
         let identity = context.as_ref().and_then(|context| context.directory_identity().unwrap());
         let spec = ProcessSpec { execution: context, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
         let mut initial = Step { events: vec![chat::Event::Ready(true)], ..Default::default() };
@@ -156,7 +162,7 @@ mod tests {
         let mut state = HostState::new(proof);
         state.install_model(registry);
         state.chats.insert(source.id, Record { execution_instance: uuid::Uuid::new_v4(), console_recipe: None, paired_terminal: None, session: source.clone(), handle: handle.clone(), source_process: None, subscribers: BTreeMap::new(), observations: BTreeMap::new(), completion_observed: false, returning_terminal: false });
-        Fixture { _directory: directory, host: Arc::new(HostLock::new(state)), handle, source, old, moved, calls }
+        Fixture { _directory: directory, host: Arc::new(HostLock::new(state)), handle, source, old, moved, calls, original_context }
     }
     fn locate(fixture: &Fixture) -> WorkspaceModel {
         let request = ClientRequest::EditWorkspaceModel { edit: ModelEdit::RelocateProject { relocation: Relocation { repository: fixture.old.clone(), destination: fixture.moved.clone(), old_root: fixture.old.clone(), new_root: fixture.moved.clone() } } };
@@ -166,8 +172,8 @@ mod tests {
 
     #[test]
     fn locate_keeps_fresh_and_legacy_owned_native_processes_and_immutable_recipes() {
-        for pinned in [true, false] {
-            let fixture = fixture(pinned);
+        for context_mode in [0, 1, 2] {
+            let fixture = fixture(context_mode);
             let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&fixture.old).unwrap());
             std::fs::rename(&fixture.old, &fixture.moved).unwrap();
             std::fs::create_dir(&fixture.old).unwrap();
@@ -183,6 +189,9 @@ mod tests {
             let saved = registry.lock().unwrap().session_location(&HostedSession::Chat(fixture.source.clone())).unwrap().unwrap();
             assert_eq!(saved.directory, fixture.moved);
             assert_eq!(saved.approved, Some(identity));
+            if let Some(original_context) = &fixture.original_context {
+                assert_eq!(original_context.directory_identity().unwrap(), Some(identity), "legacy empty shared context gains a pin without losing its launch owner");
+            }
             fixture.handle.command_for_run(crate::model::RunId::new(), chat::Command::Prompt { text: "follow-up after Locate".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
             assert_eq!(*fixture.calls.lock().unwrap(), vec![fixture.moved.clone()]);
             assert!(fixture.old.is_dir());
@@ -191,7 +200,7 @@ mod tests {
 
     #[test]
     fn locate_replacement_folder_retains_provider_and_returns_actionable_refusal() {
-        let fixture = fixture(true);
+        let fixture = fixture(0);
         let retained = fixture._directory.path().join("actual-provider-folder");
         std::fs::rename(&fixture.old, &retained).unwrap();
         std::fs::create_dir(&fixture.old).unwrap();

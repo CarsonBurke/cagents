@@ -94,6 +94,7 @@ struct LaunchOwnership {
 #[derive(Default)]
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
+    owned_directory: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
 }
@@ -137,7 +138,7 @@ impl ExecutionContext {
     pub(crate) fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
-        match &self.directory {
+        match self.directory_descriptor() {
             Some(directory) => directory
                 .metadata()
                 .map(|metadata| {
@@ -148,6 +149,24 @@ impl ExecutionContext {
                 .map_err(|error| error.to_string()),
             None => Ok(self.expected_directory),
         }
+    }
+    pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.directory.clone().or_else(|| self.owned_directory.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+    /// Only positive owned-process cwd evidence may add a legacy pin. Keep
+    /// this same shared context so its launch cleanup/ownership stays intact.
+    pub(crate) fn pin_owned_directory(&self, directory: std::sync::Arc<std::fs::File>) -> Result<(), String> {
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata().map_err(|error| error.to_string())?);
+        if self.directory_identity()?.is_some_and(|approved| approved != identity) {
+            return Err("The owned process directory differs from its approved launch identity".into());
+        }
+        let mut pinned = self.owned_directory.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = pinned.as_ref()
+            && crate::agent_execution::DirectoryIdentity::from_metadata(&previous.metadata().map_err(|error| error.to_string())?) != identity {
+            return Err("The approved process directory changed during capture".into());
+        }
+        *pinned = Some(directory);
+        Ok(())
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
