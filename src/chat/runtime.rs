@@ -3344,6 +3344,54 @@ mod tests {
         context
     }
     #[test]
+    fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
+        struct Stalled {
+            entered:crossbeam_channel::Sender<()>, release:crossbeam_channel::Receiver<()>,
+            prompts:Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Adapter for Stalled {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                match command {
+                    Command::SetFastMode {..}=> {
+                        self.entered.send(()).unwrap();self.release.recv().unwrap();
+                        // Two individually legal frames exceed normal outbound
+                        // backpressure while the real provider never reads stdin.
+                        let frame=serde_json::Value::String("x".repeat(17*1024*1024));
+                        Ok(Step {writes:vec![frame.clone(),frame],..Default::default()})
+                    }
+                    Command::Prompt {..}=> {self.prompts.fetch_add(1,Ordering::AcqRel);Ok(Step::default())},
+                    _=>Err("Unexpected stalled fixture command".into()),
+                }
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sleep".into(),arguments:vec!["600".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let (entered,waiting)=crossbeam_channel::bounded(1);let (release,resume)=crossbeam_channel::bounded(1);
+        let prompts=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Stalled {entered,release:resume,prompts:prompts.clone()}),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        let command=handle.enqueue_command(Command::SetFastMode {enabled:true}).unwrap();
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..64 {
+            let (reply,_)=crossbeam_channel::bounded(1);
+            handle.0.commands.try_send((ActorCommand::Provider {run:None,command:Command::Prompt {text:"queued work".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}},reply)).unwrap();
+        }
+        assert!(handle.0.commands.is_full());
+        let stopping=handle.clone();let actor=handle.close_observation().actor_id;
+        let stop=thread::spawn(move||stopping.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(15)));
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while handle.0.session_stop.lock().unwrap().is_none() {assert!(Instant::now()<deadline);thread::yield_now();}
+        release.send(()).unwrap();
+        command.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        stop.join().unwrap().unwrap();
+        assert_eq!(prompts.load(Ordering::Acquire),0,"whole-session stop must preempt every queued authorizing command");
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
     fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
