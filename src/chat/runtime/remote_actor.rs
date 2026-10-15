@@ -3698,6 +3698,92 @@ done"#;
         assert!(validate_pair(&source, Some(&source.launch.recipe), None, None).is_err());
     }
     #[test]
+    fn real_proxy_poll_forwards_newer_idle_generation_without_history_rpc() {
+        const CHILD: &str = "CAGENTS_IDLE_PROXY_EDGE_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear().env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .env("PATH", "/usr/bin:/bin").output().unwrap();
+            assert!(output.status.success(), "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let fixture = RemoteActor::fixture();
+        let mut identity = fixture.identity();
+        identity.record.boot = crate::daemon::read_boot_id().unwrap();
+        let mut proof = fixture.0.proof.clone();
+        proof.boot_id = identity.record.boot.clone();
+        let before = fixture.state().as_ref().clone();
+        assert_eq!(before.activity, crate::agent::ActivityState::Idle);
+        let mut after = before.clone();
+        after.generation += 1;
+        after.changed += 1;
+        let directory = registry::directory(Kind::Native).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = registry::socket(&directory, identity.record.terminal);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let expected_proof = proof.clone();
+        let expected_after = before.changed;
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let request: Invocation = receive(&stream, Duration::from_secs(1)).unwrap();
+                        assert_eq!(request.proof, expected_proof);
+                        assert_eq!(request.method, "state", "proxy requested transcript/history instead of resident metadata");
+                        let seen: (u64,) = serde_json::from_value(request.args).unwrap();
+                        let reply = if seen.0 == expected_after { Some(after.clone()) } else { None };
+                        send(&stream, &Ok::<_, String>(reply), Duration::from_secs(1)).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("private proxy endpoint: {error}"),
+                }
+            }
+        });
+        let mut source = chat::native_holder::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        let attached = Attached {
+            protocol: PROTOCOL, identity, epoch: uuid::Uuid::new_v4(), resident: before,
+            source, launch_account_scope: Err("private metadata-only fixture".into()),
+            execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),
+            recovery_environment: Default::default(),
+        };
+        let (send_update, receive_update) = crossbeam_channel::unbounded();
+        let actor = RemoteActor::from_attached(attached, proof, None, move |update| {
+            let _ = send_update.send(update);
+        }).unwrap();
+        let generation = loop {
+            if let Update::Activity { state, generation, .. } = receive_update.recv_timeout(Duration::from_secs(3)).unwrap() {
+                assert_eq!(state, crate::agent::ActivityState::Idle);
+                break generation;
+            }
+        };
+        assert_eq!(generation, 2);
+        assert_eq!(actor.state().generation, 2);
+        actor.0.stop.store(true, Ordering::Release);
+        actor.0.worker.lock().unwrap().take().unwrap().join().unwrap();
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
     fn attachment_metadata_and_observation_are_local_and_body_free() {
         let actor = RemoteActor::fixture();
         actor.set_visible(false);
