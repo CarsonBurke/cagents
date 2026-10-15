@@ -412,19 +412,37 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
         for file in &page.files {
             let index=file.file_index;let open=entry.opened.contains(&index) || runtime.find.as_ref().is_some_and(|query|!query.is_empty());
             let label=step::path_label(&file.path,&runtime.session.launch.recipe.working_directory);
+            let Ok(logical_index)=u32::try_from(index) else {rows.push(design::caption("The file index exceeds the selectable document range.").into());continue;};
+            let painted=runtime.snapshot.items.iter().chain(runtime.snapshot.subagents.iter().flat_map(|agent|agent.items.iter()))
+                .find(|current|current.id==item).and_then(|item|runtime.find_paint_for(item));
+            let logical=|path:&[u32]|selectable_prose::Logical {identity:selection::logical_identity(item,path),start:0,paint:painted.clone()};
             let title=widget::row::with_children(vec![
-                widget::icon(Icon::handle(if open {Icon::PanDown}else {Icon::PanEnd})).size(design::COMPACT_ICON_SIZE).into(),
-                design::body(label.display).font(iced::Font::MONOSPACE).width(Length::Fill).into(),
+                widget::button::custom(widget::icon(Icon::handle(if open {Icon::PanDown}else {Icon::PanEnd})).size(design::COMPACT_ICON_SIZE))
+                    .name(if open {"Collapse changed file"} else {"Expand changed file"})
+                    .on_press(action(Action::ToggleChangeFile(target,item.into(),index))).into(),
+                if runtime.changes_find.metadata_ready(item,entry.part.epoch) {
+                    crate::interaction::tooltip(selectable_prose::logical_text(vec![iced::widget::text::Span::new(label.display)].into(),
+                        design::TEXT_BODY.into(),iced::Font::MONOSPACE,target,None,logical(&[7,logical_index,0])),label.absolute)
+                } else {crate::interaction::tooltip(design::body(label.display),label.absolute)},
                 design::caption(format!("+{} −{}",file.additions.map_or("?".into(),|value|value.to_string()),file.deletions.map_or("?".into(),|value|value.to_string()))).into(),
             ]).spacing(step::GAP_S).align_y(Alignment::Center);
-            rows.push(crate::interaction::tooltip(widget::button::custom(title).width(Length::Fill)
-                .on_press(action(Action::ToggleChangeFile(target,item.into(),index))),label.absolute));
+            rows.push(title.into());
+            if let chat::ChangeKind::Renamed {from}=&file.kind {
+                let from=step::path_label(from,&runtime.session.launch.recipe.working_directory);
+                rows.push(if runtime.changes_find.metadata_ready(item,entry.part.epoch) {
+                    crate::interaction::tooltip(selectable_prose::logical_text(vec![iced::widget::text::Span::new(from.display)].into(),
+                        design::TEXT_CAPTION.into(),iced::Font::MONOSPACE,target,None,logical(&[7,logical_index,1])),from.absolute)
+                } else {crate::interaction::tooltip(design::caption(from.display),from.absolute)});
+            }
             if !open {continue;}
             if let Some(patch)=entry.current(index) {
                 rows.push(widget::row::with_children(vec![design::caption("Patch").width(Length::Fill).into(),
                     widget::button::text("Copy patch").on_press(action(Action::CopyChangePatch(target,item.into(),index))).into()])
                     .spacing(step::GAP_S).into());
-                rows.push(patch.view.view_from_start(runtime.syntax_theme,320.0,target,runtime.find.as_deref()));
+                if runtime.changes_find.represents(item,index,&patch.text,entry.part.epoch) {
+                    rows.push(patch.view.view_logical_with_reader(runtime.syntax_theme,Some((320.0,false)),target,None,
+                        logical(&[6,logical_index]),runtime.scroll_memory.clone(),runtime.selected_subagent.clone()));
+                } else {rows.push(design::caption("Preparing complete patch selection…").into());}
             } else if let Some(error)=entry.patch_errors.get(&index) {
                 rows.push(widget::row::with_children(vec![design::caption(error.clone()).width(Length::Fill).into(),
                     widget::button::text("Retry patch").on_press(action(Action::RetryChangeSource(target,item.into(),Some(index)))).into()])
@@ -436,6 +454,7 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
         }
         if page.omitted_files>0 {rows.push(design::caption(format!("{} original files are unavailable; this file list is incomplete.",page.omitted_files)).into());}
     }
+    if let Some(notice)=changes_find::notice(runtime) {rows.push(notice);}
     Some(widget::column::with_children(rows).spacing(step::GAP_S).width(Length::Fill).into())
 }
 
@@ -479,6 +498,7 @@ pub(super) fn complete_copy(runtime:&mut Runtime,item:&str,epoch:chat::cache::So
             runtime.copied=Some((item.into(),Instant::now()));
             let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
             runtime.logical_changes.reconcile_demand(&runtime.expanded,find);
+            changes_find::sync(runtime);
             return iced::clipboard::write(output.text).map(cosmic::Action::App);
         },
         Err(error)=>if let Some(key)=runtime.logical_changes.aliases.get(item)

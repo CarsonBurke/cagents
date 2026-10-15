@@ -24,6 +24,7 @@ mod fold;
 mod hover;
 mod hydration;
 mod changes_sources;
+mod changes_find;
 mod reader_source;
 mod images;
 mod layout;
@@ -179,6 +180,7 @@ pub enum Action {
     RetryChangeSource(Target,String,Option<usize>),
     CopyChangePatch(Target,String,usize),
     CopyAllChangePatches(Target,String),
+    ChangesFindReady(Target,u64,changes_find::Ready),
     CompleteChangeCopy(Target,String,chat::cache::SourceEpoch,u64,Result<changes_sources::CopyReady,String>),
 
     UpdatesAcknowledged(Target, Result<(), String>),
@@ -344,6 +346,7 @@ impl Action {
                 | Self::ChangesManifestReady(..)
                 | Self::ChangePatchReady(..)
                 | Self::CompleteChangeCopy(..)
+                | Self::ChangesFindReady(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -1517,6 +1520,7 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     logical_sources: hydration::State,
     logical_changes: changes_sources::State,
+    changes_find: changes_find::State,
     source_clock: Option<chat::client::SourceClock>,
     /// Tiny interaction metadata survives transcript window/cache eviction.
     turn_started_at: Option<u64>,
@@ -2093,6 +2097,7 @@ impl Runtime {
             }),
             logical_sources: hydration::State::default(),
             logical_changes: changes_sources::State::default(),
+            changes_find: changes_find::State::default(),
             source_clock: None,
             turn_started_at: None,
             turn_prompt_id: None,
@@ -2172,7 +2177,7 @@ impl Runtime {
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.logical_sources.clear();
-        self.logical_changes.clear();
+        self.logical_changes.clear();self.changes_find.clear();self.set_find_external(HashMap::new(),false);
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2600,6 +2605,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        changes_find::sync(self);
         images::sync(self);
         self.refresh_find();
     }
@@ -2632,6 +2638,8 @@ impl Runtime {
     }
 
     fn refresh_find(&mut self) {
+        self.logical_changes.reconcile_demand(&self.expanded,self.find.as_ref().is_some_and(|query|!query.is_empty()));
+        changes_find::sync(self);
         let previous = self.find_matches.get(self.find_index).cloned();
         let query = self.find.as_deref().unwrap_or_default();
         self.find_matches = self
@@ -2687,7 +2695,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
-        if !visible {self.logical_changes.clear();hydration::release(self);}
+        if !visible {self.logical_changes.clear();self.changes_find.clear();self.set_find_external(HashMap::new(),false);hydration::release(self);}
         images::sync(self);
         self.present()
     }
@@ -4637,6 +4645,7 @@ impl Cagents {
                 subscriptions.extend(images::subscriptions(runtime));
                 subscriptions.extend(hydration::subscriptions(runtime));
                 subscriptions.extend(changes_sources::subscriptions(runtime));
+                subscriptions.extend(changes_find::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6316,7 +6325,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
                             runtime.logical_sources.clear();
-                            runtime.logical_changes.clear();
+                            runtime.logical_changes.clear();runtime.changes_find.clear();runtime.set_find_external(HashMap::new(),false);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -7815,6 +7824,9 @@ impl Cagents {
                     runtime.thumbnails.complete(&path, loaded);
                 }
             }
+            Action::ChangesFindReady(target,id,ready)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_find::complete(runtime,id,ready);}
+            }
             Action::ChangesManifestReady(target,key,offset,attempt,result)=>{
                 if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::manifest_ready(runtime,&key,offset,attempt,result);return changes_sources::copy_task(runtime,None);}
             }
@@ -7822,13 +7834,13 @@ impl Cagents {
                 if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::patch_ready(runtime,&key,index,attempt,result);return changes_sources::copy_task(runtime,None);}
             }
             Action::ToggleChangeFile(target,item,index)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.toggle_file(&item,index);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.toggle_file(&item,index);changes_find::sync(runtime);}
             }
             Action::LoadChangePage(target,item,offset)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.page(&item,offset);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.page(&item,offset);changes_find::sync(runtime);}
             }
             Action::RetryChangeSource(target,item,index)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.retry(&item,index);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.retry(&item,index);changes_find::sync(runtime);}
             }
             Action::CopyChangePatch(target,item,index)=>{
                 if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index)));}
