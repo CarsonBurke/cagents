@@ -35,7 +35,7 @@ impl Language {
 pub(super) struct ToolText {
     key: u64,
     reader_source: reader_source::Source,
-    flow_cache: flow_layout::Cache,
+    pub(super) flow_cache: flow_layout::Cache,
     language: Language,
     pub(super) text: Arc<str>,
     syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,

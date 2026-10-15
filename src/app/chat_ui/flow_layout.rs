@@ -24,8 +24,18 @@ struct Entries {
 }
 pub(super) type Handle = Rc<RefCell<Entry>>;
 
+thread_local! {
+    // Weak UI-thread handles let temporary approval/readers receive results
+    // without retaining parked paragraphs or requiring a CachedItem owner.
+    static REQUESTS: RefCell<HashMap<u64,std::rc::Weak<RefCell<Entry>>>> = RefCell::default();
+}
+pub(super) fn find(target: Target, request: &Request) -> Option<Handle> {
+    REQUESTS.with(|requests|requests.borrow().get(&request.id).and_then(std::rc::Weak::upgrade))
+        .filter(|entry|entry.borrow().target == Some(target) && entry.borrow().accepts(request))
+}
 pub(super) struct Entry {
     id: u64,
+    target: Option<Target>,
     source: Source,
     source_revision: u64,
     source_len: usize,
@@ -75,7 +85,10 @@ impl Source {
     fn presentation_changed(&self, previous: &Self) -> bool {
         match (self, previous) {
             (Self::Code {range,spans,..}, Self::Code {range:old,spans:old_spans,..}) =>
-                range.end != old.end || (!spans.is_empty() || !old_spans.is_empty()) && !Arc::ptr_eq(spans,old_spans),
+                range.end != old.end || (!Arc::ptr_eq(spans,old_spans) &&
+                    (spans.len()!=old_spans.len() || !spans.iter().zip(old_spans.iter()).all(|(a,b)|a==b &&
+                        a.link==b.link && a.highlight==b.highlight && a.padding==b.padding &&
+                        a.underline==b.underline && a.strikethrough==b.strikethrough))),
             _ => self.len() != previous.len(),
         }
     }
@@ -124,7 +137,7 @@ impl Cache {
         }
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let source_len = source.len();
-        let entry = Rc::new(RefCell::new(Entry { id: NEXT.fetch_add(1, Ordering::Relaxed), source,
+        let entry = Rc::new(RefCell::new(Entry { id: NEXT.fetch_add(1, Ordering::Relaxed), target: None, source,
             source_len, source_revision: 0, ready_revision: None,
             key: None, attempt: 0, requested: false, deferred: None, failed: false, ready: None,
             cancelled: Arc::new(AtomicBool::new(false)) }));
@@ -140,6 +153,11 @@ impl Cache {
             entries.requests.remove(&previous.id);
         }
         entries.requests.insert(entry.borrow().id, Rc::downgrade(&entry));
+        REQUESTS.with(|requests| {
+            let mut requests=requests.borrow_mut();
+            if requests.len() >= 256 {requests.retain(|_,entry|entry.strong_count()!=0);}
+            requests.insert(entry.borrow().id,Rc::downgrade(&entry));
+        });
         entry
     }
     pub(super) fn find(&self, id: u64) -> Option<Handle> {
@@ -166,6 +184,24 @@ impl Cache {
 }
 
 impl Entry {
+    pub(super) fn bind_target(&mut self, target: Target) {
+        if self.target.is_some_and(|previous|previous != target) {
+            self.attempt=self.attempt.wrapping_add(1);self.ready=None;self.ready_revision=None;
+            self.requested=false;self.failed=false;self.deferred=None;
+            self.cancelled.store(true,Ordering::Release);self.cancelled=Arc::new(AtomicBool::new(false));
+        }
+        self.target=Some(target);
+    }
+    /// A temporary view may recreate its cache while its widget tree still
+    /// owns the prior paragraph. Adopt only compatible source state.
+    pub(super) fn adopt(&mut self, current: &Entry) -> bool {
+        if self.cancelled.load(Ordering::Acquire) || !current.source.extends(&self.source) {return false;}
+        if current.source.presentation_changed(&self.source) {
+            self.source_revision=self.source_revision.wrapping_add(1);
+            self.source_len=current.source_len;self.failed=false;
+        }
+        self.source=current.source.clone();true
+    }
     pub(super) fn configure(&mut self, width: f32, size: iced::Pixels, font: iced::Font) {
         let width = if self.source.unwrapped() && !width.is_finite() { design::READABLE_MEASURE } else { width };
         let key = Key { width, size, font, unwrapped: self.source.unwrapped(), version: graphics_text::font_system().read().expect("font system").version() };
@@ -195,10 +231,10 @@ impl Entry {
         if self.ready_revision == Some(self.source_revision) || self.requested || self.failed || self.deferred == Some(COMPLETED.load(Ordering::Acquire)) || !key.width.is_finite() || key.width <= 0.0 { return None; }
         self.requested = true;
         self.deferred = None;
-        Some(Request { id: self.id, attempt: self.attempt, key, source: self.source.clone(), source_revision: self.source_revision, cancelled: self.cancelled.clone() })
+        Some(Request { id: self.id, target: self.target, attempt: self.attempt, key, source: self.source.clone(), source_revision: self.source_revision, cancelled: self.cancelled.clone() })
     }
     pub(super) fn accepts(&self, request: &Request) -> bool {
-        self.id == request.id && self.attempt == request.attempt && self.key == Some(request.key)
+        self.id == request.id && self.target == request.target && self.attempt == request.attempt && self.key == Some(request.key)
             && request.source_revision <= self.source_revision && !request.cancelled.load(Ordering::Acquire)
     }
     pub(super) fn defer(&mut self, request: &Request, epoch: u64) {
@@ -230,6 +266,7 @@ impl Entry {
 #[derive(Clone)]
 pub(super) struct Request {
     pub(super) id: u64,
+    target: Option<Target>,
     attempt: u64,
     key: Key,
     source: Source,
