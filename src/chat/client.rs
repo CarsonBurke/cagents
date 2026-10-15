@@ -613,6 +613,15 @@ impl ClientHandle {
         Self::fixture_account_home(session, snapshot, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_stream(
+        stream: UnixStream,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(stream, session, Intent::Start, None, false, None, None, wake)
+    }
+
     /// Models trusted attachment metadata before binding any cached reader.
     /// It conveys association only, never provider read authority.
     #[cfg(test)]
@@ -1558,13 +1567,19 @@ impl ClientHandle {
     /// generation never authorizes stopping, switching or writing a provider.
     /// Borrow only control metadata, without retaining/hydrating transcript.
     pub(crate) fn account_switch_idle_observation(&self) -> Option<u64> {
-        let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-        ((snapshot.ready || snapshot.exited)
-            && !snapshot.busy
-            && !snapshot.waiting
-            && snapshot.requests.is_empty()
-            && snapshot.queued_messages.is_empty())
-            .then_some(snapshot.generation)
+        let (generation, idle) = {
+            let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            (snapshot.generation, (snapshot.ready || snapshot.exited)
+                && !snapshot.busy && !snapshot.waiting
+                && snapshot.requests.is_empty() && snapshot.queued_messages.is_empty())
+        };
+        // Hidden subscriptions receive activity metadata without a new body
+        // publication. Do not consume its pending edge or hydrate snapshot.
+        let activity = self.inner.activity.lock().unwrap_or_else(|p| p.into_inner());
+        if activity.generation >= generation && activity.state != ActivityState::Unknown {
+            return (activity.state == ActivityState::Idle).then_some(activity.generation);
+        }
+        idle.then_some(generation)
     }
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
         let snapshot = self
