@@ -14633,6 +14633,12 @@ mod worktree_journal_tests {
             assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated metadata\n");
             assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1,
                 "no destination command may rediscover or modify substituted metadata");
+            if alteration == "admin" {
+                let locator = fs::read(fixture.request.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                assert_eq!(fs::read(admin.join("foreign")).unwrap(), b"foreign admin\n");
+                assert_eq!(fs::read_dir(admin).unwrap().count(), 1);
+            }
             let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
             assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown, "{alteration}");
         }
