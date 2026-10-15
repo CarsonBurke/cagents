@@ -26,6 +26,28 @@ impl OwnedChildren {
         self.child.as_ref().expect("owned provider").id() as i32
     }
 
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+
+    pub(crate) fn exit_status(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(child) = &self.child else { return Ok(None); };
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::waitid(libc::P_PID, child.id(), &mut status, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { status.si_pid() } == 0 { return Ok(None); }
+        let code = unsafe { status.si_status() };
+        let raw = match status.si_code {
+            libc::CLD_EXITED => code << 8,
+            libc::CLD_KILLED => code,
+            libc::CLD_DUMPED => code | 0x80,
+            _ => return Err(io::Error::other("Unexpected owned provider exit status")),
+        };
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    }
+
     pub(crate) fn exited(&self) -> bool {
         let Some(child) = &self.child else {
             return true;
