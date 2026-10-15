@@ -984,13 +984,14 @@ mod tests {
         assert_eq!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) }, count);
         let alternate = groups.into_iter().find(|gid| *gid != primary)
             .or_else(|| (uid == 0).then_some(if primary == 23_456 { 23_457 } else { 23_456 }));
-        if let Some(gid) = alternate {
-            fs_safety::restore_ownership(&original, uid, gid).unwrap();
-        } else {
-            // No secondary group is available in this runner. Exercise a real
-            // post-fchown verification refusal instead; report this branch,
-            // never a cross-GID restoration pass.
-            eprintln!("NO_SECONDARY_GID: testing unavailable ownership refusal, not cross-GID restoration");
+        // Root UID is not proof of CAP_CHOWN (e.g. a user namespace or a
+        // capability-dropped runner). Require the actual positive native step.
+        let alternate = alternate.filter(|gid| fs_safety::restore_ownership(&original, uid, *gid).is_ok());
+        if alternate.is_none() {
+            // No restorable secondary group is available in this runner.
+            // Exercise actual post-fchown verification refusal instead and
+            // never report this branch as cross-GID restoration coverage.
+            eprintln!("NO_RESTORABLE_SECONDARY_GID: testing unavailable ownership refusal, not cross-GID restoration");
         }
         let mut access = SavedFileAccess::capture(&original).unwrap();
         let file = holding.create_private_blob().unwrap();
