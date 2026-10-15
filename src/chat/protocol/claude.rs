@@ -453,7 +453,9 @@ impl Claude {
             self.control_deadlines.remove(&id);
             if let Some(request) = self.controls.remove(&id) {
                 if string(&request, "subtype") == "interrupt" {
-                    self.interruption = None;
+                    if request["_cagents_turn"].as_u64() == Some(self.attention_generation) {
+                        self.interruption = None;
+                    }
                     if let Some(generation) = request["_cagents_turn"].as_u64()
                         && let Some((key, outcome, run)) =
                             self.deferred_attention.remove(&generation)
@@ -5659,6 +5661,29 @@ mod tests {
             Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Cancelled } if key=="claude:old-before-reset")));
         assert!(!acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
         assert!(adapter.deferred_attention.is_empty());
+    }
+
+    #[test]
+    fn expired_old_interrupt_keeps_the_current_turn_interrupt_pending() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
+        let mut started = Step::default();
+        adapter.start_turn(&mut started);
+        adapter.busy = true;
+        let current = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
+        let now = std::time::Instant::now();
+        adapter.control_deadlines.insert(old, now - std::time::Duration::from_secs(1));
+        adapter.control_deadlines.insert(current.clone(), now + std::time::Duration::from_secs(60));
+        assert_eq!(adapter.interruption, Some(false));
+        let expired = adapter.expire_controls(now);
+        assert!(expired.events.iter().any(|event| matches!(event, Event::PastTurnFinished { key: Some(key), .. } if key == "claude:A")));
+        assert_eq!(adapter.interruption, Some(false), "old A expiry cannot clear B's pending interrupt");
+        let waiting = adapter.receive(json!({"type":"result","uuid":"B","subtype":"success","is_error":false})).unwrap();
+        assert!(!waiting.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        let acknowledged = adapter.receive(reply(&current, json!({}))).unwrap();
+        assert!(acknowledged.events.iter().any(|event| matches!(event,
+            Event::TurnFinished { key: Some(key), outcome: crate::notifications::Kind::Cancelled } if key == "claude:B")));
     }
 
     #[test]
