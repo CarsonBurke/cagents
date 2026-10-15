@@ -157,7 +157,7 @@ fn apply_reports(
         let entry = entries.entry(key.clone()).or_insert_with(|| Entry {
             identity: None,
             snapshot: UsageSnapshot::state(
-                UsageStatus::Unsupported,
+                UsageStatus::Unavailable,
                 "Awaiting account verification",
                 0,
             ),
