@@ -3135,11 +3135,11 @@ pub(super) fn process(
     // authoritative even if a stale client still presents live controls.
     let sessions = executable_automation_sessions(&request);
     if !sessions.is_empty() {
-        let registry = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execution_registry
-            .clone();
+        // This read must precede any preparation that replaces a saved native
+        // ID/proof. An unavailable managed store cannot turn a closed scheduled
+        // source into an unmarked, apparently new resumable conversation.
+        // Truly unmanaged diagnostic hosts still have no registry to consult.
+        let registry = super::session_locations::observer_registry(host).map_err(unavailable)?;
         if let Some(registry) = registry {
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             for id in sessions {
@@ -4836,6 +4836,110 @@ mod tests {
                 && state.execution_inventory_count_for_test() == 0
                 && state.terminals.is_empty()
         );
+    }
+
+    fn prior_boot_unmarked_resume_source(directory: &std::path::Path) -> Session {
+        Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Omp,
+                recipe: LaunchRecipe {
+                    program: "/must-never-be-spawned-resume-preflight".into(),
+                    arguments: vec![], working_directory: directory.into(),
+                    environment: Default::default(), unset_environment: Default::default(),
+                },
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(HostSessionProof {
+                host_session_id: HostSessionId::new("previous-resume-host"),
+                boot_id: BootId::new("previous-resume-boot"),
+                host_incarnation: HostIncarnation::new("previous-resume-instance"),
+            }),
+            terminal: None, owned_codex_listener: None,
+            native_continuity: Default::default(), archive_report: None,
+        }
+    }
+
+    #[test]
+    fn managed_registry_unavailability_refuses_unmarked_saved_resume_before_fresh_identity() {
+        let directory=tempfile::tempdir().unwrap();
+        let source=prior_boot_unmarked_resume_source(directory.path());
+        assert!(source.has_valid_native_continuity());
+        assert!(source.archive_report.is_none());
+        for unavailable_phase in 0..3 {
+            let host=super::super::service::test_host();
+            {
+                let mut state=host.lock().unwrap();
+                match unavailable_phase {
+                    0=>state.expect_model(),
+                    1=>state.model_open_failed(),
+                    _=>{
+                        state.install_model(super::super::model::Registry::at(&directory.path().join("missing-execution.sqlite3")).unwrap());
+                        assert!(state.execution_registry.take().is_some());
+                    }
+                }
+            }
+            let failure=process(&host,1,ClientRequest::ChatPrepareResume{source:source.clone()}).unwrap_err();
+            assert!(failure.message.contains("metadata storage is unavailable"),"{failure:?}");
+            let mut state=host.lock().unwrap();
+            assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty());
+            assert_eq!(state.execution_inventory_count_for_test(),0);
+        }
+    }
+
+    #[test]
+    fn closed_automation_without_report_marker_refuses_resume_after_execution_store_recovers() {
+        use crate::agent_execution::{Destination,HostedSession,Origin,Spec,State,Submit,Surface,Target,Update};
+        let directory=tempfile::tempdir().unwrap();
+        let source=prior_boot_unmarked_resume_source(directory.path());
+        let mut registry=super::super::model::Registry::at(&directory.path().join("closed-automation.sqlite3")).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::OpenProject{
+            repository:directory.path().into(), checkout:None, primary_checkout:None,
+            name:"Saved scheduled source".into(), kind:crate::model::ProjectKind::Folder,
+        }).unwrap();
+        let origin=Origin::Automation{id:uuid::Uuid::new_v4()};
+        let accepted=registry.submit_agent(&origin,&Submit {
+            name:None,destination:Destination::New(Spec {
+                provider:source.launch.provider,account:None,
+                target:Target{repository:directory.path().into(),directory:directory.path().into(),placement:None},
+                surface:Surface::Chat,model:None,permission_mode:None,reasoning_effort:None,
+            }),prompt:"Never submit this provider prompt".into(),idempotency_key:"resume-preflight".into(),
+        },1).unwrap();
+        registry.bind_agent(accepted.agent.id,None,HostedSession::Chat(source.clone())).unwrap();
+        let started=registry.update_agent_run(accepted.run.id,accepted.run.revision,Update::Started{provider_key:"saved-turn".into()},2).unwrap();
+        registry.update_agent_run(accepted.run.id,started.revision,Update::Finished{state:State::Succeeded,result:Default::default()},3).unwrap();
+        registry.close_agent(&origin,accepted.agent.id).unwrap();
+        assert!(registry.is_archived_automation_session(source.id).unwrap(),"closed authority survives without a report marker or snapshot");
+        let host=super::super::service::test_host();
+        let connection={let mut state=host.lock().unwrap();state.install_model(registry);state.execution_registry.take().unwrap()};
+        let unavailable=process(&host,1,ClientRequest::ChatPrepareResume{source:source.clone()}).unwrap_err();
+        assert!(unavailable.message.contains("metadata storage is unavailable"),"{unavailable:?}");
+        host.lock().unwrap().execution_registry=Some(connection.clone());
+        let refused=process(&host,1,ClientRequest::ChatPrepareResume{source:source.clone()}).unwrap_err();
+        assert!(!refused.retryable);
+        assert!(refused.message.contains("saved read-only"),"{refused:?}");
+        let owner=connection.lock().unwrap().archived_automation_owner(source.id).unwrap().unwrap();
+        assert_eq!(owner.id,accepted.agent.id);
+        assert_eq!(owner.session,Some(HostedSession::Chat(source)));
+        assert!(owner.closed);
+        let mut state=host.lock().unwrap();
+        assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty());
+        assert_eq!(state.execution_inventory_count_for_test(),0);
+    }
+
+    #[test]
+    fn unmanaged_prior_boot_resume_still_prepares_only_metadata() {
+        let directory=tempfile::tempdir().unwrap();
+        let source=prior_boot_unmarked_resume_source(directory.path());
+        let host=super::super::service::test_host();
+        assert!(super::super::session_locations::observer_registry(&host).unwrap().is_none());
+        let ServerResponse::ChatResumePrepared{session}=process(&host,1,ClientRequest::ChatPrepareResume{source:source.clone()}).unwrap() else {panic!("ordinary unmanaged resume should prepare metadata")};
+        assert_ne!(session.id,source.id);
+        assert!(session.proof.is_none());
+        assert_eq!(session.launch,source.launch);
+        let mut state=host.lock().unwrap();
+        assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty());
+        assert_eq!(state.execution_inventory_count_for_test(),0);
     }
 
     #[test]
