@@ -17,7 +17,8 @@ pub struct TerminalConfig {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty scrollback page budget in bytes (allocated lazily).
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
     pub command_capacity: usize,
@@ -29,6 +30,12 @@ pub struct TerminalConfig {
     /// Exact native execution environment for a host-owned CLI replacement.
     /// Never serialized with the terminal's durable launch recipe.
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
+    /// Host-verified operational cwd. Kept out of recipes and spawn options.
+    #[cfg(feature = "host")]
+    pub execution_directory: Option<std::sync::Arc<std::fs::File>>,
+    /// Private setup authority, retained by the holder until family cleanup.
+    #[cfg(feature = "host")]
+    pub setup_execution_lease: Option<std::sync::Arc<std::fs::File>>,
     /// Daemon-issued identity for child-agent tools, never a durable recipe.
     pub agent_authority: crate::agent_execution::Authority,
     /// Take over the terminal a previous daemon left to its holder, which
@@ -45,7 +52,7 @@ impl Default for TerminalConfig {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: 16 * 1024 * 1024,
             initially_visible: true,
             theme: TerminalTheme::default(),
             command_capacity: DEFAULT_COMMAND_CAPACITY,
@@ -53,6 +60,10 @@ impl Default for TerminalConfig {
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
+            #[cfg(feature = "host")]
+            execution_directory: None,
+            #[cfg(feature = "host")]
+            setup_execution_lease: None,
             agent_authority: Default::default(),
             adoption: None,
             #[cfg(feature = "host")]
@@ -91,6 +102,10 @@ pub enum TerminalEvent {
     },
     ConversationTitleChanged(String),
     WorkingDirectoryChanged(std::path::PathBuf),
+    ClipboardWrite {
+        primary: bool,
+        text: String,
+    },
     ClipboardText {
         request: uuid::Uuid,
         text: String,
@@ -140,6 +155,116 @@ pub enum TerminalKey {
     ArrowLeft,
     ArrowRight,
     Function(u8),
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadBackspace,
+    NumpadClear,
+    NumpadClearEntry,
+    NumpadComma,
+    NumpadDecimal,
+    NumpadDivide,
+    NumpadEnter,
+    NumpadEqual,
+    NumpadMemoryAdd,
+    NumpadMemoryClear,
+    NumpadMemoryRecall,
+    NumpadMemoryStore,
+    NumpadMemorySubtract,
+    NumpadMultiply,
+    NumpadParenLeft,
+    NumpadParenRight,
+    NumpadSubtract,
+    NumpadSeparator,
+    NumpadUp,
+    NumpadDown,
+    NumpadRight,
+    NumpadLeft,
+    NumpadBegin,
+    NumpadHome,
+    NumpadEnd,
+    NumpadInsert,
+    NumpadDelete,
+    NumpadPageUp,
+    NumpadPageDown,
+
+    AltLeft,
+    AltRight,
+    ControlLeft,
+    ControlRight,
+    SuperLeft,
+    SuperRight,
+    ShiftLeft,
+    ShiftRight,
+    CapsLock,
+    NumLock,
+    IntlBackslash,
+    IntlRo,
+    IntlYen,
+    ContextMenu,
+    Convert,
+    KanaMode,
+    NonConvert,
+    Help,
+    Fn,
+    FnLock,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+    BrowserBack,
+    BrowserFavorites,
+    BrowserForward,
+    BrowserHome,
+    BrowserRefresh,
+    BrowserSearch,
+    BrowserStop,
+    Eject,
+    LaunchApp1,
+    LaunchApp2,
+    LaunchMail,
+    MediaPlayPause,
+    MediaSelect,
+    MediaStop,
+    MediaTrackNext,
+    MediaTrackPrevious,
+    Power,
+    Sleep,
+    AudioVolumeDown,
+    AudioVolumeMute,
+    AudioVolumeUp,
+    WakeUp,
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl TerminalKey {
+    pub fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Self::AltLeft
+                | Self::AltRight
+                | Self::ControlLeft
+                | Self::ControlRight
+                | Self::SuperLeft
+                | Self::SuperRight
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::CapsLock
+                | Self::NumLock
+                | Self::Fn
+                | Self::FnLock
+                | Self::ScrollLock
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +276,13 @@ pub struct KeyInput {
     /// makes of it, which the encoder derives from the key and modifiers.
     pub text: Option<String>,
     pub unshifted_codepoint: Option<char>,
+    /// Return to the live prompt after an input-producing press or repeat.
+    #[serde(default = "default_scroll_to_bottom_on_input")]
+    pub scroll_to_bottom_on_input: bool,
+}
+
+pub const fn default_scroll_to_bottom_on_input() -> bool {
+    true
 }
 
 /// Where pasted text came from, which decides how much of it may act as keys.
@@ -220,6 +352,8 @@ pub enum TerminalSendError {
     Full,
     #[error("terminal worker has closed")]
     Closed,
+    #[error("Output moved; selection cleared. Select again to copy.")]
+    SelectionMoved,
     /// Text larger than the daemon takes as one paste, refused before it is
     /// sent: a request that large would not fit in a frame, and losing the
     /// connection over it would lose the paste without a word.

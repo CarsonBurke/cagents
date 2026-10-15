@@ -24,7 +24,7 @@ mod ownership;
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
-    reconcile_agent_run, reconcile_agent_run_under_control,
+    reconcile_agent_run, reconcile_agent_run_under_control, try_interactive,
 };
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns

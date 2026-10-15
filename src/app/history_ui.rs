@@ -7,13 +7,24 @@ use crate::sidebar::CommitChanges;
 pub(super) struct State {
     generation: u64,
     page_generation: u64,
+    page_cancellation: Option<CancellationToken>,
     cancellation: Option<CancellationToken>,
 }
 
 impl State {
     pub(super) fn next_page_request(&mut self) -> u64 {
-        self.page_generation = self.page_generation.wrapping_add(1);
+        self.cancel_pages();
+        self.page_cancellation = Some(CancellationToken::default());
         self.page_generation
+    }
+
+    pub(super) fn cancel_pages(&mut self) {
+        self.page_generation = self.page_generation.wrapping_add(1);
+        if let Some(cancellation) = self.page_cancellation.take() { cancellation.cancel(); }
+    }
+
+    pub(super) fn page_cancellation(&self) -> CancellationToken {
+        self.page_cancellation.clone().unwrap_or_default()
     }
 
     pub(super) fn accepts_page(&self, generation: u64) -> bool {
@@ -31,6 +42,7 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancel();
+        self.cancel_pages();
     }
 }
 
@@ -201,6 +213,44 @@ mod tests {
     }
 
     #[test]
+    fn history_search_without_head_does_not_start_an_unfinishable_page() {
+        let (mut app, key, _, _) = fixture();
+        let mut source = SourceControlModel::loading(key.clone());
+        source.unborn = true;
+        app.sidebar_model.source_control = Some(source);
+        let generation = app.history_ui.page_generation;
+        drop(app.update(Message::Sidebar(SidebarAction::SearchHistory {
+            key,
+            query: "Author".into(),
+        })));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(!source.history_loading);
+        assert!(!source.history_requested());
+        assert!(source.history_query.is_empty());
+        assert_eq!(app.history_ui.page_generation, generation);
+    }
+
+    #[test]
+    fn history_paging_without_head_keeps_the_page_idle() {
+        for unborn in [false, true] {
+            let (mut app, key, _, _) = fixture();
+            let mut source = SourceControlModel::loading(key.clone());
+            source.unborn = unborn;
+            app.sidebar_model.source_control = Some(source);
+            let generation = app.history_ui.page_generation;
+            drop(app.update(Message::Sidebar(SidebarAction::LoadMoreHistory {
+                key,
+                page: 0,
+            })));
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            assert!(!source.history_loading);
+            assert!(!source.history_requested());
+            assert_eq!(source.next_history_page, 0);
+            assert_eq!(app.history_ui.page_generation, generation);
+        }
+    }
+
+    #[test]
     fn switching_commits_cancels_the_old_read_and_rejects_its_completion() {
         let (mut app, key, first, second) = fixture();
         drop(app.open_history_commit(key.clone(), first.clone()));
@@ -255,6 +305,25 @@ mod tests {
                 .result,
             Some(Ok(_))
         ));
+    }
+
+    #[test]
+    fn superseded_history_searches_and_rebindings_cancel_the_old_worker() {
+        let mut state = State::default();
+        let old = state.next_page_request();
+        let cancelled = state.page_cancellation();
+        let current = state.next_page_request();
+        assert!(cancelled.is_cancelled());
+        assert!(!state.accepts_page(old));
+        assert!(state.accepts_page(current));
+        let active = state.page_cancellation();
+        state.cancel_pages();
+        assert!(active.is_cancelled());
+        assert!(!state.accepts_page(current));
+        state.next_page_request();
+        let final_token = state.page_cancellation();
+        drop(state);
+        assert!(final_token.is_cancelled());
     }
 
     #[test]

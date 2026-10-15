@@ -210,6 +210,8 @@ impl Cagents {
             let mut runtime = RepositoryRuntime::new_directory(view.clone());
             runtime.set_auto_save(self.settings.editor_auto_save);
             runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+            runtime.set_editor_tab_width(self.settings.editor_tab_width);
+            runtime.set_editor_auto_close(self.settings.editor_auto_close);
             runtime.set_syntax_theme(self.settings.editor_syntax_theme);
             runtime.set_external_editors(self.sidebar_model.external_editors.clone());
             self.cards
@@ -242,7 +244,7 @@ impl Cagents {
                     ))
                 })
                 .unwrap_or_else(|| self.terminal_insertion_indices());
-            let width = self.settings.default_native_pane_fraction;
+            let width = self.new_pane_fraction(self.settings.default_native_pane_fraction);
             let state = CardState {
                 id: card,
                 generation: self.durable.generation,

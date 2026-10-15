@@ -10,6 +10,14 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+mod presence;
+mod save_publication;
+pub use presence::FileRestoration;
+pub(crate) use presence::{
+    PresenceSave, capture_restoration_at, save_document_file, save_document_file_at,
+};
+use save_publication::{SaveBaseline, publish_replacement};
+
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
 /// its first page, and the view asks for the pages after that.
@@ -71,6 +79,8 @@ pub enum ReadOnlyReason {
         refusal: LinkRefusal,
     },
     Binary,
+    /// Bounded, paged binary details loaded from the same safe descriptor.
+    BinaryPreview(BinaryPreview),
     InvalidUtf8,
     Image(String),
     Document(String),
@@ -83,6 +93,96 @@ pub enum ReadOnlyReason {
         kind: OversizeKind,
     },
     NotRegularFile,
+}
+
+/// One page of a binary file. Paging replaces the page rather than retaining
+/// the whole file, including for multi-gigabyte artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryPreview {
+    pub bytes: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub mime: &'static str,
+    pub error: Option<String>,
+    pub offset: u64,
+    pub data: std::sync::Arc<[u8]>,
+    pub hex: std::sync::Arc<str>,
+}
+
+pub const BINARY_PREVIEW_BYTES: u64 = 64 * 1024;
+
+fn binary_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x7fELF") {
+        "application/x-elf"
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        "application/zip"
+    } else if bytes.starts_with(b"\x1f\x8b") {
+        "application/gzip"
+    } else if bytes.starts_with(b"SQLite format 3\0") {
+        "application/vnd.sqlite3"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn binary_preview(mut file: File, offset: u64) -> Result<BinaryPreview, FileIoError> {
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(FileIoError::Io("Not a regular file".into()));
+    }
+    file.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
+    let mut header = [0; 32];
+    let read = file.read(&mut header).map_err(io_error)?;
+    file.seek(io::SeekFrom::Start(offset)).map_err(io_error)?;
+    let mut data = Vec::new();
+    file.take(BINARY_PREVIEW_BYTES)
+        .read_to_end(&mut data)
+        .map_err(io_error)?;
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(data.len() * 5);
+    for (row, bytes) in data.chunks(16).enumerate() {
+        let _ = write!(hex, "{:08x}  ", offset + (row * 16) as u64);
+        for index in 0..16 {
+            match bytes.get(index) {
+                Some(byte) => {
+                    let _ = write!(hex, "{byte:02x} ");
+                }
+                None => hex.push_str("   "),
+            }
+        }
+        hex.push_str(" | ");
+        for byte in bytes {
+            hex.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            });
+        }
+        hex.push('\n');
+    }
+    Ok(BinaryPreview {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        mime: binary_mime(&header[..read]),
+        error: None,
+        offset,
+        data: data.into(),
+        hex: hex.into(),
+    })
+}
+
+pub fn load_binary_page(
+    worktree: &Path,
+    path: &Path,
+    offset: u64,
+) -> Result<BinaryPreview, FileIoError> {
+    validate_repo_path(path)?;
+    let root = worktree_root(worktree)?;
+    let file = fs_safety::open_beneath(&root, path).map_err(resolve_error)?;
+    binary_preview(file, offset)
 }
 
 /// Why a symbolic link was presented instead of followed.
@@ -192,6 +292,10 @@ pub enum SaveOutcome {
         content_hash: blake3::Hash,
         durability: SaveDurability,
     },
+    Absent {
+        restoration: std::sync::Arc<FileRestoration>,
+        durability: SaveDurability,
+    },
     Conflict {
         disk_hash: blake3::Hash,
     },
@@ -201,9 +305,9 @@ pub enum SaveOutcome {
 pub enum SaveDurability {
     /// The replacement and its parent-directory entry were synced.
     Durable,
-    /// The destination was replaced, but syncing its parent directory failed.
-    /// The new bytes are the live disk baseline even though crash durability is
-    /// not guaranteed.
+    /// The destination was replaced, but durability or recovery-artifact
+    /// cleanup could not be confirmed. The new bytes are the live disk
+    /// baseline; the diagnostic describes any retained artifact.
     Unconfirmed { error: String },
 }
 
@@ -218,6 +322,67 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
         return Err(FileIoError::InvalidRepositoryPath);
     }
     Ok(())
+}
+
+/// Reads a dependency source explicitly selected through language-server
+/// navigation. The caller mounts it as read-only; it never enters the save
+/// path. A parent-directory descriptor fences the bounded regular-file read.
+pub fn load_external_source(path: &Path) -> Result<LoadedFile, FileIoError> {
+    if !path.is_absolute() {
+        return Err(FileIoError::InvalidRepositoryPath);
+    }
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let parent = canonical
+        .parent()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let name = canonical
+        .file_name()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let root =
+        crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let file = crate::fs_safety::open_beneath(&root, Path::new(name))
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let content = if !metadata.is_file() {
+        FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+    } else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+        FileContent::ReadOnly(ReadOnlyReason::Oversize {
+            bytes: metadata.len(),
+            limit: MAX_EDITABLE_FILE_BYTES,
+            kind: OversizeKind::Editable,
+        })
+    } else {
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        file.take(MAX_EDITABLE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| FileIoError::Io(error.to_string()))?;
+        if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                bytes: bytes.len() as u64,
+                limit: MAX_EDITABLE_FILE_BYTES,
+                kind: OversizeKind::Editable,
+            })
+        } else if bytes.contains(&0) {
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        } else {
+            match String::from_utf8(bytes) {
+                Ok(text) => FileContent::Editable {
+                    content_hash: blake3::hash(text.as_bytes()),
+                    text,
+                    markdown: false,
+                },
+                Err(_) => FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8),
+            }
+        }
+    };
+    Ok(LoadedFile {
+        source: path.to_path_buf(),
+        content,
+    })
 }
 
 /// Whether the open file begins with a PDF header, leaving it rewound.
@@ -258,8 +423,17 @@ pub fn load_file(
     relative_path: &Path,
     tone: PdfTone,
 ) -> Result<LoadedFile, FileIoError> {
-    validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
+    load_file_at(&root, relative_path, tone)
+}
+
+pub(crate) fn load_file_at(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
+    validate_repo_path(relative_path)?;
+    let worktree = root.path();
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a
     // target that turns out to name nothing usable is reported against the
@@ -416,6 +590,20 @@ fn load_regular_file(
         OversizeKind::Document => MAX_DOCUMENT_BYTES,
         OversizeKind::Editable => MAX_EDITABLE_FILE_BYTES,
     };
+    if metadata.len() > limit && !document && image::ImageFormat::from_path(relative_path).is_err()
+    {
+        let mut sample = [0; 4096];
+        let mut descriptor = &file;
+        let read = descriptor.read(&mut sample).map_err(io_error)?;
+        descriptor.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
+        if sample[..read].contains(&0)
+            || std::str::from_utf8(&sample[..read]).is_err_and(|error| error.error_len().is_some())
+        {
+            return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+                binary_preview(file, 0)?,
+            )));
+        }
+    }
     if metadata.len() > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: metadata.len(),
@@ -447,7 +635,8 @@ fn load_regular_file(
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit + 1)
+    (&file)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > limit {
@@ -460,24 +649,26 @@ fn load_regular_file(
     if relative_path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+        && let Ok(image) = decode_svg(&bytes)
     {
-        return Ok(decode_svg(&bytes)
-            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
+        return Ok(image);
     }
-    let format = image::guess_format(&bytes)
-        .ok()
-        .or_else(|| image::ImageFormat::from_path(relative_path).ok());
-    if let Some(format) = format {
-        return Ok(decode_raster(&bytes, format)
-            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
+    // Weak BMP/PNM signatures are common prose. An image requires an image
+    // extension, agreeing magic when present, and a successful decode.
+    let extension = image::ImageFormat::from_path(relative_path).ok();
+    let guessed = image::guess_format(&bytes).ok();
+    if let Some(format) = extension
+        && guessed.is_none_or(|magic| magic == format)
+        && let Ok(image) = decode_raster(&bytes, format)
+    {
+        return Ok(image);
     }
-    if bytes.contains(&0) {
-        return Ok(FileContent::ReadOnly(ReadOnlyReason::Binary));
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+            binary_preview(file, 0)?,
+        )));
     }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return Ok(FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)),
-    };
+    let text = String::from_utf8(bytes).expect("UTF-8 validated above");
     let markdown = relative_path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("README"))
@@ -834,6 +1025,29 @@ pub fn save_file(
     )
 }
 
+/// Uses the caller's pinned worktree authority for a multi-file transaction.
+/// Reopening the path for each file would allow a previewed tree to be replaced
+/// between publications and redirect later writes into a different checkout.
+pub(crate) fn save_file_at(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+) -> Result<SaveOutcome, FileIoError> {
+    // The workspace planner retains its cleanup protection with this Root
+    // from preparation through rollback, even if the directory is renamed.
+    save_file_at_with_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        || Ok(()),
+        fs_safety::sync_directory,
+    )
+}
+
 fn save_file_with_hooks(
     worktree: &Path,
     relative_path: &Path,
@@ -845,14 +1059,35 @@ fn save_file_with_hooks(
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
+    save_file_at_with_hooks(
+        &root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        before_publish,
+        sync_parent,
+    )
+}
+
+pub(crate) fn save_file_at_with_hooks(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(relative_path)?;
     let (parent, name) =
-        fs_safety::open_parent_beneath(&root, relative_path).map_err(resolve_error)?;
+        fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
     let name = Path::new(&name);
     // The destination is classified by name once, only to refuse a symlink
     // without opening it, and then opened; every decision that follows — its
     // mode, its ACL, its attributes and the bytes the conflict check hashes —
-    // is taken from that one descriptor, so nothing can be swapped in behind
-    // the name between the check and the save.
+    // is taken from that descriptor. Publication separately acquires the
+    // current named entry and verifies it against this same baseline.
     let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
     if listed.file_type().is_symlink() {
         return Err(FileIoError::Io(
@@ -867,7 +1102,15 @@ fn save_file_with_hooks(
         ));
     }
 
-    // A forced save compares nothing, so it reads nothing. An ordinary save
+    let baseline = SaveBaseline::capture(&destination, (!overwrite).then_some(expected_disk_hash))?;
+    baseline.ensure_initial(&metadata)?;
+    if !save_publication::same_file(&listed, &metadata) {
+        return Err(FileIoError::Io(
+            "The destination changed while opening the save target.".into(),
+        ));
+    }
+    // A forced save replaces the loaded baseline with a coherent digest of
+    // the current disk file; acquisition still fences later changes. An ordinary save
     // bounds the read the way `load_file` does rather than reading whatever is
     // there now: this worktree is shared with coding agents, so the
     // destination can have been replaced by a file far larger than the editor
@@ -889,6 +1132,7 @@ fn save_file_with_hooks(
         &destination,
         text.as_bytes(),
         metadata.permissions(),
+        &baseline,
         before_publish,
         sync_parent,
     )?;
@@ -898,72 +1142,46 @@ fn save_file_with_hooks(
     })
 }
 
-/// Writes `bytes` into a temporary sibling that carries the destination's
-/// ownership, permissions, access ACL and content attributes, then renames it over the
-/// destination.
-///
-/// The replacement is a new inode, so every piece of metadata the old one
-/// carried has to be reproduced deliberately — `st_mode` alone leaves an
-/// ACL-bearing file readable by the wrong people and silently drops the user's
-/// extended attributes.
-fn publish_replacement(
-    parent: &Root,
-    name: &Path,
-    destination: &File,
-    bytes: &[u8],
-    permissions: Permissions,
-    before_publish: impl FnOnce() -> io::Result<()>,
-    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
-) -> Result<SaveDurability, FileIoError> {
-    let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
+/// Recreates a document the user explicitly chose to save after deletion.
+/// Publication refuses any replacement that appeared meanwhile.
+pub fn save_missing_file(
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
+    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
+    let root = worktree_root(worktree)?;
+    save_missing_file_at(&root, path, text)
+}
+
+pub(crate) fn save_missing_file_at(
+    root: &Root,
+    path: &Path,
+    text: &str,
+) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
+    let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
+    let (mut file, temporary) =
+        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
     let result = (|| {
-        // Establish access rules before any sensitive bytes exist: otherwise
-        // the final chmod could briefly expose a mode-only view of an ACL.
-        fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        temporary.write_all(bytes).map_err(io_error)?;
-        // Set the mode after writing: writing can clear set-ID permission bits.
-        temporary.set_permissions(permissions).map_err(io_error)?;
-        // ...and reinstate the ACL after it, because the kernel rewrites the
-        // ACL's mask from the mode.
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        let lost = fs_safety::copy_extended_attributes(destination, &temporary);
-        temporary.sync_all().map_err(io_error)?;
-        before_publish().map_err(io_error)?;
-        fs_safety::rename_within(parent, &temporary_name, name.as_os_str())
-            .map_err(resolve_error)?;
-        Ok(lost)
+        file.write_all(text.as_bytes()).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        fs_safety::rename_new_within(&parent, &temporary, &name).map_err(resolve_error)
     })();
-    let lost = match result {
-        Ok(lost) => lost,
-        Err(error) => {
-            if let Err(cleanup_error) = fs_safety::unlink_within(parent, &temporary_name) {
-                return Err(FileIoError::Io(format!(
-                    "{error}; could not remove partial save: {cleanup_error}"
-                )));
-            }
-            return Err(error);
-        }
-    };
-    // The bytes are published. Losing an optional attribute is not worth
-    // failing a save that already succeeded, but it must not be silent either.
-    for attribute in lost {
-        tracing::warn!(
-            path = %parent.path().join(name).display(),
-            %attribute,
-            "saved file did not receive one of its extended attributes"
-        );
+    if let Err(error) = result {
+        let _ = fs_safety::unlink_within(&parent, &temporary);
+        return Err(error);
     }
-    // The rename has replaced the destination. From this point onward, an I/O
-    // failure must be reported as a successful replacement with unconfirmed
-    // durability; returning `Err` would falsely tell callers the old baseline
-    // is still on disk.
-    Ok(match sync_parent(parent) {
+    let durability = match fs_safety::sync_directory(&parent) {
         Ok(()) => SaveDurability::Durable,
         Err(error) => SaveDurability::Unconfirmed {
             error: error.to_string(),
         },
+    };
+    Ok(SaveOutcome::Saved {
+        content_hash: blake3::hash(text.as_bytes()),
+        durability,
     })
 }
 
@@ -1068,7 +1286,7 @@ fn file_operation_root(
 /// exactly what makes everything below it fd-relative. It is canonicalized
 /// first because a worktree may legitimately live behind a symbolic link,
 /// which `Root::open` refuses for its final component.
-fn worktree_root(worktree: &Path) -> Result<Root, FileIoError> {
+pub(crate) fn worktree_root(worktree: &Path) -> Result<Root, FileIoError> {
     let root = fs::canonicalize(worktree)
         .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
     Root::open(&root).map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))
@@ -1120,9 +1338,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_sources_are_bounded_regular_utf8_without_binary_or_directory_reads() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("stdlib.rs");
+        fs::write(&source, "pub fn example() { /* λ */ }\n").unwrap();
+        let loaded = load_external_source(&source).unwrap();
+        assert_eq!(loaded.source, source);
+        assert!(
+            matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ"))
+        );
+        fs::write(&source, b"binary\0bytes").unwrap();
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        ));
+        fs::write(&source, [0xff]).unwrap();
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+        ));
+        let file = fs::File::create(&source).unwrap();
+        file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
+        ));
+        assert!(matches!(
+            load_external_source(directory.path()).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+        ));
+        assert!(load_external_source(Path::new("relative.rs")).is_err());
+    }
+
+    #[test]
     fn raster_file_load_preserves_pixels_without_creating_editable_text() {
         let root = tempdir().unwrap();
-        let path = root.path().join("opaque.dat");
+        let path = root.path().join("opaque.png");
         let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([31, 127, 220, 128]));
         image
             .save_with_format(&path, image::ImageFormat::Png)
@@ -1132,13 +1383,70 @@ mod tests {
             width,
             height,
             rgba,
-        } = content(root.path(), "opaque.dat")
+        } = content(root.path(), "opaque.png")
         else {
-            panic!("image magic must win over the filename extension");
+            panic!("valid image with agreeing extension must render");
         };
         assert_eq!((width, height), (2, 1));
         assert_eq!(&*rgba, &[31, 127, 220, 128, 31, 127, 220, 128]);
         assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn prose_with_weak_image_magic_and_failed_decodes_remains_text() {
+        let root = tempdir().unwrap();
+        for (name, text) in [
+            ("rank.md", "BM25 ranking..."),
+            ("notes.txt", "P3: notes"),
+            ("broken.bmp", "BMbroken"),
+            ("broken.png", "plain text"),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert!(
+                matches!(content(root.path(), name), FileContent::Editable { .. }),
+                "{name}"
+            );
+        }
+        let path = root.path().join("pixel.bmp");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(matches!(
+            content(root.path(), "pixel.bmp"),
+            FileContent::Image {
+                width: 1,
+                height: 1,
+                ..
+            }
+        ));
+        fs::write(root.path().join("invalid.bmp"), b"BM\0\xff").unwrap();
+        assert!(matches!(
+            content(root.path(), "invalid.bmp"),
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
+        ));
+    }
+
+    #[test]
+    fn binary_pages_remain_bounded_for_large_files_and_report_content_type() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("artifact.bin");
+        let mut file = File::create(path).unwrap();
+        file.write_all(b"\x7fELF\0").unwrap();
+        file.set_len(1024 * 1024 * 1024).unwrap();
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "artifact.bin")
+        else {
+            panic!("binary");
+        };
+        assert_eq!(preview.bytes, 1024 * 1024 * 1024);
+        assert_eq!(preview.mime, "application/x-elf");
+        assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
+        let next =
+            load_binary_page(root.path(), Path::new("artifact.bin"), BINARY_PREVIEW_BYTES).unwrap();
+        assert_eq!(next.offset, BINARY_PREVIEW_BYTES);
+        assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
+        symlink("/etc/passwd", root.path().join("escape.bin")).unwrap();
+        assert!(load_binary_page(root.path(), Path::new("escape.bin"), 0).is_err());
     }
 
     #[test]
@@ -1150,7 +1458,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             content(root.path(), "wide.png"),
-            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
         ));
         let file = File::create(root.path().join("huge.png")).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
@@ -1161,7 +1469,7 @@ mod tests {
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
         assert!(matches!(
             content(root.path(), "broken.png"),
-            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+            FileContent::Editable { .. }
         ));
     }
 
@@ -1295,22 +1603,21 @@ mod tests {
         fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
         symlink("binary.bin", root.path().join("link.txt")).unwrap();
 
-        assert_eq!(
-            load_file(root.path(), Path::new("binary.bin"), PdfTone::Original).unwrap(),
-            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
-        );
-        assert_eq!(
-            load_file(root.path(), Path::new("invalid.txt"), PdfTone::Original).unwrap(),
-            loaded(
-                "invalid.txt",
-                FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
-            )
-        );
-        // A link is classified by what it leads to, and the source names that.
-        assert_eq!(
-            load_file(root.path(), Path::new("link.txt"), PdfTone::Original).unwrap(),
-            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
-        );
+        for (name, source, bytes) in [
+            ("binary.bin", "binary.bin", 11),
+            ("invalid.txt", "invalid.txt", 2),
+            ("link.txt", "binary.bin", 11),
+        ] {
+            let loaded = load_file(root.path(), Path::new(name), PdfTone::Original).unwrap();
+            assert_eq!(loaded.source, Path::new(source));
+            let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) = loaded.content
+            else {
+                panic!("binary preview expected");
+            };
+            assert_eq!(preview.bytes, bytes);
+            assert_eq!(preview.offset, 0);
+            assert!(preview.modified.is_some());
+        }
     }
 
     /// What the file at `path` presents as, for the tests that are about the
@@ -1346,12 +1653,12 @@ mod tests {
             );
         }
         std::fs::write(root.path().join("binary"), b"a\0b").unwrap();
-        assert_eq!(
+        assert!(matches!(
             load_file(root.path(), Path::new("binary"), PdfTone::Original)
                 .unwrap()
                 .content,
-            FileContent::ReadOnly(ReadOnlyReason::Binary)
-        );
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
+        ));
     }
 
     fn editable(text: &str, markdown: bool) -> FileContent {
@@ -1546,12 +1853,17 @@ mod tests {
             &foreign,
             b"after",
             source.permissions(),
+            &SaveBaseline::capture(&foreign, None).unwrap(),
             || Ok(()),
             fs_safety::sync_directory,
         );
         match result {
             Err(error) => {
-                assert!(error.to_string().contains("file ownership"), "{error}");
+                assert!(
+                    error.to_string().contains("file ownership")
+                        || error.to_string().contains("identity"),
+                    "{error}"
+                );
                 assert_eq!(fs::read(&path).unwrap(), b"before");
                 let after = fs::metadata(&path).unwrap();
                 assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
@@ -1599,6 +1911,23 @@ mod tests {
         assert_eq!(after.mode() & 0o777, before.mode() & 0o777);
         assert_eq!(fs::read(&path).unwrap(), b"after\n");
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_save_after_deletion_recreates_without_replacing_another_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("deleted.rs");
+        let outcome = save_missing_file(root.path(), path, "kept buffer").unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
+        assert!(save_missing_file(root.path(), path, "another writer").is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
     }
 
     #[test]

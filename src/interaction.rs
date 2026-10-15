@@ -16,10 +16,29 @@ use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 mod context_menu;
+mod owned_surface;
+pub(crate) use owned_surface::owned_surface;
+mod focus_snapshot;
+pub(crate) use focus_snapshot::{FocusSnapshot, observe_focus};
 mod list_navigation;
-pub use list_navigation::reveal_list_selection;
+pub use list_navigation::{reveal_list_region, reveal_list_selection};
 
 use crate::design::space;
+
+/// Native menu hints come from the same grammar as shortcut dispatch.
+pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(
+    bindings: impl IntoIterator<Item = (&'a [String], A)>,
+) -> std::collections::HashMap<widget::menu::KeyBind, A> {
+    bindings
+        .into_iter()
+        .filter_map(|(chords, action)| {
+            chords
+                .iter()
+                .find_map(|chord| crate::workspace_widget::menu_keybind(chord))
+                .map(|key| (key, action))
+        })
+        .collect()
+}
 
 /// How far a tooltip sits from the control it names, and how wide it may
 /// grow before its label wraps.
@@ -423,6 +442,41 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
     .into()
 }
 
+/// A context menu whose native state closes when its target changes.
+/// Use stable row IDs and relevant source/selection revisions as lightweight
+/// keys, so unrelated frames preserve the menu without retaining stale actions.
+pub fn context_menu_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    key: Key,
+    menu: Vec<widget::menu::Tree<Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::surface_keyed(key, menu)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+/// Lazy menu construction with the same target lifetime as [`context_menu_keyed`].
+pub fn context_menu_lazy_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    key: Key,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(
+            content.into(),
+            context_menu::lazy_surface_keyed(key, builder),
+        ),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
 /// Keeps every key from the layers beneath a transient surface that the
 /// application's keyboard subscription drives, so a key that steers or
 /// dismisses it is not also typed into the pane it covers.
@@ -432,6 +486,21 @@ pub fn keyboard_modal<'a, Message: 'a>(
     Effect {
         content: content.into(),
         kind: Kind::KeyboardModal,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+/// The app's modal router owns Tab for these surfaces. Capturing it here
+/// keeps Cosmic's separate ignored-key traversal from also moving focus.
+/// Other keys continue to the native child controls.
+pub(crate) fn modal_tabs<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ModalTabs,
         tip: None,
         on_escape: None,
     }
@@ -1150,6 +1219,7 @@ enum Kind {
     },
     Opaque,
     KeyboardModal,
+    ModalTabs,
 }
 
 struct Effect<'a, Message> {
@@ -1197,6 +1267,7 @@ struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
 struct KeyboardModalTag;
+struct ModalTabsTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
 
@@ -1217,6 +1288,7 @@ struct State {
     tooltip: Animation<bool>,
     entered: Option<Instant>,
     tip_open: bool,
+    tip_suppressed: bool,
     inspect_control: bool,
     disabled: bool,
     focused: bool,
@@ -1231,6 +1303,7 @@ impl Default for State {
             tooltip: Animation::new(false).duration(HOVER_DURATION),
             entered: None,
             tip_open: false,
+            tip_suppressed: false,
             inspect_control: true,
             disabled: false,
             focused: true,
@@ -1253,6 +1326,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
             Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
+            Kind::ModalTabs => tree::Tag::of::<ModalTabsTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
             Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
@@ -1428,6 +1502,29 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         // Modifier state is not a key press: widgets beneath keep their own
         // copy of it for the clicks and drags that follow, and would be left
         // believing a modifier is still held.
+        if matches!(self.kind, Kind::ModalTabs)
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    } | cosmic::iced::keyboard::Event::KeyReleased {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    }
+                )
+            )
+        {
+            // Repeats remain captured even when the app deliberately ignores
+            // them, otherwise only Cosmic would move the focus on a repeat.
+            shell.capture_event();
+            return;
+        }
         if matches!(self.kind, Kind::KeyboardModal)
             && matches!(
                 event,
@@ -1531,6 +1628,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 .intersection(viewport)
                 .is_some_and(|bounds| cursor.is_over(bounds));
         if !inside {
+            state.tip_suppressed = false;
             state.inspect_control = true;
         }
         if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
@@ -1545,6 +1643,22 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.inspect_control = false;
         }
         inside &= !state.disabled;
+        if matches!(self.kind, Kind::Tooltip)
+            && inside
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                    | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
+            )
+        {
+            state.tip_suppressed = true;
+            state.entered = None;
+            state.tip_open = false;
+            state.tooltip = Animation::new(false).duration(HOVER_DURATION);
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
+
         if state.hover.value() != inside {
             state.hover.go_mut(inside, now);
             state.entered = inside.then_some(now);
@@ -1554,7 +1668,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             Kind::Hover if state.hover.is_animating(now) => shell.request_redraw(),
             Kind::Tooltip => {
                 let mut visible = false;
-                if let Some(entered) = state.entered.filter(|_| inside) {
+                if let Some(entered) = state.entered.filter(|_| inside && !state.tip_suppressed) {
                     let deadline = entered + TOOLTIP_DELAY;
                     visible = now >= deadline;
                     if !visible {
@@ -1784,6 +1898,107 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_menu_hints_use_effective_shortcut_configuration() {
+        use cosmic::iced::keyboard::{Key, Modifiers};
+        let chords = vec!["Ctrl+Alt+F5".to_owned(), "Ctrl+N".to_owned()];
+        let bindings = menu_shortcuts([(chords.as_slice(), 7u8)]);
+        assert_eq!(bindings.len(), 1);
+        let (key, action) = bindings.iter().next().unwrap();
+        assert_eq!(*action, 7);
+        assert!(key.matches(
+            Modifiers::CTRL | Modifiers::ALT,
+            &Key::Named(cosmic::iced::keyboard::key::Named::F5),
+            None
+        ));
+        assert!(!key.to_string().is_empty());
+    }
+
+    #[test]
+    fn pressed_tooltip_stays_hidden_until_pointer_leaves() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element = tooltip(
+            cosmic::widget::button::text("Settings").on_press(1u8),
+            "Open settings",
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let pointer = mouse::Cursor::Available(node.bounds().center());
+        let state = tree.state.downcast_mut::<State>();
+        state.tip_open = true;
+        state.tooltip = Animation::new(true).duration(HOVER_DURATION);
+        state.entered = Some(Instant::now() - TOOLTIP_DELAY);
+        let mut messages = Vec::new();
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY,
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert!(!tree.state.downcast_ref::<State>().tip_open);
+            assert!(tree.state.downcast_ref::<State>().tip_suppressed);
+        }
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorLeft),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(!tree.state.downcast_ref::<State>().tip_suppressed);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: node.bounds().center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY + Duration::from_millis(1),
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        assert!(
+            tree.state.downcast_ref::<State>().tip_open,
+            "a fresh hover can show the tooltip again"
+        );
+    }
+
     use super::*;
     #[test]
     fn font_zoom_accepts_layout_variants_without_claiming_typing() {

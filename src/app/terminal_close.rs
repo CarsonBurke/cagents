@@ -17,6 +17,24 @@ pub(super) struct CloseIntent {
     restore_keyboard_nav: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogTarget {
+    card: CardId,
+    terminal: TerminalId,
+    proof: HostSessionProof,
+    generation: u64,
+}
+impl CloseIntent {
+    pub(super) fn target(&self) -> DialogTarget {
+        DialogTarget {
+            card: self.card,
+            terminal: self.terminal,
+            proof: self.proof.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
@@ -145,6 +163,12 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
@@ -209,12 +233,14 @@ impl Cagents {
                 .live_proof()
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
+            let terminal = session.id;
+            self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
             self.terminal_close = Some(CloseIntent {
                 card,
-                terminal: session.id,
+                terminal,
                 proof,
                 completed_source: None,
-                generation: 0,
+                generation: self.terminal_close_generation,
                 restore_card: self.workspace.focused(),
                 pending: false,
                 active: false,
@@ -227,7 +253,7 @@ impl Cagents {
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 self.core.set_keyboard_nav(false);
-                return close_focus(0);
+                return self.modal_focus(close_focus_id(0));
             }
             return self.start_terminal_close(allow_active);
         }
@@ -260,22 +286,23 @@ impl Cagents {
                     });
                     return Task::none();
                 }
+                self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
                 self.terminal_close = Some(CloseIntent {
                     card,
                     terminal: session.id,
                     proof,
                     completed_source: Some(session),
-                    generation: 0,
+                    generation: self.terminal_close_generation,
                     restore_card: self.workspace.focused(),
                     restore_keyboard_nav: self.core.keyboard_nav(),
                     pending: false,
                     active: true,
                     dont_ask_again: false,
                     detail: None,
-                    focus: 1,
+                    focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                self.modal_focus(close_focus_id(0))
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -425,13 +452,12 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
+            self.modal_restore_focus(
                 self.workspace
                     .focused()
                     .map(|card| self.card_keyboard_focus(card))
                     .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
             )
-            .map(cosmic::Action::App)
         } else {
             Task::none()
         };
@@ -478,11 +504,10 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
-        iced::widget::operation::focus(
+        self.modal_restore_focus(
             card.map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
-        .map(cosmic::Action::App)
         .chain(self.next_queued_card_close())
     }
 
@@ -519,7 +544,7 @@ impl Cagents {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return self.modal_focus(close_focus_id(0));
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
             self.terminal_close.as_mut().unwrap().detail = Some(
@@ -527,7 +552,7 @@ impl Cagents {
                     .into(),
             );
             self.core.set_keyboard_nav(false);
-            return close_focus(0);
+            return self.modal_focus(close_focus_id(0));
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
         let intent = self.terminal_close.as_mut().unwrap();
@@ -597,9 +622,9 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
-                intent.focus = 1;
+                intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                self.modal_focus(close_focus_id(0))
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -622,24 +647,61 @@ impl Cagents {
                     ),
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(0)
+                self.modal_focus(close_focus_id(0))
             }
         }
     }
 
+    pub(super) fn terminal_close_target(&self) -> Option<DialogTarget> {
+        self.terminal_close.as_ref().map(CloseIntent::target)
+    }
+    pub(super) fn terminal_close_decision_current(&self, target: &DialogTarget) -> bool {
+        self.top_modal() == Some(modal_ui::Modal::TerminalClose)
+            && self.terminal_close.as_ref().is_some_and(|intent| {
+                intent.card == target.card
+                    && intent.terminal == target.terminal
+                    && intent.proof == target.proof
+                    && intent.generation == target.generation
+            })
+    }
+
+    pub(super) fn set_terminal_close_dont_ask(&mut self, value: bool) -> Task<Message> {
+        let Some(intent) = self
+            .terminal_close
+            .as_mut()
+            .filter(|intent| !intent.pending && intent.active && intent.detail.is_none())
+        else {
+            return Task::none();
+        };
+        intent.dont_ask_again = value;
+        intent.focus = 2;
+        // The nested checkbox can consume a pointer toggle before the outer
+        // focusable button sees it. Keep its native and logical focus aligned.
+        self.modal_focus(close_focus_id(2))
+    }
+
     pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
+        let observed = self
+            .modal_stack
+            .focus_snapshot(modal_ui::Modal::TerminalClose)
+            .get()
+            .and_then(|id| (0..3).find(|index| close_focus_id(*index) == id));
         let Some(intent) = self.terminal_close.as_mut() else {
             return Task::none();
         };
         if intent.pending {
             return Task::none();
         }
+        if let Some(index) = observed {
+            intent.focus = index;
+        }
         intent.focus = if intent.detail.is_some() || !intent.active {
             0
         } else {
             (intent.focus + if backwards { 2 } else { 1 }) % 3
         };
-        close_focus(intent.focus)
+        let target = close_focus_id(intent.focus);
+        self.modal_focus(target)
     }
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
@@ -648,17 +710,19 @@ impl Cagents {
         if !self.terminal_close_dialog_visible() {
             return None;
         }
+        let target = self.terminal_close_target()?;
+        let checkbox_target = target.clone();
         let mut rows: Vec<Element<'_, Message>> = vec![
             crate::design::title(if intent.detail.is_some() {
                 "Terminal kept open"
             } else {
-                "Close active processes?"
+                "Close terminal?"
             })
             .into(),
             crate::design::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
-                "This terminal or its paired conversation still owns running processes. Closing stops them."
+                "This terminal has running processes or an unfinished command. Closing stops its processes and discards any unsent input."
             }))
             .into(),
         ];
@@ -667,15 +731,17 @@ impl Cagents {
                 widget::button::custom(
                     crate::ui_controls::field::checkbox(intent.dont_ask_again)
                         .label("Don't ask me again")
-                        .on_toggle_maybe(
-                            (!intent.pending).then_some(Message::TerminalCloseDontAskChanged),
-                        ),
+                        .on_toggle_maybe((!intent.pending).then_some(move |value| {
+                            Message::TerminalCloseDontAskChanged(checkbox_target.clone(), value)
+                        })),
                 )
                 .class(cosmic::theme::Button::Text)
                 .id(widget::Id::new("dialog.terminal-close.dont-ask"))
                 .on_press_maybe(
-                    (!intent.pending)
-                        .then_some(Message::TerminalCloseDontAskChanged(!intent.dont_ask_again)),
+                    (!intent.pending).then_some(Message::TerminalCloseDontAskChanged(
+                        target.clone(),
+                        !intent.dont_ask_again,
+                    )),
                 )
                 .into(),
             );
@@ -688,24 +754,29 @@ impl Cagents {
             vec![
                 crate::ui_controls::button::primary("Dismiss")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .on_press_maybe(
+                        (!intent.pending).then_some(Message::CancelTerminalClose(target.clone())),
+                    )
                     .into(),
             ]
         } else {
             vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .on_press_maybe(
+                        (!intent.pending).then_some(Message::CancelTerminalClose(target.clone())),
+                    )
                     .into(),
                 crate::ui_controls::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
-                        (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
+                        (!intent.pending && intent.active)
+                            .then_some(Message::ConfirmTerminalClose(target.clone())),
                     )
                     .into(),
             ]
         };
-        rows.push(widget::row::with_children(buttons).spacing(space::S).into());
+        rows.push(super::dialog_ui::confirmation_controls(buttons));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
             560.0,
@@ -713,19 +784,169 @@ impl Cagents {
     }
 }
 
-fn close_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(match index {
+fn close_focus_id(index: usize) -> widget::Id {
+    widget::Id::new(match index {
         1 => "dialog.terminal-close.confirm",
         2 => "dialog.terminal-close.dont-ask",
         _ => "dialog.terminal-close.cancel",
-    }))
-    .map(cosmic::Action::App)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+    use iced::mouse;
+
+    #[test]
+    fn tab_starts_from_the_actual_checkbox_control_after_focus_or_pointer_toggle() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
+        let renderer = super::super::tests::headless_renderer();
+        for clicked in [false, true] {
+            for backwards in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                let card = app.workspace.focused().unwrap();
+                app.terminal_close = Some(CloseIntent {
+                    card,
+                    terminal: TerminalId::new(),
+                    proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("focus-fixture"),
+                        boot_id: BootId::new("boot"),
+                        host_incarnation: HostIncarnation::new("incarnation"),
+                    },
+                    completed_source: None,
+                    generation: 1,
+                    restore_card: Some(card),
+                    pending: false,
+                    active: true,
+                    dont_ask_again: false,
+                    detail: None,
+                    focus: 0,
+                    restore_keyboard_nav: true,
+                });
+                app.terminal_close_generation = 1;
+                drop(app.finish_modal_update(Task::none()));
+                if clicked {
+                    let messages = {
+                        let mut element = app.dialog().unwrap();
+                        let mut tree = Tree::new(&element);
+                        let viewport = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+                        let node = element.as_widget_mut().layout(
+                            &mut tree,
+                            &renderer,
+                            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                        );
+                        struct Bounds(Option<iced::Rectangle>);
+                        impl Operation for Bounds {
+                            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                                visit(self);
+                            }
+                            fn focusable(
+                                &mut self,
+                                id: Option<&widget::Id>,
+                                bounds: iced::Rectangle,
+                                _: &mut dyn operation::Focusable,
+                            ) {
+                                if id == Some(&close_focus_id(2)) {
+                                    self.0 = Some(bounds);
+                                }
+                            }
+                        }
+                        let mut initial = operation::focusable::focus::<()>(close_focus_id(0));
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut initial,
+                        );
+                        let mut bounds = Bounds(None);
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut bounds,
+                        );
+                        let bounds = bounds.0.expect("actual don't-ask control");
+                        let cursor = mouse::Cursor::Available(iced::Point::new(
+                            bounds.x + bounds.width / 2.0,
+                            bounds.y + bounds.height / 2.0,
+                        ));
+                        let mut messages = Vec::new();
+                        for event in [
+                            mouse::Event::ButtonPressed(mouse::Button::Left),
+                            mouse::Event::ButtonReleased(mouse::Button::Left),
+                        ] {
+                            element.as_widget_mut().update(
+                                &mut tree,
+                                &iced::Event::Mouse(event),
+                                Layout::new(&node),
+                                cursor,
+                                &renderer,
+                                &mut clipboard::Null,
+                                &mut Shell::new(&mut messages),
+                                &viewport,
+                            );
+                        }
+                        messages
+                    };
+                    assert!(messages.iter().any(|message| matches!(
+                        app.admit_modal_surface_message(message.clone()),
+                        Some(Message::TerminalCloseDontAskChanged(_, true))
+                    )));
+                    for message in messages {
+                        let toggled = matches!(
+                            app.admit_modal_surface_message(message.clone()),
+                            Some(Message::TerminalCloseDontAskChanged(..))
+                        );
+                        let task = app.update(message);
+                        if toggled {
+                            assert_eq!(
+                                super::super::tests::focused_element(app.dialog().unwrap(), task),
+                                Some(close_focus_id(2))
+                            );
+                        }
+                    }
+                    assert!(app.terminal_close.as_ref().unwrap().dont_ask_again);
+                } else {
+                    let focus = app.modal_focus(close_focus_id(2));
+                    assert_eq!(
+                        super::super::tests::focused_element(app.dialog().unwrap(), focus),
+                        Some(close_focus_id(2))
+                    );
+                    assert_eq!(
+                        app.terminal_close.as_ref().unwrap().focus,
+                        0,
+                        "the next cycle must read actual native focus, not this stale logical index"
+                    );
+                }
+                let mut event = keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                };
+                if backwards && let keyboard::Event::KeyPressed { modifiers, .. } = &mut event {
+                    *modifiers = keyboard::Modifiers::SHIFT;
+                }
+                let task = app.update(Message::KeyEvent {
+                    event,
+                    captured: true,
+                });
+                let expected = if backwards { 1 } else { 0 };
+                assert_eq!(app.terminal_close.as_ref().unwrap().focus, expected);
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), task),
+                    Some(close_focus_id(expected))
+                );
+            }
+        }
+    }
 
     #[test]
     fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {
@@ -796,7 +1017,9 @@ mod tests {
         });
         assert!(app.terminal_close_dialog().is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
-        let _ = app.update(Message::ConfirmTerminalClose);
+        let _ = app.update(Message::ConfirmTerminalClose(
+            app.terminal_close_target().unwrap(),
+        ));
         let intent = app.terminal_close.as_ref().unwrap().clone();
         assert!(intent.pending);
         assert_eq!(intent.completed_source, Some(source));
@@ -852,7 +1075,9 @@ mod tests {
             "the dialog owns Tab while it is open"
         );
 
-        let _ = app.update(Message::CancelTerminalClose);
+        let _ = app.update(Message::CancelTerminalClose(
+            app.terminal_close_target().unwrap(),
+        ));
         assert!(app.terminal_close.is_none());
         assert!(!app.chrome_ui.is_open());
         assert!(
@@ -889,7 +1114,9 @@ mod tests {
             session: source,
             result: Ok(CompletedCloseOutcome::Active(proof)),
         });
-        let _ = app.update(Message::ConfirmTerminalClose);
+        let _ = app.update(Message::ConfirmTerminalClose(
+            app.terminal_close_target().unwrap(),
+        ));
         let intent = app.terminal_close.as_ref().unwrap().clone();
         assert!(intent.pending);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
