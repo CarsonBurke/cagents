@@ -27,6 +27,81 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+/// Stack ranges are virtual reservations, not committed memory. A profiler
+/// can intersect these ranges with smaps RSS/PSS rather than multiplying an
+/// assumed stack size by the number of chat workers.
+#[cfg(target_os = "linux")]
+fn task_start_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn trace_worker_stack(role: &'static str) {
+    #[cfg(target_os = "linux")]
+    if tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+        // The current thread cannot reuse its own live TID during this read.
+        // Absence/malformed metadata leaves no purportedly exact stack event.
+        let thread_id = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
+        let Some(thread_start_ticks) =
+            std::fs::read_to_string(format!("/proc/self/task/{thread_id}/stat"))
+                .ok()
+                .and_then(|stat| task_start_ticks(&stat))
+        else {
+            return;
+        };
+        // SAFETY: pthread initializes attr on success; all output pointers are
+        // live local storage and the initialized attribute is destroyed once.
+        unsafe {
+            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+            if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+                return;
+            }
+            let mut attr = attr.assume_init();
+            let mut base = std::ptr::null_mut();
+            let mut bytes = 0;
+            let mut guard_bytes = 0;
+            let valid = libc::pthread_attr_getstack(&attr, &mut base, &mut bytes) == 0;
+            let _ = libc::pthread_attr_getguardsize(&attr, &mut guard_bytes);
+            let _ = libc::pthread_attr_destroy(&mut attr);
+            if valid {
+                tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "thread_stack", role,
+                    thread_id, thread_start_ticks,
+                    stack_base = base as usize, reserved_stack_bytes = bytes, guard_bytes);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = role;
+}
+
+/// Diagnostic logical references from this exact initial handshake snapshot.
+/// Parent/tool bytes cannot stand in for absent or truncated child histories.
+fn initial_payload_parts(snapshot: &Snapshot) -> (usize, usize, usize, usize) {
+    let bytes = |items: &[Arc<super::Item>]| {
+        items.iter().fold(0usize, |total, item| {
+            total.saturating_add(item.content.byte_len())
+        })
+    };
+    let parent = bytes(&snapshot.items);
+    let mut total = 0usize;
+    let mut minimum = None;
+    for child in &snapshot.subagents {
+        let size = bytes(&child.items);
+        total = total.saturating_add(size);
+        minimum = Some(minimum.map_or(size, |current: usize| current.min(size)));
+    }
+    (
+        parent,
+        snapshot.subagents.len(),
+        total,
+        minimum.unwrap_or(0),
+    )
+}
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -928,6 +1003,14 @@ impl ClientHandle {
             initial.sampled_at,
             Instant::now(),
         )));
+        if tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+            let (parent, children, child_bytes, minimum_child) = initial_payload_parts(&initial);
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %session.id,
+                resident_bytes = initial.transcript_bytes(), initial_snapshot_generation = initial.generation,
+                initial_parent_reference_bytes = parent, initial_child_count = children,
+                initial_child_reference_bytes = child_bytes, initial_min_child_reference_bytes = minimum_child,
+                initial_child_minimum_available = children > 0);
+        }
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -965,6 +1048,7 @@ impl ClientHandle {
         let visibility_worker = thread::Builder::new()
             .name(format!("chat-visibility-{id}"))
             .spawn(move || {
+                trace_worker_stack("chat_visibility");
                 while visibility_rx.recv().is_ok() {
                     if !visibility_alive.load(Ordering::Acquire) {
                         break;
@@ -999,6 +1083,7 @@ impl ClientHandle {
         // Ready consumes any pre-attachment unread edge; do not publish a wake
         // before the UI has installed the matching runtime generation.
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
+            trace_worker_stack("chat_reader");
             let mut read_pending = false;
             let mut read_again = false;
             let mut resync = false;
@@ -1497,12 +1582,70 @@ impl Drop for Inner {
         {
             let _ = worker.join();
         }
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %self.id,
+            released = true, resident_bytes = 0usize);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn diagnostic_task_start_ticks_uses_kernel_field_after_full_comm() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[19] = "12345";
+        assert_eq!(
+            task_start_ticks(&format!("9 (chat ) worker) {}", fields.join(" "))),
+            Some(12345)
+        );
+        assert_eq!(task_start_ticks("9 (incomplete) S 0"), None);
+        fields[19] = "invalid";
+        assert_eq!(
+            task_start_ticks(&format!("9 (chat) {}", fields.join(" "))),
+            None
+        );
+    }
+
+    #[test]
+    fn diagnostic_child_parts_do_not_let_parent_compensate_for_missing_history() {
+        let text = |size: usize| {
+            Arc::new(super::super::Item {
+                id: "diagnostic".into(),
+                role: super::super::Role::Assistant,
+                started_at: None,
+                at: None,
+                content: super::super::ItemContent::Text {
+                    text: "x".repeat(size),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+            })
+        };
+        let mut snapshot = Snapshot {
+            items: vec![text(3 * 1024 * 1024)],
+            ..Default::default()
+        };
+        assert_eq!(initial_payload_parts(&snapshot), (3 * 1024 * 1024, 0, 0, 0));
+        let child = |size| super::super::Subagent {
+            id: "child".into(),
+            kind: "Agent".into(),
+            description: String::new(),
+            status: super::super::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items: vec![text(size)],
+        };
+        snapshot.subagents = vec![child(65536), child(1)];
+        assert_eq!(
+            initial_payload_parts(&snapshot),
+            (3 * 1024 * 1024, 2, 65537, 1)
+        );
+    }
 
     #[test]
     fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
