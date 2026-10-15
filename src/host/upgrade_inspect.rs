@@ -161,6 +161,9 @@ fn inspect(request: Request) -> Result<(), String> {
         .proof
         .as_ref()
         .ok_or("Source service proof is unavailable")?;
+    let matched_cli = crate::companion::Product::Cli
+        .beside_current()
+        .map_err(|_| "Cannot qualify the destination console companion")?;
     let mut ids = HashSet::new();
     for session in &inventory {
         if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
@@ -169,8 +172,20 @@ fn inspect(request: Request) -> Result<(), String> {
                 session.id
             ));
         }
+        if let Some(terminal) = &session.terminal {
+            qualify_console_migration(terminal, &matched_cli).map_err(|reason| {
+                format!("Source conversation {}: {reason}. Source windows remain usable", session.id)
+            })?;
+        }
         validate_live_chat(session, request.require_resumable)
             .map_err(|_| format!("Source conversation {} has no qualified immutable migration; reconnect or close it before updating. Source windows remain usable", session.id))?;
+    }
+    for terminal in &terminals {
+        if !terminal_ended(&terminal.session) {
+            qualify_console_migration(&terminal.session, &matched_cli).map_err(|reason| {
+                format!("Source terminal {}: {reason}. Source windows remain usable", terminal.session.id)
+            })?;
+        }
     }
     for (card, kind) in saved {
         check_deadline(deadline)?;
@@ -237,6 +252,23 @@ fn terminal_ended(session: &crate::model::TerminalSession) -> bool {
     )
 }
 
+/// A console's issued recipe is not permission to replay a different installed
+/// CLI. Even an unchanged path cannot prove that its existing ControlClient
+/// survives the source daemon stopping. Defer until an exact, typed migration
+/// route qualifies both the accepted console and its retained provider.
+fn qualify_console_migration(
+    terminal: &crate::model::TerminalSession,
+    matched_cli: &Path,
+) -> Result<(), &'static str> {
+    if crate::agent_execution::console_agent(&terminal.launch).is_none() {
+        return Ok(());
+    }
+    if Path::new(&terminal.launch.program) != matched_cli {
+        return Err("its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet");
+    }
+    Err("its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet")
+}
+
 // A foreground process hint is an observation of the retained PTY, not an
 // issued launch or a choice of provider/thread to resume. Match the exact
 // complete proof and all immutable fields across Live/Detached presentation.
@@ -301,6 +333,35 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[test]
+    fn accepted_console_migration_defers_even_when_the_cli_path_is_unchanged() {
+        let matched = Path::new("/installed/new/bin/cagents");
+        let recipe = crate::model::LaunchRecipe {
+            program: matched.to_string_lossy().into_owned(),
+            arguments: vec!["agent".into(), "console".into(), crate::model::AgentId::new().to_string()],
+            working_directory: "/private-directory".into(),
+            environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
+            unset_environment: Default::default(),
+        };
+        let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(), recipe, None,
+        ).session;
+        let same_path = qualify_console_migration(&terminal, matched).unwrap_err();
+        assert!(same_path.contains("no qualified reconnection"));
+        terminal.launch.program = "/installed/old/bin/cagents".into();
+        let older = qualify_console_migration(&terminal, matched).unwrap_err();
+        assert!(older.contains("different matched CLI installation"));
+        for error in [same_path, older] {
+            assert!(!error.contains("private-directory"));
+            assert!(!error.contains("never-print-this"));
+            assert!(!error.contains("/installed"));
+        }
+        terminal.launch.arguments = vec!["--login".into()];
+        assert!(qualify_console_migration(&terminal, matched).is_ok());
+        terminal.launch.arguments = vec!["--remote".into(), "unix://owned-listener".into(), "resume".into(), "exact-thread".into()];
+        assert!(qualify_console_migration(&terminal, matched).is_ok());
+    }
 
     #[test]
     fn archived_panes_require_typed_history_and_never_hide_unclaimed_live_panes() {
