@@ -1090,13 +1090,6 @@ fn open_directory_sync_handle(root: &fs_safety::Root) -> io::Result<fs::File> {
 }
 
 impl RecoveryDirectoryFrontier {
-    #[cfg(test)]
-    fn new(root: &fs_safety::Root) -> Self {
-        Self::new_with_recovery(
-            &LiveDiscardRecovery::default(),
-            &crate::filesystem_recovery_context::fixtures::fixture_context(root).unwrap(),
-        )
-    }
     fn new_with_recovery(
         live: &LiveDiscardRecovery,
         context: &crate::filesystem_recovery_context::FilesystemRecoveryContext,
