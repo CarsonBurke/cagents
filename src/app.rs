@@ -4239,6 +4239,10 @@ pub enum Message {
         request: DelegateRequestId,
         result: Result<Option<Vec<PathBuf>>, String>,
     },
+    WorktreeLinearResolved {
+        id: crate::model::OperationId,
+        result: Result<crate::linear::IssuePreview, String>,
+    },
     WorktreeBranchChanged(String),
     WorktreeBaseChanged(String),
     WorktreeDestinationChanged(String),
@@ -11272,8 +11276,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -15432,11 +15439,9 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::WorktreeBranchChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog {
-                    dialog.edit(WorktreeField::Branch, value);
-                }
-                Task::none()
+            Message::WorktreeBranchChanged(value) => self.edit_worktree_branch(value),
+            Message::WorktreeLinearResolved { id, result } => {
+                self.finish_worktree_linear(id, result)
             }
             Message::WorktreeBaseChanged(value) => {
                 if let Some(dialog) = &mut self.worktree_dialog {
