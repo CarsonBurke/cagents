@@ -1777,25 +1777,28 @@ impl Claude {
             }
             self.remember_retracted(carrier);
         }
-        for id in ids.iter().chain(child_ids.values().flatten()) {
-            if ids.contains(id) {
-                self.tools.remove(None, id);
-            }
-            for (parent, children) in &child_ids {
-                if children.contains(id) {
-                    self.tools.remove(Some(parent), id);
-                }
+        for id in &ids {
+            self.tools.remove(None, id);
+        }
+        for (parent, children) in &child_ids {
+            for id in children {
+                self.tools.remove(Some(parent), id);
             }
         }
-        self.blocks.retain(|(parent, _, _), item| {
-            if parent.is_empty() {
-                !ids.contains(&item.id)
-            } else {
-                !child_ids
-                    .get(parent)
-                    .is_some_and(|ids| ids.contains(&item.id))
-            }
-        });
+        {
+            let removed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let removed_children: HashMap<&str, HashSet<&str>> = child_ids.iter()
+                .map(|(parent, ids)| (parent.as_str(), ids.iter().map(String::as_str).collect()))
+                .collect();
+            self.blocks.retain(|(parent, _, _), item| {
+                if parent.is_empty() {
+                    !removed.contains(item.id.as_str())
+                } else {
+                    !removed_children.get(parent.as_str())
+                        .is_some_and(|ids| ids.contains(item.id.as_str()))
+                }
+            });
+        }
         self.recount_blocks();
         if !ids.is_empty() {
             step.events.push(Event::ItemsRemoved { ids });
@@ -8959,6 +8962,26 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::ItemsRemoved { .. }))
         );
+    }
+
+    #[test]
+    fn retracting_one_native_child_tool_keeps_same_id_parent_and_sibling_cache_owners() {
+        let mut adapter = Claude::default();
+        for parent in [None, Some("one"), Some("two")] {
+            let carrier = parent.unwrap_or("parent");
+            let mut frame = json!({"type":"assistant","uuid":carrier,"message":{"id":carrier,"content":[{"type":"tool_use","id":"same-native-tool","name":"Opaque","input":{"owner":carrier}}]}});
+            if let Some(parent) = parent { frame["parent_tool_use_id"] = json!(parent); }
+            adapter.receive(frame).unwrap();
+        }
+        assert!(adapter.tools.get(None,"same-native-tool").is_some());
+        assert!(adapter.tools.get(Some("one"),"same-native-tool").is_some());
+        assert!(adapter.tools.get(Some("two"),"same-native-tool").is_some());
+        let retracted = adapter.receive(json!({"type":"assistant","uuid":"replacement","supersedes":["one"],"message":{"id":"replacement","content":"Updated child report"}})).unwrap();
+        assert!(adapter.tools.get(None,"same-native-tool").is_some());
+        assert!(adapter.tools.get(Some("one"),"same-native-tool").is_none());
+        assert!(adapter.tools.get(Some("two"),"same-native-tool").is_some());
+        assert!(retracted.events.iter().any(|event| matches!(event, Event::SubagentItemsRemoved { id, ids } if id=="one" && ids==&vec!["same-native-tool".to_owned()])));
+        assert!(!retracted.events.iter().any(|event| matches!(event, Event::ItemsRemoved { .. })));
     }
 
     #[test]
