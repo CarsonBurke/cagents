@@ -1967,21 +1967,28 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
         Err(error) if daemon_missing(&error) => {
             confirm_daemon_absent(&socket)?;
             Err(AppError::new(
-                "daemon_not_running", "The daemon is not running; omit --no-start to start it",
+                "daemon_not_running",
+                "The daemon is not running; omit --no-start to start it",
             ))
-        },
+        }
         Err(error) => Err(AppError::new("daemon_connection", error)),
     }
 }
 
 fn daemon_missing(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn confirm_daemon_absent(socket: &Path) -> Result<(), AppError> {
     match crate::daemon::HostLease::is_held_at(socket) {
         Ok(false) => Ok(()),
-        Ok(true) => Err(AppError::new("daemon_busy", "The daemon still owns its inventory lease but is not accepting connections; retry after startup or shutdown completes")),
+        Ok(true) => Err(AppError::new(
+            "daemon_busy",
+            "The daemon still owns its inventory lease but is not accepting connections; retry after startup or shutdown completes",
+        )),
         Err(error) => Err(AppError::new("daemon_connection", error)),
     }
 }
@@ -2020,9 +2027,16 @@ where
         }
     };
 
-    let stopping_daemon=matches!(&cli.command,TopCommand::Daemon{command:DaemonCommand::Stop{..}});
-    let no_start = stopping_daemon || cli.no_start || std::env::var("CAGENTS_NO_START")
-        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let stopping_daemon = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Stop { .. }
+        }
+    );
+    let no_start = stopping_daemon
+        || cli.no_start
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
@@ -2078,7 +2092,9 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.no_start { command.arg("--no-start"); }
+                if no_start && !cli.no_start {
+                    command.arg("--no-start");
+                }
                 command.args(&arguments[1..]);
                 crate::install_guard::sanitize_child_environment(&mut command);
                 let error = command.exec();
@@ -2100,7 +2116,7 @@ where
     ) {
         return match crate::device::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) if crate::device::daemon_absent(&error)=>{
+            Err(error) if crate::device::daemon_absent(&error) => {
                 crate::device::report_absent_bridge();
                 ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
             }
@@ -2113,8 +2129,11 @@ where
     if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
         if let Err(error) = crate::device::prepare() {
             if crate::device::daemon_absent(&error) {
-                if stopping_daemon {emit_success(cli.json,already_stopped());return ExitCode::SUCCESS;}
-                emit_error(cli.json,&AppError::new("daemon_not_running",error));
+                if stopping_daemon {
+                    emit_success(cli.json, already_stopped());
+                    return ExitCode::SUCCESS;
+                }
+                emit_error(cli.json, &AppError::new("daemon_not_running", error));
                 return ExitCode::FAILURE;
             }
             emit_error(cli.json, &AppError::new("device", error));
@@ -2582,7 +2601,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             if daemon_autostart_disabled() {
                 // Readiness still requires the matched protocol; a listener
                 // alone does not prove this daemon can serve CLI requests.
-                let _client=ControlClient::connect(&socket).map_err(protocol_error)?;
+                let _client = ControlClient::connect(&socket).map_err(protocol_error)?;
             }
             let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
             // Installers discard a successful start's output, but a daemon that
@@ -2659,13 +2678,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket = daemon_socket_path().map_err(|error|AppError::new("socket_path",error))?;
+            let socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let mut client = match ControlClient::connect(&socket) {
                 Ok(client) => client,
                 Err(ControlError::Connect(error)) if daemon_missing(&error) => {
                     confirm_daemon_absent(&socket)?;
                     return Ok(already_stopped());
-                },
+                }
                 Err(error) => return Err(protocol_error(error)),
             };
             let outcome = match confirm {
