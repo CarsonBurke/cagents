@@ -51,7 +51,7 @@ impl NativeActorRetirement {
             || !matches!(self.source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { protocol: 1 })
             || !self.source.has_valid_native_continuity()
             || self.confirmed_session.as_ref().is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
-            || self.source.launch.session_id.as_ref().is_some_and(|id| Some(id) != self.confirmed_session.as_ref())
+            || self.source.launch.session_id.as_ref().zip(self.confirmed_session.as_ref()).is_some_and(|(issued,confirmed)| issued != confirmed)
         {
             return Err("Retained actor retirement has invalid exact source or physical account identity".into());
         }
