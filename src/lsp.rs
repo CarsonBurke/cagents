@@ -9016,6 +9016,31 @@ mod tests {
     });}
 
     #[test]
+    fn restarted_server_cannot_claim_old_unopened_only_workspace_preview() { block_on(async {
+        let (_guard, worktree, file) = workspace();
+        let unopened = file.with_file_name("unopened.rs");
+        std::fs::write(&unopened, "foo\n").unwrap();
+        let uri = Url::from_file_path(&unopened).unwrap();
+        let mut manager = rust_manager();
+        let slot = install_fake(&mut manager, incremental_capabilities(), |_|vec![]);
+        let events = manager.events(); let doc = LspDocumentId(1);
+        manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "context\n");
+        let handle = handle_of(&slot).await; await_ready(&events, doc).await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":602,"method":"workspace/applyEdit","params":{"edit":{"changes":{uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}]}}}}))).unwrap();
+        let id = next_matching(&events, |event|match event { LspEvent::ApplyWorkspaceEdit { id, edit, .. } => {
+            assert_eq!(edit.documents.len(), 1); assert_eq!(edit.documents[0].observed_version, None); Some(*id)
+        }, _ => None }).await;
+        let before = manager.document_version(doc).unwrap();
+        // No await: the old protocol request is still admitted while restart
+        // retires its exact origin and re-registers the same document ID.
+        manager.restart(doc);
+        assert!(manager.document_version(doc).unwrap() > before);
+        assert!(manager.claim_workspace_edit(id).unwrap_err().contains("server retired"));
+        assert_eq!(std::fs::read_to_string(&unopened).unwrap(), "foo\n");
+        manager.begin_shutdown().await;
+    }); }
+
+    #[test]
     fn cross_file_rename_flushes_other_buffers_inside_their_debounce_window(){block_on(async{
         let (_guard,worktree,file)=workspace();let other=file.with_file_name("other.rs");let other_uri=Url::from_file_path(&other).unwrap();
         let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":true}),|request|if request.method=="textDocument/rename"{vec![json!({"jsonrpc":"2.0","id":request.id,"result":null})]}else{vec![]});
