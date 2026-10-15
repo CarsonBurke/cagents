@@ -21548,6 +21548,10 @@ mod tests {
             for card in [repository, pr] {
                 let (mut runtime, _) =
                     RepositoryRuntime::diff_snapshot_fixture(card, "source.rs", before, after);
+                // The fixture starts from an editable document before becoming
+                // a read-only diff. Discard that stale editor-open intent so
+                // settling diff tasks cannot discover or launch a real LSP.
+                drop(runtime.take_lsp_intents());
                 runtime.descriptor.repository = directory.path().join(".git");
                 runtime.descriptor.worktree = directory.path().to_path_buf();
                 runtime.set_diff_surface_visible(true);
