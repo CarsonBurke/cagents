@@ -2154,6 +2154,9 @@ pub struct SettingsSaved {
     generation: u64,
     path: PathBuf,
     settings: AppSettings,
+    desired: AppSettings,
+    reload_error: Option<String>,
+    observed_at: Instant,
     backup: Option<PathBuf>,
     reset: Option<u64>,
 }
@@ -2175,26 +2178,34 @@ impl SettingsSave {
                 .save_window_view(&value)
                 .map_err(|error| error.to_string())?;
         }
-        let backup = if let Some(reset) = self.reset {
+        let (backup, observed) = if let Some(reset) = self.reset {
             if let Some(backup) = lane.as_ref().filter(|saved| saved.reset == Some(reset)).and_then(|saved| saved.backup.clone()) {
                 settings::save(&self.path, &self.desired).map_err(|error| error.to_string())?;
-                Some(backup)
+                (Some(backup), settings::load_live_observed(&self.path))
             } else {
-                Some(if self.reset_keys.is_empty() {
+                let backup = if self.reset_keys.is_empty() {
                     settings::reset_with_backup(&self.path, &self.desired)
                 } else {
                     settings::reset_keys_with_backup(&self.path, &self.desired, &self.reset_keys)
-                }.map_err(|error| error.to_string())?)
+                }.map_err(|error| error.to_string())?;
+                (Some(backup), settings::load_live_observed(&self.path))
             }
         } else {
-            let base = lane.as_ref().map_or(&self.base, |saved| &saved.settings);
-            settings::save_merged(&self.path, base, &self.desired).map_err(|error| error.to_string())?;
-            None
+            let base = lane.as_ref().map_or(&self.base, |saved| &saved.desired);
+            let saved = settings::save_merged_observed(&self.path, base, &self.desired).map_err(|error| error.to_string())?;
+            (None, settings::LiveSettings { result: saved.reload_error.map_or(Ok(saved.settings), Err), observed_at: saved.observed_at })
+        };
+        let (settings, reload_error) = match observed.result {
+            Ok(settings) => (settings, None),
+            Err(error) => (self.desired.clone(), Some(error)),
         };
         let saved = SettingsSaved {
             generation: self.generation,
             path: self.path,
-            settings: self.desired,
+            settings,
+            desired: self.desired,
+            reload_error,
+            observed_at: observed.observed_at,
             backup,
             reset: self.reset,
         };
@@ -4563,7 +4574,7 @@ pub enum Message {
     ResetSettingsCategory(SettingsCategory),
     OpenSettingsFile { reveal: bool },
     SettingsFileOpened(Result<(), String>),
-    SettingsReloaded(Result<AppSettings, String>),
+    SettingsReloaded(settings::LiveSettings),
     UndoSettingsReset,
     ConfirmResetSettings,
     CancelResetSettings,
@@ -5104,6 +5115,7 @@ pub struct Cagents {
     core: Core,
     settings_path: Option<PathBuf>,
     settings_reload_error: Option<String>,
+    settings_observed_at: Option<Instant>,
     settings_backup: Option<PathBuf>,
     settings_write_blocked: bool,
     /// Bounded notice history, fed from `status` at the end of every `update`.
@@ -12443,24 +12455,28 @@ impl Cagents {
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
-        if saved.generation >= self.settings_ack_generation {
-            if let Some(backup) = saved.backup.clone() { self.settings_backup = Some(backup); }
-            self.settings_ack_generation = saved.generation;
-            self.settings_base = saved.settings;
-            self.settings_path = Some(saved.path);
-            if self
-                .settings_reset_generation
-                .is_some_and(|generation| saved.generation >= generation)
-            {
-                self.settings_reset_generation = None;
-            }
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> Task<Message> {
+        if saved.generation < self.settings_ack_generation { return Task::none(); }
+        if let Some(backup) = saved.backup.clone() { self.settings_backup = Some(backup); }
+        self.settings_ack_generation = saved.generation;
+        self.settings_path = Some(saved.path);
+        if self.settings_reset_generation.is_some_and(|generation| saved.generation >= generation) {
+            self.settings_reset_generation = None;
         }
+        // The save's UI snapshot is the baseline for edits made while it ran;
+        // actual merged values may include a different window's preferences.
+        if saved.reload_error.is_some() && self.settings_observed_at.is_none_or(|last| saved.observed_at >= last) {
+            self.settings_base = saved.desired.clone();
+        }
+        self.apply_observed_settings(settings::LiveSettings {
+            result: saved.reload_error.map_or(Ok(saved.settings), Err), observed_at: saved.observed_at
+        }, Some(saved.desired))
     }
 
     fn save_settings_now(&mut self) -> Result<(), String> {
         let saved = self.capture_settings_save()?.run()?;
-        self.acknowledge_settings_save(saved);
+        // Synchronous persistence is used only while exiting the application.
+        drop(self.acknowledge_settings_save(saved));
         Ok(())
     }
 
@@ -12918,8 +12934,15 @@ impl Cagents {
         iced::widget::operation::focus(target).map(cosmic::Action::App)
     }
 
-    fn reload_settings(&mut self, result: Result<AppSettings, String>) -> Task<Message> {
-        match result {
+    fn reload_settings(&mut self, observed: settings::LiveSettings) -> Task<Message> {
+        self.apply_observed_settings(observed, None)
+    }
+
+    fn apply_observed_settings(&mut self, observed: settings::LiveSettings, pending_base: Option<AppSettings>) -> Task<Message> {
+        if self.settings_observed_at.is_some_and(|last| observed.observed_at < last) { return Task::none(); }
+        self.settings_observed_at = Some(observed.observed_at);
+        let observed_at = observed.observed_at;
+        match observed.result {
             Err(error) => {
                 self.status = Some(TransientNotice::error("Could not reload settings.toml; your working settings are still active.").key("settings-reload").details(error.clone()));
                 self.settings_reload_error = Some(error);
@@ -12936,9 +12959,9 @@ impl Cagents {
                 self.settings_write_blocked = false;
                 // Keep local changes that are still waiting for their save lane;
                 // this avoids an external write racing a debounced UI edit.
-                let next = match settings::merge_live(&self.settings_base, &self.settings, &loaded) {
+                let next = match settings::merge_live(pending_base.as_ref().unwrap_or(&self.settings_base), &self.settings, &loaded) {
                     Ok(next) => next,
-                    Err(error) => return self.reload_settings(Err(error.to_string())),
+                    Err(error) => return self.reload_settings(settings::LiveSettings { result: Err(error.to_string()), observed_at }),
                 };
                 self.settings_base = loaded;
                 let previous = std::mem::replace(&mut self.settings, next);
@@ -13201,6 +13224,7 @@ impl Application for Cagents {
             window_height: 900.0,
             settings_path,
             settings_reload_error: status.clone(),
+            settings_observed_at: None,
             settings_backup: None,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -15047,24 +15071,23 @@ impl Application for Cagents {
                 Task::batch([drafts, open])
             }
             Message::NewWindowOpened { saved, result } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let settings = saved.map_or_else(|_| Task::none(), |saved| self.acknowledge_settings_save(saved));
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
                 }
-                Task::none()
+                settings
             }
             Message::SettingsSaved { generation, result } => {
+                let mut settings = Task::none();
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
                             self.notices.resolve("settings-save");
                         }
-                        self.acknowledge_settings_save(saved);
+                        settings = self.acknowledge_settings_save(saved);
                     }
                     Err(error) if generation >= self.settings_ack_generation => {
                         self.status = Some(TransientNotice::warning("Could not save settings.").key("settings-save").details(error.clone()));
@@ -15073,7 +15096,7 @@ impl Application for Cagents {
                     Err(_) => {}
                 }
                 self.refresh_settings_feedback();
-                Task::none()
+                settings
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
@@ -15167,7 +15190,7 @@ impl Application for Cagents {
                 result,
             } => {
                 if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
+                    drop(self.acknowledge_settings_save(saved));
                 }
                 if generation != self.update_generation || !self.update_prepared {
                     let _ =
@@ -16483,14 +16506,16 @@ impl Application for Cagents {
                     let result = tokio::task::spawn_blocking(move || {
                         let mut saved = lane.lock().map_err(|_| "Settings save lane unavailable".to_owned())?;
                         settings::restore_backup(&path, backup).map_err(|error| error.to_string())?;
-                        let result = settings::load_live(&path);
+                        let result = settings::load_live_observed(&path);
                         // Captured saves from before Undo cannot rewrite the
                         // restored bytes after this lock is released.
                         *saved = Some(SettingsSaved { generation, path,
-                            settings: result.as_ref().unwrap_or(&fallback).clone(),
+                            settings: result.result.as_ref().unwrap_or(&fallback).clone(),
+                            desired: result.result.as_ref().unwrap_or(&fallback).clone(), reload_error: result.result.as_ref().err().cloned(), observed_at: result.observed_at,
                             backup: None, reset: None });
-                        result
-                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                        Ok::<_, String>(result)
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result)
+                        .unwrap_or_else(|error| settings::LiveSettings::now(Err(error)));
                     Message::SettingsReloaded(result)
                 })
             }
@@ -19758,17 +19783,92 @@ mod tests {
         }
         first.settings.terminal_font_size = 21.0;
         first.save_settings_now().unwrap();
-        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        drop(second.update(Message::SettingsReloaded(settings::load_live_observed(&path))));
         assert_eq!(second.settings.terminal_font_size, 21.0);
         std::fs::write(&path, "schema_version = 3\nterminal_font_size = -5\n").unwrap();
-        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        drop(second.update(Message::SettingsReloaded(settings::load_live_observed(&path))));
         assert_eq!(second.settings.terminal_font_size, 21.0);
         assert!(second.settings_reload_error.is_some());
         assert!(second.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reload")));
         settings::save(&path, &first.settings).unwrap();
-        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        drop(second.update(Message::SettingsReloaded(settings::load_live_observed(&path))));
         assert!(second.settings_reload_error.is_none());
         assert!(!second.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reload")));
+    }
+
+    #[test]
+    fn settings_late_save_ack_never_replaces_a_newer_external_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        app.settings.terminal_font_size = 18.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_family = "monospace".into();
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        drop(app.acknowledge_settings_save(saved));
+        external.terminal_font_family = "Different mono".into();
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings.terminal_font_family, "Different mono");
+        assert_eq!(app.settings_base.terminal_font_family, "Different mono");
+    }
+
+    #[test]
+    fn settings_save_ack_applies_merged_values_and_retains_later_local_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let stale = settings::load_live_observed(&path);
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_family = "monospace".into();
+        settings::save(&path, &external).unwrap();
+        app.settings.terminal_font_size = 18.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(saved.settings.terminal_font_family, "monospace");
+        app.settings.terminal_font_size = 20.0;
+        drop(app.acknowledge_settings_save(saved));
+        drop(app.reload_settings(stale));
+        assert_eq!(app.settings.terminal_font_size, 20.0);
+        assert_eq!(app.settings.terminal_font_family, "monospace");
+        app.save_settings_now().unwrap();
+        let persisted = settings::load_live(&path).unwrap();
+        assert_eq!(persisted.terminal_font_size, 20.0);
+        assert_eq!(persisted.terminal_font_family, "monospace");
+    }
+
+    #[test]
+    fn settings_stale_invalid_snapshot_cannot_restore_a_resolved_banner() {
+        let mut app = context_inspector_test_app(false);
+        let invalid = settings::LiveSettings::now(Err("invalid TOML".into()));
+        let valid = settings::LiveSettings::now(Ok(app.settings.clone()));
+        drop(app.reload_settings(valid));
+        drop(app.reload_settings(invalid));
+        assert!(app.settings_reload_error.is_none());
+    }
+
+    #[test]
+    fn settings_category_reset_keeps_undo_when_another_category_remains_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        std::fs::write(&path, "schema_version = 3\nterminal_font_size = -5\n").unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        app.settings_reset_keys = vec!["chat_enter_sends".into()];
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        assert!(app.settings_backup.as_ref().is_some_and(|backup| backup.exists()));
+        assert!(app.settings_reload_error.is_some());
     }
 
     #[test]
@@ -19783,7 +19883,7 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         app.settings_reset_generation = Some(app.settings_save_generation + 1);
         let saved = app.capture_settings_save().unwrap().run().unwrap();
-        app.acknowledge_settings_save(saved);
+        drop(app.acknowledge_settings_save(saved));
         let backup = app.settings_backup.as_ref().unwrap();
         assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
         settings::restore_backup(&path, backup).unwrap();
@@ -19803,9 +19903,9 @@ mod tests {
         let newer = app.capture_settings_save().unwrap();
         let newer_ack = newer.run().unwrap();
         let older_ack = older.run().unwrap();
-        app.acknowledge_settings_save(newer_ack);
+        drop(app.acknowledge_settings_save(newer_ack));
         app.settings.terminal_font_size = 22.0;
-        app.acknowledge_settings_save(older_ack);
+        drop(app.acknowledge_settings_save(older_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, 20.0);
         assert_eq!(app.settings.terminal_font_size, 22.0);
         app.save_settings_now().unwrap();
@@ -19826,8 +19926,8 @@ mod tests {
         let second = app.capture_settings_save().unwrap();
         let first_ack = first.run().unwrap();
         let second_ack = second.run().unwrap();
-        app.acknowledge_settings_save(second_ack);
-        app.acknowledge_settings_save(first_ack);
+        drop(app.acknowledge_settings_save(second_ack));
+        drop(app.acknowledge_settings_save(first_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
     }
 
@@ -19860,7 +19960,7 @@ mod tests {
         app.settings_invalid.insert(field, "Enter a valid number".into());
         let mut external = app.settings.clone();
         external.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
-        drop(app.reload_settings(Ok(external)));
+        drop(app.reload_settings(settings::LiveSettings::now(Ok(external))));
         assert!(app.settings_draft.has_custom_terminal_theme);
         assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
     }
@@ -25695,6 +25795,7 @@ mod tests {
             core,
             settings_path: None,
             settings_reload_error: None,
+            settings_observed_at: None,
             settings_backup: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),

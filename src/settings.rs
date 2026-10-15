@@ -1882,6 +1882,24 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired).map(|_| ())
+}
+
+/// A save and its actual merged file contents, ordered while holding the file lock.
+#[derive(Clone, Debug)]
+pub struct SavedSettings {
+    pub settings: AppSettings,
+    pub reload_error: Option<String>,
+    pub observed_at: std::time::Instant,
+}
+
+pub fn save_merged_observed(path: impl AsRef<Path>, base: &AppSettings, desired: &AppSettings) -> Result<SavedSettings, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired)
+}
+
+fn save_merged_observed_unlocked(path: &Path, base: &AppSettings, desired: &AppSettings) -> Result<SavedSettings, SettingsError> {
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -1889,7 +1907,14 @@ pub fn save_merged(
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate()?;
+    save_unlocked(path, &settings)?;
+    // Unknown values are preserved by saving. A known-but-invalid foreign
+    // value in another category must keep its banner after this save too.
+    let loaded = load_unlocked(path)?;
+    let warnings: Vec<_> = loaded.set_aside().collect();
+    let reload_error = (!warnings.is_empty()).then(|| warnings.join("\n"));
+    Ok(SavedSettings { settings: loaded.settings, reload_error, observed_at: std::time::Instant::now() })
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -1962,9 +1987,34 @@ pub fn merge_live(base: &AppSettings, desired: &AppSettings, external: &AppSetti
 /// Live edits are atomic: a known setting that cannot be used rejects the whole
 /// edit, leaving the window's last working settings in force.
 pub fn load_live(path: impl AsRef<Path>) -> Result<AppSettings, String> {
-    let loaded = load_detailed(path).map_err(|error| error.to_string())?;
-    let warnings: Vec<_> = loaded.set_aside().collect();
-    if warnings.is_empty() { Ok(loaded.settings) } else { Err(warnings.join("\n")) }
+    load_live_observed(path).result
+}
+
+/// File reads may finish on a blocking thread in a different order from UI
+/// delivery. Stamp both valid and invalid snapshots inside the settings lock.
+#[derive(Clone, Debug)]
+pub struct LiveSettings {
+    pub result: Result<AppSettings, String>,
+    pub observed_at: std::time::Instant,
+}
+
+impl LiveSettings {
+    pub fn now(result: Result<AppSettings, String>) -> Self {
+        Self { result, observed_at: std::time::Instant::now() }
+    }
+}
+
+pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
+    let path = path.as_ref();
+    let result = (|| {
+        let _lock = settings_lock(path).map_err(|error| error.to_string())?;
+        let result = load_unlocked(path).map_err(|error| error.to_string()).and_then(|loaded| {
+            let warnings: Vec<_> = loaded.set_aside().collect();
+            if warnings.is_empty() { Ok(loaded.settings) } else { Err(warnings.join("\n")) }
+        });
+        Ok::<_, String>(LiveSettings::now(result))
+    })();
+    result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
 }
 
 /// Save a byte-for-byte recovery copy before resetting any preferences.
