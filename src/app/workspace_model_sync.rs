@@ -394,6 +394,28 @@ impl Cagents {
     }
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
+        self.apply_workspace_model_update_effect(update).0
+    }
+
+    /// A sequence may already have been folded from AgentsChanged or an
+    /// unranked CreateChannel. Only a complete equal snapshot is redundant;
+    /// acknowledgements and connection/reopen transitions always progress.
+    pub(super) fn apply_workspace_model_update_effect(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, bool) {
+        if let ModelUpdate::Read(model) = &update {
+            if (model.identity == self.workspace_model.identity
+                && model.sequence < self.workspace_model.sequence)
+                || model == &self.workspace_model
+            {
+                return (Task::none(), false);
+            }
+        }
+        (self.apply_workspace_model_update_inner(update), true)
+    }
+
+    fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(

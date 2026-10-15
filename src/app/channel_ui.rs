@@ -849,6 +849,11 @@ impl Cagents {
         }) else {
             return;
         };
+        if self.durable.channels[index].title == title
+            && self.durable.channels[index].title_source == source
+        {
+            return;
+        }
         let id = self.durable.channels[index].id;
         Arc::make_mut(&mut self.durable).channels[index].title = title.clone();
         Arc::make_mut(&mut self.durable).channels[index].title_source = source;
