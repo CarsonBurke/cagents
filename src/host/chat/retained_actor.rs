@@ -193,10 +193,12 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
                 let current = state.terminals.get(&terminal.id).filter(|current|
                     current.handle.holder_identity() == Some(owner)
                     && current.session.launch == terminal.launch
-                    && current.session.owned_codex_listener == terminal.owned_codex_listener
-                    && current.session.continuity.live_proof().as_ref() == Some(proof))
+                    && current.session.owned_codex_listener == terminal.owned_codex_listener)
                     .ok_or("The retained Claude console's exact worker could not be recovered; provider ownership was preserved")?;
-                *terminal = current.session.clone();
+                *terminal = state.native_terminal_projection(terminal.id)?;
+                if terminal.continuity.live_proof().as_ref() != Some(proof) {
+                    return Err("The retained Claude console belongs to a different daemon owner".into());
+                }
                 Some(current.handle.clone())
             }
             _ => return Err("The retained Claude pair lacks exact worker evidence; no pair was released".into()),
@@ -228,7 +230,9 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&record.session.terminal, &paired) {
         (None, None) => true,
-        (Some(terminal), Some(handle)) => state.terminals.get(&terminal.id).is_some_and(|current| current.session == *terminal && current.handle.same_worker(handle)),
+        (Some(terminal), Some(handle)) => state.terminals.get(&terminal.id).is_some_and(|current|
+            current.handle.same_worker(handle)
+                && state.native_terminal_projection(terminal.id).as_ref() == Ok(terminal)),
         _ => false,
     };
     if state.shutting_down || state.proof() != proof || !pair_unchanged {

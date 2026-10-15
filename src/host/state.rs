@@ -1141,6 +1141,20 @@ impl HostState {
         self.detach(0, source.id)
     }
 
+    /// Typed native recovery may inspect this authenticated current worker
+    /// before its durable native-console association has been installed.
+    pub(super) fn native_terminal_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
+        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
+        if terminal.handle.is_completed() || !self.proof().is_complete() {
+            return Err("The native console worker completed or its current ownership is unavailable".into());
+        }
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        Ok(current)
+    }
+
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
