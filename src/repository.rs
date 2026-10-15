@@ -24,11 +24,11 @@ use std::{
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
-pub use pr_creation::PrWorktreeCreationConsent;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
     PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
 };
+pub use pr_creation::PrWorktreeCreationConsent;
 
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
@@ -10940,7 +10940,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
         self.create_worktree_journaled_with_pr_consent(
-            store, request, None, generation, cancellation, progress,
+            store,
+            request,
+            None,
+            generation,
+            cancellation,
+            progress,
         )
     }
 
@@ -10957,7 +10962,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
         self.create_worktree_journaled_with_pr_consent(
-            store, request, Some(consent), generation, cancellation, progress,
+            store,
+            request,
+            Some(consent),
+            generation,
+            cancellation,
+            progress,
         )
     }
 
@@ -11013,9 +11023,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(consent) = consent {
             if let Err(error) = consent.validate_request(&journal.request) {
                 emit(WorktreeProgressStage::Finished);
-                let detail = format!("PR checkout consent changed: {error}; prepare checkout again");
+                let detail =
+                    format!("PR checkout consent changed: {error}; prepare checkout again");
                 let failure = process_failure(
-                    &CommandSpec::new(&self.git), ProcessFailureKind::Io, &detail, false,
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Io,
+                    &detail,
+                    false,
                 );
                 let mut report = failure_report(WorktreeOperationState::NotCreated, detail);
                 report.outcome = Some(WorktreeCreationOutcome::NotCreated { failure });
@@ -11089,7 +11103,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .into());
             }
             if let Some(consent) = &journal.pr_checkout {
-                if journal.existing_branch_oid.as_deref()
+                if journal
+                    .existing_branch_oid
+                    .as_deref()
                     .is_some_and(|oid| oid != consent.expected_head().as_str())
                 {
                     return Err(ValidationError::InvalidBranch(
@@ -11132,7 +11148,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
             if let Some(consent) = &journal.pr_checkout {
-                self.fetch_reviewed_pr_creation_head(&journal.request, consent, &lease, cancellation)?;
+                self.fetch_reviewed_pr_creation_head(
+                    &journal.request,
+                    consent,
+                    &lease,
+                    cancellation,
+                )?;
             } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
                 let remotes = self.remotes(&journal.request.repository, cancellation)?;
                 let (remote, branch) = remotes
@@ -11214,7 +11235,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     }
                 }
             }
-            if journal.pr_checkout.as_ref()
+            if journal
+                .pr_checkout
+                .as_ref()
                 .is_some_and(|consent| oid != consent.expected_head().as_str())
             {
                 return Err(ValidationError::InvalidBase(
@@ -11507,11 +11530,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if residual.branch_exists && owned && admin_dir.is_some() {
             if let Some(consent) = &journal.pr_checkout {
                 if let Err(error) = self.reviewed_pr_creation_endpoint(
-                    &journal.request, consent, &CancellationToken::new(),
+                    &journal.request,
+                    consent,
+                    &CancellationToken::new(),
                 ) {
                     journal.state = WorktreeOperationState::OutcomeUnknown;
-                    journal.detail = format!("PR checkout source changed before settlement: {error}; inspect the retained worktree");
-                    journal.outcome = Some(WorktreeCreationOutcome::OutcomeUnknown { failure, residual });
+                    journal.detail = format!(
+                        "PR checkout source changed before settlement: {error}; inspect the retained worktree"
+                    );
+                    journal.outcome =
+                        Some(WorktreeCreationOutcome::OutcomeUnknown { failure, residual });
                     return;
                 }
             }
@@ -11755,7 +11783,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 ));
             } else {
                 reports.push(self.guard_created_pr_checkout_report(
-                    &journal, journal.report(operation.created_at_unix_ms),
+                    &journal,
+                    journal.report(operation.created_at_unix_ms),
                 ));
             }
         }
