@@ -210,10 +210,13 @@ fn publish_with_hooks(
         // create_temporary_in deliberately returns O_WRONLY. Authenticate a
         // separate no-follow read descriptor against that exact written inode
         // before hashing; cloning the write-only FD would fail with EBADF.
-        let readable = fs_safety::open_beneath(&holding.root, Path::new(&temporary_name)).map_err(resolve_error)?;
+        let readable = fs_safety::open_beneath(&holding.root, Path::new(&temporary_name))
+            .map_err(resolve_error)?;
         let written = temporary.metadata().map_err(io_error)?;
         let opened = readable.metadata().map_err(io_error)?;
-        if !same_file(&written, &opened) || full_version(&written) != full_version(&opened) { return Err(changed()); }
+        if !same_file(&written, &opened) || full_version(&written) != full_version(&opened) {
+            return Err(changed());
+        }
         let mut prepared = SaveBaseline::capture(&readable, Some(blake3::hash(bytes)))?;
         prepared.hash_limit = bytes.len() as u64;
         temporary_baseline = Some(prepared);
