@@ -36,6 +36,43 @@ pub(super) fn guard(db: &Connection) -> Result<(), String> {
     if pending(db)? { return Err(UNAVAILABLE.into()); }
     Ok(())
 }
+/// Ordinary transcript ingestion may deliberately use synchronous=OFF. Reset
+/// admission is different: both commits must reach the disk before restoring
+/// that cache policy. EXTRA also synchronizes DELETE journal removal; in WAL
+/// it has FULL semantics. No journal-less/in-memory database can claim this.
+fn durable<T>(db: &mut Connection, action: impl FnOnce(&mut Connection)->Result<T,String>) -> Result<T,String> {
+    if !db.is_autocommit() { return Err("Conversation Reset requires its own durability boundary".into()); }
+    let journal: String = db.pragma_query_value(None,"journal_mode",|row|row.get(0)).map_err(error)?;
+    if !matches!(journal.to_ascii_lowercase().as_str(),"wal"|"delete"|"truncate"|"persist") {
+        return Err("Conversation Reset requires a persistent rollback journal or WAL; no durable intent was recorded".into());
+    }
+    let previous: i64 = db.pragma_query_value(None,"synchronous",|row|row.get(0)).map_err(error)?;
+    if !(0..=3).contains(&previous) { return Err("Conversation Reset could not establish the cache synchronization policy".into()); }
+    db.pragma_update(None,"synchronous",3).map_err(error)?;
+    let established: i64 = db.pragma_query_value(None,"synchronous",|row|row.get(0)).map_err(error)?;
+    if established!=3 { return Err("Conversation Reset durability admission was refused".into()); }
+    let result=action(db);
+    // The action has returned/dropped both transactions before this pragma.
+    // A panic retains EXTRA and the local unavailable gate; it cannot weaken
+    // durability or acknowledge the Reset while unwinding.
+    let restored=db.pragma_update(None,"synchronous",previous).map_err(error).and_then(|()| {
+        let actual: i64=db.pragma_query_value(None,"synchronous",|row|row.get(0)).map_err(error)?;
+        if actual!=previous { return Err("Cache synchronization policy restoration was refused".into()); }
+        Ok(())
+    });
+    match (result,restored) {
+        (Ok(value),Ok(()))=>Ok(value),
+        (Err(cause),Ok(()))=>Err(cause),
+        (Ok(value),Err(cause))=>{
+            // The durable Reset already committed. Keep its exact new owner;
+            // a cache-policy restoration failure cannot resurrect old bodies
+            // or discard the receipt needed for future source writes.
+            tracing::warn!(reason=%crate::chat::protocol::preview(cause.as_bytes(),1024),"Cache synchronization policy could not be verified after durable Reset");
+            Ok(value)
+        },
+        (Err(cause),Err(restoration))=>Err(format!("{cause}; cache synchronization restoration also failed: {restoration}")),
+    }
+}
 impl Store {
     pub(super) fn source_guard(&self) -> Result<(), String> {
         if self.reset_pending { return Err(UNAVAILABLE.into()); }
@@ -75,30 +112,31 @@ impl Store {
         self.presentation = None;
         self.presented_generation = None;
         self.presented_children.clear();
-        let result = (|| -> Result<raw::State, String> {
+        let owner=self.raw_sources.nonce;
+        let result = durable(&mut self.db, |db| {
             {
-                let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
-                raw::guard_owner(&tx, self.raw_sources.nonce)?;
-                child_tools::reset_guard(&tx, self.raw_sources.nonce)?;
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+                raw::guard_owner(&tx, owner)?;
+                child_tools::reset_guard(&tx, owner)?;
                 let _already_pending = pending(&tx)?;
                 tx.execute("UPDATE transcript_reset_schema SET pending=1 WHERE singleton=1", []).map_err(error)?;
                 tx.commit().map_err(error)?;
             }
-            let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
-            raw::guard_owner(&tx, self.raw_sources.nonce)?;
-            child_tools::reset_guard(&tx, self.raw_sources.nonce)?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+            raw::guard_owner(&tx, owner)?;
+            child_tools::reset_guard(&tx, owner)?;
             if !pending(&tx)? { return Err("Conversation Reset admission disappeared".into()); }
-            child_tools::reset_in(&tx, self.raw_sources.nonce)?;
-            source::reset_in(&tx, self.raw_sources.nonce)?;
-            file_changes::reset_in(&tx, self.raw_sources.nonce)?;
+            child_tools::reset_in(&tx, owner)?;
+            source::reset_in(&tx, owner)?;
+            file_changes::reset_in(&tx, owner)?;
             tx.execute("DELETE FROM items", []).map_err(error)?;
             // Rotate the owner LAST; every earlier namespace checks the same
             // admitted owner while this transaction remains unpublished.
-            let raw = raw::reset_in(&tx, self.raw_sources.nonce)?;
+            let raw = raw::reset_in(&tx, owner)?;
             tx.execute("UPDATE transcript_reset_schema SET pending=0 WHERE singleton=1", []).map_err(error)?;
             tx.commit().map_err(error)?;
             Ok(raw)
-        })();
+        });
         let raw = result.map_err(|cause| format!("{UNAVAILABLE}: {cause}"))?;
         self.raw_sources = raw;
         self.reset_pending = false;
@@ -276,6 +314,81 @@ mod tests {
         assert_eq!(snapshot.source_incarnation,current.source_incarnation);
         assert!(snapshot.items.is_empty() && snapshot.raw_source_parts.is_empty());
         let _=handle.close();
+    }
+
+    #[test]
+    fn reset_commits_use_extra_then_restore_actual_cache_pragmas() {
+        for (journal,previous) in [("WAL",1_i64),("DELETE",0_i64)] {
+            let mut store=Store::new().unwrap();
+            store.db.pragma_update(None,"journal_mode",journal).unwrap();
+            store.db.pragma_update(None,"synchronous",previous).unwrap();
+            durable(&mut store.db,|db| {
+                assert_eq!(db.pragma_query_value(None,"synchronous",|row|row.get::<_,i64>(0)).unwrap(),3);
+                assert!(db.is_autocommit());
+                Ok(())
+            }).unwrap();
+            assert_eq!(store.db.pragma_query_value(None,"synchronous",|row|row.get::<_,i64>(0)).unwrap(),previous);
+            populate(&mut store);
+            store.db.execute_batch("CREATE TRIGGER fail_after_durable_intent BEFORE DELETE ON items BEGIN SELECT RAISE(FAIL,'interrupted clear');END;").unwrap();
+            assert!(store.apply(Event::Reset {reason:"failed durable reset".into()}).is_err());
+            assert!(pending(&store.db).unwrap());
+            assert_eq!(store.db.pragma_query_value(None,"synchronous",|row|row.get::<_,i64>(0)).unwrap(),previous);
+            store.db.execute_batch("DROP TRIGGER fail_after_durable_intent").unwrap();
+            store.apply(Event::Reset {reason:"retry".into()}).unwrap();
+            assert_eq!(store.db.pragma_query_value(None,"synchronous",|row|row.get::<_,i64>(0)).unwrap(),previous);
+            assert!(!pending(&store.db).unwrap());
+        }
+        let mut store=Store::new().unwrap();
+        populate(&mut store);
+        let before=counts(&store);
+        store.db.pragma_update(None,"journal_mode","OFF").unwrap();
+        assert!(store.apply(Event::Reset {reason:"unsupported durability".into()}).is_err());
+        assert_eq!(counts(&store),before);
+        assert!(!pending(&store.db).unwrap());
+        assert_unavailable(&mut store);
+    }
+
+    #[test]
+    fn reset_recovers_pending_intent_after_process_exit_under_actual_cache_modes() {
+        const ENV:&str="CAGENTS_RESET_CRASH_ROOT";
+        if let Some(root)=std::env::var_os(ENV) {
+            let root=PathBuf::from(root);
+            let mut store=Store::at(root.clone()).unwrap();
+            let mode=std::env::var("CAGENTS_RESET_CRASH_MODE").unwrap();
+            store.db.pragma_update(None,"journal_mode",if mode=="delete-off" {"DELETE"} else {"WAL"}).unwrap();
+            store.db.pragma_update(None,"synchronous",if mode=="delete-off" {0} else {1}).unwrap();
+            populate(&mut store);
+            let path:String=store.db.query_row("SELECT file FROM pragma_database_list WHERE name='main'",[],|r|r.get(0)).unwrap();
+            std::fs::write(root.join("database-path"),path).unwrap();
+            std::fs::write(root.join("body-counts"),serde_json::to_vec(&counts(&store)).unwrap()).unwrap();
+            unsafe extern "C" fn crash_mid_clear(kind:std::ffi::c_uint,_:*mut std::ffi::c_void,statement:*mut std::ffi::c_void,_:*mut std::ffi::c_void)->std::ffi::c_int {
+                if kind==rusqlite::ffi::SQLITE_TRACE_STMT as u32 {
+                    let sql=unsafe {rusqlite::ffi::sqlite3_sql(statement.cast())};
+                    if !sql.is_null() && unsafe {std::ffi::CStr::from_ptr(sql)}.to_bytes().starts_with(b"DELETE FROM raw_tool_chunks") {
+                        // The intent committed, but the shared reset Tx has
+                        // already deleted several namespaces and not committed.
+                        unsafe {libc::_exit(87)};
+                    }
+                }
+                0
+            }
+            assert_eq!(unsafe {rusqlite::ffi::sqlite3_trace_v2(store.db.handle(),rusqlite::ffi::SQLITE_TRACE_STMT as u32,Some(crash_mid_clear),std::ptr::null_mut())},rusqlite::ffi::SQLITE_OK);
+            let _=store.apply(Event::Reset {reason:"crash during clear".into()});
+            panic!("the actual shared transaction did not reach its crash seam");
+        }
+        for mode in ["delete-off","wal-normal"] {
+            let root=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::store::reset::tests::reset_recovers_pending_intent_after_process_exit_under_actual_cache_modes","--nocapture"]).env(ENV,root.path()).env("CAGENTS_RESET_CRASH_MODE",mode).output().unwrap();
+            assert_eq!(output.status.code(),Some(87),"nested {mode} crash seam must execute, stderr={}",String::from_utf8_lossy(&output.stderr));
+            let path=std::fs::read_to_string(root.path().join("database-path")).unwrap();
+            let expected:Vec<usize>=serde_json::from_slice(&std::fs::read(root.path().join("body-counts")).unwrap()).unwrap();
+            let mut db=Connection::open(path).unwrap();
+            assert!(pending(&db).unwrap(),"{mode} must recover the committed pending intent");
+            for (table,expected) in BODIES.iter().zip(expected) {
+                assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,usize>(0)).unwrap(),expected,"{mode} {table} must roll back the interrupted shared clear");
+            }
+            assert!(raw::initialize_with(&mut db,child_tools::initialize_in).is_err(),"process restart cannot rotate ownership past unresolved Reset");
+        }
     }
 
 }
