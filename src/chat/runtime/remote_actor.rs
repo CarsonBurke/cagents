@@ -2578,6 +2578,9 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 }
 
 #[cfg(test)]
+mod backend_binding_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     struct Fixture {
@@ -2675,44 +2678,12 @@ mod tests {
     }
     #[test]
     fn backend_binding_survives_lost_restart_reply_without_authorizing_same_handle_successor() {
-        const CHILD: &str = "CAGENTS_BACKEND_BINDING_RESTART_FIXTURE";
-        if std::env::var_os(CHILD).is_none() {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            for name in ["home", "run", "data", "config", "cache"] {
-                std::fs::create_dir(directory.path().join(name)).unwrap();
-            }
-            let output = std::fs::File::create(directory.path().join("child.log")).unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", thread::current().name().unwrap(), "--nocapture"])
-                .env_clear().env(CHILD, "1").env("HOME", directory.path().join("home"))
-                .env("XDG_RUNTIME_DIR", directory.path().join("run"))
-                .env("XDG_DATA_HOME", directory.path().join("data"))
-                .env("XDG_CONFIG_HOME", directory.path().join("config"))
-                .env("XDG_CACHE_HOME", directory.path().join("cache"))
-                .env("PATH", "/usr/bin:/bin")
-                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(40);
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() { break status; }
-                if Instant::now() >= deadline {
-                    let _ = child.kill(); let _ = child.wait();
-                    let root = directory.keep();
-                    panic!("backend fixture timed out; evidence retained at {}", root.display());
-                }
-                thread::sleep(Duration::from_millis(10));
-            };
-            let log = std::fs::read_to_string(directory.path().join("child.log")).unwrap();
-            if !status.success() {
-                let root = directory.keep();
-                panic!("backend fixture failed ({status}); evidence {}\n{log}", root.display());
-            }
-            assert!(log.contains("1 passed"), "isolated fixture did not execute: {log}");
-            return;
-        }
+        let exact = thread::current().name().expect("named libtest contract").to_owned();
+        if backend_binding_test::isolated(&exact) { return; }
         // Server::restart's orphan reconciliation is process-wide; only this
         // private child owns its provider descendants and becomes a subreaper.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
-        let mut fixture = resident_fixture();
+        let fixture = resident_fixture();
         let source = fixture.server.source.clone();
         let mut remote = RemoteActor::fixture();
         let resident = fixture.server.resident().unwrap();
@@ -2727,7 +2698,12 @@ mod tests {
         let instance = remote.identity().instance;
         let handle = super::super::Handle::from_remote_fixture(remote.clone());
         let host = crate::host::BackendFixture::new(source.clone(), handle.clone(), instance);
+        let (complete, completed) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
+            // Drop order sends completion only after the actual owned provider
+            // and private Server have completed their bounded cleanup.
+            let _complete = backend_binding_test::Completed(complete);
+            let mut fixture = fixture;
             let deadline = Instant::now() + Duration::from_secs(30);
             fixture.server.listener.set_nonblocking(true).unwrap();
             let mut lose_first_restart_reply = true;
@@ -2795,7 +2771,10 @@ done"#;
         assert!(!host.validates(&a), "B fully retiring never resurrects A consent");
         assert!(host.validates(&b));
         remote.call::<()>("fixture_finish", Value::Null).unwrap();
-        worker.join().unwrap();
+        completed.recv_timeout(Duration::from_secs(5)).expect("server cleanup completion");
+        // No caller-side raw pthread join: even finished Rust threads may be
+        // in TLS destruction. The fixture no longer owns a backend at this edge.
+        drop(worker);
     }
     #[test]
     fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {
