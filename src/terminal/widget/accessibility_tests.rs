@@ -943,3 +943,41 @@ fn observed_window_return_admits_first_fresh_down_when_old_physical_up_was_outsi
     let actions: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some((input.key, input.action)) } else { None }).collect();
     assert_eq!(actions, vec![(TerminalKey::Character('a'), KeyAction::Press), (TerminalKey::Character('a'), KeyAction::Release)], "{requests:?}");
 }
+
+
+#[test]
+fn repeat_keeps_original_release_identity_and_window_blur_ends_review_before_cleanup() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "review-window-pane", barrier.clone(), true, false);
+    terminal.on_shortcut = None;
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    native_focus(&mut terminal, &mut tree, &renderer);
+    dispatch(&mut terminal, &mut tree, &renderer, raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()));
+    let mut repeat = raw_letter(keyboard::key::Code::KeyA, "b", true, keyboard::Modifiers::SHIFT);
+    if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat { *repeat = true; }
+    dispatch(&mut terminal, &mut tree, &renderer, repeat);
+    let requests = peer.fence();
+    let keys: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
+    assert_eq!(keys.len(), 2, "{requests:?}");
+    assert_eq!(keys[0].action, KeyAction::Press);
+    assert_eq!(keys[0].unshifted_codepoint, Some('a'));
+    assert_eq!(keys[1].action, KeyAction::Repeat);
+    assert_eq!(keys[1].unshifted_codepoint, Some('b'), "repeat payload itself remains current");
+    let id = terminal.id.clone().unwrap();
+    assert_eq!(dispatch(&mut terminal, &mut tree, &renderer, action(id, Action::Focus, None)), vec![Message::Review(true)]);
+    assert!(reviewing(&tree));
+    let messages = dispatch(&mut terminal, &mut tree, &renderer, Event::Window(window::Event::Unfocused));
+    assert!(messages.contains(&Message::Review(false)), "{messages:?}");
+    assert!(!reviewing(&tree));
+    let requests = peer.fence();
+    let keys: Vec<_> = requests.iter().filter_map(|r| if let ClientRequest::Key { input, .. } = r { Some(input) } else { None }).collect();
+    assert_eq!(keys.len(), 1, "{requests:?}");
+    assert_eq!(keys[0].key, TerminalKey::Character('a'));
+    assert_eq!(keys[0].unshifted_codepoint, Some('a'));
+    assert_eq!(keys[0].action, KeyAction::Release);
+    assert!(keys[0].modifiers.shift);
+    assert!(!barrier.flush_owned_keys());
+    assert!(!peer.fence().iter().any(|r| matches!(r, ClientRequest::Key { .. })));
+}

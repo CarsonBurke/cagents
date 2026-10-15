@@ -2037,7 +2037,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 columns: geometry.columns,
                 offset: self.snapshot.scroll.offset,
                 alternate: self.snapshot.scroll.alternate_screen,
-                focused: self.model_focused,
+                focused: self.model_focused && state.native_window_focused.unwrap_or(self.window_focused),
             },
             Instant::now(),
             true,
@@ -2267,6 +2267,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if self.on_review.is_some() {
             self.reconcile_review(state);
         }
+        let window_focused = state.native_window_focused.unwrap_or(self.window_focused);
+        if !window_focused && state.a11y.borrow().review {
+            {
+                let mut a11y = state.a11y.borrow_mut();
+                a11y.review = false;
+                a11y.selection = None;
+            }
+            self.publish_review(false, shell);
+        }
         let view = accessibility::View {
             rows: if bounds.height > REVIEW_BAR_HEIGHT {
                 geometry.rows
@@ -2276,7 +2285,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             columns: geometry.columns,
             offset: self.snapshot.scroll.offset,
             alternate: self.snapshot.scroll.alternate_screen,
-            focused: self.model_focused,
+            focused: self.model_focused && window_focused,
         };
         if let Some(due) =
             state
