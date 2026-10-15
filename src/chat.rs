@@ -587,6 +587,31 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     }
 }
 
+/// The proof-only transition of an exact retained Claude actor before it has
+/// named a conversation. This shape check grants no ownership: callers must
+/// resolve authenticated helper lineage and verify the attached snapshot.
+/// Keep ordinary thread-bearing upgrade and save predicates strict.
+pub fn is_unnamed_retained_claude_recovery(source: &Session, replacement: &Session) -> bool {
+    let Some((old,new))=source.proof.as_ref().zip(replacement.proof.as_ref()) else {return false;};
+    if !matches!(source.native_continuity, NativeContinuity::RetainedClaudeActor { protocol: 1 })
+        || source.native_continuity != replacement.native_continuity
+        || !source.has_valid_native_continuity() || !replacement.has_valid_native_continuity()
+        || !old.is_complete() || !new.is_complete() || old == new || old.boot_id != new.boot_id
+        || source.id != replacement.id || source.launch != replacement.launch
+        || source.launch.session_id.is_some() || replacement.launch.session_id.is_some()
+        || source.owned_codex_listener != replacement.owned_codex_listener
+    {return false;}
+    match (&source.terminal,&replacement.terminal) {
+        (None,None)=>true,
+        (Some(previous),Some(next)) if previous.id==source.id && next.id==source.id
+            && previous.continuity.live_proof().as_ref()==Some(old)
+            && next.continuity.live_proof().as_ref()==Some(new) => {
+                let mut normalized=next.clone();normalized.continuity=previous.continuity.clone();normalized==*previous
+            }
+        _=>false,
+    }
+}
+
 /// A retained Codex holder may have issued the same confirmed thread with an
 /// explicit resume prefix after its original fresh-thread descriptor. Only
 /// that prefix can change; the endpoint and all execution settings stay exact.
@@ -2145,6 +2170,25 @@ mod tests {
             native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 1 } };
         assert!(session.has_valid_native_continuity(), "an unnamed issued actor can persist before its first provider result");
         assert!(!session.is_unstarted(), "an installed actor is never an empty draft");
+        let mut next=session.clone();
+        next.proof.as_mut().unwrap().host_incarnation="successor".into();
+        assert!(is_unnamed_retained_claude_recovery(&session,&next));
+        assert!(!is_upgrade_recovery(&session,&next),"ordinary named-thread predicate remains strict");
+        for field in 0..8 {
+            let mut wrong=next.clone();
+            match field {
+                0=>wrong.proof.as_mut().unwrap().boot_id="other-boot".into(),
+                1=>wrong.proof=session.proof.clone(),
+                2=>{wrong.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/other".into());},
+                3=>wrong.launch.recipe.arguments.push("--other-option".into()),
+                4=>wrong.launch.recipe.working_directory="/other".into(),
+                5=>wrong.launch.session_id=Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                6=>wrong.native_continuity=NativeContinuity::ReconnectOnly,
+                _=>wrong.id=crate::model::TerminalId::new(),
+            }
+            assert!(!is_unnamed_retained_claude_recovery(&session,&wrong),"unnamed proof transition changed field {field}");
+        }
+
         assert_eq!(postcard::from_bytes::<Session>(&postcard::to_stdvec(&session).unwrap()).unwrap(), session);
         session.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
         assert!(session.has_valid_native_continuity());

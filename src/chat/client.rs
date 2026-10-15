@@ -401,7 +401,9 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
-                if session.launch.session_id.is_some()
+                if super::is_unnamed_retained_claude_recovery(&session, &restored) {
+                    *upgrade_recovery = Some((session, restored.clone()));
+                } else if session.launch.session_id.is_some()
                     && (session.launch.session_id != restored.launch.session_id
                         || session.launch.recipe != restored.launch.recipe)
                 {
@@ -507,7 +509,7 @@ impl ClientHandle {
 
     #[cfg(test)]
     pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
-        assert!(super::is_upgrade_recovery(&source, &session));
+        assert!(super::is_upgrade_recovery(&source, &session) || super::is_unnamed_retained_claude_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
         let mut handle = Self::fixture(session.clone(), snapshot);

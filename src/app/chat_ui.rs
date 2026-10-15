@@ -6103,7 +6103,8 @@ impl Cagents {
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || &replacement != resolved
-                                || !chat::is_upgrade_recovery(source, &replacement)
+                                || !(chat::is_upgrade_recovery(source, &replacement)
+                                    || chat::is_unnamed_retained_claude_recovery(source, &replacement))
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
