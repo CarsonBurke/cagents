@@ -271,6 +271,7 @@ impl Cagents {
                     reason: record.lock_reason,
                 },
                 prunable_reason: record.prunable_reason,
+                creation_basis: None,
                 created_at_unix_ms: None,
             })
             .collect::<Vec<_>>();

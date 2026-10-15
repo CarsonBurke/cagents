@@ -2270,6 +2270,7 @@ mod tests {
                     bare: false,
                     lock: crate::repository::WorktreeLock::default(),
                     prunable_reason: None,
+                    creation_basis: None,
                     created_at_unix_ms: None,
                 },
                 warnings: Vec::new(),
@@ -2342,6 +2343,8 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            linear_issue: None,
+            setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),
             destination: destination.clone(),

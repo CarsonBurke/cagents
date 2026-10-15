@@ -29,6 +29,7 @@ pub(super) struct ActiveWorktreeOperation {
     /// What the user typed to start it, when this session started it: a
     /// failure can then be reopened in the dialog instead of retyped.
     draft: Option<WorktreeDraft>,
+    setup_intent: Option<super::worktree_setup_ui::SetupIntent>,
 }
 
 impl ActiveWorktreeOperation {
@@ -157,6 +158,47 @@ fn stage_order(stage: WorktreeProgressStage) -> u8 {
         WorktreeProgressStage::Finished => 4,
     }
 }
+#[derive(Debug, Clone)]
+pub(super) struct Rehydrated {
+    reports: Vec<WorktreeOperationReport>,
+    current_setups: HashSet<OperationId>,
+    observed_runs: HashMap<PathBuf, OperationId>,
+}
+
+fn verified_setup_generations(
+    store: &crate::persistence::StateStore,
+    reports: &[WorktreeOperationReport],
+) -> HashSet<OperationId> {
+    let service = RepositoryService::system("git");
+    let token = CancellationToken::new();
+    let mut locations = HashMap::new();
+    reports
+        .iter()
+        .filter_map(|report| {
+            let request = report.request.as_ref()?;
+            if report.state != WorktreeOperationState::Created || request.setup_intent.is_none() {
+                return None;
+            }
+            let current = locations
+                .entry(request.destination.clone())
+                .or_insert_with(|| {
+                    service
+                        .common_dir(&request.destination, &token)
+                        .ok()
+                        .zip(service.git_dir(&request.destination, &token).ok())
+                });
+            let (common, admin) = current.as_ref()?;
+            let identity = service
+                .worktree_setup_creation_identity(store, report.operation_id)
+                .ok()??;
+            identity
+                .matches_checkout(common, admin)
+                .ok()?
+                .then_some(report.operation_id)
+        })
+        .collect()
+}
+
 impl Cagents {
     pub(super) fn has_active_worktree_operations(&self) -> bool {
         self.worktree_operations
@@ -200,6 +242,7 @@ impl Cagents {
                 created_worktree: None,
                 state: None,
                 draft,
+                setup_intent: request.setup_intent.clone(),
             },
         );
         self.sync_worktree_operation_rows();
@@ -254,6 +297,7 @@ impl Cagents {
     /// Its row waits for the checkout to list the worktree, which it never
     /// will again.
     pub(super) fn forget_worktree_creation(&mut self, path: &Path) {
+        self.forget_worktree_setup(path);
         self.worktree_operations.retain(|_, operation| {
             !(operation.finished
                 && operation
@@ -315,7 +359,16 @@ impl Cagents {
                 };
                 operation.state = Some(report.state);
                 operation.detail = report.detail;
-                report.outcome
+                if let Some(request) = report.request {
+                    operation.setup_intent = request.setup_intent.clone();
+                    operation.request = Some(request);
+                }
+                // Git may have created the checkout while ticket linking still
+                // needs reconciliation. Keep the actionable operation row and
+                // defer setup/agent startup until the complete contract settles.
+                report
+                    .outcome
+                    .filter(|_| report.state == WorktreeOperationState::Created)
             }
             Err(error) => {
                 operation.state = Some(WorktreeOperationState::OutcomeUnknown);
@@ -323,15 +376,23 @@ impl Cagents {
                 None
             }
         };
+        let setup_intent = outcome.as_ref().and_then(|_| operation.setup_intent.take());
         self.sync_worktree_operation_rows();
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
+            let setup = match (&outcome, setup_intent) {
+                (WorktreeCreationOutcome::Created { worktree, .. }, Some(intent)) => {
+                    self.start_worktree_setup(id, worktree.path.clone(), intent)
+                }
+                _ => Task::none(),
+            };
             return cosmic::task::message(Message::WorktreeCreated {
                 project_id,
                 repository,
                 result: Ok(outcome),
-            });
+            })
+            .chain(setup);
         }
         Task::none()
     }
@@ -340,10 +401,18 @@ impl Cagents {
             return Task::none();
         };
         let store = session.operation_store();
+        let observed_runs = self.setup_ui.run_snapshot();
         cosmic::task::future(async move {
             Message::WorktreeOperationsRehydrated(
                 tokio::task::spawn_blocking(move || {
-                    RepositoryService::system("git").rehydrate_worktree_operations(&store)
+                    let reports =
+                        RepositoryService::system("git").rehydrate_worktree_operations(&store)?;
+                    let current_setups = verified_setup_generations(&store, &reports);
+                    Ok::<_, crate::persistence::StoreError>(Rehydrated {
+                        reports,
+                        current_setups,
+                        observed_runs,
+                    })
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -353,10 +422,63 @@ impl Cagents {
     }
     pub(super) fn restore_worktree_operations(
         &mut self,
-        result: Result<Vec<WorktreeOperationReport>, String>,
+        result: Result<Rehydrated, String>,
     ) -> Task<Message> {
         match result {
-            Ok(reports) => {
+            Ok(Rehydrated {
+                reports,
+                current_setups,
+                observed_runs,
+            }) => {
+                let unchanged = |path: &Path| {
+                    self.setup_ui.current_run(path) == observed_runs.get(path).copied()
+                };
+                let verified_paths = reports
+                    .iter()
+                    .filter(|report| current_setups.contains(&report.operation_id))
+                    .filter_map(|report| {
+                        report
+                            .request
+                            .as_ref()
+                            .map(|request| request.destination.clone())
+                    })
+                    .filter(|path| unchanged(path))
+                    .collect::<HashSet<_>>();
+                let superseded_paths = reports
+                    .iter()
+                    .filter_map(|report| {
+                        report
+                            .request
+                            .as_ref()
+                            .map(|request| request.destination.clone())
+                    })
+                    .filter(|path| !unchanged(path))
+                    .collect::<HashSet<_>>();
+                for report in &reports {
+                    if report.state != WorktreeOperationState::Created {
+                        continue;
+                    }
+                    let Some(request) = report
+                        .request
+                        .as_ref()
+                        .filter(|request| request.setup_intent.is_some())
+                    else {
+                        continue;
+                    };
+                    let locally_created = self.worktree_operations.values().any(|operation| {
+                        !operation.restored
+                            && operation
+                                .request
+                                .as_ref()
+                                .is_some_and(|current| current.destination == request.destination)
+                    });
+                    if !verified_paths.contains(&request.destination)
+                        && !superseded_paths.contains(&request.destination)
+                        && !locally_created
+                    {
+                        self.mark_unverified_worktree_setup(request.destination.clone());
+                    }
+                }
                 for report in reports {
                     if self.worktree_operations.contains_key(&report.operation_id) {
                         continue;
@@ -378,6 +500,27 @@ impl Cagents {
                         )));
                         continue;
                     };
+                    let setup_intent = report
+                        .request
+                        .as_ref()
+                        .and_then(|request| request.setup_intent.clone());
+                    if report.state == WorktreeOperationState::Created
+                        && current_setups.contains(&report.operation_id)
+                        && report
+                            .request
+                            .as_ref()
+                            .is_some_and(|request| verified_paths.contains(&request.destination))
+                        && let (
+                            Some(intent),
+                            Some(WorktreeCreationOutcome::Created { worktree, .. }),
+                        ) = (setup_intent.clone(), &report.outcome)
+                    {
+                        self.recover_worktree_setup(
+                            report.operation_id,
+                            worktree.path.clone(),
+                            intent,
+                        );
+                    }
                     self.worktree_operations.insert(
                         report.operation_id,
                         ActiveWorktreeOperation {
@@ -402,6 +545,7 @@ impl Cagents {
                             detail: report.detail,
                             state: Some(report.state),
                             draft: None,
+                            setup_intent,
                         },
                     );
                 }
@@ -430,6 +574,7 @@ impl Cagents {
             .worktree_operations
             .values()
             .any(|operation| !operation.finished)
+            || self.setup_ui.active()
         {
             subscriptions.push(
                 Subscription::run_with(0_u8, elapsed_stream).map(|()| Message::WorktreeElapsed),
@@ -469,12 +614,206 @@ impl Cagents {
             }),
         );
         self.sync_worktree_deletion_rows();
+        self.refresh_worktree_setup_rows();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_link_reconciliation_defers_created_followup_until_fully_settled() {
+        for state in [
+            WorktreeOperationState::ReconcileRequired,
+            WorktreeOperationState::Created,
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let id = OperationId::new();
+            let project = ProjectId::new();
+            let destination = PathBuf::from("/repo/worktrees/eng-123");
+            let intent = super::super::worktree_setup_ui::SetupIntent {
+                skip: true,
+                run_id: Some(id),
+                ..Default::default()
+            };
+            let request = CreateWorktreeRequest {
+                setup_intent: Some(intent.clone()),
+                linear_issue: Some(crate::linear::context::LinkedIssue {
+                    issue_id: "ENG-123".into(),
+                    workspace: None,
+                }),
+                repository: "/repo".into(),
+                managed_root: "/repo/worktrees".into(),
+                destination: destination.clone(),
+                branch: crate::repository::ValidatedBranchName::parse("eng-123").unwrap(),
+                base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
+                track: false,
+                operation_id: id,
+            };
+            app.worktree_operations.insert(
+                id,
+                ActiveWorktreeOperation {
+                    project,
+                    generation: 1,
+                    request: Some(request.clone()),
+                    token: None,
+                    receiver: None,
+                    stage: None,
+                    started: Instant::now(),
+                    completed_elapsed: None,
+                    restored: false,
+                    termination_requested: false,
+                    finished: false,
+                    detail: "creating".into(),
+                    created_worktree: None,
+                    label: "eng-123".into(),
+                    state: None,
+                    draft: None,
+                    setup_intent: None,
+                },
+            );
+            let task = app.finish_worktree_operation(
+                id,
+                1,
+                Ok(WorktreeOperationReport {
+                    operation_id: id,
+                    generation: 1,
+                    request: Some(request),
+                    state,
+                    outcome: Some(WorktreeCreationOutcome::Created {
+                        worktree: crate::repository::WorktreeRecord {
+                            id: crate::model::WorktreeId::new(),
+                            path: destination,
+                            creation_basis: None,
+                            created_at_unix_ms: Some(1),
+                            head_oid: Some("a".repeat(40)),
+                            branch: Some("refs/heads/eng-123".into()),
+                            detached: false,
+                            bare: false,
+                            lock: crate::repository::WorktreeLock::default(),
+                            prunable_reason: None,
+                        },
+                        warnings: Vec::new(),
+                    }),
+                    detail: "Linear linking requires reconciliation".into(),
+                    created_at_unix_ms: 1,
+                }),
+            );
+            assert_eq!(
+                cosmic::iced::runtime::task::into_stream(task).is_some(),
+                state == WorktreeOperationState::Created
+            );
+            assert_eq!(app.worktree_operations[&id].state, Some(state));
+            if state == WorktreeOperationState::ReconcileRequired {
+                assert_eq!(
+                    app.worktree_operations[&id].row(&[]).unwrap().0,
+                    WorktreeOperationPhase::Failed
+                );
+                assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
+            }
+        }
+    }
+
+    #[test]
+    fn restored_creation_keeps_setup_intent_without_starting_effects() {
+        for (state, reverse, superseded) in [
+            (WorktreeOperationState::Created, false, false),
+            (WorktreeOperationState::Created, true, false),
+            (WorktreeOperationState::Created, false, true),
+            (WorktreeOperationState::ReconcileRequired, false, false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let project = ProjectId::new();
+            let repository = PathBuf::from("/repo");
+            let path = repository.join("worktrees/recovered");
+            let id = OperationId::new();
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "repo".into(),
+                repository.clone(),
+                vec![],
+                vec![],
+            ));
+            let intent = super::super::worktree_setup_ui::SetupIntent {
+                primary: Some(repository.clone()),
+                run_id: Some(id),
+                ..Default::default()
+            };
+            let request = CreateWorktreeRequest {
+                setup_intent: Some(intent.clone()),
+                linear_issue: None,
+                repository,
+                managed_root: "/repo/worktrees".into(),
+                destination: path.clone(),
+                branch: crate::repository::ValidatedBranchName::parse("recovered").unwrap(),
+                base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
+                track: false,
+                operation_id: id,
+            };
+            let report = WorktreeOperationReport {
+                operation_id: id,
+                generation: 1,
+                request: Some(request),
+                state,
+                outcome: Some(WorktreeCreationOutcome::Created {
+                    worktree: crate::repository::WorktreeRecord {
+                        id: crate::model::WorktreeId::new(),
+                        path: path.clone(),
+                        creation_basis: None,
+                        created_at_unix_ms: Some(1),
+                        head_oid: Some("a".repeat(40)),
+                        branch: Some("refs/heads/recovered".into()),
+                        detached: false,
+                        bare: false,
+                        lock: Default::default(),
+                        prunable_reason: None,
+                    },
+                    warnings: vec![],
+                }),
+                detail: "recovered".into(),
+                created_at_unix_ms: 1,
+            };
+            // Synthetic imported history can retain both Applied generations.
+            // A newer run can also finish while this snapshot is in flight.
+            let newer = OperationId::new();
+            if superseded {
+                let mut current = intent.clone();
+                current.run_id = Some(newer);
+                app.recover_worktree_setup(newer, path.clone(), current);
+            }
+            let mut old = report.clone();
+            let old_id = OperationId::new();
+            old.operation_id = old_id;
+            let old_request = old.request.as_mut().unwrap();
+            old_request.operation_id = old_id;
+            old_request.setup_intent.as_mut().unwrap().run_id = Some(old_id);
+            let reports = if reverse {
+                vec![report, old]
+            } else {
+                vec![old, report]
+            };
+            let task = app.restore_worktree_operations(Ok(Rehydrated {
+                reports,
+                current_setups: HashSet::from([id]),
+                observed_runs: HashMap::new(),
+            }));
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
+            assert_eq!(
+                app.setup_ui.recovered_creation(&path),
+                if superseded {
+                    Some(newer)
+                } else {
+                    (state == WorktreeOperationState::Created).then_some(id)
+                },
+                "only the verified nonsuperseded generation is current regardless of imported history order"
+            );
+            assert!(!app.setup_ui.active());
+            assert_eq!(app.durable.cards.len(), 0);
+        }
+    }
 
     #[test]
     fn retained_cancel_is_once_and_stale_stages_do_not_advance() {
@@ -505,6 +844,7 @@ mod tests {
                     label: "review".into(),
                     state: None,
                     draft: None,
+                    setup_intent: None,
                 },
             );
             let _ = app.cancel_worktree_operation(id);
@@ -574,6 +914,7 @@ mod tests {
             label: path.into(),
             state: Some(WorktreeOperationState::Created),
             draft: None,
+            setup_intent: None,
         };
         let deleted = OperationId::new();
         let other = OperationId::new();

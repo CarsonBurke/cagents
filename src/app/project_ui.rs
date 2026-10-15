@@ -18,6 +18,7 @@ pub struct State {
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
     remove_dialog: Option<ProjectRemoval>,
+    pub(super) setup_review: Option<super::worktree_setup_ui::Review>,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
     /// Projects closed by the shared model but still settling their channels.
@@ -49,12 +50,17 @@ struct Deletion {
 }
 
 impl State {
+    pub(super) fn show_setup_review(&mut self, review: super::worktree_setup_ui::Review) {
+        self.dialog = None;
+        self.remove_dialog = None;
+        self.setup_review = Some(review);
+    }
     pub(super) fn is_reopening(&self, repository: &Path) -> bool {
         self.reopening.values().any(|path| path == repository)
     }
 
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.remove_dialog.is_some()
+        self.dialog.is_some() || self.remove_dialog.is_some() || self.setup_review.is_some()
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -124,6 +130,9 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
+        if self.setup_review.is_some() {
+            return widget::Id::new("dialog.setup.cancel");
+        }
         if self.remove_dialog.is_some() {
             return widget::Id::new("dialog.project.remove.confirm");
         }
@@ -186,6 +195,22 @@ pub enum Action {
         command: ProjectCommand,
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
+    SetupReviewLoaded {
+        request: crate::model::OperationId,
+        result: Result<super::worktree_setup_ui::ReviewSnapshot, String>,
+    },
+    SetupReviewTrust {
+        request: crate::model::OperationId,
+        approved: bool,
+    },
+    ConfirmSetupReview {
+        request: crate::model::OperationId,
+        skip: bool,
+    },
+    SetupReviewReady {
+        request: crate::model::OperationId,
+        result: Result<super::worktree_setup_ui::ReviewCompletion, String>,
+    },
     ConfirmDelete,
     ConfirmRemove,
     RemovedProject {
@@ -215,7 +240,13 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn sync_worktree_protections(&mut self) {
-        let mut paths = Vec::new();
+        // Retain the window lease through background preparation and until
+        // its result creates the terminal card, even after a scope switch.
+        let mut paths = self
+            .setup_ui
+            .protected_directories()
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
         }
@@ -1127,6 +1158,9 @@ impl Cagents {
                         self.project_ui.dialog = None;
                         return launch_task(PathBuf::from("xdg-open"), target.path, false);
                     }
+                    ProjectCommand::ReviewSetup => {
+                        return self.review_worktree_setup(target.path);
+                    }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
                         let select = self.select_worktree(target.path.clone(), false);
@@ -1172,7 +1206,25 @@ impl Cagents {
                     }
                 }
             }
+            Action::SetupReviewLoaded { request, result } => {
+                self.setup_review_loaded(request, result)
+            }
+            Action::SetupReviewTrust { request, approved } => {
+                if self.setup_review_on_top()
+                    && let Some(review) = &mut self.project_ui.setup_review
+                    && review.request == request
+                {
+                    review.approved = approved;
+                }
+            }
+            Action::ConfirmSetupReview { request, skip } => {
+                return self.confirm_setup_review(request, skip);
+            }
+            Action::SetupReviewReady { request, result } => {
+                return self.setup_review_ready(request, result);
+            }
             Action::Dismiss => {
+                self.dismiss_worktree_setup_review();
                 self.project_ui.remove_dialog = None;
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
@@ -1608,6 +1660,11 @@ impl Cagents {
     }
 
     fn worktree_deletion_blocker(&self, target: &Target) -> Option<String> {
+        if self.setup_ui.preparing(&target.path) {
+            return Some(
+                "Wait for this worktree's setup file copy to finish before deleting it.".into(),
+            );
+        }
         if self.session.is_none() {
             return Some(
                 "Session storage is unavailable; deletion cannot be recorded safely.".into(),
@@ -1719,6 +1776,9 @@ impl Cagents {
     }
 
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
+        if let Some(review) = &self.project_ui.setup_review {
+            return Some(super::worktree_setup_ui::review_view(review));
+        }
         if let Some(removal) = &self.project_ui.remove_dialog {
             let detail = if removal.channels == 0 {
                 "No channels are attached to this project.".to_owned()

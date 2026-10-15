@@ -44,8 +44,10 @@ mod terminal_failure;
 mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
+mod worktree_choices;
 mod worktree_dialog;
 mod worktree_operations;
+mod worktree_setup_ui;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
@@ -2553,6 +2555,12 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
                 | Message::CancelRepositoryClose
+                | Message::WorktreeFieldFocused(_)
+                | Message::WorktreeChoiceSelected { .. }
+                | Message::WorktreePrefixChanged(_)
+                | Message::WorktreeSetupSkipChanged(_)
+                | Message::WorktreeSetupTrustChanged(_)
+                | Message::WorktreeSuggestionsDismissed(_)
                 | Message::WorktreeBranchChanged(_)
                 | Message::WorktreeBaseChanged(_)
                 | Message::WorktreeDestinationChanged(_)
@@ -2578,6 +2586,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
                         | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::SetupReviewTrust { .. }
+                        | project_ui::Action::ConfirmSetupReview { .. }
                         | project_ui::Action::Dismiss
                 )
                 | Message::ChannelUi(
@@ -4239,6 +4249,42 @@ pub enum Message {
         request: DelegateRequestId,
         result: Result<Option<Vec<PathBuf>>, String>,
     },
+    WorktreeSetupSkipChanged(bool),
+    WorktreeSetupTrustChanged(bool),
+    WorktreeSetupPrepared {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+        result: Result<crate::worktree_setup::SetupPreparation, String>,
+    },
+    WorktreeSetupReceipts {
+        project: ProjectId,
+        repository: PathBuf,
+        request: crate::model::OperationId,
+        result: Result<(Vec<crate::worktree_control::SetupReceipt>, Vec<String>), String>,
+    },
+    WorktreeSetupSelectionCommitted {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+    },
+    WorktreeSetupSelectionRejected {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+    },
+    WorktreeChoicesResolved {
+        id: crate::model::OperationId,
+        result: Result<worktree_choices::Choices, String>,
+    },
+    WorktreeFieldFocused(WorktreeField),
+    WorktreeChoiceSelected {
+        field: WorktreeField,
+        reference: String,
+    },
+    WorktreePrefixChanged(String),
+    WorktreeSuggestionsDismissed(WorktreeField),
+    WorktreeLinearResolved {
+        id: crate::model::OperationId,
+        result: Result<crate::linear::IssuePreview, String>,
+    },
     WorktreeBranchChanged(String),
     WorktreeBaseChanged(String),
     WorktreeDestinationChanged(String),
@@ -4256,7 +4302,7 @@ pub enum Message {
         generation: u64,
         result: Result<crate::repository::WorktreeOperationReport, String>,
     },
-    WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
+    WorktreeOperationsRehydrated(Result<worktree_operations::Rehydrated, String>),
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
@@ -4936,6 +4982,7 @@ pub struct Cagents {
     terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
+    setup_ui: worktree_setup_ui::State,
     /// A source-control navigation waiting for its repository card to finish
     /// listing files.
     ///
@@ -5428,6 +5475,7 @@ impl Cagents {
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
+        let setup_run = self.setup_ui.authorized_run(&session);
         let shared = self.shared_views.attached.contains(&card);
         let reserved = self
             .workspace_model
@@ -5437,6 +5485,7 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if setup_run.is_some() { worktree_setup_ui::verify_setup_launch(&session.launch)?; }
                 let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -5448,7 +5497,12 @@ impl Cagents {
                     };
                     if reserved {
                         for _ in 0..100 {
-                            match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
+                            let options = crate::terminal_ipc::TerminalSpawnOptions::from(config.clone());
+                            let started = match setup_run {
+                                Some(run) => client.start_worktree_setup(card, session.id, run, options),
+                                None => client.complete_pending_terminal(card, session.id, options),
+                            };
+                            match started {
                                 Ok(terminal) => { hosted=Some(terminal);created=true;break; }
                                 Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
                                     hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
@@ -5805,6 +5859,12 @@ impl Cagents {
         }
         let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
+        let setup = session
+            .launch
+            .environment
+            .get("CAGENTS_WORKTREE_SETUP")
+            .map(String::as_str)
+            == Some("1");
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "terminal");
         let card = CardState {
             id: card_id,
@@ -5812,10 +5872,14 @@ impl Cagents {
             // A directory name is chosen outside the application, so it needs
             // the same normalisation a reported title gets: it reaches the card
             // header, the accessibility strings and the window title.
-            title: working_directory
-                .file_name()
-                .and_then(|name| normalize_card_name(&name.to_string_lossy()))
-                .unwrap_or_else(|| "Terminal".into()),
+            title: if setup {
+                "Worktree setup".into()
+            } else {
+                working_directory
+                    .file_name()
+                    .and_then(|name| normalize_card_name(&name.to_string_lossy()))
+                    .unwrap_or_else(|| "Terminal".into())
+            },
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
@@ -5854,6 +5918,11 @@ impl Cagents {
             self.shared_views.defaults.insert(card_id, session.clone());
         } else if session.continuity.live_proof().is_none() {
             self.reserve_terminal_creation(card_id);
+        }
+        if setup {
+            self.chrome_ui
+                .user_titles
+                .insert(card_id, "Worktree setup".into());
         }
         self.persist();
         Task::batch([
@@ -11272,8 +11341,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12970,6 +13042,7 @@ impl Application for Cagents {
             pending_terminal_handoffs: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
+            setup_ui: Default::default(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
@@ -13576,7 +13649,10 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([
+                                task,
+                                self.request_worktree_setup_receipts(existing_id, false),
+                            ]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -13758,6 +13834,7 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
+                            self.request_worktree_setup_receipts(project_id, false),
                             self.reconcile_workspace_model(),
                         ]);
                     }
@@ -15432,9 +15509,62 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::WorktreeBranchChanged(value) => {
+            Message::WorktreeBranchChanged(value) => self.edit_worktree_branch(value),
+            Message::WorktreeLinearResolved { id, result } => {
+                self.finish_worktree_linear(id, result)
+            }
+            Message::WorktreeChoicesResolved { id, result } => {
+                self.finish_worktree_choices(id, result)
+            }
+            Message::WorktreeSetupPrepared {
+                operation,
+                worktree,
+                result,
+            } => self.finish_worktree_setup(operation, worktree, result),
+            Message::WorktreeSetupReceipts {
+                project,
+                repository,
+                request,
+                result,
+            } => self.finish_worktree_setup_receipts(project, repository, request, result),
+            Message::WorktreeSetupSelectionCommitted {
+                operation,
+                worktree,
+            } => self.worktree_setup_selection_finished(operation, worktree, true),
+            Message::WorktreeSetupSelectionRejected {
+                operation,
+                worktree,
+            } => self.worktree_setup_selection_finished(operation, worktree, false),
+            Message::WorktreeSetupSkipChanged(skip) => {
                 if let Some(dialog) = &mut self.worktree_dialog {
-                    dialog.edit(WorktreeField::Branch, value);
+                    dialog.edit_setup_skip(skip);
+                }
+                Task::none()
+            }
+            Message::WorktreeSetupTrustChanged(trust) => {
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit_setup_trust(trust);
+                }
+                Task::none()
+            }
+            Message::WorktreeFieldFocused(field) => {
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.focus_field(field);
+                }
+                Task::none()
+            }
+            Message::WorktreeChoiceSelected { field, reference } => {
+                self.select_worktree_choice(field, reference)
+            }
+            Message::WorktreeSuggestionsDismissed(field) => {
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.dismiss_suggestions(field);
+                }
+                Task::none()
+            }
+            Message::WorktreePrefixChanged(value) => {
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit_prefix(value);
                 }
                 Task::none()
             }
@@ -15511,6 +15641,7 @@ impl Application for Cagents {
                                 .worktrees
                                 .push(SidebarWorktree::from_repository(&worktree, None));
                         }
+                        self.refresh_worktree_setup_rows();
                         let terminal = self.select_worktree(worktree.path, true);
                         let chrome = self.sync_chrome();
                         return Task::batch([
@@ -17903,6 +18034,7 @@ mod tests {
         let record = WorktreeRecord {
             id: WorktreeId::new(),
             path: PathBuf::from("/repo/worktrees/old"),
+            creation_basis: None,
             created_at_unix_ms: None,
             head_oid: Some("abc".into()),
             branch: Some("refs/heads/old-feature".into()),
@@ -17966,6 +18098,7 @@ mod tests {
         let record = WorktreeRecord {
             id: WorktreeId::new(),
             path: "/repo/feature".into(),
+            creation_basis: None,
             created_at_unix_ms: None,
             head_oid: Some("old".into()),
             branch: Some("refs/heads/feature".into()),
@@ -25240,6 +25373,7 @@ mod tests {
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             worktree_operations: HashMap::new(),
+            setup_ui: Default::default(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),

@@ -11,6 +11,7 @@ pub struct Identity {
     head: Oid,
     base_ref: ValidatedRefName,
     base_oid: Option<Oid>,
+    recorded: bool,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,37 @@ fn comparison_identity(
         head,
         base_ref,
         base_oid,
+        recorded: false,
+    })
+}
+
+fn comparison_identity_with_basis(
+    key: ActiveWorktreeKey,
+    snapshot: &RepositorySnapshot,
+    primary_branch: Option<&str>,
+    recorded: Option<&crate::worktree_basis::CreationBasis>,
+) -> Result<Identity, &'static str> {
+    let Some(recorded) = recorded else {
+        return comparison_identity(key, snapshot, primary_branch);
+    };
+    let head = match &snapshot.status.head {
+        HeadState::Branch { oid, .. } | HeadState::Detached { oid } => {
+            Oid::parse_object(oid.clone()).map_err(|_| "HEAD could not be read.")?
+        }
+        HeadState::Unborn { .. } => return Err("No commits yet."),
+        HeadState::Unknown => return Err("HEAD could not be read."),
+    };
+    Ok(Identity {
+        key,
+        head,
+        base_ref: recorded
+            .display_reference()
+            .map_err(|_| "Recorded creation base is invalid.")?,
+        base_oid: Some(
+            Oid::parse_object(recorded.oid.clone())
+                .map_err(|_| "Recorded creation commit is invalid.")?,
+        ),
+        recorded: true,
     })
 }
 
@@ -129,7 +161,18 @@ impl Cagents {
             })
             .filter(|worktree| !worktree.detached)
             .and_then(|worktree| worktree.branch.as_deref());
-        let identity = match comparison_identity(key, snapshot, primary_branch) {
+        let recorded = self
+            .sidebar_model
+            .project(key.project_id)
+            .and_then(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == key.worktree_id)
+            })
+            .and_then(|worktree| worktree.creation_basis.as_ref());
+        let identity = match comparison_identity_with_basis(key, snapshot, primary_branch, recorded)
+        {
             Ok(identity) => identity,
             Err(reason) => {
                 self.branch_ui.cancel();
@@ -173,10 +216,19 @@ impl Cagents {
         cosmic::task::future(async move {
             let worktree = identity.key.canonical_path.clone();
             let base_ref = identity.base_ref.clone();
+            let recorded_oid = identity
+                .recorded
+                .then(|| identity.base_oid.clone())
+                .flatten();
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .branch_comparison(&worktree, &base_ref, &cancellation)
-                    .map_err(|error| error.to_string())
+                let service = RepositoryService::system("git");
+                match recorded_oid {
+                    Some(base_oid) => {
+                        service.branch_comparison_at(&worktree, &base_ref, &base_oid, &cancellation)
+                    }
+                    None => service.branch_comparison(&worktree, &base_ref, &cancellation),
+                }
+                .map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| format!("branch comparison reader join failed: {error}"))
@@ -402,6 +454,35 @@ mod tests {
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
         }
+    }
+
+    #[test]
+    fn creation_basis_overrides_default_and_stays_pinned_when_ref_moves() {
+        let mut snapshot = snapshot();
+        let basis = crate::worktree_basis::CreationBasis::new(
+            "refs/heads/release/1.2".into(),
+            "ef".repeat(20),
+        )
+        .unwrap();
+        let before =
+            comparison_identity_with_basis(key(), &snapshot, Some("trunk"), Some(&basis)).unwrap();
+        assert_eq!(before.base_ref.as_str(), "refs/heads/release/1.2");
+        assert_eq!(before.base_oid.as_ref().unwrap().as_str(), basis.oid);
+        assert!(before.recorded);
+        snapshot.local_refs[0].oid = Oid::parse_object("12".repeat(20)).unwrap();
+        let after = comparison_identity_with_basis(
+            before.key.clone(),
+            &snapshot,
+            Some("trunk"),
+            Some(&basis),
+        )
+        .unwrap();
+        assert_eq!(before, after);
+        assert!(
+            !comparison_identity_with_basis(key(), &snapshot, Some("trunk"), None)
+                .unwrap()
+                .recorded
+        );
     }
 
     #[test]
