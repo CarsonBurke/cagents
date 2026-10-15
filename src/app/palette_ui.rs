@@ -54,7 +54,6 @@ impl Cagents {
                 Task::none()
             }
             Action::FilterKey => {
-                self.palette.pressed_key_filter = None;
                 self.palette.filtering_key = true;
                 self.palette.recording = None;
                 self.palette.query = None;

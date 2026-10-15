@@ -1561,6 +1561,24 @@ mod keyboard_table_tests {
             ));
         }
         drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        assert!(!app.palette.is_open());
+        assert_eq!(app.settings_search, "Ctrl+Shift+1");
+        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
+            app.palette.pressed_key_filter()).len(), 3,
+            "cancelling replacement capture preserves both previous match groups");
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_matches_pressed_key(chord, app.palette.pressed_key_filter()));
+        }
+        drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&press(
             "1",
             keyboard::key::Code::Numpad1,
