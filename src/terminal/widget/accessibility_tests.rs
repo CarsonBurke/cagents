@@ -31,7 +31,7 @@ enum Message {
     Shortcut,
     Paste,
 }
-struct Peer {
+pub(crate) struct Peer {
     _directory: tempfile::TempDir,
     handle: HostedTerminalHandle,
     requests: crossbeam_channel::Receiver<ClientRequest>,
@@ -39,18 +39,20 @@ struct Peer {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Peer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        Self::with_generation(TerminalId::new(),uuid::Uuid::new_v4(),HostSessionProof {
+            host_session_id: HostSessionId::new("review-test-session"),
+            boot_id: BootId::new("review-test-boot"),
+            host_incarnation: HostIncarnation::new("review-test-host"),
+        })
+    }
+    pub(crate) fn surface(&self) -> TerminalSurface { self.handle.clone().into() }
+    pub(crate) fn with_generation(id:TerminalId,worker:uuid::Uuid,proof:HostSessionProof) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let id = TerminalId::new();
-        let proof = HostSessionProof {
-            host_session_id: HostSessionId::new("review-test-session"),
-            boot_id: BootId::new("review-test-boot"),
-            host_incarnation: HostIncarnation::new("review-test-host"),
-        };
-        let descriptor = TerminalDescriptor::relaunchable(
+        let mut descriptor = TerminalDescriptor::relaunchable(
             id,
             LaunchRecipe {
                 program: "/bin/sh".into(),
@@ -61,6 +63,10 @@ impl Peer {
             },
             None,
         );
+        descriptor.execution_instance=worker;
+        descriptor.session.continuity=crate::model::TerminalContinuity::Live {
+            host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone(),
+        };
         let handle =
             HostedTerminalHandle::connect_at(socket, id, Some(proof.clone()), |_| {}).unwrap();
         let (tx, requests) = crossbeam_channel::unbounded();
