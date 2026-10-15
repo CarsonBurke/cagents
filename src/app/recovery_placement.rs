@@ -2,11 +2,44 @@
 //! Capture clones on the UI thread; directory and Git checks belong to workers.
 use super::*;
 use crate::fs_safety::{Root, RecoveryDirectoryStamp, recovery_directory_stamp};
-use crate::recovery_domain::{HeldRecoveryRoot, LocalRecoveryEndpoint, ObservedProject, RecoveryPlacementClient, RecoveryPlacementInputs};
-use crate::{filesystem_recovery_context::FilesystemRecoveryContext, worktree_cleanup::Protection};
+use crate::recovery_domain::{HeldRecoveryRoot, IssuedRecoveryPlacement, LocalRecoveryEndpoint, ObservedProject, RecoveryIssueError, RecoveryPlacementClient, RecoveryPlacementInputs, RecoveryPlacementReceipt};
+use crate::worktree_cleanup::Protection;
 use std::{io, os::unix::ffi::OsStrExt, time::Instant};
 
 const MAX_RECOVERY_ROOTS: usize = 256;
+
+/// A failure before any Prepare has no custody. Once intake starts, preserve
+/// its WHOLE original request/endpoint/root/protection receipt on uncertainty.
+/// UI completion/queue owners must store that receipt before showing text,
+/// even when the originating pane closes or its generation becomes stale.
+#[derive(Debug)]
+pub(super) enum WindowRecoveryIssueError {
+    BeforeAdmission(io::Error),
+    Intake(RecoveryIssueError),
+}
+impl std::fmt::Display for WindowRecoveryIssueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::BeforeAdmission(error) => write!(f, "{error}"), Self::Intake(error) => write!(f, "{error}") }
+    }
+}
+impl std::error::Error for WindowRecoveryIssueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self { Self::BeforeAdmission(error) => error, Self::Intake(error) => error })
+    }
+}
+impl From<io::Error> for WindowRecoveryIssueError {
+    fn from(error: io::Error) -> Self { Self::BeforeAdmission(error) }
+}
+impl WindowRecoveryIssueError {
+    pub(super) fn retained(&self) -> Option<&RecoveryPlacementReceipt> {
+        match self { Self::BeforeAdmission(_) => None, Self::Intake(error) => error.retained() }
+    }
+    /// The error's text is separate from the mandatory retained owner. Do not
+    /// discard the latter in a String conversion or stale-result early return.
+    pub(super) fn into_parts(self) -> (io::Error, Option<RecoveryPlacementReceipt>) {
+        match self { Self::BeforeAdmission(error) => (error, None), Self::Intake(error) => error.into_parts() }
+    }
+}
 
 /// This is an input census, never registration/effect authority. The blocking
 /// producer must pass the resolved original roots into the authenticated daemon
@@ -141,7 +174,9 @@ impl WindowRecoveryRoots {
     /// The authenticated client owns the original endpoint/proof. Its candidate
     /// loop continues only after an explicitly settled effect-free refusal;
     /// unknown transfers stop with the daemon's negative obligation retained.
-    /// The returned context retains that SAME issuer lease and issued parent.
+    /// The returned WHOLE issued placement retains that SAME issuer lease,
+    /// issued parent and explicit retirement receipt. The operation owner must
+    /// keep both context and receipt through cleanup; Drop grants no settlement.
     /// This method does not create H or lower any file effect.
     ///
     /// Source-only until the actual host route/controller and independent
@@ -154,31 +189,31 @@ impl WindowRecoveryRoots {
         payload_capacity: u8,
         cancellation: &CancellationToken,
         deadline: Instant,
-    ) -> io::Result<FilesystemRecoveryContext> {
+    ) -> Result<IssuedRecoveryPlacement, WindowRecoveryIssueError> {
         if cancellation.is_cancelled() || Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::Interrupted,
-                "Recovery intake cancelled or expired before source validation."));
+                "Recovery intake cancelled or expired before source validation.").into());
         }
         if !(1..=crate::recovery_domain::MAX_PAYLOADS).contains(&payload_capacity) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "Recovery requires a bounded positive payload reservation."));
+                "Recovery requires a bounded positive payload reservation.").into());
         }
         let lease = protection.as_ref().as_ref().ok_or_else(|| io::Error::new(
             io::ErrorKind::Unsupported, "Recovery requires the original strong source protection before admission."))?;
         if !lease.protects_root(&source)? {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "Recovery source no longer matches its original operation protection."));
+                "Recovery source no longer matches its original operation protection.").into());
         }
         let resolved = self.resolve_until(cancellation, Some(deadline))?;
         let inputs = resolved.issuer_inputs();
         let commons = resolved.holding_candidates(&source)?;
         if cancellation.is_cancelled() || Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::Interrupted,
-                "Recovery intake cancelled or expired before connecting to its original endpoint."));
+                "Recovery intake cancelled or expired before connecting to its original endpoint.").into());
         }
         let client = RecoveryPlacementClient::connect_local(resolved.endpoint)?;
         client.reserve_with_candidates(inputs, source, protection, commons, payload_capacity,
-            cancellation, deadline)
+            cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
     }
 
     /// Blocking worker only. Every source is the original cached actor; no
@@ -366,12 +401,12 @@ mod tests {
         };
         let result = input().issue_context(source.clone(), Arc::new(None), 1,
             &CancellationToken::new(), Instant::now() + Duration::from_secs(5));
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Unsupported
+        assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Unsupported
             && error.to_string().contains("strong source protection")));
         let cancelled = CancellationToken::new(); cancelled.cancel();
         let result = input().issue_context(source.clone(), Arc::new(None), 1,
             &cancelled, Instant::now() + Duration::from_secs(5));
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Interrupted));
         assert_eq!(std::fs::read(files.path().join("unchanged")).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(files.path()).unwrap().count(), 1);
     }
@@ -391,7 +426,7 @@ mod tests {
         };
         let result = input.issue_context(source, protection, 1, &CancellationToken::new(),
             Instant::now() + Duration::from_secs(5));
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
+        assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::NotFound));
         assert_eq!(std::fs::read(files.path().join("unchanged")).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(files.path()).unwrap().count(), 1);
         assert!(!runtime.path().join("absent-daemon.sock").exists());
