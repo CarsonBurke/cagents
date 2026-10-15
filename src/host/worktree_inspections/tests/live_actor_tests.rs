@@ -2,12 +2,13 @@
 //! actors. These are lifecycle fixtures, not installed provider qualification.
 use super::*;
 use crate::{chat, model::TerminalId, worktree_control::SessionIdentity};
-use std::{collections::BTreeMap, fs, sync::mpsc, thread};
+use std::{collections::BTreeMap, fs, os::fd::{AsRawFd,FromRawFd}, sync::mpsc, thread};
 
 struct Actor {
     id: TerminalId,
     handle: chat::runtime::Handle,
     process: crate::daemon::holder_registry::Process,
+    pin: fs::File,
 }
 impl Actor {
     fn start(host: &SharedHost, root: &Path) -> Self {
@@ -49,7 +50,11 @@ impl Actor {
             assert!(Instant::now()<deadline,"actual local provider did not become ready");
             thread::sleep(Duration::from_millis(2));
         };
-        let actor = Self {id,handle:handle.clone(),process};
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
+        assert!(descriptor >= 0,"capture the original provider liveness observation");
+        let pin = unsafe { fs::File::from_raw_fd(descriptor as i32) };
+        assert_eq!(crate::daemon::holder_registry::Process::read(process.pid).unwrap(),process);
+        let actor = Self {id,handle:handle.clone(),process,pin};
         host.lock().unwrap().chats.insert(id,super::super::super::chat::Record {
             execution_instance:uuid::Uuid::new_v4(),console_recipe:None,paired_terminal:None,
             session:chat::Session {id,proof:None,terminal:None,owned_codex_listener:None,native_continuity:Default::default(),
@@ -60,12 +65,17 @@ impl Actor {
     }
     fn assert_live(&self, host: &SharedHost) {
         assert_eq!(crate::daemon::holder_registry::Process::read(self.process.pid).unwrap(),self.process);
+        let mut descriptor=libc::pollfd {fd:self.pin.as_raw_fd(),events:libc::POLLIN,revents:0};
+        assert_eq!(unsafe {libc::poll(&mut descriptor,1,0)},0,"same PID/start alone must not classify an unreaped zombie as live");
         assert!(!self.handle.is_completed());
         let state=host.lock().unwrap();
         assert!(state.chats.get(&self.id).is_some_and(|record|record.handle.same_actor(&self.handle)));
     }
     fn assert_reaped(&self) {
         assert!(self.handle.is_completed());
+        let mut descriptor=libc::pollfd {fd:self.pin.as_raw_fd(),events:libc::POLLIN,revents:0};
+        assert_eq!(unsafe {libc::poll(&mut descriptor,1,0)},1);
+        assert_ne!(descriptor.revents & libc::POLLIN,0,"original pinned provider exited");
         match crate::daemon::holder_registry::Process::read(self.process.pid) {
             Ok(current)=>assert_ne!(current,self.process,"original provider must have been reaped"),
             Err(error)=>assert!(error.kind()==std::io::ErrorKind::NotFound || error.raw_os_error()==Some(libc::ESRCH),"unexpected process observation: {error}"),
